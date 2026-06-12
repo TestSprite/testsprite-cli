@@ -34,11 +34,7 @@ AI ships code in minutes — verifying it hasn't. `testsprite` opens your live a
 
 </div>
 
-
-
 https://github.com/user-attachments/assets/eca90a91-93ef-49f6-8d13-86b4eb25f4cf
-
-
 
 <p align="center"><sub><b>▶ Watch the launch video</b> — the three hard limits every coding agent hits, and the loop that breaks them (4 min).</sub></p>
 

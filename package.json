@@ -1,6 +1,6 @@
 {
   "name": "@testsprite/testsprite-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Official TestSprite command-line interface",
   "type": "module",
   "main": "dist/index.js",

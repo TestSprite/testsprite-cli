@@ -4,6 +4,12 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-12
+
+### Changed
+
+- README: point the launch video at the updated public asset. Docs-only release — no code changes.
+
 ## [0.1.0] - 2026-06-10
 
 ### Added
@@ -106,5 +112,6 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 - Commander `help [command]` exits 0 (previously exited 5 on `test help` / `project help`).
 
-[Unreleased]: https://github.com/TestSprite/testsprite-cli/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/TestSprite/testsprite-cli/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/TestSprite/testsprite-cli/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/TestSprite/testsprite-cli/releases/tag/v0.1.0
