@@ -1,4 +1,10 @@
-import { existsSync, mkdtempSync, readFileSync, symlinkSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -16,6 +22,21 @@ import {
 } from '../lib/agent-targets.js';
 import type { AgentDeps, AgentFs, InstallResult, ListResult } from './agent.js';
 import { AGENTS_MD_CODEX_BUDGET_BYTES, createAgentCommand, runInstall, runList } from './agent.js';
+
+/** Windows requires Developer Mode or elevation to create symlinks. */
+function canCreateSymlinks(): boolean {
+  try {
+    const probeRoot = mkdtempSync(path.join(tmpdir(), 'agent-symlink-probe-'));
+    const target = path.join(probeRoot, 'target.txt');
+    writeFileSync(target, 'probe');
+    symlinkSync(target, path.join(probeRoot, 'link.txt'), 'file');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const symlinkCapable = canCreateSymlinks();
 
 // ---------------------------------------------------------------------------
 // In-memory AgentFs backed by a Map
@@ -1085,7 +1106,9 @@ describe('runInstall — default AgentFs (real disk)', () => {
     expect(readFileSync(abs, 'utf8')).toBe(content);
   });
 
-  it('refuses to write through a symlinked parent dir (real disk) — exit 5', async () => {
+  it.skipIf(!symlinkCapable)(
+    'refuses to write through a symlinked parent dir (real disk) — exit 5',
+    async () => {
     const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-parent-'));
     const outside = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-'));
     // `.claude` is a real symlink to a directory outside the project root.
@@ -1115,9 +1138,12 @@ describe('runInstall — default AgentFs (real disk)', () => {
     expect((thrown as CLIError).exitCode).toBe(5);
     // Nothing was created through the symlink, outside --dir.
     expect(existsSync(path.join(outside, 'skills'))).toBe(false);
-  });
+    },
+  );
 
-  it('refuses to overwrite a symlinked target file (real disk) with --force — exit 5', async () => {
+  it.skipIf(!symlinkCapable)(
+    'refuses to overwrite a symlinked target file (real disk) with --force — exit 5',
+    async () => {
     const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-target-'));
     const outsideDir = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-target-'));
     const { path: relPath } = renderForTarget('claude', 'testsprite-verify');
@@ -1153,7 +1179,8 @@ describe('runInstall — default AgentFs (real disk)', () => {
     expect((thrown as CLIError).exitCode).toBe(5);
     // The outside file was NOT overwritten (nor clobbered via the .bak path).
     expect(readFileSync(outsideFile, 'utf8')).toBe('SECRET');
-  });
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

@@ -7,8 +7,9 @@
  * and runs `auth whoami` against the mock."
  */
 
-import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, statSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { execNpm } from './helpers/execNpm.js';
+import { existsSync, mkdtempSync, statSync, unlinkSync } from 'node:fs';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -37,7 +38,7 @@ beforeAll(async () => {
   // existsSync skip we used to do here let `dist` rot under
   // refactors and gave false-green on `project list` once
   // already.
-  execFileSync('npm', ['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
+  execNpm(['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
   server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const url = req.url ?? '/';
     if (url.startsWith('/api/cli/v1/projects/')) {
@@ -358,13 +359,18 @@ interface SpawnResult {
   stderr: string;
 }
 
+function isolatedHomeEnv(): Record<string, string> {
+  // Windows `os.homedir()` reads USERPROFILE, not HOME.
+  return { HOME: tmpHome, USERPROFILE: tmpHome };
+}
+
 function runCli(args: string[], envOverrides: Record<string, string> = {}): Promise<SpawnResult> {
   return new Promise((resolveResult, rejectResult) => {
     const child = spawn('node', [BIN_PATH, ...args], {
       cwd: REPO_ROOT,
       env: {
         ...process.env,
-        HOME: tmpHome,
+        ...isolatedHomeEnv(),
         TESTSPRITE_API_KEY: undefined,
         TESTSPRITE_API_URL: undefined,
         ...envOverrides,
@@ -897,7 +903,9 @@ describe('setup --from-env subprocess', () => {
     expect(result.exitCode).toBe(0);
     const credentialsPath = join(tmpHome, '.testsprite', 'credentials');
     expect(existsSync(credentialsPath)).toBe(true);
-    expect(statSync(credentialsPath).mode & 0o777).toBe(0o600);
+    if (process.platform !== 'win32') {
+      expect(statSync(credentialsPath).mode & 0o777).toBe(0o600);
+    }
   }, 30_000);
 
   it('exits 5 with VALIDATION_ERROR when --from-env is set without TESTSPRITE_API_KEY', async () => {
@@ -1044,7 +1052,7 @@ describe('--dry-run subprocess smoke', () => {
     // skipped the prompt.
     const credPath = join(tmpHome, '.testsprite', 'credentials');
     // Make sure any previous test didn't leave one behind.
-    if (existsSync(credPath)) execFileSync('rm', [credPath]);
+    if (existsSync(credPath)) unlinkSync(credPath);
     const result = await runCli(['setup', '--dry-run', '--no-agent', '--output', 'json']);
     expect(result.exitCode).toBe(0);
     expect(existsSync(credPath)).toBe(false);

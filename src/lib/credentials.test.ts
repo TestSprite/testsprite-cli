@@ -1,5 +1,5 @@
 import { mkdtempSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
@@ -135,12 +135,16 @@ describe('readCredentialsFile / readProfile', () => {
   });
 });
 
+const isWin = process.platform === 'win32';
+
 describe('writeProfile', () => {
   it('creates the file with mode 0600 and writes the profile', () => {
     writeProfile(DEFAULT_PROFILE, { apiKey: 'sk-new' }, { path: credentialsPath });
     expect(existsSync(credentialsPath)).toBe(true);
-    const mode = statSync(credentialsPath).mode & 0o777;
-    expect(mode).toBe(0o600);
+    if (!isWin) {
+      const mode = statSync(credentialsPath).mode & 0o777;
+      expect(mode).toBe(0o600);
+    }
     expect(readProfile(DEFAULT_PROFILE, { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
   });
 
@@ -188,7 +192,7 @@ describe('ensureRestrictiveMode', () => {
     expect(() => ensureRestrictiveMode(credentialsPath)).not.toThrow();
   });
 
-  it('downgrades over-permissive modes', () => {
+  it.skipIf(isWin)('downgrades over-permissive modes', () => {
     mkdirSync(tmpRoot, { recursive: true });
     writeFileSync(credentialsPath, 'data', { mode: 0o644 });
     ensureRestrictiveMode(credentialsPath);
@@ -199,7 +203,7 @@ describe('ensureRestrictiveMode', () => {
 
 describe('defaultCredentialsPath', () => {
   it('points at ~/.testsprite/credentials', () => {
-    expect(defaultCredentialsPath().endsWith('/.testsprite/credentials')).toBe(true);
+    expect(defaultCredentialsPath()).toBe(join(homedir(), '.testsprite', 'credentials'));
   });
 });
 

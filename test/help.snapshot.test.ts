@@ -10,6 +10,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { execNpm } from './helpers/execNpm.js';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { beforeAll, describe, expect, it } from 'vitest';
@@ -46,7 +47,7 @@ const cases: Array<[string, string[]]> = [
 
 describe('--help snapshots', () => {
   beforeAll(() => {
-    execFileSync('npm', ['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
+    execNpm(['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
   });
 
   for (const [name, args] of cases) {

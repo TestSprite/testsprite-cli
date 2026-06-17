@@ -313,6 +313,17 @@ export function applyFailedOnly(ctx: CliFailureContext): CliFailureContext {
  * its `.tmp` child — `writeBundle` mkdir's after the integrity check
  * passes so a forged response never modifies the operator's filesystem.
  */
+function stripTrailingSeparators(rawPath: string): string {
+  if (rawPath.length <= 1) return rawPath;
+  let end = rawPath.length;
+  while (end > 1 && (rawPath[end - 1] === '/' || rawPath[end - 1] === '\\')) {
+    // Preserve Windows drive roots (e.g. `C:\`).
+    if (end === 3 && rawPath[1] === ':' && /[A-Za-z]/.test(rawPath[0]!)) break;
+    end--;
+  }
+  return rawPath.slice(0, end);
+}
+
 export function resolveBundleDir(rawPath: string): string {
   if (typeof rawPath !== 'string' || rawPath.length === 0) {
     throw ApiError.fromEnvelope({
@@ -325,7 +336,7 @@ export function resolveBundleDir(rawPath: string): string {
       },
     });
   }
-  const trimmed = rawPath.endsWith('/') ? rawPath.slice(0, -1) : rawPath;
+  const trimmed = stripTrailingSeparators(rawPath);
   return isAbsolute(trimmed) ? trimmed : resolve(process.cwd(), trimmed);
 }
 

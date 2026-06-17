@@ -41,7 +41,7 @@ function parseFrontmatterDescription(content: string): string | undefined {
       }
     }
     if (inFrontmatter && line.startsWith('description: ')) {
-      return line.slice('description: '.length);
+      return line.slice('description: '.length).replace(/\r$/, '');
     }
   }
   return undefined;
