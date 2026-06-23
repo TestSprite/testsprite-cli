@@ -51,6 +51,7 @@ import type {
   RerunResponse,
   BatchRerunResponse,
   BatchRerunAccepted,
+  BatchRerunClosureByProject,
   RerunClosureMember,
   ListRunsResponse,
   RunHistoryItem,
@@ -1699,6 +1700,65 @@ const MAX_BATCH_BODY_BYTES = 5 * 1024 * 1024;
  * than this, the CLI splits into chunks and aggregates the results.
  */
 const MAX_BATCH_RERUN_IDS = 50;
+
+/**
+ * Drop duplicate `testId` entries from a chunked batch-rerun's aggregated
+ * `accepted[]`, keeping the first occurrence. BE producer/teardown closure
+ * dedup happens per-request server-side, not across the separate requests
+ * one chunk per `MAX_BATCH_RERUN_IDS` window produces, so the same producer
+ * can come back accepted (with a different runId) from more than one
+ * chunk. Returns the deduped list plus how many entries were dropped, so
+ * the caller can warn the operator that a shared BE producer/teardown was
+ * triggered more than once.
+ */
+function dedupeBatchRerunAccepted(entries: BatchRerunAccepted[]): {
+  deduped: BatchRerunAccepted[];
+  droppedCount: number;
+} {
+  const seen = new Map<string, BatchRerunAccepted>();
+  let droppedCount = 0;
+  for (const entry of entries) {
+    if (seen.has(entry.testId)) {
+      droppedCount++;
+      continue;
+    }
+    seen.set(entry.testId, entry);
+  }
+  return { deduped: [...seen.values()], droppedCount };
+}
+
+/**
+ * Merge per-project closure summaries from multiple batch-rerun chunk
+ * responses, combining entries that share a `projectId` rather than
+ * leaving one entry per chunk. `testIds` / `addedProducers` /
+ * `addedTeardowns` are unioned (a producer present in two chunks' entries
+ * for the same project, the closure-dedup race this fixes, must not be
+ * counted twice); `clearedCaptured` is summed, each chunk's expansion is a
+ * disjoint operation so its count is additive.
+ */
+function mergeBatchRerunClosureByProject(
+  entries: BatchRerunClosureByProject[],
+): BatchRerunClosureByProject[] {
+  const byProject = new Map<string, BatchRerunClosureByProject>();
+  for (const entry of entries) {
+    const existing = byProject.get(entry.projectId);
+    if (!existing) {
+      byProject.set(entry.projectId, {
+        projectId: entry.projectId,
+        testIds: [...new Set(entry.testIds)],
+        addedProducers: [...new Set(entry.addedProducers)],
+        addedTeardowns: [...new Set(entry.addedTeardowns)],
+        clearedCaptured: entry.clearedCaptured,
+      });
+      continue;
+    }
+    existing.testIds = [...new Set([...existing.testIds, ...entry.testIds])];
+    existing.addedProducers = [...new Set([...existing.addedProducers, ...entry.addedProducers])];
+    existing.addedTeardowns = [...new Set([...existing.addedTeardowns, ...entry.addedTeardowns])];
+    existing.clearedCaptured += entry.clearedCaptured;
+  }
+  return [...byProject.values()];
+}
 
 /**
  * Default max in-flight run-triggers for `create-batch --run`.
@@ -6147,20 +6207,28 @@ export async function runTestRerun(
 
   let chunkResponses: BatchRerunResponse[];
   try {
-    chunkResponses = await Promise.all(
-      chunks.map((chunk, idx) => {
-        const chunkKey = chunks.length === 1 ? idempotencyKey : `${idempotencyKey}:chunk${idx}`;
-        return client.triggerBatchRerun(
-          {
-            source: 'cli',
-            testIds: chunk,
-            ...(effectiveAutoHeal ? { autoHeal: true } : {}),
-            ...(opts.skipDependencies ? { skipDependencies: true } : {}),
-          },
-          { idempotencyKey: chunkKey },
-        );
-      }),
-    );
+    // Dispatch chunks one at a time, NOT via Promise.all. BE producer/
+    // teardown closure dedup happens per-request, server-side. Two chunks
+    // that share a project's producer fired concurrently can each decide
+    // independently "this producer hasn't been added yet" and both trigger
+    // it, double-running the producer. Sequential dispatch closes that
+    // race: by the time chunk N is sent, chunk N-1's trigger has already
+    // landed server-side for it to dedup against.
+    chunkResponses = [];
+    for (let idx = 0; idx < chunks.length; idx++) {
+      const chunk = chunks[idx]!;
+      const chunkKey = chunks.length === 1 ? idempotencyKey : `${idempotencyKey}:chunk${idx}`;
+      const chunkResp = await client.triggerBatchRerun(
+        {
+          source: 'cli',
+          testIds: chunk,
+          ...(effectiveAutoHeal ? { autoHeal: true } : {}),
+          ...(opts.skipDependencies ? { skipDependencies: true } : {}),
+        },
+        { idempotencyKey: chunkKey },
+      );
+      chunkResponses.push(chunkResp);
+    }
   } catch (err) {
     // D2 (dogfood): the batch endpoint rejects the WHOLE request when any id is
     // unresolvable (unknown, cross-tenant, or never ran cleanly), so one bad id
@@ -6183,12 +6251,24 @@ export async function runTestRerun(
   }
 
   // Aggregate chunk responses into a single synthetic BatchRerunResponse.
+  // `accepted` is deduped by testId (defense in depth: even with sequential
+  // dispatch above, a shared producer/teardown should never be reported, or
+  // polled under --wait, more than once) and `closure.byProject` entries
+  // sharing a projectId are merged rather than left as separate per-chunk
+  // entries.
+  const { deduped: dedupedAccepted, droppedCount: duplicateAcceptedCount } =
+    dedupeBatchRerunAccepted(chunkResponses.flatMap(r => r.accepted));
+  if (duplicateAcceptedCount > 0) {
+    stderrFn(
+      `[warn] ${duplicateAcceptedCount} test${duplicateAcceptedCount !== 1 ? 's were' : ' was'} triggered more than once across chunked batch-rerun requests (shared BE producer/teardown); kept the first run, ignored the rest.`,
+    );
+  }
   const batchResp: BatchRerunResponse = {
-    accepted: chunkResponses.flatMap(r => r.accepted),
+    accepted: dedupedAccepted,
     deferred: chunkResponses.flatMap(r => r.deferred),
     conflicts: chunkResponses.flatMap(r => r.conflicts),
     closure: {
-      byProject: chunkResponses.flatMap(r => r.closure.byProject),
+      byProject: mergeBatchRerunClosureByProject(chunkResponses.flatMap(r => r.closure.byProject)),
     },
     notFound: chunkResponses.flatMap(r => r.notFound ?? []),
   };
@@ -6284,32 +6364,36 @@ export async function runTestRerun(
 
       let retryChunkResponses: BatchRerunResponse[];
       try {
-        retryChunkResponses = await Promise.all(
-          retryChunks.map((chunk, idx) => {
-            // [P2] Bound the derived key to ≤256 chars. Caller-supplied keys may
-            // be up to 256 chars; appending the suffix could exceed the server
-            // limit and cause every retry to be rejected. Truncate the base key
-            // to leave room for the longest possible suffix before concatenating.
-            const retrySuffix =
-              retryChunks.length === 1
-                ? `:deferred-retry${attempt}`
-                : `:deferred-retry${attempt}:chunk${idx}`;
-            const retryBase =
-              idempotencyKey.length + retrySuffix.length > 256
-                ? idempotencyKey.slice(0, 256 - retrySuffix.length)
-                : idempotencyKey;
-            const retryKey = `${retryBase}${retrySuffix}`;
-            return client.triggerBatchRerun(
-              {
-                source: 'cli',
-                testIds: chunk,
-                ...(effectiveAutoHeal ? { autoHeal: true } : {}),
-                ...(opts.skipDependencies ? { skipDependencies: true } : {}),
-              },
-              { idempotencyKey: retryKey },
-            );
-          }),
-        );
+        // Sequential, same reason as the initial dispatch above: concurrent
+        // chunks racing on per-request server-side closure dedup can
+        // double-trigger a shared BE producer/teardown.
+        retryChunkResponses = [];
+        for (let idx = 0; idx < retryChunks.length; idx++) {
+          const chunk = retryChunks[idx]!;
+          // [P2] Bound the derived key to ≤256 chars. Caller-supplied keys may
+          // be up to 256 chars; appending the suffix could exceed the server
+          // limit and cause every retry to be rejected. Truncate the base key
+          // to leave room for the longest possible suffix before concatenating.
+          const retrySuffix =
+            retryChunks.length === 1
+              ? `:deferred-retry${attempt}`
+              : `:deferred-retry${attempt}:chunk${idx}`;
+          const retryBase =
+            idempotencyKey.length + retrySuffix.length > 256
+              ? idempotencyKey.slice(0, 256 - retrySuffix.length)
+              : idempotencyKey;
+          const retryKey = `${retryBase}${retrySuffix}`;
+          const retryChunkResp = await client.triggerBatchRerun(
+            {
+              source: 'cli',
+              testIds: chunk,
+              ...(effectiveAutoHeal ? { autoHeal: true } : {}),
+              ...(opts.skipDependencies ? { skipDependencies: true } : {}),
+            },
+            { idempotencyKey: retryKey },
+          );
+          retryChunkResponses.push(retryChunkResp);
+        }
       } catch (err) {
         stderrFn(
           `[deferred-retry] attempt ${attempt} failed with error: ${err instanceof Error ? err.message : String(err)}`,
@@ -6317,7 +6401,8 @@ export async function runTestRerun(
         break;
       }
 
-      const newlyAccepted = retryChunkResponses.flatMap(r => r.accepted);
+      const { deduped: newlyAccepted, droppedCount: newlyDuplicateCount } =
+        dedupeBatchRerunAccepted(retryChunkResponses.flatMap(r => r.accepted));
       const newlyDeferred = retryChunkResponses.flatMap(r => r.deferred);
       const newlyConflicted = retryChunkResponses.flatMap(r => r.conflicts);
       // [P2] Collect notFound[] from the retry response. A deferred test may be
@@ -6326,11 +6411,16 @@ export async function runTestRerun(
       // reported as "resolved" in the final output.
       const newlyNotFound = retryChunkResponses.flatMap(r => r.notFound ?? []);
 
+      if (newlyDuplicateCount > 0) {
+        stderrFn(
+          `[warn] ${newlyDuplicateCount} test${newlyDuplicateCount !== 1 ? 's were' : ' was'} triggered more than once across deferred-retry chunked requests (shared BE producer/teardown); kept the first run, ignored the rest.`,
+        );
+      }
       if (newlyAccepted.length > 0) {
         stderrFn(
           `[deferred-retry] attempt ${attempt}: ${newlyAccepted.length} test${newlyAccepted.length !== 1 ? 's' : ''} now accepted.`,
         );
-        accepted = accepted.concat(newlyAccepted);
+        accepted = dedupeBatchRerunAccepted(accepted.concat(newlyAccepted)).deduped;
       }
       if (newlyConflicted.length > 0) {
         // [P1] Merge retry-returned conflicts into the running conflicts collection
