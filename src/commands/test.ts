@@ -1,6 +1,6 @@
 import { createWriteStream, readFileSync, readdirSync, statSync, type WriteStream } from 'node:fs';
-import { stat } from 'node:fs/promises';
-import { dirname, extname, isAbsolute, join, resolve } from 'node:path';
+import { rename, stat, unlink } from 'node:fs/promises';
+import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Command } from 'commander';
 import {
@@ -3182,11 +3182,14 @@ interface CodeGetOptions extends CommonOptions {
  * directly; presigned URLs are dereferenced via the same fetch impl
  * (without API-key headers — the URL is the bearer of authority).
  *
- * `--out <path>` redirects the same bytes into a file. We open the file
- * before issuing the network request so a permission/dir error fails
- * fast (exit 5 / VALIDATION_ERROR) without spending an API call. On
- * any error after open we tear down the sink so we don't leak a
- * half-written artifact.
+ * `--out <path>` redirects the same bytes into a file. We validate the
+ * path and open a sibling temp file before issuing the network request
+ * so a permission/dir error fails fast (exit 5 / VALIDATION_ERROR)
+ * without spending an API call. The temp file is renamed onto the real
+ * `--out` path only after a successful, complete write; on any error
+ * (or the "no code generated yet" branch, which writes nothing) the
+ * temp file is discarded and the user's pre-existing `--out` file, if
+ * any, is left untouched.
  */
 export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Promise<CliTestCode> {
   // Dry-run: no fetch, no fs. Print the canned shape to stdout and, if
@@ -3217,9 +3220,11 @@ export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Pro
 
   try {
     const code = await client.get<CliTestCode>(`/tests/${encodeURIComponent(opts.testId)}/code`);
+    let wroteContent = false;
 
     if (opts.output === 'json') {
       out.print(code);
+      wroteContent = true;
     } else if (isPresignedCodeUrl(code.code)) {
       // Text mode: dump the source body. JSON consumers want the wire
       // shape; humans (and agents shelling out via `> file.ts`) want
@@ -3230,20 +3235,24 @@ export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Pro
       // or a piped `gzip`) pauses the upstream reader rather than
       // letting chunks accumulate in V8's heap.
       await streamPresignedBody(code.code, out, deps);
+      wroteContent = true;
     } else if (code.code === '' || code.code === null) {
       // P2-10: draft test with no code yet — empty body would produce
       // silent empty stdout. Print a friendly hint to stderr instead so
-      // the operator knows what happened, and keep exit 0.
+      // the operator knows what happened, and keep exit 0. Nothing was
+      // written, so the temp file is discarded below without touching
+      // a pre-existing `--out` file.
       const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
       stderrFn('(no code generated yet — run the test first)');
     } else {
       await out.writeChunk(code.code);
+      wroteContent = true;
     }
 
-    if (fileSink) await closeOutputFile(fileSink);
+    if (fileSink) await closeOutputFile(fileSink, wroteContent);
     return code;
   } catch (err) {
-    if (fileSink) await closeOutputFile(fileSink).catch(() => undefined);
+    if (fileSink) await closeOutputFile(fileSink, false).catch(() => undefined);
     throw err;
   }
 }
@@ -7746,22 +7755,29 @@ function makeOutput(mode: OutputMode, deps: TestDeps): Output {
  * Internal handle for `--out <path>` writes. Wraps a Node WriteStream
  * with a tracked `error` field so `closeOutputFile` can re-raise an
  * async stream error (EACCES on a write, ENOSPC mid-stream, etc.) that
- * was emitted between writes.
+ * was emitted between writes. The stream writes to `tmpPath`, a sibling
+ * of the real `path`; `closeOutputFile` renames it into place only on
+ * a successful, complete write, so a forged or failed response never
+ * modifies (or empties) the operator's pre-existing `--out` file.
  */
 interface FileSink {
   readonly stream: WriteStream;
   readonly path: string;
+  readonly tmpPath: string;
   error: Error | null;
 }
 
 /**
- * Open the `--out` target before any network I/O so a permission/dir
- * error fails fast. Synchronous open via `createWriteStream` doesn't
- * actually open the descriptor until first write, so we don't surface
- * EACCES/ENOENT here — instead the stream emits `'error'`, which we
- * remember on the sink and re-throw at close time. The benefit of
- * opening early is still real: invalid path strings (empty, `/dev/null`
- * on a sandboxed fs, etc.) are caught before the API request goes out.
+ * Open a temp file next to the `--out` target before any network I/O so
+ * a permission/dir error fails fast. Synchronous open via
+ * `createWriteStream` doesn't actually open the descriptor until first
+ * write, so we don't surface EACCES/ENOENT here, instead the stream
+ * emits `'error'`, which we remember on the sink and re-throw at close
+ * time. The benefit of opening early is still real: invalid path
+ * strings (empty, `/dev/null` on a sandboxed fs, etc.) are caught
+ * before the API request goes out. Writing to a temp path rather than
+ * `resolved` directly means the real `--out` file is never truncated
+ * up front, see `closeOutputFile` for the commit step.
  */
 function openOutputFile(rawPath: string): FileSink {
   if (typeof rawPath !== 'string' || rawPath.length === 0) {
@@ -7790,8 +7806,9 @@ function openOutputFile(rawPath: string): FileSink {
   if (!parentStat.isDirectory()) {
     throw localValidationError('out', `parent path is not a directory: ${parent}`);
   }
-  const stream = createWriteStream(resolved, { encoding: 'utf8' });
-  const sink: FileSink = { stream, path: resolved, error: null };
+  const tmpPath = join(parent, `.${basename(resolved)}.tmp-${randomUUID()}`);
+  const stream = createWriteStream(tmpPath, { encoding: 'utf8' });
+  const sink: FileSink = { stream, path: resolved, tmpPath, error: null };
   stream.on('error', err => {
     sink.error = err instanceof Error ? err : new Error(String(err));
   });
@@ -7821,25 +7838,37 @@ function makeFileOutput(mode: OutputMode, sink: FileSink): Output {
 }
 
 /**
- * Flush + close the file sink. Called on the success path after the
- * last write and on the error path inside a `.catch(() => undefined)`
- * so the original error isn't masked by a teardown failure.
+ * Flush + close the file sink, then either commit or discard the temp
+ * file. Called on the success path after the last write (`commit:
+ * true` when content was actually written) and on the error / "no code
+ * yet" paths (`commit: false`) inside a `.catch(() => undefined)` so a
+ * teardown failure doesn't mask the original error.
+ *
+ * `commit: true` renames `tmpPath` onto the real `--out` path, the
+ * only point at which the operator's file is touched. `commit: false`
+ * discards the temp file and leaves any pre-existing `--out` file
+ * exactly as it was, this is what prevents a failed/empty response
+ * from silently truncating the operator's filesystem (mirrors the
+ * atomic-rename contract `bundle.ts` uses for multi-file bundles).
  *
  * Re-raises any async stream error captured by the `'error'` listener.
  * Without this re-raise, an EACCES on first write would leave a
- * zero-byte file behind and exit 0 — a false-success surface that is
- * exactly the failure mode `--out` exists to avoid.
+ * zero-byte temp file behind and exit 0, a false-success surface that
+ * is exactly the failure mode `--out` exists to avoid.
  */
-function closeOutputFile(sink: FileSink): Promise<void> {
-  return new Promise((resolve, reject) => {
-    sink.stream.end(() => {
-      if (sink.error) {
-        reject(new TransportError(`Failed to write --out ${sink.path}: ${sink.error.message}`));
-        return;
-      }
-      resolve();
-    });
+async function closeOutputFile(sink: FileSink, commit: boolean): Promise<void> {
+  await new Promise<void>(resolveStream => {
+    sink.stream.end(() => resolveStream());
   });
+  if (sink.error) {
+    await unlink(sink.tmpPath).catch(() => undefined);
+    throw new TransportError(`Failed to write --out ${sink.path}: ${sink.error.message}`);
+  }
+  if (!commit) {
+    await unlink(sink.tmpPath).catch(() => undefined);
+    return;
+  }
+  await rename(sink.tmpPath, sink.path);
 }
 
 /** A presigned `code` body is any `https://` URL — never anything else. */

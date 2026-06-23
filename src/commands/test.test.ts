@@ -1,4 +1,11 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -1555,6 +1562,46 @@ describe('runCodeGet', () => {
         { credentialsPath, fetchImpl },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  // Regression: --out used to open (truncate) the destination file
+  // before the network request. A failed fetch left a pre-existing
+  // file emptied. The fix writes to a sibling temp file and renames it
+  // into place only on success, so a failure must never touch the
+  // operator's existing --out file.
+  it('--out: a failed fetch leaves a pre-existing file untouched, not truncated', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-out-fail-'));
+    const target = join(dir, 'existing.ts');
+    writeFileSync(target, 'PRE-EXISTING CONTENT', 'utf8');
+    const fetchImpl = (() => Promise.reject(new Error('ENETUNREACH'))) as typeof globalThis.fetch;
+    await expect(
+      runCodeGet(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_fe', out: target },
+        { credentialsPath, fetchImpl },
+      ),
+    ).rejects.toBeDefined();
+    expect(readFileSync(target, 'utf-8')).toBe('PRE-EXISTING CONTENT');
+    // No leftover temp file in the directory.
+    const leftovers = readdirSync(dir).filter(f => f !== 'existing.ts');
+    expect(leftovers).toEqual([]);
+  });
+
+  // Regression: the "no code generated yet" branch writes nothing but
+  // previously still closed (and thus truncated) the opened file.
+  it('--out: "no code generated yet" leaves a pre-existing file untouched', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-out-empty-'));
+    const target = join(dir, 'existing.ts');
+    writeFileSync(target, 'PRE-EXISTING CONTENT', 'utf8');
+    const fetchImpl = makeFetch(() => ({ body: { ...TEST_CODE_INLINE, code: '' } }));
+    await runCodeGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe', out: target },
+      { credentialsPath, fetchImpl, stderr: () => undefined },
+    );
+    expect(readFileSync(target, 'utf-8')).toBe('PRE-EXISTING CONTENT');
+    const leftovers = readdirSync(dir).filter(f => f !== 'existing.ts');
+    expect(leftovers).toEqual([]);
   });
 });
 
