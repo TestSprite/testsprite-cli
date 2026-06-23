@@ -426,12 +426,13 @@ These apply to every command:
 
 ### Environment variables
 
-| Variable                        | Purpose                                                                           |
-| ------------------------------- | --------------------------------------------------------------------------------- |
-| `TESTSPRITE_API_KEY`            | API key — overrides the credentials file                                          |
-| `TESTSPRITE_API_URL`            | API endpoint — overrides the credentials file                                     |
-| `TESTSPRITE_PROFILE`            | Active profile (below `--profile`, above `default`)                               |
-| `TESTSPRITE_REQUEST_TIMEOUT_MS` | Per-request timeout in **milliseconds** (default `120000`, range `1000`–`600000`) |
+| Variable                        | Purpose                                                                                 |
+| ------------------------------- | --------------------------------------------------------------------------------------- |
+| `TESTSPRITE_API_KEY`            | API key — overrides the credentials file                                                |
+| `TESTSPRITE_API_URL`            | API endpoint — overrides the credentials file                                           |
+| `TESTSPRITE_PROFILE`            | Active profile (below `--profile`, above `default`)                                     |
+| `TESTSPRITE_REQUEST_TIMEOUT_MS` | Per-request timeout in **milliseconds** (default `120000`, range `1000`–`600000`)       |
+| `NO_COLOR`                      | Suppress ANSI escape sequences in ticker output ([no-color.org](https://no-color.org/)) |
 
 ### Scopes
 
