@@ -191,3 +191,18 @@ Pull requests target the `dev` branch. The full guide — build from source, tes
 ## License
 
 [Apache-2.0](./LICENSE) © TestSprite
+
+## Useful Commands
+
+Here is a list of commonly used commands to help you get started quickly with the TestSprite CLI:
+
+| Command                                    | Description                                           |
+|--------------------------------------------|-------------------------------------------------------|
+| `testsprite setup`                         | Configure your API key and install the verification-loop skill in one command. |
+| `testsprite test create --plan-from <file>` | Create a new test from a plan file.                  |
+| `testsprite test run <test-id>`           | Trigger a run for a specific test.                    |
+| `testsprite test rerun <test-id>`         | Replay a previously run test.                          |
+| `testsprite project list`                  | List all projects associated with your API key.       |
+| `testsprite auth status`                   | Check the status of your authentication.              |
+
+Feel free to explore more commands in the [full command reference](./DOCUMENTATION.md).
