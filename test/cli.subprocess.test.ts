@@ -499,6 +499,59 @@ describe('project list subprocess', () => {
   }, 30_000);
 });
 
+describe('--output json honors the JSON contract for argument-parse errors too', () => {
+  // Previously Commander parse errors (unknown command/option, missing
+  // argument) printed plain text even under --output json, so a machine
+  // consumer that JSON.parse()'d stderr crashed on a malformed invocation.
+  // Now every error path emits a structured envelope.
+
+  it('unknown command emits a JSON VALIDATION_ERROR envelope (exit 5)', async () => {
+    const result = await runCli(['--output', 'json', 'frobnicate'], {});
+    expect(result.exitCode).toBe(5);
+    const parsed = JSON.parse(result.stderr) as {
+      error: { code: string; message: string; details: { commanderCode: string } };
+    };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error.message).toContain('frobnicate');
+    expect(parsed.error.details.commanderCode).toBe('commander.unknownCommand');
+  }, 30_000);
+
+  it('unknown option on a subcommand emits JSON (deep config, not just the root)', async () => {
+    const result = await runCli(['--output', 'json', 'project', 'list', '--bogus'], {});
+    expect(result.exitCode).toBe(5);
+    const parsed = JSON.parse(result.stderr) as { error: { code: string } };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+  }, 30_000);
+
+  it('missing required argument on a nested subcommand emits JSON', async () => {
+    const result = await runCli(['--output', 'json', 'test', 'code', 'get'], {});
+    expect(result.exitCode).toBe(5);
+    const parsed = JSON.parse(result.stderr) as { error: { message: string } };
+    expect(parsed.error.message).toContain('test-id');
+  }, 30_000);
+
+  it('resolves --output even when it follows the failing token', async () => {
+    // The mode is scanned from argv, so json applies even though Commander
+    // errors on the unknown command before it would bind the global flag.
+    const result = await runCli(['frobnicate', '--output', 'json'], {});
+    expect(result.exitCode).toBe(5);
+    expect(() => JSON.parse(result.stderr)).not.toThrow();
+  }, 30_000);
+
+  it('text mode (no --output) still prints the plain-text parse error', async () => {
+    const result = await runCli(['frobnicate'], {});
+    expect(result.exitCode).toBe(5);
+    expect(result.stderr).toContain("unknown command 'frobnicate'");
+    expect(result.stderr.trimStart().startsWith('{')).toBe(false);
+  }, 30_000);
+
+  it('--help still exits 0 with human-readable text under --output json', async () => {
+    const result = await runCli(['--output', 'json', '--help'], {});
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('Usage: testsprite');
+  }, 30_000);
+});
+
 describe('project get subprocess', () => {
   it('--output json returns the §6.1 Project shape', async () => {
     const result = await runCli(['--output', 'json', 'project', 'get', 'project_subproc'], {

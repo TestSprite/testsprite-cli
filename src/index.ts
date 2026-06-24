@@ -11,7 +11,7 @@ import { createProjectCommand } from './commands/project.js';
 import { createTestCommand } from './commands/test.js';
 import { createUsageCommand } from './commands/usage.js';
 import { ApiError, CLIError, RequestTimeoutError } from './lib/errors.js';
-import { Output, isOutputMode } from './lib/output.js';
+import { Output, isOutputMode, type OutputMode } from './lib/output.js';
 import { rephraseUnknownOption } from './lib/render-error.js';
 import { maybeEmitSkillNudge } from './lib/skill-nudge.js';
 import { VERSION } from './version.js';
@@ -91,12 +91,49 @@ function applyExitOverrideDeep(cmd: Command): void {
 }
 applyExitOverrideDeep(program);
 
-program.configureOutput({
-  outputError(str, write) {
-    const rephrased = rephraseUnknownOption(str);
-    write(rephrased !== null ? `${rephrased}\n` : str);
-  },
-});
+/**
+ * Resolve the requested `--output` mode directly from argv.
+ *
+ * We cannot rely on `program.opts()` for this: a parse error can be thrown
+ * before Commander binds the global `--output` option (e.g. an unknown command,
+ * or `--output` placed after the failing token), yet the error renderer below
+ * runs at exactly that point. Scanning argv is order-independent and always
+ * reflects what the caller asked for.
+ */
+function outputModeFromArgv(argv: readonly string[]): OutputMode {
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--') break; // end-of-options marker
+    if (a === '--output') return isOutputMode(argv[i + 1]) ? (argv[i + 1] as OutputMode) : 'text';
+    if (a?.startsWith('--output=')) {
+      const v = a.slice('--output='.length);
+      return isOutputMode(v) ? v : 'text';
+    }
+  }
+  return 'text';
+}
+const requestedMode = outputModeFromArgv(process.argv.slice(2));
+
+// Commander writes parse errors (unknown option/command, missing argument,
+// excess arguments) via `outputError` BEFORE throwing the CommanderError our
+// catch block sees. In `--output json` mode we suppress that plain-text write
+// and let the catch emit a JSON envelope instead, so EVERY error path honors
+// the JSON contract a machine consumer relies on. Text mode keeps the friendly
+// rephrasing. Applied to every command in the tree because subcommands do not
+// inherit the root's output configuration.
+function configureErrorOutput(cmd: Command): void {
+  cmd.configureOutput({
+    outputError(str, write) {
+      if (requestedMode === 'json') return; // the catch block emits a JSON envelope
+      const rephrased = rephraseUnknownOption(str);
+      write(rephrased !== null ? `${rephrased}\n` : str);
+    },
+  });
+  for (const child of cmd.commands) {
+    configureErrorOutput(child);
+  }
+}
+configureErrorOutput(program);
 
 /**
  * Render a leaf command's full path (group + leaf), e.g. `test run` /
@@ -212,6 +249,22 @@ try {
       err.code === 'commander.version'
     ) {
       process.exit(0);
+    }
+    // JSON mode: the plain-text write was suppressed in `configureErrorOutput`,
+    // so emit a structured envelope here. Parse errors are the VALIDATION_ERROR
+    // family (exit 5). `err.message` is the bare reason (e.g. "unknown option
+    // '--foo'"); strip any leading "error: " Commander may have prefixed.
+    if (requestedMode === 'json') {
+      const envelope = {
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: err.message.replace(/^error:\s*/i, ''),
+          nextAction: 'Run `testsprite --help`, or `testsprite <command> --help`, for usage.',
+          requestId: 'local',
+          details: { commanderCode: err.code },
+        },
+      };
+      process.stderr.write(`${JSON.stringify(envelope, null, 2)}\n`);
     }
     process.exit(5);
   }
