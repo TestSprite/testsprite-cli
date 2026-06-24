@@ -12,7 +12,7 @@ import { createTestCommand } from './commands/test.js';
 import { createUsageCommand } from './commands/usage.js';
 import { ApiError, CLIError, RequestTimeoutError } from './lib/errors.js';
 import { Output, isOutputMode } from './lib/output.js';
-import { rephraseUnknownOption } from './lib/render-error.js';
+import { renderCommanderError, rephraseUnknownOption } from './lib/render-error.js';
 import { maybeEmitSkillNudge } from './lib/skill-nudge.js';
 import { VERSION } from './version.js';
 
@@ -77,26 +77,31 @@ program.addCommand(createTestCommand());
 program.addCommand(createAgentCommand({}));
 program.addCommand(createUsageCommand());
 
-// Propagate exitOverride to every subcommand in the tree.
-// Commander's addCommand() does NOT inherit exitOverride from the parent,
-// so commands built externally (createTestCommand, createProjectCommand, …)
-// and attached via addCommand() still have _exitCallback = null and call
-// process.exit directly. Recursively set exitOverride so CommanderError
-// bubbles up to our catch block for every leaf subcommand.
+// Buffer Commander error messages instead of writing immediately. The catch
+// block re-emits in the correct format (JSON or text) once the requested
+// output mode is known. Safe because applyExitOverrideDeep ensures every
+// command throws CommanderError rather than calling process.exit directly.
+let pendingCommanderErrorMsg: string | null = null;
+
+// Propagate exitOverride AND the buffered outputError config to every
+// subcommand in the tree. Commander's addCommand() does NOT inherit either
+// from the parent, so commands built externally (createTestCommand, etc.) and
+// attached via addCommand() still have _exitCallback = null and a default
+// outputError that writes immediately. Both must be applied after the full
+// command tree is assembled so every leaf subcommand behaves consistently.
 function applyExitOverrideDeep(cmd: Command): void {
   cmd.exitOverride();
+  cmd.configureOutput({
+    outputError(str, _write) {
+      const rephrased = rephraseUnknownOption(str);
+      pendingCommanderErrorMsg = rephrased !== null ? `${rephrased}\n` : str;
+    },
+  });
   for (const child of cmd.commands) {
     applyExitOverrideDeep(child);
   }
 }
 applyExitOverrideDeep(program);
-
-program.configureOutput({
-  outputError(str, write) {
-    const rephrased = rephraseUnknownOption(str);
-    write(rephrased !== null ? `${rephrased}\n` : str);
-  },
-});
 
 /**
  * Render a leaf command's full path (group + leaf), e.g. `test run` /
@@ -192,9 +197,8 @@ try {
     process.exit(err.exitCode);
   }
   if (err instanceof CommanderError) {
-    // Commander already wrote the error message (via configureOutput) or the
-    // help/version text to stdout. Map exit codes per the CLI taxonomy:
-    //   help / version  → 0  (user asked for it — no error)
+    // Map exit codes per the CLI taxonomy:
+    //   help / version  → 0  (user asked for it; Commander already wrote the text)
     //   parse errors    → 5  (VALIDATION_ERROR family: missing arg, invalid
     //                         option, unknown command, etc.)
     //
@@ -213,6 +217,23 @@ try {
     ) {
       process.exit(0);
     }
+    // For parse errors, write the buffered message in the correct format.
+    // rawMode from program.opts() is reliable when --output was parsed before
+    // the error. When the error occurs first (e.g. `testsprite badcmd --output
+    // json`), rawMode is the default 'text'; scan argv as a best-effort
+    // fallback so machine consumers still receive a JSON envelope.
+    const commanderMode = (() => {
+      if (rawMode === 'json') return 'json' as const;
+      for (let i = 2; i < process.argv.length; i++) {
+        const arg = process.argv[i]!;
+        if (arg === '--output' && process.argv[i + 1] === 'json') return 'json' as const;
+        if (arg === '--output=json') return 'json' as const;
+      }
+      return mode;
+    })();
+    process.stderr.write(
+      renderCommanderError(pendingCommanderErrorMsg, err.message, commanderMode),
+    );
     process.exit(5);
   }
   if (err instanceof CLIError) {

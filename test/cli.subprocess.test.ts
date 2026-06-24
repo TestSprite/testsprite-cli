@@ -1110,4 +1110,64 @@ describe('[fix-5] Commander parse errors → exit 5; help/version → exit 0', (
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBeTruthy(); // version string on stdout
   }, 30_000);
+
+  it('--output json: missing required arg emits JSON VALIDATION_ERROR envelope, not plain text', async () => {
+    // `test result` requires a positional <test-id>. With --output json, the
+    // CommanderError must be rendered as a machine-readable JSON envelope so
+    // a coding agent parsing stderr does not receive an unexpected plain-text
+    // error and crash its JSON.parse.
+    const result = await runCli(['--output', 'json', 'test', 'result'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    let parsed: { error: { code: string; message: string; requestId: string } };
+    expect(() => {
+      parsed = JSON.parse(result.stderr) as typeof parsed;
+    }).not.toThrow();
+    expect(parsed!.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed!.error.requestId).toBe('local');
+    expect(parsed!.error.message).toBeTruthy();
+  }, 30_000);
+
+  it('--output json: unknown subcommand emits JSON envelope (--output before bad arg)', async () => {
+    // --output json appears before the unknown subcommand, so Commander parses
+    // it and program.opts().output is 'json' when the error fires.
+    const result = await runCli(['--output', 'json', 'test', 'not-a-real-subcommand'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    let parsed: { error: { code: string } };
+    expect(() => {
+      parsed = JSON.parse(result.stderr) as typeof parsed;
+    }).not.toThrow();
+    expect(parsed!.error.code).toBe('VALIDATION_ERROR');
+  }, 30_000);
+
+  it('--output json after bad arg: argv fallback detects json mode and emits envelope', async () => {
+    // The error fires before --output json is parsed, so program.opts().output
+    // is the default 'text'. The argv fallback scan must still detect json mode.
+    const result = await runCli(['test', 'not-a-real-subcommand', '--output', 'json'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    let parsed: { error: { code: string } };
+    expect(() => {
+      parsed = JSON.parse(result.stderr) as typeof parsed;
+    }).not.toThrow();
+    expect(parsed!.error.code).toBe('VALIDATION_ERROR');
+  }, 30_000);
+
+  it('text mode: Commander parse error still emits plain text (no regression)', async () => {
+    const result = await runCli(['test', 'result'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    // Must NOT be a JSON envelope in text mode.
+    expect(() => JSON.parse(result.stderr)).toThrow();
+    expect(result.stderr).toContain('test-id');
+  }, 30_000);
 });
