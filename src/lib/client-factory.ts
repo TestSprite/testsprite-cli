@@ -180,6 +180,43 @@ export function assertValidEndpointUrl(rawUrl: string): void {
   }
 }
 
+/**
+ * Parse the `--request-timeout <seconds>` flag value into milliseconds.
+ *
+ * Returns `undefined` when the flag was omitted (the factory then falls back to
+ * the `TESTSPRITE_REQUEST_TIMEOUT_MS` env var, else the 120s default).
+ *
+ * A supplied-but-invalid value (non-numeric, zero, or negative) throws a typed
+ * VALIDATION_ERROR (exit 5) rather than being silently dropped. An explicit
+ * `--request-timeout 30s` typo previously resolved to `undefined` and the
+ * command ran with the default 120s deadline — the operator believed they had
+ * set a timeout but had not, with no signal. Failing loudly here is consistent
+ * with every other validated flag (`--page-size`, `--output`, `--type`).
+ *
+ * Out-of-range but positive values are intentionally NOT rejected — they flow
+ * through to {@link resolveRequestTimeoutMs}, which clamps to
+ * `[REQUEST_TIMEOUT_MIN_MS, REQUEST_TIMEOUT_MAX_MS]`. The env-var path stays
+ * lenient by design (a stray global env var should not hard-fail every
+ * command); only the explicit per-invocation flag is strict.
+ *
+ * This single definition replaces five byte-identical copies that previously
+ * lived in `auth`, `project`, `usage`, `init`, and `test` — drift between them
+ * would have silently changed timeout behaviour depending on the command.
+ */
+export function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    // Surface the offending value in the message (same as assertValidEndpointUrl)
+    // so the operator sees exactly what they typed.
+    throw localValidationError(
+      'request-timeout',
+      `"${raw}" is not valid — must be a positive number of seconds`,
+    );
+  }
+  return Math.round(n * 1000); // seconds → milliseconds
+}
+
 export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}): HttpClient {
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const env = deps.env ?? process.env;

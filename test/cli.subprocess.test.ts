@@ -499,6 +499,24 @@ describe('project list subprocess', () => {
     const parsed = JSON.parse(result.stderr) as { error: { code: string } };
     expect(parsed.error.code).toBe('VALIDATION_ERROR');
   }, 30_000);
+
+  it('--request-timeout 30s exits 5 (VALIDATION_ERROR), not a silent fallback to 120s', async () => {
+    // Previously an invalid flag value resolved to `undefined` and the command
+    // silently ran with the default 120s deadline — the operator believed they
+    // had set a timeout but had not. Now the explicit flag is validated like
+    // every other flag.
+    const result = await runCli(
+      ['--output', 'json', '--request-timeout', '30s', 'project', 'list'],
+      {
+        TESTSPRITE_API_KEY: 'sk-subproc',
+        TESTSPRITE_API_URL: baseUrl,
+      },
+    );
+    expect(result.exitCode).toBe(5);
+    const parsed = JSON.parse(result.stderr) as { error: { code: string; nextAction: string } };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error.nextAction).toContain('request-timeout');
+  }, 30_000);
 });
 
 describe('malformed --endpoint-url is rejected (exit 5), not retried as a network error', () => {

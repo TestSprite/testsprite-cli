@@ -5,6 +5,7 @@ import {
   assertValidEndpointUrl,
   emitDryRunBanner,
   makeHttpClient,
+  parseRequestTimeoutFlag,
   resetDryRunBannerForTesting,
   resolveRequestTimeoutMs,
 } from './client-factory.js';
@@ -211,6 +212,45 @@ describe('resolveRequestTimeoutMs', () => {
   it('accepts a valid env var within range', () => {
     expect(resolveRequestTimeoutMs({}, { TESTSPRITE_REQUEST_TIMEOUT_MS: '5000' })).toBe(5_000);
   });
+});
+
+// ---------------------------------------------------------------------------
+// parseRequestTimeoutFlag — strict flag parsing (seconds → ms)
+// ---------------------------------------------------------------------------
+
+describe('parseRequestTimeoutFlag', () => {
+  it('returns undefined when the flag is omitted (factory falls back to env/default)', () => {
+    expect(parseRequestTimeoutFlag(undefined)).toBeUndefined();
+  });
+
+  it('converts a positive number of seconds to milliseconds', () => {
+    expect(parseRequestTimeoutFlag('30')).toBe(30_000);
+    expect(parseRequestTimeoutFlag('1')).toBe(1_000);
+    expect(parseRequestTimeoutFlag('2.5')).toBe(2_500);
+  });
+
+  it('does NOT reject positive out-of-range values — resolveRequestTimeoutMs clamps them', () => {
+    // 700s is above the 600s cap, but parsing succeeds; the clamp lives in
+    // resolveRequestTimeoutMs so a large script-supplied value still works.
+    expect(parseRequestTimeoutFlag('700')).toBe(700_000);
+  });
+
+  it.each(['abc', '30s', '0', '-5', 'NaN', 'Infinity', ''])(
+    'throws a VALIDATION_ERROR (exit 5) on the invalid flag value %j',
+    bad => {
+      let caught: unknown;
+      try {
+        parseRequestTimeoutFlag(bad);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(ApiError);
+      const apiErr = caught as ApiError;
+      expect(apiErr.code).toBe('VALIDATION_ERROR');
+      expect(apiErr.exitCode).toBe(5);
+      expect(apiErr.nextAction).toContain('request-timeout');
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

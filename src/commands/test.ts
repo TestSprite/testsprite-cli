@@ -6,6 +6,7 @@ import { Command } from 'commander';
 import {
   emitDryRunBanner,
   makeHttpClient,
+  parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import {
@@ -7819,18 +7820,6 @@ function resolveCommonOptions(command: Command): CommonOptions {
     verbose: globals.verbose ?? false,
     requestTimeoutMs: parseRequestTimeoutFlag(globals.requestTimeout),
   };
-}
-
-/**
- * Parse the `--request-timeout <seconds>` flag value into milliseconds.
- * Returns `undefined` when the flag was not supplied (factory falls back to
- * the env var / default). Silently clamps out-of-range values.
- */
-function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
-  if (raw === undefined) return undefined;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return undefined;
-  return Math.round(n * 1000); // seconds → milliseconds
 }
 
 /** D4: headroom added on top of `--timeout` when deriving the per-request window under `--wait`. */

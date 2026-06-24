@@ -11,7 +11,10 @@
  */
 
 import { Command } from 'commander';
-import type { CommonOptions as FactoryCommonOptions } from '../lib/client-factory.js';
+import {
+  parseRequestTimeoutFlag,
+  type CommonOptions as FactoryCommonOptions,
+} from '../lib/client-factory.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
 import { CLIError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT, Output } from '../lib/output.js';
@@ -431,13 +434,6 @@ function resolveCommonOptions(command: Command): CommonOptions {
     dryRun: globals.dryRun ?? false,
     requestTimeoutMs: parseRequestTimeoutFlag(globals.requestTimeout),
   };
-}
-
-function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
-  if (raw === undefined) return undefined;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return undefined;
-  return Math.round(n * 1000);
 }
 
 const SETUP_DESCRIPTION =
