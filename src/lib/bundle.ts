@@ -46,6 +46,11 @@ import type { FetchImpl } from './http.js';
 /** Schema version stamped into `meta.json`. Bumps with the contract. */
 export const BUNDLE_SCHEMA_VERSION = 'cli-v1' as const;
 
+/** Max fetch attempts for each presigned URL (initial + retries). */
+export const STREAM_URL_MAX_RETRIES = 3;
+/** Delay between retries for transient transport failures (ms). */
+export const STREAM_URL_RETRY_DELAY_MS = 1000;
+
 /** Default radius around the failed step when `--failed-only` is set. */
 export const FAILED_ONLY_RADIUS = 1;
 
@@ -695,55 +700,84 @@ function sidecarExtension(kind: 'log' | 'network' | 'console' | 'screenshot' | '
  * the upstream reader rather than buffering chunks in V8 heap. This
  * matters for video files (multi-MB) and for very large HTML
  * snapshots.
+ *
+ * Transport failures (network reset, DNS blip, mid-stream EOF) are
+ * retried up to STREAM_URL_MAX_RETRIES times with a fixed delay.
+ * Presigned URLs are valid for 15 minutes, so retries are safe.
  */
 export async function streamUrlToFile(
   url: string,
   filePath: string,
   fetchImpl: FetchImpl,
+  deps?: { sleep?: (ms: number) => Promise<void> },
 ): Promise<void> {
-  let response: Response;
-  try {
-    response = await fetchImpl(url);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw new TransportError(`Failed to download presigned URL ${url}: ${message}`);
-  }
-  if (!response.ok) {
-    throw ApiError.fromEnvelope({
-      error: {
-        code: 'UNAVAILABLE',
-        message: `Failed to download presigned URL (HTTP ${response.status}).`,
-        nextAction:
-          'Re-run `testsprite test failure get`. Presigned URLs in the bundle expire after 15 minutes.',
-        requestId: 'local',
-        details: { status: response.status, url },
-      },
-    });
-  }
-  if (!response.body) {
-    // Some test runtimes / fetch polyfills don't expose `body` as a
-    // ReadableStream. Fall back to a buffered write — same correctness,
-    // just no streaming benefit. The bundle is bounded by the
-    // backend's 15-min TTL, so even a multi-MB video buffers fully in
-    // a tolerable amount of memory.
-    const buffer = Buffer.from(await response.arrayBuffer());
-    await writeFile(filePath, buffer);
-    return;
-  }
-  await mkdir(dirname(filePath), { recursive: true });
-  // `response.body` is a Web ReadableStream. Node's `pipeline` accepts
-  // it via `Readable.fromWeb` (Node ≥ 18). Wrap in a try so any error
-  // from the stream propagates as a TransportError, preserving the
-  // exit-code contract.
-  const fileSink = createWriteStream(filePath);
-  try {
-    const webBody = response.body as unknown as NodeReadableStream<Uint8Array>;
-    const { Readable } = await import('node:stream');
-    const nodeStream = Readable.fromWeb(webBody);
-    await pipeline(nodeStream, fileSink as unknown as Writable);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw new TransportError(`Failed mid-download of ${url}: ${message}`);
+  const sleepFn = deps?.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+  for (let attempt = 1; attempt <= STREAM_URL_MAX_RETRIES; attempt++) {
+    let response: Response;
+    try {
+      response = await fetchImpl(url);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (attempt < STREAM_URL_MAX_RETRIES) {
+        await sleepFn(STREAM_URL_RETRY_DELAY_MS);
+        continue;
+      }
+      throw new TransportError(`Failed to download presigned URL ${url}: ${message}`);
+    }
+    if (!response.ok) {
+      // Non-2xx: the URL itself is bad (expired, unauthorized, not found).
+      // Retrying the same URL won't help — surface immediately.
+      throw ApiError.fromEnvelope({
+        error: {
+          code: 'UNAVAILABLE',
+          message: `Failed to download presigned URL (HTTP ${response.status}).`,
+          nextAction:
+            'Re-run `testsprite test failure get`. Presigned URLs in the bundle expire after 15 minutes.',
+          requestId: 'local',
+          details: { status: response.status, url },
+        },
+      });
+    }
+    if (!response.body) {
+      // Some test runtimes / fetch polyfills don't expose `body` as a
+      // ReadableStream. Fall back to a buffered write — same correctness,
+      // just no streaming benefit. The bundle is bounded by the
+      // backend's 15-min TTL, so even a multi-MB video buffers fully in
+      // a tolerable amount of memory.
+      try {
+        const buffer = Buffer.from(await response.arrayBuffer());
+        await writeFile(filePath, buffer);
+        return;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (attempt < STREAM_URL_MAX_RETRIES) {
+          await sleepFn(STREAM_URL_RETRY_DELAY_MS);
+          continue;
+        }
+        throw new TransportError(`Failed to download presigned URL ${url}: ${message}`);
+      }
+    }
+    await mkdir(dirname(filePath), { recursive: true });
+    // `response.body` is a Web ReadableStream. Node's `pipeline` accepts
+    // it via `Readable.fromWeb` (Node >= 18). Wrap in a try so any error
+    // from the stream propagates as a TransportError, preserving the
+    // exit-code contract. `pipeline` destroys both streams on error, so
+    // a new WriteStream on retry starts clean.
+    const fileSink = createWriteStream(filePath);
+    try {
+      const webBody = response.body as unknown as NodeReadableStream<Uint8Array>;
+      const { Readable } = await import('node:stream');
+      const nodeStream = Readable.fromWeb(webBody);
+      await pipeline(nodeStream, fileSink as unknown as Writable);
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (attempt < STREAM_URL_MAX_RETRIES) {
+        await sleepFn(STREAM_URL_RETRY_DELAY_MS);
+        continue;
+      }
+      throw new TransportError(`Failed mid-download of ${url}: ${message}`);
+    }
   }
 }
 
