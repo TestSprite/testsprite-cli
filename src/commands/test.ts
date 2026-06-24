@@ -4007,11 +4007,16 @@ export async function runFailureGet(
 ): Promise<FailureGetResult> {
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
-  // We resolve the output dir BEFORE the network call so a missing /
+
+  // Resolve and validate --out BEFORE the network call so a missing /
   // empty path surfaces as VALIDATION_ERROR (exit 5) without spending
-  // an API call. `writeBundle` re-validates internally; this is the
-  // fast-fail.
-  const requestedDir = opts.out;
+  // an API call. Mirrors `runArtifactGet`; `writeBundle` re-validates
+  // internally as defense-in-depth.
+  let resolvedDir: string | undefined;
+  if (opts.out !== undefined) {
+    resolvedDir = resolveBundleDir(opts.out);
+    await assertOutDirParentExists(resolvedDir);
+  }
 
   const context = await client.get<CliFailureContext>(
     `/tests/${encodeURIComponent(opts.testId)}/failure`,
@@ -4024,7 +4029,7 @@ export async function runFailureGet(
   // internally; this call is the cheap upfront trap.
   assertContextIntegrity(context, 'local');
 
-  if (requestedDir !== undefined) {
+  if (resolvedDir !== undefined) {
     // Dry-run: do NOT call writeBundle (which would mkdir, fetch
     // presigned URLs, and write files). Print the would-be bundle layout
     // to stderr and emit the wire envelope to stdout so the agent sees
@@ -4033,18 +4038,18 @@ export async function runFailureGet(
       const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
       const fileNames = plannedBundleFiles(context, opts.failedOnly);
       stderr(
-        `[dry-run] would write bundle to ${requestedDir} (${fileNames.length} files; meta.json renames last)`,
+        `[dry-run] would write bundle to ${resolvedDir} (${fileNames.length} files; meta.json renames last)`,
       );
       for (const f of fileNames) stderr(`[dry-run]   ${f}`);
       if (opts.output === 'json') {
-        out.print({ ok: true, dir: requestedDir, dryRun: true, context });
+        out.print({ ok: true, dir: resolvedDir, dryRun: true, context });
       } else {
         // Use a dry-run-specific renderer: the real success renderer
         // says "Bundle written to ..." which would be a lie here. Stdout
         // is the success contract automation may parse, so it must not
         // imply the bundle was created.
         out.print(
-          { dir: requestedDir, files: fileNames.length, snapshotId: context.snapshotId },
+          { dir: resolvedDir, files: fileNames.length, snapshotId: context.snapshotId },
           data =>
             renderBundleDryRunText(data as { dir: string; files: number; snapshotId: string }),
         );
@@ -4053,7 +4058,7 @@ export async function runFailureGet(
     }
 
     const bundle = await writeBundle(context, {
-      dir: requestedDir,
+      dir: resolvedDir,
       failedOnly: opts.failedOnly,
       fetchImpl: deps.fetchImpl,
     });

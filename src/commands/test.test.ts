@@ -3220,6 +3220,52 @@ function makeFailureContext(overrides: Partial<CliFailureContext> = {}): CliFail
 }
 
 describe('runFailureGet', () => {
+  it('--out rejects an empty path with VALIDATION_ERROR (exit 5) before any network I/O', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetchCalls = 0;
+    const fetchImpl = makeFetch(() => {
+      fetchCalls += 1;
+      return { body: makeFailureContext() };
+    });
+    await expect(
+      runFailureGet(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          testId: 'test_failed',
+          failedOnly: false,
+          out: '',
+        },
+        { credentialsPath, fetchImpl },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchCalls).toBe(0);
+  });
+
+  it('--out rejects a path under a missing parent dir with VALIDATION_ERROR (exit 5) before any network I/O', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetchCalls = 0;
+    const fetchImpl = makeFetch(() => {
+      fetchCalls += 1;
+      return { body: makeFailureContext() };
+    });
+    await expect(
+      runFailureGet(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          testId: 'test_failed',
+          failedOnly: false,
+          out: `/tmp/_p5_no_such_dir_${process.pid}_${Date.now()}/bundle`,
+        },
+        { credentialsPath, fetchImpl },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchCalls).toBe(0);
+  });
+
   it('JSON mode (no --out) prints the wire envelope verbatim to stdout', async () => {
     const { credentialsPath } = makeCreds();
     const ctx = makeFailureContext();
