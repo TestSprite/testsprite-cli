@@ -499,6 +499,23 @@ describe('project list subprocess', () => {
   }, 30_000);
 });
 
+describe('a malformed --profile is rejected (exit 5), not silently corrupting credentials', () => {
+  // A profile name becomes an INI section header (`[name]`). `prod]` would
+  // serialise to `[prod]]`, which the parser cannot read back — `setup` would
+  // report success while the key silently fails to persist. The guard fires on
+  // any credential read/write path.
+  it('exits 5 with a VALIDATION_ERROR naming the profile flag', async () => {
+    const result = await runCli(['--output', 'json', '--profile', 'prod]', 'project', 'list'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    const parsed = JSON.parse(result.stderr) as { error: { code: string; nextAction: string } };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error.nextAction).toContain('profile');
+  }, 30_000);
+});
+
 describe('project get subprocess', () => {
   it('--output json returns the §6.1 Project shape', async () => {
     const result = await runCli(['--output', 'json', 'project', 'get', 'project_subproc'], {

@@ -9,8 +9,42 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { localValidationError } from './errors.js';
 
 export const DEFAULT_PROFILE = 'default';
+
+/**
+ * Allowed profile-name characters. A profile name is written verbatim as an
+ * INI section header (`[name]`) in the credentials file, so any character that
+ * breaks that grammar must be rejected:
+ *   - `]` closes the header early — `prod]` serialises to `[prod]]`, which the
+ *     section regex cannot match, so the api_key/api_url lines that follow are
+ *     silently dropped on read (the credential never persists).
+ *   - CR/LF splits the header across lines, corrupting the file.
+ *   - leading/trailing whitespace does not round-trip — the parser trims
+ *     section names, so `[ prod ]` reads back as `prod`.
+ * A conservative allowlist (letters, digits, dot, underscore, hyphen) matches
+ * conventional profile names (`default`, `prod`, `ci-staging`, `team.qa`) and
+ * cannot corrupt the file.
+ */
+const PROFILE_NAME_RE = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * Throw a typed VALIDATION_ERROR (exit 5) when `profile` is not a safe INI
+ * section name. Guards every credential read/write so a malformed `--profile`
+ * (or `TESTSPRITE_PROFILE`) value fails loudly instead of silently corrupting
+ * `~/.testsprite/credentials` or failing to persist a key written by `setup`.
+ */
+export function assertValidProfileName(profile: string): void {
+  if (!PROFILE_NAME_RE.test(profile)) {
+    throw localValidationError(
+      'profile',
+      'must contain only letters, digits, dot, underscore, or hyphen (no spaces, brackets, or newlines)',
+      undefined,
+      'flag',
+    );
+  }
+}
 
 export function defaultCredentialsPath(): string {
   return join(homedir(), '.testsprite', 'credentials');
@@ -99,6 +133,7 @@ export function readProfile(
   profile: string,
   options: CredentialsOptions = {},
 ): ProfileEntry | undefined {
+  assertValidProfileName(profile);
   const file = readCredentialsFile(options);
   return file[profile];
 }
@@ -108,6 +143,7 @@ export function writeProfile(
   entry: ProfileEntry,
   options: CredentialsOptions = {},
 ): void {
+  assertValidProfileName(profile);
   const path = resolvePath(options);
   const file = readCredentialsFile(options);
   file[profile] = { ...file[profile], ...entry };
@@ -115,6 +151,7 @@ export function writeProfile(
 }
 
 export function deleteProfile(profile: string, options: CredentialsOptions = {}): boolean {
+  assertValidProfileName(profile);
   const path = resolvePath(options);
   const file = readCredentialsFile(options);
   if (!(profile in file)) return false;
