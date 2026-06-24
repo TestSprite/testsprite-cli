@@ -4,7 +4,7 @@ import { Command } from 'commander';
 import type { CommonOptions as FactoryCommonOptions } from '../lib/client-factory.js';
 import { CLIError, localValidationError } from '../lib/errors.js';
 import type { OutputMode } from '../lib/output.js';
-import { GLOBAL_OPTS_HINT, Output } from '../lib/output.js';
+import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptText } from '../lib/prompt.js';
 import {
   type AgentTarget,
@@ -852,7 +852,7 @@ function resolveCommonOptions(command: Command): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions>;
   return {
     profile: globals.profile ?? 'default',
-    output: globals.output ?? 'text',
+    output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
     verbose: globals.verbose ?? false,

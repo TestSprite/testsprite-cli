@@ -18,7 +18,7 @@ import {
 import { loadConfig } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
 import type { OutputMode } from '../lib/output.js';
-import { GLOBAL_OPTS_HINT, Output } from '../lib/output.js';
+import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptSecret } from '../lib/prompt.js';
 
 export interface MeResponse {
@@ -318,7 +318,7 @@ function resolveCommonOptions(command: Command): CommonOptions {
   };
   return {
     profile: globals.profile ?? 'default',
-    output: globals.output ?? 'text',
+    output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
     verbose: globals.verbose ?? false,

@@ -530,6 +530,33 @@ describe('malformed --endpoint-url is rejected (exit 5), not retried as a networ
   }, 30_000);
 });
 
+describe('invalid --output is rejected uniformly (exit 5)', () => {
+  // Regression: previously only `test` and `project` validated `--output`;
+  // `auth`, `usage`, `agent`, and `init` silently coerced an unknown value to
+  // text mode. An agent that asked for `--output json` but mistyped it then
+  // received a text payload it could not parse, with no signal as to why. Every
+  // command group now routes through resolveOutputMode (exit 5 on bad input).
+
+  // Note: when `--output` itself is the invalid value, the requested mode is
+  // unusable for the error envelope, so it is rendered in text mode (the catch
+  // block in index.ts falls back to text for an unrecognised --output).
+
+  it('agent list --output josn exits 5 with an actionable message (offline command)', async () => {
+    const result = await runCli(['--output', 'josn', 'agent', 'list'], {});
+    expect(result.exitCode).toBe(5);
+    expect(result.stderr).toContain('must be one of: json, text');
+  }, 30_000);
+
+  it('auth status --output yaml exits 5 before any network call', async () => {
+    const result = await runCli(['--output', 'yaml', 'auth', 'status'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    expect(result.stderr).toContain('must be one of: json, text');
+  }, 30_000);
+});
+
 describe('a malformed --profile is rejected (exit 5), not silently corrupting credentials', () => {
   // A profile name becomes an INI section header (`[name]`). `prod]` would
   // serialise to `[prod]]`, which the parser cannot read back — `setup` would

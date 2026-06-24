@@ -1,3 +1,5 @@
+import { localValidationError } from './errors.js';
+
 export type OutputMode = 'json' | 'text';
 
 /**
@@ -11,6 +13,26 @@ export const GLOBAL_OPTS_HINT =
 
 export function isOutputMode(value: unknown): value is OutputMode {
   return value === 'json' || value === 'text';
+}
+
+/**
+ * Resolve a raw `--output` flag value to a concrete {@link OutputMode}.
+ *
+ * `undefined` (flag omitted) resolves to the default `'text'`. Any other
+ * value that is not `'json'` or `'text'` throws a typed VALIDATION_ERROR
+ * (exit 5) with an actionable message.
+ *
+ * The alternative — silently falling back to `'text'` — is a footgun for the
+ * CLI's primary consumer (coding agents): a caller that asks for
+ * `--output json` but mistypes it (`--output josn`) would otherwise receive a
+ * human-readable text payload and fail to parse it as JSON, with no signal as
+ * to why. Every command group routes its global-option resolution through this
+ * helper so the validation is uniform.
+ */
+export function resolveOutputMode(raw: unknown): OutputMode {
+  if (raw === undefined) return 'text';
+  if (isOutputMode(raw)) return raw;
+  throw localValidationError('output', 'must be one of: json, text', ['json', 'text']);
 }
 
 export interface OutputStreams {

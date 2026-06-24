@@ -9,7 +9,7 @@ import {
 import { ApiError } from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
-import { GLOBAL_OPTS_HINT, Output, type OutputMode } from '../lib/output.js';
+import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
 import {
@@ -494,13 +494,9 @@ function resolveCommonOptions(command: Command): CommonOptions {
     requestTimeout?: string;
   };
   // P2-8: validate --output before allowing silent fallback to 'text'.
-  const rawOutput = globals.output;
-  if (rawOutput !== undefined && rawOutput !== 'json' && rawOutput !== 'text') {
-    throw localValidationError('--output must be one of: json, text');
-  }
   return {
     profile: globals.profile ?? 'default',
-    output: (globals.output as OutputMode | undefined) ?? 'text',
+    output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
     verbose: globals.verbose ?? false,

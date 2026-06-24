@@ -34,7 +34,7 @@ import {
 import { REQUEST_TIMEOUT_DEFAULT_MS, REQUEST_TIMEOUT_MAX_MS } from '../lib/http.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
-import { GLOBAL_OPTS_HINT, Output, type OutputMode } from '../lib/output.js';
+import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import {
   fetchSinglePage,
   paginate,
@@ -7806,13 +7806,9 @@ function resolveCommonOptions(command: Command): CommonOptions {
   // P2-8: validate --output before allowing silent fallback to 'text'.
   // An invalid value (e.g. `--output yaml`) must exit 5 with a clear error
   // rather than silently treating the request as text mode.
-  const rawOutput = globals.output;
-  if (rawOutput !== undefined && rawOutput !== 'json' && rawOutput !== 'text') {
-    throw localValidationError('output', 'must be one of: json, text', ['json', 'text']);
-  }
   return {
     profile: globals.profile ?? 'default',
-    output: (globals.output as OutputMode | undefined) ?? 'text',
+    output: resolveOutputMode(globals.output),
     dryRun: globals.dryRun ?? false,
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
