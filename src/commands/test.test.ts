@@ -1591,21 +1591,65 @@ describe('runCodeGet', () => {
     expect(leftovers).toEqual([]);
   });
 
-  // Regression: the "no code generated yet" branch writes nothing but
-  // previously still closed (and thus truncated) the opened file.
+  it('--out (text mode) rejects empty inline code with VALIDATION_ERROR and leaves no artifact', async () => {
+    const { credentialsPath } = makeCreds();
+    const emptyCode: CliTestCode = { ...TEST_CODE_INLINE, code: '' };
+    const fetchImpl = makeFetch(() => ({ body: emptyCode }));
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-empty-out-'));
+    const target = join(dir, 'empty.ts');
+    await expect(
+      runCodeGet(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          testId: 'test_fe',
+          out: target,
+        },
+        { credentialsPath, fetchImpl },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'out' }),
+    });
+    expect(existsSync(target)).toBe(false);
+  });
+
+  // Regression: empty inline code with --out must reject (exit 5) without
+  // truncating or replacing a pre-existing destination file.
   it('--out: "no code generated yet" leaves a pre-existing file untouched', async () => {
     const { credentialsPath } = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-out-empty-'));
     const target = join(dir, 'existing.ts');
     writeFileSync(target, 'PRE-EXISTING CONTENT', 'utf8');
     const fetchImpl = makeFetch(() => ({ body: { ...TEST_CODE_INLINE, code: '' } }));
-    await runCodeGet(
-      { profile: 'default', output: 'text', debug: false, testId: 'test_fe', out: target },
-      { credentialsPath, fetchImpl, stderr: () => undefined },
-    );
+    await expect(
+      runCodeGet(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_fe', out: target },
+        { credentialsPath, fetchImpl, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'out' }),
+    });
     expect(readFileSync(target, 'utf-8')).toBe('PRE-EXISTING CONTENT');
     const leftovers = readdirSync(dir).filter(f => f !== 'existing.ts');
     expect(leftovers).toEqual([]);
+  });
+
+  it('text mode without --out still hints on stderr when inline code is empty', async () => {
+    const { credentialsPath } = makeCreds();
+    const emptyCode: CliTestCode = { ...TEST_CODE_INLINE, code: '' };
+    const fetchImpl = makeFetch(() => ({ body: emptyCode }));
+    const stderr: string[] = [];
+    const got = await runCodeGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl, stderr: line => stderr.push(line) },
+    );
+    expect(got.code).toBe('');
+    expect(stderr.join('\n')).toContain('no code generated yet');
   });
 });
 
@@ -1659,6 +1703,30 @@ describe('runCodePut', () => {
     expect(sent.headers.get('if-match')).toBe('v3');
     expect(sent.headers.get('idempotency-key')).toMatch(/^cli-code-put-[0-9a-f-]{36}$/);
     expect(sent.headers.get('content-type')).toBe('application/json');
+  });
+
+  it('strips a UTF-8 BOM from --code-file before uploading (Windows PowerShell 5.1 default)', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-p4-bom-'));
+    const codeFile = join(dir, 'updated.spec.ts');
+    writeFileSync(codeFile, '\uFEFF' + 'updated body', 'utf8');
+    let seenBody: unknown;
+    const fetchImpl = makeFetch((_url, init) => {
+      seenBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { body: SAMPLE_RESPONSE };
+    });
+    await runCodePut(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_alpha',
+        codeFile,
+        expectedVersion: 'v3',
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    );
+    expect(seenBody).toEqual({ code: 'updated body' });
   });
 
   it('forwards --language in the body when set', async () => {

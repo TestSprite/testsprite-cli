@@ -911,7 +911,7 @@ function readCodeFileGuarded(path: string): string {
 
 function readCodeFile(path: string): string {
   try {
-    return readFileSync(resolveAbsolute(path), 'utf8');
+    return stripBom(readFileSync(resolveAbsolute(path), 'utf8'));
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT') {
@@ -3292,7 +3292,7 @@ export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Pro
     return code;
   }
 
-  const fileSink = opts.out !== undefined ? openOutputFile(opts.out) : null;
+  let fileSink = opts.out !== undefined ? openOutputFile(opts.out) : null;
   const out = fileSink ? makeFileOutput(opts.output, fileSink) : makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
 
@@ -3317,9 +3317,20 @@ export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Pro
     } else if (code.code === '' || code.code === null) {
       // P2-10: draft test with no code yet — empty body would produce
       // silent empty stdout. Print a friendly hint to stderr instead so
-      // the operator knows what happened, and keep exit 0. Nothing was
-      // written, so the temp file is discarded below without touching
-      // a pre-existing `--out` file.
+      // the operator knows what happened, and keep exit 0 when no `--out`.
+      //
+      // With `--out`, refuse to leave a zero-byte artifact behind: agents
+      // and scripts that check file size would otherwise treat exit 0 as
+      // a successful download. Discard the temp sink without touching a
+      // pre-existing destination file.
+      if (fileSink) {
+        await abortOutputFile(fileSink);
+        fileSink = null;
+        throw localValidationError(
+          'out',
+          'test has no generated code yet — run the test first (refusing to write an empty --out file)',
+        );
+      }
       const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
       stderrFn('(no code generated yet — run the test first)');
     } else {
@@ -7996,6 +8007,12 @@ async function closeOutputFile(sink: FileSink, commit: boolean): Promise<void> {
     return;
   }
   await rename(sink.tmpPath, sink.path);
+}
+
+/** Tear down an opened `--out` sink without leaving a zero-byte artifact. */
+async function abortOutputFile(sink: FileSink): Promise<void> {
+  sink.stream.destroy();
+  await unlink(sink.tmpPath).catch(() => undefined);
 }
 
 /** A presigned `code` body is any `https://` URL — never anything else. */
