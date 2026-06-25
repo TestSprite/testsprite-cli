@@ -564,6 +564,33 @@ describe('runCreate', () => {
     ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it('rejects a whitespace-only --name with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network — validation must fire client-side');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'frontend',
+          name: '   ',
+          targetUrl: 'https://example.com',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -629,6 +656,31 @@ describe('runUpdate', () => {
           debug: false,
           projectId: 'proj_abc',
           // no mutable fields
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('rejects a whitespace-only --name with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not be called');
+    });
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          name: '   ',
         },
         {
           credentialsPath,

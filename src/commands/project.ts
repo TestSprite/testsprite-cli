@@ -140,6 +140,15 @@ export async function runCreate(
   // (exit 10 UNAVAILABLE) — fail fast with a clear exit 5 instead.
   assertIdempotencyKey(opts.idempotencyKey);
 
+  // Reject empty / whitespace-only names so a junk record never reaches the
+  // backend — matches the `requireString` whitespace guard `test create` uses
+  // (dogfood P1 fix #1). Without this, `--name "   "` passes the action
+  // handler's `if (!name)` check (a non-empty string is truthy) and is sent
+  // verbatim, creating a blank-named project.
+  if (opts.name !== undefined && opts.name.trim().length === 0) {
+    throw localValidationError('--name must not be empty or whitespace-only');
+  }
+
   // P1-3: client-side length checks matching server limits.
   if (opts.name !== undefined && opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
@@ -247,6 +256,9 @@ export async function runUpdate(
   assertIdempotencyKey(opts.idempotencyKey);
 
   // P1-3: client-side length checks matching server limits.
+  if (opts.name !== undefined && opts.name.trim().length === 0) {
+    throw localValidationError('--name must not be empty or whitespace-only');
+  }
   if (opts.name !== undefined && opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
   }
