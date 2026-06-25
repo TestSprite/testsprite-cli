@@ -6285,7 +6285,15 @@ export async function runTestRerun(
     chunkResponses = [];
     for (let idx = 0; idx < chunks.length; idx++) {
       const chunk = chunks[idx]!;
-      const chunkKey = chunks.length === 1 ? idempotencyKey : `${idempotencyKey}:chunk${idx}`;
+      // Bound the per-chunk idempotency key to <=256 chars (mirrors the retry
+      // path). A long base key plus the `:chunkN` suffix could otherwise exceed
+      // the server cap and be rejected or truncated inconsistently.
+      const chunkSuffix = chunks.length === 1 ? '' : `:chunk${idx}`;
+      const chunkBase =
+        chunkSuffix.length > 0 && idempotencyKey.length + chunkSuffix.length > 256
+          ? idempotencyKey.slice(0, 256 - chunkSuffix.length)
+          : idempotencyKey;
+      const chunkKey = `${chunkBase}${chunkSuffix}`;
       const chunkResp = await client.triggerBatchRerun(
         {
           source: 'cli',
@@ -6631,11 +6639,14 @@ export async function runTestRerun(
         };
       }
       if (err instanceof ApiError) {
+        // Preserve the real exit code (AUTH_INVALID=3, RATE_LIMITED=11, …) so the
+        // batch exit-code aggregator can escalate auth failures correctly. Mirroring
+        // the identical fix already applied to runTestRunAll's pollFreshAccepted.
         return {
           testId: entry.testId,
           runId: entry.runId,
           status: 'error',
-          error: { code: err.code, message: err.message, exitCode: 1 },
+          error: { code: err.code, message: err.message, exitCode: err.exitCode },
         };
       }
       throw err;
@@ -6736,6 +6747,17 @@ export async function runTestRerun(
   }
 
   if (failed > 0) {
+    // Auth failure on any member is a batch-wide condition — the credential is
+    // bad, not the test. Propagate exit 3 so the operator fixes auth rather than
+    // chasing a "rerun failed" (exit 1). Mirrors the identical logic already
+    // applied to runTestRunAll lines 5462-5468.
+    const authErr = rerunResults.find(r => r.error?.exitCode === 3);
+    if (authErr) {
+      throw new CLIError(
+        `${failed} rerun${failed !== 1 ? 's' : ''} failed — auth error (${authErr.error?.code}): ${authErr.error?.message}`,
+        3,
+      );
+    }
     throw new CLIError(`${failed} rerun${failed !== 1 ? 's' : ''} failed.`, 1);
   }
 
