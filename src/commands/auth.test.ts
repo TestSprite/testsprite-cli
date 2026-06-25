@@ -140,6 +140,35 @@ describe('runConfigure', () => {
     expect(capture.prelude.join('')).toContain('Configuring profile "default"');
   });
 
+  it('routes the interactive prelude to stderr by default, keeping stdout for the result', async () => {
+    // Regression: the prelude used to default to process.stdout, polluting the
+    // result stream (and the JSON document under --output json). With no
+    // injected preludeWrite/stderr, the default must land on stderr, not stdout.
+    const stdout: string[] = [];
+    const errChunks: string[] = [];
+    const origErr = process.stderr.write.bind(process.stderr);
+    (process.stderr as unknown as { write: (c: string) => boolean }).write = c => {
+      errChunks.push(String(c));
+      return true;
+    };
+    try {
+      await runConfigure(
+        { profile: 'default', output: 'text', debug: false, fromEnv: false },
+        {
+          stdout: line => stdout.push(line),
+          prompt: { secret: vi.fn(async () => 'sk-typed') },
+          fetchImpl: meOkFetch,
+          credentialsPath,
+          env: {},
+        },
+      );
+    } finally {
+      (process.stderr as unknown as { write: typeof origErr }).write = origErr;
+    }
+    expect(errChunks.join('')).toContain('Configuring profile "default"');
+    expect(stdout.join('\n')).not.toContain('Configuring profile');
+  });
+
   it('interactive path resolves the endpoint from TESTSPRITE_API_URL without prompting', async () => {
     const { capture, deps } = makeCapture();
     const prompt = { secret: vi.fn(async () => 'sk-typed') };

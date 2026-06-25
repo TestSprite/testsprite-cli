@@ -73,7 +73,10 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   const env = deps.env ?? process.env;
   const credentialsPath = deps.credentialsPath ?? defaultCredentialsPath();
   const out = makeOutput(opts.output, deps);
-  const prelude = deps.preludeWrite ?? ((chunk: string) => process.stdout.write(chunk));
+  // The "Configuring profile …" prelude is informational, not result data, so
+  // it defaults to stderr — stdout stays a pure result stream (the configured
+  // JSON/text), which matters under `--output json` (§8.1 stdout purity).
+  const prelude = deps.preludeWrite ?? ((chunk: string) => process.stderr.write(chunk));
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   // Normalize the env endpoint: an empty / whitespace-only TESTSPRITE_API_URL is
