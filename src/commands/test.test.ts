@@ -5777,6 +5777,31 @@ describe('runUpdate', () => {
     expect(called).toBe(0);
   });
 
+  it('rejects a whitespace-only --name before sending (parity with test create)', async () => {
+    const { credentialsPath } = makeCreds();
+    let called = 0;
+    const fetchImpl = makeFetch(() => {
+      called += 1;
+      return { body: SAMPLE_RESPONSE };
+    });
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_alpha',
+          name: '   ',
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'name' }),
+    });
+    expect(called).toBe(0);
+  });
+
   it('renders text mode with one line per updated field', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
