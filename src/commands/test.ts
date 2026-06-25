@@ -1,6 +1,6 @@
 import { createWriteStream, readFileSync, readdirSync, statSync, type WriteStream } from 'node:fs';
-import { stat } from 'node:fs/promises';
-import { dirname, extname, isAbsolute, join, resolve } from 'node:path';
+import { rename, stat, unlink } from 'node:fs/promises';
+import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Command } from 'commander';
 import {
@@ -51,6 +51,7 @@ import type {
   RerunResponse,
   BatchRerunResponse,
   BatchRerunAccepted,
+  BatchRerunClosureByProject,
   RerunClosureMember,
   ListRunsResponse,
   RunHistoryItem,
@@ -1701,6 +1702,65 @@ const MAX_BATCH_BODY_BYTES = 5 * 1024 * 1024;
 const MAX_BATCH_RERUN_IDS = 50;
 
 /**
+ * Drop duplicate `testId` entries from a chunked batch-rerun's aggregated
+ * `accepted[]`, keeping the first occurrence. BE producer/teardown closure
+ * dedup happens per-request server-side, not across the separate requests
+ * one chunk per `MAX_BATCH_RERUN_IDS` window produces, so the same producer
+ * can come back accepted (with a different runId) from more than one
+ * chunk. Returns the deduped list plus how many entries were dropped, so
+ * the caller can warn the operator that a shared BE producer/teardown was
+ * triggered more than once.
+ */
+function dedupeBatchRerunAccepted(entries: BatchRerunAccepted[]): {
+  deduped: BatchRerunAccepted[];
+  droppedCount: number;
+} {
+  const seen = new Map<string, BatchRerunAccepted>();
+  let droppedCount = 0;
+  for (const entry of entries) {
+    if (seen.has(entry.testId)) {
+      droppedCount++;
+      continue;
+    }
+    seen.set(entry.testId, entry);
+  }
+  return { deduped: [...seen.values()], droppedCount };
+}
+
+/**
+ * Merge per-project closure summaries from multiple batch-rerun chunk
+ * responses, combining entries that share a `projectId` rather than
+ * leaving one entry per chunk. `testIds` / `addedProducers` /
+ * `addedTeardowns` are unioned (a producer present in two chunks' entries
+ * for the same project, the closure-dedup race this fixes, must not be
+ * counted twice); `clearedCaptured` is summed, each chunk's expansion is a
+ * disjoint operation so its count is additive.
+ */
+function mergeBatchRerunClosureByProject(
+  entries: BatchRerunClosureByProject[],
+): BatchRerunClosureByProject[] {
+  const byProject = new Map<string, BatchRerunClosureByProject>();
+  for (const entry of entries) {
+    const existing = byProject.get(entry.projectId);
+    if (!existing) {
+      byProject.set(entry.projectId, {
+        projectId: entry.projectId,
+        testIds: [...new Set(entry.testIds)],
+        addedProducers: [...new Set(entry.addedProducers)],
+        addedTeardowns: [...new Set(entry.addedTeardowns)],
+        clearedCaptured: entry.clearedCaptured,
+      });
+      continue;
+    }
+    existing.testIds = [...new Set([...existing.testIds, ...entry.testIds])];
+    existing.addedProducers = [...new Set([...existing.addedProducers, ...entry.addedProducers])];
+    existing.addedTeardowns = [...new Set([...existing.addedTeardowns, ...entry.addedTeardowns])];
+    existing.clearedCaptured += entry.clearedCaptured;
+  }
+  return [...byProject.values()];
+}
+
+/**
  * Default max in-flight run-triggers for `create-batch --run`.
  *
  * Rationale: the server caps run-triggers at 60/min/key
@@ -2753,43 +2813,30 @@ async function runBatchRun(
     };
   }
 
-  // Bounded concurrency fan-out using a semaphore pattern.
-  // We process testIds one slot at a time up to the concurrency limit.
-  // This avoids pulling in p-limit; the logic is simple enough inline.
-  const remaining = [...testIds];
-  const inFlight = new Set<Promise<CliBatchRunResult>>();
+  // Bounded concurrency fan-out: launch up to concurrencyLimit jobs, then
+  // launch the next one as each finishes. Mirrors the startNext() pattern
+  // used by the other fan-outs in this file (e.g. pollFreshAccepted below).
+  let nextIdx = 0;
+  let inFlight = 0;
 
-  async function drainOne(): Promise<void> {
-    const testId = remaining.shift();
-    if (testId === undefined) return;
-    const p = triggerOne(testId).then(result => {
-      batchRunResults.push(result);
-      inFlight.delete(p);
-      return result;
-    });
-    inFlight.add(p);
-    await p;
-  }
-
-  // Fill up to concurrencyLimit slots, then drain one before adding
-  // each new testId so we never exceed the limit.
-  const initial = Math.min(concurrencyLimit, testIds.length);
-  const startPromises: Promise<void>[] = [];
-  for (let i = 0; i < initial; i++) {
-    startPromises.push(drainOne());
-  }
-  // Process remaining items as slots free up.
-  while (remaining.length > 0) {
-    // Wait for any in-flight slot to free up.
-    if (inFlight.size > 0) {
-      await Promise.race(inFlight);
+  await new Promise<void>((resolve, reject) => {
+    function startNext(): void {
+      while (inFlight < concurrencyLimit && nextIdx < testIds.length) {
+        const testId = testIds[nextIdx++]!;
+        inFlight++;
+        triggerOne(testId)
+          .then(result => {
+            batchRunResults.push(result);
+            inFlight--;
+            startNext();
+            if (inFlight === 0 && nextIdx >= testIds.length) resolve();
+          })
+          .catch(reject);
+      }
     }
-    if (remaining.length > 0 && inFlight.size < concurrencyLimit) {
-      await drainOne();
-    }
-  }
-  // Wait for all in-flight to finish.
-  await Promise.all([...inFlight, ...startPromises]);
+    startNext();
+    if (testIds.length === 0) resolve();
+  });
 
   // Sort by testId order (same as input order for stable output).
   batchRunResults.sort((a, b) => testIds.indexOf(a.testId) - testIds.indexOf(b.testId));
@@ -3182,11 +3229,14 @@ interface CodeGetOptions extends CommonOptions {
  * directly; presigned URLs are dereferenced via the same fetch impl
  * (without API-key headers — the URL is the bearer of authority).
  *
- * `--out <path>` redirects the same bytes into a file. We open the file
- * before issuing the network request so a permission/dir error fails
- * fast (exit 5 / VALIDATION_ERROR) without spending an API call. On
- * any error after open we tear down the sink so we don't leak a
- * half-written artifact.
+ * `--out <path>` redirects the same bytes into a file. We validate the
+ * path and open a sibling temp file before issuing the network request
+ * so a permission/dir error fails fast (exit 5 / VALIDATION_ERROR)
+ * without spending an API call. The temp file is renamed onto the real
+ * `--out` path only after a successful, complete write; on any error
+ * (or the "no code generated yet" branch, which writes nothing) the
+ * temp file is discarded and the user's pre-existing `--out` file, if
+ * any, is left untouched.
  */
 export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Promise<CliTestCode> {
   // Dry-run: no fetch, no fs. Print the canned shape to stdout and, if
@@ -3217,9 +3267,11 @@ export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Pro
 
   try {
     const code = await client.get<CliTestCode>(`/tests/${encodeURIComponent(opts.testId)}/code`);
+    let wroteContent = false;
 
     if (opts.output === 'json') {
       out.print(code);
+      wroteContent = true;
     } else if (isPresignedCodeUrl(code.code)) {
       // Text mode: dump the source body. JSON consumers want the wire
       // shape; humans (and agents shelling out via `> file.ts`) want
@@ -3230,20 +3282,24 @@ export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Pro
       // or a piped `gzip`) pauses the upstream reader rather than
       // letting chunks accumulate in V8's heap.
       await streamPresignedBody(code.code, out, deps);
+      wroteContent = true;
     } else if (code.code === '' || code.code === null) {
       // P2-10: draft test with no code yet — empty body would produce
       // silent empty stdout. Print a friendly hint to stderr instead so
-      // the operator knows what happened, and keep exit 0.
+      // the operator knows what happened, and keep exit 0. Nothing was
+      // written, so the temp file is discarded below without touching
+      // a pre-existing `--out` file.
       const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
       stderrFn('(no code generated yet — run the test first)');
     } else {
       await out.writeChunk(code.code);
+      wroteContent = true;
     }
 
-    if (fileSink) await closeOutputFile(fileSink);
+    if (fileSink) await closeOutputFile(fileSink, wroteContent);
     return code;
   } catch (err) {
-    if (fileSink) await closeOutputFile(fileSink).catch(() => undefined);
+    if (fileSink) await closeOutputFile(fileSink, false).catch(() => undefined);
     throw err;
   }
 }
@@ -4007,11 +4063,16 @@ export async function runFailureGet(
 ): Promise<FailureGetResult> {
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
-  // We resolve the output dir BEFORE the network call so a missing /
+
+  // Resolve and validate --out BEFORE the network call so a missing /
   // empty path surfaces as VALIDATION_ERROR (exit 5) without spending
-  // an API call. `writeBundle` re-validates internally; this is the
-  // fast-fail.
-  const requestedDir = opts.out;
+  // an API call. Mirrors `runArtifactGet`; `writeBundle` re-validates
+  // internally as defense-in-depth.
+  let resolvedDir: string | undefined;
+  if (opts.out !== undefined) {
+    resolvedDir = resolveBundleDir(opts.out);
+    await assertOutDirParentExists(resolvedDir);
+  }
 
   const context = await client.get<CliFailureContext>(
     `/tests/${encodeURIComponent(opts.testId)}/failure`,
@@ -4024,7 +4085,7 @@ export async function runFailureGet(
   // internally; this call is the cheap upfront trap.
   assertContextIntegrity(context, 'local');
 
-  if (requestedDir !== undefined) {
+  if (resolvedDir !== undefined) {
     // Dry-run: do NOT call writeBundle (which would mkdir, fetch
     // presigned URLs, and write files). Print the would-be bundle layout
     // to stderr and emit the wire envelope to stdout so the agent sees
@@ -4033,18 +4094,18 @@ export async function runFailureGet(
       const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
       const fileNames = plannedBundleFiles(context, opts.failedOnly);
       stderr(
-        `[dry-run] would write bundle to ${requestedDir} (${fileNames.length} files; meta.json renames last)`,
+        `[dry-run] would write bundle to ${resolvedDir} (${fileNames.length} files; meta.json renames last)`,
       );
       for (const f of fileNames) stderr(`[dry-run]   ${f}`);
       if (opts.output === 'json') {
-        out.print({ ok: true, dir: requestedDir, dryRun: true, context });
+        out.print({ ok: true, dir: resolvedDir, dryRun: true, context });
       } else {
         // Use a dry-run-specific renderer: the real success renderer
         // says "Bundle written to ..." which would be a lie here. Stdout
         // is the success contract automation may parse, so it must not
         // imply the bundle was created.
         out.print(
-          { dir: requestedDir, files: fileNames.length, snapshotId: context.snapshotId },
+          { dir: resolvedDir, files: fileNames.length, snapshotId: context.snapshotId },
           data =>
             renderBundleDryRunText(data as { dir: string; files: number; snapshotId: string }),
         );
@@ -4053,7 +4114,7 @@ export async function runFailureGet(
     }
 
     const bundle = await writeBundle(context, {
-      dir: requestedDir,
+      dir: resolvedDir,
       failedOnly: opts.failedOnly,
       fetchImpl: deps.fetchImpl,
     });
@@ -6147,20 +6208,28 @@ export async function runTestRerun(
 
   let chunkResponses: BatchRerunResponse[];
   try {
-    chunkResponses = await Promise.all(
-      chunks.map((chunk, idx) => {
-        const chunkKey = chunks.length === 1 ? idempotencyKey : `${idempotencyKey}:chunk${idx}`;
-        return client.triggerBatchRerun(
-          {
-            source: 'cli',
-            testIds: chunk,
-            ...(effectiveAutoHeal ? { autoHeal: true } : {}),
-            ...(opts.skipDependencies ? { skipDependencies: true } : {}),
-          },
-          { idempotencyKey: chunkKey },
-        );
-      }),
-    );
+    // Dispatch chunks one at a time, NOT via Promise.all. BE producer/
+    // teardown closure dedup happens per-request, server-side. Two chunks
+    // that share a project's producer fired concurrently can each decide
+    // independently "this producer hasn't been added yet" and both trigger
+    // it, double-running the producer. Sequential dispatch closes that
+    // race: by the time chunk N is sent, chunk N-1's trigger has already
+    // landed server-side for it to dedup against.
+    chunkResponses = [];
+    for (let idx = 0; idx < chunks.length; idx++) {
+      const chunk = chunks[idx]!;
+      const chunkKey = chunks.length === 1 ? idempotencyKey : `${idempotencyKey}:chunk${idx}`;
+      const chunkResp = await client.triggerBatchRerun(
+        {
+          source: 'cli',
+          testIds: chunk,
+          ...(effectiveAutoHeal ? { autoHeal: true } : {}),
+          ...(opts.skipDependencies ? { skipDependencies: true } : {}),
+        },
+        { idempotencyKey: chunkKey },
+      );
+      chunkResponses.push(chunkResp);
+    }
   } catch (err) {
     // D2 (dogfood): the batch endpoint rejects the WHOLE request when any id is
     // unresolvable (unknown, cross-tenant, or never ran cleanly), so one bad id
@@ -6183,12 +6252,24 @@ export async function runTestRerun(
   }
 
   // Aggregate chunk responses into a single synthetic BatchRerunResponse.
+  // `accepted` is deduped by testId (defense in depth: even with sequential
+  // dispatch above, a shared producer/teardown should never be reported, or
+  // polled under --wait, more than once) and `closure.byProject` entries
+  // sharing a projectId are merged rather than left as separate per-chunk
+  // entries.
+  const { deduped: dedupedAccepted, droppedCount: duplicateAcceptedCount } =
+    dedupeBatchRerunAccepted(chunkResponses.flatMap(r => r.accepted));
+  if (duplicateAcceptedCount > 0) {
+    stderrFn(
+      `[warn] ${duplicateAcceptedCount} test${duplicateAcceptedCount !== 1 ? 's were' : ' was'} triggered more than once across chunked batch-rerun requests (shared BE producer/teardown); kept the first run, ignored the rest.`,
+    );
+  }
   const batchResp: BatchRerunResponse = {
-    accepted: chunkResponses.flatMap(r => r.accepted),
+    accepted: dedupedAccepted,
     deferred: chunkResponses.flatMap(r => r.deferred),
     conflicts: chunkResponses.flatMap(r => r.conflicts),
     closure: {
-      byProject: chunkResponses.flatMap(r => r.closure.byProject),
+      byProject: mergeBatchRerunClosureByProject(chunkResponses.flatMap(r => r.closure.byProject)),
     },
     notFound: chunkResponses.flatMap(r => r.notFound ?? []),
   };
@@ -6284,32 +6365,36 @@ export async function runTestRerun(
 
       let retryChunkResponses: BatchRerunResponse[];
       try {
-        retryChunkResponses = await Promise.all(
-          retryChunks.map((chunk, idx) => {
-            // [P2] Bound the derived key to ≤256 chars. Caller-supplied keys may
-            // be up to 256 chars; appending the suffix could exceed the server
-            // limit and cause every retry to be rejected. Truncate the base key
-            // to leave room for the longest possible suffix before concatenating.
-            const retrySuffix =
-              retryChunks.length === 1
-                ? `:deferred-retry${attempt}`
-                : `:deferred-retry${attempt}:chunk${idx}`;
-            const retryBase =
-              idempotencyKey.length + retrySuffix.length > 256
-                ? idempotencyKey.slice(0, 256 - retrySuffix.length)
-                : idempotencyKey;
-            const retryKey = `${retryBase}${retrySuffix}`;
-            return client.triggerBatchRerun(
-              {
-                source: 'cli',
-                testIds: chunk,
-                ...(effectiveAutoHeal ? { autoHeal: true } : {}),
-                ...(opts.skipDependencies ? { skipDependencies: true } : {}),
-              },
-              { idempotencyKey: retryKey },
-            );
-          }),
-        );
+        // Sequential, same reason as the initial dispatch above: concurrent
+        // chunks racing on per-request server-side closure dedup can
+        // double-trigger a shared BE producer/teardown.
+        retryChunkResponses = [];
+        for (let idx = 0; idx < retryChunks.length; idx++) {
+          const chunk = retryChunks[idx]!;
+          // [P2] Bound the derived key to ≤256 chars. Caller-supplied keys may
+          // be up to 256 chars; appending the suffix could exceed the server
+          // limit and cause every retry to be rejected. Truncate the base key
+          // to leave room for the longest possible suffix before concatenating.
+          const retrySuffix =
+            retryChunks.length === 1
+              ? `:deferred-retry${attempt}`
+              : `:deferred-retry${attempt}:chunk${idx}`;
+          const retryBase =
+            idempotencyKey.length + retrySuffix.length > 256
+              ? idempotencyKey.slice(0, 256 - retrySuffix.length)
+              : idempotencyKey;
+          const retryKey = `${retryBase}${retrySuffix}`;
+          const retryChunkResp = await client.triggerBatchRerun(
+            {
+              source: 'cli',
+              testIds: chunk,
+              ...(effectiveAutoHeal ? { autoHeal: true } : {}),
+              ...(opts.skipDependencies ? { skipDependencies: true } : {}),
+            },
+            { idempotencyKey: retryKey },
+          );
+          retryChunkResponses.push(retryChunkResp);
+        }
       } catch (err) {
         stderrFn(
           `[deferred-retry] attempt ${attempt} failed with error: ${err instanceof Error ? err.message : String(err)}`,
@@ -6317,7 +6402,8 @@ export async function runTestRerun(
         break;
       }
 
-      const newlyAccepted = retryChunkResponses.flatMap(r => r.accepted);
+      const { deduped: newlyAccepted, droppedCount: newlyDuplicateCount } =
+        dedupeBatchRerunAccepted(retryChunkResponses.flatMap(r => r.accepted));
       const newlyDeferred = retryChunkResponses.flatMap(r => r.deferred);
       const newlyConflicted = retryChunkResponses.flatMap(r => r.conflicts);
       // [P2] Collect notFound[] from the retry response. A deferred test may be
@@ -6326,11 +6412,16 @@ export async function runTestRerun(
       // reported as "resolved" in the final output.
       const newlyNotFound = retryChunkResponses.flatMap(r => r.notFound ?? []);
 
+      if (newlyDuplicateCount > 0) {
+        stderrFn(
+          `[warn] ${newlyDuplicateCount} test${newlyDuplicateCount !== 1 ? 's were' : ' was'} triggered more than once across deferred-retry chunked requests (shared BE producer/teardown); kept the first run, ignored the rest.`,
+        );
+      }
       if (newlyAccepted.length > 0) {
         stderrFn(
           `[deferred-retry] attempt ${attempt}: ${newlyAccepted.length} test${newlyAccepted.length !== 1 ? 's' : ''} now accepted.`,
         );
-        accepted = accepted.concat(newlyAccepted);
+        accepted = dedupeBatchRerunAccepted(accepted.concat(newlyAccepted)).deduped;
       }
       if (newlyConflicted.length > 0) {
         // [P1] Merge retry-returned conflicts into the running conflicts collection
@@ -7746,22 +7837,29 @@ function makeOutput(mode: OutputMode, deps: TestDeps): Output {
  * Internal handle for `--out <path>` writes. Wraps a Node WriteStream
  * with a tracked `error` field so `closeOutputFile` can re-raise an
  * async stream error (EACCES on a write, ENOSPC mid-stream, etc.) that
- * was emitted between writes.
+ * was emitted between writes. The stream writes to `tmpPath`, a sibling
+ * of the real `path`; `closeOutputFile` renames it into place only on
+ * a successful, complete write, so a forged or failed response never
+ * modifies (or empties) the operator's pre-existing `--out` file.
  */
 interface FileSink {
   readonly stream: WriteStream;
   readonly path: string;
+  readonly tmpPath: string;
   error: Error | null;
 }
 
 /**
- * Open the `--out` target before any network I/O so a permission/dir
- * error fails fast. Synchronous open via `createWriteStream` doesn't
- * actually open the descriptor until first write, so we don't surface
- * EACCES/ENOENT here — instead the stream emits `'error'`, which we
- * remember on the sink and re-throw at close time. The benefit of
- * opening early is still real: invalid path strings (empty, `/dev/null`
- * on a sandboxed fs, etc.) are caught before the API request goes out.
+ * Open a temp file next to the `--out` target before any network I/O so
+ * a permission/dir error fails fast. Synchronous open via
+ * `createWriteStream` doesn't actually open the descriptor until first
+ * write, so we don't surface EACCES/ENOENT here, instead the stream
+ * emits `'error'`, which we remember on the sink and re-throw at close
+ * time. The benefit of opening early is still real: invalid path
+ * strings (empty, `/dev/null` on a sandboxed fs, etc.) are caught
+ * before the API request goes out. Writing to a temp path rather than
+ * `resolved` directly means the real `--out` file is never truncated
+ * up front, see `closeOutputFile` for the commit step.
  */
 function openOutputFile(rawPath: string): FileSink {
   if (typeof rawPath !== 'string' || rawPath.length === 0) {
@@ -7790,8 +7888,9 @@ function openOutputFile(rawPath: string): FileSink {
   if (!parentStat.isDirectory()) {
     throw localValidationError('out', `parent path is not a directory: ${parent}`);
   }
-  const stream = createWriteStream(resolved, { encoding: 'utf8' });
-  const sink: FileSink = { stream, path: resolved, error: null };
+  const tmpPath = join(parent, `.${basename(resolved)}.tmp-${randomUUID()}`);
+  const stream = createWriteStream(tmpPath, { encoding: 'utf8' });
+  const sink: FileSink = { stream, path: resolved, tmpPath, error: null };
   stream.on('error', err => {
     sink.error = err instanceof Error ? err : new Error(String(err));
   });
@@ -7821,25 +7920,37 @@ function makeFileOutput(mode: OutputMode, sink: FileSink): Output {
 }
 
 /**
- * Flush + close the file sink. Called on the success path after the
- * last write and on the error path inside a `.catch(() => undefined)`
- * so the original error isn't masked by a teardown failure.
+ * Flush + close the file sink, then either commit or discard the temp
+ * file. Called on the success path after the last write (`commit:
+ * true` when content was actually written) and on the error / "no code
+ * yet" paths (`commit: false`) inside a `.catch(() => undefined)` so a
+ * teardown failure doesn't mask the original error.
+ *
+ * `commit: true` renames `tmpPath` onto the real `--out` path, the
+ * only point at which the operator's file is touched. `commit: false`
+ * discards the temp file and leaves any pre-existing `--out` file
+ * exactly as it was, this is what prevents a failed/empty response
+ * from silently truncating the operator's filesystem (mirrors the
+ * atomic-rename contract `bundle.ts` uses for multi-file bundles).
  *
  * Re-raises any async stream error captured by the `'error'` listener.
  * Without this re-raise, an EACCES on first write would leave a
- * zero-byte file behind and exit 0 — a false-success surface that is
- * exactly the failure mode `--out` exists to avoid.
+ * zero-byte temp file behind and exit 0, a false-success surface that
+ * is exactly the failure mode `--out` exists to avoid.
  */
-function closeOutputFile(sink: FileSink): Promise<void> {
-  return new Promise((resolve, reject) => {
-    sink.stream.end(() => {
-      if (sink.error) {
-        reject(new TransportError(`Failed to write --out ${sink.path}: ${sink.error.message}`));
-        return;
-      }
-      resolve();
-    });
+async function closeOutputFile(sink: FileSink, commit: boolean): Promise<void> {
+  await new Promise<void>(resolveStream => {
+    sink.stream.end(() => resolveStream());
   });
+  if (sink.error) {
+    await unlink(sink.tmpPath).catch(() => undefined);
+    throw new TransportError(`Failed to write --out ${sink.path}: ${sink.error.message}`);
+  }
+  if (!commit) {
+    await unlink(sink.tmpPath).catch(() => undefined);
+    return;
+  }
+  await rename(sink.tmpPath, sink.path);
 }
 
 /** A presigned `code` body is any `https://` URL — never anything else. */

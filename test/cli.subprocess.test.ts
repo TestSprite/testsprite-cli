@@ -499,6 +499,35 @@ describe('project list subprocess', () => {
   }, 30_000);
 });
 
+describe('malformed --endpoint-url is rejected (exit 5), not retried as a network error', () => {
+  // Previously: a malformed endpoint surfaced either as an opaque `Invalid URL`
+  // (exit 1) or, for a missing/wrong scheme, as a `fetch failed` UNAVAILABLE
+  // only after a full retry-and-backoff cycle. Both are misleading config
+  // errors. Validation throws before any fetch, so no network is hit here even
+  // though a (dummy) key is configured.
+
+  it('an unparseable endpoint exits 5 with a VALIDATION_ERROR naming endpoint-url', async () => {
+    const result = await runCli(
+      ['--output', 'json', '--endpoint-url', 'not a url', 'project', 'list'],
+      { TESTSPRITE_API_KEY: 'sk-subproc' },
+    );
+    expect(result.exitCode).toBe(5);
+    const parsed = JSON.parse(result.stderr) as { error: { code: string; nextAction: string } };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error.nextAction).toContain('endpoint-url');
+  }, 30_000);
+
+  it('a non-http(s) scheme exits 5 instead of being retried as a network failure', async () => {
+    const result = await runCli(
+      ['--output', 'json', '--endpoint-url', 'ftp://example.com', 'project', 'list'],
+      { TESTSPRITE_API_KEY: 'sk-subproc' },
+    );
+    expect(result.exitCode).toBe(5);
+    const parsed = JSON.parse(result.stderr) as { error: { code: string } };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+  }, 30_000);
+});
+
 describe('project get subprocess', () => {
   it('--output json returns the §6.1 Project shape', async () => {
     const result = await runCli(['--output', 'json', 'project', 'get', 'project_subproc'], {
