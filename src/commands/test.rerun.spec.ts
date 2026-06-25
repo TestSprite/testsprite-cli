@@ -2431,6 +2431,159 @@ describe('[fix-D] --all resolves >50 tests: chunked batch requests, aggregated r
     // Exactly 50 → 1 request only
     expect(batchCallCount).toBe(1);
   });
+
+  // Regression: chunked batch-rerun dispatched chunks via Promise.all, so
+  // when --all resolves >50 tests every chunk's request was in flight at
+  // once. BE producer/teardown closure dedup happens per-request, so two
+  // concurrent chunks sharing a project's producer could each independently
+  // trigger it. Chunks must be dispatched strictly one at a time.
+  it('60 tests → 2 chunks are dispatched sequentially, not concurrently', async () => {
+    const creds = makeCreds();
+    const allTests = Array.from({ length: 60 }, (_, i) => ({
+      ...FE_TEST,
+      id: `test_seq_${String(i).padStart(3, '0')}`,
+    }));
+    const CHUNK_DELAY_MS = 40;
+    let activeBatchCalls = 0;
+    const activeAtStart: number[] = [];
+
+    type FetchInput2 = Parameters<typeof globalThis.fetch>[0];
+    const fetchImpl = (async (input: FetchInput2, init: RequestInit = {}) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      if (url.includes('/tests') && !url.includes('batch') && !url.includes('/runs')) {
+        return new Response(JSON.stringify({ items: allTests, nextToken: null }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.includes('/tests/batch/rerun')) {
+        activeBatchCalls++;
+        activeAtStart.push(activeBatchCalls);
+        const body = JSON.parse(init.body as string) as { testIds: string[] };
+        await new Promise(resolve => setTimeout(resolve, CHUNK_DELAY_MS));
+        activeBatchCalls--;
+        const accepted = body.testIds.map(tid => ({
+          testId: tid,
+          runId: `run_${tid}`,
+          enqueuedAt: '2026-06-03T10:00:00.000Z',
+        }));
+        return new Response(
+          JSON.stringify({
+            accepted,
+            deferred: [],
+            conflicts: [],
+            closure: { byProject: [] },
+          } satisfies BatchRerunResponse),
+          { status: 202, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          error: { code: 'NOT_FOUND', message: 'not found', nextAction: '', requestId: 'r1' },
+        }),
+        { status: 404, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof globalThis.fetch;
+
+    await runTestRerun(
+      {
+        testIds: [],
+        all: true,
+        projectId: 'project_abc',
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, sleep: instantSleep, fetchImpl },
+    );
+
+    expect(activeAtStart).toEqual([1, 1]);
+  });
+
+  // Regression: even with sequential dispatch, defend the CLI's own
+  // accounting against a shared BE producer/teardown coming back accepted
+  // from more than one chunk (a different runId each time). Duplicate
+  // testIds must be deduped, not double-counted or double-polled.
+  it('a testId accepted by two chunks is deduped, kept once, and warned about', async () => {
+    const creds = makeCreds();
+    const allTests = Array.from({ length: 60 }, (_, i) => ({
+      ...FE_TEST,
+      id: `test_dup_${String(i).padStart(3, '0')}`,
+    }));
+    let batchCallCount = 0;
+    const stderrLines: string[] = [];
+
+    const fetchImpl = makeFetch((url, init) => {
+      if (url.includes('/tests') && !url.includes('batch') && !url.includes('/runs')) {
+        return { body: { items: allTests, nextToken: null } };
+      }
+      if (url.includes('/tests/batch/rerun')) {
+        batchCallCount++;
+        const body = JSON.parse(init.body as string) as { testIds: string[] };
+        const accepted = body.testIds.map(tid => ({
+          testId: tid,
+          runId: `run_${tid}_call${batchCallCount}`,
+          enqueuedAt: '2026-06-03T10:00:00.000Z',
+        }));
+        // Simulate a shared BE producer (not one of the 60 selected ids)
+        // that both chunks' server-side closure expansion independently
+        // decided to trigger, each with its own runId.
+        accepted.push({
+          testId: 'test_dup_producer',
+          runId: `run_producer_call${batchCallCount}`,
+          enqueuedAt: '2026-06-03T10:00:00.000Z',
+        });
+        return {
+          status: 202,
+          body: {
+            accepted,
+            deferred: [],
+            conflicts: [],
+            closure: { byProject: [] },
+          } satisfies BatchRerunResponse,
+        };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    await runTestRerun(
+      {
+        testIds: [],
+        all: true,
+        projectId: 'project_abc',
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, sleep: instantSleep, fetchImpl, stderr: line => stderrLines.push(line) },
+    );
+
+    expect(batchCallCount).toBe(2);
+    expect(
+      stderrLines.some(l => l.includes('triggered more than once') && l.includes('1 test')),
+    ).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3055,20 +3208,21 @@ describe('D3: batch rerun summary surfaces deferred + conflicts', () => {
   it('--wait JSON summary includes deferred/conflicts counts (no silent undercount)', async () => {
     const creds = makeCreds();
     // Initial dispatch: 1 accepted, 1 deferred, 1 conflict.
-    // D3 retry loop will fire (opts.wait=true). All 3 retry attempts return the
-    // same deferred entry so `deferred` never drains, and each retry's `accepted`
-    // entry (same test_1 / run_b1) is merged in. After the loop, accepted has
-    // 4 entries (1 original + 3 retries) and deferred still has 1 entry.
+    // D3 retry loop will fire (opts.wait=true). The retry request only ever
+    // re-asks about the still-deferred testId (test_deferred), so a
+    // realistic retry response never re-returns test_1 as newly accepted.
+    // All 3 retry attempts keep returning the same deferred entry so
+    // `deferred` never drains.
     const initialBatchResp: BatchRerunResponse = {
       accepted: [{ testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' }],
       deferred: [{ testId: 'test_deferred', reason: 'rate_limited' }],
       conflicts: [{ testId: 'test_conf', currentRunId: 'run_conf' }],
       closure: { byProject: [] },
     };
-    // Retry responses: keep returning 1 deferred + 1 accepted (same run) so
-    // the loop exhausts MAX_DEFERRED_RETRIES and falls through.
+    // Retry responses: keep returning 1 deferred so the loop exhausts
+    // MAX_DEFERRED_RETRIES and falls through. No new accepted entries.
     const retryBatchResp: BatchRerunResponse = {
-      accepted: [{ testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' }],
+      accepted: [],
       deferred: [{ testId: 'test_deferred', reason: 'rate_limited' }],
       conflicts: [],
       closure: { byProject: [] },
@@ -3120,15 +3274,16 @@ describe('D3: batch rerun summary surfaces deferred + conflicts', () => {
 
     const withSummary = printed.find(p => p.summary);
     expect(withSummary).toBeDefined();
-    // After D3 retries: accepted = 4 entries (same run_b1 merged 4 times);
-    // all 4 poll as passed. deferred = 1 (still undrained). conflicts = 1 (from initial).
+    // After D3 retries: accepted = 1 entry (test_1 from the initial dispatch;
+    // retries never re-return it). deferred = 1 (still undrained). conflicts
+    // = 1 (from initial).
     expect(withSummary!.summary).toMatchObject({
-      passed: 4,
+      passed: 1,
       failed: 0,
       timedOut: 0,
       deferred: 1,
       conflicts: 1,
-      total: 4,
+      total: 1,
     });
   });
 });

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   DRY_RUN_API_KEY,
   DRY_RUN_BANNER,
+  assertValidEndpointUrl,
   emitDryRunBanner,
   makeHttpClient,
   resetDryRunBannerForTesting,
@@ -12,6 +13,7 @@ import {
   REQUEST_TIMEOUT_MAX_MS,
   REQUEST_TIMEOUT_MIN_MS,
 } from './http.js';
+import { ApiError } from './errors.js';
 
 const NO_CREDS_PATH = '/tmp/testsprite-cli-test-no-such-file-1234.ini';
 
@@ -282,5 +284,90 @@ describe('makeHttpClient — real path (regression)', () => {
       ),
     ).toThrow();
     expect(stderrLines).not.toContain(DRY_RUN_BANNER);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// assertValidEndpointUrl — endpoint syntax guard (NOT an SSRF guard)
+// ---------------------------------------------------------------------------
+
+describe('assertValidEndpointUrl', () => {
+  it('accepts http(s) URLs, including private / localhost hosts (self-hosted, dev, mock)', () => {
+    for (const url of [
+      'https://api.testsprite.com',
+      'http://localhost:3000',
+      'http://127.0.0.1:8787',
+      'https://testsprite.internal.example.com/api/cli/v1',
+    ]) {
+      expect(() => assertValidEndpointUrl(url)).not.toThrow();
+    }
+  });
+
+  it('rejects an unparseable URL with a VALIDATION_ERROR (exit 5)', () => {
+    let caught: unknown;
+    try {
+      assertValidEndpointUrl('not a url');
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ApiError);
+    const apiErr = caught as ApiError;
+    expect(apiErr.code).toBe('VALIDATION_ERROR');
+    expect(apiErr.exitCode).toBe(5);
+    expect(apiErr.nextAction).toContain('endpoint-url');
+  });
+
+  it('rejects a missing scheme (parses as a bogus scheme) and a non-http(s) scheme', () => {
+    // `new URL('localhost:3000')` does not throw — it parses with protocol
+    // `localhost:`. Without the scheme check this would sail through and later
+    // fail as a retried "fetch failed".
+    for (const url of ['localhost:3000', 'ftp://example.com', 'file:///etc/hosts']) {
+      let caught: unknown;
+      try {
+        assertValidEndpointUrl(url);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(ApiError);
+      expect((caught as ApiError).code).toBe('VALIDATION_ERROR');
+      expect((caught as ApiError).exitCode).toBe(5);
+    }
+  });
+});
+
+describe('makeHttpClient — endpoint validation', () => {
+  afterEach(() => {
+    resetDryRunBannerForTesting();
+  });
+
+  it('throws a VALIDATION_ERROR (exit 5) on a malformed --endpoint-url under --dry-run', () => {
+    let caught: unknown;
+    try {
+      makeHttpClient(
+        { profile: 'default', output: 'json', debug: false, dryRun: true, endpointUrl: 'ftp://x' },
+        { env: {} as NodeJS.ProcessEnv, credentialsPath: NO_CREDS_PATH, stderr: () => {} },
+      );
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).exitCode).toBe(5);
+  });
+
+  it('rejects a malformed endpoint before the auth check on the real path', () => {
+    // No API key is configured, but the malformed endpoint is reported first
+    // (a deterministic config error) — exit 5, not exit 3.
+    let caught: unknown;
+    try {
+      makeHttpClient(
+        { profile: 'default', output: 'json', debug: false, dryRun: false, endpointUrl: 'nope' },
+        { env: {} as NodeJS.ProcessEnv, credentialsPath: NO_CREDS_PATH, stderr: () => {} },
+      );
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).code).toBe('VALIDATION_ERROR');
+    expect((caught as ApiError).exitCode).toBe(5);
   });
 });

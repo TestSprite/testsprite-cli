@@ -1,4 +1,11 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -1555,6 +1562,46 @@ describe('runCodeGet', () => {
         { credentialsPath, fetchImpl },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  // Regression: --out used to open (truncate) the destination file
+  // before the network request. A failed fetch left a pre-existing
+  // file emptied. The fix writes to a sibling temp file and renames it
+  // into place only on success, so a failure must never touch the
+  // operator's existing --out file.
+  it('--out: a failed fetch leaves a pre-existing file untouched, not truncated', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-out-fail-'));
+    const target = join(dir, 'existing.ts');
+    writeFileSync(target, 'PRE-EXISTING CONTENT', 'utf8');
+    const fetchImpl = (() => Promise.reject(new Error('ENETUNREACH'))) as typeof globalThis.fetch;
+    await expect(
+      runCodeGet(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_fe', out: target },
+        { credentialsPath, fetchImpl },
+      ),
+    ).rejects.toBeDefined();
+    expect(readFileSync(target, 'utf-8')).toBe('PRE-EXISTING CONTENT');
+    // No leftover temp file in the directory.
+    const leftovers = readdirSync(dir).filter(f => f !== 'existing.ts');
+    expect(leftovers).toEqual([]);
+  });
+
+  // Regression: the "no code generated yet" branch writes nothing but
+  // previously still closed (and thus truncated) the opened file.
+  it('--out: "no code generated yet" leaves a pre-existing file untouched', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-out-empty-'));
+    const target = join(dir, 'existing.ts');
+    writeFileSync(target, 'PRE-EXISTING CONTENT', 'utf8');
+    const fetchImpl = makeFetch(() => ({ body: { ...TEST_CODE_INLINE, code: '' } }));
+    await runCodeGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe', out: target },
+      { credentialsPath, fetchImpl, stderr: () => undefined },
+    );
+    expect(readFileSync(target, 'utf-8')).toBe('PRE-EXISTING CONTENT');
+    const leftovers = readdirSync(dir).filter(f => f !== 'existing.ts');
+    expect(leftovers).toEqual([]);
   });
 });
 
@@ -3220,6 +3267,52 @@ function makeFailureContext(overrides: Partial<CliFailureContext> = {}): CliFail
 }
 
 describe('runFailureGet', () => {
+  it('--out rejects an empty path with VALIDATION_ERROR (exit 5) before any network I/O', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetchCalls = 0;
+    const fetchImpl = makeFetch(() => {
+      fetchCalls += 1;
+      return { body: makeFailureContext() };
+    });
+    await expect(
+      runFailureGet(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          testId: 'test_failed',
+          failedOnly: false,
+          out: '',
+        },
+        { credentialsPath, fetchImpl },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchCalls).toBe(0);
+  });
+
+  it('--out rejects a path under a missing parent dir with VALIDATION_ERROR (exit 5) before any network I/O', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetchCalls = 0;
+    const fetchImpl = makeFetch(() => {
+      fetchCalls += 1;
+      return { body: makeFailureContext() };
+    });
+    await expect(
+      runFailureGet(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          testId: 'test_failed',
+          failedOnly: false,
+          out: `/tmp/_p5_no_such_dir_${process.pid}_${Date.now()}/bundle`,
+        },
+        { credentialsPath, fetchImpl },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchCalls).toBe(0);
+  });
+
   it('JSON mode (no --out) prints the wire envelope verbatim to stdout', async () => {
     const { credentialsPath } = makeCreds();
     const ctx = makeFailureContext();
@@ -6692,6 +6785,103 @@ describe('runCreateBatch', () => {
         { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
       ),
     ).resolves.toBeDefined();
+  });
+
+  // Regression test: create-batch --run must keep launching new triggers
+  // up to --max-concurrency as slots free up, not collapse to serial
+  // after the first wave. Uses equal-delay trigger responses so the
+  // first three jobs settle in the same microtask batch, the exact
+  // condition that exposed the bug (race only reacts to one settlement,
+  // then blocks the scheduler on the whole next job before moving on).
+  it('--run keeps concurrency at --max-concurrency for tail jobs, not just the first wave', async () => {
+    const { credentialsPath } = makeCreds();
+    const specs = Array.from({ length: 6 }, (_, i) => ({ ...FE_SPEC, name: `spec-${i}` }));
+    const plansFile = writePlansJsonl(specs);
+    const CREATE_RESP = {
+      results: specs.map((_, i) => ({
+        specIndex: i,
+        testId: `test_tail_${i}`,
+        status: 'created' as const,
+      })),
+      summary: { total: 6, created: 6, failed: 0 },
+    };
+    const TRIGGER_DELAY_MS = 60;
+    const limit = 3;
+    let activeCount = 0;
+    let triggerCallIndex = 0;
+    const activeAtStart: number[] = [];
+
+    type FetchInput2 = Parameters<typeof globalThis.fetch>[0];
+    const fetchImpl = (async (input: FetchInput2) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      if (url.includes('/tests/batch')) {
+        return new Response(JSON.stringify(CREATE_RESP), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.includes('/runs')) {
+        const callIdx = triggerCallIndex++;
+        activeCount++;
+        activeAtStart[callIdx] = activeCount;
+        await new Promise(resolve => setTimeout(resolve, TRIGGER_DELAY_MS));
+        activeCount--;
+        return new Response(
+          JSON.stringify({
+            runId: `run_tail_${callIdx}`,
+            status: 'queued' as const,
+            enqueuedAt: '2026-06-09T10:00:00.000Z',
+            codeVersion: 'v1',
+            targetUrl: 'https://example.com',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          error: { code: 'NOT_FOUND', message: 'not found', nextAction: '', requestId: 'r1' },
+        }),
+        { status: 404, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof globalThis.fetch;
+
+    try {
+      await runCreateBatch(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          plans: plansFile,
+          run: true,
+          wait: false,
+          dryRun: false,
+          maxConcurrency: limit,
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as ReturnType<typeof makeFetch>,
+          stdout: () => undefined,
+          stderr: () => undefined,
+        },
+      );
+    } catch {
+      // CLIError exit 1 expected: trigger status is 'queued', not 'passed'.
+    }
+
+    expect(activeAtStart).toHaveLength(6);
+    // First wave fills up to the limit; true under the bug too.
+    expect(Math.max(...activeAtStart.slice(0, limit))).toBe(limit);
+    // Tail jobs (index >= limit) must ALSO reach the concurrency limit.
+    // Under the bug, the scheduler blocks on each whole job after the
+    // first wave, so every tail job launches alone (active === 1).
+    for (const snapshot of activeAtStart.slice(limit)) {
+      expect(snapshot).toBe(limit);
+    }
   });
 
   // Per codex round-1 P2: a 200 OK with `summary.created === 0` on a
