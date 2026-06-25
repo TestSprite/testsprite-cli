@@ -158,13 +158,22 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     stderr(`API key rejected by ${apiUrl}: ${message} — profile NOT updated`);
-    const exitCode = err instanceof ApiError ? err.exitCode : 3;
-    // Include the resolved endpoint in the thrown message so the user knows
-    // which host rejected the key. This prevents the "invalid or revoked"
-    // message from being ambiguous when the key is valid for a different env.
+    // When the verification call returned a typed API error (AUTH_INVALID,
+    // AUTH_FORBIDDEN, etc.), re-throw it directly so `index.ts` renders the
+    // full typed envelope under `--output json` (code, nextAction, requestId,
+    // details). Previously wrapping it in CLIError discarded those fields and
+    // emitted a bare `{"error":"...string..."}` — violating the JSON contract.
+    // Augment the message with the endpoint context so text-mode users still
+    // see which host rejected the key.
+    if (err instanceof ApiError) {
+      err.message = `API key rejected by ${apiUrl}: ${message} — did you mean to set TESTSPRITE_API_URL?`;
+      throw err;
+    }
+    // Non-ApiError (truly unexpected throws like a TypeError from a
+    // misconfigured fetchImpl). Exit 3 (auth family).
     throw new CLIError(
       `API key rejected by ${apiUrl}: ${message} — did you mean to set TESTSPRITE_API_URL?`,
-      exitCode,
+      3,
     );
   }
 

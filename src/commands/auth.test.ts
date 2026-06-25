@@ -268,6 +268,46 @@ describe('runConfigure', () => {
     expect(capture.stderr.join('\n')).toContain('profile NOT updated');
   });
 
+  it('key-rejected error preserves the typed ApiError envelope (JSON contract)', async () => {
+    const { deps } = makeCapture();
+    const rejectedFetch: AuthDeps['fetchImpl'] = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 'AUTH_INVALID',
+              message: 'API key is invalid or revoked.',
+              nextAction: 'Rotate your key.',
+              requestId: 'req_reject',
+              details: { reason: 'malformed' },
+            },
+          }),
+          { status: 401, headers: { 'content-type': 'application/json' } },
+        ),
+    ) as unknown as AuthDeps['fetchImpl'];
+
+    // The thrown error must be an ApiError (with code, nextAction, requestId)
+    // — not a CLIError wrapper that drops those fields. Under --output json,
+    // index.ts renders ApiError as the full typed envelope; CLIError would
+    // render only {"error":"...string..."}, violating the JSON contract.
+    await expect(
+      runConfigure(
+        { profile: 'default', output: 'json', debug: false, fromEnv: true },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk-bad' },
+          credentialsPath,
+          fetchImpl: rejectedFetch,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'AUTH_INVALID',
+      exitCode: 3,
+      nextAction: 'Rotate your key.',
+      requestId: 'req_reject',
+    });
+  });
+
   // The old "run `testsprite agent install`" self-bootstrap tip was removed with
   // the setup consolidation — runConfigure now runs ONLY as part of `setup`,
   // which installs the skill itself. These guard that the tip stays gone.
