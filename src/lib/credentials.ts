@@ -1,10 +1,13 @@
 import {
   chmodSync,
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
@@ -109,22 +112,26 @@ export function writeProfile(
   options: CredentialsOptions = {},
 ): void {
   const path = resolvePath(options);
-  const file = readCredentialsFile(options);
-  file[profile] = { ...file[profile], ...entry };
-  writeCredentialsAtomic(path, file);
+  withCredentialsLock(path, () => {
+    const file = readCredentialsFile(options);
+    file[profile] = { ...file[profile], ...entry };
+    writeCredentialsAtomic(path, file);
+  });
 }
 
 export function deleteProfile(profile: string, options: CredentialsOptions = {}): boolean {
   const path = resolvePath(options);
-  const file = readCredentialsFile(options);
-  if (!(profile in file)) return false;
-  delete file[profile];
-  if (Object.keys(file).length === 0) {
-    writeCredentialsAtomic(path, {});
-  } else {
-    writeCredentialsAtomic(path, file);
-  }
-  return true;
+  return withCredentialsLock(path, () => {
+    const file = readCredentialsFile(options);
+    if (!(profile in file)) return false;
+    delete file[profile];
+    if (Object.keys(file).length === 0) {
+      writeCredentialsAtomic(path, {});
+    } else {
+      writeCredentialsAtomic(path, file);
+    }
+    return true;
+  });
 }
 
 export function ensureRestrictiveMode(path: string): void {
@@ -143,4 +150,92 @@ function writeCredentialsAtomic(path: string, file: CredentialsFile): void {
   writeFileSync(tmp, serializeCredentials(file), { mode: 0o600, encoding: 'utf8' });
   renameSync(tmp, path);
   ensureRestrictiveMode(path);
+}
+
+/** Max wall-clock wait when another process holds the credentials lock. */
+const CREDENTIALS_LOCK_MAX_WAIT_MS = 10_000;
+/** Back-off between lock attempts. */
+const CREDENTIALS_LOCK_RETRY_MS = 25;
+/** Reclaim a lock file when the holder pid is gone or the file is older than this. */
+const CREDENTIALS_LOCK_STALE_MS = 30_000;
+
+function credentialsLockPath(credentialsPath: string): string {
+  return `${credentialsPath}.lock`;
+}
+
+/**
+ * Serialize read-modify-write on the credentials file across processes.
+ * `writeCredentialsAtomic` only makes the final rename atomic; without this
+ * lock, concurrent `writeProfile` / `deleteProfile` calls can each read the
+ * same snapshot and the last rename wins — silently dropping the other update.
+ */
+function withCredentialsLock<T>(credentialsPath: string, fn: () => T): T {
+  acquireCredentialsLock(credentialsPath);
+  try {
+    return fn();
+  } finally {
+    releaseCredentialsLock(credentialsPath);
+  }
+}
+
+function acquireCredentialsLock(credentialsPath: string): void {
+  const lockPath = credentialsLockPath(credentialsPath);
+  const deadline = Date.now() + CREDENTIALS_LOCK_MAX_WAIT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const fd = openSync(lockPath, 'wx');
+      try {
+        writeFileSync(fd, `${process.pid}\n${Date.now()}\n`, 'utf8');
+      } finally {
+        closeSync(fd);
+      }
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST') throw err;
+      if (isStaleCredentialsLock(lockPath)) {
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          // Another waiter may have claimed or released the lock.
+        }
+        continue;
+      }
+      syncSleep(CREDENTIALS_LOCK_RETRY_MS);
+    }
+  }
+  throw new Error(`Timed out acquiring credentials lock: ${lockPath}`);
+}
+
+function releaseCredentialsLock(credentialsPath: string): void {
+  try {
+    unlinkSync(credentialsLockPath(credentialsPath));
+  } catch {
+    // Lock already released or never acquired — teardown must not mask errors.
+  }
+}
+
+function isStaleCredentialsLock(lockPath: string): boolean {
+  try {
+    const stat = statSync(lockPath);
+    if (Date.now() - stat.mtimeMs > CREDENTIALS_LOCK_STALE_MS) return true;
+    const firstLine = readFileSync(lockPath, 'utf8').split('\n')[0] ?? '';
+    const pid = Number.parseInt(firstLine, 10);
+    if (!Number.isFinite(pid) || pid <= 0) return true;
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch {
+      return true;
+    }
+  } catch {
+    return false;
+  }
+}
+
+function syncSleep(ms: number): void {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    // Busy-wait: credentials I/O is sync-only; sub-ms precision is unnecessary.
+  }
 }

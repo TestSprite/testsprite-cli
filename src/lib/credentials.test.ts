@@ -1,7 +1,11 @@
+import { execSync } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { mkdtempSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { fileURLToPath } from 'node:url';
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   DEFAULT_PROFILE,
   defaultCredentialsPath,
@@ -166,5 +170,64 @@ describe('ensureRestrictiveMode', () => {
 describe('defaultCredentialsPath', () => {
   it('points at ~/.testsprite/credentials', () => {
     expect(defaultCredentialsPath().endsWith('/.testsprite/credentials')).toBe(true);
+  });
+});
+
+const projectRoot = fileURLToPath(new URL('../..', import.meta.url));
+const credentialsWriteChild = join(projectRoot, 'test/helpers/credentials-write-child.mjs');
+
+function waitForChild(child: ChildProcess): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let stderr = '';
+    child.stderr?.on('data', chunk => {
+      stderr += String(chunk);
+    });
+    child.on('error', reject);
+    child.on('close', code => {
+      if (code === 0) resolve();
+      else reject(new Error(`child exited with code ${code}: ${stderr}`));
+    });
+  });
+}
+
+function spawnCredentialsWriter(profile: string, apiKey: string, path: string): ChildProcess {
+  return spawn(process.execPath, [credentialsWriteChild], {
+    env: {
+      ...process.env,
+      CRED_PROFILE: profile,
+      CRED_PATH: path,
+      CRED_API_KEY: apiKey,
+    },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+}
+
+describe('credentials write lock', () => {
+  beforeAll(() => {
+    execSync('npm run build', { cwd: projectRoot, stdio: 'pipe' });
+  });
+
+  it('serializes cross-process writes so concurrent profile updates are not lost', async () => {
+    const children = [
+      spawnCredentialsWriter('dev', 'sk-dev', credentialsPath),
+      spawnCredentialsWriter('staging', 'sk-staging', credentialsPath),
+    ];
+    await Promise.all(children.map(waitForChild));
+
+    const file = readCredentialsFile({ path: credentialsPath });
+    expect(file.dev).toEqual({ apiKey: 'sk-dev' });
+    expect(file.staging).toEqual({ apiKey: 'sk-staging' });
+  });
+
+  it('removes the lock file after writeProfile completes', () => {
+    writeProfile('default', { apiKey: 'sk-lock-cleanup' }, { path: credentialsPath });
+    expect(existsSync(`${credentialsPath}.lock`)).toBe(false);
+  });
+
+  it('removes the lock file after deleteProfile completes', () => {
+    writeProfile('default', { apiKey: 'sk-d' }, { path: credentialsPath });
+    writeProfile('dev', { apiKey: 'sk-dev' }, { path: credentialsPath });
+    expect(deleteProfile('dev', { path: credentialsPath })).toBe(true);
+    expect(existsSync(`${credentialsPath}.lock`)).toBe(false);
   });
 });
