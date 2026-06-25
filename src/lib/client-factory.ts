@@ -15,7 +15,7 @@
  */
 import { loadConfig } from './config.js';
 import { defaultCredentialsPath } from './credentials.js';
-import { ApiError } from './errors.js';
+import { ApiError, localValidationError } from './errors.js';
 import { facadeBaseUrl } from './facade.js';
 import type { DebugEvent, FetchImpl } from './http.js';
 import {
@@ -139,15 +139,61 @@ function clampRequestTimeout(ms: number): number {
   return Math.min(Math.max(Math.round(ms), REQUEST_TIMEOUT_MIN_MS), REQUEST_TIMEOUT_MAX_MS);
 }
 
+/**
+ * Validate that the resolved API endpoint is a syntactically valid http(s)
+ * URL before it is used to build requests.
+ *
+ * Unlike the `--target-url` guard in `target-url.ts`, this deliberately does
+ * NOT reject localhost or private addresses: the API endpoint legitimately
+ * points at a self-hosted, local-dev, or mock backend on a private host. It
+ * only catches a malformed value (unparseable, or a non-http(s) scheme) so the
+ * operator gets a fast, actionable VALIDATION_ERROR (exit 5) instead of an
+ * opaque `Invalid URL` (exit 1, a raw `new URL()` throw) or a misleading
+ * `fetch failed / Service temporarily unavailable` emitted only after a full
+ * retry-and-backoff cycle.
+ *
+ * The value can originate from `--endpoint-url`, `TESTSPRITE_API_URL`, or the
+ * credentials file `api_url`, so the message names all three rather than
+ * assuming the flag.
+ */
+export function assertValidEndpointUrl(rawUrl: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw localValidationError(
+      'endpoint-url',
+      `"${rawUrl}" is not a valid URL — provide an http(s) URL (e.g. https://api.testsprite.com) ` +
+        `via --endpoint-url, TESTSPRITE_API_URL, or the credentials file`,
+      undefined,
+      'field',
+    );
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw localValidationError(
+      'endpoint-url',
+      `scheme "${parsed.protocol.replace(/:$/, '')}" is not supported — use http or https ` +
+        `(e.g. https://api.testsprite.com)`,
+      undefined,
+      'field',
+    );
+  }
+}
+
 export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}): HttpClient {
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const env = deps.env ?? process.env;
   const requestTimeoutMs = resolveRequestTimeoutMs(opts, env);
 
   if (opts.dryRun) {
+    const dryRunEndpoint = opts.endpointUrl ?? DRY_RUN_DEFAULT_ENDPOINT;
+    // Validate even under --dry-run so a typo in --endpoint-url is caught
+    // offline (no creds, no network). Validate BEFORE the banner so a rejected
+    // endpoint doesn't first announce a "sample response".
+    assertValidEndpointUrl(dryRunEndpoint);
     emitDryRunBanner(stderr);
     return new HttpClient({
-      baseUrl: facadeBaseUrl(opts.endpointUrl ?? DRY_RUN_DEFAULT_ENDPOINT),
+      baseUrl: facadeBaseUrl(dryRunEndpoint),
       apiKey: DRY_RUN_API_KEY,
       fetchImpl: deps.fetchImpl ?? createDryRunFetch(),
       onDebug: opts.debug ? (event: DebugEvent) => stderr(formatDryRunDebug(event)) : undefined,
@@ -163,6 +209,10 @@ export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}
     env,
     credentialsPath,
   });
+  // Catch a malformed endpoint (from --endpoint-url / TESTSPRITE_API_URL /
+  // credentials) before the auth check so a config typo surfaces as a clear
+  // VALIDATION_ERROR rather than an opaque URL throw or a retried "fetch failed".
+  assertValidEndpointUrl(config.apiUrl);
   if (!config.apiKey) throw ApiError.authRequired();
   return new HttpClient({
     baseUrl: facadeBaseUrl(config.apiUrl),
