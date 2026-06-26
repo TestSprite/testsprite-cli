@@ -8,6 +8,9 @@
  * the full http+fetch path is wired against MSW).
  */
 
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   applyFailedOnly,
@@ -16,6 +19,8 @@ import {
   buildMeta,
   pickCodeExtension,
   resolveBundleDir,
+  STREAM_URL_MAX_RETRIES,
+  streamUrlToFile,
   stepFilenamePrefix,
   type AssertContextIntegrityOptions,
 } from './bundle.js';
@@ -590,5 +595,97 @@ describe('resolveBundleDir', () => {
   it('strips a trailing slash', () => {
     const out = resolveBundleDir('/tmp/x/');
     expect(out).toBe('/tmp/x');
+  });
+});
+
+describe('streamUrlToFile retry', () => {
+  const noSleep = () => Promise.resolve();
+
+  it('succeeds on the first attempt: file written, fetchImpl called once', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stream-test-'));
+    const dest = join(dir, 'out.bin');
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      return new Response('hello', { status: 200 });
+    };
+    await streamUrlToFile('https://example.com/x', dest, fetchImpl as typeof globalThis.fetch, {
+      sleep: noSleep,
+    });
+    expect(calls).toBe(1);
+  });
+
+  it('retries on transport error and succeeds: fetchImpl called twice, file written', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stream-test-'));
+    const dest = join(dir, 'out.bin');
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      if (calls === 1) throw new Error('ECONNRESET socket hang up');
+      return new Response('retried-content', { status: 200 });
+    };
+    await streamUrlToFile('https://example.com/x', dest, fetchImpl as typeof globalThis.fetch, {
+      sleep: noSleep,
+    });
+    expect(calls).toBe(2);
+  });
+
+  it('throws TransportError after all retries exhausted', async () => {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      throw new Error('ENETUNREACH dns lookup failed');
+    };
+    await expect(
+      streamUrlToFile(
+        'https://example.com/x',
+        '/tmp/will-not-be-written',
+        fetchImpl as typeof globalThis.fetch,
+        { sleep: noSleep },
+      ),
+    ).rejects.toMatchObject({
+      name: 'TransportError',
+      message: expect.stringContaining('ENETUNREACH'),
+    });
+    expect(calls).toBe(STREAM_URL_MAX_RETRIES);
+  });
+
+  it('does NOT retry a non-2xx HTTP response (expired presigned URL)', async () => {
+    let calls = 0;
+    const fetchImpl = async () => {
+      calls++;
+      return new Response('Forbidden', { status: 403 });
+    };
+    await expect(
+      streamUrlToFile(
+        'https://example.com/x',
+        '/tmp/will-not-be-written',
+        fetchImpl as typeof globalThis.fetch,
+        { sleep: noSleep },
+      ),
+    ).rejects.toMatchObject({ code: 'UNAVAILABLE' });
+    expect(calls).toBe(1);
+  });
+
+  it('sleeps between retries', async () => {
+    const sleepDelays: number[] = [];
+    const fetchImpl = async () => {
+      throw new Error('flaky');
+    };
+    await expect(
+      streamUrlToFile(
+        'https://example.com/x',
+        '/tmp/will-not-be-written',
+        fetchImpl as typeof globalThis.fetch,
+        {
+          sleep: ms => {
+            sleepDelays.push(ms);
+            return Promise.resolve();
+          },
+        },
+      ),
+    ).rejects.toThrow();
+    expect(sleepDelays).toHaveLength(STREAM_URL_MAX_RETRIES - 1);
+    expect(sleepDelays.every(d => d > 0)).toBe(true);
   });
 });

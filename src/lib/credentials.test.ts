@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   DEFAULT_PROFILE,
+  assertValidProfileName,
   defaultCredentialsPath,
   deleteProfile,
   ensureRestrictiveMode,
@@ -17,6 +18,7 @@ import {
   serializeCredentials,
   writeProfile,
 } from './credentials.js';
+import { ApiError } from './errors.js';
 
 let tmpRoot: string;
 let credentialsPath: string;
@@ -229,5 +231,44 @@ describe('credentials write lock', () => {
     writeProfile('dev', { apiKey: 'sk-dev' }, { path: credentialsPath });
     expect(deleteProfile('dev', { path: credentialsPath })).toBe(true);
     expect(existsSync(`${credentialsPath}.lock`)).toBe(false);
+  });
+});
+
+describe('assertValidProfileName / profile-name guard', () => {
+  it('accepts conventional profile names', () => {
+    for (const name of ['default', 'dev', 'prod', 'ci-staging', 'team.qa', 'a_b', 'P1']) {
+      expect(() => assertValidProfileName(name)).not.toThrow();
+    }
+  });
+
+  it('rejects names that would corrupt the INI file, with a VALIDATION_ERROR (exit 5)', () => {
+    // `prod]` -> `[prod]]` (unreadable); newline splits the header; padded
+    // names do not round-trip (the parser trims section names); empty is not a
+    // valid section.
+    for (const name of ['prod]', '[weird', 'a\nb', '  spaced  ', 'has space', '', 'a/b']) {
+      let caught: unknown;
+      try {
+        assertValidProfileName(name);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(ApiError);
+      const apiErr = caught as ApiError;
+      expect(apiErr.code).toBe('VALIDATION_ERROR');
+      expect(apiErr.exitCode).toBe(5);
+      expect(apiErr.nextAction).toContain('profile');
+    }
+  });
+
+  it('writeProfile rejects a malformed name and does NOT create the file', () => {
+    expect(() => writeProfile('prod]', { apiKey: 'sk-1' }, { path: credentialsPath })).toThrow(
+      ApiError,
+    );
+    expect(existsSync(credentialsPath)).toBe(false);
+  });
+
+  it('readProfile and deleteProfile reject a malformed name', () => {
+    expect(() => readProfile('a\nb', { path: credentialsPath })).toThrow(ApiError);
+    expect(() => deleteProfile('a\nb', { path: credentialsPath })).toThrow(ApiError);
   });
 });

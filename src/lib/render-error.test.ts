@@ -7,7 +7,7 @@
  * subcommand name.
  */
 import { describe, expect, it } from 'vitest';
-import { rephraseUnknownOption } from './render-error.js';
+import { renderCommanderError, rephraseUnknownOption } from './render-error.js';
 
 describe('rephraseUnknownOption', () => {
   it('rephrases --dry-run placed after subcommand', () => {
@@ -86,5 +86,62 @@ describe('rephraseUnknownOption', () => {
     const result = rephraseUnknownOption("error: unknown option '--endpoint-url'");
     expect(result).not.toBeNull();
     expect(result).toContain('testsprite --endpoint-url <value> <subcommand>');
+  });
+});
+
+describe('renderCommanderError', () => {
+  it('json mode: emits VALIDATION_ERROR envelope', () => {
+    const out = renderCommanderError("error: unknown command 'foo'\n", 'fallback', 'json');
+    const parsed = JSON.parse(out) as {
+      error: { code: string; message: string; requestId: string; nextAction: string };
+    };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error.message).toBe("error: unknown command 'foo'");
+    expect(parsed.error.requestId).toBe('local');
+    expect(typeof parsed.error.nextAction).toBe('string');
+    expect(parsed.error.nextAction.length).toBeGreaterThan(0);
+  });
+
+  it('json mode: uses fallback when pendingMsg is null', () => {
+    const out = renderCommanderError(null, 'missing required argument', 'json');
+    const parsed = JSON.parse(out) as { error: { message: string } };
+    expect(parsed.error.message).toBe('missing required argument');
+  });
+
+  it('json mode: trims trailing newline from message', () => {
+    const out = renderCommanderError('error: bad option\n', 'bad', 'json');
+    const parsed = JSON.parse(out) as { error: { message: string } };
+    expect(parsed.error.message).toBe('error: bad option');
+  });
+
+  it('json mode: output is valid JSON ending with newline', () => {
+    const out = renderCommanderError('error: something', 'fallback', 'json');
+    expect(out.endsWith('\n')).toBe(true);
+    expect(() => JSON.parse(out)).not.toThrow();
+  });
+
+  it('text mode: returns pendingMsg as-is', () => {
+    const out = renderCommanderError('error: bad command\n', 'bad', 'text');
+    expect(out).toBe('error: bad command\n');
+  });
+
+  it('text mode: synthesizes from fallback when pendingMsg is null', () => {
+    const out = renderCommanderError(null, 'missing required argument', 'text');
+    expect(out).toContain('missing required argument');
+  });
+
+  it('json mode: rephrased global-flag message is embedded in envelope', () => {
+    const rephrased = rephraseUnknownOption("error: unknown option '--output'")!;
+    const out = renderCommanderError(`${rephrased}\n`, 'unknown option', 'json');
+    const parsed = JSON.parse(out) as { error: { code: string; message: string } };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error.message).toContain('--output');
+    expect(parsed.error.message).toContain('global flag');
+  });
+
+  it('json mode: envelope has exactly the expected top-level key', () => {
+    const out = renderCommanderError('error: test', 'test', 'json');
+    const parsed = JSON.parse(out) as Record<string, unknown>;
+    expect(Object.keys(parsed)).toEqual(['error']);
   });
 });

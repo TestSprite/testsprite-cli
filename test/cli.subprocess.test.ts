@@ -499,6 +499,52 @@ describe('project list subprocess', () => {
   }, 30_000);
 });
 
+describe('a malformed --profile is rejected (exit 5), not silently corrupting credentials', () => {
+  // A profile name becomes an INI section header (`[name]`). `prod]` would
+  // serialise to `[prod]]`, which the parser cannot read back — `setup` would
+  // report success while the key silently fails to persist. The guard fires on
+  // any credential read/write path.
+  it('exits 5 with a VALIDATION_ERROR naming the profile flag', async () => {
+    const result = await runCli(['--output', 'json', '--profile', 'prod]', 'project', 'list'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    const parsed = JSON.parse(result.stderr) as { error: { code: string; nextAction: string } };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error.nextAction).toContain('profile');
+  }, 30_000);
+});
+
+describe('malformed --endpoint-url is rejected (exit 5), not retried as a network error', () => {
+  // Previously: a malformed endpoint surfaced either as an opaque `Invalid URL`
+  // (exit 1) or, for a missing/wrong scheme, as a `fetch failed` UNAVAILABLE
+  // only after a full retry-and-backoff cycle. Both are misleading config
+  // errors. Validation throws before any fetch, so no network is hit here even
+  // though a (dummy) key is configured.
+
+  it('an unparseable endpoint exits 5 with a VALIDATION_ERROR naming endpoint-url', async () => {
+    const result = await runCli(
+      ['--output', 'json', '--endpoint-url', 'not a url', 'project', 'list'],
+      { TESTSPRITE_API_KEY: 'sk-subproc' },
+    );
+    expect(result.exitCode).toBe(5);
+    const parsed = JSON.parse(result.stderr) as { error: { code: string; nextAction: string } };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error.nextAction).toContain('endpoint-url');
+  }, 30_000);
+
+  it('a non-http(s) scheme exits 5 instead of being retried as a network failure', async () => {
+    const result = await runCli(
+      ['--output', 'json', '--endpoint-url', 'ftp://example.com', 'project', 'list'],
+      { TESTSPRITE_API_KEY: 'sk-subproc' },
+    );
+    expect(result.exitCode).toBe(5);
+    const parsed = JSON.parse(result.stderr) as { error: { code: string } };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+  }, 30_000);
+});
+
 describe('project get subprocess', () => {
   it('--output json returns the §6.1 Project shape', async () => {
     const result = await runCli(['--output', 'json', 'project', 'get', 'project_subproc'], {
@@ -1109,5 +1155,65 @@ describe('[fix-5] Commander parse errors → exit 5; help/version → exit 0', (
     const result = await runCli(['--version']);
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBeTruthy(); // version string on stdout
+  }, 30_000);
+
+  it('--output json: missing required arg emits JSON VALIDATION_ERROR envelope, not plain text', async () => {
+    // `test result` requires a positional <test-id>. With --output json, the
+    // CommanderError must be rendered as a machine-readable JSON envelope so
+    // a coding agent parsing stderr does not receive an unexpected plain-text
+    // error and crash its JSON.parse.
+    const result = await runCli(['--output', 'json', 'test', 'result'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    let parsed: { error: { code: string; message: string; requestId: string } };
+    expect(() => {
+      parsed = JSON.parse(result.stderr) as typeof parsed;
+    }).not.toThrow();
+    expect(parsed!.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed!.error.requestId).toBe('local');
+    expect(parsed!.error.message).toBeTruthy();
+  }, 30_000);
+
+  it('--output json: unknown subcommand emits JSON envelope (--output before bad arg)', async () => {
+    // --output json appears before the unknown subcommand, so Commander parses
+    // it and program.opts().output is 'json' when the error fires.
+    const result = await runCli(['--output', 'json', 'test', 'not-a-real-subcommand'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    let parsed: { error: { code: string } };
+    expect(() => {
+      parsed = JSON.parse(result.stderr) as typeof parsed;
+    }).not.toThrow();
+    expect(parsed!.error.code).toBe('VALIDATION_ERROR');
+  }, 30_000);
+
+  it('--output json after bad arg: argv fallback detects json mode and emits envelope', async () => {
+    // The error fires before --output json is parsed, so program.opts().output
+    // is the default 'text'. The argv fallback scan must still detect json mode.
+    const result = await runCli(['test', 'not-a-real-subcommand', '--output', 'json'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    let parsed: { error: { code: string } };
+    expect(() => {
+      parsed = JSON.parse(result.stderr) as typeof parsed;
+    }).not.toThrow();
+    expect(parsed!.error.code).toBe('VALIDATION_ERROR');
+  }, 30_000);
+
+  it('text mode: Commander parse error still emits plain text (no regression)', async () => {
+    const result = await runCli(['test', 'result'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    // Must NOT be a JSON envelope in text mode.
+    expect(() => JSON.parse(result.stderr)).toThrow();
+    expect(result.stderr).toContain('test-id');
   }, 30_000);
 });
