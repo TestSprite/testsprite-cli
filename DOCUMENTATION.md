@@ -248,6 +248,31 @@ testsprite test failure summary test_xxxxxxxx --output json
 testsprite test failure summary test_xxxxxxxx --dry-run --output json
 ```
 
+#### `testsprite test failure triage --project <id>`
+
+When many tests fail in the same project, triage them into a few root-cause clusters before downloading bundles. The CLI lists all failed tests, fetches a lightweight `failure/summary` per test (no screenshots or video), and groups them client-side by:
+
+1. shared `recommendedFixTarget.reference`
+2. env-wide `failureKind` (`infra`, `network`, `network_timeout`, `routing_404`)
+3. normalized `rootCauseHypothesis` prefix
+4. singleton (one test per cluster when no shared signal exists)
+
+Each cluster includes a `representativeTestId`, `memberTestIds`, `confidence`, and `fixPriority` (lower = fix first). After triage, pull one bundle from the representative test:
+
+```bash
+# Triage all failed tests in a project
+testsprite test failure triage --project proj_xxxxxxxx --output json
+
+# Limit to backend tests whose name contains "checkout"
+testsprite test failure triage --project proj_xxxxxxxx --type backend --filter checkout --output json
+
+# Then investigate the highest-priority cluster's representative test
+testsprite test failure get <representativeTestId> --out ./.testsprite/failure
+
+# Learn the JSON shape offline
+testsprite test failure triage --project proj_xxxxxxxx --dry-run --output json
+```
+
 ### Write commands
 
 Require the `write:tests` scope.

@@ -101,6 +101,7 @@ Prefer to configure each step by hand (or learn the surface offline with `--dry-
 |           | `test result`                                       | Latest result; `--history` lists a test's prior runs                                                                  |
 |           | `test failure get`                                  | The agent entry point: one self-contained latest-failure bundle                                                       |
 |           | `test failure summary`                              | One-screen triage card (no media download)                                                                            |
+|           | `test failure triage`                             | Group all failed tests in a project into root-cause clusters (no bundle download)                                   |
 | **Write** | `test create` / `test create-batch`                 | Create a test (or bulk-create from a plan file); `--produces` / `--needs` / `--category` wire BE dependency metadata  |
 |           | `test update` / `test delete` / `test delete-batch` | Edit metadata / soft-delete                                                                                           |
 |           | `test code put`                                     | Replace generated code (etag-guarded)                                                                                 |

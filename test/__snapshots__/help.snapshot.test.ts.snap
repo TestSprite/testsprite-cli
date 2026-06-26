@@ -336,6 +336,35 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --deb
 "
 `;
 
+exports[`--help snapshots > test failure triage 1`] = `
+"Usage: testsprite test failure triage [options]
+
+Group all failed tests in a project into root-cause clusters (lightweight
+summary fan-out — no bundle downloads)
+
+Options:
+  --project <id>         project id (returned by \`testsprite project list\`)
+  --type <type>          filter by test type (frontend|backend)
+  --filter <substr>      only include tests whose name contains this substring
+                         (case-insensitive)
+  --max-concurrency <n>  max parallel failure-summary fetches (1–100, default
+                         5) (default: \\"5\\")
+  -h, --help             display help for command
+Clusters are built client-side from existing M2.1 analysis fields:
+  1. shared recommendedFixTarget.reference
+  2. env-wide failureKind (infra, network, network_timeout, routing_404)
+  3. normalized rootCauseHypothesis prefix
+  4. singleton (one test per cluster)
+
+After a batch run with many failures, triage first — then pull one bundle:
+  testsprite test failure get <representativeTestId> --out ./.testsprite/failure
+
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+  testsprite --help
+"
+`;
+
 exports[`--help snapshots > test get 1`] = `
 "Usage: testsprite test get [options] <test-id>
 

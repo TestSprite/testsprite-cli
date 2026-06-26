@@ -29,6 +29,7 @@ import {
   runDelete,
   runFailureGet,
   runFailureSummary,
+  runFailureTriage,
   runGet,
   runList,
   runPlanPut,
@@ -147,7 +148,7 @@ describe('createTestCommand — surface', () => {
     expect(failure).toBeDefined();
     // M2.1 piece 3 adds `summary`. `get` is the bundle entry point;
     // `summary` is the lightweight analysis-only triage card.
-    expect(failure!.commands.map(c => c.name()).sort()).toEqual(['get', 'summary']);
+    expect(failure!.commands.map(c => c.name()).sort()).toEqual(['get', 'summary', 'triage']);
   });
 
   it('list exposes the documented filter and pagination flags (including --cursor alias)', () => {
@@ -281,6 +282,16 @@ describe('createTestCommand — surface', () => {
     const help = captureHelp(failureSummary);
     expect(help).toContain('testsprite --help');
     expect(help).toContain('--dry-run');
+  });
+
+  it('test failure triage --help includes GLOBAL_OPTS_HINT and --project', () => {
+    const test = createTestCommand();
+    const failure = test.commands.find(c => c.name() === 'failure')!;
+    const failureTriage = failure.commands.find(c => c.name() === 'triage')!;
+    const help = captureHelp(failureTriage);
+    expect(help).toContain('testsprite --help');
+    expect(help).toContain('--project');
+    expect(help).toContain('--max-concurrency');
   });
 
   it('M2 sweep: all remaining leaf subcommands include GLOBAL_OPTS_HINT', () => {
@@ -3234,6 +3245,225 @@ describe('runFailureSummary', () => {
       exitCode: 4,
       details: { reason: 'no_failing_run' },
     });
+  });
+});
+
+// ---------- runFailureTriage ----------
+
+describe('runFailureTriage', () => {
+  const FAILED_TEST_A = {
+    id: 'test_a',
+    projectId: 'proj_1',
+    name: 'Checkout submit',
+    type: 'frontend' as const,
+    createdFrom: 'cli' as const,
+    status: 'failed' as const,
+    createdAt: '2026-06-26T10:00:00.000Z',
+    updatedAt: '2026-06-26T12:00:00.000Z',
+  };
+  const FAILED_TEST_B = {
+    ...FAILED_TEST_A,
+    id: 'test_b',
+    name: 'Checkout validation',
+    updatedAt: '2026-06-26T12:01:00.000Z',
+  };
+  const FAILED_TEST_C = {
+    ...FAILED_TEST_A,
+    id: 'test_c',
+    name: 'Health check',
+    type: 'backend' as const,
+    updatedAt: '2026-06-26T12:02:00.000Z',
+  };
+
+  const SHARED_REF = 'src/components/CheckoutForm.tsx:412';
+
+  function summaryFor(testId: string, overrides: Record<string, unknown> = {}) {
+    return {
+      testId,
+      status: 'failed' as const,
+      failureKind: 'assertion' as const,
+      snapshotId: `snap_${testId}`,
+      rootCauseHypothesis: 'Submit button is disabled.',
+      recommendedFixTarget: {
+        kind: 'code' as const,
+        reference: SHARED_REF,
+        rationale: 'Fix validation predicate.',
+      },
+      ...overrides,
+    };
+  }
+
+  it('JSON mode clusters failed tests by shared fix target', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      seen.push(url);
+      if (url.includes('/tests?') && url.includes('status=failed')) {
+        return { body: { items: [FAILED_TEST_A, FAILED_TEST_B, FAILED_TEST_C], nextToken: null } };
+      }
+      if (url.includes('/tests/test_a/failure/summary')) {
+        return { body: summaryFor('test_a') };
+      }
+      if (url.includes('/tests/test_b/failure/summary')) {
+        return { body: summaryFor('test_b') };
+      }
+      if (url.includes('/tests/test_c/failure/summary')) {
+        return {
+          body: summaryFor('test_c', {
+            failureKind: 'network_timeout',
+            rootCauseHypothesis: null,
+            recommendedFixTarget: null,
+          }),
+        };
+      }
+      throw new Error(`unexpected url: ${url}`);
+    });
+    const out: string[] = [];
+    const got = await runFailureTriage(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_1',
+        maxConcurrency: 5,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    expect(seen.some(u => u.includes('status=failed'))).toBe(true);
+    expect(got.summary.totalFailed).toBe(3);
+    expect(got.clusters).toHaveLength(2);
+
+    const codeCluster = got.clusters.find(c => c.groupReason === 'fix_target');
+    expect(codeCluster?.memberTestIds).toEqual(['test_a', 'test_b']);
+    // test_b is fresher (updatedAt) and both members have a hypothesis
+    expect(codeCluster?.representativeTestId).toBe('test_b');
+
+    const envCluster = got.clusters.find(c => c.groupReason === 'failure_kind');
+    expect(envCluster?.memberTestIds).toEqual(['test_c']);
+
+    expect(JSON.parse(out[0]!).clusters).toHaveLength(2);
+  });
+
+  it('text mode renders cluster summary lines', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests?')) {
+        return { body: { items: [FAILED_TEST_A], nextToken: null } };
+      }
+      return { body: summaryFor('test_a') };
+    });
+    const out: string[] = [];
+    await runFailureTriage(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_1',
+        maxConcurrency: 5,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    const block = out.join('\n');
+    expect(block).toContain('projectId:    proj_1');
+    expect(block).toContain('representative:  test_a');
+    expect(block).toContain('Shared fix target:');
+  });
+
+  it('dry-run emits canned clusters without network', async () => {
+    const out: string[] = [];
+    const got = await runFailureTriage(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'proj_dry',
+        maxConcurrency: 5,
+      },
+      { stdout: line => out.push(line) },
+    );
+    expect(got.summary.clusterCount).toBe(2);
+    expect(got.clusters[0]?.groupReason).toBe('failure_kind');
+    expect(JSON.parse(out[0]!).projectId).toBe('proj_dry');
+  });
+
+  it('returns empty clusters when no failed tests match', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { items: [], nextToken: null } }));
+    const out: string[] = [];
+    const got = await runFailureTriage(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_empty',
+        maxConcurrency: 5,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    expect(got.clusters).toEqual([]);
+    expect(got.summary.totalFailed).toBe(0);
+    expect(JSON.parse(out[0]!).clusters).toEqual([]);
+  });
+
+  it('skips tests whose failure summary returns NOT_FOUND', async () => {
+    const { credentialsPath } = makeCreds();
+    const stderrLines: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests?')) {
+        return { body: { items: [FAILED_TEST_A, FAILED_TEST_B], nextToken: null } };
+      }
+      if (url.includes('/tests/test_a/failure/summary')) {
+        return { body: summaryFor('test_a') };
+      }
+      return {
+        status: 404,
+        body: {
+          error: {
+            code: 'NOT_FOUND',
+            message: 'Test has no failing run.',
+            nextAction: 'No failing run.',
+            requestId: 'req_test',
+            details: { resource: 'test', id: 'test_b', reason: 'no_failing_run' },
+          },
+        },
+      };
+    });
+    const got = await runFailureTriage(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_1',
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    expect(got.summary.totalFailed).toBe(1);
+    expect(got.summary.skipped).toBe(1);
+    expect(got.skipped?.[0]).toEqual({ testId: 'test_b', reason: 'no_failing_run' });
+    expect(stderrLines.some(l => l.includes('skipped'))).toBe(true);
+  });
+
+  it('rejects missing projectId with VALIDATION_ERROR (exit 5)', async () => {
+    await expect(
+      runFailureTriage(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: '',
+          maxConcurrency: 5,
+        },
+        { stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 });
 

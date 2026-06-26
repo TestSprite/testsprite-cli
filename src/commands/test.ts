@@ -65,6 +65,12 @@ import { createTicker } from '../lib/ticker.js';
 import { RateThrottle } from '../lib/rate-throttle.js';
 import { resolvePortalBase, resolvePortalUrl } from '../lib/facade.js';
 import { loadConfig } from '../lib/config.js';
+import {
+  buildFailureClusters,
+  renderFailureTriageText,
+  type FailureTriageInput,
+  type FailureTriageResult,
+} from '../lib/failure-triage.js';
 
 /**
  * `details` debug block per the CLI OpenAPI `Test` schema
@@ -1812,6 +1818,9 @@ function mergeBatchRerunClosureByProject(
 export const DEFAULT_BATCH_RUN_CONCURRENCY = 50;
 /** Hard upper bound for --max-concurrency. Values above this are rejected with exit 5 (VALIDATION_ERROR). */
 export const MAX_BATCH_CONCURRENCY = 100;
+
+/** Default fan-out when fetching per-test failure summaries during triage. */
+export const DEFAULT_TRIAGE_CONCURRENCY = 5;
 
 /** Client-side run-trigger throttle: 50 triggers per 60-second rolling window per key (sits just under the server's 60/min/key cap). */
 export const BATCH_RUN_RATE_LIMIT = 50;
@@ -4018,6 +4027,217 @@ function formatDurationMs(startedAt: string | null, finishedAt: string | null): 
 
 interface FailureSummaryOptions extends CommonOptions {
   testId: string;
+}
+
+interface FailureTriageOptions extends CommonOptions {
+  projectId: string;
+  type?: 'frontend' | 'backend';
+  nameFilter?: string;
+  maxConcurrency: number;
+}
+
+/**
+ * `test failure triage --project <id>` — groups failed tests in a
+ * project into root-cause clusters using existing M2.1 analysis
+ * fields (`failureKind`, `recommendedFixTarget.reference`,
+ * `rootCauseHypothesis`). Lightweight: one `failure/summary` call
+ * per failed test, no bundle downloads.
+ *
+ * Client-side Phase-0 triage — deterministic heuristics only. When
+ * the backend ships native clustering, this command becomes a thin
+ * wrapper over the new read API.
+ */
+export async function runFailureTriage(
+  opts: FailureTriageOptions,
+  deps: TestDeps = {},
+): Promise<FailureTriageResult> {
+  requireProjectId(opts.projectId);
+
+  if (
+    !Number.isInteger(opts.maxConcurrency) ||
+    opts.maxConcurrency < 1 ||
+    opts.maxConcurrency > MAX_BATCH_CONCURRENCY
+  ) {
+    throw localValidationError('max-concurrency', 'must be an integer between 1 and 100');
+  }
+
+  const out = makeOutput(opts.output, deps);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+
+  if (opts.dryRun) {
+    const dryRunResult: FailureTriageResult = {
+      projectId: opts.projectId,
+      clusters: [
+        {
+          clusterId: 'cluster_kind_network_timeout',
+          label: 'Environment issue (network_timeout)',
+          groupKey: 'kind:network_timeout',
+          groupReason: 'failure_kind',
+          failureKind: 'network_timeout',
+          representativeTestId: 'test_dryrun_a',
+          memberTestIds: ['test_dryrun_a', 'test_dryrun_b'],
+          members: [
+            {
+              testId: 'test_dryrun_a',
+              testName: 'Dry-run checkout flow',
+              testType: 'frontend',
+              updatedAt: '2026-06-26T12:00:00.000Z',
+              status: 'failed',
+              failureKind: 'network_timeout',
+              snapshotId: 'snap_dryrun_a',
+              rootCauseHypothesis: null,
+              recommendedFixTarget: null,
+            },
+            {
+              testId: 'test_dryrun_b',
+              testName: 'Dry-run profile update',
+              testType: 'frontend',
+              updatedAt: '2026-06-26T12:01:00.000Z',
+              status: 'failed',
+              failureKind: 'network_timeout',
+              snapshotId: 'snap_dryrun_b',
+              rootCauseHypothesis: null,
+              recommendedFixTarget: null,
+            },
+          ],
+          canonicalRootCause: null,
+          confidence: 0.88,
+          fixPriority: 1,
+        },
+        {
+          clusterId: 'cluster_ref_src_components_checkoutform_tsx_412',
+          label: 'Shared fix target: src/components/CheckoutForm.tsx:412',
+          groupKey: 'ref:src/components/CheckoutForm.tsx:412',
+          groupReason: 'fix_target',
+          failureKind: 'assertion',
+          representativeTestId: 'test_dryrun_c',
+          memberTestIds: ['test_dryrun_c'],
+          members: [
+            {
+              testId: 'test_dryrun_c',
+              testName: 'Dry-run submit checkout',
+              testType: 'frontend',
+              updatedAt: '2026-06-26T12:02:00.000Z',
+              status: 'failed',
+              failureKind: 'assertion',
+              snapshotId: 'snap_dryrun_c',
+              rootCauseHypothesis: 'Submit button is disabled because the credit-card field is empty.',
+              recommendedFixTarget: {
+                kind: 'code',
+                reference: 'src/components/CheckoutForm.tsx:412',
+                rationale: 'Disabled state originates from `isFormValid()`.',
+              },
+            },
+          ],
+          canonicalRootCause:
+            'Submit button is disabled because the credit-card field is empty.',
+          confidence: 0.7,
+          fixPriority: 3,
+        },
+      ],
+      summary: { totalFailed: 3, clusterCount: 2, skipped: 0 },
+    };
+    out.print(dryRunResult, data => renderFailureTriageText(data as FailureTriageResult));
+    return dryRunResult;
+  }
+
+  const client = makeClient(opts, deps);
+
+  const failedPage = await paginate<CliTest>(
+    async ({ pageSize, cursor }) =>
+      client.get<Page<CliTest>>('/tests', {
+        query: {
+          projectId: opts.projectId,
+          status: 'failed',
+          type: opts.type,
+          pageSize,
+          cursor,
+        },
+      }),
+    {},
+  );
+
+  let failedTests = failedPage.items.filter(t => t.status === 'failed');
+  if (opts.nameFilter !== undefined && opts.nameFilter !== '') {
+    const needle = opts.nameFilter.toLowerCase();
+    failedTests = failedTests.filter(t => t.name.toLowerCase().includes(needle));
+  }
+
+  if (failedTests.length === 0) {
+    const empty: FailureTriageResult = {
+      projectId: opts.projectId,
+      clusters: [],
+      summary: { totalFailed: 0, clusterCount: 0, skipped: 0 },
+    };
+    out.print(empty, data => renderFailureTriageText(data as FailureTriageResult));
+    return empty;
+  }
+
+  stderrFn(
+    `Fetching failure summaries for ${failedTests.length} failed test${failedTests.length !== 1 ? 's' : ''}…`,
+  );
+
+  const triageInputs: FailureTriageInput[] = [];
+  const skipped: Array<{ testId: string; reason: string }> = [];
+  const concurrencyLimit = opts.maxConcurrency;
+  let nextIdx = 0;
+  let inFlight = 0;
+
+  await new Promise<void>((resolve, reject) => {
+    function startNext(): void {
+      while (inFlight < concurrencyLimit && nextIdx < failedTests.length) {
+        const test = failedTests[nextIdx++]!;
+        inFlight++;
+        client
+          .get<CliFailureSummary>(`/tests/${encodeURIComponent(test.id)}/failure/summary`)
+          .then(summary => {
+            triageInputs.push({
+              testId: test.id,
+              testName: test.name,
+              testType: test.type,
+              updatedAt: test.updatedAt,
+              summary: {
+                status: summary.status,
+                failureKind: summary.failureKind,
+                snapshotId: summary.snapshotId,
+                rootCauseHypothesis: summary.rootCauseHypothesis,
+                recommendedFixTarget: summary.recommendedFixTarget,
+              },
+            });
+            inFlight--;
+            startNext();
+            if (inFlight === 0 && nextIdx >= failedTests.length) resolve();
+          })
+          .catch(err => {
+            if (err instanceof ApiError && err.code === 'NOT_FOUND') {
+              skipped.push({ testId: test.id, reason: 'no_failing_run' });
+              if (opts.verbose) {
+                stderrFn(`[triage] skipped ${test.id} — no failing run (race or stale list row)`);
+              }
+            } else {
+              reject(err);
+            }
+            inFlight--;
+            startNext();
+            if (inFlight === 0 && nextIdx >= failedTests.length) resolve();
+          });
+      }
+    }
+    startNext();
+    if (failedTests.length === 0) resolve();
+  });
+
+  const result = buildFailureClusters(opts.projectId, triageInputs);
+  if (skipped.length > 0) {
+    result.summary.skipped = skipped.length;
+    result.skipped = skipped;
+    stderrFn(
+      `[advisory] ${skipped.length} test${skipped.length !== 1 ? 's' : ''} skipped — listed as failed but had no failure summary (stale status or in-flight run).`,
+    );
+  }
+
+  out.print(result, data => renderFailureTriageText(data as FailureTriageResult));
+  return result;
 }
 
 /**
@@ -8697,5 +8917,50 @@ function createTestFailureCommand(deps: TestDeps): Command {
     .action(async (testId: string, _cmdOpts, command: Command) => {
       await runFailureSummary({ ...resolveCommonOptions(command), testId }, deps);
     });
+  failure
+    .command('triage')
+    .description(
+      'Group all failed tests in a project into root-cause clusters (lightweight summary fan-out — no bundle downloads)',
+    )
+    .requiredOption('--project <id>', 'project id (returned by `testsprite project list`)')
+    .option('--type <type>', 'filter by test type (frontend|backend)')
+    .option('--filter <substr>', 'only include tests whose name contains this substring (case-insensitive)')
+    .option(
+      '--max-concurrency <n>',
+      `max parallel failure-summary fetches (1–${MAX_BATCH_CONCURRENCY}, default ${DEFAULT_TRIAGE_CONCURRENCY})`,
+      String(DEFAULT_TRIAGE_CONCURRENCY),
+    )
+    .addHelpText(
+      'after',
+      [
+        'Clusters are built client-side from existing M2.1 analysis fields:',
+        '  1. shared recommendedFixTarget.reference',
+        '  2. env-wide failureKind (infra, network, network_timeout, routing_404)',
+        '  3. normalized rootCauseHypothesis prefix',
+        '  4. singleton (one test per cluster)',
+        '',
+        'After a batch run with many failures, triage first — then pull one bundle:',
+        '  testsprite test failure get <representativeTestId> --out ./.testsprite/failure',
+        '',
+        GLOBAL_OPTS_HINT,
+      ].join('\n'),
+    )
+    .action(
+      async (
+        cmdOpts: { project: string; type?: string; filter?: string; maxConcurrency?: string },
+        command: Command,
+      ) => {
+        await runFailureTriage(
+          {
+            ...resolveCommonOptions(command),
+            projectId: cmdOpts.project,
+            type: parseEnumFlag(cmdOpts.type, 'type', TEST_TYPES),
+            nameFilter: cmdOpts.filter,
+            maxConcurrency: parseNumericFlag(cmdOpts.maxConcurrency, 'max-concurrency') ?? DEFAULT_TRIAGE_CONCURRENCY,
+          },
+          deps,
+        );
+      },
+    );
   return failure;
 }

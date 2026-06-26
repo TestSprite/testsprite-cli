@@ -416,7 +416,22 @@ testing agent's observation; don't auto-fix on the recommendation alone. If you
 genuinely can't tell: report `inconclusive` with the signal that triggered the
 call and ask.
 
-## 5. On failure → download the artifact
+## 5. On failure → triage first, then download one bundle
+
+When **multiple tests failed** in the same project (batch run, regression, or
+`test list --status failed` shows more than one red row), triage before pulling
+every bundle:
+
+```bash
+testsprite test failure triage --project <projectId> --output json
+```
+
+Read the clusters: each has a `representativeTestId`, `memberTestIds`,
+`confidence`, and `fixPriority` (lower = fix first). Investigate the
+representative test from the highest-priority cluster — not an arbitrary failed
+test. After a fix, rerun that representative before rerunning the full suite.
+
+For a **single** failed test, skip triage and go straight to the artifact:
 
 ```bash
 testsprite test artifact get <run-id> --out ./.testsprite/runs/<run-id>/

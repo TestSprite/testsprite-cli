@@ -4,6 +4,10 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **`test failure triage --project <id>`** — groups all failed tests in a project into root-cause clusters using existing M2.1 analysis fields (`failureKind`, `recommendedFixTarget.reference`, `rootCauseHypothesis`). Returns a representative test per cluster, affected test ids, confidence score, and fix priority — without downloading failure bundles. Supports `--type`, `--filter`, and `--max-concurrency`. Client-side Phase-0 triage until native backend clustering ships.
+
 ## [0.2.0] - 2026-06-29
 
 ### Added
