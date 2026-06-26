@@ -43,8 +43,16 @@ describe('validatePaginationFlags', () => {
     expect(() => validatePaginationFlags({ pageSize: Number.NaN })).toThrow(ApiError);
   });
 
+  it('rejects fractional pageSize values', () => {
+    expect(() => validatePaginationFlags({ pageSize: 1.5 })).toThrow(ApiError);
+  });
+
   it('rejects maxItems=0', () => {
     expect(() => validatePaginationFlags({ maxItems: 0 })).toThrow(ApiError);
+  });
+
+  it('rejects fractional maxItems values', () => {
+    expect(() => validatePaginationFlags({ maxItems: 2.5 })).toThrow(ApiError);
   });
 
   it('accepts pageSize=100 (the hard cap)', () => {
