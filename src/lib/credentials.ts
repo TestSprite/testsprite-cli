@@ -217,6 +217,9 @@ function withCredentialsLock<T>(credentialsPath: string, fn: () => T): T {
 
 function acquireCredentialsLock(credentialsPath: string): void {
   const lockPath = credentialsLockPath(credentialsPath);
+  // Ensure the credentials directory exists before creating the lock file.
+  // writeCredentialsAtomic also mkdirs, but only after the lock is held.
+  mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
   const deadline = Date.now() + CREDENTIALS_LOCK_MAX_WAIT_MS;
   while (Date.now() < deadline) {
     try {
