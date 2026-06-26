@@ -319,10 +319,10 @@ testsprite test plan put test_xxxxxxxx --steps ./refined.plan.json --dry-run --o
 
 #### `testsprite project create` / `project update`
 
-Manage projects from the CLI. Both pre-flight `--target-url` against local addresses for fast feedback.
+Manage projects from the CLI. Both pre-flight `--url` against local addresses for fast feedback.
 
 ```bash
-testsprite project create --name "Checkout" --target-url https://staging.example.com
+testsprite project create --type frontend --name "Checkout" --url https://staging.example.com
 testsprite project update proj_xxxxxxxx --name "Checkout v2"
 ```
 
