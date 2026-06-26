@@ -34,7 +34,7 @@ Options:
                 destroyed.
   -h, --help    display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -47,7 +47,7 @@ List supported agent targets, their status, and landing paths
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -84,7 +84,7 @@ exports[`--help snapshots > auth logout 1`] = `
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -95,7 +95,7 @@ exports[`--help snapshots > auth whoami 1`] = `
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -151,7 +151,7 @@ Get a project by id
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -173,7 +173,7 @@ Options:
   --max-items <n>           stop after this many items across auto-paged pages
   -h, --help                display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -278,7 +278,7 @@ Options:
                 source body; json mode: wire envelope)
   -h, --help    display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -313,7 +313,7 @@ Options:
                              per invocation; pin one yourself for safe retries.
   -h, --help                 display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -329,7 +329,7 @@ Options:
   --failed-only  Keep only the failed step plus its immediate neighbors (±1)
   -h, --help     display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -342,7 +342,7 @@ Get a test by id
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -367,7 +367,7 @@ Options:
   --max-items <n>           stop after this many items across auto-paged pages
   -h, --help                display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -431,7 +431,7 @@ Dry-run shape notes:
     omit \`closure\` (or return it as null) since there is no dependency expansion.
   • \`autoHeal\` defaults true for FE reruns; BE reruns ignore the field entirely.
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -463,7 +463,7 @@ Options:
   --cursor <token>    with --history: opaque cursor from a prior page
   -h, --help          display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -514,7 +514,7 @@ Dependency-aware fresh run (M4):
 BE tests can declare --produces/--needs at create time to drive wave ordering
 (see \`testsprite test create --help\` for details).
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -537,7 +537,7 @@ Options:
                             excluded when this flag is set.
   -h, --help                display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;

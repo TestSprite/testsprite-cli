@@ -3,10 +3,10 @@ export type OutputMode = 'json' | 'text';
 /**
  * Help-text footer pointing at the global options surface so users
  * looking at any subcommand `--help` don't miss `--dry-run`, `--output`,
- * `--profile`, `--endpoint-url`, `--debug`.
+ * `--profile`, `--endpoint-url`, `--request-timeout`, `--debug`.
  */
 export const GLOBAL_OPTS_HINT =
-  '\nGlobal options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):' +
+  '\nGlobal options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):' +
   '\n  testsprite --help';
 
 export function isOutputMode(value: unknown): value is OutputMode {
