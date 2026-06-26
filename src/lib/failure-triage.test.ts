@@ -10,7 +10,9 @@ import {
   type FailureTriageMember,
 } from './failure-triage.js';
 
-function makeInput(overrides: Partial<FailureTriageInput> & { testId: string }): FailureTriageInput {
+function makeInput(
+  overrides: Partial<FailureTriageInput> & { testId: string },
+): FailureTriageInput {
   return {
     testName: overrides.testName ?? `Test ${overrides.testId}`,
     testType: overrides.testType ?? 'frontend',

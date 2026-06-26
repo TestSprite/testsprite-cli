@@ -242,7 +242,10 @@ export function buildFailureClusters(
   projectId: string,
   inputs: FailureTriageInput[],
 ): FailureTriageResult {
-  const groups = new Map<string, { reason: FailureTriageGroupReason; members: FailureTriageMember[] }>();
+  const groups = new Map<
+    string,
+    { reason: FailureTriageGroupReason; members: FailureTriageMember[] }
+  >();
 
   for (const input of inputs) {
     const { groupKey, groupReason } = computeGroupKey(input);
@@ -323,7 +326,9 @@ export function renderFailureTriageText(result: FailureTriageResult): string {
     lines.push(`    groupReason:     ${cluster.groupReason}`);
     if (cluster.failureKind !== null) lines.push(`    failureKind:     ${cluster.failureKind}`);
     lines.push(`    representative:  ${cluster.representativeTestId}`);
-    lines.push(`    affected (${cluster.memberTestIds.length}): ${cluster.memberTestIds.join(', ')}`);
+    lines.push(
+      `    affected (${cluster.memberTestIds.length}): ${cluster.memberTestIds.join(', ')}`,
+    );
     if (cluster.canonicalRootCause !== null) {
       const hyp =
         cluster.canonicalRootCause.length > 120

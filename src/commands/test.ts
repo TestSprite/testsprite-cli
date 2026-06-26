@@ -4121,7 +4121,8 @@ export async function runFailureTriage(
               status: 'failed',
               failureKind: 'assertion',
               snapshotId: 'snap_dryrun_c',
-              rootCauseHypothesis: 'Submit button is disabled because the credit-card field is empty.',
+              rootCauseHypothesis:
+                'Submit button is disabled because the credit-card field is empty.',
               recommendedFixTarget: {
                 kind: 'code',
                 reference: 'src/components/CheckoutForm.tsx:412',
@@ -4129,8 +4130,7 @@ export async function runFailureTriage(
               },
             },
           ],
-          canonicalRootCause:
-            'Submit button is disabled because the credit-card field is empty.',
+          canonicalRootCause: 'Submit button is disabled because the credit-card field is empty.',
           confidence: 0.7,
           fixPriority: 3,
         },
@@ -8924,7 +8924,10 @@ function createTestFailureCommand(deps: TestDeps): Command {
     )
     .requiredOption('--project <id>', 'project id (returned by `testsprite project list`)')
     .option('--type <type>', 'filter by test type (frontend|backend)')
-    .option('--filter <substr>', 'only include tests whose name contains this substring (case-insensitive)')
+    .option(
+      '--filter <substr>',
+      'only include tests whose name contains this substring (case-insensitive)',
+    )
     .option(
       '--max-concurrency <n>',
       `max parallel failure-summary fetches (1–${MAX_BATCH_CONCURRENCY}, default ${DEFAULT_TRIAGE_CONCURRENCY})`,
@@ -8956,7 +8959,9 @@ function createTestFailureCommand(deps: TestDeps): Command {
             projectId: cmdOpts.project,
             type: parseEnumFlag(cmdOpts.type, 'type', TEST_TYPES),
             nameFilter: cmdOpts.filter,
-            maxConcurrency: parseNumericFlag(cmdOpts.maxConcurrency, 'max-concurrency') ?? DEFAULT_TRIAGE_CONCURRENCY,
+            maxConcurrency:
+              parseNumericFlag(cmdOpts.maxConcurrency, 'max-concurrency') ??
+              DEFAULT_TRIAGE_CONCURRENCY,
           },
           deps,
         );

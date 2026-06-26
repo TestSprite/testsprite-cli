@@ -348,7 +348,7 @@ Options:
   --filter <substr>      only include tests whose name contains this substring
                          (case-insensitive)
   --max-concurrency <n>  max parallel failure-summary fetches (1–100, default
-                         5) (default: \\"5\\")
+                         5) (default: "5")
   -h, --help             display help for command
 Clusters are built client-side from existing M2.1 analysis fields:
   1. shared recommendedFixTarget.reference

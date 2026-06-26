@@ -3465,6 +3465,49 @@ describe('runFailureTriage', () => {
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
+
+  it('rejects invalid --max-concurrency with VALIDATION_ERROR (exit 5)', async () => {
+    await expect(
+      runFailureTriage(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_1',
+          maxConcurrency: 0,
+        },
+        { stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('--filter keeps only tests whose name matches (case-insensitive)', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests?')) {
+        return {
+          body: {
+            items: [FAILED_TEST_A, { ...FAILED_TEST_B, name: 'Profile update flow' }],
+            nextToken: null,
+          },
+        };
+      }
+      return { body: summaryFor('test_a') };
+    });
+    const got = await runFailureTriage(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_1',
+        nameFilter: 'checkout',
+        maxConcurrency: 5,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(got.summary.totalFailed).toBe(1);
+    expect(got.clusters[0]?.memberTestIds).toEqual(['test_a']);
+  });
 });
 
 // ---------- §6.7 runFailureGet ----------
