@@ -1,10 +1,4 @@
-import {
-  existsSync,
-  mkdtempSync,
-  readFileSync,
-  symlinkSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -25,10 +19,10 @@ import { AGENTS_MD_CODEX_BUDGET_BYTES, createAgentCommand, runInstall, runList }
 
 /** Windows requires Developer Mode or elevation to create symlinks. */
 function canCreateSymlinks(): boolean {
+  const probeRoot = mkdtempSync(path.join(tmpdir(), 'agent-symlink-probe-'));
+  const target = path.join(probeRoot, 'target.txt');
+  writeFileSync(target, 'probe');
   try {
-    const probeRoot = mkdtempSync(path.join(tmpdir(), 'agent-symlink-probe-'));
-    const target = path.join(probeRoot, 'target.txt');
-    writeFileSync(target, 'probe');
     symlinkSync(target, path.join(probeRoot, 'link.txt'), 'file');
     return true;
   } catch {
@@ -1109,76 +1103,76 @@ describe('runInstall — default AgentFs (real disk)', () => {
   it.skipIf(!symlinkCapable)(
     'refuses to write through a symlinked parent dir (real disk) — exit 5',
     async () => {
-    const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-parent-'));
-    const outside = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-'));
-    // `.claude` is a real symlink to a directory outside the project root.
-    symlinkSync(outside, path.join(tmpRoot, '.claude'), 'dir');
-    const { deps } = makeCapture();
+      const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-parent-'));
+      const outside = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-'));
+      // `.claude` is a real symlink to a directory outside the project root.
+      symlinkSync(outside, path.join(tmpRoot, '.claude'), 'dir');
+      const { deps } = makeCapture();
 
-    let thrown: unknown;
-    try {
-      await runInstall(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          dryRun: false,
-          target: ['claude'],
-          skills: ['testsprite-verify'],
-          force: false,
-          dir: tmpRoot,
-        },
-        { ...deps },
-      );
-    } catch (err) {
-      thrown = err;
-    }
+      let thrown: unknown;
+      try {
+        await runInstall(
+          {
+            profile: 'default',
+            output: 'text',
+            debug: false,
+            dryRun: false,
+            target: ['claude'],
+            skills: ['testsprite-verify'],
+            force: false,
+            dir: tmpRoot,
+          },
+          { ...deps },
+        );
+      } catch (err) {
+        thrown = err;
+      }
 
-    expect(thrown).toBeInstanceOf(CLIError);
-    expect((thrown as CLIError).exitCode).toBe(5);
-    // Nothing was created through the symlink, outside --dir.
-    expect(existsSync(path.join(outside, 'skills'))).toBe(false);
+      expect(thrown).toBeInstanceOf(CLIError);
+      expect((thrown as CLIError).exitCode).toBe(5);
+      // Nothing was created through the symlink, outside --dir.
+      expect(existsSync(path.join(outside, 'skills'))).toBe(false);
     },
   );
 
   it.skipIf(!symlinkCapable)(
     'refuses to overwrite a symlinked target file (real disk) with --force — exit 5',
     async () => {
-    const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-target-'));
-    const outsideDir = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-target-'));
-    const { path: relPath } = renderForTarget('claude', 'testsprite-verify');
-    const abs = path.resolve(tmpRoot, relPath);
-    const nodeFs = await import('node:fs/promises');
-    await nodeFs.mkdir(path.dirname(abs), { recursive: true });
-    // SKILL.md is a real symlink to a file outside the project root.
-    const outsideFile = path.join(outsideDir, 'secret.txt');
-    await nodeFs.writeFile(outsideFile, 'SECRET', 'utf8');
-    symlinkSync(outsideFile, abs, 'file');
-    const { deps } = makeCapture();
+      const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-target-'));
+      const outsideDir = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-target-'));
+      const { path: relPath } = renderForTarget('claude', 'testsprite-verify');
+      const abs = path.resolve(tmpRoot, relPath);
+      const nodeFs = await import('node:fs/promises');
+      await nodeFs.mkdir(path.dirname(abs), { recursive: true });
+      // SKILL.md is a real symlink to a file outside the project root.
+      const outsideFile = path.join(outsideDir, 'secret.txt');
+      await nodeFs.writeFile(outsideFile, 'SECRET', 'utf8');
+      symlinkSync(outsideFile, abs, 'file');
+      const { deps } = makeCapture();
 
-    let thrown: unknown;
-    try {
-      await runInstall(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          dryRun: false,
-          target: ['claude'],
-          skills: ['testsprite-verify'],
-          force: true,
-          dir: tmpRoot,
-        },
-        { ...deps },
-      );
-    } catch (err) {
-      thrown = err;
-    }
+      let thrown: unknown;
+      try {
+        await runInstall(
+          {
+            profile: 'default',
+            output: 'text',
+            debug: false,
+            dryRun: false,
+            target: ['claude'],
+            skills: ['testsprite-verify'],
+            force: true,
+            dir: tmpRoot,
+          },
+          { ...deps },
+        );
+      } catch (err) {
+        thrown = err;
+      }
 
-    expect(thrown).toBeInstanceOf(CLIError);
-    expect((thrown as CLIError).exitCode).toBe(5);
-    // The outside file was NOT overwritten (nor clobbered via the .bak path).
-    expect(readFileSync(outsideFile, 'utf8')).toBe('SECRET');
+      expect(thrown).toBeInstanceOf(CLIError);
+      expect((thrown as CLIError).exitCode).toBe(5);
+      // The outside file was NOT overwritten (nor clobbered via the .bak path).
+      expect(readFileSync(outsideFile, 'utf8')).toBe('SECRET');
     },
   );
 });
