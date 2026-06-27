@@ -19,10 +19,12 @@ describe('paginate', () => {
   it('breaks out of loop when API returns empty items with non-null nextToken', async () => {
     // This is the bug from issue #35: API returns { items: [], nextToken: 'cursor' }
     // Without the fix, paginate() would loop forever requesting the same empty page.
-    const fetchPage: FetchPage<string> = vi.fn(async (): Promise<Page<string>> => ({
-      items: [],
-      nextToken: 'cursor',
-    }));
+    const fetchPage: FetchPage<string> = vi.fn(
+      async (): Promise<Page<string>> => ({
+        items: [],
+        nextToken: 'cursor',
+      }),
+    );
 
     const result = await paginate(fetchPage);
 
@@ -65,7 +67,9 @@ describe('paginate', () => {
       { items: ['a'], nextToken: null },
     ];
     let callIndex = 0;
-    const fetchPage: FetchPage<string> = vi.fn(async (): Promise<Page<string>> => pages[callIndex++]!);
+    const fetchPage: FetchPage<string> = vi.fn(
+      async (): Promise<Page<string>> => pages[callIndex++]!,
+    );
 
     const result = await paginate(fetchPage);
 
