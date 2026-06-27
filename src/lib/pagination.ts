@@ -106,6 +106,10 @@ export async function paginate<T>(
       items.push(item);
     }
 
+    // Guard against infinite loop when API returns empty items with non-null nextToken.
+    // Without this, a filtered list returning zero results hangs indefinitely.
+    if (page.items.length === 0) break;
+
     if (page.nextToken === null) break;
     cursor = page.nextToken;
   }
