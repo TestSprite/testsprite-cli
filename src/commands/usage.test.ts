@@ -7,6 +7,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Command } from 'commander';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { writeProfile } from '../lib/credentials.js';
 import type { UsageDeps, UsageResponse } from './usage.js';
@@ -309,5 +310,22 @@ describe('createUsageCommand wiring', () => {
     const helpText = cmd.helpInformation();
     // Commander's helpInformation() includes the command description.
     expect(helpText).toContain('credit balance');
+  });
+
+  it('rejects unsupported global --output modes instead of falling back to text', async () => {
+    const root = new Command('testsprite')
+      .exitOverride()
+      .option('--output <mode>', 'Output format (json|text)', 'text')
+      .option('--dry-run', 'Skip the network and emit a canned response', false);
+
+    root.addCommand(createUsageCommand(makeCapture().deps));
+
+    await expect(
+      root.parseAsync(['usage', '--output', 'yaml', '--dry-run'], { from: 'user' }),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'output' },
+    });
   });
 });

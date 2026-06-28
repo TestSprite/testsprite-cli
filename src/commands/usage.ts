@@ -20,6 +20,7 @@ import {
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { loadConfig } from '../lib/config.js';
+import { localValidationError } from '../lib/errors.js';
 import { resolvePortalBase } from '../lib/facade.js';
 import type { FetchImpl } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, type OutputMode } from '../lib/output.js';
@@ -214,9 +215,13 @@ function resolveCommonOptions(command: Command): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
+  const rawOutput = globals.output;
+  if (rawOutput !== undefined && rawOutput !== 'json' && rawOutput !== 'text') {
+    throw localValidationError('output', 'must be one of: json, text', ['json', 'text']);
+  }
   return {
     profile: globals.profile ?? 'default',
-    output: globals.output ?? 'text',
+    output: (globals.output as OutputMode | undefined) ?? 'text',
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
     verbose: globals.verbose ?? false,
