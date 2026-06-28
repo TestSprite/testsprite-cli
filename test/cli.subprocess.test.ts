@@ -497,6 +497,25 @@ describe('project list subprocess', () => {
     const parsed = JSON.parse(result.stderr) as { error: { code: string } };
     expect(parsed.error.code).toBe('VALIDATION_ERROR');
   }, 30_000);
+
+  it('--request-timeout abc exits 5 instead of silently using the default', async () => {
+    const result = await runCli([
+      '--output',
+      'json',
+      'project',
+      'list',
+      '--dry-run',
+      '--request-timeout',
+      'abc',
+    ]);
+    expect(result.exitCode).toBe(5);
+    const parsed = JSON.parse(result.stderr) as {
+      error: { code: string; nextAction: string; details: { field?: string } };
+    };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error.nextAction).toContain('request-timeout');
+    expect(parsed.error.details.field).toBe('request-timeout');
+  }, 30_000);
 });
 
 describe('a malformed --profile is rejected (exit 5), not silently corrupting credentials', () => {

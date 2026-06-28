@@ -111,10 +111,10 @@ export function resetDryRunBannerForTesting(): void {
  * is in milliseconds to give scripts sub-second granularity and match the
  * typical convention for `*_MS` env vars.
  *
- * Values are clamped to [REQUEST_TIMEOUT_MIN_MS, REQUEST_TIMEOUT_MAX_MS];
- * values below the minimum are raised to 1s, values above the maximum are
- * lowered to 10m — both silently (no exit 5), since this is a tuning knob,
- * not a safety-critical gate.
+ * Env values and direct factory callers are clamped to
+ * [REQUEST_TIMEOUT_MIN_MS, REQUEST_TIMEOUT_MAX_MS]. Explicit CLI flag values
+ * are parsed by {@link parseRequestTimeoutFlag} first, so invalid user input
+ * exits 5 instead of being silently rounded, clamped, or ignored.
  */
 export function resolveRequestTimeoutMs(
   opts: Pick<CommonOptions, 'requestTimeoutMs'>,
@@ -133,6 +133,27 @@ export function resolveRequestTimeoutMs(
     }
   }
   return REQUEST_TIMEOUT_DEFAULT_MS;
+}
+
+/**
+ * Parse the global `--request-timeout <seconds>` flag into milliseconds.
+ *
+ * The flag is user-facing and documented as seconds in the inclusive 1-600
+ * range, so an explicit invalid value should fail fast instead of silently
+ * falling back to the default or being rounded/clamped.
+ */
+export function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const seconds = Number(raw);
+  const minSeconds = REQUEST_TIMEOUT_MIN_MS / 1000;
+  const maxSeconds = REQUEST_TIMEOUT_MAX_MS / 1000;
+  if (!Number.isInteger(seconds) || seconds < minSeconds || seconds > maxSeconds) {
+    throw localValidationError(
+      'request-timeout',
+      `must be an integer between ${minSeconds} and ${maxSeconds} seconds`,
+    );
+  }
+  return seconds * 1000;
 }
 
 function clampRequestTimeout(ms: number): number {

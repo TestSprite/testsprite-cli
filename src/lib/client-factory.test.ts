@@ -5,6 +5,7 @@ import {
   assertValidEndpointUrl,
   emitDryRunBanner,
   makeHttpClient,
+  parseRequestTimeoutFlag,
   resetDryRunBannerForTesting,
   resolveRequestTimeoutMs,
 } from './client-factory.js';
@@ -162,6 +163,34 @@ describe('makeHttpClient — getRunFailure dry-run path (M3.3 piece-4)', () => {
 // ---------------------------------------------------------------------------
 // resolveRequestTimeoutMs — flag / env / default precedence
 // ---------------------------------------------------------------------------
+
+describe('parseRequestTimeoutFlag', () => {
+  it('returns undefined when the flag is absent', () => {
+    expect(parseRequestTimeoutFlag(undefined)).toBeUndefined();
+  });
+
+  it('converts valid whole seconds to milliseconds', () => {
+    expect(parseRequestTimeoutFlag('1')).toBe(1_000);
+    expect(parseRequestTimeoutFlag('120')).toBe(120_000);
+    expect(parseRequestTimeoutFlag('600')).toBe(600_000);
+  });
+
+  it.each(['abc', '0', '-1', '1.5', '601'])(
+    'rejects invalid explicit flag value %s with VALIDATION_ERROR',
+    raw => {
+      expect(() => parseRequestTimeoutFlag(raw)).toThrow(ApiError);
+      try {
+        parseRequestTimeoutFlag(raw);
+      } catch (err) {
+        expect(err).toMatchObject({
+          code: 'VALIDATION_ERROR',
+          exitCode: 5,
+          details: expect.objectContaining({ field: 'request-timeout' }),
+        });
+      }
+    },
+  );
+});
 
 describe('resolveRequestTimeoutMs', () => {
   it('returns the default when no flag or env var is set', () => {
