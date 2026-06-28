@@ -3799,7 +3799,10 @@ export async function runResultHistory(
   // configured (codex round-2), matching validatePaginationFlags ordering
   // in `test list` / `project list`.
   if (opts.pageSize !== undefined) {
-    if (!Number.isFinite(opts.pageSize) || opts.pageSize < 1 || opts.pageSize > 100) {
+    if (!Number.isFinite(opts.pageSize) || !Number.isInteger(opts.pageSize)) {
+      throw localValidationError('page-size', 'must be an integer between 1 and 100');
+    }
+    if (opts.pageSize < 1 || opts.pageSize > 100) {
       throw localValidationError('page-size', 'must be between 1 and 100');
     }
   }

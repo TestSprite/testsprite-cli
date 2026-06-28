@@ -533,6 +533,32 @@ describe('runResultHistory — pagination', () => {
 
     expect(capturedUrl).toContain('pageSize=5');
   });
+
+  it('rejects fractional --page-size before making a request', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => {
+      throw new Error('should not be called');
+    });
+
+    await expect(
+      runResultHistory(
+        {
+          output: 'json',
+          testId: 'test_abc',
+          pageSize: 1.5,
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { credentialsPath, fetchImpl, stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'page-size' }),
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
