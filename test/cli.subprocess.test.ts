@@ -893,6 +893,22 @@ describe('--dry-run subprocess smoke', () => {
     expect(parsed.id).toBeTruthy();
   }, 30_000);
 
+  it('project update --dry-run does not read a missing --password-file', async () => {
+    const result = await runCli([
+      'project',
+      'update',
+      'proj_anything',
+      '--password-file',
+      '/tmp/definitely-not-here-testsprite',
+      '--dry-run',
+      '--output',
+      'json',
+    ]);
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as { updatedFields: string[] };
+    expect(parsed.updatedFields).toContain('password');
+  }, 30_000);
+
   it('test list --dry-run returns canned TestList', async () => {
     const result = await runCli([
       'test',

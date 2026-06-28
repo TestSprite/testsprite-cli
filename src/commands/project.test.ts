@@ -668,6 +668,33 @@ describe('runUpdate', () => {
     expect(result.updatedFields).toContain('name');
   });
 
+  it('P7 — dry-run with --password-file does not read the filesystem', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network');
+    });
+    const result = await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'proj_dry',
+        passwordFile: '/tmp/definitely-not-here-testsprite',
+      },
+      {
+        credentialsPath,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(result.id).toBe('proj_dry');
+    expect(result.updatedFields).toContain('password');
+  });
+
   it('P7 — renders text mode with updatedFields and updatedAt', async () => {
     const { credentialsPath } = makeCreds();
     const updateResponse: CliUpdateProjectResponse = {

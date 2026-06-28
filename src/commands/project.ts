@@ -254,27 +254,24 @@ export async function runUpdate(
     throw localValidationError('--description must be at most 2000 characters');
   }
 
-  // Resolve password
-  let password = opts.password;
-  if (password === undefined && opts.passwordFile !== undefined) {
-    password = readFileSync(opts.passwordFile, 'utf8').trim();
-  }
-
   // P2-7: guard --url against localhost/RFC1918/non-http(s).
   if (opts.targetUrl !== undefined) {
     assertNotLocal(opts.targetUrl);
   }
 
-  const mutableFields: Record<string, string | undefined> = {
-    name: opts.name,
-    targetUrl: opts.targetUrl,
-    username: opts.username,
-    password,
-    description: opts.description,
-    instruction: opts.instruction,
+  const passwordSupplied = opts.password !== undefined || opts.passwordFile !== undefined;
+  const mutableFields: Record<string, boolean> = {
+    name: opts.name !== undefined,
+    targetUrl: opts.targetUrl !== undefined,
+    username: opts.username !== undefined,
+    password: passwordSupplied,
+    description: opts.description !== undefined,
+    instruction: opts.instruction !== undefined,
   };
-  const presentFields = Object.entries(mutableFields).filter(([, v]) => v !== undefined);
-  if (presentFields.length === 0) {
+  const presentFieldNames = Object.entries(mutableFields)
+    .filter(([, present]) => present)
+    .map(([field]) => field);
+  if (presentFieldNames.length === 0) {
     throw localValidationError(
       'At least one mutable flag is required: --name, --url, --username, --password/--password-file, --description, or --instruction.',
     );
@@ -290,11 +287,18 @@ export async function runUpdate(
     }
     const sample: CliUpdateProjectResponse = {
       id: opts.projectId,
-      updatedFields: presentFields.map(([k]) => k),
+      updatedFields: presentFieldNames,
       updatedAt: '2026-05-16T00:00:00.000Z',
     };
     out.print(sample, data => renderUpdateText(data as CliUpdateProjectResponse));
     return sample;
+  }
+
+  // Resolve password only on the real path. Dry-run must not touch the
+  // filesystem, even when --password-file is present.
+  let password = opts.password;
+  if (password === undefined && opts.passwordFile !== undefined) {
+    password = readFileSync(opts.passwordFile, 'utf8').trim();
   }
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-update-${randomUUID()}`;
@@ -302,7 +306,17 @@ export async function runUpdate(
     stderr(`idempotency-key: ${idempotencyKey}`);
   }
 
-  const body = Object.fromEntries(presentFields) as Record<string, string>;
+  const bodyFields: Record<string, string | undefined> = {
+    name: opts.name,
+    targetUrl: opts.targetUrl,
+    username: opts.username,
+    password,
+    description: opts.description,
+    instruction: opts.instruction,
+  };
+  const body = Object.fromEntries(
+    Object.entries(bodyFields).filter(([, v]) => v !== undefined),
+  ) as Record<string, string>;
   const client = makeClient(opts, deps);
   const updated = await client.patch<CliUpdateProjectResponse>(
     `/projects/${encodeURIComponent(opts.projectId)}`,
