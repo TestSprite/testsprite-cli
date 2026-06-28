@@ -1,0 +1,118 @@
+name: Security
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, dev, stg]
+
+permissions:
+  contents: read
+  security-events: write  # CodeQL needs this to upload SARIF results
+
+jobs:
+
+  # ── 1. Dependency audit ────────────────────────────────────────────────────
+  # Blocks on HIGH/CRITICAL in production dependencies (what ships to users).
+  # Dev-only vulns (vitest, esbuild) are reported but do not fail the build.
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Audit production dependencies (blocking)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Audit all dependencies (informational)
+        run: npm audit --audit-level=high || true
+
+  # ── 2. Dependency review on PRs ───────────────────────────────────────────
+  # Blocks PRs that introduce new vulnerable packages.
+  # Uses GITHUB_TOKEN automatically — no external API key needed.
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
+  # ── 3. CodeQL static analysis ─────────────────────────────────────────────
+  # Catches classes of bugs the linter/typechecker miss:
+  #   CWE-22  path traversal (F-003, F-009)
+  #   CWE-918 SSRF (F-002)
+  #   CWE-73  external file path control (F-008)
+  #   CWE-116 improper output encoding (F-004, F-006)
+  # Free for public repos. Uses GITHUB_TOKEN — no external key.
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+
+      - run: npm ci && npm run build
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:javascript-typescript'
+
+  # ── 4. ESLint with security rules ─────────────────────────────────────────
+  # Runs eslint-plugin-security against src/ using eslint.security.config.mjs.
+  # Separate from the main lint job so security findings surface distinctly.
+  # No API key — pure local analysis.
+  lint-security:
+    name: ESLint Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Install security plugin
+        run: npm install --no-save eslint-plugin-security
+
+      - name: Run security lint
+        run: npx eslint src/ --config eslint.security.config.mjs --format stylish
+
+  # ── 5. Secret scanning ────────────────────────────────────────────────────
+  # Scans git history for accidentally committed secrets (API keys, tokens).
+  # gitleaks is open source, no account or API key required.
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # full history needed for git log scan
+
+      - name: Scan for secrets with gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE not set — free mode scans public repos without limit

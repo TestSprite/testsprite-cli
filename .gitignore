@@ -20,3 +20,4 @@ test/dev-e2e/.env.local
 # Per-session Claude Code worktrees (parallel-session scratch space). Other
 # `.claude/` content (e.g., `skills/`) stays tracked.
 .claude/worktrees/
+sandbox/
