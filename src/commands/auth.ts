@@ -145,6 +145,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
     baseUrl: facadeBaseUrl(apiUrl),
     apiKey,
     fetchImpl: deps.fetchImpl,
+    requestTimeoutMs: opts.requestTimeoutMs,
   });
   try {
     // Tag the validation call with the originating command (when provided) so

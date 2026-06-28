@@ -110,6 +110,50 @@ describe('runConfigure', () => {
     );
   });
 
+  it('uses requestTimeoutMs for the pre-write key validation ping', async () => {
+    const { deps } = makeCapture();
+    let sawAbort = false;
+    const fetchImpl = vi.fn(
+      async (_input: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          const timeout = setTimeout(() => {
+            reject(new Error('requestTimeoutMs was not applied to the validation ping'));
+          }, 50);
+          signal?.addEventListener(
+            'abort',
+            () => {
+              sawAbort = true;
+              clearTimeout(timeout);
+              reject(new DOMException('The operation timed out.', 'TimeoutError'));
+            },
+            { once: true },
+          );
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          fromEnv: true,
+          requestTimeoutMs: 1,
+        },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          credentialsPath,
+          fetchImpl,
+        },
+      ),
+    ).rejects.toBeInstanceOf(CLIError);
+
+    expect(sawAbort).toBe(true);
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+  });
+
   it('throws VALIDATION_ERROR when --from-env is set but key is missing', async () => {
     const { deps } = makeCapture();
     await expect(
