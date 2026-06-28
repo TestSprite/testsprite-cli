@@ -986,6 +986,27 @@ describe('createAuthCommand wiring', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
+  it('status rejects unsupported global --output modes', async () => {
+    const { deps } = makeCapture();
+    const auth = createAuthCommand({ ...deps });
+    const parent = new (await import('commander')).Command('testsprite');
+    parent.option('--output <mode>', 'output', 'text');
+    parent.option('--profile <name>', 'profile', 'default');
+    parent.option('--endpoint-url <url>');
+    parent.option('--debug', 'debug', false);
+    parent.option('--verbose', 'verbose', false);
+    parent.option('--dry-run', 'dry-run', false);
+    parent.addCommand(auth);
+
+    await expect(
+      parent.parseAsync(['node', 'ts', 'auth', 'status', '--output', 'yaml', '--dry-run']),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'output' },
+    });
+  });
+
   it('logout removes the profile', async () => {
     writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { deps } = makeCapture();
