@@ -755,9 +755,13 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
 
 function resolveCommonOptions(command: Command): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions>;
+  const rawOutput = globals.output;
+  if (rawOutput !== undefined && rawOutput !== 'json' && rawOutput !== 'text') {
+    throw localValidationError('output', 'must be one of: json, text', ['json', 'text']);
+  }
   return {
     profile: globals.profile ?? 'default',
-    output: globals.output ?? 'text',
+    output: (globals.output as OutputMode | undefined) ?? 'text',
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
     verbose: globals.verbose ?? false,

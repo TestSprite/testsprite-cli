@@ -854,6 +854,28 @@ describe('createAgentCommand wiring', () => {
     expect(out).toContain('claude');
     expect(out).toContain('antigravity');
   });
+
+  it('agent list rejects unsupported global --output modes', async () => {
+    const { deps } = makeCapture();
+
+    const command = createAgentCommand({ cwd: CWD, ...deps });
+    const parent = new (await import('commander')).Command('testsprite');
+    parent.option('--output <mode>', 'output', 'text');
+    parent.option('--profile <name>', 'profile', 'default');
+    parent.option('--endpoint-url <url>');
+    parent.option('--debug', 'debug', false);
+    parent.option('--verbose', 'verbose', false);
+    parent.option('--dry-run', 'dry-run', false);
+    parent.addCommand(command);
+
+    await expect(
+      parent.parseAsync(['node', 'ts', 'agent', 'list', '--output', 'yaml']),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'output' },
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
