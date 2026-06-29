@@ -110,15 +110,16 @@ Every artifact in the bundle shares one `snapshotId`; the CLI will not mix a fai
 ```bash
 testsprite agent install claude     # install the skill for Claude Code
 testsprite agent install codex      # install into AGENTS.md for Codex (managed-section)
+testsprite agent install gemini     # install into GEMINI.md for Gemini CLI (managed-section)
 testsprite agent install cursor     # .cursor/rules/testsprite-verify.mdc
 testsprite agent install cline      # .clinerules/testsprite-verify.md
 testsprite agent install antigravity  # .agents/skills/testsprite-verify/SKILL.md
-testsprite agent list               # list all 5 targets with status + mode + path
+testsprite agent list               # list all targets with status + mode + path
 ```
 
-Supported targets: `claude` (GA), `codex` (experimental), `cursor` (experimental), `cline` (experimental), `antigravity` (experimental).
+Supported targets: `claude` (GA), `codex` (experimental), `gemini` (experimental), `cursor` (experimental), `cline` (experimental), `antigravity` (experimental).
 
-The `codex` target uses **managed-section mode** — it writes only a sentinel-delimited section inside your existing `AGENTS.md`, so your project instructions are never clobbered. Re-running without `--force` replaces the section in-place; user content outside the sentinels is always preserved.
+The `codex` and `gemini` targets use **managed-section mode** — they write only a sentinel-delimited section inside your existing `AGENTS.md` or `GEMINI.md`, so your project instructions are never clobbered. Re-running without `--force` replaces the section in-place; user content outside the sentinels is always preserved.
 
 Re-running with `--force` on **own-file targets** (claude, cursor, cline, antigravity) backs up the existing file to `<path>.bak` first.
 

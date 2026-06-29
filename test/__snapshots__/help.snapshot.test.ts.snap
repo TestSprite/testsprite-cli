@@ -4,7 +4,7 @@ exports[`--help snapshots > agent 1`] = `
 "Usage: testsprite agent [options] [command]
 
 Install TestSprite guidance into coding-agent config (Claude Code, Cursor,
-Cline, Antigravity, Codex)
+Cline, Antigravity, Codex, Gemini CLI)
 
 Options:
   -h, --help         display help for command
@@ -25,11 +25,11 @@ Write the TestSprite verification-loop skill file into a project for a coding
 agent
 
 Options:
-  --target <t>  Agent target(s): claude, cursor, cline, antigravity, codex
-                (comma-separated or repeated) (default: [])
+  --target <t>  Agent target(s): claude, cursor, cline, antigravity, codex,
+                gemini (comma-separated or repeated) (default: [])
   --dir <path>  Project root to write into (default: cwd)
   --force       For own-file targets: overwrite existing file (a .bak backup is
-                kept). For codex (managed-section): replaces the section
+                kept). For managed-section targets: replaces the section
                 unconditionally; user content outside the section is never
                 destroyed.
   -h, --help    display help for command
@@ -110,7 +110,8 @@ Options:
   --from-env        Read TESTSPRITE_API_KEY from the environment instead of
                     prompting (default: false)
   --agent <target>  Coding-agent target to install: claude, antigravity,
-                    cursor, cline, codex (default: claude) (default: "claude")
+                    cursor, cline, codex, gemini (default: claude) (default:
+                    "claude")
   --no-agent        Skip the agent skill install (configure credentials only)
   --force           Overwrite an existing skill file (a .bak backup is kept)
   --dir <path>      Project root for the skill install (default: current
@@ -580,7 +581,7 @@ Commands:
   test                         Inspect TestSprite tests
   agent                        Install TestSprite guidance into coding-agent
                                config (Claude Code, Cursor, Cline, Antigravity,
-                               Codex)
+                               Codex, Gemini CLI)
   usage|credits                Show credit balance and plan/entitlement info
                                (proactive pre-flight before a large test run)
   help [command]               display help for command

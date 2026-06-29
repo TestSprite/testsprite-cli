@@ -8,12 +8,11 @@ import { GLOBAL_OPTS_HINT, Output } from '../lib/output.js';
 import { promptText } from '../lib/prompt.js';
 import {
   type AgentTarget,
+  type ManagedSectionSpec,
   TARGETS,
   loadSkillBody,
   loadCodexSkillBody,
   renderForTarget,
-  MANAGED_SECTION_BEGIN,
-  MANAGED_SECTION_END,
 } from '../lib/agent-targets.js';
 
 // ---------------------------------------------------------------------------
@@ -150,8 +149,8 @@ async function writeBackup(agentFs: AgentFs, abs: string, existing: string): Pro
  * Build the section block to inject (sentinels + body + trailing newline).
  * Uses \n throughout; the caller handles CRLF normalisation.
  */
-function buildSection(body: string): string {
-  return `${MANAGED_SECTION_BEGIN}\n${body.trimEnd()}\n${MANAGED_SECTION_END}\n`;
+function buildSection(body: string, managed: ManagedSectionSpec): string {
+  return `${managed.begin}\n${body.trimEnd()}\n${managed.end}\n`;
 }
 
 /**
@@ -182,7 +181,11 @@ type SectionState =
  *  - CRLF files are handled by stripping trailing \r from each line before
  *    comparison.
  */
-function classifySection(existing: string, section: string): SectionState {
+function classifySection(
+  existing: string,
+  section: string,
+  managed: ManagedSectionSpec,
+): SectionState {
   // Split on LF; strip trailing CR so CRLF files normalise correctly.
   const lines = existing.split('\n');
 
@@ -193,8 +196,8 @@ function classifySection(existing: string, section: string): SectionState {
 
   for (let i = 0; i < lines.length; i++) {
     const stripped = (lines[i] ?? '').trimEnd();
-    if (stripped === MANAGED_SECTION_BEGIN) beginLines.push(i);
-    else if (stripped === MANAGED_SECTION_END) endLines.push(i);
+    if (stripped === managed.begin) beginLines.push(i);
+    else if (stripped === managed.end) endLines.push(i);
   }
 
   const hasBegin = beginLines.length > 0;
@@ -391,7 +394,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
 
   // 4. Load skill bodies (lazy — only touch disk if a target actually needs it)
   let ownFileBody: string | undefined;
-  let codexBody: string | undefined;
+  let managedSectionBody: string | undefined;
 
   const results: InstallResult[] = [];
 
@@ -410,11 +413,16 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
     }
 
     // -----------------------------------------------------------------------
-    // managed-section mode (codex target)
+    // managed-section mode (root instruction files such as AGENTS.md/GEMINI.md)
     // -----------------------------------------------------------------------
     if (spec.mode === 'managed-section') {
-      if (codexBody === undefined) codexBody = loadCodexSkillBody();
-      const section = buildSection(codexBody);
+      const managed = spec.managedSection;
+      if (managed === undefined) {
+        throw new CLIError(`managed-section target "${t}" is missing sentinel metadata`, 5);
+      }
+      const managedConfig = managed;
+      if (managedSectionBody === undefined) managedSectionBody = loadCodexSkillBody();
+      const section = buildSection(managedSectionBody, managedConfig);
 
       if (opts.dryRun) {
         // Dry-run: report what would happen without writing disk.
@@ -458,7 +466,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
             }
           }
           if (existing !== null) {
-            const state = classifySection(existing, section);
+            const state = classifySection(existing, section, managedConfig);
             if (state.kind === 'corrupt') {
               // The real install would refuse with exit 5 — dry-run reports
               // the same outcome rather than a misleading success.
@@ -477,9 +485,12 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
           }
         }
         const wouldBeBytes = Buffer.byteLength(wouldBeContent, 'utf8');
-        if (wouldBeBytes > AGENTS_MD_CODEX_BUDGET_BYTES) {
+        if (
+          managedConfig.loadBudgetBytes !== undefined &&
+          wouldBeBytes > managedConfig.loadBudgetBytes
+        ) {
           stderrFn(
-            `[warn] ${relPath} will be ${wouldBeBytes} bytes after this write — Codex may not load content beyond its 32 KiB (${AGENTS_MD_CODEX_BUDGET_BYTES} byte) budget. Trim AGENTS.md to stay within the limit.`,
+            `[warn] ${relPath} will be ${wouldBeBytes} bytes after this write — ${managedConfig.loadBudgetLabel ?? `the target agent may not load content beyond its ${managedConfig.loadBudgetBytes} byte budget`}. Trim ${relPath} to stay within the limit.`,
           );
         }
         dryRunLines.push({ abs, bytes, note: 'managed section' });
@@ -498,15 +509,18 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
       }
 
       /**
-       * [P2] Emit a stderr warn when the would-be file content exceeds Codex's
-       * 32 KiB load budget. We still write — this is a warn, not a refusal —
-       * but the operator needs early visibility so they can trim AGENTS.md.
+       * Emit a stderr warn when the target has a documented load budget and the
+       * would-be file content exceeds it. We still write — this is visibility,
+       * not a refusal.
        */
       function warnIfOverBudget(wouldBeContent: string): void {
         const byteLen = Buffer.byteLength(wouldBeContent, 'utf8');
-        if (byteLen > AGENTS_MD_CODEX_BUDGET_BYTES) {
+        if (
+          managedConfig.loadBudgetBytes !== undefined &&
+          byteLen > managedConfig.loadBudgetBytes
+        ) {
           stderrFn(
-            `[warn] ${relPath} will be ${byteLen} bytes after this write — Codex may not load content beyond its 32 KiB (${AGENTS_MD_CODEX_BUDGET_BYTES} byte) budget. Trim AGENTS.md to stay within the limit.`,
+            `[warn] ${relPath} will be ${byteLen} bytes after this write — ${managedConfig.loadBudgetLabel ?? `the target agent may not load content beyond its ${managedConfig.loadBudgetBytes} byte budget`}. Trim ${relPath} to stay within the limit.`,
           );
         }
       }
@@ -529,7 +543,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
         results.push({ target: t, path: relPath, action: 'section-installed' });
       } else {
         const existing = await agentFs.readFile(abs);
-        const state = classifySection(existing, section);
+        const state = classifySection(existing, section, managedConfig);
 
         if (state.kind === 'corrupt') {
           // BEGIN without matching END (or vice-versa) — never destroy user content.
@@ -703,7 +717,7 @@ function collect(v: string, prev: string[]): string[] {
 
 export function createAgentCommand(deps: AgentDeps = {}): Command {
   const agent = new Command('agent').description(
-    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Codex)',
+    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Codex, Gemini CLI)',
   );
 
   agent
@@ -713,7 +727,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
     )
     .option(
       '--target <t>',
-      'Agent target(s): claude, cursor, cline, antigravity, codex (comma-separated or repeated)',
+      'Agent target(s): claude, cursor, cline, antigravity, codex, gemini (comma-separated or repeated)',
       collect,
       [],
     )
@@ -721,7 +735,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
     .option(
       '--force',
       'For own-file targets: overwrite existing file (a .bak backup is kept). ' +
-        'For codex (managed-section): replaces the section unconditionally; user content outside the section is never destroyed.',
+        'For managed-section targets: replaces the section unconditionally; user content outside the section is never destroyed.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(

@@ -695,7 +695,7 @@ describe('runInstall — empty target', () => {
 // ---------------------------------------------------------------------------
 
 describe('runList', () => {
-  it('returns all five targets with correct status', async () => {
+  it('returns all six targets with correct status', async () => {
     const { capture, deps } = makeCapture();
 
     await runList({ profile: 'default', output: 'text', debug: false, dryRun: false }, deps);
@@ -706,6 +706,7 @@ describe('runList', () => {
     expect(out).toContain('cline');
     expect(out).toContain('antigravity');
     expect(out).toContain('codex');
+    expect(out).toContain('gemini');
     expect(out).toContain('ga');
     expect(out).toContain('experimental');
     // All matrix paths present
@@ -714,6 +715,7 @@ describe('runList', () => {
     expect(out).toContain(TARGETS.cline.path);
     expect(out).toContain(TARGETS.antigravity.path);
     expect(out).toContain(TARGETS.codex.path);
+    expect(out).toContain(TARGETS.gemini.path);
   });
 
   it('JSON mode emits array of {target, status, path, mode}', async () => {
@@ -723,19 +725,22 @@ describe('runList', () => {
 
     const json = JSON.parse(capture.stdout.join('\n')) as ListResult[];
     expect(Array.isArray(json)).toBe(true);
-    expect(json).toHaveLength(5);
+    expect(json).toHaveLength(6);
     const targets = json.map(r => r.target);
     expect(targets).toContain('claude');
     expect(targets).toContain('cursor');
     expect(targets).toContain('cline');
     expect(targets).toContain('antigravity');
     expect(targets).toContain('codex');
+    expect(targets).toContain('gemini');
     const claudeEntry = json.find(r => r.target === 'claude');
     expect(claudeEntry?.status).toBe('ga');
     expect(claudeEntry?.path).toBe(TARGETS.claude.path);
     // codex entry has mode: managed-section
     const codexEntry = json.find(r => r.target === 'codex');
     expect(codexEntry?.mode).toBe('managed-section');
+    const geminiEntry = json.find(r => r.target === 'gemini');
+    expect(geminiEntry?.mode).toBe('managed-section');
   });
 
   it('text mode has a header row', async () => {
@@ -1350,6 +1355,31 @@ describe('runInstall — codex managed-section: create (AGENTS.md absent)', () =
     const out = capture.stdout.join('\n');
     expect(out).toContain('section-installed');
     expect(writeCalls.some(p => p === abs)).toBe(true);
+  });
+});
+
+describe('runInstall — gemini managed-section: append (GEMINI.md exists, no sentinels)', () => {
+  it('appends the section to existing GEMINI.md content', async () => {
+    const { store, fs: agentFs, seedFile } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    const geminiAbs = path.resolve(CWD, TARGETS.gemini.path);
+    const existingContent = '# Project Instructions\n\nKeep existing Gemini CLI notes.\n';
+    seedFile(geminiAbs, existingContent);
+
+    await runInstall(
+      { ...BASE_OPTS, target: ['gemini'], force: false },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const written = store.get(geminiAbs)!;
+    expect(written).toContain('# Project Instructions');
+    expect(written).toContain('Keep existing Gemini CLI notes.');
+    expect(written).toContain(TARGETS.gemini.managedSection!.begin);
+    expect(written).toContain(TARGETS.gemini.managedSection!.end);
+    expect(written).toContain('testsprite test run');
+    expect(capture.stdout.join('\n')).toContain('gemini');
+    expect(capture.stdout.join('\n')).toContain('section-installed');
   });
 });
 

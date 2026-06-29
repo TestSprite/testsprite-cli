@@ -1,19 +1,29 @@
 import { readFileSync } from 'node:fs';
 
-export type AgentTarget = 'claude' | 'cursor' | 'cline' | 'antigravity' | 'codex';
+export type AgentTarget = 'claude' | 'cursor' | 'cline' | 'antigravity' | 'codex' | 'gemini';
+
+export interface ManagedSectionSpec {
+  begin: string;
+  end: string;
+  /** Optional documented load budget for root instruction files such as AGENTS.md. */
+  loadBudgetBytes?: number;
+  loadBudgetLabel?: string;
+}
 
 export interface TargetSpec {
   status: 'ga' | 'experimental';
   /** repo-relative landing path, POSIX separators */
   path: string;
   /**
-   * 'own-file': the CLI owns the whole file (existing 4 targets).
+   * 'own-file': the CLI owns the whole file.
    * 'managed-section': the CLI writes only a sentinel-delimited section inside
-   * a potentially user-authored file (codex target, AGENTS.md).
+   * a potentially user-authored root instruction file.
    */
   mode: 'own-file' | 'managed-section';
   /** wrap the canonical body in this target's frontmatter/header */
   wrap(body: string): string;
+  /** Sentinel and budget metadata for managed-section targets. */
+  managedSection?: ManagedSectionSpec;
 }
 
 export const SKILL_NAME = 'testsprite-verify';
@@ -32,6 +42,11 @@ function wrapSkill(body: string): string {
 function wrapMdc(body: string): string {
   return `---\ndescription: ${SKILL_DESCRIPTION}\nalwaysApply: false\n---\n\n${body}\n`;
 }
+
+/** Sentinel pair that bounds our managed section in AGENTS.md. */
+export const MANAGED_SECTION_BEGIN =
+  '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install codex) -->';
+export const MANAGED_SECTION_END = '<!-- END TESTSPRITE AGENT SECTION -->';
 
 export const TARGETS: Record<AgentTarget, TargetSpec> = {
   claude: {
@@ -79,13 +94,31 @@ export const TARGETS: Record<AgentTarget, TargetSpec> = {
     // wrap is a no-op for managed-section — content is authored as plain Markdown
     // with no frontmatter (AGENTS.md is plain prose, not a skill schema).
     wrap: body => body,
+    managedSection: {
+      begin: MANAGED_SECTION_BEGIN,
+      end: MANAGED_SECTION_END,
+      loadBudgetBytes: 32768,
+      loadBudgetLabel: 'Codex may not load content beyond its 32 KiB budget',
+    },
+  },
+  /**
+   * gemini target — managed-section mode.
+   *
+   * Gemini CLI reads GEMINI.md as the project instruction file. Like AGENTS.md,
+   * it is commonly user-authored project context, so we merge a sentinel-delimited
+   * section rather than owning the whole file.
+   */
+  gemini: {
+    status: 'experimental',
+    path: 'GEMINI.md',
+    mode: 'managed-section',
+    wrap: body => body,
+    managedSection: {
+      begin: '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install gemini) -->',
+      end: '<!-- END TESTSPRITE AGENT SECTION -->',
+    },
   },
 };
-
-/** Sentinel pair that bounds our managed section in AGENTS.md. */
-export const MANAGED_SECTION_BEGIN =
-  '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install codex) -->';
-export const MANAGED_SECTION_END = '<!-- END TESTSPRITE AGENT SECTION -->';
 
 type ReadFn = (url: URL) => string;
 
@@ -106,7 +139,7 @@ export function loadSkillBody(read: ReadFn = defaultRead): string {
 
 /**
  * Load the trimmed codex skill body (plain Markdown, no frontmatter).
- * Designed for AGENTS.md managed-section injection.
+ * Designed for managed-section injection into root instruction files.
  */
 export function loadCodexSkillBody(read: ReadFn = defaultRead): string {
   return read(new URL('../../skills/testsprite-verify.codex.md', import.meta.url));
@@ -116,7 +149,7 @@ export function loadCodexSkillBody(read: ReadFn = defaultRead): string {
  * Convenience for piece-2: returns the exact bytes to write for a target.
  *
  * For own-file targets, `body` defaults to the full skill body.
- * For the codex managed-section target, the trimmed codex body is used instead —
+ * For managed-section targets, the trimmed Markdown body is used instead —
  * pass an explicit `body` to override in tests.
  */
 export function renderForTarget(t: AgentTarget, body?: string): { path: string; content: string } {

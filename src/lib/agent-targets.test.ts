@@ -60,20 +60,21 @@ testsprite test artifact get <run-id> --out ./out/
 // ---------------------------------------------------------------------------
 
 describe('TARGETS', () => {
-  it('has all five required keys', () => {
+  it('has all six required keys', () => {
     const keys = Object.keys(TARGETS).sort();
-    expect(keys).toEqual(['antigravity', 'claude', 'cline', 'codex', 'cursor']);
+    expect(keys).toEqual(['antigravity', 'claude', 'cline', 'codex', 'cursor', 'gemini']);
   });
 
   it('claude is GA', () => {
     expect(TARGETS.claude.status).toBe('ga');
   });
 
-  it('cursor, cline, antigravity, and codex are experimental', () => {
+  it('cursor, cline, antigravity, codex, and gemini are experimental', () => {
     expect(TARGETS.cursor.status).toBe('experimental');
     expect(TARGETS.cline.status).toBe('experimental');
     expect(TARGETS.antigravity.status).toBe('experimental');
     expect(TARGETS.codex.status).toBe('experimental');
+    expect(TARGETS.gemini.status).toBe('experimental');
   });
 
   it('each target has a non-empty POSIX path', () => {
@@ -90,12 +91,17 @@ describe('TARGETS', () => {
     expect(TARGETS.cline.mode).toBe('own-file');
   });
 
-  it('codex target has mode managed-section', () => {
+  it('codex and gemini targets have mode managed-section', () => {
     expect(TARGETS.codex.mode).toBe('managed-section');
+    expect(TARGETS.gemini.mode).toBe('managed-section');
   });
 
   it('codex target path is AGENTS.md', () => {
     expect(TARGETS.codex.path).toBe('AGENTS.md');
+  });
+
+  it('gemini target path is GEMINI.md', () => {
+    expect(TARGETS.gemini.path).toBe('GEMINI.md');
   });
 });
 
@@ -376,6 +382,34 @@ describe('content integrity — codex target (testsprite-verify.codex.md)', () =
     // The real codex asset is trimmed (no acronym line).
     const result = renderForTarget('codex');
     // Plain Markdown; no frontmatter fences from own-file wraps
+    expect(result.content).not.toContain('name: testsprite-verify');
+    expect(result.content).not.toContain('alwaysApply:');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// content integrity — gemini target
+// ---------------------------------------------------------------------------
+
+describe('content integrity — gemini target (GEMINI.md managed-section body)', () => {
+  it('renderForTarget("gemini") path is GEMINI.md', () => {
+    const STUB_GEMINI_BODY =
+      '# TestSprite Verification Loop\ntestsprite test run\n--wait\ntest artifact get\n';
+    const result = renderForTarget('gemini', STUB_GEMINI_BODY);
+    expect(result.path).toBe('GEMINI.md');
+  });
+
+  it('renderForTarget("gemini") content is the body unwrapped (no frontmatter)', () => {
+    const STUB_GEMINI_BODY =
+      '# TestSprite Verification Loop\ntestsprite test run\n--wait\ntest artifact get\n';
+    const result = renderForTarget('gemini', STUB_GEMINI_BODY);
+    expect(result.content).toBe(STUB_GEMINI_BODY);
+    expect(result.content).not.toContain('---');
+  });
+
+  it('renderForTarget("gemini") without body arg uses the managed-section asset', () => {
+    const result = renderForTarget('gemini');
+    expect(result.content).toContain('testsprite test run');
     expect(result.content).not.toContain('name: testsprite-verify');
     expect(result.content).not.toContain('alwaysApply:');
   });
