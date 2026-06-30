@@ -6735,6 +6735,23 @@ export async function assertOutDirParentExists(resolvedDir: string): Promise<voi
   }
 }
 
+export function resolveDefaultArtifactDir(runId: string, cwd = process.cwd()): string {
+  requireNonEmpty('run-id', runId);
+  if (
+    runId === '.' ||
+    runId === '..' ||
+    runId.includes('/') ||
+    runId.includes('\\') ||
+    runId.includes('\0')
+  ) {
+    throw localValidationError(
+      'run-id',
+      'must be a single path-safe segment for the default output directory; pass --out <dir> to choose a custom path',
+    );
+  }
+  return join(cwd, '.testsprite', 'runs', runId);
+}
+
 /**
  * `test artifact get <run-id>` — run-scoped failure-bundle download.
  *
@@ -6752,14 +6769,11 @@ export async function runArtifactGet(
   deps: TestDeps = {},
 ): Promise<ArtifactGetResult> {
   const out = makeOutput(opts.output, deps);
-  const client = makeClient(opts, deps);
   const { runId } = opts;
 
   // Resolve output dir: explicit --out or the default .testsprite/runs/<runId>/
   const resolvedDir =
-    opts.out !== undefined
-      ? resolveBundleDir(opts.out)
-      : join(process.cwd(), '.testsprite', 'runs', runId);
+    opts.out !== undefined ? resolveBundleDir(opts.out) : resolveDefaultArtifactDir(runId);
 
   // --dry-run: no network, no disk write.
   // The client (makeClient) is already wired with createDryRunFetch() when
@@ -6798,6 +6812,8 @@ export async function runArtifactGet(
     }
     return { context: cannedCtx };
   }
+
+  const client = makeClient(opts, deps);
 
   // Parent-dir validation for explicit --out only. The default path
   // (.testsprite/runs/<runId>/) is always under cwd — mkdir will create it.
