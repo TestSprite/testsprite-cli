@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { Command } from 'commander';
 import {
   makeHttpClient,
@@ -18,6 +19,8 @@ import {
   type Page,
   type PaginationFlags,
 } from '../lib/pagination.js';
+
+export const MAX_PASSWORD_FILE_BYTES = 64 * 1024;
 
 export interface CliProject {
   id: string;
@@ -185,7 +188,7 @@ export async function runCreate(
   // Resolve password: flag > file > none
   let password = opts.password;
   if (password === undefined && opts.passwordFile !== undefined) {
-    password = readFileSync(opts.passwordFile, 'utf8').trim();
+    password = readPasswordFileGuarded(opts.passwordFile);
   }
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-create-${randomUUID()}`;
@@ -257,7 +260,7 @@ export async function runUpdate(
   // Resolve password
   let password = opts.password;
   if (password === undefined && opts.passwordFile !== undefined) {
-    password = readFileSync(opts.passwordFile, 'utf8').trim();
+    password = readPasswordFileGuarded(opts.passwordFile);
   }
 
   // P2-7: guard --url against localhost/RFC1918/non-http(s).
@@ -593,6 +596,51 @@ function renderUpdateText(r: CliUpdateProjectResponse): string {
     `updatedFields: ${r.updatedFields?.join(', ') ?? '(none)'}`,
     `updatedAt:     ${r.updatedAt}`,
   ].join('\n');
+}
+
+function readPasswordFileGuarded(path: string): string {
+  const absolute = resolve(path);
+  let stat;
+  try {
+    stat = statSync(absolute);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw passwordFileError('must point to a readable file', { path: absolute, error: message });
+  }
+
+  if (!stat.isFile()) {
+    throw passwordFileError('must point to a regular file', { path: absolute });
+  }
+
+  if (stat.size > MAX_PASSWORD_FILE_BYTES) {
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'PAYLOAD_TOO_LARGE',
+        message: 'Password file is too large.',
+        nextAction: `Flag \`--password-file\` is invalid: file must be at most ${MAX_PASSWORD_FILE_BYTES} bytes.`,
+        requestId: 'local',
+        details: {
+          field: 'password-file',
+          sizeBytes: stat.size,
+          maxBytes: MAX_PASSWORD_FILE_BYTES,
+        },
+      },
+    });
+  }
+
+  return readFileSync(absolute, 'utf8').trim();
+}
+
+function passwordFileError(reason: string, details: Record<string, unknown>): ApiError {
+  return ApiError.fromEnvelope({
+    error: {
+      code: 'VALIDATION_ERROR',
+      message: 'Invalid request.',
+      nextAction: `Flag \`--password-file\` is invalid: ${reason}.`,
+      requestId: 'local',
+      details: { field: 'password-file', reason, ...details },
+    },
+  });
 }
 
 function localValidationError(message: string): ApiError {

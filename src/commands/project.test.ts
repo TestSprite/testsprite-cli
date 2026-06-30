@@ -7,6 +7,7 @@ import {
   type CliProject,
   type CliUpdateProjectResponse,
   createProjectCommand,
+  MAX_PASSWORD_FILE_BYTES,
   runCreate,
   runGet,
   runList,
@@ -484,6 +485,66 @@ describe('runCreate', () => {
     expect(result.type).toBe('backend');
   });
 
+  it('P6 — reads --password-file from a bounded regular file', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'project-password-'));
+    const passwordPath = join(dir, 'password.txt');
+    writeFileSync(passwordPath, '  secret-from-file  \n', 'utf8');
+    const sentBodies: unknown[] = [];
+    const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      if (init.body) sentBodies.push(JSON.parse(init.body as string) as unknown);
+      return new Response(JSON.stringify({ ...PROJECT_FIXTURE, id: 'proj_pw' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        type: 'backend',
+        name: 'Password File',
+        passwordFile: passwordPath,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+
+    expect(sentBodies[0]).toMatchObject({ password: 'secret-from-file' });
+  });
+
+  it('P6 — rejects --password-file directories before network', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'project-password-dir-'));
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'backend',
+          name: 'Bad Password File',
+          passwordFile: dir,
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'password-file' }),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('P6 — dry-run returns canned shape without hitting the network', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn(async () => {
@@ -638,6 +699,41 @@ describe('runUpdate', () => {
         },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('P7 — rejects oversized --password-file before network', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'project-password-big-'));
+    const passwordPath = join(dir, 'password.txt');
+    writeFileSync(passwordPath, 'x'.repeat(MAX_PASSWORD_FILE_BYTES + 1), 'utf8');
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network');
+    });
+
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          passwordFile: passwordPath,
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'PAYLOAD_TOO_LARGE',
+      details: expect.objectContaining({
+        field: 'password-file',
+        maxBytes: MAX_PASSWORD_FILE_BYTES,
+      }),
+    });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 

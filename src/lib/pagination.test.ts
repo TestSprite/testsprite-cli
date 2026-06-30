@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from './errors.js';
-import { paginate, validatePaginationFlags, type FetchPage, type Page } from './pagination.js';
+import {
+  MAX_AUTO_PAGES,
+  paginate,
+  validatePaginationFlags,
+  type FetchPage,
+  type Page,
+} from './pagination.js';
 
 function makePages<T>(pages: Page<T>[]): {
   fetchPage: FetchPage<T>;
@@ -86,6 +92,35 @@ describe('paginate', () => {
     const { fetchPage, calls } = makePages([{ items: [1], nextToken: null }]);
     await paginate(fetchPage, { startingToken: 'resume' });
     expect(calls[0]!.cursor).toBe('resume');
+  });
+
+  it('rejects a repeated nextToken instead of following a cursor cycle forever', async () => {
+    const { fetchPage, calls } = makePages([
+      { items: [1], nextToken: 'cursor-a' },
+      { items: [2], nextToken: 'cursor-b' },
+      { items: [3], nextToken: 'cursor-a' },
+    ]);
+
+    await expect(paginate(fetchPage)).rejects.toMatchObject({
+      code: 'UNAVAILABLE',
+      details: expect.objectContaining({ reason: 'repeated_next_token' }),
+    });
+    expect(calls).toHaveLength(3);
+  });
+
+  it('rejects when auto-pagination exceeds the hard page budget', async () => {
+    const { fetchPage, calls } = makePages(
+      Array.from({ length: MAX_AUTO_PAGES + 1 }, (_, i) => ({
+        items: [i],
+        nextToken: `cursor-${i}`,
+      })),
+    );
+
+    await expect(paginate(fetchPage)).rejects.toMatchObject({
+      code: 'UNAVAILABLE',
+      details: expect.objectContaining({ reason: 'max_pages_exceeded' }),
+    });
+    expect(calls).toHaveLength(MAX_AUTO_PAGES);
   });
 
   it('shrinks the per-call pageSize when remaining < pageSize', async () => {

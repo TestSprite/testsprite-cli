@@ -1,5 +1,5 @@
 import type { HttpClient } from './http.js';
-import { localValidationError } from './errors.js';
+import { ApiError, localValidationError } from './errors.js';
 
 /**
  * Page shape returned by every list endpoint per
@@ -22,6 +22,7 @@ export interface PaginationFlags {
 
 const HARD_PAGE_SIZE_CAP = 100;
 const DEFAULT_PAGE_SIZE = 25;
+export const MAX_AUTO_PAGES = 1000;
 
 /**
  * Validates and normalizes pagination flags. Per the CLI OpenAPI spec
@@ -91,14 +92,24 @@ export async function paginate<T>(
   const items: T[] = [];
   let cursor: string | undefined = flags.startingToken;
   let lastNextToken: string | null = null;
+  let pagesFetched = 0;
+  const seenNextTokens = new Set<string>();
+  if (cursor !== undefined) seenNextTokens.add(cursor);
 
   while (true) {
     const remaining = maxItems !== undefined ? maxItems - items.length : Infinity;
     if (remaining <= 0) break;
+    if (pagesFetched >= MAX_AUTO_PAGES) {
+      throw paginationSafetyError('max_pages_exceeded', {
+        maxPages: MAX_AUTO_PAGES,
+        cursor,
+      });
+    }
 
     const callPageSize = Number.isFinite(remaining) ? Math.min(pageSize, remaining) : pageSize;
 
     const page = await fetchPage({ pageSize: callPageSize, cursor });
+    pagesFetched += 1;
     lastNextToken = page.nextToken;
 
     for (const item of page.items) {
@@ -107,6 +118,13 @@ export async function paginate<T>(
     }
 
     if (page.nextToken === null) break;
+    if (seenNextTokens.has(page.nextToken)) {
+      throw paginationSafetyError('repeated_next_token', {
+        nextToken: page.nextToken,
+        pagesFetched,
+      });
+    }
+    seenNextTokens.add(page.nextToken);
     cursor = page.nextToken;
   }
 
@@ -127,5 +145,18 @@ export async function fetchSinglePage<T>(
 ): Promise<Page<T>> {
   return client.get<Page<T>>(path, {
     query: { ...extraQuery, pageSize, cursor },
+  });
+}
+
+function paginationSafetyError(reason: string, details: Record<string, unknown>): ApiError {
+  return ApiError.fromEnvelope({
+    error: {
+      code: 'UNAVAILABLE',
+      message: 'Pagination did not make safe progress.',
+      nextAction:
+        'Retry with --page-size and --starting-token, or use --max-items to bound auto-pagination. Report this if the server keeps returning cursors indefinitely.',
+      requestId: 'local',
+      details: { reason, ...details },
+    },
   });
 }
