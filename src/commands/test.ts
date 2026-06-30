@@ -6737,9 +6737,10 @@ export async function assertOutDirParentExists(resolvedDir: string): Promise<voi
 
 export function resolveDefaultArtifactDir(runId: string, cwd = process.cwd()): string {
   requireNonEmpty('run-id', runId);
+  const windowsNormalizedSegment = runId.trimEnd();
   if (
-    runId === '.' ||
-    runId === '..' ||
+    windowsNormalizedSegment === '.' ||
+    windowsNormalizedSegment === '..' ||
     runId.includes('/') ||
     runId.includes('\\') ||
     runId.includes('\0')
