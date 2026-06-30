@@ -712,6 +712,7 @@ export async function streamUrlToFile(
   deps?: { sleep?: (ms: number) => Promise<void> },
 ): Promise<void> {
   const sleepFn = deps?.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+  const artifactUrl = redactArtifactUrlForDetails(url);
   for (let attempt = 1; attempt <= STREAM_URL_MAX_RETRIES; attempt++) {
     let response: Response;
     try {
@@ -722,7 +723,7 @@ export async function streamUrlToFile(
         await sleepFn(STREAM_URL_RETRY_DELAY_MS);
         continue;
       }
-      throw new TransportError(`Failed to download presigned URL ${url}: ${message}`);
+      throw new TransportError(`Failed to download presigned URL ${artifactUrl}: ${message}`);
     }
     if (!response.ok) {
       // Non-2xx: the URL itself is bad (expired, unauthorized, not found).
@@ -734,7 +735,7 @@ export async function streamUrlToFile(
           nextAction:
             'Re-run `testsprite test failure get`. Presigned URLs in the bundle expire after 15 minutes.',
           requestId: 'local',
-          details: { status: response.status, url },
+          details: { status: response.status, artifactUrl },
         },
       });
     }
@@ -754,7 +755,7 @@ export async function streamUrlToFile(
           await sleepFn(STREAM_URL_RETRY_DELAY_MS);
           continue;
         }
-        throw new TransportError(`Failed to download presigned URL ${url}: ${message}`);
+        throw new TransportError(`Failed to download presigned URL ${artifactUrl}: ${message}`);
       }
     }
     await mkdir(dirname(filePath), { recursive: true });
@@ -776,8 +777,17 @@ export async function streamUrlToFile(
         await sleepFn(STREAM_URL_RETRY_DELAY_MS);
         continue;
       }
-      throw new TransportError(`Failed mid-download of ${url}: ${message}`);
+      throw new TransportError(`Failed mid-download of ${artifactUrl}: ${message}`);
     }
+  }
+}
+
+function redactArtifactUrlForDetails(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return '<invalid-url>';
   }
 }
 
