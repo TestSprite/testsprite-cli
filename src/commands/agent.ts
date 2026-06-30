@@ -15,6 +15,7 @@ import {
   pathFor,
   loadSkillBodyFor,
   bodyHash12,
+  compactBodyFor,
   buildCodexAggregate,
   buildSkillMarker,
   parseSkillMarker,
@@ -443,6 +444,21 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
     }
     return b;
   };
+  // Budget-capped own-file targets (e.g. windsurf) render the compact per-skill
+  // body so the rule file isn't truncated by the agent. Cached separately; must
+  // match renderForTarget's default selection so written bytes equal the asserted
+  // render.
+  const compactBodyCache = new Map<string, string>();
+  const compactBodyForSkill = (skill: string): string => {
+    let b = compactBodyCache.get(skill);
+    if (b === undefined) {
+      b = compactBodyFor(skill);
+      compactBodyCache.set(skill, b);
+    }
+    return b;
+  };
+  const ownFileBodyFor = (t: AgentTarget, skill: string): string =>
+    TARGETS[t].compactBody ? compactBodyForSkill(skill) : bodyForSkill(skill);
   let codexSectionCache: string | undefined;
   const getCodexSection = (): string => {
     if (codexSectionCache === undefined) {
@@ -651,7 +667,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
       if (abs !== root && !abs.startsWith(root + path.sep)) {
         throw new CLIError(`refusing to write outside --dir: ${relPath}`, 5);
       }
-      const content = renderForTarget(t, skill, bodyForSkill(skill)).content;
+      const content = renderForTarget(t, skill, ownFileBodyFor(t, skill)).content;
 
       if (opts.dryRun) {
         // Apply the SAME symlink fail-close guard as the real install path
@@ -1045,7 +1061,7 @@ function collect(v: string, prev: string[]): string[] {
 
 export function createAgentCommand(deps: AgentDeps = {}): Command {
   const agent = new Command('agent').description(
-    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Codex)',
+    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Windsurf, Antigravity, Codex)',
   );
 
   agent
@@ -1055,7 +1071,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
     )
     .option(
       '--target <t>',
-      'Agent target(s): claude, cursor, cline, antigravity, kiro, codex (comma-separated or repeated)',
+      'Agent target(s): claude, cursor, cline, antigravity, kiro, windsurf, codex (comma-separated or repeated)',
       collect,
       [],
     )

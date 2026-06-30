@@ -2,7 +2,14 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { VERSION } from '../version.js';
 
-export type AgentTarget = 'claude' | 'cursor' | 'cline' | 'antigravity' | 'codex' | 'kiro';
+export type AgentTarget =
+  | 'claude'
+  | 'cursor'
+  | 'cline'
+  | 'antigravity'
+  | 'codex'
+  | 'kiro'
+  | 'windsurf';
 
 export interface TargetSpec {
   status: 'ga' | 'experimental';
@@ -14,11 +21,19 @@ export interface TargetSpec {
    */
   path: string;
   /**
-   * 'own-file': the CLI owns the whole file (claude/cursor/cline/antigravity).
+   * 'own-file': the CLI owns the whole file (claude/cursor/cline/antigravity/windsurf).
    * 'managed-section': the CLI writes only a sentinel-delimited section inside
    * a potentially user-authored file (codex target, AGENTS.md).
    */
   mode: 'own-file' | 'managed-section';
+  /**
+   * When true, render the budget-friendly body (see {@link compactBodyFor})
+   * instead of the full own-file skill body. Used for own-file targets whose
+   * rule files are size-capped — currently `windsurf` (`.windsurf/rules/*.md`
+   * files cap at ~12 K characters and Cascade silently truncates beyond that,
+   * which would cut the full ~22 KB verify skill in half).
+   */
+  compactBody?: boolean;
   /**
    * Wrap a skill body in this target's frontmatter/header. Takes the skill's
    * `name`+`description` (own-file targets emit them as frontmatter) and the body.
@@ -122,6 +137,18 @@ function wrapMdc(_name: string, description: string, body: string): string {
   return `---\ndescription: ${description}\nalwaysApply: false\n---\n\n${body}\n`;
 }
 
+/**
+ * Windsurf (Cascade) reads workspace rules from `.windsurf/rules/*.md` with YAML
+ * frontmatter. `trigger: model_decision` is the Cascade equivalent of the Cursor
+ * `.mdc` `alwaysApply: false` mode: only the `description` is surfaced up front,
+ * and Cascade pulls in the full rule body when the description shows it is
+ * relevant — exactly the on-demand activation these skills want. (The other
+ * triggers are `always_on`, `manual`, and `glob`.)
+ */
+function wrapWindsurf(_name: string, description: string, body: string): string {
+  return `---\ntrigger: model_decision\ndescription: ${description}\n---\n\n${body}\n`;
+}
+
 // ---------------------------------------------------------------------------
 // Landing paths
 // ---------------------------------------------------------------------------
@@ -144,6 +171,8 @@ export function pathFor(target: AgentTarget, skill: string): string {
       return `.clinerules/${skill}.md`;
     case 'kiro':
       return `.kiro/skills/${skill}/SKILL.md`;
+    case 'windsurf':
+      return `.windsurf/rules/${skill}.md`;
     case 'codex':
       return 'AGENTS.md';
   }
@@ -181,6 +210,15 @@ export const TARGETS: Record<AgentTarget, TargetSpec> = {
     // kiro reads SKILL.md files with name/description frontmatter, same as
     // claude/antigravity, so it shares the wrapSkill wrapper.
     wrap: wrapSkill,
+  },
+  windsurf: {
+    status: 'experimental',
+    path: pathFor('windsurf', SKILL_NAME),
+    mode: 'own-file',
+    // Windsurf rules files are budget-capped (~12 K chars per `.windsurf/rules/*.md`),
+    // so render the compact body per skill (see compactBodyFor).
+    compactBody: true,
+    wrap: wrapWindsurf,
   },
   /**
    * codex target — managed-section mode.
@@ -319,6 +357,24 @@ export function loadSkillBodyFor(skill: string, read: ReadFn = defaultRead): str
 }
 
 /**
+ * Budget-friendly body for an own-file target whose rule files are size-capped
+ * (e.g. windsurf). For a skill that ships a trimmed codex asset (`codex.kind ===
+ * 'full'`, e.g. `testsprite-verify` — full body ~22 KB, codex ~5 KB) we render
+ * that compact asset so the wrapped file stays under the cap. For skills whose
+ * codex contribution is only a one-liner (`'line'`/`'none'`, e.g.
+ * `testsprite-onboard`), the one-liner is useless as a standalone rule and the
+ * full own-file body (~6.5 KB) already fits the budget — so the full body is
+ * used.
+ */
+export function compactBodyFor(skill: string, read: ReadFn = defaultRead): string {
+  const spec = SKILLS[skill];
+  if (!spec) throw new Error(`unknown skill: ${skill}`);
+  return spec.codex.kind === 'full'
+    ? readSkillAsset(spec.codex.file, read)
+    : loadSkillBodyFor(skill, read);
+}
+
+/**
  * Resolve a skill's codex (AGENTS.md) contribution as a Markdown string.
  * 'full' → read the `*.codex.md` asset; 'line' → the inline one-liner; 'none' → ''.
  */
@@ -441,7 +497,8 @@ export function renderForTarget(
     const resolvedBody = body !== undefined ? body : codexContentFor(skill);
     return { path, content: spec.wrap(skillSpec.name, skillSpec.description, resolvedBody) };
   }
-  const resolvedBody = body !== undefined ? body : loadSkillBodyFor(skill);
+  const resolvedBody =
+    body !== undefined ? body : spec.compactBody ? compactBodyFor(skill) : loadSkillBodyFor(skill);
   return {
     path,
     content: renderOwnFileWithMarker(t, skill, buildSkillMarker(skill, resolvedBody), resolvedBody),

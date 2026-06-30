@@ -4,7 +4,7 @@ exports[`--help snapshots > agent 1`] = `
 "Usage: testsprite agent [options] [command]
 
 Install TestSprite guidance into coding-agent config (Claude Code, Cursor,
-Cline, Antigravity, Codex)
+Cline, Windsurf, Antigravity, Codex)
 
 Options:
   -h, --help         display help for command
@@ -29,7 +29,7 @@ into a project for a coding agent
 
 Options:
   --target <t>    Agent target(s): claude, cursor, cline, antigravity, kiro,
-                  codex (comma-separated or repeated) (default: [])
+                  windsurf, codex (comma-separated or repeated) (default: [])
   --skill <name>  Skill(s) to install: testsprite-verify, testsprite-onboard
                   (comma-separated or repeated; default: all) (default: [])
   --dir <path>    Project root to write into (default: cwd)
@@ -115,8 +115,8 @@ Options:
   --from-env        Read TESTSPRITE_API_KEY from the environment instead of
                     prompting (default: false)
   --agent <target>  Coding-agent target to install: claude, antigravity,
-                    cursor, cline, kiro, codex (default: claude) (default:
-                    "claude")
+                    cursor, cline, kiro, windsurf, codex (default: claude)
+                    (default: "claude")
   --no-agent        Skip the agent skill install (configure credentials only)
   --force           Overwrite an existing skill file (a .bak backup is kept)
   --dir <path>      Project root for the skill install (default: current
@@ -604,8 +604,8 @@ Commands:
   project                      Manage TestSprite projects
   test                         Inspect TestSprite tests
   agent                        Install TestSprite guidance into coding-agent
-                               config (Claude Code, Cursor, Cline, Antigravity,
-                               Codex)
+                               config (Claude Code, Cursor, Cline, Windsurf,
+                               Antigravity, Codex)
   usage|credits                Show credit balance and plan/entitlement info
                                (proactive pre-flight before a large test run)
   help [command]               display help for command

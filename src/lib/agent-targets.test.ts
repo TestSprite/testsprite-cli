@@ -80,18 +80,19 @@ testsprite test artifact get <run-id> --out ./out/
 // ---------------------------------------------------------------------------
 
 describe('TARGETS', () => {
-  it('has all six required keys', () => {
+  it('has all seven required keys', () => {
     const keys = Object.keys(TARGETS).sort();
-    expect(keys).toEqual(['antigravity', 'claude', 'cline', 'codex', 'cursor', 'kiro']);
+    expect(keys).toEqual(['antigravity', 'claude', 'cline', 'codex', 'cursor', 'kiro', 'windsurf']);
   });
 
   it('claude is GA', () => {
     expect(TARGETS.claude.status).toBe('ga');
   });
 
-  it('cursor, cline, antigravity, kiro, and codex are experimental', () => {
+  it('cursor, cline, windsurf, antigravity, kiro, and codex are experimental', () => {
     expect(TARGETS.cursor.status).toBe('experimental');
     expect(TARGETS.cline.status).toBe('experimental');
+    expect(TARGETS.windsurf.status).toBe('experimental');
     expect(TARGETS.antigravity.status).toBe('experimental');
     expect(TARGETS.kiro.status).toBe('experimental');
     expect(TARGETS.codex.status).toBe('experimental');
@@ -110,6 +111,7 @@ describe('TARGETS', () => {
     expect(TARGETS.cursor.mode).toBe('own-file');
     expect(TARGETS.cline.mode).toBe('own-file');
     expect(TARGETS.kiro.mode).toBe('own-file');
+    expect(TARGETS.windsurf.mode).toBe('own-file');
   });
 
   it('codex target has mode managed-section', () => {
@@ -290,6 +292,52 @@ describe('renderForTarget("cline")', () => {
 
   it('starts with the TestSprite Verification Loop H1 (the body H1)', () => {
     expect(result.content.trimStart().startsWith('# TestSprite Verification Loop')).toBe(true);
+  });
+});
+
+describe('renderForTarget("windsurf")', () => {
+  const result = renderForTarget('windsurf', 'testsprite-verify', STUB_BODY);
+
+  it('returns the .windsurf/rules path', () => {
+    expect(result.path).toBe('.windsurf/rules/testsprite-verify.md');
+  });
+
+  it('uses the Cascade frontmatter (trigger: model_decision + description)', () => {
+    expect(result.content.startsWith('---\n')).toBe(true);
+    expect(result.content).toContain('trigger: model_decision');
+    expect(result.content).toContain(`description: ${SKILL_DESCRIPTION}`);
+  });
+
+  it('does NOT carry the Claude/Cursor frontmatter keys', () => {
+    const match = /^---\n([\s\S]*?)\n---/.exec(result.content);
+    const fm = match?.[1] ?? '';
+    expect(fm).not.toContain('name:'); // claude key
+    expect(fm).not.toContain('alwaysApply:'); // cursor .mdc key
+  });
+});
+
+describe('windsurf renders within the rules-file budget', () => {
+  // Regression: a `.windsurf/rules/*.md` file caps at ~12 K characters and
+  // Cascade silently truncates beyond that. The full verify body (~22 KB) would
+  // be cut in half, so windsurf renders the COMPACT body for verify (its trimmed
+  // codex asset) and the full body for onboard (which already fits). Uses the
+  // REAL bodies (no stub) so the size reflects what a user receives.
+  for (const skill of DEFAULT_SKILLS) {
+    it(`${skill} fits under 12 000 characters`, () => {
+      const r = renderForTarget('windsurf', skill);
+      expect(r.content.length).toBeLessThan(12_000);
+    });
+  }
+
+  it('verify uses the compact body (smaller than the full claude render)', () => {
+    const windsurf = renderForTarget('windsurf', 'testsprite-verify');
+    const claude = renderForTarget('claude', 'testsprite-verify');
+    expect(windsurf.content.length).toBeLessThan(claude.content.length);
+    // The full-body-only intro line is absent from the compact body...
+    expect(claude.content).toContain('The verification loop that flies');
+    expect(windsurf.content).not.toContain('The verification loop that flies');
+    // ...but the load-bearing command survives.
+    expect(windsurf.content).toContain('testsprite test run');
   });
 });
 
