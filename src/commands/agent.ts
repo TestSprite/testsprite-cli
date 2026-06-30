@@ -324,7 +324,7 @@ export interface InstallResult {
   action: InstallAction;
   /**
    * Skill(s) this result covers. Own-file targets produce one result per skill
-   * (`[skill]`); the codex managed-section target produces ONE result whose
+   * (`[skill]`); managed-section targets produce ONE result whose
    * section aggregates every installed skill (`[...skills]`).
    */
   skills: string[];
@@ -540,7 +540,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
             `[warn] ${relPath} will be ${wouldBeBytes} bytes after this write — ${managedConfig.loadBudgetLabel ?? `the target agent may not load content beyond its ${managedConfig.loadBudgetBytes} byte budget`}. Trim ${relPath} to stay within the limit.`,
           );
         }
-        dryRunLines.push({ abs, bytes, note: 'managed section' });
+        dryRunLines.push({ abs, bytes: wouldBeBytes, note: 'managed section' });
         results.push({ target: t, path: relPath, action: 'dry-run', skills: [...skills] });
         continue;
       }
@@ -762,9 +762,9 @@ export async function runList(opts: CommonOptions, deps: AgentDeps = {}): Promis
   const out = makeOutput(opts.output, deps);
 
   // One row per (target × default skill). Own-file targets land each skill at a
-  // distinct path; the codex managed-section target merges all skills into the
-  // single AGENTS.md (so every codex row shares that path — truthful, since both
-  // skills' content lands there).
+  // distinct path; managed-section targets merge all skills into a single root
+  // instruction file (so every managed-section row shares that path — truthful,
+  // since both skills' content lands there).
   const results: ListResult[] = [];
   for (const [t, spec] of Object.entries(TARGETS) as [
     AgentTarget,

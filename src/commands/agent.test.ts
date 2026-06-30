@@ -1437,6 +1437,17 @@ describe('runInstall — gemini managed-section: append (GEMINI.md exists, no se
     expect(written).toContain('testsprite test run');
     expect(capture.stdout.join('\n')).toContain('gemini');
     expect(capture.stdout.join('\n')).toContain('section-installed');
+
+    await runInstall(
+      { ...BASE_OPTS, target: ['gemini'], force: false },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const rewritten = store.get(geminiAbs)!;
+    expect(rewritten).toContain('# Project Instructions');
+    expect(rewritten).toContain('Keep existing Gemini CLI notes.');
+    expect(rewritten.split(TARGETS.gemini.managedSection!.begin).length - 1).toBe(1);
+    expect(rewritten.split(TARGETS.gemini.managedSection!.end).length - 1).toBe(1);
   });
 });
 

@@ -713,4 +713,11 @@ describe('content integrity — gemini target (GEMINI.md managed-section body)',
     expect(result.content).not.toContain('name: testsprite-verify');
     expect(result.content).not.toContain('alwaysApply:');
   });
+
+  it('renderForTarget("gemini") supports the onboard managed-section contribution', () => {
+    const result = renderForTarget('gemini', 'testsprite-onboard');
+    expect(result.path).toBe('GEMINI.md');
+    expect(result.content).toBe(ONBOARD_CODEX_LINE);
+    expect(result.content).not.toContain('---');
+  });
 });

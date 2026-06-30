@@ -136,8 +136,9 @@ function wrapMdc(_name: string, description: string, body: string): string {
 /**
  * Repo-relative landing path for a given skill on a given target (POSIX
  * separators). Own-file targets embed the skill name in the path so multiple
- * skills coexist; the codex target always lands at the single shared `AGENTS.md`
- * (every skill's codex contribution is merged into one managed section there).
+ * skills coexist; managed-section targets land at shared root instruction files
+ * (`AGENTS.md` for codex, `GEMINI.md` for gemini), where every selected skill's
+ * contribution is merged into one managed section.
  */
 export function pathFor(target: AgentTarget, skill: string): string {
   switch (target) {

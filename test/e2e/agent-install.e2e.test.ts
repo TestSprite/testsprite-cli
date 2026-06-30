@@ -334,7 +334,7 @@ describe('force overwrite with backup', () => {
     expect(parsed[0]!.action).toBe('updated');
 
     // File must now equal canonical content
-    const { content: canonical } = renderForTarget('claude');
+    const { content: canonical } = renderForTarget('claude', 'testsprite-verify');
     expect(readFileSync(filePath, 'utf8')).toBe(canonical);
 
     // .bak must hold the edited bytes
