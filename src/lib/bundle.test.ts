@@ -667,6 +667,22 @@ describe('streamUrlToFile retry', () => {
     expect(calls).toBe(1);
   });
 
+  it('disables automatic redirects so unsafe redirect targets cannot bypass URL validation', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stream-test-'));
+    const dest = join(dir, 'out.bin');
+    const redirects: Array<RequestInit['redirect']> = [];
+    const fetchImpl = async (_url: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+      redirects.push(init?.redirect);
+      return new Response('hello', { status: 200 });
+    };
+
+    await streamUrlToFile('https://example.com/x', dest, fetchImpl as typeof globalThis.fetch, {
+      sleep: noSleep,
+    });
+
+    expect(redirects).toEqual(['error']);
+  });
+
   it('sleeps between retries', async () => {
     const sleepDelays: number[] = [];
     const fetchImpl = async () => {

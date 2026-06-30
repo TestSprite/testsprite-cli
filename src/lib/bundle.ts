@@ -715,7 +715,7 @@ export async function streamUrlToFile(
   for (let attempt = 1; attempt <= STREAM_URL_MAX_RETRIES; attempt++) {
     let response: Response;
     try {
-      response = await fetchImpl(url);
+      response = await fetchImpl(url, { redirect: 'error' });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (attempt < STREAM_URL_MAX_RETRIES) {
