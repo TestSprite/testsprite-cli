@@ -55,7 +55,7 @@
   "devDependencies": {
     "@eslint/js": "^9.14.0",
     "@types/node": "^22.9.0",
-    "@vitest/coverage-v8": "^2.1.4",
+    "@vitest/coverage-v8": "^4.1.9",
     "eslint": "^9.14.0",
     "eslint-config-prettier": "^9.1.0",
     "globals": "^15.12.0",
