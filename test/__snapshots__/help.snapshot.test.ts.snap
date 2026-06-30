@@ -10,10 +10,10 @@ Options:
   -h, --help         display help for command
 
 Commands:
-  install [options]  Write the TestSprite verification-loop skill file into a
-                     project for a coding agent
-  list               List supported agent targets, their status, and landing
-                     paths
+  install [options]  Write the TestSprite agent skills (verification loop +
+                     first-run onboarding) into a project for a coding agent
+  list               List supported agent targets and skills, their status, and
+                     landing paths
   help [command]     display help for command
 "
 `;
@@ -21,18 +21,20 @@ Commands:
 exports[`--help snapshots > agent install 1`] = `
 "Usage: testsprite agent install [options]
 
-Write the TestSprite verification-loop skill file into a project for a coding
-agent
+Write the TestSprite agent skills (verification loop + first-run onboarding)
+into a project for a coding agent
 
 Options:
-  --target <t>  Agent target(s): claude, cursor, cline, antigravity, codex,
-                gemini (comma-separated or repeated) (default: [])
-  --dir <path>  Project root to write into (default: cwd)
-  --force       For own-file targets: overwrite existing file (a .bak backup is
-                kept). For managed-section targets: replaces the section
-                unconditionally; user content outside the section is never
-                destroyed.
-  -h, --help    display help for command
+  --target <t>    Agent target(s): claude, cursor, cline, antigravity, codex,
+                  gemini (comma-separated or repeated) (default: [])
+  --skill <name>  Skill(s) to install: testsprite-verify, testsprite-onboard
+                  (comma-separated or repeated; default: all) (default: [])
+  --dir <path>    Project root to write into (default: cwd)
+  --force         For own-file targets: overwrite existing file (a .bak backup
+                  is kept). For managed-section targets: replaces the section
+                  unconditionally; user content outside the section is never
+                  destroyed.
+  -h, --help      display help for command
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
   testsprite --help
@@ -42,7 +44,7 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --deb
 exports[`--help snapshots > agent list 1`] = `
 "Usage: testsprite agent list [options]
 
-List supported agent targets, their status, and landing paths
+List supported agent targets and skills, their status, and landing paths
 
 Options:
   -h, --help  display help for command
@@ -574,8 +576,8 @@ Options:
 
 Commands:
   setup [options]              Set up TestSprite: configure your API key and
-                               install the verification skill for your coding
-                               agent
+                               install the TestSprite agent skills for your
+                               coding agent
   auth                         Manage TestSprite credentials
   project                      Manage TestSprite projects
   test                         Inspect TestSprite tests

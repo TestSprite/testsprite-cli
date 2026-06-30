@@ -4,8 +4,12 @@ import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError, CLIError } from '../lib/errors.js';
 import {
+  DEFAULT_SKILLS,
   MANAGED_SECTION_BEGIN,
   MANAGED_SECTION_END,
+  ONBOARD_CODEX_LINE,
+  SKILLS,
+  pathFor,
   renderForTarget,
   TARGETS,
   type AgentTarget,
@@ -135,12 +139,13 @@ describe('runInstall — fresh install', () => {
         debug: false,
         dryRun: false,
         target: [t],
+        skills: ['testsprite-verify'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
     );
 
-    const { path: relPath, content } = renderForTarget(t);
+    const { path: relPath, content } = renderForTarget(t, 'testsprite-verify');
     const abs = path.resolve(CWD, relPath);
 
     // File was written to store
@@ -165,12 +170,13 @@ describe('runInstall — fresh install', () => {
         debug: false,
         dryRun: false,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
     );
 
-    const { path: relPath, content } = renderForTarget('claude');
+    const { path: relPath, content } = renderForTarget('claude', 'testsprite-verify');
     const abs = path.resolve(CWD, relPath);
     expect(store.get(abs)).toBe(content);
   });
@@ -186,6 +192,7 @@ describe('runInstall — fresh install', () => {
         debug: false,
         dryRun: false,
         target: ['claude', 'antigravity'],
+        skills: ['testsprite-verify'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -208,6 +215,7 @@ describe('runInstall — fresh install', () => {
         debug: false,
         dryRun: false,
         target: ['cline'],
+        skills: ['testsprite-verify'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -228,6 +236,7 @@ describe('runInstall — fresh install', () => {
         debug: false,
         dryRun: false,
         target: ['cursor'],
+        skills: ['testsprite-verify'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -248,7 +257,7 @@ describe('runInstall — idempotency (skipped)', () => {
     const { capture, deps } = makeCapture();
 
     // Pre-seed with the canonical content
-    const { path: relPath, content } = renderForTarget('claude');
+    const { path: relPath, content } = renderForTarget('claude', 'testsprite-verify');
     const abs = path.resolve(CWD, relPath);
     seedFile(abs, content);
 
@@ -261,6 +270,7 @@ describe('runInstall — idempotency (skipped)', () => {
         debug: false,
         dryRun: false,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -283,7 +293,7 @@ describe('runInstall — conflict (blocked)', () => {
     const { store, fs: agentFs, writeCalls, seedFile } = makeMemFs();
     const { capture, deps } = makeCapture();
 
-    const { path: relPath } = renderForTarget('claude');
+    const { path: relPath } = renderForTarget('claude', 'testsprite-verify');
     const abs = path.resolve(CWD, relPath);
     seedFile(abs, 'DIFFERENT CONTENT');
 
@@ -298,6 +308,7 @@ describe('runInstall — conflict (blocked)', () => {
           debug: false,
           dryRun: false,
           target: ['claude'],
+          skills: ['testsprite-verify'],
           force: false,
         },
         { cwd: CWD, fs: agentFs, ...deps },
@@ -329,7 +340,7 @@ describe('runInstall — --force', () => {
     const { store, fs: agentFs, writeCalls, seedFile } = makeMemFs();
     const { capture, deps } = makeCapture();
 
-    const { path: relPath, content } = renderForTarget('claude');
+    const { path: relPath, content } = renderForTarget('claude', 'testsprite-verify');
     const abs = path.resolve(CWD, relPath);
     const oldContent = 'OLD CONTENT';
     seedFile(abs, oldContent);
@@ -341,6 +352,7 @@ describe('runInstall — --force', () => {
         debug: false,
         dryRun: false,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: true,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -363,7 +375,7 @@ describe('runInstall — --force', () => {
     const { store, fs: agentFs, seedFile } = makeMemFs();
     const { deps: deps1 } = makeCapture();
 
-    const { path: relPath, content } = renderForTarget('claude');
+    const { path: relPath, content } = renderForTarget('claude', 'testsprite-verify');
     const abs = path.resolve(CWD, relPath);
     const firstEdit = 'FIRST EDIT';
     seedFile(abs, firstEdit);
@@ -376,6 +388,7 @@ describe('runInstall — --force', () => {
         debug: false,
         dryRun: false,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: true,
       },
       { cwd: CWD, fs: agentFs, ...deps1 },
@@ -398,6 +411,7 @@ describe('runInstall — --force', () => {
         debug: false,
         dryRun: false,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: true,
       },
       { cwd: CWD, fs: agentFs, ...deps2 },
@@ -427,6 +441,7 @@ describe('runInstall — --dry-run', () => {
         debug: false,
         dryRun: true,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -468,13 +483,14 @@ describe('runInstall — --dir override', () => {
         debug: false,
         dryRun: false,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: false,
         dir: customDir,
       },
       { cwd: CWD, fs: agentFs, ...deps },
     );
 
-    const { path: relPath, content } = renderForTarget('claude');
+    const { path: relPath, content } = renderForTarget('claude', 'testsprite-verify');
     const abs = path.resolve(customDir, relPath);
     expect(store.get(abs)).toBe(content);
     // Not written under CWD
@@ -534,6 +550,7 @@ describe('runInstall — multi-target', () => {
         debug: false,
         dryRun: false,
         target: ['claude', 'cursor'],
+        skills: ['testsprite-verify'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -555,6 +572,7 @@ describe('runInstall — multi-target', () => {
         debug: false,
         dryRun: false,
         target: ['claude,cursor'],
+        skills: ['testsprite-verify'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -581,6 +599,7 @@ describe('runInstall — multi-target', () => {
           debug: false,
           dryRun: false,
           target: ['claude', 'cursor'],
+          skills: ['testsprite-verify'],
           force: false,
         },
         { cwd: CWD, fs: agentFs, ...deps },
@@ -617,6 +636,7 @@ describe('runInstall — multi-target', () => {
         debug: false,
         dryRun: false,
         target: ['claude', 'claude'],
+        skills: ['testsprite-verify'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -665,7 +685,15 @@ describe('runInstall — empty target', () => {
     const promptFn = vi.fn().mockResolvedValue('claude');
 
     await runInstall(
-      { profile: 'default', output: 'text', debug: false, dryRun: false, target: [], force: false },
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        target: [],
+        skills: ['testsprite-verify'],
+        force: false,
+      },
       { cwd: CWD, fs: agentFs, isTTY: true, prompt: promptFn, ...deps },
     );
 
@@ -681,7 +709,15 @@ describe('runInstall — empty target', () => {
     const promptFn = vi.fn().mockResolvedValue(''); // empty => default to claude
 
     await runInstall(
-      { profile: 'default', output: 'text', debug: false, dryRun: false, target: [], force: false },
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        target: [],
+        skills: ['testsprite-verify'],
+        force: false,
+      },
       { cwd: CWD, fs: agentFs, isTTY: true, prompt: promptFn, ...deps },
     );
 
@@ -718,14 +754,15 @@ describe('runList', () => {
     expect(out).toContain(TARGETS.gemini.path);
   });
 
-  it('JSON mode emits array of {target, status, path, mode}', async () => {
+  it('JSON mode emits array of {target, skill, status, path, mode}', async () => {
     const { capture, deps } = makeCapture();
 
     await runList({ profile: 'default', output: 'json', debug: false, dryRun: false }, deps);
 
     const json = JSON.parse(capture.stdout.join('\n')) as ListResult[];
     expect(Array.isArray(json)).toBe(true);
-    expect(json).toHaveLength(6);
+    // 6 targets × 2 default skills = 12 rows
+    expect(json).toHaveLength(12);
     const targets = json.map(r => r.target);
     expect(targets).toContain('claude');
     expect(targets).toContain('cursor');
@@ -733,13 +770,17 @@ describe('runList', () => {
     expect(targets).toContain('antigravity');
     expect(targets).toContain('codex');
     expect(targets).toContain('gemini');
-    const claudeEntry = json.find(r => r.target === 'claude');
+    // skill field present on each row
+    const skills = json.map(r => r.skill);
+    expect(skills).toContain('testsprite-verify');
+    expect(skills).toContain('testsprite-onboard');
+    const claudeEntry = json.find(r => r.target === 'claude' && r.skill === 'testsprite-verify');
     expect(claudeEntry?.status).toBe('ga');
     expect(claudeEntry?.path).toBe(TARGETS.claude.path);
     // codex entry has mode: managed-section
-    const codexEntry = json.find(r => r.target === 'codex');
+    const codexEntry = json.find(r => r.target === 'codex' && r.skill === 'testsprite-verify');
     expect(codexEntry?.mode).toBe('managed-section');
-    const geminiEntry = json.find(r => r.target === 'gemini');
+    const geminiEntry = json.find(r => r.target === 'gemini' && r.skill === 'testsprite-verify');
     expect(geminiEntry?.mode).toBe('managed-section');
   });
 
@@ -750,6 +791,7 @@ describe('runList', () => {
 
     const lines = capture.stdout.join('\n').split('\n');
     expect(lines[0]).toMatch(/TARGET/i);
+    expect(lines[0]).toMatch(/SKILL/i);
     expect(lines[0]).toMatch(/STATUS/i);
     expect(lines[0]).toMatch(/PATH/i);
   });
@@ -760,7 +802,7 @@ describe('runList', () => {
 // ---------------------------------------------------------------------------
 
 describe('runInstall — output modes', () => {
-  it('JSON mode emits array of {target, path, action}', async () => {
+  it('JSON mode emits array of {target, path, action, skills}', async () => {
     const { fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -771,6 +813,7 @@ describe('runInstall — output modes', () => {
         debug: false,
         dryRun: false,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -778,7 +821,11 @@ describe('runInstall — output modes', () => {
 
     const json = JSON.parse(capture.stdout.join('\n')) as InstallResult[];
     expect(Array.isArray(json)).toBe(true);
-    expect(json[0]).toMatchObject({ target: 'claude', action: 'written' });
+    expect(json[0]).toMatchObject({
+      target: 'claude',
+      action: 'written',
+      skills: ['testsprite-verify'],
+    });
     expect(json[0]?.path).toBe(TARGETS.claude.path);
   });
 
@@ -793,6 +840,7 @@ describe('runInstall — output modes', () => {
         debug: false,
         dryRun: false,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -877,6 +925,7 @@ describe('runInstall — all four own-file targets', () => {
         debug: false,
         dryRun: false,
         target: ['claude', 'cursor', 'cline', 'antigravity'],
+        skills: ['testsprite-verify'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -897,7 +946,7 @@ describe('runInstall — all four own-file targets', () => {
 // ---------------------------------------------------------------------------
 
 describe('runInstall — dry-run all own-file targets', () => {
-  it('writes nothing for any of the four own-file targets', async () => {
+  it('writes nothing for any of the four own-file targets (default 2 skills = 8 would-write lines)', async () => {
     const { store, fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -917,9 +966,9 @@ describe('runInstall — dry-run all own-file targets', () => {
     const stderrOut = capture.stderr.join('\n');
     // Banner appears once
     expect(stderrOut).toContain('[dry-run] no files written');
-    // Four would-write lines
+    // 4 targets × 2 default skills = 8 would-write lines
     const wouldWriteLines = stderrOut.split('\n').filter(l => l.includes('would write'));
-    expect(wouldWriteLines.length).toBe(4);
+    expect(wouldWriteLines.length).toBe(8);
   });
 });
 
@@ -939,13 +988,14 @@ describe('runInstall — default AgentFs (real disk)', () => {
         debug: false,
         dryRun: false,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: false,
         dir: tmpRoot,
       },
       { ...deps }, // no fs injected → uses defaultAgentFs
     );
 
-    const { path: relPath, content } = renderForTarget('claude');
+    const { path: relPath, content } = renderForTarget('claude', 'testsprite-verify');
     const abs = path.resolve(tmpRoot, relPath);
     // File exists on real disk
     expect(readFileSync(abs, 'utf8')).toBe(content);
@@ -964,6 +1014,7 @@ describe('runInstall — default AgentFs (real disk)', () => {
         debug: false,
         dryRun: false,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: false,
         dir: tmpRoot,
       },
@@ -979,6 +1030,7 @@ describe('runInstall — default AgentFs (real disk)', () => {
         debug: false,
         dryRun: false,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: false,
         dir: tmpRoot,
       },
@@ -1000,6 +1052,7 @@ describe('runInstall — default AgentFs (real disk)', () => {
         debug: false,
         dryRun: false,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: false,
         dir: tmpRoot,
       },
@@ -1007,7 +1060,7 @@ describe('runInstall — default AgentFs (real disk)', () => {
     );
 
     // Mutate the file
-    const { path: relPath, content } = renderForTarget('claude');
+    const { path: relPath, content } = renderForTarget('claude', 'testsprite-verify');
     const abs = path.resolve(tmpRoot, relPath);
     const oldContent = 'MODIFIED BY USER';
     // Use default fs to write the modified content
@@ -1023,6 +1076,7 @@ describe('runInstall — default AgentFs (real disk)', () => {
         debug: false,
         dryRun: false,
         target: ['claude'],
+        skills: ['testsprite-verify'],
         force: true,
         dir: tmpRoot,
       },
@@ -1052,6 +1106,7 @@ describe('runInstall — default AgentFs (real disk)', () => {
           debug: false,
           dryRun: false,
           target: ['claude'],
+          skills: ['testsprite-verify'],
           force: false,
           dir: tmpRoot,
         },
@@ -1070,7 +1125,7 @@ describe('runInstall — default AgentFs (real disk)', () => {
   it('refuses to overwrite a symlinked target file (real disk) with --force — exit 5', async () => {
     const tmpRoot = mkdtempSync(path.join(tmpdir(), 'agent-test-symlink-target-'));
     const outsideDir = mkdtempSync(path.join(tmpdir(), 'agent-test-outside-target-'));
-    const { path: relPath } = renderForTarget('claude');
+    const { path: relPath } = renderForTarget('claude', 'testsprite-verify');
     const abs = path.resolve(tmpRoot, relPath);
     const nodeFs = await import('node:fs/promises');
     await nodeFs.mkdir(path.dirname(abs), { recursive: true });
@@ -1089,6 +1144,7 @@ describe('runInstall — default AgentFs (real disk)', () => {
           debug: false,
           dryRun: false,
           target: ['claude'],
+          skills: ['testsprite-verify'],
           force: true,
           dir: tmpRoot,
         },
@@ -1114,6 +1170,7 @@ const BASE_OPTS = {
   output: 'text' as const,
   debug: false,
   dryRun: false,
+  skills: ['testsprite-verify'],
 };
 
 describe('runInstall — path safety', () => {
@@ -1264,7 +1321,7 @@ describe('runInstall — symlink safety', () => {
     const abs = path.resolve(CWD, TARGETS.claude.path);
     seedFile(abs, 'DIFFERENT CONTENT'); // real file that differs -> overwrite
     seedSymlink(`${abs}.bak`); // a planted symlink at the default .bak slot
-    const { content } = renderForTarget('claude');
+    const { content } = renderForTarget('claude', 'testsprite-verify');
     const { deps } = makeCapture();
 
     await runInstall(
@@ -1289,7 +1346,7 @@ describe('runInstall — backup collision', () => {
     const abs = path.resolve(CWD, TARGETS.claude.path);
     seedFile(abs, 'CURRENT EDIT');
     seedFile(`${abs}.bak`, 'PRECIOUS USER BACKUP'); // a backup the user already has
-    const { content } = renderForTarget('claude');
+    const { content } = renderForTarget('claude', 'testsprite-verify');
     const { capture, deps } = makeCapture();
 
     await runInstall(
@@ -1983,5 +2040,376 @@ describe('[P3 round-2] codex --dry-run: composed-size precision + read-failure s
     await expect(
       runInstall({ ...BASE_OPTS_DRY, target: ['codex'] }, { cwd: CWD, fs: agentFs, ...deps }),
     ).rejects.toMatchObject({ exitCode: 5 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Multi-skill behavior — new tests covering the SKILLS registry refactor
+// ---------------------------------------------------------------------------
+
+describe('runInstall — multi-skill: default install writes BOTH skills (own-file target)', () => {
+  it('default claude install produces 2 results: verify + onboard, both action:written', async () => {
+    const { store, fs: agentFs, writeCalls } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    // No skills option → DEFAULT_SKILLS (both verify and onboard); use json output to parse results
+    await runInstall(
+      {
+        ...BASE_OPTS,
+        output: 'json',
+        dryRun: false,
+        skills: undefined,
+        target: ['claude'],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    // Both skill files should be written
+    const verifyAbs = path.resolve(CWD, pathFor('claude', 'testsprite-verify'));
+    const onboardAbs = path.resolve(CWD, pathFor('claude', 'testsprite-onboard'));
+    expect(store.has(verifyAbs)).toBe(true);
+    expect(store.has(onboardAbs)).toBe(true);
+
+    // Both writes recorded
+    expect(writeCalls).toContain(verifyAbs);
+    expect(writeCalls).toContain(onboardAbs);
+
+    // JSON output contains 2 results
+    const json = JSON.parse(capture.stdout.join('\n')) as InstallResult[];
+
+    // There must be a result for testsprite-verify
+    const verifyResult = json.find(r => r.skills.includes('testsprite-verify'));
+    expect(verifyResult).toBeDefined();
+    expect(verifyResult?.target).toBe('claude');
+    expect(verifyResult?.action).toBe('written');
+    expect(verifyResult?.path).toBe(pathFor('claude', 'testsprite-verify'));
+
+    // There must be a result for testsprite-onboard
+    const onboardResult = json.find(r => r.skills.includes('testsprite-onboard'));
+    expect(onboardResult).toBeDefined();
+    expect(onboardResult?.target).toBe('claude');
+    expect(onboardResult?.action).toBe('written');
+    expect(onboardResult?.path).toBe(pathFor('claude', 'testsprite-onboard'));
+  });
+
+  it('onboard skill file content contains the onboard H1 heading', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    await runInstall(
+      { ...BASE_OPTS, dryRun: false, skills: undefined, target: ['claude'], force: false },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const onboardAbs = path.resolve(CWD, pathFor('claude', 'testsprite-onboard'));
+    const content = store.get(onboardAbs)!;
+    // The onboard skill body must contain its H1
+    expect(content).toContain('# TestSprite: onboard a repo');
+  });
+
+  it('each result has skills:[skill] (one-element array) for own-file targets', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      {
+        ...BASE_OPTS,
+        output: 'json',
+        dryRun: false,
+        skills: undefined,
+        target: ['claude'],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const json = JSON.parse(capture.stdout.join('\n')) as InstallResult[];
+    expect(json.length).toBe(2);
+    for (const r of json) {
+      expect(Array.isArray(r.skills)).toBe(true);
+      expect(r.skills.length).toBe(1);
+    }
+  });
+
+  it('text output FORMAT is unchanged: one row per result (target padEnd(12) action padEnd(12) path), 2 rows for default install', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      {
+        ...BASE_OPTS,
+        dryRun: false,
+        output: 'text',
+        skills: undefined,
+        target: ['claude'],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const lines = capture.stdout.join('\n').split('\n').filter(Boolean);
+    // 2 results → 2 lines
+    expect(lines.length).toBe(2);
+    // Each line has target, action, and path
+    for (const line of lines) {
+      expect(line).toContain('claude');
+      expect(line).toContain('written');
+    }
+    // One line for each skill path
+    expect(lines.some(l => l.includes(pathFor('claude', 'testsprite-verify')))).toBe(true);
+    expect(lines.some(l => l.includes(pathFor('claude', 'testsprite-onboard')))).toBe(true);
+  });
+});
+
+describe('runInstall — multi-skill: default codex install aggregates BOTH skills in ONE section', () => {
+  it('creates ONE AGENTS.md managed section containing verify H1 AND onboard one-liner', async () => {
+    const { store, fs: agentFs, writeCalls } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    // Default (no skills opt) → both skills; json output for result parsing
+    await runInstall(
+      {
+        ...BASE_OPTS,
+        output: 'json',
+        dryRun: false,
+        skills: undefined,
+        target: ['codex'],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const agentsAbs = path.resolve(CWD, TARGETS.codex.path);
+    expect(writeCalls).toContain(agentsAbs);
+
+    const written = store.get(agentsAbs)!;
+    // Exactly ONE BEGIN sentinel (not two)
+    const beginCount = written.split(MANAGED_SECTION_BEGIN).length - 1;
+    expect(beginCount).toBe(1);
+
+    // Section contains the verify H1
+    expect(written).toContain('# TestSprite Verification Loop');
+
+    // Section contains the onboard one-liner
+    expect(written).toContain('**First-time setup:**');
+
+    // The result is a single codex result with skills = both
+    const json = JSON.parse(capture.stdout.join('\n')) as InstallResult[];
+    expect(json.length).toBe(1);
+    const codexResult = json[0]!;
+    expect(codexResult.target).toBe('codex');
+    expect(codexResult.action).toBe('section-installed');
+    expect(codexResult.skills).toContain('testsprite-verify');
+    expect(codexResult.skills).toContain('testsprite-onboard');
+  });
+
+  it('single-skill codex install produces a section byte-identical to old single-skill behavior', async () => {
+    // A ['testsprite-verify']-only codex install should produce the same section
+    // content as the pre-refactor behavior (single-skill codex body).
+    const { store: storeA, fs: fsA } = makeMemFs();
+    const { deps: depsA } = makeCapture();
+    await runInstall(
+      {
+        ...BASE_OPTS,
+        dryRun: false,
+        skills: ['testsprite-verify'],
+        target: ['codex'],
+        force: false,
+      },
+      { cwd: CWD, fs: fsA, ...depsA },
+    );
+    const verifyOnlyContent = storeA.get(path.resolve(CWD, TARGETS.codex.path))!;
+
+    // The section must contain the verify H1 but NOT the onboard line
+    expect(verifyOnlyContent).toContain('# TestSprite Verification Loop');
+    expect(verifyOnlyContent).not.toContain('**First-time setup:**');
+    // Exactly one BEGIN sentinel
+    expect(verifyOnlyContent.split(MANAGED_SECTION_BEGIN).length - 1).toBe(1);
+  });
+});
+
+describe('runInstall — multi-skill: --skill subset installs only the named skill', () => {
+  it('skills:[testsprite-onboard] installs ONLY the onboard file (1 result, 1 write)', async () => {
+    const { store, fs: agentFs, writeCalls } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      {
+        ...BASE_OPTS,
+        output: 'json',
+        dryRun: false,
+        skills: ['testsprite-onboard'],
+        target: ['claude'],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const onboardAbs = path.resolve(CWD, pathFor('claude', 'testsprite-onboard'));
+    const verifyAbs = path.resolve(CWD, pathFor('claude', 'testsprite-verify'));
+
+    // Only onboard written; verify NOT written
+    expect(store.has(onboardAbs)).toBe(true);
+    expect(store.has(verifyAbs)).toBe(false);
+    expect(writeCalls).toContain(onboardAbs);
+    expect(writeCalls).not.toContain(verifyAbs);
+
+    // Exactly 1 result
+    const json = JSON.parse(capture.stdout.join('\n')) as InstallResult[];
+    expect(json.length).toBe(1);
+    expect(json[0]?.skills).toEqual(['testsprite-onboard']);
+    expect(json[0]?.action).toBe('written');
+  });
+
+  it('skills:[testsprite-verify] installs ONLY the verify file (1 result)', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      {
+        ...BASE_OPTS,
+        output: 'json',
+        dryRun: false,
+        skills: ['testsprite-verify'],
+        target: ['claude'],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const verifyAbs = path.resolve(CWD, pathFor('claude', 'testsprite-verify'));
+    const onboardAbs = path.resolve(CWD, pathFor('claude', 'testsprite-onboard'));
+
+    expect(store.has(verifyAbs)).toBe(true);
+    expect(store.has(onboardAbs)).toBe(false);
+
+    const json = JSON.parse(capture.stdout.join('\n')) as InstallResult[];
+    expect(json.length).toBe(1);
+    expect(json[0]?.skills).toEqual(['testsprite-verify']);
+  });
+});
+
+describe('runInstall — multi-skill: unknown --skill exits 5', () => {
+  it('skills:[bogus] → localValidationError exit 5 with documented message', async () => {
+    const { fs: agentFs, writeCalls } = makeMemFs();
+    const { deps } = makeCapture();
+
+    let thrown: unknown;
+    try {
+      await runInstall(
+        { ...BASE_OPTS, dryRun: false, skills: ['bogus'], target: ['claude'], force: false },
+        { cwd: CWD, fs: agentFs, ...deps },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(ApiError);
+    expect((thrown as ApiError).exitCode).toBe(5);
+    // The nextAction must contain the exact documented message format
+    const nextAction = (thrown as ApiError).nextAction ?? '';
+    expect(nextAction).toContain('unknown skill "bogus"');
+    expect(nextAction).toContain('testsprite-verify');
+    expect(nextAction).toContain('testsprite-onboard');
+    // Nothing written
+    expect(writeCalls.length).toBe(0);
+  });
+
+  it('unknown skill via createAgentCommand parseAsync → exit 5', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    const command = createAgentCommand({ cwd: CWD, fs: agentFs, ...deps });
+    const parent = new (await import('commander')).Command('testsprite');
+    parent.option('--output <mode>', 'output', 'text');
+    parent.option('--profile <name>', 'profile', 'default');
+    parent.option('--endpoint-url <url>');
+    parent.option('--debug', 'debug', false);
+    parent.option('--verbose', 'verbose', false);
+    parent.option('--dry-run', 'dry-run', false);
+    parent.addCommand(command);
+
+    let thrown: unknown;
+    try {
+      await parent.parseAsync([
+        'node',
+        'ts',
+        'agent',
+        'install',
+        '--target=claude',
+        '--skill=bogus',
+        `--dir=${CWD}`,
+      ]);
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeDefined();
+    const isValidationErr =
+      (thrown instanceof ApiError && thrown.exitCode === 5) ||
+      (thrown instanceof CLIError && thrown.exitCode === 5);
+    expect(isValidationErr).toBe(true);
+  });
+});
+
+describe('runInstall — multi-skill: multi-target own-file with default skills', () => {
+  it('default install to claude + cursor writes 4 files (2 targets × 2 skills)', async () => {
+    const { store, fs: agentFs, writeCalls } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    // No skills → default both; json output for result parsing
+    await runInstall(
+      {
+        ...BASE_OPTS,
+        output: 'json',
+        dryRun: false,
+        skills: undefined,
+        target: ['claude', 'cursor'],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const expectedPaths = [
+      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
+      path.resolve(CWD, pathFor('claude', 'testsprite-onboard')),
+      path.resolve(CWD, pathFor('cursor', 'testsprite-verify')),
+      path.resolve(CWD, pathFor('cursor', 'testsprite-onboard')),
+    ];
+
+    for (const p of expectedPaths) {
+      expect(store.has(p)).toBe(true);
+      expect(writeCalls).toContain(p);
+    }
+
+    const json = JSON.parse(capture.stdout.join('\n')) as InstallResult[];
+    expect(json.length).toBe(4);
+    expect(json.every(r => r.action === 'written')).toBe(true);
+  });
+});
+
+describe('runInstall — SKILLS registry / DEFAULT_SKILLS contract', () => {
+  it('DEFAULT_SKILLS contains exactly testsprite-verify and testsprite-onboard', () => {
+    expect(DEFAULT_SKILLS).toContain('testsprite-verify');
+    expect(DEFAULT_SKILLS).toContain('testsprite-onboard');
+    expect(DEFAULT_SKILLS.length).toBe(2);
+  });
+
+  it('SKILLS registry contains both skills with required fields', () => {
+    expect(SKILLS['testsprite-verify']).toBeDefined();
+    expect(SKILLS['testsprite-onboard']).toBeDefined();
+    for (const [name, spec] of Object.entries(SKILLS)) {
+      expect(spec.name).toBe(name);
+      expect(typeof spec.description).toBe('string');
+      expect(spec.description.length).toBeGreaterThan(0);
+      expect(typeof spec.bodyFile).toBe('string');
+      expect(spec.codex).toBeDefined();
+    }
+  });
+
+  it('ONBOARD_CODEX_LINE is the one-liner used in the codex section', () => {
+    expect(typeof ONBOARD_CODEX_LINE).toBe('string');
+    expect(ONBOARD_CODEX_LINE).toContain('**First-time setup:**');
   });
 });

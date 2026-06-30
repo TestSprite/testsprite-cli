@@ -181,11 +181,11 @@ testsprite test get test_xxxxxxxx --dry-run --output json
 
 #### `testsprite test code get <test-id>`
 
-Print the generated test source. With `--out <path>`, write it to a file instead of stdout (text mode writes the source body; JSON mode writes the wire envelope).
+Print the generated test source. TestSprite test code is **Python**: frontend tests are Playwright (`playwright.async_api`, async), backend tests use `requests` with `pytest`-style assertions. With `--out <path>`, write it to a file instead of stdout (text mode writes the source body; JSON mode writes the wire envelope).
 
 ```bash
 testsprite test code get test_xxxxxxxx
-testsprite test code get test_xxxxxxxx --out ./test_xxxxxxxx.spec.ts
+testsprite test code get test_xxxxxxxx --out ./test_xxxxxxxx.py
 testsprite test code get test_xxxxxxxx --dry-run --output json
 ```
 
@@ -301,12 +301,12 @@ testsprite test delete test_xxxxxxxx --dry-run --output json
 
 #### `testsprite test code put <test-id>`
 
-Replace the generated test code with a new file. The CLI uses an etag (`codeVersion`) for optimistic-concurrency control: it auto-fetches the current version, or pass `--expected-version` to pin one, or `--force` to skip the guard.
+Replace the generated test code with a new file. **The replacement must be Python** — the execution engine runs the stored code with Python `exec()` (frontend: Playwright `playwright.async_api`; backend: `requests` + assertions), so a TypeScript/JavaScript file would fail at run time with a `SyntaxError`. The CLI uses an etag (`codeVersion`) for optimistic-concurrency control: it auto-fetches the current version, or pass `--expected-version` to pin one, or `--force` to skip the guard.
 
 ```bash
-testsprite test code put test_xxxxxxxx --code-file ./test.spec.ts
-testsprite test code put test_xxxxxxxx --code-file ./test.spec.ts --expected-version v3
-testsprite test code put test_xxxxxxxx --code-file ./test.spec.ts --dry-run --output json
+testsprite test code put test_xxxxxxxx --code-file ./test.py
+testsprite test code put test_xxxxxxxx --code-file ./test.py --expected-version v3
+testsprite test code put test_xxxxxxxx --code-file ./test.py --dry-run --output json
 ```
 
 #### `testsprite test plan put <test-id>`

@@ -10,8 +10,11 @@ import {
   type AgentTarget,
   type ManagedSectionSpec,
   TARGETS,
-  loadSkillBody,
-  loadCodexSkillBody,
+  SKILLS,
+  DEFAULT_SKILLS,
+  pathFor,
+  loadSkillBodyFor,
+  buildCodexAggregate,
   renderForTarget,
 } from '../lib/agent-targets.js';
 
@@ -319,6 +322,12 @@ export interface InstallResult {
   target: AgentTarget;
   path: string; // repo-relative matrix path
   action: InstallAction;
+  /**
+   * Skill(s) this result covers. Own-file targets produce one result per skill
+   * (`[skill]`); the codex managed-section target produces ONE result whose
+   * section aggregates every installed skill (`[...skills]`).
+   */
+  skills: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +338,8 @@ type CommonOptions = FactoryCommonOptions;
 
 interface InstallOptions extends CommonOptions {
   target: string[];
+  /** Skill subset to install; empty/absent → {@link DEFAULT_SKILLS}. */
+  skills?: string[];
   dir?: string;
   force: boolean;
 }
@@ -388,13 +399,51 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
     return true;
   }) as AgentTarget[];
 
+  // 2b. Resolve + validate the skill set (empty/absent → DEFAULT_SKILLS).
+  // Accepts comma-separated or repeated --skill values, same shape as --target.
+  const rawSkills = (opts.skills ?? [])
+    .flatMap(s => s.split(','))
+    .map(s => s.trim())
+    .filter(Boolean);
+  const validSkills = Object.keys(SKILLS);
+  for (const s of rawSkills) {
+    if (!validSkills.includes(s)) {
+      throw localValidationError(
+        'skill',
+        `unknown skill "${s}"; supported: ${validSkills.join(', ')}`,
+      );
+    }
+  }
+  const seenSkill = new Set<string>();
+  const skills = (rawSkills.length > 0 ? rawSkills : [...DEFAULT_SKILLS]).filter(s => {
+    if (seenSkill.has(s)) return false;
+    seenSkill.add(s);
+    return true;
+  });
+
   // 3. Resolve dir
   const dir = opts.dir ?? deps.cwd ?? process.cwd();
   const root = path.resolve(dir);
 
-  // 4. Load skill bodies (lazy — only touch disk if a target actually needs it)
-  let ownFileBody: string | undefined;
+  // 4. Lazy asset loaders — only touch disk if a target actually needs it.
+  // own-file bodies are per-skill (cached); managed sections aggregate EVERY
+  // installed skill's contribution into one target-specific section.
+  const skillBodyCache = new Map<string, string>();
+  const bodyForSkill = (skill: string): string => {
+    let b = skillBodyCache.get(skill);
+    if (b === undefined) {
+      b = loadSkillBodyFor(skill);
+      skillBodyCache.set(skill, b);
+    }
+    return b;
+  };
   let managedSectionBody: string | undefined;
+  const getManagedSectionBody = (): string => {
+    if (managedSectionBody === undefined) {
+      managedSectionBody = buildCodexAggregate(skills);
+    }
+    return managedSectionBody;
+  };
 
   const results: InstallResult[] = [];
 
@@ -404,13 +453,6 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
   // 5. Process each target
   for (const t of targets) {
     const spec = TARGETS[t];
-    const relPath = spec.path;
-    const abs = path.resolve(root, relPath);
-
-    // Path safety: ensure abs is inside root (defense against .. in relPath or dir)
-    if (abs !== root && !abs.startsWith(root + path.sep)) {
-      throw new CLIError(`refusing to write outside --dir: ${relPath}`, 5);
-    }
 
     // -----------------------------------------------------------------------
     // managed-section mode (root instruction files such as AGENTS.md/GEMINI.md)
@@ -421,8 +463,13 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
         throw new CLIError(`managed-section target "${t}" is missing sentinel metadata`, 5);
       }
       const managedConfig = managed;
-      if (managedSectionBody === undefined) managedSectionBody = loadCodexSkillBody();
-      const section = buildSection(managedSectionBody, managedConfig);
+      const relPath = spec.path;
+      const abs = path.resolve(root, relPath);
+      // Path safety: ensure abs is inside root (defense against .. in relPath or dir)
+      if (abs !== root && !abs.startsWith(root + path.sep)) {
+        throw new CLIError(`refusing to write outside --dir: ${relPath}`, 5);
+      }
+      const section = buildSection(getManagedSectionBody(), managedConfig);
 
       if (opts.dryRun) {
         // Dry-run: report what would happen without writing disk.
@@ -494,7 +541,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
           );
         }
         dryRunLines.push({ abs, bytes, note: 'managed section' });
-        results.push({ target: t, path: relPath, action: 'dry-run' });
+        results.push({ target: t, path: relPath, action: 'dry-run', skills: [...skills] });
         continue;
       }
 
@@ -540,7 +587,12 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
           }
           throw err;
         }
-        results.push({ target: t, path: relPath, action: 'section-installed' });
+        results.push({
+          target: t,
+          path: relPath,
+          action: 'section-installed',
+          skills: [...skills],
+        });
       } else {
         const existing = await agentFs.readFile(abs);
         const state = classifySection(existing, section, managedConfig);
@@ -555,12 +607,22 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
         }
 
         if (state.kind === 'unchanged') {
-          results.push({ target: t, path: relPath, action: 'section-unchanged' });
+          results.push({
+            target: t,
+            path: relPath,
+            action: 'section-unchanged',
+            skills: [...skills],
+          });
         } else if (state.kind === 'create') {
           // Shouldn't happen (st !== null means file exists), but guard anyway.
           warnIfOverBudget(section);
           await agentFs.writeFile(abs, section);
-          results.push({ target: t, path: relPath, action: 'section-installed' });
+          results.push({
+            target: t,
+            path: relPath,
+            action: 'section-installed',
+            skills: [...skills],
+          });
         } else {
           // 'append' or 'replace' — write the new content.
           // --force has no special meaning for managed-section: we always merge
@@ -571,72 +633,82 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
           await agentFs.writeFile(abs, newContent);
           const action: InstallAction =
             state.kind === 'append' ? 'section-installed' : 'section-updated';
-          results.push({ target: t, path: relPath, action });
+          results.push({ target: t, path: relPath, action, skills: [...skills] });
         }
       }
       continue;
     }
 
     // -----------------------------------------------------------------------
-    // own-file mode (all other targets)
+    // own-file mode (all other targets) — one file per skill
     // -----------------------------------------------------------------------
-    if (ownFileBody === undefined) ownFileBody = loadSkillBody();
-    const content = renderForTarget(t, ownFileBody).content;
-
-    if (opts.dryRun) {
-      const bytes = Buffer.byteLength(content, 'utf8');
-      dryRunLines.push({ abs, bytes, note: '' });
-      results.push({ target: t, path: relPath, action: 'dry-run' });
-      continue;
-    }
-
-    // Inspect the target path: refuse to traverse or write through a symlink
-    // (fs writes follow symlinks, which would let a planted symlink escape
-    // --dir), and reject a non-regular-file landing path. The lexical guard
-    // above is necessary but not sufficient — it cannot see symlinks.
-    const st = await inspectTargetPath(agentFs, root, relPath);
-
-    if (st !== null && !st.isFile) {
-      throw new CLIError(`${relPath} exists but is not a regular file — remove it and re-run.`, 5);
-    }
-
-    if (st === null) {
-      // Path does not exist — create it. inspectTargetPath verified every
-      // existing ancestor is a real directory; exclusive create (wx) then
-      // ensures a file or symlink that races in after the check is not followed
-      // or silently overwritten.
-      await agentFs.mkdir(path.dirname(abs));
-      try {
-        await agentFs.writeFile(abs, content, { exclusive: true });
-      } catch (err) {
-        if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'EEXIST') {
-          throw new CLIError(
-            `${relPath} appeared after the path check — re-run, or pass --force to overwrite.`,
-            6,
-          );
-        }
-        throw err;
+    for (const skill of skills) {
+      const relPath = pathFor(t, skill);
+      const abs = path.resolve(root, relPath);
+      // Path safety: ensure abs is inside root (defense against .. in relPath or dir)
+      if (abs !== root && !abs.startsWith(root + path.sep)) {
+        throw new CLIError(`refusing to write outside --dir: ${relPath}`, 5);
       }
-      results.push({ target: t, path: relPath, action: 'written' });
-    } else {
-      const existing = await agentFs.readFile(abs);
-      if (existing === content) {
-        // Byte-identical — skip
-        results.push({ target: t, path: relPath, action: 'skipped' });
-      } else if (!opts.force) {
-        // Differs and no --force → blocked
-        results.push({ target: t, path: relPath, action: 'blocked' });
+      const content = renderForTarget(t, skill, bodyForSkill(skill)).content;
+
+      if (opts.dryRun) {
+        const bytes = Buffer.byteLength(content, 'utf8');
+        dryRunLines.push({ abs, bytes, note: '' });
+        results.push({ target: t, path: relPath, action: 'dry-run', skills: [skill] });
+        continue;
+      }
+
+      // Inspect the target path: refuse to traverse or write through a symlink
+      // (fs writes follow symlinks, which would let a planted symlink escape
+      // --dir), and reject a non-regular-file landing path. The lexical guard
+      // above is necessary but not sufficient — it cannot see symlinks.
+      const st = await inspectTargetPath(agentFs, root, relPath);
+
+      if (st !== null && !st.isFile) {
+        throw new CLIError(
+          `${relPath} exists but is not a regular file — remove it and re-run.`,
+          5,
+        );
+      }
+
+      if (st === null) {
+        // Path does not exist — create it. inspectTargetPath verified every
+        // existing ancestor is a real directory; exclusive create (wx) then
+        // ensures a file or symlink that races in after the check is not followed
+        // or silently overwritten.
+        await agentFs.mkdir(path.dirname(abs));
+        try {
+          await agentFs.writeFile(abs, content, { exclusive: true });
+        } catch (err) {
+          if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'EEXIST') {
+            throw new CLIError(
+              `${relPath} appeared after the path check — re-run, or pass --force to overwrite.`,
+              6,
+            );
+          }
+          throw err;
+        }
+        results.push({ target: t, path: relPath, action: 'written', skills: [skill] });
       } else {
-        // Differs and --force → back up the current bytes to a fresh slot
-        // (never clobbering an existing backup or following a symlink), then
-        // overwrite. The overwrite itself can follow a symlink swapped in after
-        // the check — an accepted TOCTOU residual for a local, single-user CLI.
-        const backupPath = await writeBackup(agentFs, abs, existing);
-        await agentFs.writeFile(abs, content);
-        if (opts.output === 'text') {
-          stderrFn(`backed up ${relPath} to ${path.relative(root, backupPath)}`);
+        const existing = await agentFs.readFile(abs);
+        if (existing === content) {
+          // Byte-identical — skip
+          results.push({ target: t, path: relPath, action: 'skipped', skills: [skill] });
+        } else if (!opts.force) {
+          // Differs and no --force → blocked
+          results.push({ target: t, path: relPath, action: 'blocked', skills: [skill] });
+        } else {
+          // Differs and --force → back up the current bytes to a fresh slot
+          // (never clobbering an existing backup or following a symlink), then
+          // overwrite. The overwrite itself can follow a symlink swapped in after
+          // the check — an accepted TOCTOU residual for a local, single-user CLI.
+          const backupPath = await writeBackup(agentFs, abs, existing);
+          await agentFs.writeFile(abs, content);
+          if (opts.output === 'text') {
+            stderrFn(`backed up ${relPath} to ${path.relative(root, backupPath)}`);
+          }
+          results.push({ target: t, path: relPath, action: 'updated', skills: [skill] });
         }
-        results.push({ target: t, path: relPath, action: 'updated' });
       }
     }
   }
@@ -680,6 +752,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
 
 export interface ListResult {
   target: AgentTarget;
+  skill: string;
   status: string;
   mode: string;
   path: string;
@@ -688,20 +761,32 @@ export interface ListResult {
 export async function runList(opts: CommonOptions, deps: AgentDeps = {}): Promise<void> {
   const out = makeOutput(opts.output, deps);
 
-  const results: ListResult[] = (
-    Object.entries(TARGETS) as [AgentTarget, { status: string; mode: string; path: string }][]
-  ).map(([t, spec]) => ({
-    target: t,
-    status: spec.status,
-    mode: spec.mode,
-    path: spec.path,
-  }));
+  // One row per (target × default skill). Own-file targets land each skill at a
+  // distinct path; the codex managed-section target merges all skills into the
+  // single AGENTS.md (so every codex row shares that path — truthful, since both
+  // skills' content lands there).
+  const results: ListResult[] = [];
+  for (const [t, spec] of Object.entries(TARGETS) as [
+    AgentTarget,
+    { status: string; mode: string },
+  ][]) {
+    for (const skill of DEFAULT_SKILLS) {
+      results.push({
+        target: t,
+        skill,
+        status: spec.status,
+        mode: spec.mode,
+        path: pathFor(t, skill),
+      });
+    }
+  }
 
   out.print(results, data => {
     const items = data as ListResult[];
-    const header = `${'TARGET'.padEnd(14)} ${'STATUS'.padEnd(12)} ${'MODE'.padEnd(18)} PATH`;
+    const header = `${'TARGET'.padEnd(14)} ${'SKILL'.padEnd(20)} ${'STATUS'.padEnd(12)} ${'MODE'.padEnd(18)} PATH`;
     const rows = items.map(
-      r => `${r.target.padEnd(14)} ${r.status.padEnd(12)} ${r.mode.padEnd(18)} ${r.path}`,
+      r =>
+        `${r.target.padEnd(14)} ${r.skill.padEnd(20)} ${r.status.padEnd(12)} ${r.mode.padEnd(18)} ${r.path}`,
     );
     return [header, ...rows].join('\n');
   });
@@ -723,11 +808,17 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
   agent
     .command('install')
     .description(
-      'Write the TestSprite verification-loop skill file into a project for a coding agent',
+      'Write the TestSprite agent skills (verification loop + first-run onboarding) into a project for a coding agent',
     )
     .option(
       '--target <t>',
       'Agent target(s): claude, cursor, cline, antigravity, codex, gemini (comma-separated or repeated)',
+      collect,
+      [],
+    )
+    .option(
+      '--skill <name>',
+      `Skill(s) to install: ${Object.keys(SKILLS).join(', ')} (comma-separated or repeated; default: all)`,
       collect,
       [],
     )
@@ -739,11 +830,15 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(
-      async (cmdOpts: { target: string[]; dir?: string; force?: boolean }, command: Command) => {
+      async (
+        cmdOpts: { target: string[]; skill: string[]; dir?: string; force?: boolean },
+        command: Command,
+      ) => {
         await runInstall(
           {
             ...resolveCommonOptions(command),
             target: cmdOpts.target,
+            skills: cmdOpts.skill,
             dir: cmdOpts.dir,
             force: Boolean(cmdOpts.force),
           },
@@ -754,7 +849,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
 
   agent
     .command('list')
-    .description('List supported agent targets, their status, and landing paths')
+    .description('List supported agent targets and skills, their status, and landing paths')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_o, command: Command) => {
       await runList(resolveCommonOptions(command), deps);

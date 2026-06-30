@@ -1,13 +1,20 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_SKILLS,
   MANAGED_SECTION_BEGIN,
   MANAGED_SECTION_END,
+  ONBOARD_CODEX_LINE,
   SKILL_DESCRIPTION,
   SKILL_NAME,
+  SKILLS,
   TARGETS,
+  buildCodexAggregate,
+  codexContentFor,
   loadCodexSkillBody,
   loadSkillBody,
+  loadSkillBodyFor,
+  pathFor,
   renderForTarget,
 } from './agent-targets.js';
 
@@ -43,6 +50,13 @@ function parseFrontmatterDescription(content: string): string | undefined {
 // Load skill-template.md from repo root (vitest cwd = repo root).
 const templateRaw = readFileSync('docs/cli-v1-agent-install/skill-template.md', 'utf8');
 const templateDescription = parseFrontmatterDescription(templateRaw);
+
+// Load onboard-skill-template.md from repo root.
+const onboardTemplateRaw = readFileSync(
+  'docs/cli-v1-agent-install/onboard-skill-template.md',
+  'utf8',
+);
+const onboardTemplateDescription = parseFrontmatterDescription(onboardTemplateRaw);
 
 // Stub body for unit tests that don't need the real file, so tests are fast
 // and deterministic regardless of asset path resolution.
@@ -157,7 +171,7 @@ describe('loadSkillBody', () => {
 // ---------------------------------------------------------------------------
 
 describe('renderForTarget("claude")', () => {
-  const result = renderForTarget('claude', STUB_BODY);
+  const result = renderForTarget('claude', 'testsprite-verify', STUB_BODY);
 
   it('returns the correct path', () => {
     expect(result.path).toBe('.claude/skills/testsprite-verify/SKILL.md');
@@ -177,7 +191,7 @@ describe('renderForTarget("claude")', () => {
 });
 
 describe('renderForTarget("antigravity")', () => {
-  const result = renderForTarget('antigravity', STUB_BODY);
+  const result = renderForTarget('antigravity', 'testsprite-verify', STUB_BODY);
 
   it('returns the correct path', () => {
     expect(result.path).toBe('.agents/skills/testsprite-verify/SKILL.md');
@@ -194,8 +208,8 @@ describe('renderForTarget("antigravity")', () => {
 
 describe('renderForTarget("claude") vs renderForTarget("antigravity")', () => {
   it('produce the same frontmatter lines (name + description)', () => {
-    const claude = renderForTarget('claude', STUB_BODY);
-    const antigravity = renderForTarget('antigravity', STUB_BODY);
+    const claude = renderForTarget('claude', 'testsprite-verify', STUB_BODY);
+    const antigravity = renderForTarget('antigravity', 'testsprite-verify', STUB_BODY);
 
     // Extract the frontmatter block from each
     const extractFrontmatter = (content: string): string => {
@@ -207,8 +221,8 @@ describe('renderForTarget("claude") vs renderForTarget("antigravity")', () => {
   });
 
   it('differ only in their landing path', () => {
-    const claude = renderForTarget('claude', STUB_BODY);
-    const antigravity = renderForTarget('antigravity', STUB_BODY);
+    const claude = renderForTarget('claude', 'testsprite-verify', STUB_BODY);
+    const antigravity = renderForTarget('antigravity', 'testsprite-verify', STUB_BODY);
 
     expect(claude.path).not.toBe(antigravity.path);
     // Body content should be identical
@@ -217,7 +231,7 @@ describe('renderForTarget("claude") vs renderForTarget("antigravity")', () => {
 });
 
 describe('renderForTarget("cursor")', () => {
-  const result = renderForTarget('cursor', STUB_BODY);
+  const result = renderForTarget('cursor', 'testsprite-verify', STUB_BODY);
 
   it('returns the correct path', () => {
     expect(result.path).toBe('.cursor/rules/testsprite-verify.mdc');
@@ -246,7 +260,7 @@ describe('renderForTarget("cursor")', () => {
 });
 
 describe('renderForTarget("cline")', () => {
-  const result = renderForTarget('cline', STUB_BODY);
+  const result = renderForTarget('cline', 'testsprite-verify', STUB_BODY);
 
   it('returns the correct path', () => {
     expect(result.path).toBe('.clinerules/testsprite-verify.md');
@@ -276,7 +290,7 @@ describe('content integrity — own-file targets', () => {
   // Use the real body for these checks, since we're guarding against trimming.
   for (const target of ownFileTargets) {
     describe(`target: ${target}`, () => {
-      const result = renderForTarget(target);
+      const result = renderForTarget(target, 'testsprite-verify');
 
       it('contains the TestSprite Verification Loop H1', () => {
         // The skill body opens with the renamed H1.
@@ -365,14 +379,14 @@ describe('content integrity — codex target (testsprite-verify.codex.md)', () =
   it('renderForTarget("codex") path is AGENTS.md', () => {
     const STUB_CODEX_BODY =
       '# TestSprite Verification Loop\ntestsprite test run\n--wait\ntest artifact get\n';
-    const result = renderForTarget('codex', STUB_CODEX_BODY);
+    const result = renderForTarget('codex', 'testsprite-verify', STUB_CODEX_BODY);
     expect(result.path).toBe('AGENTS.md');
   });
 
   it('renderForTarget("codex") content is the body unwrapped (no frontmatter)', () => {
     const STUB_CODEX_BODY =
       '# TestSprite Verification Loop\ntestsprite test run\n--wait\ntest artifact get\n';
-    const result = renderForTarget('codex', STUB_CODEX_BODY);
+    const result = renderForTarget('codex', 'testsprite-verify', STUB_CODEX_BODY);
     // codex wrap is identity — no frontmatter fences
     expect(result.content).toBe(STUB_CODEX_BODY);
     expect(result.content).not.toContain('---');
@@ -380,10 +394,296 @@ describe('content integrity — codex target (testsprite-verify.codex.md)', () =
 
   it('renderForTarget("codex") without body arg uses codex asset (not full skill body)', () => {
     // The real codex asset is trimmed (no acronym line).
-    const result = renderForTarget('codex');
+    const result = renderForTarget('codex', 'testsprite-verify');
     // Plain Markdown; no frontmatter fences from own-file wraps
     expect(result.content).not.toContain('name: testsprite-verify');
     expect(result.content).not.toContain('alwaysApply:');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SKILLS registry
+// ---------------------------------------------------------------------------
+
+describe('SKILLS registry', () => {
+  it('has testsprite-verify key', () => {
+    expect(SKILLS['testsprite-verify']).toBeDefined();
+  });
+
+  it('has testsprite-onboard key', () => {
+    expect(SKILLS['testsprite-onboard']).toBeDefined();
+  });
+
+  it('testsprite-verify description is ≤ 1536 characters', () => {
+    expect(SKILLS['testsprite-verify']!.description.length).toBeLessThanOrEqual(1536);
+  });
+
+  it('testsprite-onboard description is ≤ 1536 characters', () => {
+    expect(SKILLS['testsprite-onboard']!.description.length).toBeLessThanOrEqual(1536);
+  });
+
+  it('testsprite-verify description is byte-identical to skill-template.md frontmatter description', () => {
+    expect(templateDescription).toBeDefined();
+    expect(SKILLS['testsprite-verify']!.description).toBe(templateDescription);
+  });
+
+  it('testsprite-onboard description is byte-identical to onboard-skill-template.md frontmatter description', () => {
+    expect(onboardTemplateDescription).toBeDefined();
+    expect(SKILLS['testsprite-onboard']!.description).toBe(onboardTemplateDescription);
+  });
+
+  it('testsprite-verify has bodyFile testsprite-verify.skill.md', () => {
+    expect(SKILLS['testsprite-verify']!.bodyFile).toBe('testsprite-verify.skill.md');
+  });
+
+  it('testsprite-onboard has bodyFile testsprite-onboard.skill.md', () => {
+    expect(SKILLS['testsprite-onboard']!.bodyFile).toBe('testsprite-onboard.skill.md');
+  });
+
+  it('testsprite-verify codex kind is full', () => {
+    const codex = SKILLS['testsprite-verify']!.codex;
+    expect(codex.kind).toBe('full');
+  });
+
+  it('testsprite-onboard codex kind is line', () => {
+    const codex = SKILLS['testsprite-onboard']!.codex;
+    expect(codex.kind).toBe('line');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEFAULT_SKILLS
+// ---------------------------------------------------------------------------
+
+describe('DEFAULT_SKILLS', () => {
+  it('equals ["testsprite-verify", "testsprite-onboard"]', () => {
+    expect(DEFAULT_SKILLS).toEqual(['testsprite-verify', 'testsprite-onboard']);
+  });
+
+  it('has exactly two entries', () => {
+    expect(DEFAULT_SKILLS.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pathFor
+// ---------------------------------------------------------------------------
+
+describe('pathFor', () => {
+  it('claude + testsprite-verify', () => {
+    expect(pathFor('claude', 'testsprite-verify')).toBe(
+      '.claude/skills/testsprite-verify/SKILL.md',
+    );
+  });
+
+  it('antigravity + testsprite-verify', () => {
+    expect(pathFor('antigravity', 'testsprite-verify')).toBe(
+      '.agents/skills/testsprite-verify/SKILL.md',
+    );
+  });
+
+  it('cursor + testsprite-verify', () => {
+    expect(pathFor('cursor', 'testsprite-verify')).toBe('.cursor/rules/testsprite-verify.mdc');
+  });
+
+  it('cline + testsprite-verify', () => {
+    expect(pathFor('cline', 'testsprite-verify')).toBe('.clinerules/testsprite-verify.md');
+  });
+
+  it('codex + testsprite-verify', () => {
+    expect(pathFor('codex', 'testsprite-verify')).toBe('AGENTS.md');
+  });
+
+  it('claude + testsprite-onboard', () => {
+    expect(pathFor('claude', 'testsprite-onboard')).toBe(
+      '.claude/skills/testsprite-onboard/SKILL.md',
+    );
+  });
+
+  it('antigravity + testsprite-onboard', () => {
+    expect(pathFor('antigravity', 'testsprite-onboard')).toBe(
+      '.agents/skills/testsprite-onboard/SKILL.md',
+    );
+  });
+
+  it('cursor + testsprite-onboard', () => {
+    expect(pathFor('cursor', 'testsprite-onboard')).toBe('.cursor/rules/testsprite-onboard.mdc');
+  });
+
+  it('cline + testsprite-onboard', () => {
+    expect(pathFor('cline', 'testsprite-onboard')).toBe('.clinerules/testsprite-onboard.md');
+  });
+
+  it('codex + testsprite-onboard is AGENTS.md (shared)', () => {
+    expect(pathFor('codex', 'testsprite-onboard')).toBe('AGENTS.md');
+  });
+
+  it('TARGETS[t].path === pathFor(t, "testsprite-verify") for every target', () => {
+    for (const [target] of Object.entries(TARGETS)) {
+      expect(TARGETS[target as keyof typeof TARGETS].path).toBe(
+        pathFor(target as Parameters<typeof pathFor>[0], 'testsprite-verify'),
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadSkillBodyFor
+// ---------------------------------------------------------------------------
+
+describe('loadSkillBodyFor', () => {
+  it('stub read returns the provided stub body for testsprite-verify', () => {
+    const body = loadSkillBodyFor('testsprite-verify', () => STUB_BODY);
+    expect(body).toBe(STUB_BODY);
+  });
+
+  it('stub read returns the provided stub body for testsprite-onboard', () => {
+    const ONBOARD_STUB = '# TestSprite: onboard a repo with a seed test suite\nStub.';
+    const body = loadSkillBodyFor('testsprite-onboard', () => ONBOARD_STUB);
+    expect(body).toBe(ONBOARD_STUB);
+  });
+
+  it('real loadSkillBodyFor("testsprite-verify") starts with the verify H1', () => {
+    const body = loadSkillBodyFor('testsprite-verify');
+    expect(body.trimStart().startsWith('# TestSprite Verification Loop')).toBe(true);
+  });
+
+  it('real loadSkillBodyFor("testsprite-onboard") contains the onboard H1', () => {
+    const body = loadSkillBodyFor('testsprite-onboard');
+    expect(body).toContain('# TestSprite: onboard a repo with a seed test suite');
+  });
+
+  it('unknown skill throws', () => {
+    expect(() => loadSkillBodyFor('testsprite-unknown')).toThrow('unknown skill');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// codexContentFor
+// ---------------------------------------------------------------------------
+
+describe('codexContentFor', () => {
+  it('testsprite-verify (full) contains "testsprite test run"', () => {
+    const content = codexContentFor('testsprite-verify');
+    expect(content).toContain('testsprite test run');
+  });
+
+  it('testsprite-verify (full) contains "--wait"', () => {
+    const content = codexContentFor('testsprite-verify');
+    expect(content).toContain('--wait');
+  });
+
+  it('testsprite-onboard (line) equals ONBOARD_CODEX_LINE', () => {
+    const content = codexContentFor('testsprite-onboard');
+    expect(content).toBe(ONBOARD_CODEX_LINE);
+  });
+
+  it('ONBOARD_CODEX_LINE starts with "**First-time setup:**"', () => {
+    expect(ONBOARD_CODEX_LINE.startsWith('**First-time setup:**')).toBe(true);
+  });
+
+  it('unknown skill throws', () => {
+    expect(() => codexContentFor('testsprite-unknown')).toThrow('unknown skill');
+  });
+
+  it('testsprite-verify with stub read returns stub value', () => {
+    const content = codexContentFor('testsprite-verify', () => '# stub codex');
+    expect(content).toBe('# stub codex');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildCodexAggregate
+// ---------------------------------------------------------------------------
+
+describe('buildCodexAggregate', () => {
+  it('single verify is byte-identical to loadCodexSkillBody().trimEnd()', () => {
+    const aggregate = buildCodexAggregate(['testsprite-verify']);
+    expect(aggregate).toBe(loadCodexSkillBody().trimEnd());
+  });
+
+  it('DEFAULT_SKILLS aggregate contains the verify H1', () => {
+    const aggregate = buildCodexAggregate(DEFAULT_SKILLS);
+    expect(aggregate).toContain('# TestSprite Verification Loop');
+  });
+
+  it('DEFAULT_SKILLS aggregate contains the onboard line', () => {
+    const aggregate = buildCodexAggregate(DEFAULT_SKILLS);
+    expect(aggregate).toContain('**First-time setup:**');
+  });
+
+  it('DEFAULT_SKILLS aggregate byte length is < 32768 (AGENTS.md budget)', () => {
+    const aggregate = buildCodexAggregate(DEFAULT_SKILLS);
+    expect(Buffer.byteLength(aggregate, 'utf8')).toBeLessThan(32768);
+  });
+
+  it('empty skills list returns empty string', () => {
+    const aggregate = buildCodexAggregate([]);
+    expect(aggregate).toBe('');
+  });
+
+  it('DEFAULT_SKILLS aggregate with stub read joins both contributions', () => {
+    const stubRead = () => '# Verify stub';
+    const aggregate = buildCodexAggregate(DEFAULT_SKILLS, stubRead);
+    // verify contributes the stub read result, onboard contributes its inline line
+    expect(aggregate).toContain('# Verify stub');
+    expect(aggregate).toContain('**First-time setup:**');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// renderForTarget — onboard skill
+// ---------------------------------------------------------------------------
+
+describe('renderForTarget for testsprite-onboard', () => {
+  it('claude path is .claude/skills/testsprite-onboard/SKILL.md', () => {
+    const result = renderForTarget('claude', 'testsprite-onboard');
+    expect(result.path).toBe('.claude/skills/testsprite-onboard/SKILL.md');
+  });
+
+  it('claude frontmatter contains name: testsprite-onboard', () => {
+    const result = renderForTarget('claude', 'testsprite-onboard');
+    expect(result.content).toContain('name: testsprite-onboard');
+  });
+
+  it('claude body contains onboard H1', () => {
+    const result = renderForTarget('claude', 'testsprite-onboard');
+    expect(result.content).toContain('# TestSprite: onboard a repo with a seed test suite');
+  });
+
+  it('cursor onboard path is .cursor/rules/testsprite-onboard.mdc', () => {
+    const result = renderForTarget('cursor', 'testsprite-onboard');
+    expect(result.path).toBe('.cursor/rules/testsprite-onboard.mdc');
+  });
+
+  it('cursor onboard frontmatter has alwaysApply: false', () => {
+    const result = renderForTarget('cursor', 'testsprite-onboard');
+    expect(result.content).toContain('alwaysApply: false');
+  });
+
+  it('cline onboard path is .clinerules/testsprite-onboard.md', () => {
+    const result = renderForTarget('cline', 'testsprite-onboard');
+    expect(result.path).toBe('.clinerules/testsprite-onboard.md');
+  });
+
+  it('cline onboard has no frontmatter fence', () => {
+    const result = renderForTarget('cline', 'testsprite-onboard');
+    expect(result.content).not.toContain('---');
+  });
+
+  it('codex onboard renders the unwrapped ONBOARD_CODEX_LINE', () => {
+    const result = renderForTarget('codex', 'testsprite-onboard');
+    expect(result.content).toBe(ONBOARD_CODEX_LINE);
+    expect(result.content).not.toContain('---');
+  });
+
+  it('codex onboard path is AGENTS.md', () => {
+    const result = renderForTarget('codex', 'testsprite-onboard');
+    expect(result.path).toBe('AGENTS.md');
+  });
+
+  it('unknown skill throws for renderForTarget', () => {
+    expect(() => renderForTarget('claude', 'testsprite-unknown')).toThrow('unknown skill');
   });
 });
 
@@ -395,20 +695,20 @@ describe('content integrity — gemini target (GEMINI.md managed-section body)',
   it('renderForTarget("gemini") path is GEMINI.md', () => {
     const STUB_GEMINI_BODY =
       '# TestSprite Verification Loop\ntestsprite test run\n--wait\ntest artifact get\n';
-    const result = renderForTarget('gemini', STUB_GEMINI_BODY);
+    const result = renderForTarget('gemini', 'testsprite-verify', STUB_GEMINI_BODY);
     expect(result.path).toBe('GEMINI.md');
   });
 
   it('renderForTarget("gemini") content is the body unwrapped (no frontmatter)', () => {
     const STUB_GEMINI_BODY =
       '# TestSprite Verification Loop\ntestsprite test run\n--wait\ntest artifact get\n';
-    const result = renderForTarget('gemini', STUB_GEMINI_BODY);
+    const result = renderForTarget('gemini', 'testsprite-verify', STUB_GEMINI_BODY);
     expect(result.content).toBe(STUB_GEMINI_BODY);
     expect(result.content).not.toContain('---');
   });
 
   it('renderForTarget("gemini") without body arg uses the managed-section asset', () => {
-    const result = renderForTarget('gemini');
+    const result = renderForTarget('gemini', 'testsprite-verify');
     expect(result.content).toContain('testsprite test run');
     expect(result.content).not.toContain('name: testsprite-verify');
     expect(result.content).not.toContain('alwaysApply:');
