@@ -5120,6 +5120,8 @@ async function writeBatchJUnitReportIfRequested(
 interface CliBatchRunFreshResult {
   testId: string;
   runId: string | undefined;
+  /** Observed on polled runs; used for JUnit report naming when --project omitted. */
+  projectId?: string;
   status: string;
   error?: { code: string; message: string; exitCode: number };
   /** CLIENT-synthesized Portal deep link (projectId from opts, testId per item). */
