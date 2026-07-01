@@ -70,6 +70,7 @@ export function isVerifySkillInstalled(dir: string, deps: SkillPresenceDeps = {}
   return false;
 }
 
+/** True when a managed-section file contains an ordered TestSprite BEGIN/END pair. */
 function hasCompleteManagedSection(content: string): boolean {
   const begin = content.indexOf(MANAGED_SECTION_BEGIN);
   if (begin === -1) return false;
@@ -140,6 +141,7 @@ export function maybeEmitSkillNudge(ctx: SkillNudgeContext): void {
   }
 }
 
+/** Interpret common env-var spellings for an enabled opt-out flag. */
 function isTruthyEnv(v: string | undefined): boolean {
   if (v === undefined) return false;
   const s = v.trim().toLowerCase();
