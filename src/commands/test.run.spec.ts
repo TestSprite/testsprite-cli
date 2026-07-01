@@ -3655,7 +3655,12 @@ describe('runTestRunAll — JUnit report export', () => {
       failureKind: null,
       error: null,
       videoUrl: null,
-      stepSummary: { total: 3, completed: 3, passedCount: status === 'passed' ? 3 : 0, failedCount: 0 },
+      stepSummary: {
+        total: 3,
+        completed: 3,
+        passedCount: status === 'passed' ? 3 : 0,
+        failedCount: 0,
+      },
     };
   }
 

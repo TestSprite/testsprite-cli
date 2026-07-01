@@ -221,7 +221,9 @@ export async function writeJUnitReportFile(rawPath: string, xml: string): Promis
       stream.end(() => {
         if (streamError) {
           unlink(tmpPath).catch(() => undefined);
-          reject(new TransportError(`Failed to write --report-file ${resolved}: ${streamError.message}`));
+          reject(
+            new TransportError(`Failed to write --report-file ${resolved}: ${streamError.message}`),
+          );
           return;
         }
         rename(tmpPath, resolved)

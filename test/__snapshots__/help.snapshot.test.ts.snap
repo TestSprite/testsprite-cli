@@ -392,37 +392,40 @@ Exit codes:
 On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
 
 Options:
-  --all                    rerun all tests in the resolved project (requires
-                           --project) (default: false)
-  --project <id>           project id (required with --all; returned by
-                           \`testsprite project list\`)
-  --skip-terminal          with --all: skip tests already in a terminal status
-                           (passed|failed|blocked|cancelled) (default: false)
-  --status <list>          with --all: only dispatch tests whose status matches
-                           one of these values (comma-separated; accepted:
-                           draft|ready|queued|running|passed|failed|blocked|cancelled|unknown)
-  --filter <substr>        with --all: only rerun tests whose name contains
-                           this substring (case-insensitive)
-  --wait                   block until terminal status or --timeout elapses
-                           (default: false)
-  --timeout <s>            with --wait, max seconds to wait (1–3600, default
-                           600)
-  --no-auto-heal           opt out of AI heal-on-drift for this FE rerun
-                           (default: auto-heal is ON). Costs 0.2 credits per
-                           engage when a step has drifted. Ignored for backend
-                           tests.
-  --skip-dependencies      BE only: rerun only the named test without expanding
-                           the producer/teardown closure (default: false)
-  --max-concurrency <n>    with --wait, max in-flight polls at once (1-100,
-                           default: 50)
-  --idempotency-key <key>  opaque key for safe retries (1–256 chars). Printed
-                           to stderr at --verbose if auto-generated.
-  --report <format>        with batch --wait: write a JUnit XML sidecar
-                           report after polling (accepted: junit)
-  --report-file <path>     output path for --report (atomic write)
+  --all                       rerun all tests in the resolved project (requires
+                              --project) (default: false)
+  --project <id>              project id (required with --all; returned by
+                              \`testsprite project list\`)
+  --skip-terminal             with --all: skip tests already in a terminal
+                              status (passed|failed|blocked|cancelled)
+                              (default: false)
+  --status <list>             with --all: only dispatch tests whose status
+                              matches one of these values (comma-separated;
+                              accepted:
+                              draft|ready|queued|running|passed|failed|blocked|cancelled|unknown)
+  --filter <substr>           with --all: only rerun tests whose name contains
+                              this substring (case-insensitive)
+  --wait                      block until terminal status or --timeout elapses
+                              (default: false)
+  --timeout <s>               with --wait, max seconds to wait (1–3600, default
+                              600)
+  --no-auto-heal              opt out of AI heal-on-drift for this FE rerun
+                              (default: auto-heal is ON). Costs 0.2 credits per
+                              engage when a step has drifted. Ignored for
+                              backend tests.
+  --skip-dependencies         BE only: rerun only the named test without
+                              expanding the producer/teardown closure (default:
+                              false)
+  --max-concurrency <n>       with --wait, max in-flight polls at once (1-100,
+                              default: 50)
+  --idempotency-key <key>     opaque key for safe retries (1–256 chars).
+                              Printed to stderr at --verbose if auto-generated.
+  --report <format>           with batch --wait: write a JUnit XML sidecar
+                              report after polling (accepted: junit)
+  --report-file <path>        output path for --report (atomic write)
   --report-suite-name <name>  optional JUnit <testsuite name=...> override
-                           (default: testsprite:<projectId>)
-  -h, --help               display help for command
+                              (default: testsprite:<projectId>)
+  -h, --help                  display help for command
 
 Notes:
   • rerun replays a saved run/script and is MORE LENIENT than a fresh \`test run\`
@@ -495,29 +498,29 @@ Exit codes:
 On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
 
 Options:
-  --target-url <url>       override the project default env URL for this run
-                           (http/https only, no localhost/private IPs)
-  --wait                   poll until terminal status or --timeout elapses
-                           (default: false)
-  --timeout <s>            with --wait, max seconds to wait (1–3600, default
-                           600)
-  --idempotency-key <key>  opaque key for safe retries (1–256 chars). Printed
-                           to stderr at --debug if auto-generated.
-  --all                    run all BE tests in the project (wave-ordered fresh
-                           run; requires --project). Mutually exclusive with
-                           <test-id>. (default: false)
-  --project <id>           project id (required with --all; returned by
-                           \`testsprite project list\`)
-  --filter <substr>        with --all: only run tests whose name contains this
-                           substring (case-insensitive)
-  --max-concurrency <n>    with --all --wait, max in-flight polls at once
-                           (1-100, default: 50)
-  --report <format>        with --all --wait: write a JUnit XML sidecar
-                           report after polling (accepted: junit)
-  --report-file <path>     output path for --report (atomic write)
+  --target-url <url>          override the project default env URL for this run
+                              (http/https only, no localhost/private IPs)
+  --wait                      poll until terminal status or --timeout elapses
+                              (default: false)
+  --timeout <s>               with --wait, max seconds to wait (1–3600, default
+                              600)
+  --idempotency-key <key>     opaque key for safe retries (1–256 chars).
+                              Printed to stderr at --debug if auto-generated.
+  --all                       run all BE tests in the project (wave-ordered
+                              fresh run; requires --project). Mutually
+                              exclusive with <test-id>. (default: false)
+  --project <id>              project id (required with --all; returned by
+                              \`testsprite project list\`)
+  --filter <substr>           with --all: only run tests whose name contains
+                              this substring (case-insensitive)
+  --max-concurrency <n>       with --all --wait, max in-flight polls at once
+                              (1-100, default: 50)
+  --report <format>           with --all --wait: write a JUnit XML sidecar
+                              report after polling (accepted: junit)
+  --report-file <path>        output path for --report (atomic write)
   --report-suite-name <name>  optional JUnit <testsuite name=...> override
-                           (default: testsprite:<projectId>)
-  -h, --help               display help for command
+                              (default: testsprite:<projectId>)
+  -h, --help                  display help for command
 
 Dependency-aware fresh run (M4):
   testsprite test run --all --project <id>           run all BE tests in wave order

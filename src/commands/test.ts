@@ -6767,10 +6767,7 @@ export async function runTestRerun(
   };
   out.print(jsonPayload);
   const reportProjectId = opts.projectId ?? 'batch';
-  await writeBatchJUnitReportIfRequested(
-    { ...opts, projectId: reportProjectId },
-    rerunResults,
-  );
+  await writeBatchJUnitReportIfRequested({ ...opts, projectId: reportProjectId }, rerunResults);
 
   // Determine exit code: timeout (deferred or any timeout) → 7; any fail → 1; all pass → 0
   if (deferred.length > 0 || timedOut > 0) {

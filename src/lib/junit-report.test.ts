@@ -52,9 +52,7 @@ describe('parseJUnitReportFormat', () => {
 
 describe('assertJUnitReportOptions', () => {
   it('allows absent report flags', () => {
-    expect(() =>
-      assertJUnitReportOptions({ wait: false, batchPath: true }),
-    ).not.toThrow();
+    expect(() => assertJUnitReportOptions({ wait: false, batchPath: true })).not.toThrow();
   });
 
   it('rejects report-file without report', () => {
@@ -99,7 +97,9 @@ describe('buildJUnitReport', () => {
       classname: 'proj_empty',
       results: [],
     });
-    expect(xml).toContain('<testsuite name="Dry suite" tests="0" failures="0" errors="0" skipped="0"');
+    expect(xml).toContain(
+      '<testsuite name="Dry suite" tests="0" failures="0" errors="0" skipped="0"',
+    );
     expect(xml).toContain('</testsuites>');
   });
 
