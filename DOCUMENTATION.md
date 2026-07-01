@@ -344,6 +344,10 @@ testsprite test run test_xxxxxxxx --target-url https://staging.example.com \
 
 # Dry-run prints a canned queued response (no network, no credentials)
 testsprite test run test_xxxxxxxx --dry-run --output json
+
+# Batch BE run with JUnit XML for CI (sidecar; --output json unchanged)
+testsprite test run --all --project proj_xxxxxxxx --wait \
+  --report junit --report-file ./results.xml --output json
 ```
 
 `--target-url` must be a publicly reachable URL — the CLI pre-flights it against local addresses (`localhost`, `127.x`, `::1`, `0.0.0.0`, `169.254.x`, RFC1918) and the backend resolves it via DNS. For testing against localhost, use the [TestSprite MCP plugin](https://www.testsprite.com/docs), which handles the local tunnel. The CLI auto-mints an idempotency key (printed to stderr under `--output json`, `--verbose`, or `--debug`); pass `--idempotency-key <uuid>` to control it explicitly.
@@ -365,6 +369,10 @@ testsprite test rerun test_be_xxxx --skip-dependencies --output json
 # Rerun every test in a project (batch)
 testsprite test rerun --all --project proj_xxxxxxxx --wait --max-concurrency 4 --output json
 
+# Batch rerun with JUnit XML for CI
+testsprite test rerun --all --project proj_xxxxxxxx --wait \
+  --report junit --report-file ./results.xml --output json
+
 # Several specific tests
 testsprite test rerun test_aaaa test_bbbb --wait --output json
 ```
@@ -377,6 +385,7 @@ Flags:
 - `--skip-dependencies` — backend only: rerun just the named test without expanding the producer/teardown closure.
 - `--max-concurrency <n>` — with `--wait`, cap on in-flight polls during a batch rerun.
 - `--idempotency-key <key>` — auto-minted when omitted (the minted key is printed to stderr under `--output json`, `--verbose`, or `--debug`).
+- `--report junit --report-file <path>` — with batch `--wait`, write a JUnit XML sidecar after polling (atomic write). Optional `--report-suite-name <name>` overrides the default `testsprite:<projectId>` suite name. Requires `--wait`; not available on single-test reruns.
 
 A batch rerun returns `accepted[]` (one `runId` per dispatched test) plus `deferred[]` for any test shed by the per-key run-rate limit; under `--wait`, a non-empty `deferred[]` exits 7 with a `nextAction` you can retry with a fresh idempotency key.
 

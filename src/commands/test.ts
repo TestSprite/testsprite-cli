@@ -18,7 +18,15 @@ import {
   writeBundle,
   type WriteBundleResult,
 } from '../lib/bundle.js';
-import { findSample } from '../lib/dry-run/samples.js';
+import { findSample, sampleJUnitReportXml } from '../lib/dry-run/samples.js';
+import {
+  assertJUnitReportOptions,
+  buildJUnitReport,
+  writeJUnitReportFile,
+  type JUnitReportFormat,
+  parseJUnitReportFormat,
+  type JUnitTestResult,
+} from '../lib/junit-report.js';
 import {
   ApiError,
   CLIError,
@@ -4296,6 +4304,12 @@ interface RunTestRerunOptions extends CommonOptions {
    * filters. Client-side only.
    */
   nameFilter?: string;
+  /** --report junit: write a JUnit XML sidecar after batch --wait completes. */
+  report?: JUnitReportFormat;
+  /** --report-file: destination path for the JUnit XML artifact. */
+  reportFile?: string;
+  /** --report-suite-name: optional override for the JUnit <testsuite name=...>. */
+  reportSuiteName?: string;
 }
 
 /**
@@ -5071,6 +5085,31 @@ interface RunTestRunAllOptions extends CommonOptions {
   maxConcurrency: number;
   /** Caller-supplied idempotency token; auto-minted if absent. */
   idempotencyKey?: string;
+  /** --report junit: write a JUnit XML sidecar after batch --wait completes. */
+  report?: JUnitReportFormat;
+  /** --report-file: destination path for the JUnit XML artifact. */
+  reportFile?: string;
+  /** --report-suite-name: optional override for the JUnit <testsuite name=...>. */
+  reportSuiteName?: string;
+}
+
+async function writeBatchJUnitReportIfRequested(
+  opts: {
+    report?: JUnitReportFormat;
+    reportFile?: string;
+    reportSuiteName?: string;
+    projectId: string;
+  },
+  results: readonly JUnitTestResult[],
+): Promise<void> {
+  if (opts.report !== 'junit' || opts.reportFile === undefined) return;
+  const suiteName = opts.reportSuiteName ?? `testsprite:${opts.projectId}`;
+  const xml = buildJUnitReport({
+    suiteName,
+    classname: opts.projectId,
+    results,
+  });
+  await writeJUnitReportFile(opts.reportFile, xml);
 }
 
 /**
@@ -5105,6 +5144,13 @@ export async function runTestRunAll(
   ) {
     throw localValidationError('max-concurrency', 'must be an integer between 1 and 100');
   }
+  assertJUnitReportOptions({
+    report: opts.report,
+    reportFile: opts.reportFile,
+    reportSuiteName: opts.reportSuiteName,
+    wait: opts.wait,
+    batchPath: true,
+  });
 
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const out = makeOutput(opts.output, deps);
@@ -5129,6 +5175,9 @@ export async function runTestRunAll(
       ...(opts.wait ? { thenPoll: '/api/cli/v1/runs/<run-id>?waitSeconds=25' } : {}),
     };
     out.print(batchRunSample ?? envelope);
+    if (opts.report === 'junit' && opts.reportFile !== undefined) {
+      await writeJUnitReportFile(opts.reportFile, sampleJUnitReportXml(opts.projectId));
+    }
     return undefined;
   }
 
@@ -5550,6 +5599,7 @@ export async function runTestRunAll(
     },
   };
   out.print(jsonPayload);
+  await writeBatchJUnitReportIfRequested(opts, freshRunResults);
 
   // Rate-deferred tests were never dispatched → the batch is incomplete (exit 7),
   // mirroring `test rerun --all`. Checked before the failed-run throw so the
@@ -5680,6 +5730,13 @@ export async function runTestRerun(
   }
 
   const isSingle = !opts.all && opts.testIds.length === 1;
+  assertJUnitReportOptions({
+    report: opts.report,
+    reportFile: opts.reportFile,
+    reportSuiteName: opts.reportSuiteName,
+    wait: opts.wait,
+    batchPath: !isSingle,
+  });
 
   // -------------------------------------------------------------------------
   // Pre-flight: auto-heal + Free-tier hint (best-effort, non-blocking)
@@ -5720,6 +5777,10 @@ export async function runTestRerun(
         ...(opts.wait ? { thenPoll: `/api/cli/v1/runs/<run-id>?waitSeconds=25` } : {}),
       };
       out.print(findSample('POST', '/api/cli/v1/tests/batch/rerun')?.body() ?? envelope);
+      if (opts.report === 'junit' && opts.reportFile !== undefined) {
+        const projectKey = opts.projectId ?? 'batch';
+        await writeJUnitReportFile(opts.reportFile, sampleJUnitReportXml(projectKey));
+      }
     }
     void client;
     return undefined;
@@ -6705,6 +6766,11 @@ export async function runTestRerun(
     },
   };
   out.print(jsonPayload);
+  const reportProjectId = opts.projectId ?? 'batch';
+  await writeBatchJUnitReportIfRequested(
+    { ...opts, projectId: reportProjectId },
+    rerunResults,
+  );
 
   // Determine exit code: timeout (deferred or any timeout) → 7; any fail → 1; all pass → 0
   if (deferred.length > 0 || timedOut > 0) {
@@ -7428,11 +7494,21 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       '--max-concurrency <n>',
       `with --all --wait, max in-flight polls at once (1-100, default: ${DEFAULT_BATCH_RUN_CONCURRENCY})`,
     )
+    .option(
+      '--report <format>',
+      'with --all --wait: write a JUnit XML sidecar report after polling (accepted: junit)',
+    )
+    .option('--report-file <path>', 'output path for --report (atomic write)')
+    .option(
+      '--report-suite-name <name>',
+      'optional JUnit <testsuite name=...> override (default: testsprite:<projectId>)',
+    )
     .addHelpText(
       'after',
       '\nDependency-aware fresh run (M4):\n' +
         '  testsprite test run --all --project <id>           run all BE tests in wave order\n' +
         '  testsprite test run --all --project <id> --filter <substr>  name-glob subset\n' +
+        '  testsprite test run --all --project <id> --wait --report junit --report-file ./results.xml\n' +
         '\nBE tests can declare --produces/--needs at create time to drive wave ordering\n' +
         '(see `testsprite test create --help` for details).',
     )
@@ -7462,6 +7538,14 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           '--filter only applies with --all (it narrows which project tests run). Remove --filter, or add --all --project <id>.',
         );
       }
+      const report = parseJUnitReportFormat(cmdOpts.report);
+      assertJUnitReportOptions({
+        report,
+        reportFile: cmdOpts.reportFile,
+        reportSuiteName: cmdOpts.reportSuiteName,
+        wait: cmdOpts.wait === true,
+        batchPath: isAll,
+      });
 
       if (isAll) {
         // --all path: wave-ordered fresh batch run.
@@ -7492,6 +7576,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
               parseNumericFlag(cmdOpts.maxConcurrency, 'max-concurrency') ??
               DEFAULT_BATCH_RUN_CONCURRENCY,
             idempotencyKey: cmdOpts.idempotencyKey,
+            report,
+            reportFile: cmdOpts.reportFile,
+            reportSuiteName: cmdOpts.reportSuiteName,
           },
           deps,
         );
@@ -7599,6 +7686,15 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       '--idempotency-key <key>',
       'opaque key for safe retries (1–256 chars). Printed to stderr at --verbose if auto-generated.',
     )
+    .option(
+      '--report <format>',
+      'with batch --wait: write a JUnit XML sidecar report after polling (accepted: junit)',
+    )
+    .option('--report-file <path>', 'output path for --report (atomic write)')
+    .option(
+      '--report-suite-name <name>',
+      'optional JUnit <testsuite name=...> override (default: testsprite:<projectId>)',
+    )
     .addHelpText(
       'after',
       '\nNotes:\n' +
@@ -7624,10 +7720,20 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       // `--no-auto-heal`. There is no explicit `--auto-heal` flag, so
       // autoHealExplicit is always false in this design — the default-on value
       // is never a deliberate user choice to opt in.
+      const testIds = testIdsArg ?? [];
+      const isBatch = cmdOpts.all === true || testIds.length !== 1;
+      const report = parseJUnitReportFormat(cmdOpts.report);
+      assertJUnitReportOptions({
+        report,
+        reportFile: cmdOpts.reportFile,
+        reportSuiteName: cmdOpts.reportSuiteName,
+        wait: cmdOpts.wait === true,
+        batchPath: isBatch,
+      });
       await runTestRerun(
         {
           ...resolveCommonOptions(command),
-          testIds: testIdsArg ?? [],
+          testIds,
           all: cmdOpts.all === true,
           projectId: cmdOpts.project,
           skipTerminal: cmdOpts.skipTerminal === true,
@@ -7642,6 +7748,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             parseNumericFlag(cmdOpts.maxConcurrency, 'max-concurrency') ??
             DEFAULT_BATCH_RUN_CONCURRENCY,
           idempotencyKey: cmdOpts.idempotencyKey,
+          report,
+          reportFile: cmdOpts.reportFile,
+          reportSuiteName: cmdOpts.reportSuiteName,
         },
         deps,
       );
@@ -7665,6 +7774,9 @@ interface RunFlagOpts {
   project?: string;
   filter?: string;
   maxConcurrency?: string;
+  report?: string;
+  reportFile?: string;
+  reportSuiteName?: string;
 }
 
 interface WaitFlagOpts {
@@ -7683,6 +7795,9 @@ interface RerunFlagOpts {
   skipDependencies?: boolean;
   maxConcurrency?: string;
   idempotencyKey?: string;
+  report?: string;
+  reportFile?: string;
+  reportSuiteName?: string;
 }
 
 interface UpdateFlagOpts {

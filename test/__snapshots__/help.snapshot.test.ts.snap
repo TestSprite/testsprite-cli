@@ -417,6 +417,11 @@ Options:
                            default: 50)
   --idempotency-key <key>  opaque key for safe retries (1–256 chars). Printed
                            to stderr at --verbose if auto-generated.
+  --report <format>        with batch --wait: write a JUnit XML sidecar
+                           report after polling (accepted: junit)
+  --report-file <path>     output path for --report (atomic write)
+  --report-suite-name <name>  optional JUnit <testsuite name=...> override
+                           (default: testsprite:<projectId>)
   -h, --help               display help for command
 
 Notes:
@@ -507,11 +512,17 @@ Options:
                            substring (case-insensitive)
   --max-concurrency <n>    with --all --wait, max in-flight polls at once
                            (1-100, default: 50)
+  --report <format>        with --all --wait: write a JUnit XML sidecar
+                           report after polling (accepted: junit)
+  --report-file <path>     output path for --report (atomic write)
+  --report-suite-name <name>  optional JUnit <testsuite name=...> override
+                           (default: testsprite:<projectId>)
   -h, --help               display help for command
 
 Dependency-aware fresh run (M4):
   testsprite test run --all --project <id>           run all BE tests in wave order
   testsprite test run --all --project <id> --filter <substr>  name-glob subset
+  testsprite test run --all --project <id> --wait --report junit --report-file ./results.xml
 
 BE tests can declare --produces/--needs at create time to drive wave ordering
 (see \`testsprite test create --help\` for details).

@@ -4,6 +4,10 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **JUnit XML report export for batch `--wait` runs.** `test run --all` and batch `test rerun` (`--all` or multiple test ids) accept `--report junit --report-file <path>` to write a CI-friendly XML sidecar after polling completes. `--output json` is unchanged; the report is written even when the batch exits non-zero. `--dry-run` writes a canned sample without network calls.
+
 ## [0.2.0] - 2026-06-29
 
 ### Added
