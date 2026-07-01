@@ -8011,7 +8011,14 @@ async function closeOutputFile(sink: FileSink, commit: boolean): Promise<void> {
 
 /** Tear down an opened `--out` sink without leaving a zero-byte artifact. */
 async function abortOutputFile(sink: FileSink): Promise<void> {
-  sink.stream.destroy();
+  await new Promise<void>(resolve => {
+    if (sink.stream.destroyed) {
+      resolve();
+      return;
+    }
+    sink.stream.once('close', () => resolve());
+    sink.stream.destroy();
+  });
   await unlink(sink.tmpPath).catch(() => undefined);
 }
 

@@ -1708,7 +1708,7 @@ describe('runCodePut', () => {
   it('strips a UTF-8 BOM from --code-file before uploading (Windows PowerShell 5.1 default)', async () => {
     const { credentialsPath } = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-p4-bom-'));
-    const codeFile = join(dir, 'updated.spec.ts');
+    const codeFile = join(dir, 'updated.py');
     writeFileSync(codeFile, '\uFEFF' + 'updated body', 'utf8');
     let seenBody: unknown;
     const fetchImpl = makeFetch((_url, init) => {
