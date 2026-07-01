@@ -64,8 +64,9 @@ export const DEFAULT_PATTERNS: readonly RedactionPattern[] = [
   { name: 'github-token', regex: /\bgh[pousr]_[A-Za-z0-9]{36,}\b/g },
 
   // Generic hex secrets: 32+ consecutive hex chars (SHA-256, API keys, etc.)
-  // Only matches lowercase or mixed-case to reduce false positives on UUIDs.
-  { name: 'hex-secret', regex: /\b[0-9a-f]{32,}\b/g },
+  // Matches lowercase, uppercase, and mixed-case hex to avoid leaking secrets,
+  // consistent with the false-positive-over-false-negative principle above.
+  { name: 'hex-secret', regex: /\b[0-9a-fA-F]{32,}\b/g },
 ];
 
 /**

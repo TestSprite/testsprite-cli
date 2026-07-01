@@ -105,6 +105,16 @@ describe('redactSecrets', () => {
       const input = 'short=abcdef123456';
       expect(redactSecrets(input)).toBe('short=abcdef123456');
     });
+
+    it('redacts uppercase hex strings', () => {
+      const input = 'hash=A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4';
+      expect(redactSecrets(input)).toContain('[REDACTED:hex-secret]');
+    });
+
+    it('redacts mixed-case hex strings', () => {
+      const input = 'hash=a1B2c3D4e5F6a1B2c3D4e5F6a1B2c3D4';
+      expect(redactSecrets(input)).toContain('[REDACTED:hex-secret]');
+    });
   });
 
   describe('edge cases', () => {
