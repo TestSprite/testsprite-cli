@@ -10,7 +10,7 @@ import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, type OutputMode } from '../lib/output.js';
 import { assertNotLocal } from '../lib/target-url.js';
-import { assertIdempotencyKey } from '../lib/validate.js';
+import { assertIdempotencyKey, requireString } from '../lib/validate.js';
 import {
   fetchSinglePage,
   paginate,
@@ -128,6 +128,25 @@ interface CreateOptions extends CommonOptions {
   idempotencyKey?: string;
 }
 
+function validateInlinePassword(password: string | undefined): void {
+  if (password !== undefined) {
+    requireString('password', password, { kind: 'flag' });
+  }
+}
+
+function resolvePassword(opts: { password?: string; passwordFile?: string }): string | undefined {
+  validateInlinePassword(opts.password);
+  if (opts.password !== undefined) {
+    return opts.password;
+  }
+  if (opts.passwordFile !== undefined) {
+    const password = readFileSync(opts.passwordFile, 'utf8').trim();
+    requireString('passwordFile', password, { kind: 'flag' });
+    return password;
+  }
+  return undefined;
+}
+
 export async function runCreate(
   opts: CreateOptions,
   deps: ProjectDeps = {},
@@ -158,6 +177,8 @@ export async function runCreate(
     throw localValidationError('--url is required for --type frontend');
   }
 
+  validateInlinePassword(opts.password);
+
   if (opts.dryRun) {
     const idempotencyKey = opts.idempotencyKey ?? `cli-proj-create-${randomUUID()}`;
     // P2-6: gate idempotency-key output behind --verbose/--debug/json (matches
@@ -182,11 +203,8 @@ export async function runCreate(
     return sample;
   }
 
-  // Resolve password: flag > file > none
-  let password = opts.password;
-  if (password === undefined && opts.passwordFile !== undefined) {
-    password = readFileSync(opts.passwordFile, 'utf8').trim();
-  }
+  // Resolve password: flag > file > none.
+  const password = resolvePassword(opts);
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-create-${randomUUID()}`;
   if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
@@ -254,11 +272,8 @@ export async function runUpdate(
     throw localValidationError('--description must be at most 2000 characters');
   }
 
-  // Resolve password
-  let password = opts.password;
-  if (password === undefined && opts.passwordFile !== undefined) {
-    password = readFileSync(opts.passwordFile, 'utf8').trim();
-  }
+  // Resolve password: flag > file > none.
+  const password = resolvePassword(opts);
 
   // P2-7: guard --url against localhost/RFC1918/non-http(s).
   if (opts.targetUrl !== undefined) {

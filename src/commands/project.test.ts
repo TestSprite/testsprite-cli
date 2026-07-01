@@ -484,6 +484,65 @@ describe('runCreate', () => {
     expect(result.type).toBe('backend');
   });
 
+  it('P6 — rejects a blank inline --password before POSTing', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network — validation must fire client-side');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'backend',
+          name: 'Auth Project',
+          password: '   ',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('P6 — preserves surrounding spaces in a non-empty inline --password', async () => {
+    const { credentialsPath } = makeCreds();
+    const sentBodies: unknown[] = [];
+    const createdProject: CliProject = {
+      ...PROJECT_FIXTURE,
+      id: 'proj_password_spaces',
+      type: 'backend',
+      name: 'Password Spaces',
+    };
+    const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      if (init.body) sentBodies.push(JSON.parse(init.body as string) as unknown);
+      return new Response(JSON.stringify(createdProject), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        type: 'backend',
+        name: 'Password Spaces',
+        password: '  keep spaces  ',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+
+    expect((sentBodies[0] as Record<string, unknown>).password).toBe('  keep spaces  ');
+  });
+
   it('P6 — dry-run returns canned shape without hitting the network', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn(async () => {
@@ -629,6 +688,32 @@ describe('runUpdate', () => {
           debug: false,
           projectId: 'proj_abc',
           // no mutable fields
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('P7 — rejects an empty inline --password before PATCHing', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network — validation must fire client-side');
+    });
+
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          password: '',
         },
         {
           credentialsPath,
