@@ -1,9 +1,7 @@
 import {
   chmodSync,
-  closeSync,
   existsSync,
   mkdirSync,
-  openSync,
   readFileSync,
   renameSync,
   statSync,
@@ -222,15 +220,17 @@ function acquireCredentialsLock(credentialsPath: string): void {
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
   const deadline = Date.now() + CREDENTIALS_LOCK_MAX_WAIT_MS;
   while (Date.now() < deadline) {
+    const tmp = `${lockPath}.tmp.${process.pid}.${Date.now()}`;
+    writeFileSync(tmp, `${process.pid}\n${Date.now()}\n`, 'utf8');
     try {
-      const fd = openSync(lockPath, 'wx');
-      try {
-        writeFileSync(fd, `${process.pid}\n${Date.now()}\n`, 'utf8');
-      } finally {
-        closeSync(fd);
-      }
+      renameSync(tmp, lockPath);
       return;
     } catch (err) {
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // Best-effort cleanup of the unclaimed temp file.
+      }
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== 'EEXIST') throw err;
       if (isStaleCredentialsLock(lockPath)) {
@@ -257,11 +257,16 @@ function releaseCredentialsLock(credentialsPath: string): void {
 
 function isStaleCredentialsLock(lockPath: string): boolean {
   try {
+    const content = readFileSync(lockPath, 'utf8');
+    const [pidLine = '', tsLine = ''] = content.split('\n');
+    const pid = Number.parseInt(pidLine.trim(), 10);
+    const ts = Number.parseInt(tsLine.trim(), 10);
+    // Incomplete lock — another process may be creating it; never reclaim.
+    if (!Number.isFinite(pid) || pid <= 0 || !Number.isFinite(ts)) return false;
+
     const stat = statSync(lockPath);
     if (Date.now() - stat.mtimeMs > CREDENTIALS_LOCK_STALE_MS) return true;
-    const firstLine = readFileSync(lockPath, 'utf8').split('\n')[0] ?? '';
-    const pid = Number.parseInt(firstLine, 10);
-    if (!Number.isFinite(pid) || pid <= 0) return true;
+    if (Date.now() - ts > CREDENTIALS_LOCK_STALE_MS) return true;
     try {
       process.kill(pid, 0);
       return false;
