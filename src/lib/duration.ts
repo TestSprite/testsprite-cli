@@ -178,8 +178,9 @@ export function formatDuration(ms: number): string {
  * @param input  Raw duration string.
  * @param field  Flag/field name for error messages.
  * @param opts.min  Minimum duration in milliseconds (inclusive).
- * @param opts.max  Maximum duration in milliseconds (inclusive).
- *                  Defaults to 24 hours.
+ * @param opts.max  Maximum duration in milliseconds (inclusive), capped at
+ *                  and never able to exceed the 24-hour ceiling enforced by
+ *                  `parseDuration`. Defaults to 24 hours when omitted.
  */
 export function requireDuration(
   input: string,
