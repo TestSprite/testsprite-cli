@@ -11,6 +11,8 @@ export interface JUnitTestResult {
   testId: string;
   runId?: string;
   status: string;
+  /** Observed on polled runs; used for classname when --project is omitted. */
+  projectId?: string;
   error?: { code: string; message: string; exitCode?: number };
 }
 
@@ -49,6 +51,12 @@ export function assertJUnitReportOptions(opts: JUnitReportFlagOptions): void {
     if (opts.reportFile !== undefined && opts.reportFile !== '') {
       throw localValidationError('report-file', '--report-file requires --report junit');
     }
+    if (opts.reportSuiteName !== undefined && opts.reportSuiteName !== '') {
+      throw localValidationError(
+        'report-suite-name',
+        '--report-suite-name requires --report junit',
+      );
+    }
     return;
   }
 
@@ -67,6 +75,23 @@ export function assertJUnitReportOptions(opts: JUnitReportFlagOptions): void {
   if (opts.reportFile === undefined || opts.reportFile === '') {
     throw localValidationError('report-file', '--report junit requires --report-file <path>');
   }
+}
+
+/**
+ * Resolve the project id used for JUnit classname / default suite naming.
+ * Prefer explicit `--project`, then ids observed on polled run rows.
+ */
+export function resolveBatchReportProjectId(
+  opts: { projectId?: string },
+  results: ReadonlyArray<{ projectId?: string }>,
+): string {
+  if (opts.projectId) return opts.projectId;
+  const fromPoll = results.map(r => r.projectId).find((id): id is string => !!id);
+  if (fromPoll) return fromPoll;
+  throw localValidationError(
+    'project',
+    '--report junit requires --project <id> when the project cannot be inferred from run results',
+  );
 }
 
 /**

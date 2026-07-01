@@ -22,6 +22,7 @@ import { findSample, sampleJUnitReportXml } from '../lib/dry-run/samples.js';
 import {
   assertJUnitReportOptions,
   buildJUnitReport,
+  resolveBatchReportProjectId,
   writeJUnitReportFile,
   type JUnitReportFormat,
   parseJUnitReportFormat,
@@ -5098,15 +5099,16 @@ async function writeBatchJUnitReportIfRequested(
     report?: JUnitReportFormat;
     reportFile?: string;
     reportSuiteName?: string;
-    projectId: string;
+    projectId?: string;
   },
   results: readonly JUnitTestResult[],
 ): Promise<void> {
   if (opts.report !== 'junit' || opts.reportFile === undefined) return;
-  const suiteName = opts.reportSuiteName ?? `testsprite:${opts.projectId}`;
+  const projectId = resolveBatchReportProjectId(opts, results);
+  const suiteName = opts.reportSuiteName ?? `testsprite:${projectId}`;
   const xml = buildJUnitReport({
     suiteName,
-    classname: opts.projectId,
+    classname: projectId,
     results,
   });
   await writeJUnitReportFile(opts.reportFile, xml);
@@ -5174,10 +5176,13 @@ export async function runTestRunAll(
       idempotencyKey,
       ...(opts.wait ? { thenPoll: '/api/cli/v1/runs/<run-id>?waitSeconds=25' } : {}),
     };
-    out.print(batchRunSample ?? envelope);
     if (opts.report === 'junit' && opts.reportFile !== undefined) {
-      await writeJUnitReportFile(opts.reportFile, sampleJUnitReportXml(opts.projectId));
+      await writeJUnitReportFile(
+        opts.reportFile,
+        sampleJUnitReportXml(opts.projectId, opts.reportSuiteName),
+      );
     }
+    out.print(batchRunSample ?? envelope);
     return undefined;
   }
 
@@ -5516,7 +5521,12 @@ export async function runTestRunAll(
         },
         resolveAlternate,
       });
-      return { testId: entry.testId, runId, status: finalRun.status };
+      return {
+        testId: entry.testId,
+        runId,
+        projectId: finalRun.projectId,
+        status: finalRun.status,
+      };
     } catch (err) {
       if (err instanceof TimeoutError) {
         return {
@@ -5598,8 +5608,8 @@ export async function runTestRunAll(
       total: pollable.length,
     },
   };
-  out.print(jsonPayload);
   await writeBatchJUnitReportIfRequested(opts, freshRunResults);
+  out.print(jsonPayload);
 
   // Rate-deferred tests were never dispatched → the batch is incomplete (exit 7),
   // mirroring `test rerun --all`. Checked before the failed-run throw so the
@@ -5661,6 +5671,8 @@ export async function runTestRunAll(
 interface CliRerunResult {
   testId: string;
   runId: string;
+  /** Observed on polled runs; used for JUnit report naming when --project omitted. */
+  projectId?: string;
   /** Terminal status, or 'timeout' for per-run deadline exceeded. */
   status: string;
   /** Set when the test is a closure member (not the user's named test). */
@@ -5776,11 +5788,14 @@ export async function runTestRerun(
         idempotencyKey,
         ...(opts.wait ? { thenPoll: `/api/cli/v1/runs/<run-id>?waitSeconds=25` } : {}),
       };
-      out.print(findSample('POST', '/api/cli/v1/tests/batch/rerun')?.body() ?? envelope);
       if (opts.report === 'junit' && opts.reportFile !== undefined) {
-        const projectKey = opts.projectId ?? 'batch';
-        await writeJUnitReportFile(opts.reportFile, sampleJUnitReportXml(projectKey));
+        const projectKey = resolveBatchReportProjectId(opts, []);
+        await writeJUnitReportFile(
+          opts.reportFile,
+          sampleJUnitReportXml(projectKey, opts.reportSuiteName),
+        );
       }
+      out.print(findSample('POST', '/api/cli/v1/tests/batch/rerun')?.body() ?? envelope);
     }
     void client;
     return undefined;
@@ -6677,7 +6692,12 @@ export async function runTestRerun(
         },
         resolveAlternate,
       });
-      return { testId: entry.testId, runId: entry.runId, status: finalRun.status };
+      return {
+        testId: entry.testId,
+        runId: entry.runId,
+        projectId: finalRun.projectId,
+        status: finalRun.status,
+      };
     } catch (err) {
       if (err instanceof TimeoutError) {
         return {
@@ -6765,9 +6785,8 @@ export async function runTestRerun(
       total: accepted.length,
     },
   };
+  await writeBatchJUnitReportIfRequested(opts, rerunResults);
   out.print(jsonPayload);
-  const reportProjectId = opts.projectId ?? 'batch';
-  await writeBatchJUnitReportIfRequested({ ...opts, projectId: reportProjectId }, rerunResults);
 
   // Determine exit code: timeout (deferred or any timeout) → 7; any fail → 1; all pass → 0
   if (deferred.length > 0 || timedOut > 0) {

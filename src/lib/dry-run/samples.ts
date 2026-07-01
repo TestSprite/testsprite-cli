@@ -72,9 +72,12 @@ export const SAMPLE_DRY_RUN_REQUEST_ID = SAMPLE_REQUEST_ID;
  * Canned JUnit XML for batch `--wait --report junit --dry-run`. Mirrors the
  * fresh batch-run sample ids so agents can learn the sidecar shape offline.
  */
-export function sampleJUnitReportXml(projectId: string = SAMPLE_PROJECT_ID): string {
+export function sampleJUnitReportXml(
+  projectId: string = SAMPLE_PROJECT_ID,
+  reportSuiteName?: string,
+): string {
   return buildJUnitReport({
-    suiteName: `testsprite:${projectId}`,
+    suiteName: reportSuiteName ?? `testsprite:${projectId}`,
     classname: projectId,
     results: [
       {

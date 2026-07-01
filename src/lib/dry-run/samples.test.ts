@@ -11,6 +11,12 @@ describe('sampleJUnitReportXml', () => {
     expect(xml).toContain('name="test_fresh_wave_02"');
     expect(xml).toContain('failures="1"');
   });
+
+  it('honors reportSuiteName override', () => {
+    const xml = sampleJUnitReportXml('proj_dry', 'custom-ci-suite');
+    expect(xml).toContain('<testsuite name="custom-ci-suite"');
+    expect(xml).not.toContain('testsprite:proj_dry');
+  });
 });
 
 describe('findSample', () => {

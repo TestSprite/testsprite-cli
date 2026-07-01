@@ -3767,6 +3767,24 @@ describe('runTestRunAll — JUnit report export', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 
+  it('rejects --report-suite-name without --report', async () => {
+    await expect(
+      runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+          reportSuiteName: 'orphan-suite',
+        },
+        {},
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
   it('--dry-run --report junit writes canned sample XML', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'junit-run-dry-'));
     const reportPath = join(dir, 'results.xml');
@@ -3793,5 +3811,34 @@ describe('runTestRunAll — JUnit report export', () => {
     const xml = readFileSync(reportPath, 'utf8');
     expect(xml).toContain('name="test_fresh_wave_01"');
     expect(xml).toContain('failures="1"');
+  });
+
+  it('--dry-run --report junit --report-suite-name overrides canned suite name', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'junit-run-dry-suite-'));
+    const reportPath = join(dir, 'results.xml');
+
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+        report: 'junit',
+        reportFile: reportPath,
+        reportSuiteName: 'ci-checkout-suite',
+      },
+      {
+        stdout: () => undefined,
+        stderr: () => undefined,
+      },
+    );
+
+    const xml = readFileSync(reportPath, 'utf8');
+    expect(xml).toContain('<testsuite name="ci-checkout-suite"');
+    expect(xml).not.toContain('testsprite:project_be');
   });
 });

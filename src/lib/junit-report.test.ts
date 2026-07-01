@@ -8,6 +8,7 @@ import {
   buildJUnitReport,
   escapeXml,
   parseJUnitReportFormat,
+  resolveBatchReportProjectId,
   writeJUnitReportFile,
   type JUnitTestResult,
 } from './junit-report.js';
@@ -61,6 +62,16 @@ describe('assertJUnitReportOptions', () => {
     ).toThrowError(ApiError);
   });
 
+  it('rejects report-suite-name without report', () => {
+    expect(() =>
+      assertJUnitReportOptions({
+        reportSuiteName: 'my-suite',
+        wait: true,
+        batchPath: true,
+      }),
+    ).toThrowError(ApiError);
+  });
+
   it('rejects report on non-batch paths', () => {
     expect(() =>
       assertJUnitReportOptions({
@@ -87,6 +98,26 @@ describe('assertJUnitReportOptions', () => {
     expect(() =>
       assertJUnitReportOptions({ report: 'junit', wait: true, batchPath: true }),
     ).toThrowError(ApiError);
+  });
+});
+
+describe('resolveBatchReportProjectId', () => {
+  it('prefers explicit projectId', () => {
+    expect(resolveBatchReportProjectId({ projectId: 'proj_a' }, [])).toBe('proj_a');
+  });
+
+  it('infers from polled run rows', () => {
+    expect(resolveBatchReportProjectId({}, [{ projectId: 'proj_from_run' }])).toBe('proj_from_run');
+  });
+
+  it('requires --project when the project cannot be inferred', () => {
+    expect(() => resolveBatchReportProjectId({}, [])).toThrowError(ApiError);
+    try {
+      resolveBatchReportProjectId({}, []);
+    } catch (err) {
+      expect((err as ApiError).code).toBe('VALIDATION_ERROR');
+      expect((err as ApiError).exitCode).toBe(5);
+    }
   });
 });
 

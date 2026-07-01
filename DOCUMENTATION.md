@@ -348,7 +348,13 @@ testsprite test run test_xxxxxxxx --dry-run --output json
 # Batch BE run with JUnit XML for CI (sidecar; --output json unchanged)
 testsprite test run --all --project proj_xxxxxxxx --wait \
   --report junit --report-file ./results.xml --output json
+
+# Optional custom suite name (default: testsprite:<projectId>)
+testsprite test run --all --project proj_xxxxxxxx --wait \
+  --report junit --report-file ./results.xml --report-suite-name my-ci-suite --output json
 ```
+
+Batch `--report` flags apply only to `test run --all --wait` (and batch `test rerun --wait`). `--report junit --report-file <path>` writes a JUnit XML sidecar after polling completes (atomic write); `--output json` is unchanged. Optional `--report-suite-name <name>` overrides the default `testsprite:<projectId>` suite name.
 
 `--target-url` must be a publicly reachable URL — the CLI pre-flights it against local addresses (`localhost`, `127.x`, `::1`, `0.0.0.0`, `169.254.x`, RFC1918) and the backend resolves it via DNS. For testing against localhost, use the [TestSprite MCP plugin](https://www.testsprite.com/docs), which handles the local tunnel. The CLI auto-mints an idempotency key (printed to stderr under `--output json`, `--verbose`, or `--debug`); pass `--idempotency-key <uuid>` to control it explicitly.
 
@@ -373,9 +379,15 @@ testsprite test rerun --all --project proj_xxxxxxxx --wait --max-concurrency 4 -
 testsprite test rerun --all --project proj_xxxxxxxx --wait \
   --report junit --report-file ./results.xml --output json
 
+# Optional custom suite name (default: testsprite:<projectId>)
+testsprite test rerun --all --project proj_xxxxxxxx --wait \
+  --report junit --report-file ./results.xml --report-suite-name my-ci-suite --output json
+
 # Several specific tests
 testsprite test rerun test_aaaa test_bbbb --wait --output json
 ```
+
+Batch `--report` flags apply only to batch `--wait` reruns (`--all` or multiple test ids). `--report junit --report-file <path>` writes a JUnit XML sidecar after polling completes (atomic write); `--output json` is unchanged. When `--project` is omitted, the CLI infers `projectId` from polled run rows for classname / default suite naming; if inference fails, pass `--project <id>` explicitly (required under `--dry-run`).
 
 Flags:
 
