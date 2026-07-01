@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MANAGED_SECTION_BEGIN, TARGETS } from './agent-targets.js';
+import { MANAGED_SECTION_BEGIN, MANAGED_SECTION_END, TARGETS } from './agent-targets.js';
 import type { OutputMode } from './output.js';
 import {
   SKILL_NUDGE_COMMANDS,
@@ -36,8 +36,15 @@ describe('isVerifySkillInstalled', () => {
 
   it('true when AGENTS.md exists AND carries our BEGIN sentinel', () => {
     const existsSync = (p: string) => p.endsWith('AGENTS.md');
-    const readFileSync = () => `# project\n${MANAGED_SECTION_BEGIN}\n...skill...\n`;
+    const readFileSync = () =>
+      `# project\n${MANAGED_SECTION_BEGIN}\n...skill...\n${MANAGED_SECTION_END}\n`;
     expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(true);
+  });
+
+  it('false when AGENTS.md has only the BEGIN sentinel without a complete managed section', () => {
+    const existsSync = (p: string) => p.endsWith('AGENTS.md');
+    const readFileSync = () => `# project\n${MANAGED_SECTION_BEGIN}\n...partial skill...\n`;
+    expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(false);
   });
 
   it('false when only a bare AGENTS.md (no sentinel) exists', () => {
