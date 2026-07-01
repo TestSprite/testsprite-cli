@@ -27,6 +27,7 @@ import type {
   CliTestStep,
 } from '../../commands/test.js';
 import type { MeResponse } from '../../commands/auth.js';
+import type { FailureTriageResult } from '../failure-triage.js';
 import type { Page } from '../pagination.js';
 import type {
   TriggerRunResponse,
@@ -308,6 +309,86 @@ const failureSummary: CliFailureSummary = {
   rootCauseHypothesis: failureContext.failure.rootCauseHypothesis,
   recommendedFixTarget: failureContext.failure.recommendedFixTarget,
 };
+
+/**
+ * Canned response for `test failure triage --dry-run`. Client-side
+ * orchestration command — not a single backend endpoint — so the full
+ * clustered envelope lives here alongside the per-route samples above.
+ */
+export function sampleFailureTriageResult(projectId: string): FailureTriageResult {
+  return {
+    projectId,
+    clusters: [
+      {
+        clusterId: 'cluster_kind_network_timeout',
+        label: 'Environment issue (network_timeout)',
+        groupKey: 'kind:network_timeout',
+        groupReason: 'failure_kind',
+        failureKind: 'network_timeout',
+        representativeTestId: 'test_dryrun_a',
+        memberTestIds: ['test_dryrun_a', 'test_dryrun_b'],
+        members: [
+          {
+            testId: 'test_dryrun_a',
+            testName: 'Dry-run checkout flow',
+            testType: 'frontend',
+            updatedAt: '2026-06-26T12:00:00.000Z',
+            status: 'failed',
+            failureKind: 'network_timeout',
+            snapshotId: 'snap_dryrun_a',
+            rootCauseHypothesis: null,
+            recommendedFixTarget: null,
+          },
+          {
+            testId: 'test_dryrun_b',
+            testName: 'Dry-run profile update',
+            testType: 'frontend',
+            updatedAt: '2026-06-26T12:01:00.000Z',
+            status: 'failed',
+            failureKind: 'network_timeout',
+            snapshotId: 'snap_dryrun_b',
+            rootCauseHypothesis: null,
+            recommendedFixTarget: null,
+          },
+        ],
+        canonicalRootCause: null,
+        confidence: 0.88,
+        fixPriority: 1,
+      },
+      {
+        clusterId: 'cluster_ref_src_components_checkoutform_tsx_412',
+        label: 'Shared fix target: src/components/CheckoutForm.tsx:412',
+        groupKey: 'ref:src/components/CheckoutForm.tsx:412',
+        groupReason: 'fix_target',
+        failureKind: 'assertion',
+        representativeTestId: 'test_dryrun_c',
+        memberTestIds: ['test_dryrun_c'],
+        members: [
+          {
+            testId: 'test_dryrun_c',
+            testName: 'Dry-run submit checkout',
+            testType: 'frontend',
+            updatedAt: '2026-06-26T12:02:00.000Z',
+            status: 'failed',
+            failureKind: 'assertion',
+            snapshotId: 'snap_dryrun_c',
+            rootCauseHypothesis:
+              'Submit button is disabled because the credit-card field is empty.',
+            recommendedFixTarget: {
+              kind: 'code',
+              reference: 'src/components/CheckoutForm.tsx:412',
+              rationale: 'Disabled state originates from `isFormValid()`.',
+            },
+          },
+        ],
+        canonicalRootCause: 'Submit button is disabled because the credit-card field is empty.',
+        confidence: 0.7,
+        fixPriority: 3,
+      },
+    ],
+    summary: { totalFailed: 3, clusterCount: 2, skipped: 0 },
+  };
+}
 
 /**
  * Dry-run sample lookup keyed by OpenAPI operationId. Order matters in

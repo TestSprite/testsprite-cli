@@ -17,7 +17,7 @@ import {
   writeBundle,
   type WriteBundleResult,
 } from '../lib/bundle.js';
-import { findSample } from '../lib/dry-run/samples.js';
+import { findSample, sampleFailureTriageResult } from '../lib/dry-run/samples.js';
 import {
   ApiError,
   CLIError,
@@ -4065,78 +4065,7 @@ export async function runFailureTriage(
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   if (opts.dryRun) {
-    const dryRunResult: FailureTriageResult = {
-      projectId: opts.projectId,
-      clusters: [
-        {
-          clusterId: 'cluster_kind_network_timeout',
-          label: 'Environment issue (network_timeout)',
-          groupKey: 'kind:network_timeout',
-          groupReason: 'failure_kind',
-          failureKind: 'network_timeout',
-          representativeTestId: 'test_dryrun_a',
-          memberTestIds: ['test_dryrun_a', 'test_dryrun_b'],
-          members: [
-            {
-              testId: 'test_dryrun_a',
-              testName: 'Dry-run checkout flow',
-              testType: 'frontend',
-              updatedAt: '2026-06-26T12:00:00.000Z',
-              status: 'failed',
-              failureKind: 'network_timeout',
-              snapshotId: 'snap_dryrun_a',
-              rootCauseHypothesis: null,
-              recommendedFixTarget: null,
-            },
-            {
-              testId: 'test_dryrun_b',
-              testName: 'Dry-run profile update',
-              testType: 'frontend',
-              updatedAt: '2026-06-26T12:01:00.000Z',
-              status: 'failed',
-              failureKind: 'network_timeout',
-              snapshotId: 'snap_dryrun_b',
-              rootCauseHypothesis: null,
-              recommendedFixTarget: null,
-            },
-          ],
-          canonicalRootCause: null,
-          confidence: 0.88,
-          fixPriority: 1,
-        },
-        {
-          clusterId: 'cluster_ref_src_components_checkoutform_tsx_412',
-          label: 'Shared fix target: src/components/CheckoutForm.tsx:412',
-          groupKey: 'ref:src/components/CheckoutForm.tsx:412',
-          groupReason: 'fix_target',
-          failureKind: 'assertion',
-          representativeTestId: 'test_dryrun_c',
-          memberTestIds: ['test_dryrun_c'],
-          members: [
-            {
-              testId: 'test_dryrun_c',
-              testName: 'Dry-run submit checkout',
-              testType: 'frontend',
-              updatedAt: '2026-06-26T12:02:00.000Z',
-              status: 'failed',
-              failureKind: 'assertion',
-              snapshotId: 'snap_dryrun_c',
-              rootCauseHypothesis:
-                'Submit button is disabled because the credit-card field is empty.',
-              recommendedFixTarget: {
-                kind: 'code',
-                reference: 'src/components/CheckoutForm.tsx:412',
-                rationale: 'Disabled state originates from `isFormValid()`.',
-              },
-            },
-          ],
-          canonicalRootCause: 'Submit button is disabled because the credit-card field is empty.',
-          confidence: 0.7,
-          fixPriority: 3,
-        },
-      ],
-      summary: { totalFailed: 3, clusterCount: 2, skipped: 0 },
-    };
+    const dryRunResult = sampleFailureTriageResult(opts.projectId);
     out.print(dryRunResult, data => renderFailureTriageText(data as FailureTriageResult));
     return dryRunResult;
   }
@@ -8922,7 +8851,7 @@ function createTestFailureCommand(deps: TestDeps): Command {
     .description(
       'Group all failed tests in a project into root-cause clusters (lightweight summary fan-out — no bundle downloads)',
     )
-    .requiredOption('--project <id>', 'project id (returned by `testsprite project list`)')
+    .option('--project <id>', 'project id (returned by `testsprite project list`)')
     .option('--type <type>', 'filter by test type (frontend|backend)')
     .option(
       '--filter <substr>',
@@ -8950,13 +8879,13 @@ function createTestFailureCommand(deps: TestDeps): Command {
     )
     .action(
       async (
-        cmdOpts: { project: string; type?: string; filter?: string; maxConcurrency?: string },
+        cmdOpts: { project?: string; type?: string; filter?: string; maxConcurrency?: string },
         command: Command,
       ) => {
         await runFailureTriage(
           {
             ...resolveCommonOptions(command),
-            projectId: cmdOpts.project,
+            projectId: cmdOpts.project ?? '',
             type: parseEnumFlag(cmdOpts.type, 'type', TEST_TYPES),
             nameFilter: cmdOpts.filter,
             maxConcurrency:

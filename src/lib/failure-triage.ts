@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 /**
  * Client-side failure triage — groups per-test failure summaries into
  * root-cause clusters using deterministic heuristics over existing
@@ -190,11 +192,10 @@ export function computeFixPriority(
 
 function buildClusterLabel(
   groupReason: FailureTriageGroupReason,
-  members: FailureTriageMember[],
+  representative: FailureTriageMember,
   failureKind: string | null,
 ): string {
-  const rep = members.find(m => m.recommendedFixTarget?.reference) ?? members[0]!;
-  const ref = rep.recommendedFixTarget?.reference;
+  const ref = representative.recommendedFixTarget?.reference;
 
   if (groupReason === 'fix_target' && ref) {
     return `Shared fix target: ${ref}`;
@@ -203,21 +204,22 @@ function buildClusterLabel(
     return `Environment issue (${failureKind})`;
   }
   if (groupReason === 'hypothesis') {
-    const hyp = rep.rootCauseHypothesis;
+    const hyp = representative.rootCauseHypothesis;
     if (hyp) {
       return hyp.length > 80 ? `${hyp.slice(0, 77)}…` : hyp;
     }
   }
-  return `Independent failure: ${rep.testName}`;
+  return `Independent failure: ${representative.testName}`;
 }
 
 function slugifyClusterId(groupKey: string): string {
   const slug = groupKey
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_|_$/g, '')
-    .slice(0, 48);
-  return slug.length > 0 ? slug : 'unknown';
+    .replace(/^_|_$/g, '');
+  const hash = createHash('sha256').update(groupKey).digest('hex').slice(0, 8);
+  const prefix = slug.length > 0 ? slug.slice(0, 48) : 'unknown';
+  return `${prefix}_${hash}`;
 }
 
 function toMember(input: FailureTriageInput): FailureTriageMember {
@@ -267,7 +269,7 @@ export function buildFailureClusters(
 
     clusters.push({
       clusterId: `cluster_${slugifyClusterId(groupKey)}`,
-      label: buildClusterLabel(reason, members, failureKind),
+      label: buildClusterLabel(reason, rep, failureKind),
       groupKey,
       groupReason: reason,
       failureKind,

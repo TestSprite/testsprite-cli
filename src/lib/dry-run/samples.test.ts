@@ -1,5 +1,25 @@
 import { describe, expect, it } from 'vitest';
-import { DRY_RUN_SAMPLE_ENTRIES, findSample } from './samples.js';
+import { DRY_RUN_SAMPLE_ENTRIES, findSample, sampleFailureTriageResult } from './samples.js';
+
+describe('sampleFailureTriageResult', () => {
+  it('returns a FailureTriageResult envelope wired for --dry-run', () => {
+    const result = sampleFailureTriageResult('proj_dry');
+    expect(result.projectId).toBe('proj_dry');
+    expect(result.summary).toEqual({ totalFailed: 3, clusterCount: 2, skipped: 0 });
+    expect(result.clusters).toHaveLength(2);
+    expect(result.clusters[0]).toMatchObject({
+      groupReason: 'failure_kind',
+      representativeTestId: expect.any(String),
+      memberTestIds: expect.any(Array),
+      confidence: expect.any(Number),
+      fixPriority: expect.any(Number),
+    });
+    expect(result.clusters[1]).toMatchObject({
+      groupReason: 'fix_target',
+      label: expect.stringContaining('Shared fix target:'),
+    });
+  });
+});
 
 describe('findSample', () => {
   it('resolves /me', () => {

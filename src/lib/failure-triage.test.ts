@@ -209,4 +209,76 @@ describe('buildFailureClusters', () => {
     expect(result.clusters).toEqual([]);
     expect(result.summary.totalFailed).toBe(0);
   });
+
+  it('labels hypothesis clusters from the representative test, not map-insertion order', () => {
+    const sharedHyp = 'Shared login validation failure across checkout flows.';
+    const result = buildFailureClusters('proj_hyp', [
+      makeInput({
+        testId: 't_first',
+        updatedAt: '2026-06-20T00:00:00.000Z',
+        summary: {
+          status: 'failed',
+          failureKind: 'assertion',
+          snapshotId: 'snap_first',
+          rootCauseHypothesis: sharedHyp,
+          recommendedFixTarget: null,
+        },
+      }),
+      makeInput({
+        testId: 't_recent',
+        updatedAt: '2026-06-26T00:00:00.000Z',
+        summary: {
+          status: 'failed',
+          failureKind: 'assertion',
+          snapshotId: 'snap_recent',
+          rootCauseHypothesis: sharedHyp,
+          recommendedFixTarget: null,
+        },
+      }),
+    ]);
+
+    const cluster = result.clusters[0]!;
+    expect(cluster.representativeTestId).toBe('t_recent');
+    expect(cluster.label).toBe(sharedHyp);
+    expect(cluster.canonicalRootCause).toBe(sharedHyp);
+  });
+
+  it('assigns distinct clusterIds when slug prefixes would otherwise collide', () => {
+    const longRef = `${'a'.repeat(50)}`;
+    const result = buildFailureClusters('proj_collide', [
+      makeInput({
+        testId: 't_one',
+        summary: {
+          status: 'failed',
+          failureKind: 'assertion',
+          snapshotId: 'snap_one',
+          rootCauseHypothesis: null,
+          recommendedFixTarget: {
+            kind: 'code',
+            reference: `${longRef}_one`,
+            rationale: 'First target',
+          },
+        },
+      }),
+      makeInput({
+        testId: 't_two',
+        summary: {
+          status: 'failed',
+          failureKind: 'assertion',
+          snapshotId: 'snap_two',
+          rootCauseHypothesis: null,
+          recommendedFixTarget: {
+            kind: 'code',
+            reference: `${longRef}_two`,
+            rationale: 'Second target',
+          },
+        },
+      }),
+    ]);
+
+    expect(result.clusters).toHaveLength(2);
+    expect(result.clusters[0]!.clusterId).not.toBe(result.clusters[1]!.clusterId);
+    expect(result.clusters[0]!.clusterId).toMatch(/_[0-9a-f]{8}$/);
+    expect(result.clusters[1]!.clusterId).toMatch(/_[0-9a-f]{8}$/);
+  });
 });
