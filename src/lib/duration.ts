@@ -80,23 +80,20 @@ const UNIT_MS: Record<string, number> = {
  *   or exceeds the 24-hour ceiling.
  */
 export function parseDuration(input: string, field = 'duration'): number {
+  /** Throw a VALIDATION_ERROR scoped to `field` with flag formatting. */
+  const fail = (reason: string): never => {
+    throw localValidationError(field, reason, undefined, 'flag');
+  };
+
   const trimmed = input.trim();
 
   if (trimmed === '') {
-    throw localValidationError(
-      field,
-      'must be a duration string (e.g. "4h", "30m", "1h30m")',
-      undefined,
-      'flag',
-    );
+    fail('must be a duration string (e.g. "4h", "30m", "1h30m")');
   }
 
   if (!DURATION_RE.test(trimmed)) {
-    throw localValidationError(
-      field,
+    fail(
       'must be a duration string using h (hours), m (minutes), s (seconds) — e.g. "4h", "30m", "1h30m", "2h15m30s"',
-      undefined,
-      'flag',
     );
   }
 
@@ -109,12 +106,7 @@ export function parseDuration(input: string, field = 'duration'): number {
     const unit = match[2]!.toLowerCase();
 
     if (seen.has(unit)) {
-      throw localValidationError(
-        field,
-        `contains duplicate unit "${unit}" — each unit (h, m, s) may appear at most once`,
-        undefined,
-        'flag',
-      );
+      fail(`contains duplicate unit "${unit}" — each unit (h, m, s) may appear at most once`);
     }
     seen.add(unit);
 
@@ -126,16 +118,11 @@ export function parseDuration(input: string, field = 'duration'): number {
   totalMs = Math.round(totalMs);
 
   if (totalMs <= 0) {
-    throw localValidationError(field, 'must be a positive duration', undefined, 'flag');
+    fail('must be a positive duration');
   }
 
   if (totalMs > MAX_DURATION_MS) {
-    throw localValidationError(
-      field,
-      `must not exceed 24 hours (got ${formatDuration(totalMs)})`,
-      undefined,
-      'flag',
-    );
+    fail(`must not exceed 24 hours (got ${formatDuration(totalMs)})`);
   }
 
   return totalMs;
@@ -189,22 +176,17 @@ export function requireDuration(
   const ms = parseDuration(input, field);
   const { min, max } = opts;
 
+  /** Throw a VALIDATION_ERROR scoped to `field` with flag formatting. */
+  const fail = (reason: string): never => {
+    throw localValidationError(field, reason, undefined, 'flag');
+  };
+
   if (min !== undefined && ms < min) {
-    throw localValidationError(
-      field,
-      `must be at least ${formatDuration(min)} (got ${formatDuration(ms)})`,
-      undefined,
-      'flag',
-    );
+    fail(`must be at least ${formatDuration(min)} (got ${formatDuration(ms)})`);
   }
 
   if (max !== undefined && ms > max) {
-    throw localValidationError(
-      field,
-      `must not exceed ${formatDuration(max)} (got ${formatDuration(ms)})`,
-      undefined,
-      'flag',
-    );
+    fail(`must not exceed ${formatDuration(max)} (got ${formatDuration(ms)})`);
   }
 
   return ms;

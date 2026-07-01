@@ -72,6 +72,14 @@ describe('redactSecrets', () => {
       expect(result).not.toContain('pass123');
       expect(result).not.toContain('secret456');
     });
+
+    it('handles username that is a substring of the password pattern', () => {
+      const input = 'redis://adminpass:realpassword@cache.internal:6379';
+      const result = redactSecrets(input);
+      expect(result).toContain('adminpass');
+      expect(result).toContain('[REDACTED:url-password]');
+      expect(result).not.toContain('realpassword');
+    });
   });
 
   describe('AWS keys', () => {
