@@ -220,17 +220,10 @@ function acquireCredentialsLock(credentialsPath: string): void {
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
   const deadline = Date.now() + CREDENTIALS_LOCK_MAX_WAIT_MS;
   while (Date.now() < deadline) {
-    const tmp = `${lockPath}.tmp.${process.pid}.${Date.now()}`;
-    writeFileSync(tmp, `${process.pid}\n${Date.now()}\n`, 'utf8');
     try {
-      renameSync(tmp, lockPath);
+      writeFileSync(lockPath, `${process.pid}\n${Date.now()}\n`, { flag: 'wx', encoding: 'utf8' });
       return;
     } catch (err) {
-      try {
-        unlinkSync(tmp);
-      } catch {
-        // Best-effort cleanup of the unclaimed temp file.
-      }
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== 'EEXIST') throw err;
       if (isStaleCredentialsLock(lockPath)) {
