@@ -17,7 +17,7 @@ AI ships code in minutes — verifying it hasn't. `testsprite` opens your live a
 <p>
   <a href="https://www.npmjs.com/package/@testsprite/testsprite-cli"><img src="https://img.shields.io/npm/v/@testsprite/testsprite-cli?color=19C379&label=npm" alt="npm version"></a>
   <a href="https://www.npmjs.com/package/@testsprite/testsprite-cli"><img src="https://img.shields.io/npm/dm/@testsprite/testsprite-cli?color=19C379&label=downloads" alt="npm downloads"></a>
-  <a href="#quickstart"><img src="https://img.shields.io/badge/node-%3E%3D20-19C379" alt="Node >= 20"></a>
+  <a href="#quickstart"><img src="https://img.shields.io/badge/node-20.19%2B%20%7C%2022.13%2B%20%7C%2024%2B-19C379" alt="Node 20.19+, 22.13+, or 24+"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-0A0A0A" alt="License Apache 2.0"></a>
   <a href="https://github.com/TestSprite/testsprite-cli/actions/workflows/ci.yml"><img src="https://github.com/TestSprite/testsprite-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
@@ -54,7 +54,7 @@ If you find `testsprite` useful, a GitHub Star ⭐️ would be greatly appreciat
 
 ## Quickstart
 
-Requires **Node.js ≥ 20**. (No global install? `npx @testsprite/testsprite-cli` works too.)
+Requires **Node.js 20.19+**, **22.13+**, or **24+**. (No global install? `npx @testsprite/testsprite-cli` works too.)
 
 ```bash
 npm install -g @testsprite/testsprite-cli
@@ -173,7 +173,7 @@ That's the point of all of this: you no longer need the biggest, most expensive 
 
 ## Contributing
 
-Contributions are welcome — the CLI is plain TypeScript/Node (≥ 20), tested with Vitest, built with `tsc`. Getting a dev loop running takes a minute:
+Contributions are welcome — the CLI is plain TypeScript/Node (20.19+, 22.13+, or 24+), tested with Vitest, built with `tsc`. Getting a dev loop running takes a minute:
 
 ```bash
 git clone https://github.com/TestSprite/testsprite-cli.git

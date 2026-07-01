@@ -35,7 +35,7 @@ Or run it without installing:
 npx @testsprite/testsprite-cli --version
 ```
 
-Requires **Node.js ≥ 20**.
+Requires **Node.js 20.19+**, **22.13+**, or **24+**.
 
 Confirm the binary works **without** configuring an API key:
 

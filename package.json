@@ -28,7 +28,7 @@
     "test:e2e": "npm run build && vitest run -c vitest.e2e.config.ts"
   },
   "engines": {
-    "node": ">=20"
+    "node": "^20.19.0 || ^22.13.0 || >=24"
   },
   "publishConfig": {
     "access": "public"
