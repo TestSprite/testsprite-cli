@@ -39,6 +39,31 @@ describe('promptText', () => {
     expect(await promptText('? ', { input, output })).toBe('ok');
   });
 
+  it('preserves buffered answers for sequential prompts on the same stream', async () => {
+    const input = Readable.from(['first\nsecond\nthird\n']);
+    const output = new CaptureStream();
+
+    await expect(promptText('One: ', { input, output })).resolves.toBe('first');
+    await expect(promptText('Two: ', { input, output })).resolves.toBe('second');
+    await expect(promptText('Three: ', { input, output })).resolves.toBe('third');
+  });
+
+  it('uses buffered tail input at EOF for a following prompt', async () => {
+    const input = Readable.from(['first\nsecond']);
+    const output = new CaptureStream();
+
+    await expect(promptText('One: ', { input, output })).resolves.toBe('first');
+    await expect(promptText('Two: ', { input, output })).resolves.toBe('second');
+  });
+
+  it('preserves buffered CRLF answers for sequential prompts', async () => {
+    const input = Readable.from(['first\r\nsecond\r\n']);
+    const output = new CaptureStream();
+
+    await expect(promptText('One: ', { input, output })).resolves.toBe('first');
+    await expect(promptText('Two: ', { input, output })).resolves.toBe('second');
+  });
+
   it('returns the buffered input on stream end without newline', async () => {
     const input = Readable.from(['eof-no-newline']);
     const output = new CaptureStream();
@@ -68,6 +93,16 @@ describe('promptSecret (non-TTY behavior)', () => {
     const input = Readable.from([`abc${DEL}d\n`]);
     const output = new CaptureStream();
     expect(await promptSecret('? ', { input, output })).toBe('abd');
+  });
+
+  it('preserves buffered secret answers for sequential prompts', async () => {
+    const input = Readable.from(['sk-one\nsk-two\n']);
+    const output = new CaptureStream();
+
+    await expect(promptSecret('First key: ', { input, output })).resolves.toBe('sk-one');
+    await expect(promptSecret('Second key: ', { input, output })).resolves.toBe('sk-two');
+    expect(output.text()).not.toContain('sk-one');
+    expect(output.text()).not.toContain('sk-two');
   });
 
   it('rejects on Ctrl-C input', async () => {
