@@ -28,7 +28,8 @@ export interface TargetSpec {
   /**
    * Wrap a skill body in this target's frontmatter/header. Takes the skill's
    * `name`+`description` (own-file targets emit them as frontmatter) and the body.
-   * No-op for cline and managed-section targets.
+   * No-op for cline (body verbatim) and managed-section targets (plain
+   * Markdown with no frontmatter).
    */
   wrap(name: string, description: string, body: string): string;
   /** Sentinel and budget metadata for managed-section targets. */
@@ -136,9 +137,8 @@ function wrapMdc(_name: string, description: string, body: string): string {
 /**
  * Repo-relative landing path for a given skill on a given target (POSIX
  * separators). Own-file targets embed the skill name in the path so multiple
- * skills coexist; managed-section targets land at shared root instruction files
- * (`AGENTS.md` for codex, `GEMINI.md` for gemini), where every selected skill's
- * contribution is merged into one managed section.
+ * skills coexist; the codex target always lands at the single shared `AGENTS.md`
+ * (every skill's codex contribution is merged into one managed section there).
  */
 export function pathFor(target: AgentTarget, skill: string): string {
   switch (target) {
@@ -161,6 +161,11 @@ export function pathFor(target: AgentTarget, skill: string): string {
 export const MANAGED_SECTION_BEGIN =
   '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install codex) -->';
 export const MANAGED_SECTION_END = '<!-- END TESTSPRITE AGENT SECTION -->';
+
+/** Sentinel pair that bounds our managed section in GEMINI.md. */
+export const GEMINI_MANAGED_SECTION_BEGIN =
+  '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install gemini) -->';
+export const GEMINI_MANAGED_SECTION_END = '<!-- END TESTSPRITE AGENT SECTION -->';
 
 export const TARGETS: Record<AgentTarget, TargetSpec> = {
   claude: {
@@ -230,8 +235,8 @@ export const TARGETS: Record<AgentTarget, TargetSpec> = {
     mode: 'managed-section',
     wrap: (_name, _description, body) => body,
     managedSection: {
-      begin: '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install gemini) -->',
-      end: '<!-- END TESTSPRITE AGENT SECTION -->',
+      begin: GEMINI_MANAGED_SECTION_BEGIN,
+      end: GEMINI_MANAGED_SECTION_END,
     },
   },
 };
@@ -315,10 +320,10 @@ export function loadCodexSkillBody(read: ReadFn = defaultRead): string {
  *
  * - own-file targets: `body` defaults to the skill's own-file asset, wrapped in
  *   the target's frontmatter/header.
- * - managed-section targets: returns the skill's codex contribution unwrapped
- *   (plain Markdown, no frontmatter). The real install aggregates all selected
- *   skills via {@link buildCodexAggregate}; this helper stays single-skill for
- *   tests and parity. Pass an explicit `body` to override.
+ * - codex (managed-section): returns the skill's codex contribution unwrapped
+ *   (plain Markdown, no frontmatter). The real install does NOT call this for
+ *   codex — it aggregates all skills via {@link buildCodexAggregate} — but it is
+ *   kept single-skill here for tests and parity. Pass an explicit `body` to override.
  */
 export function renderForTarget(
   t: AgentTarget,

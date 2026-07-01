@@ -145,7 +145,7 @@ async function writeBackup(agentFs: AgentFs, abs: string, existing: string): Pro
 }
 
 // ---------------------------------------------------------------------------
-// Managed-section helpers (codex target)
+// Managed-section helpers (root instruction file targets)
 // ---------------------------------------------------------------------------
 
 /**
@@ -173,7 +173,7 @@ type SectionState =
   | { kind: 'corrupt' };
 
 /**
- * Inspect an existing AGENTS.md and classify the managed-section state.
+ * Inspect an existing root instruction file and classify the managed-section state.
  *
  * Sentinel-matching rules (P2 hardening):
  *  - Only STANDALONE sentinel lines count (a line that consists solely of the
@@ -426,8 +426,8 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
   const root = path.resolve(dir);
 
   // 4. Lazy asset loaders — only touch disk if a target actually needs it.
-  // own-file bodies are per-skill (cached); managed sections aggregate EVERY
-  // installed skill's contribution into one target-specific section.
+  // own-file bodies are per-skill (cached); managed-section targets aggregate EVERY
+  // installed skill's contribution into ONE managed section.
   const skillBodyCache = new Map<string, string>();
   const bodyForSkill = (skill: string): string => {
     let b = skillBodyCache.get(skill);
@@ -437,12 +437,12 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
     }
     return b;
   };
-  let managedSectionBody: string | undefined;
-  const getManagedSectionBody = (): string => {
-    if (managedSectionBody === undefined) {
-      managedSectionBody = buildCodexAggregate(skills);
+  let managedSectionBodyCache: string | undefined;
+  const getManagedSection = (managed: ManagedSectionSpec): string => {
+    if (managedSectionBodyCache === undefined) {
+      managedSectionBodyCache = buildCodexAggregate(skills);
     }
-    return managedSectionBody;
+    return buildSection(managedSectionBodyCache, managed);
   };
 
   const results: InstallResult[] = [];
@@ -455,21 +455,20 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
     const spec = TARGETS[t];
 
     // -----------------------------------------------------------------------
-    // managed-section mode (root instruction files such as AGENTS.md/GEMINI.md)
+    // managed-section mode — ONE section aggregating all skills
     // -----------------------------------------------------------------------
     if (spec.mode === 'managed-section') {
-      const managed = spec.managedSection;
-      if (managed === undefined) {
+      const managedConfig = spec.managedSection;
+      if (managedConfig === undefined) {
         throw new CLIError(`managed-section target "${t}" is missing sentinel metadata`, 5);
       }
-      const managedConfig = managed;
-      const relPath = spec.path;
+      const relPath = spec.path; // skill-independent (all skills merge here)
       const abs = path.resolve(root, relPath);
       // Path safety: ensure abs is inside root (defense against .. in relPath or dir)
       if (abs !== root && !abs.startsWith(root + path.sep)) {
         throw new CLIError(`refusing to write outside --dir: ${relPath}`, 5);
       }
-      const section = buildSection(getManagedSectionBody(), managedConfig);
+      const section = getManagedSection(managedConfig);
 
       if (opts.dryRun) {
         // Dry-run: report what would happen without writing disk.
@@ -496,7 +495,6 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
         // replace path and misses the append separator. Read failures other
         // than ENOENT are surfaced (EACCES/EIO must not read as "absent" —
         // absence is already represented by dryRunSt === null).
-        const bytes = Buffer.byteLength(section, 'utf8');
         let wouldBeContent = section;
         if (dryRunSt !== null) {
           let existing: string | null = null;
@@ -556,24 +554,23 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
       }
 
       /**
-       * Emit a stderr warn when the target has a documented load budget and the
-       * would-be file content exceeds it. We still write — this is visibility,
+       * Emit a stderr warning when this target has a documented load budget and
+       * the would-be file content exceeds it. We still write — this is visibility,
        * not a refusal.
        */
+      const budgetBytes = managedConfig.loadBudgetBytes;
+      const budgetLabel = managedConfig.loadBudgetLabel;
       function warnIfOverBudget(wouldBeContent: string): void {
         const byteLen = Buffer.byteLength(wouldBeContent, 'utf8');
-        if (
-          managedConfig.loadBudgetBytes !== undefined &&
-          byteLen > managedConfig.loadBudgetBytes
-        ) {
+        if (budgetBytes !== undefined && byteLen > budgetBytes) {
           stderrFn(
-            `[warn] ${relPath} will be ${byteLen} bytes after this write — ${managedConfig.loadBudgetLabel ?? `the target agent may not load content beyond its ${managedConfig.loadBudgetBytes} byte budget`}. Trim ${relPath} to stay within the limit.`,
+            `[warn] ${relPath} will be ${byteLen} bytes after this write — ${budgetLabel ?? `the target agent may not load content beyond its ${budgetBytes} byte budget`}. Trim ${relPath} to stay within the limit.`,
           );
         }
       }
 
       if (st === null) {
-        // File absent → create AGENTS.md containing just the section.
+        // File absent → create the target instruction file containing just the section.
         warnIfOverBudget(section);
         await agentFs.mkdir(path.dirname(abs));
         try {
@@ -762,9 +759,9 @@ export async function runList(opts: CommonOptions, deps: AgentDeps = {}): Promis
   const out = makeOutput(opts.output, deps);
 
   // One row per (target × default skill). Own-file targets land each skill at a
-  // distinct path; managed-section targets merge all skills into a single root
-  // instruction file (so every managed-section row shares that path — truthful,
-  // since both skills' content lands there).
+  // distinct path; the codex managed-section target merges all skills into the
+  // single AGENTS.md (so every codex row shares that path — truthful, since both
+  // skills' content lands there).
   const results: ListResult[] = [];
   for (const [t, spec] of Object.entries(TARGETS) as [
     AgentTarget,

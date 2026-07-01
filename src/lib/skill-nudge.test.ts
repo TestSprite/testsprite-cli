@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MANAGED_SECTION_BEGIN, TARGETS } from './agent-targets.js';
+import { GEMINI_MANAGED_SECTION_BEGIN, MANAGED_SECTION_BEGIN, TARGETS } from './agent-targets.js';
 import type { OutputMode } from './output.js';
 import {
   SKILL_NUDGE_COMMANDS,
@@ -40,8 +40,20 @@ describe('isVerifySkillInstalled', () => {
     expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(true);
   });
 
+  it('true when GEMINI.md exists AND carries the Gemini BEGIN sentinel', () => {
+    const existsSync = (p: string) => p.endsWith('GEMINI.md');
+    const readFileSync = () => `# project\n${GEMINI_MANAGED_SECTION_BEGIN}\n...skill...\n`;
+    expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(true);
+  });
+
   it('false when only a bare AGENTS.md (no sentinel) exists', () => {
     const existsSync = (p: string) => p.endsWith('AGENTS.md');
+    const readFileSync = () => '# my project\nNothing TestSprite here.\n';
+    expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(false);
+  });
+
+  it('false when only a bare GEMINI.md (no sentinel) exists', () => {
+    const existsSync = (p: string) => p.endsWith('GEMINI.md');
     const readFileSync = () => '# my project\nNothing TestSprite here.\n';
     expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(false);
   });

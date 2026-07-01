@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_SKILLS,
+  GEMINI_MANAGED_SECTION_BEGIN,
+  GEMINI_MANAGED_SECTION_END,
   MANAGED_SECTION_BEGIN,
   MANAGED_SECTION_END,
   ONBOARD_CODEX_LINE,
@@ -105,7 +107,7 @@ describe('TARGETS', () => {
     expect(TARGETS.cline.mode).toBe('own-file');
   });
 
-  it('codex and gemini targets have mode managed-section', () => {
+  it('root instruction targets have mode managed-section', () => {
     expect(TARGETS.codex.mode).toBe('managed-section');
     expect(TARGETS.gemini.mode).toBe('managed-section');
   });
@@ -354,6 +356,13 @@ describe('MANAGED_SECTION sentinels', () => {
     expect(MANAGED_SECTION_BEGIN.toLowerCase()).toContain('testsprite');
     expect(MANAGED_SECTION_END.toLowerCase()).toContain('testsprite');
   });
+
+  it('gemini sentinels are distinct HTML comments', () => {
+    expect(GEMINI_MANAGED_SECTION_BEGIN.startsWith('<!--')).toBe(true);
+    expect(GEMINI_MANAGED_SECTION_END.endsWith('-->')).toBe(true);
+    expect(GEMINI_MANAGED_SECTION_BEGIN).toContain('gemini');
+    expect(GEMINI_MANAGED_SECTION_BEGIN).not.toBe(MANAGED_SECTION_BEGIN);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -396,6 +405,34 @@ describe('content integrity — codex target (testsprite-verify.codex.md)', () =
     // The real codex asset is trimmed (no acronym line).
     const result = renderForTarget('codex', 'testsprite-verify');
     // Plain Markdown; no frontmatter fences from own-file wraps
+    expect(result.content).not.toContain('name: testsprite-verify');
+    expect(result.content).not.toContain('alwaysApply:');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// content integrity — gemini target
+// ---------------------------------------------------------------------------
+
+describe('content integrity — gemini target (GEMINI.md managed-section body)', () => {
+  it('renderForTarget("gemini") path is GEMINI.md', () => {
+    const STUB_GEMINI_BODY =
+      '# TestSprite Verification Loop\ntestsprite test run\n--wait\ntest artifact get\n';
+    const result = renderForTarget('gemini', 'testsprite-verify', STUB_GEMINI_BODY);
+    expect(result.path).toBe('GEMINI.md');
+  });
+
+  it('renderForTarget("gemini") content is the body unwrapped (no frontmatter)', () => {
+    const STUB_GEMINI_BODY =
+      '# TestSprite Verification Loop\ntestsprite test run\n--wait\ntest artifact get\n';
+    const result = renderForTarget('gemini', 'testsprite-verify', STUB_GEMINI_BODY);
+    expect(result.content).toBe(STUB_GEMINI_BODY);
+    expect(result.content).not.toContain('---');
+  });
+
+  it('renderForTarget("gemini") without body arg uses the managed-section asset', () => {
+    const result = renderForTarget('gemini', 'testsprite-verify');
+    expect(result.content).toContain('testsprite test run');
     expect(result.content).not.toContain('name: testsprite-verify');
     expect(result.content).not.toContain('alwaysApply:');
   });
@@ -494,6 +531,10 @@ describe('pathFor', () => {
     expect(pathFor('codex', 'testsprite-verify')).toBe('AGENTS.md');
   });
 
+  it('gemini + testsprite-verify', () => {
+    expect(pathFor('gemini', 'testsprite-verify')).toBe('GEMINI.md');
+  });
+
   it('claude + testsprite-onboard', () => {
     expect(pathFor('claude', 'testsprite-onboard')).toBe(
       '.claude/skills/testsprite-onboard/SKILL.md',
@@ -516,6 +557,10 @@ describe('pathFor', () => {
 
   it('codex + testsprite-onboard is AGENTS.md (shared)', () => {
     expect(pathFor('codex', 'testsprite-onboard')).toBe('AGENTS.md');
+  });
+
+  it('gemini + testsprite-onboard is GEMINI.md (shared)', () => {
+    expect(pathFor('gemini', 'testsprite-onboard')).toBe('GEMINI.md');
   });
 
   it('TARGETS[t].path === pathFor(t, "testsprite-verify") for every target', () => {
@@ -682,42 +727,13 @@ describe('renderForTarget for testsprite-onboard', () => {
     expect(result.path).toBe('AGENTS.md');
   });
 
-  it('unknown skill throws for renderForTarget', () => {
-    expect(() => renderForTarget('claude', 'testsprite-unknown')).toThrow('unknown skill');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// content integrity — gemini target
-// ---------------------------------------------------------------------------
-
-describe('content integrity — gemini target (GEMINI.md managed-section body)', () => {
-  it('renderForTarget("gemini") path is GEMINI.md', () => {
-    const STUB_GEMINI_BODY =
-      '# TestSprite Verification Loop\ntestsprite test run\n--wait\ntest artifact get\n';
-    const result = renderForTarget('gemini', 'testsprite-verify', STUB_GEMINI_BODY);
-    expect(result.path).toBe('GEMINI.md');
-  });
-
-  it('renderForTarget("gemini") content is the body unwrapped (no frontmatter)', () => {
-    const STUB_GEMINI_BODY =
-      '# TestSprite Verification Loop\ntestsprite test run\n--wait\ntest artifact get\n';
-    const result = renderForTarget('gemini', 'testsprite-verify', STUB_GEMINI_BODY);
-    expect(result.content).toBe(STUB_GEMINI_BODY);
-    expect(result.content).not.toContain('---');
-  });
-
-  it('renderForTarget("gemini") without body arg uses the managed-section asset', () => {
-    const result = renderForTarget('gemini', 'testsprite-verify');
-    expect(result.content).toContain('testsprite test run');
-    expect(result.content).not.toContain('name: testsprite-verify');
-    expect(result.content).not.toContain('alwaysApply:');
-  });
-
-  it('renderForTarget("gemini") supports the onboard managed-section contribution', () => {
+  it('gemini onboard renders unwrapped content into GEMINI.md', () => {
     const result = renderForTarget('gemini', 'testsprite-onboard');
     expect(result.path).toBe('GEMINI.md');
     expect(result.content).toBe(ONBOARD_CODEX_LINE);
-    expect(result.content).not.toContain('---');
+  });
+
+  it('unknown skill throws for renderForTarget', () => {
+    expect(() => renderForTarget('claude', 'testsprite-unknown')).toThrow('unknown skill');
   });
 });

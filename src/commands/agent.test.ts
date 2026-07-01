@@ -5,6 +5,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiError, CLIError } from '../lib/errors.js';
 import {
   DEFAULT_SKILLS,
+  GEMINI_MANAGED_SECTION_BEGIN,
+  GEMINI_MANAGED_SECTION_END,
   MANAGED_SECTION_BEGIN,
   MANAGED_SECTION_END,
   ONBOARD_CODEX_LINE,
@@ -1415,39 +1417,26 @@ describe('runInstall — codex managed-section: create (AGENTS.md absent)', () =
   });
 });
 
-describe('runInstall — gemini managed-section: append (GEMINI.md exists, no sentinels)', () => {
-  it('appends the section to existing GEMINI.md content', async () => {
-    const { store, fs: agentFs, seedFile } = makeMemFs();
+describe('runInstall — gemini managed-section: create (GEMINI.md absent)', () => {
+  it('creates GEMINI.md with Gemini sentinels when file is absent', async () => {
+    const { store, fs: agentFs, writeCalls } = makeMemFs();
     const { capture, deps } = makeCapture();
 
-    const geminiAbs = path.resolve(CWD, TARGETS.gemini.path);
-    const existingContent = '# Project Instructions\n\nKeep existing Gemini CLI notes.\n';
-    seedFile(geminiAbs, existingContent);
-
     await runInstall(
       { ...BASE_OPTS, target: ['gemini'], force: false },
       { cwd: CWD, fs: agentFs, ...deps },
     );
 
-    const written = store.get(geminiAbs)!;
-    expect(written).toContain('# Project Instructions');
-    expect(written).toContain('Keep existing Gemini CLI notes.');
-    expect(written).toContain(TARGETS.gemini.managedSection!.begin);
-    expect(written).toContain(TARGETS.gemini.managedSection!.end);
+    const abs = path.resolve(CWD, TARGETS.gemini.path);
+    expect(store.has(abs)).toBe(true);
+    const written = store.get(abs)!;
+    expect(written).toContain(GEMINI_MANAGED_SECTION_BEGIN);
+    expect(written).toContain(GEMINI_MANAGED_SECTION_END);
     expect(written).toContain('testsprite test run');
-    expect(capture.stdout.join('\n')).toContain('gemini');
-    expect(capture.stdout.join('\n')).toContain('section-installed');
-
-    await runInstall(
-      { ...BASE_OPTS, target: ['gemini'], force: false },
-      { cwd: CWD, fs: agentFs, ...deps },
-    );
-
-    const rewritten = store.get(geminiAbs)!;
-    expect(rewritten).toContain('# Project Instructions');
-    expect(rewritten).toContain('Keep existing Gemini CLI notes.');
-    expect(rewritten.split(TARGETS.gemini.managedSection!.begin).length - 1).toBe(1);
-    expect(rewritten.split(TARGETS.gemini.managedSection!.end).length - 1).toBe(1);
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('gemini');
+    expect(out).toContain('section-installed');
+    expect(writeCalls.some(p => p === abs)).toBe(true);
   });
 });
 
@@ -1495,6 +1484,38 @@ describe('runInstall — codex managed-section: append (AGENTS.md exists, no sen
     const before = written.slice(0, beginIdx);
     // Should end with two newlines (one from the original, one separator)
     expect(before.endsWith('\n\n')).toBe(true);
+  });
+});
+
+describe('runInstall — gemini managed-section: append (GEMINI.md exists, no sentinels)', () => {
+  it('appends the section to existing GEMINI.md content and is idempotent', async () => {
+    const { store, fs: agentFs, seedFile } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    const geminiAbs = path.resolve(CWD, TARGETS.gemini.path);
+    const existingContent = '# Project Instructions\n\nKeep existing Gemini CLI notes.\n';
+    seedFile(geminiAbs, existingContent);
+
+    await runInstall(
+      { ...BASE_OPTS, target: ['gemini'], force: false },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const written = store.get(geminiAbs)!;
+    expect(written).toContain('# Project Instructions');
+    expect(written).toContain('Keep existing Gemini CLI notes.');
+    expect(written).toContain(GEMINI_MANAGED_SECTION_BEGIN);
+    expect(written).toContain(GEMINI_MANAGED_SECTION_END);
+    expect(capture.stdout.join('\n')).toContain('section-installed');
+
+    await runInstall(
+      { ...BASE_OPTS, target: ['gemini'], force: false },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const rewritten = store.get(geminiAbs)!;
+    expect(rewritten.split(GEMINI_MANAGED_SECTION_BEGIN).length - 1).toBe(1);
+    expect(rewritten.split(GEMINI_MANAGED_SECTION_END).length - 1).toBe(1);
   });
 });
 

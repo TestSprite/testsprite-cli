@@ -67,7 +67,7 @@ testsprite setup
 TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --yes --agent claude
 ```
 
-> **Pointing a coding agent (Claude Code, Cursor, Codex, Cline, …) at TestSprite?** Have it run `testsprite setup` first — that installs the verification skill, so the agent knows how to create, run, and triage tests on its own (instead of guessing from this README). New here? Start with the **[getting-started overview](https://docs.testsprite.com/cli/getting-started/overview)**.
+> **Pointing a coding agent (Claude Code, Gemini CLI, Cursor, Codex, Cline, …) at TestSprite?** Have it run `testsprite setup` first — that installs the verification skill, so the agent knows how to create, run, and triage tests on its own (instead of guessing from this README). New here? Start with the **[getting-started overview](https://docs.testsprite.com/cli/getting-started/overview)**.
 
 From there, the loop runs on its own — an example session, typed by the coding agent:
 
@@ -110,7 +110,7 @@ Prefer to configure each step by hand (or learn the surface offline with `--dry-
 |           | `test rerun`                                        | Cheap replay of one/many tests (FE verbatim; BE with deps); `--all --project <id>` reruns all tests                   |
 |           | `test wait`                                         | Block on a `runId` until terminal                                                                                     |
 |           | `test artifact get`                                 | Download the failure bundle for a specific `runId`                                                                    |
-| **Agent** | `agent install` / `agent list`                      | Add or list coding-agent targets (pure-local): `claude`, `codex`, `gemini`, `cursor`, `cline`, `antigravity`          |
+| **Agent** | `agent install` / `agent list`                      | Add or list coding-agent targets (pure-local): `claude`, `codex`, `cursor`, `cline`, `antigravity`                    |
 
 > The earlier command names — `init`, `auth configure`, `auth whoami`, `auth logout` — still work as hidden, deprecated aliases (each prints a one-line notice pointing at the new name), so existing scripts keep running. `auth configure` now runs the full `setup` (it also installs the skill).
 

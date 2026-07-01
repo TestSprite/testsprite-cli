@@ -19,7 +19,7 @@ import type { AuthDeps, MeResponse } from './auth.js';
 import { runConfigure, runWhoami } from './auth.js';
 import type { AgentDeps, AgentFs, InstallResult } from './agent.js';
 import { runInstall } from './agent.js';
-import { TARGETS, type AgentTarget } from '../lib/agent-targets.js';
+import { TARGETS, DEFAULT_SKILLS, type AgentTarget } from '../lib/agent-targets.js';
 import type { FetchImpl } from '../lib/http.js';
 import { readProfile } from '../lib/credentials.js';
 
@@ -96,8 +96,25 @@ export interface InitSummary {
   env: string;
   email?: string;
   scopes: string[];
-  agent: { target: string; action: string } | null;
+  /**
+   * Agent skill install outcome. `action` is an AGGREGATE across the installed
+   * skills (setup installs {@link DEFAULT_SKILLS}); `skills` lists which skills
+   * landed. `null` when --no-agent.
+   */
+  agent: { target: string; action: string; skills?: string[] } | null;
   status: 'initialized';
+}
+
+/**
+ * Collapse the per-skill install actions into one representative action for the
+ * init summary. Precedence: a real change (updated) outranks a fresh install,
+ * which outranks a no-op. `blocked` never reaches here — runInstall throws first.
+ */
+function aggregateInstallAction(actions: string[]): string {
+  if (actions.some(a => a === 'updated' || a === 'section-updated')) return 'updated';
+  if (actions.some(a => a === 'written' || a === 'section-installed')) return 'installed';
+  if (actions.some(a => a === 'dry-run')) return 'dry-run';
+  return 'skipped'; // all skipped / section-unchanged
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +244,9 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
       apiUrl: resolveReportedEndpoint(opts, deps),
       env: 'development',
       scopes: [],
-      agent: agentTarget ? { target: agentTarget, action: 'dry-run' } : null,
+      agent: agentTarget
+        ? { target: agentTarget, action: 'dry-run', skills: [...DEFAULT_SKILLS] }
+        : null,
       status: 'initialized',
     };
 
@@ -279,17 +298,20 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   // -------------------------------------------------------------------------
   let installedTarget: string | null = null;
   let installedAction: string | null = null;
+  let installedSkills: string[] = [];
 
   if (!opts.noAgent) {
-    // Run install in JSON mode internally so we can reliably parse the action
+    // Run install in JSON mode internally so we can reliably parse the result
     // regardless of the outer --output flag. The stdout is captured here and
-    // NOT forwarded — runInit owns the output surface.
-    let capturedInstallResult: InstallResult | null = null;
+    // NOT forwarded — runInit owns the output surface. setup installs the full
+    // DEFAULT_SKILLS set (runInstall's default), so several InstallResults come
+    // back (one per own-file skill; one aggregate for codex).
+    let capturedInstallResults: InstallResult[] = [];
     const captureStdout = (line: string) => {
       try {
         const parsed = JSON.parse(line) as InstallResult[];
-        if (Array.isArray(parsed) && parsed.length > 0 && parsed[0]) {
-          capturedInstallResult = parsed[0];
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          capturedInstallResults = parsed;
         }
       } catch {
         // ignore non-JSON lines (shouldn't happen in json mode, but be safe)
@@ -302,6 +324,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
           ...opts,
           output: 'json', // parse the result; final summary is ours to print
           target: [opts.agent],
+          // skills omitted → runInstall installs DEFAULT_SKILLS (verify + onboard)
           force: opts.force,
           dir: opts.dir,
         },
@@ -309,9 +332,12 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
       );
 
       installedTarget = opts.agent;
-      installedAction = capturedInstallResult
-        ? (capturedInstallResult as InstallResult).action
-        : 'installed';
+      installedAction =
+        capturedInstallResults.length > 0
+          ? aggregateInstallAction(capturedInstallResults.map(r => r.action))
+          : 'installed';
+      // De-dupe skills across results, preserving first-seen order.
+      installedSkills = [...new Set(capturedInstallResults.flatMap(r => r.skills ?? []))];
     } catch (installErr) {
       // Fix 6: credentials were already saved (Step 1+2 above succeeded).
       // Emit a clear summary line BEFORE re-throwing so the user knows their
@@ -330,7 +356,11 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   const agentSummary: InitSummary['agent'] =
     opts.noAgent || installedTarget === null
       ? null
-      : { target: installedTarget, action: installedAction ?? 'installed' };
+      : {
+          target: installedTarget,
+          action: installedAction ?? 'installed',
+          skills: installedSkills.length > 0 ? installedSkills : [...DEFAULT_SKILLS],
+        };
 
   const summary: InitSummary = {
     profile: opts.profile,
@@ -365,6 +395,9 @@ function renderInitText(data: unknown): string {
   lines.push('');
   if (s.agent) {
     lines.push(`  agent:    ${s.agent.target} (${s.agent.action})`);
+    if (s.agent.skills && s.agent.skills.length > 0) {
+      lines.push(`  skills:   ${s.agent.skills.join(', ')}`);
+    }
   } else {
     lines.push('  agent:    skipped (--no-agent)');
   }
@@ -408,7 +441,7 @@ function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
 }
 
 const SETUP_DESCRIPTION =
-  'Set up TestSprite: configure your API key and install the verification skill for your coding agent';
+  'Set up TestSprite: configure your API key and install the TestSprite agent skills for your coding agent';
 
 /** Raw Commander options shared by `setup` and the deprecated `init` alias. */
 interface SetupCmdOpts {

@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { MANAGED_SECTION_BEGIN, TARGETS } from './agent-targets.js';
+import { TARGETS } from './agent-targets.js';
 import { defaultCredentialsPath, readProfile } from './credentials.js';
 import type { OutputMode } from './output.js';
 
@@ -43,9 +43,9 @@ export interface SkillPresenceDeps {
 /**
  * True if the `testsprite-verify` skill is installed for ANY supported agent in
  * `dir`. own-file targets (claude/cursor/cline/antigravity): the landing file
- * exists. managed-section target (codex / AGENTS.md): the file exists AND
- * carries our BEGIN sentinel — a user-authored AGENTS.md without the sentinel
- * does NOT count as our skill.
+ * exists. managed-section targets (root instruction files): the file exists
+ * AND carries that target's BEGIN sentinel — a user-authored instruction file
+ * without the sentinel does NOT count as our skill.
  *
  * The TARGETS table is the single source of truth for landing paths, so this
  * stays in lockstep with `agent install` without re-listing paths. Best-effort:
@@ -59,9 +59,11 @@ export function isVerifySkillInstalled(dir: string, deps: SkillPresenceDeps = {}
     if (!exists(full)) continue;
     if (spec.mode === 'managed-section') {
       try {
-        if (read(full).includes(MANAGED_SECTION_BEGIN)) return true;
+        if (spec.managedSection && read(full).includes(spec.managedSection.begin)) {
+          return true;
+        }
       } catch {
-        // unreadable AGENTS.md → treat this target as absent, keep checking
+        // unreadable instruction file → treat this target as absent, keep checking
       }
       continue;
     }

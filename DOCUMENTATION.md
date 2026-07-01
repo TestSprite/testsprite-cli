@@ -114,7 +114,7 @@ testsprite agent install gemini     # install into GEMINI.md for Gemini CLI (man
 testsprite agent install cursor     # .cursor/rules/testsprite-verify.mdc
 testsprite agent install cline      # .clinerules/testsprite-verify.md
 testsprite agent install antigravity  # .agents/skills/testsprite-verify/SKILL.md
-testsprite agent list               # list all targets with status + mode + path
+testsprite agent list               # list all 6 targets with status + mode + path
 ```
 
 Supported targets: `claude` (GA), `codex` (experimental), `gemini` (experimental), `cursor` (experimental), `cline` (experimental), `antigravity` (experimental).
