@@ -2487,6 +2487,61 @@ describe('runTestRunAll — batch fresh run', () => {
     expect(payload.accepted.every(r => r.status === 'passed')).toBe(true);
   });
 
+  it('run --all --wait: does not start a fresh poll for a queued run after the shared deadline expired', async () => {
+    const { credentialsPath } = makeCreds();
+    const baseNow = new Date('2026-06-09T10:00:00.000Z').getTime();
+    let nowMs = baseNow;
+    const runFetches: string[] = [];
+    const stdoutLines: string[] = [];
+    let caughtError: unknown;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
+
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'POST') return { body: BATCH_FRESH_RESP };
+
+      const runId = url.split('/runs/')[1]?.split('?')[0] ?? 'run_unknown';
+      runFetches.push(runId);
+      if (runId === 'run_fresh_01') {
+        nowMs = baseNow + 2000;
+        return { body: makePassedRun(runId, 'test_be_01') };
+      }
+      return { body: makePassedRun(runId, 'test_be_02') };
+    });
+
+    try {
+      await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 1,
+          maxConcurrency: 1,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: line => stdoutLines.push(line),
+          stderr: () => undefined,
+          sleep: instantSleep,
+        },
+      );
+    } catch (err) {
+      caughtError = err;
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    const payload = JSON.parse(stdoutLines.join('\n')) as {
+      accepted: Array<{ runId: string; status: string }>;
+    };
+    expect(runFetches).toEqual(['run_fresh_01']);
+    expect(payload.accepted.find(r => r.runId === 'run_fresh_02')?.status).toBe('timeout');
+    expect((caughtError as { exitCode?: number } | undefined)?.exitCode).toBe(7);
+  });
+
   it('--wait with a failed run → exit 1', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch((url, init) => {

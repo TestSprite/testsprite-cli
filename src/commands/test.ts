@@ -5421,7 +5421,20 @@ export async function runTestRunAll(
 
   async function pollFreshAccepted(entry: BatchRunFreshAccepted): Promise<CliBatchRunFreshResult> {
     const runId = entry.runId;
-    const remainingSeconds = Math.max(1, Math.ceil((batchDeadlineMs - Date.now()) / 1000));
+    const remainingMs = batchDeadlineMs - Date.now();
+    if (remainingMs <= 0) {
+      return {
+        testId: entry.testId,
+        runId,
+        status: 'timeout',
+        error: {
+          code: 'UNSUPPORTED',
+          message: `Timed out after ${opts.timeoutSeconds}s`,
+          exitCode: 7,
+        },
+      };
+    }
+    const remainingSeconds = Math.ceil(remainingMs / 1000);
     const resolveAlternate = makeBackendWaitFallback({
       client,
       resolveTestId: () => entry.testId,
