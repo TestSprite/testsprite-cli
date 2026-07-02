@@ -449,6 +449,52 @@ describe('HttpClient per-request timeout', () => {
     expect(callCount).toBe(1);
   });
 
+  it('clears the per-attempt timeout after a successful response body is read', async () => {
+    let capturedSignal: AbortSignal | undefined;
+    const fetchImpl = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      capturedSignal = init?.signal ?? undefined;
+      return jsonResponse({ ok: true });
+    });
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: () => Promise.resolve(),
+      random: () => 0,
+      requestTimeoutMs: 25,
+    });
+
+    await expect(client.get('/me')).resolves.toEqual({ ok: true });
+    expect(capturedSignal?.aborted).toBe(false);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(capturedSignal?.aborted).toBe(false);
+  });
+
+  it('clears a failed attempt timeout before retry backoff sleeps', async () => {
+    const attemptSignals: AbortSignal[] = [];
+    let calls = 0;
+    const fetchImpl = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      if (init?.signal) attemptSignals.push(init.signal);
+      calls += 1;
+      if (calls === 1) return errorEnvelopeResponse(500, 'INTERNAL');
+      return jsonResponse({ ok: true });
+    });
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: () => new Promise(resolve => setTimeout(resolve, 50)),
+      random: () => 0,
+      requestTimeoutMs: 25,
+    });
+
+    await expect(client.get('/me')).resolves.toEqual({ ok: true });
+    expect(attemptSignals).toHaveLength(2);
+    expect(attemptSignals.every(signal => signal.aborted === false)).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(attemptSignals.every(signal => signal.aborted === false)).toBe(true);
+  });
+
   it('caller-supplied AbortSignal still propagates as AbortError (not RequestTimeoutError)', async () => {
     const controller = new AbortController();
     // Abort immediately
