@@ -1244,7 +1244,10 @@ export async function runUpdate(
   requireNonEmpty('test-id', opts.testId);
   // P1-3: client-side length checks matching server limits.
   if (opts.name !== undefined && opts.name.trim().length === 0) {
-    throw localValidationError('name', 'must be a non-empty string (whitespace-only is not allowed)');
+    throw localValidationError(
+      'name',
+      'must be a non-empty string (whitespace-only is not allowed)',
+    );
   }
   if (opts.name !== undefined && opts.name.length > 200) {
     throw localValidationError('name', 'must be at most 200 characters');
