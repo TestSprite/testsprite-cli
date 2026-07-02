@@ -1,15 +1,5 @@
 #!/usr/bin/env node
 
-// Guard: exit early with a clear message on unsupported Node.js versions.
-// This runs before any ESM/modern-syntax imports that would crash with cryptic errors.
-const major = Number(process.versions.node.split('.')[0]);
-if (major < 20) {
-  process.stderr.write(
-    `Error: testsprite requires Node.js >= 20 (found ${process.versions.node}).\nInstall the latest LTS from https://nodejs.org\n`,
-  );
-  process.exit(1);
-}
-
 import { Command, CommanderError } from 'commander';
 import { createAgentCommand } from './commands/agent.js';
 import { createAuthCommand } from './commands/auth.js';
@@ -26,6 +16,16 @@ import { Output, isOutputMode } from './lib/output.js';
 import { renderCommanderError, rephraseUnknownOption } from './lib/render-error.js';
 import { maybeEmitSkillNudge } from './lib/skill-nudge.js';
 import { VERSION } from './version.js';
+import { shouldRejectNodeVersion } from './version-guard.js';
+
+// Guard: exit early with a clear message on unsupported Node.js versions,
+// rather than failing later with a cryptic ESM/runtime error.
+if (shouldRejectNodeVersion(process.versions.node)) {
+  process.stderr.write(
+    `Error: testsprite requires Node.js >= 20 (found ${process.versions.node}).\nInstall the latest LTS from https://nodejs.org\n`,
+  );
+  process.exit(1);
+}
 
 const program = new Command();
 

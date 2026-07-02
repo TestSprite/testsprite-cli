@@ -1,52 +1,51 @@
 import { describe, expect, it } from 'vitest';
+import {
+  MIN_SUPPORTED_NODE_MAJOR,
+  parseMajorVersion,
+  shouldRejectNodeVersion,
+} from './version-guard.js';
 
-/**
- * The version guard logic extracted for testability.
- * The real guard lives at the top of src/index.ts as imperative code.
- * These tests verify the parsing and threshold logic.
- */
+// These tests exercise the REAL guard functions used by src/index.ts,
+// imported here rather than re-declared, so a regression in the source is
+// actually caught.
 
-function parseMajorVersion(nodeVersion: string): number {
-  return Number(nodeVersion.split('.')[0]);
-}
-
-function shouldRejectVersion(nodeVersion: string): boolean {
-  return parseMajorVersion(nodeVersion) < 20;
-}
-
-describe('Node.js version guard logic', () => {
-  it('rejects Node 18.x', () => {
-    expect(shouldRejectVersion('18.19.1')).toBe(true);
-  });
-
-  it('rejects Node 16.x', () => {
-    expect(shouldRejectVersion('16.20.2')).toBe(true);
-  });
-
-  it('rejects Node 14.x', () => {
-    expect(shouldRejectVersion('14.21.3')).toBe(true);
-  });
-
-  it('accepts Node 20.x', () => {
-    expect(shouldRejectVersion('20.11.0')).toBe(false);
-  });
-
-  it('accepts Node 22.x', () => {
-    expect(shouldRejectVersion('22.1.0')).toBe(false);
-  });
-
-  it('accepts Node 21.x', () => {
-    expect(shouldRejectVersion('21.0.0')).toBe(false);
-  });
-
-  it('parses major version correctly from semver string', () => {
+describe('parseMajorVersion', () => {
+  it('extracts the leading major from a semver string', () => {
     expect(parseMajorVersion('20.11.1')).toBe(20);
     expect(parseMajorVersion('18.0.0')).toBe(18);
     expect(parseMajorVersion('22.3.0')).toBe(22);
   });
 
+  it('returns NaN for a non-numeric version string', () => {
+    expect(Number.isNaN(parseMajorVersion('not-a-version'))).toBe(true);
+  });
+});
+
+describe('shouldRejectNodeVersion', () => {
+  it('rejects majors below the supported floor', () => {
+    expect(shouldRejectNodeVersion('18.19.1')).toBe(true);
+    expect(shouldRejectNodeVersion('16.20.2')).toBe(true);
+    expect(shouldRejectNodeVersion('14.21.3')).toBe(true);
+  });
+
+  it('accepts the supported floor and above', () => {
+    expect(shouldRejectNodeVersion('20.0.0')).toBe(false);
+    expect(shouldRejectNodeVersion('20.11.0')).toBe(false);
+    expect(shouldRejectNodeVersion('21.0.0')).toBe(false);
+    expect(shouldRejectNodeVersion('22.1.0')).toBe(false);
+  });
+
+  it(`treats exactly ${MIN_SUPPORTED_NODE_MAJOR} as supported (boundary)`, () => {
+    expect(shouldRejectNodeVersion(`${MIN_SUPPORTED_NODE_MAJOR}.0.0`)).toBe(false);
+    expect(shouldRejectNodeVersion(`${MIN_SUPPORTED_NODE_MAJOR - 1}.9.9`)).toBe(true);
+  });
+
+  it('does not reject an unparseable version (guard never blocks on garbage)', () => {
+    expect(shouldRejectNodeVersion('not-a-version')).toBe(false);
+  });
+
   it('the running Node satisfies the guard (meta-test)', () => {
-    // This test is running on Node >= 20, so it must pass the guard.
-    expect(shouldRejectVersion(process.versions.node)).toBe(false);
+    // The test suite itself runs on a supported Node, so the guard must pass.
+    expect(shouldRejectNodeVersion(process.versions.node)).toBe(false);
   });
 });
