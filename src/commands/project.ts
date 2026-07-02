@@ -150,6 +150,9 @@ export async function runCreate(
   if (opts.name !== undefined && opts.name.trim().length === 0) {
     throw localValidationError('--name must not be empty or whitespace-only');
   }
+  if (opts.password !== undefined && opts.password.trim().length === 0) {
+    throw localValidationError('--password must not be empty or whitespace-only');
+  }
 
   // P1-3: client-side length checks matching server limits.
   if (opts.name !== undefined && opts.name.length > 200) {
@@ -263,6 +266,9 @@ export async function runUpdate(
   // P1-3: client-side length checks matching server limits.
   if (opts.name !== undefined && opts.name.trim().length === 0) {
     throw localValidationError('--name must not be empty or whitespace-only');
+  }
+  if (opts.password !== undefined && opts.password.trim().length === 0) {
+    throw localValidationError('--password must not be empty or whitespace-only');
   }
   if (opts.name !== undefined && opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');

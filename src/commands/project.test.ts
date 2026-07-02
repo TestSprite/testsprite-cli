@@ -596,6 +596,33 @@ describe('runCreate', () => {
     ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+  it('rejects a whitespace-only --password with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network - validation must fire client-side');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'frontend',
+          name: 'Password Guard Project',
+          targetUrl: 'https://example.com',
+          password: '   ',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -698,6 +725,30 @@ describe('runUpdate', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it('rejects a whitespace-only --password with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not be called');
+    });
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          password: '   ',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
   it('P7 — dry-run returns canned shape without network call', async () => {
     resetDryRunBannerForTesting();
     const { credentialsPath } = makeCreds();
