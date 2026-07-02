@@ -412,8 +412,10 @@ describe('findSample', () => {
     );
     expect(e?.operationId).toBe('getRun');
     const body = e?.body() as {
+      failedStepIndex: number | null;
       steps: Array<{ type: string; status: string; error: string | null }>;
     };
+    expect(body.failedStepIndex).toBe(3);
     const failedStep = body.steps.find(step => step.status === 'failed');
     expect(failedStep).toMatchObject({
       type: 'assertion',

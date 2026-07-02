@@ -677,7 +677,7 @@ const ENTRIES: DryRunSampleEntry[] = [
     codeVersion: 'v1',
     targetUrl: SAMPLE_TARGET_URL,
     createdFrom: null,
-    failedStepIndex: null,
+    failedStepIndex: 3,
     failureKind: null,
     error: null,
     videoUrl: null,
