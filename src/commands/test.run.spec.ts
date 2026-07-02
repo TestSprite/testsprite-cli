@@ -3470,6 +3470,39 @@ describe('dashboardUrl on run completion', () => {
     );
   });
 
+  it('run --all: emits the auto-minted idempotency-key on stderr in JSON output mode (parity with test run)', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', PROD_API);
+    const batchResp: BatchRunFreshResponse = {
+      accepted: [
+        { testId: 'test_be_01', runId: 'run_f_01', enqueuedAt: '2026-06-10T10:00:00.000Z' },
+      ],
+      conflicts: [],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const stderrLines: string[] = [];
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: false,
+        timeoutSeconds: 600,
+        maxConcurrency: 10,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: batchResp })),
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+    expect(stderrLines.some(l => l.startsWith('idempotency-key:'))).toBe(true);
+  });
+
   it('run --all --wait (prod endpoint): summary items carry dashboardUrl + stderr Dashboard line', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', PROD_API);
     const batchResp: BatchRunFreshResponse = {

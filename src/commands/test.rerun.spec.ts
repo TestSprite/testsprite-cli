@@ -1637,6 +1637,74 @@ describe('--idempotency-key passthrough', () => {
 
     expect(receivedKey).toBe('my-custom-key-abc');
   });
+
+  it('emits the auto-minted idempotency-key on stderr in JSON output mode (parity with test run)', async () => {
+    const creds = makeCreds();
+    const rerunResp = makeFeRerunResp();
+    const stderrLines: string[] = [];
+
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_fe_01/runs/rerun')) {
+        return { body: rerunResp };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    await runTestRerun(
+      {
+        testIds: ['test_fe_01'],
+        all: false,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, sleep: instantSleep, fetchImpl, stderr: line => stderrLines.push(line) },
+    );
+
+    expect(stderrLines.some(l => l.startsWith('idempotency-key:'))).toBe(true);
+  });
+
+  it('does NOT emit an idempotency-key line in default text mode', async () => {
+    const creds = makeCreds();
+    const rerunResp = makeFeRerunResp();
+    const stderrLines: string[] = [];
+
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_fe_01/runs/rerun')) {
+        return { body: rerunResp };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    await runTestRerun(
+      {
+        testIds: ['test_fe_01'],
+        all: false,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'text',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, sleep: instantSleep, fetchImpl, stderr: line => stderrLines.push(line) },
+    );
+
+    expect(stderrLines.some(l => l.includes('idempotency-key:'))).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

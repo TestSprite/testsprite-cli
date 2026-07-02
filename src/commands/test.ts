@@ -5136,11 +5136,8 @@ export async function runTestRunAll(
   };
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-batch-run-fresh-${randomUUID()}`;
-  if (opts.idempotencyKey === undefined && opts.debug) {
+  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
     stderrFn(`idempotency-key: ${idempotencyKey}`);
-  }
-  if (opts.idempotencyKey === undefined && opts.verbose) {
-    stderrFn(`[verbose] auto-minted idempotency-key: ${idempotencyKey}`);
   }
 
   // Resolve testIds: fetch all BE tests in the project, apply --filter.
@@ -5704,11 +5701,8 @@ export async function runTestRerun(
   // slow rerun trigger / long-poll under load isn't cut at the 120s default.
   const client = makeClient({ ...opts, requestTimeoutMs: resolveWaitRequestTimeoutMs(opts) }, deps);
   const idempotencyKey = opts.idempotencyKey ?? `cli-rerun-${randomUUID()}`;
-  if (opts.idempotencyKey === undefined && opts.debug) {
+  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
     stderrFn(`idempotency-key: ${idempotencyKey}`);
-  }
-  if (opts.idempotencyKey === undefined && opts.verbose) {
-    stderrFn(`[verbose] auto-minted idempotency-key: ${idempotencyKey}`);
   }
 
   // -------------------------------------------------------------------------
