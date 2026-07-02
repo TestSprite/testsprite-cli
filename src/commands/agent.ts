@@ -638,6 +638,17 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
       const content = renderForTarget(t, skill, bodyForSkill(skill)).content;
 
       if (opts.dryRun) {
+        // Apply the SAME symlink fail-close guard as the real install path
+        // below (the codex managed-section branch already does this). Without
+        // it, dry-run reports success for a planted symlink that the real
+        // install would refuse with exit 5.
+        const dryRunSt = await inspectTargetPath(agentFs, root, relPath);
+        if (dryRunSt !== null && !dryRunSt.isFile) {
+          throw new CLIError(
+            `${relPath} exists but is not a regular file — remove it and re-run.`,
+            5,
+          );
+        }
         const bytes = Buffer.byteLength(content, 'utf8');
         dryRunLines.push({ abs, bytes, note: '' });
         results.push({ target: t, path: relPath, action: 'dry-run', skills: [skill] });

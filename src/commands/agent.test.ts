@@ -1311,6 +1311,50 @@ describe('runInstall — symlink safety', () => {
     expect(writeCalls.length).toBe(0); // never wrote a .bak nor through the link
   });
 
+  it('dry-run: refuses (exit 5) when the target file is a symlink (parity with real install)', async () => {
+    const { fs: agentFs, writeCalls, seedSymlink } = makeMemFs();
+    // Same planted SKILL.md symlink as the real-install case above: dry-run
+    // must report the same refusal the real install would, not a success.
+    seedSymlink(path.resolve(CWD, TARGETS.claude.path));
+    const { deps } = makeCapture();
+
+    let thrown: unknown;
+    try {
+      await runInstall(
+        { ...BASE_OPTS, target: ['claude'], force: false, dryRun: true },
+        { cwd: CWD, fs: agentFs, ...deps },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(CLIError);
+    expect((thrown as CLIError).exitCode).toBe(5);
+    expect((thrown as CLIError).message).toContain('symlink');
+    expect(writeCalls.length).toBe(0);
+  });
+
+  it('dry-run: refuses (exit 5) when a parent path component is a symlink', async () => {
+    const { fs: agentFs, writeCalls, seedSymlink } = makeMemFs();
+    seedSymlink(path.resolve(CWD, '.claude'));
+    const { deps } = makeCapture();
+
+    let thrown: unknown;
+    try {
+      await runInstall(
+        { ...BASE_OPTS, target: ['claude'], force: false, dryRun: true },
+        { cwd: CWD, fs: agentFs, ...deps },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(CLIError);
+    expect((thrown as CLIError).exitCode).toBe(5);
+    expect((thrown as CLIError).message).toContain('symlink');
+    expect(writeCalls.length).toBe(0);
+  });
+
   it('does not write through a symlinked .bak slot — backs up to a numbered slot', async () => {
     const { store, fs: agentFs, seedFile, seedSymlink } = makeMemFs();
     const abs = path.resolve(CWD, TARGETS.claude.path);
