@@ -402,6 +402,29 @@ Flags:
 
 A batch rerun returns `accepted[]` (one `runId` per dispatched test) plus `deferred[]` for any test shed by the per-key run-rate limit; under `--wait`, a non-empty `deferred[]` exits 7 with a `nextAction` you can retry with a fresh idempotency key.
 
+#### `testsprite test flaky <test-id>`
+
+Detect a **flaky** test by replaying it several times and reporting how often it passes. Each attempt is a rerun with auto-heal **off** (a strict verbatim replay), so healed drift can't disguise a nondeterministic pass/fail — this measures the replay stability of the saved script against the configured URL. Frontend replays are free verbatim script replays; backend tests re-run their dependency closure and may cost credits (a one-line stderr advisory is printed before the run).
+
+```bash
+# Replay 10 times and print a stability score
+testsprite test flaky test_xxxxxxxx --runs 10
+
+# Fast "is it flaky at all?" — stop at the first non-passing attempt
+testsprite test flaky test_xxxxxxxx --runs 20 --until-fail
+
+# Machine-readable stability report for CI
+testsprite test flaky test_xxxxxxxx --runs 10 --output json
+```
+
+Flags:
+
+- `--runs <n>` — number of replays (1–100, default 5).
+- `--until-fail` — stop at the first attempt that does not pass.
+- `--timeout <s>` — per-attempt polling deadline (same semantics as `test wait`).
+
+`--output json` emits `{ testId, runs, passed, failed, stableRatio, verdict, failures: [{ attempt, runId, outcome, failureKind }] }`. Exit codes: **0** when every observed attempt passed (`stable`); **1** when any attempt did not pass (`flaky` or `failing`); **4** when the test has no replayable run (trigger `testsprite test run <id>` first); **5** on a validation error.
+
 #### `testsprite test wait <run-id>`
 
 Block until a run reaches a terminal status. Same exit-code matrix as `test run --wait`. Used to resume polling after a timed-out `test run --wait`, or when an agent already has a `runId` from a previous invocation.

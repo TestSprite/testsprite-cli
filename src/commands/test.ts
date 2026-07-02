@@ -75,6 +75,14 @@ import { createTicker } from '../lib/ticker.js';
 import { RateThrottle } from '../lib/rate-throttle.js';
 import { resolvePortalBase, resolvePortalUrl } from '../lib/facade.js';
 import { loadConfig } from '../lib/config.js';
+import {
+  flakyExitCode,
+  renderFlakyText,
+  summarizeFlaky,
+  type FlakyAttempt,
+  type FlakyOutcome,
+  type FlakyReport,
+} from '../lib/flaky.js';
 
 /**
  * `details` debug block per the CLI OpenAPI `Test` schema
@@ -8117,12 +8125,238 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       );
     });
 
+  // -------------------------------------------------------------------------
+  // `test flaky` — repeat-run flaky-test detector
+  // -------------------------------------------------------------------------
+
+  test
+    .command('flaky <test-id>')
+    .description(
+      'Repeatedly replay a test to measure stability and surface flakiness.\n' +
+        'Replays run with auto-heal OFF (strict verbatim) so healed drift cannot mask nondeterministic pass/fail.\n' +
+        '\nExit codes:\n' +
+        '  0  stable (every attempt passed)\n' +
+        '  1  flaky or failing (at least one attempt did not pass)\n' +
+        '  3  auth error\n' +
+        '  4  test not found (no replayable run — trigger `testsprite test run <id>` first)\n' +
+        '  5  validation error',
+    )
+    .option(
+      '--runs <n>',
+      `number of replays to run (1-${MAX_FLAKY_RUNS}, default ${DEFAULT_FLAKY_RUNS})`,
+    )
+    .option(
+      '--until-fail',
+      'stop at the first non-passing attempt (fast "is it flaky at all?" check)',
+      false,
+    )
+    .option(
+      '--timeout <s>',
+      `per-attempt max seconds to wait (1-${MAX_RUN_TIMEOUT_SECONDS}, default ${DEFAULT_RUN_TIMEOUT_SECONDS})`,
+    )
+    .addHelpText(
+      'after',
+      '\nNotes:\n' +
+        '  • Frontend replays are free verbatim script replays (no credit); backend replays\n' +
+        '    re-run the dependency closure and may cost credits — a one-line advisory is printed.\n' +
+        '  • Replays use auto-heal OFF so a flaky test is not silently "healed" into a pass;\n' +
+        '    this measures replay stability of the saved script against the configured URL.\n' +
+        '  • `--output json` emits a machine-readable stability report for CI gating.',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(
+      async (
+        testIdArg: string,
+        cmdOpts: { runs?: string; untilFail?: boolean; timeout?: string },
+        command: Command,
+      ) => {
+        await runFlaky(
+          {
+            ...resolveCommonOptions(command),
+            testId: testIdArg,
+            runs: parseNumericFlag(cmdOpts.runs, 'runs') ?? DEFAULT_FLAKY_RUNS,
+            untilFail: cmdOpts.untilFail === true,
+            timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
+          },
+          deps,
+        );
+      },
+    );
+
   test.addCommand(createTestCodeCommand(deps));
   test.addCommand(createTestPlanCommand(deps));
   test.addCommand(createTestFailureCommand(deps));
   test.addCommand(createTestArtifactCommand(deps));
 
   return test;
+}
+
+// ---------------------------------------------------------------------------
+// `test flaky` — repeat-run flaky-test detector
+// ---------------------------------------------------------------------------
+
+/** Upper bound on `--runs` so a typo can't spawn thousands of replays. */
+const MAX_FLAKY_RUNS = 100;
+/** Default replay count when `--runs` is omitted. */
+const DEFAULT_FLAKY_RUNS = 5;
+
+interface RunTestFlakyOptions extends CommonOptions {
+  testId: string;
+  /** Number of replays to run (1..MAX_FLAKY_RUNS). */
+  runs: number;
+  /** Stop at the first non-passing attempt. */
+  untilFail: boolean;
+  /** Per-attempt polling deadline in seconds. */
+  timeoutSeconds: number;
+}
+
+/**
+ * `test flaky <test-id>` — replay a test N times and report a stability score.
+ *
+ * Each attempt is a `POST /tests/{id}/runs/rerun` with auto-heal OFF (a strict
+ * verbatim replay) followed by `pollRunUntilTerminal`. Frontend replays are
+ * free verbatim script replays; backend replays re-run the dependency closure
+ * (a one-line credit advisory is printed). The pure scoring lives in
+ * `lib/flaky.ts`; this function is the I/O orchestrator.
+ *
+ * Exit code: 0 when every observed attempt passed (stable), else 1 — so CI can
+ * gate a merge on flakiness.
+ */
+export async function runFlaky(
+  opts: RunTestFlakyOptions,
+  deps: TestDeps = {},
+): Promise<FlakyReport | undefined> {
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const out = makeOutput(opts.output, deps);
+
+  if (typeof opts.testId !== 'string' || opts.testId.length === 0) {
+    throw localValidationError('test-id', 'is required');
+  }
+  if (!Number.isInteger(opts.runs) || opts.runs < 1 || opts.runs > MAX_FLAKY_RUNS) {
+    throw localValidationError('runs', `must be an integer between 1 and ${MAX_FLAKY_RUNS}`);
+  }
+
+  if (opts.dryRun) {
+    out.print({
+      dryRun: true,
+      command: 'test flaky',
+      testId: opts.testId,
+      runs: opts.runs,
+      untilFail: opts.untilFail,
+      method: 'POST',
+      path: `/api/cli/v1/tests/${opts.testId}/runs/rerun`,
+      note: `Would replay the test up to ${opts.runs}x with auto-heal OFF and report a stability score.`,
+    });
+    return undefined;
+  }
+
+  // Under the implicit wait, raise the per-request timeout to cover --timeout
+  // so a slow trigger / long-poll under load isn't cut at the 120s default.
+  const client = makeClient(
+    { ...opts, requestTimeoutMs: resolveWaitRequestTimeoutMs({ ...opts, wait: true }) },
+    deps,
+  );
+
+  // Best-effort test-type detection for the credit advisory. A probe failure
+  // never blocks the run — we just skip the advisory.
+  let isBackend = false;
+  try {
+    const test = await client.get<CliTest>(`/tests/${encodeURIComponent(opts.testId)}`);
+    isBackend = test.type === 'backend';
+  } catch {
+    // best-effort — proceed without the advisory.
+  }
+  if (isBackend) {
+    stderrFn(
+      `[advisory] ${opts.testId} is a backend test — each replay re-runs its dependency closure ` +
+        `and may cost credits. Frontend replays are free verbatim script replays; backend replays are not.`,
+    );
+  }
+
+  const ticker = createTicker(stderrFn, opts.output === 'json' ? false : undefined);
+  const attempts: FlakyAttempt[] = [];
+
+  for (let i = 1; i <= opts.runs; i++) {
+    const idempotencyKey = `cli-flaky-${randomUUID()}`;
+
+    let rerunResp: RerunResponse;
+    try {
+      // auto-heal is intentionally OFF: flaky detection needs a strict verbatim
+      // replay so healed drift cannot mask a nondeterministic pass/fail.
+      rerunResp = await client.triggerRerun(opts.testId, { source: 'cli' }, { idempotencyKey });
+    } catch (err) {
+      // A missing replayable run is fatal for the whole command (mirror rerun):
+      // there is nothing to repeat, so point the user at a fresh `test run`.
+      if (err instanceof ApiError && err.code === 'NOT_FOUND') {
+        throw ApiError.fromEnvelope({
+          error: {
+            code: 'NOT_FOUND',
+            message: `Test ${opts.testId} has no replayable run (unknown/cross-tenant id, or it has never completed a clean run).`,
+            nextAction: `Trigger a fresh run first: testsprite test run ${opts.testId}`,
+            requestId: err.requestId ?? 'local',
+            details: { testId: opts.testId, reason: 'no_replayable_run' },
+          },
+        });
+      }
+      // Any other trigger error is recorded as an errored attempt so a single
+      // transient blip doesn't abort a long stability probe.
+      const code = err instanceof ApiError ? err.code : 'ERROR';
+      attempts.push({ attempt: i, runId: null, outcome: 'error', failureKind: code });
+      ticker.update(`Attempt ${i}/${opts.runs} — error (${code})`);
+      if (opts.untilFail) break;
+      continue;
+    }
+
+    const runId = rerunResp.runId;
+    // Backend run rows never finalize server-side; resolve the verdict from the
+    // testId-scoped result on non-terminal ticks (same fallback as `test rerun`).
+    const resolveAlternate = makeBackendWaitFallback({
+      client,
+      resolveTestId: () => opts.testId,
+      resolveNotBefore: () => rerunResp.enqueuedAt,
+    });
+
+    let outcome: FlakyOutcome;
+    let failureKind: string | null = null;
+    try {
+      const finalRun = await pollRunUntilTerminal(client, runId, {
+        timeoutSeconds: opts.timeoutSeconds,
+        sleep: deps.sleep,
+        onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
+        resolveAlternate,
+      });
+      outcome = finalRun.status as FlakyOutcome;
+      failureKind = finalRun.failureKind;
+    } catch (err) {
+      // A per-attempt deadline (poll TimeoutError) or a client-side request
+      // timeout both count as a non-passing "timeout" outcome for this attempt.
+      if (err instanceof TimeoutError || err instanceof RequestTimeoutError) {
+        outcome = 'timeout';
+      } else {
+        throw err;
+      }
+    }
+
+    attempts.push({ attempt: i, runId, outcome, failureKind });
+    const passedSoFar = attempts.filter(a => a.outcome === 'passed').length;
+    ticker.update(`Attempt ${i}/${opts.runs} — ${outcome} (${passedSoFar} passed so far)`);
+
+    if (opts.untilFail && outcome !== 'passed') break;
+  }
+
+  ticker.finalize();
+
+  const report = summarizeFlaky(opts.testId, attempts);
+  out.print(report, data => renderFlakyText(data as FlakyReport));
+
+  const exitCode = flakyExitCode(report);
+  if (exitCode !== 0) {
+    throw new CLIError(
+      `Test ${opts.testId} is ${report.verdict} — ${report.passed}/${report.runs} attempts passed`,
+      exitCode,
+    );
+  }
+  return report;
 }
 
 interface RunFlagOpts {

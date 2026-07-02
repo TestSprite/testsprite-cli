@@ -124,6 +124,7 @@ describe('createTestCommand — surface', () => {
       'delete-batch',
       'diff',
       'failure',
+      'flaky',
       'get',
       'list',
       'plan',
