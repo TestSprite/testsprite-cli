@@ -521,6 +521,33 @@ describe('HttpClient per-request timeout', () => {
     expect((err as Error).name).toBe('AbortError');
   });
 
+  it('preserves RequestTimeoutError when the caller aborts after the request timeout wins', async () => {
+    const controller = new AbortController();
+    const fetchImpl = vi.fn(async (_input: unknown, init?: { signal?: AbortSignal }) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          const reason = init.signal?.reason;
+          controller.abort(new Error('caller aborted after timeout'));
+          const err = new Error(reason?.message ?? 'timed out');
+          err.name = reason?.name ?? 'TimeoutError';
+          reject(err);
+        });
+      });
+    });
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: () => Promise.resolve(),
+      random: () => 0,
+      requestTimeoutMs: 1,
+    });
+    const err = await client.get('/me', { signal: controller.signal }).catch(e => e);
+    expect(err).toBeInstanceOf(RequestTimeoutError);
+    expect((err as RequestTimeoutError).exitCode).toBe(7);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it('defaults to REQUEST_TIMEOUT_DEFAULT_MS when no requestTimeoutMs is supplied', () => {
     // Verify the default is wired without actually waiting 120s.
     // We test via the exported constant rather than exercising the stall.

@@ -395,9 +395,15 @@ export class HttpClient {
     timeoutSignal: AbortSignal,
     callerSignal: AbortSignal | undefined,
     requestId: string,
+    effectiveSignal: AbortSignal = timeoutSignal,
   ): void {
     if (isAbortError(err) || isTimeoutError(err)) {
-      if (timeoutSignal.aborted && (callerSignal == null || !callerSignal.aborted)) {
+      const timeoutWon =
+        timeoutSignal.aborted &&
+        (callerSignal == null ||
+          !callerSignal.aborted ||
+          effectiveSignal.reason === timeoutSignal.reason);
+      if (timeoutWon) {
         throw new RequestTimeoutError(this.requestTimeoutMs, requestId);
       }
       throw err;
@@ -451,7 +457,7 @@ export class HttpClient {
           // the caller hadn't already aborted, surface a clear RequestTimeoutError.
           // A timeout/abort during the fetch itself: classify it (RequestTimeoutError
           // when our deadline fired; otherwise rethrow the caller's abort unmodified).
-          this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId);
+          this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
           // If a RequestTimeoutError already propagated from somewhere (e.g. from a
           // nested call or from a test-injected fetchImpl), pass it through unchanged
           // rather than re-wrapping it as a TransportError.
@@ -500,8 +506,14 @@ export class HttpClient {
             return { body: (await response.json()) as T, requestId, status: response.status };
           } catch (err) {
             // A timeout/abort can fire mid-body-read (headers received, stream stalls).
-            this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId);
-            throw err;
+            this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
+            // Otherwise the successful response body was not valid JSON — a
+            // misconfigured endpoint, a proxy / captive-portal / login page that
+            // returns HTML with a 200 status, or an empty body. Surface a typed
+            // error carrying the requestId instead of letting the raw SyntaxError
+            // escape to index.ts, where it would print a bare `{"error":"..."}`
+            // and break the --output json envelope contract.
+            throw malformedResponseError(response, requestId, err);
           }
         }
 
@@ -511,14 +523,8 @@ export class HttpClient {
         } catch (err) {
           // safeReadJson rethrows aborts/timeouts (it swallows only non-abort parse
           // errors), so a timeout fired mid-body-read on a non-OK response lands here.
-          this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId);
-          // Otherwise the successful response body was not valid JSON — a
-          // misconfigured endpoint, a proxy / captive-portal / login page that
-          // returns HTML with a 200 status, or an empty body. Surface a typed
-          // error carrying the requestId instead of letting the raw SyntaxError
-          // escape to index.ts, where it would print a bare `{"error":"..."}`
-          // and break the --output json envelope contract.
-          throw malformedResponseError(response, requestId, err);
+          this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
+          throw err;
         }
 
         // Edge proxies / load balancers return 408/502/504 without our error
