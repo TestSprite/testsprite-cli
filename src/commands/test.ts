@@ -159,9 +159,16 @@ export interface CliTestCode {
 export interface CliTestStep {
   testId: string;
   stepIndex: number;
+  /**
+   * Run-scoped steps expose the backend's original plan-step type. Optional so
+   * the cumulative /tests/{id}/steps response remains backward-compatible.
+   */
+  stepType?: 'action' | 'assertion';
   action: string;
   description: string;
   status: 'passed' | 'failed' | null;
+  /** Per-step failure text already returned by GET /runs/{id}?includeSteps=true. */
+  error?: string | null;
   screenshotUrl: string | null;
   htmlSnapshotUrl: string | null;
   runIdIfAvailable: string | null;
@@ -3612,9 +3619,11 @@ function mapRunStepToCliTestStep(step: RunStepDto, run: RunResponse): CliTestSte
   return {
     testId: run.testId,
     stepIndex: numericIndex,
+    stepType: step.type,
     action: step.action,
     description: step.description ?? '',
     status: step.status,
+    error: step.error,
     screenshotUrl: step.screenshotUrl,
     htmlSnapshotUrl: step.htmlSnapshotUrl,
     runIdIfAvailable: run.runId,
@@ -8232,9 +8241,9 @@ function renderStepsText(page: Page<CliTestStep>): string {
     '  ' +
     'UPDATED';
 
-  const rows = page.items.map(s => {
+  const rows = page.items.flatMap(s => {
     const marker = s.outcomeContributesToFailure === true ? '* ' : '  ';
-    return [
+    const row = [
       marker,
       pad(String(s.stepIndex), indexWidth),
       pad(s.action, actionWidth),
@@ -8242,6 +8251,8 @@ function renderStepsText(page: Page<CliTestStep>): string {
       pad(descOf(s), descWidth),
       s.updatedAt,
     ].join('  ');
+    const error = s.error?.trim();
+    return error ? [row, `  error: ${error}`] : [row];
   });
 
   const lines: string[] = [header, ...rows, ''];

@@ -2522,11 +2522,81 @@ describe('runSteps', () => {
     // timestamps come from RunStepDto.createdAt
     expect(first.capturedAt).toBe('2026-06-01T10:00:05.000Z');
     expect(first.updatedAt).toBe('2026-06-01T10:00:05.000Z');
+    expect(first.stepType).toBe('action');
+    expect(first.error).toBeNull();
     // outcomeContributesToFailure: null when run passed (failedStepIndex is null)
     expect(first.outcomeContributesToFailure).toBeNull();
     // JSON output should be parseable with 2 items
-    const printed = JSON.parse(out[0]!) as { items: unknown[] };
+    const printed = JSON.parse(out[0]!) as {
+      items: Array<{ stepType?: string; error?: string | null }>;
+    };
     expect(printed.items).toHaveLength(2);
+    expect(printed.items[0]!.stepType).toBe('action');
+    expect(printed.items[0]!.error).toBeNull();
+  });
+
+  it('--run-id preserves per-step error text in JSON output', async () => {
+    const { credentialsPath } = makeCreds();
+    const runWithStepError = {
+      ...RUN_WITH_STEPS,
+      status: 'failed' as const,
+      failedStepIndex: 2,
+      stepSummary: { total: 2, completed: 2, passedCount: 1, failedCount: 1 },
+      steps: RUN_WITH_STEPS.steps.map(step =>
+        step.stepIndex === '0002'
+          ? {
+              ...step,
+              status: 'failed' as const,
+              error: 'AssertionError: expected heading to be visible',
+            }
+          : step,
+      ),
+    };
+    const fetchImpl = makeFetch(() => ({ body: runWithStepError }));
+    const out: string[] = [];
+
+    await runSteps(
+      { profile: 'default', output: 'json', debug: false, testId: 'test_fe', runId: 'run_scoped' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    const printed = JSON.parse(out[0]!) as {
+      items: Array<{ stepIndex: number; stepType?: string; error?: string | null }>;
+    };
+    const failedStep = printed.items.find(step => step.stepIndex === 2)!;
+    expect(failedStep.stepType).toBe('assertion');
+    expect(failedStep.error).toBe('AssertionError: expected heading to be visible');
+  });
+
+  it('--run-id prints per-step error text under failed rows in text mode', async () => {
+    const { credentialsPath } = makeCreds();
+    const runWithStepError = {
+      ...RUN_WITH_STEPS,
+      status: 'failed' as const,
+      failedStepIndex: 2,
+      stepSummary: { total: 2, completed: 2, passedCount: 1, failedCount: 1 },
+      steps: RUN_WITH_STEPS.steps.map(step =>
+        step.stepIndex === '0002'
+          ? {
+              ...step,
+              status: 'failed' as const,
+              error: 'AssertionError: expected heading to be visible',
+            }
+          : step,
+      ),
+    };
+    const fetchImpl = makeFetch(() => ({ body: runWithStepError }));
+    const out: string[] = [];
+
+    await runSteps(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe', runId: 'run_scoped' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    const block = out.join('\n');
+    expect(block).toContain('assert heading');
+    expect(block).toContain('failed');
+    expect(block).toContain('  error: AssertionError: expected heading to be visible');
   });
 
   it('--run-id: outcomeContributesToFailure=true on the failedStepIndex step', async () => {
