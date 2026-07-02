@@ -713,6 +713,17 @@ const ENTRIES: DryRunSampleEntry[] = [
         htmlSnapshotUrl: null,
         createdAt: '2026-05-15T19:32:20.000Z',
       },
+      {
+        stepIndex: '0003',
+        type: 'assertion',
+        action: 'assert_visible',
+        status: 'failed',
+        description: 'Confirmation toast is visible',
+        error: 'AssertionError: confirmation toast did not appear before timeout',
+        screenshotUrl: 'https://s3-presigned.example.com/snap/run-step-0003.png?X-Amz-dryrun',
+        htmlSnapshotUrl: 'https://s3-presigned.example.com/snap/run-step-0003.html?X-Amz-dryrun',
+        createdAt: '2026-05-15T19:32:30.000Z',
+      },
     ],
   } satisfies RunResponse),
 ];

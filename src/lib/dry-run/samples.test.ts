@@ -405,6 +405,22 @@ describe('findSample', () => {
     expect(body.stepSummary.failedCount).toBe(0);
   });
 
+  it('GET /runs/{runId} sample includes a failed run step with backend error text', () => {
+    const e = findSample(
+      'GET',
+      'https://api.testsprite.com/api/cli/v1/runs/run_xyz?includeSteps=true',
+    );
+    expect(e?.operationId).toBe('getRun');
+    const body = e?.body() as {
+      steps: Array<{ type: string; status: string; error: string | null }>;
+    };
+    const failedStep = body.steps.find(step => step.status === 'failed');
+    expect(failedStep).toMatchObject({
+      type: 'assertion',
+      error: expect.stringContaining('AssertionError'),
+    });
+  });
+
   it('getTest sample carries priority field (G1a)', () => {
     const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests/test_abc');
     expect(e?.operationId).toBe('getTest');
