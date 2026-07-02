@@ -273,14 +273,15 @@ describe('createTicker — NO_COLOR support', () => {
 });
 
 describe('isNoColor', () => {
-  it('returns true when NO_COLOR is present in env', () => {
-    expect(isNoColor({ NO_COLOR: '' })).toBe(true);
+  it('returns true when NO_COLOR is set to a non-empty value', () => {
     expect(isNoColor({ NO_COLOR: '1' })).toBe(true);
     expect(isNoColor({ NO_COLOR: 'true' })).toBe(true);
   });
 
-  it('returns false when NO_COLOR is not present in env', () => {
+  it('returns false when NO_COLOR is absent or empty', () => {
     expect(isNoColor({})).toBe(false);
     expect(isNoColor({ OTHER_VAR: '1' })).toBe(false);
+    // Per https://no-color.org/, an empty NO_COLOR does NOT disable color.
+    expect(isNoColor({ NO_COLOR: '' })).toBe(false);
   });
 });

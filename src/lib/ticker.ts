@@ -33,7 +33,8 @@ export interface Ticker {
  * an empty string, per https://no-color.org/.
  */
 export function isNoColor(env: NodeJS.ProcessEnv = process.env): boolean {
-  return 'NO_COLOR' in env;
+  const value = env.NO_COLOR;
+  return typeof value === 'string' && value.length > 0;
 }
 
 /**
