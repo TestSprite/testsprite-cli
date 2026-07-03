@@ -51,13 +51,13 @@ export async function runList(
   deps: ProjectDeps = {},
 ): Promise<Page<CliProject>> {
   const out = makeOutput(opts.output, deps);
-  const client = makeClient(opts, deps);
 
   const paginationFlags: PaginationFlags = validatePaginationFlags({
     pageSize: opts.pageSize,
     startingToken: opts.startingToken,
     maxItems: opts.maxItems,
   });
+  const client = makeClient(opts, deps);
 
   // When the user explicitly passed a page-size flag and did NOT ask
   // for --max-items, treat that as a "give me one page and the cursor"

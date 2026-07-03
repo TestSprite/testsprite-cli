@@ -199,6 +199,47 @@ describe('runList', () => {
     });
   });
 
+  it('rejects invalid pagination before requiring credentials', async () => {
+    const credentialsPath = join(mkdtempSync(join(tmpdir(), 'cli-p2-no-creds-')), 'credentials');
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runList(
+        { profile: 'default', output: 'json', debug: false, pageSize: 1.5 },
+        { credentialsPath, fetchImpl: fetchImpl as unknown as typeof globalThis.fetch },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'page-size' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('rejects invalid dry-run pagination before emitting the dry-run banner', async () => {
+    const stderr: string[] = [];
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runList(
+        { profile: 'default', output: 'json', debug: false, dryRun: true, pageSize: 1.5 },
+        {
+          credentialsPath: join(mkdtempSync(join(tmpdir(), 'cli-p2-dryrun-')), 'credentials'),
+          fetchImpl: fetchImpl as unknown as typeof globalThis.fetch,
+          stderr: line => stderr.push(line),
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'page-size' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(stderr.join('\n')).not.toContain(DRY_RUN_BANNER);
+  });
+
   it('rejects pageSize=101 with VALIDATION_ERROR exit 5 (Fix 7 — upper-bound enforced client-side)', async () => {
     // Previously silently clamped to 100; now rejected so callers get fast feedback.
     const { credentialsPath } = makeCreds();
