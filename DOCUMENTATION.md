@@ -411,7 +411,7 @@ Detect a **flaky** test by replaying it several times and reporting how often it
 testsprite test flaky test_xxxxxxxx --runs 10
 
 # Fast "is it flaky at all?" — stop at the first non-passing attempt
-testsprite test flaky test_xxxxxxxx --runs 20 --until-fail
+testsprite test flaky test_xxxxxxxx --runs 10 --until-fail
 
 # Machine-readable stability report for CI
 testsprite test flaky test_xxxxxxxx --runs 10 --output json
@@ -419,7 +419,7 @@ testsprite test flaky test_xxxxxxxx --runs 10 --output json
 
 Flags:
 
-- `--runs <n>` — number of replays (1–100, default 5).
+- `--runs <n>` — number of replays (1–10, default 5).
 - `--until-fail` — stop at the first attempt that does not pass.
 - `--timeout <s>` — per-attempt polling deadline (same semantics as `test wait`).
 

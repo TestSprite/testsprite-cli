@@ -345,7 +345,7 @@ describe('runFlaky', () => {
     expect((err as ApiError).code).toBe('NOT_FOUND');
   });
 
-  it('rejects --runs outside 1..100 with a validation error (exit 5)', async () => {
+  it('rejects --runs below the range (0) with a validation error (exit 5)', async () => {
     const { fetchImpl } = makeFlakyFetch({ statuses: [] });
     const { deps } = makeDeps(fetchImpl);
     const err = await runFlaky(
@@ -357,6 +357,27 @@ describe('runFlaky', () => {
         verbose: false,
         testId: 'test_x',
         runs: 0,
+        untilFail: false,
+        timeoutSeconds: 600,
+      },
+      deps,
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).exitCode).toBe(5);
+  });
+
+  it('rejects --runs above the cap (11) with a validation error (exit 5)', async () => {
+    const { fetchImpl } = makeFlakyFetch({ statuses: [] });
+    const { deps } = makeDeps(fetchImpl);
+    const err = await runFlaky(
+      {
+        profile: 'default',
+        output: 'text',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        testId: 'test_x',
+        runs: 11,
         untilFail: false,
         timeoutSeconds: 600,
       },

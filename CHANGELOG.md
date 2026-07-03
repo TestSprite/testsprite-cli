@@ -6,8 +6,12 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ### Added
 
+<<<<<<< HEAD
 - **JUnit XML report export for batch `--wait` runs.** `test run --all` and batch `test rerun` (`--all` or multiple test ids) accept `--report junit --report-file <path>` to write a CI-friendly XML sidecar after polling completes. `--output json` is unchanged; the report is written even when the batch exits non-zero. `--dry-run` writes a canned sample without network calls.
 - **`testsprite test flaky <test-id>`** — repeat-run flaky-test detector. Replays a test N times (`--runs <n>`, default 5), aggregates the outcomes, and reports a stability verdict (`stable` / `flaky` / `failing`) plus the `runId` and `failureKind` of every attempt that did not pass. Replays run with auto-heal OFF (strict verbatim) so a healed drift can't mask a nondeterministic pass/fail. Exit code is 0 only when every attempt passed, so CI can gate a merge on flakiness (`testsprite test flaky <id> --runs 5 || exit 1`). Flags: `--runs <n>` (1–100), `--until-fail` (stop at the first non-passing attempt), `--timeout <s>` (per-attempt), and `--output json` for a machine-readable stability report. Frontend replays are free verbatim script replays; a one-line advisory is printed for backend tests, whose closure reruns may cost credits.
+=======
+- **`testsprite test flaky <test-id>`** — repeat-run flaky-test detector. Replays a test N times (`--runs <n>`, default 5), aggregates the outcomes, and reports a stability verdict (`stable` / `flaky` / `failing`) plus the `runId` and `failureKind` of every attempt that did not pass. Replays run with auto-heal OFF (strict verbatim) so a healed drift can't mask a nondeterministic pass/fail. Exit code is 0 only when every attempt passed, so CI can gate a merge on flakiness (`testsprite test flaky <id> --runs 5 || exit 1`). Flags: `--runs <n>` (1–10), `--until-fail` (stop at the first non-passing attempt), `--timeout <s>` (per-attempt), and `--output json` for a machine-readable stability report. Frontend replays are free verbatim script replays; a one-line advisory is printed for backend tests, whose closure reruns may cost credits.
+>>>>>>> d6a959a (fix(flaky): cap --runs at 10 per maintainer scope (#115))
 
 ## [0.2.0] - 2026-06-29
 

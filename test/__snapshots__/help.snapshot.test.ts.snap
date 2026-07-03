@@ -270,6 +270,15 @@ Commands:
    11  rate limited — honor Retry-After
   
   On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
+  flaky [options] <test-id>             Repeatedly replay a test to measure stability and surface flakiness.
+  Replays run with auto-heal OFF (strict verbatim) so healed drift cannot mask nondeterministic pass/fail.
+  
+  Exit codes:
+    0  stable (every attempt passed)
+    1  flaky or failing (at least one attempt did not pass)
+    3  auth error
+    4  test not found (no replayable run — trigger \`testsprite test run <id>\` first)
+    5  validation error
   code                                  Inspect and edit generated test code
   plan                                  Manage FE test plan-steps (FE-only)
   failure                               Export the latest-failure agent bundle
@@ -341,6 +350,38 @@ Options:
   -h, --help     display help for command
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > test flaky 1`] = `
+"Usage: testsprite test flaky [options] <test-id>
+
+Repeatedly replay a test to measure stability and surface flakiness.
+Replays run with auto-heal OFF (strict verbatim) so healed drift cannot mask nondeterministic pass/fail.
+
+Exit codes:
+  0  stable (every attempt passed)
+  1  flaky or failing (at least one attempt did not pass)
+  3  auth error
+  4  test not found (no replayable run — trigger \`testsprite test run <id>\` first)
+  5  validation error
+
+Options:
+  --runs <n>     number of replays to run (1-10, default 5)
+  --until-fail   stop at the first non-passing attempt (fast "is it flaky at
+                 all?" check) (default: false)
+  --timeout <s>  per-attempt max seconds to wait (1-3600, default 600)
+  -h, --help     display help for command
+
+Notes:
+  • Frontend replays are free verbatim script replays (no credit); backend replays
+    re-run the dependency closure and may cost credits — a one-line advisory is printed.
+  • Replays use auto-heal OFF so a flaky test is not silently "healed" into a pass;
+    this measures replay stability of the saved script against the configured URL.
+  • \`--output json\` emits a machine-readable stability report for CI gating.
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
   testsprite --help
 "
 `;

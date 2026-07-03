@@ -8195,8 +8195,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 // `test flaky` — repeat-run flaky-test detector
 // ---------------------------------------------------------------------------
 
-/** Upper bound on `--runs` so a typo can't spawn thousands of replays. */
-const MAX_FLAKY_RUNS = 100;
+/** Upper bound on `--runs` so a repeat-runner can't amplify free FE replays. */
+const MAX_FLAKY_RUNS = 10;
 /** Default replay count when `--runs` is omitted. */
 const DEFAULT_FLAKY_RUNS = 5;
 
