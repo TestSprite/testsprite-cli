@@ -108,6 +108,29 @@ describe('HttpClient happy path', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
+  it('maps a 200 non-JSON body to a typed UNAVAILABLE error', async () => {
+    const events: DebugEvent[] = [];
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response('<!DOCTYPE html>', { status: 200, headers: { 'content-type': 'text/html' } }),
+    );
+    const client = makeClient(fetchImpl as unknown as typeof fetch, {
+      onDebug: e => events.push(e),
+    });
+    const err = await client.get('/projects').catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+      httpStatus: 200,
+      details: { status: 200, contentType: 'text/html' },
+    });
+    expect((err as ApiError).nextAction).toContain('TESTSPRITE_API_URL');
+    expect((err as Error).message).not.toContain('<!DOCTYPE');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(events.map(e => e.kind)).toEqual(['request', 'response', 'error']);
+  });
+
   it('sends User-Agent header as testsprite-cli/<version>', async () => {
     const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const headers = new Headers(init?.headers);

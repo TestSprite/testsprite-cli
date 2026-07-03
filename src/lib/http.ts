@@ -498,7 +498,18 @@ export class HttpClient {
         } catch (err) {
           // A timeout/abort can fire mid-body-read (headers received, stream stalls).
           this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId);
-          throw err;
+          const apiError = nonJsonSuccessResponseError(response, requestId);
+          this.debug({
+            kind: 'error',
+            method,
+            url,
+            attempt,
+            status: response.status,
+            errorCode: apiError.code,
+            requestId,
+            durationMs: Date.now() - startedAt,
+          });
+          throw apiError;
         }
       }
 
@@ -679,6 +690,21 @@ export function buildUrl(
 
 function newRequestId(): string {
   return `cli_${randomUUID()}`;
+}
+
+function nonJsonSuccessResponseError(response: Response, requestId: string): ApiError {
+  const contentType = response.headers.get('content-type') ?? 'unknown';
+  return new ApiError(
+    {
+      code: 'UNAVAILABLE',
+      message: `Expected JSON response but received HTTP ${response.status} with content-type ${contentType}.`,
+      nextAction:
+        'Check --endpoint-url or TESTSPRITE_API_URL. The endpoint may be returning an HTML login page, captive portal, or proxy response instead of the TestSprite API.',
+      requestId,
+      details: { status: response.status, contentType },
+    },
+    response.status,
+  );
 }
 
 async function safeReadJson(response: Response): Promise<unknown> {
