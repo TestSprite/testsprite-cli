@@ -110,7 +110,7 @@ Prefer to configure each step by hand (or learn the surface offline with `--dry-
 |           | `test rerun`                                        | Cheap replay of one/many tests (FE verbatim; BE with deps); `--all --project <id>` reruns all tests                   |
 |           | `test wait`                                         | Block on a `runId` until terminal                                                                                     |
 |           | `test artifact get`                                 | Download the failure bundle for a specific `runId`                                                                    |
-| **Agent** | `agent install` / `agent list`                      | Add or list coding-agent targets (pure-local): `claude`, `codex`, `cursor`, `cline`, `antigravity`                    |
+| **Agent** | `agent install` / `agent list`                      | Add or list coding-agent targets (pure-local): `claude`, `codex`, `cursor`, `cline`, `antigravity`, `kiro`            |
 
 > The earlier command names — `init`, `auth configure`, `auth whoami`, `auth logout` — still work as hidden, deprecated aliases (each prints a one-line notice pointing at the new name), so existing scripts keep running. `auth configure` now runs the full `setup` (it also installs the skill).
 

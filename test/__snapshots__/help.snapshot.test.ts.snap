@@ -25,8 +25,8 @@ Write the TestSprite agent skills (verification loop + first-run onboarding)
 into a project for a coding agent
 
 Options:
-  --target <t>    Agent target(s): claude, cursor, cline, antigravity, codex
-                  (comma-separated or repeated) (default: [])
+  --target <t>    Agent target(s): claude, cursor, cline, antigravity, kiro,
+                  codex (comma-separated or repeated) (default: [])
   --skill <name>  Skill(s) to install: testsprite-verify, testsprite-onboard
                   (comma-separated or repeated; default: all) (default: [])
   --dir <path>    Project root to write into (default: cwd)
@@ -112,7 +112,8 @@ Options:
   --from-env        Read TESTSPRITE_API_KEY from the environment instead of
                     prompting (default: false)
   --agent <target>  Coding-agent target to install: claude, antigravity,
-                    cursor, cline, codex (default: claude) (default: "claude")
+                    cursor, cline, kiro, codex (default: claude) (default:
+                    "claude")
   --no-agent        Skip the agent skill install (configure credentials only)
   --force           Overwrite an existing skill file (a .bak backup is kept)
   --dir <path>      Project root for the skill install (default: current

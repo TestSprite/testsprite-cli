@@ -741,6 +741,7 @@ describe('runList', () => {
     expect(out).toContain('cursor');
     expect(out).toContain('cline');
     expect(out).toContain('antigravity');
+    expect(out).toContain('kiro');
     expect(out).toContain('codex');
     expect(out).toContain('ga');
     expect(out).toContain('experimental');
@@ -749,6 +750,7 @@ describe('runList', () => {
     expect(out).toContain(TARGETS.cursor.path);
     expect(out).toContain(TARGETS.cline.path);
     expect(out).toContain(TARGETS.antigravity.path);
+    expect(out).toContain(TARGETS.kiro.path);
     expect(out).toContain(TARGETS.codex.path);
   });
 
@@ -759,13 +761,14 @@ describe('runList', () => {
 
     const json = JSON.parse(capture.stdout.join('\n')) as ListResult[];
     expect(Array.isArray(json)).toBe(true);
-    // 5 targets × 2 default skills = 10 rows
-    expect(json).toHaveLength(10);
+    // 6 targets × 2 default skills = 12 rows
+    expect(json).toHaveLength(12);
     const targets = json.map(r => r.target);
     expect(targets).toContain('claude');
     expect(targets).toContain('cursor');
     expect(targets).toContain('cline');
     expect(targets).toContain('antigravity');
+    expect(targets).toContain('kiro');
     expect(targets).toContain('codex');
     // skill field present on each row
     const skills = json.map(r => r.skill);
@@ -905,11 +908,11 @@ describe('createAgentCommand wiring', () => {
 });
 
 // ---------------------------------------------------------------------------
-// All four own-file targets installed at once
+// All five own-file targets installed at once
 // ---------------------------------------------------------------------------
 
-describe('runInstall — all four own-file targets', () => {
-  it('installs all four own-file targets in one invocation', async () => {
+describe('runInstall — all five own-file targets', () => {
+  it('installs all five own-file targets in one invocation', async () => {
     const { store, fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -919,7 +922,7 @@ describe('runInstall — all four own-file targets', () => {
         output: 'text',
         debug: false,
         dryRun: false,
-        target: ['claude', 'cursor', 'cline', 'antigravity'],
+        target: ['claude', 'cursor', 'cline', 'antigravity', 'kiro'],
         skills: ['testsprite-verify'],
         force: false,
       },
@@ -937,11 +940,11 @@ describe('runInstall — all four own-file targets', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Dry-run for all four own-file targets
+// Dry-run for all five own-file targets
 // ---------------------------------------------------------------------------
 
 describe('runInstall — dry-run all own-file targets', () => {
-  it('writes nothing for any of the four own-file targets (default 2 skills = 8 would-write lines)', async () => {
+  it('writes nothing for any of the five own-file targets (default 2 skills = 10 would-write lines)', async () => {
     const { store, fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -951,7 +954,7 @@ describe('runInstall — dry-run all own-file targets', () => {
         output: 'text',
         debug: false,
         dryRun: true,
-        target: ['claude', 'cursor', 'cline', 'antigravity'],
+        target: ['claude', 'cursor', 'cline', 'antigravity', 'kiro'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -961,9 +964,9 @@ describe('runInstall — dry-run all own-file targets', () => {
     const stderrOut = capture.stderr.join('\n');
     // Banner appears once
     expect(stderrOut).toContain('[dry-run] no files written');
-    // 4 targets × 2 default skills = 8 would-write lines
+    // 5 targets × 2 default skills = 10 would-write lines
     const wouldWriteLines = stderrOut.split('\n').filter(l => l.includes('would write'));
-    expect(wouldWriteLines.length).toBe(8);
+    expect(wouldWriteLines.length).toBe(10);
   });
 });
 

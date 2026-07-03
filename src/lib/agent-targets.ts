@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 
-export type AgentTarget = 'claude' | 'cursor' | 'cline' | 'antigravity' | 'codex';
+export type AgentTarget = 'claude' | 'cursor' | 'cline' | 'antigravity' | 'codex' | 'kiro';
 
 export interface TargetSpec {
   status: 'ga' | 'experimental';
@@ -140,6 +140,8 @@ export function pathFor(target: AgentTarget, skill: string): string {
       return `.cursor/rules/${skill}.mdc`;
     case 'cline':
       return `.clinerules/${skill}.md`;
+    case 'kiro':
+      return `.kiro/skills/${skill}/SKILL.md`;
     case 'codex':
       return 'AGENTS.md';
   }
@@ -169,6 +171,14 @@ export const TARGETS: Record<AgentTarget, TargetSpec> = {
     path: pathFor('cline', SKILL_NAME),
     mode: 'own-file',
     wrap: (_name, _description, body) => body,
+  },
+  kiro: {
+    status: 'experimental',
+    path: pathFor('kiro', SKILL_NAME),
+    mode: 'own-file',
+    // kiro reads SKILL.md files with name/description frontmatter, same as
+    // claude/antigravity, so it shares the wrapSkill wrapper.
+    wrap: wrapSkill,
   },
   /**
    * codex target — managed-section mode.

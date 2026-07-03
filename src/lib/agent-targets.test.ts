@@ -74,19 +74,20 @@ testsprite test artifact get <run-id> --out ./out/
 // ---------------------------------------------------------------------------
 
 describe('TARGETS', () => {
-  it('has all five required keys', () => {
+  it('has all six required keys', () => {
     const keys = Object.keys(TARGETS).sort();
-    expect(keys).toEqual(['antigravity', 'claude', 'cline', 'codex', 'cursor']);
+    expect(keys).toEqual(['antigravity', 'claude', 'cline', 'codex', 'cursor', 'kiro']);
   });
 
   it('claude is GA', () => {
     expect(TARGETS.claude.status).toBe('ga');
   });
 
-  it('cursor, cline, antigravity, and codex are experimental', () => {
+  it('cursor, cline, antigravity, kiro, and codex are experimental', () => {
     expect(TARGETS.cursor.status).toBe('experimental');
     expect(TARGETS.cline.status).toBe('experimental');
     expect(TARGETS.antigravity.status).toBe('experimental');
+    expect(TARGETS.kiro.status).toBe('experimental');
     expect(TARGETS.codex.status).toBe('experimental');
   });
 
@@ -102,6 +103,7 @@ describe('TARGETS', () => {
     expect(TARGETS.antigravity.mode).toBe('own-file');
     expect(TARGETS.cursor.mode).toBe('own-file');
     expect(TARGETS.cline.mode).toBe('own-file');
+    expect(TARGETS.kiro.mode).toBe('own-file');
   });
 
   it('codex target has mode managed-section', () => {
@@ -200,6 +202,22 @@ describe('renderForTarget("antigravity")', () => {
   });
 });
 
+describe('renderForTarget("kiro")', () => {
+  const result = renderForTarget('kiro', 'testsprite-verify', STUB_BODY);
+
+  it('returns the correct path', () => {
+    expect(result.path).toBe('.kiro/skills/testsprite-verify/SKILL.md');
+  });
+
+  it('frontmatter contains name: testsprite-verify', () => {
+    expect(result.content).toContain('name: testsprite-verify');
+  });
+
+  it('frontmatter contains description:', () => {
+    expect(result.content).toContain(`description: ${SKILL_DESCRIPTION}`);
+  });
+});
+
 describe('renderForTarget("claude") vs renderForTarget("antigravity")', () => {
   it('produce the same frontmatter lines (name + description)', () => {
     const claude = renderForTarget('claude', 'testsprite-verify', STUB_BODY);
@@ -274,11 +292,12 @@ describe('renderForTarget("cline")', () => {
 // ---------------------------------------------------------------------------
 
 describe('content integrity — own-file targets', () => {
-  const ownFileTargets: Array<'claude' | 'cursor' | 'cline' | 'antigravity'> = [
+  const ownFileTargets: Array<'claude' | 'cursor' | 'cline' | 'antigravity' | 'kiro'> = [
     'claude',
     'cursor',
     'cline',
     'antigravity',
+    'kiro',
   ];
 
   // Use the real body for these checks, since we're guarding against trimming.
