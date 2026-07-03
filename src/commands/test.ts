@@ -7939,6 +7939,17 @@ function openOutputFile(rawPath: string): FileSink {
   if (!parentStat.isDirectory()) {
     throw localValidationError('out', `parent path is not a directory: ${parent}`);
   }
+  let targetStat;
+  try {
+    targetStat = statSync(resolved);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw localValidationError('out', `cannot stat output path: ${resolved}`);
+    }
+  }
+  if (targetStat?.isDirectory()) {
+    throw localValidationError('out', `must point to a file, not a directory: ${resolved}`);
+  }
   const tmpPath = join(parent, `.${basename(resolved)}.tmp-${randomUUID()}`);
   const stream = createWriteStream(tmpPath, { encoding: 'utf8' });
   const sink: FileSink = { stream, path: resolved, tmpPath, error: null };

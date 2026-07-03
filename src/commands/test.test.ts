@@ -1522,6 +1522,31 @@ describe('runCodeGet', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 
+  it('--out rejects an existing directory path with VALIDATION_ERROR (exit 5) before any network I/O', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-out-dir-'));
+    let fetchCalls = 0;
+    const fetchImpl = (() => {
+      fetchCalls += 1;
+      return Promise.resolve(new Response('{}'));
+    }) as typeof globalThis.fetch;
+
+    await expect(
+      runCodeGet(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          testId: 'test_fe',
+          out: dir,
+        },
+        { credentialsPath, fetchImpl },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchCalls).toBe(0);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
   // Regression: a parent dir that doesn't exist used to surface as exit 1
   // (TRANSPORT_ERROR) — `createWriteStream` opens lazily and ENOENT fires
   // mid-write. Synchronous parent stat keeps every `--out` user-input
