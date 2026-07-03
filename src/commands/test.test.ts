@@ -2821,6 +2821,31 @@ describe('runDiff', () => {
     expect(diff.crossTest).toBe(true);
     expect(errs.join('\n')).toContain('different tests');
   });
+
+  it('--dry-run returns the canned sample fully offline (no credentials, no fetch)', async () => {
+    // Dry-run must not require credentials or hit the network — it returns a
+    // canned CliRunDiff so `--dry-run` shows the shape offline.
+    const diff = await runDiff(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        runA: 'run_aaa',
+        runB: 'run_bbb',
+      },
+      { stdout: () => undefined, stderr: () => undefined },
+    );
+    expect(diff.runA.runId).toBe('run_aaa');
+    expect(diff.runB.runId).toBe('run_bbb');
+    expect(diff.verdictChanged).toBe(true);
+    expect(diff.changedSteps).toHaveLength(1);
+    expect(diff.changedSteps[0]).toMatchObject({
+      stepIndex: 2,
+      statusA: 'passed',
+      statusB: 'failed',
+    });
+  });
 });
 
 describe('runResult', () => {
