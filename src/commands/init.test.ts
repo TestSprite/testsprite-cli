@@ -542,6 +542,36 @@ describe('runInit — codex-review hardening', () => {
     expect(fetchImpl).toHaveBeenCalled();
   });
 
+  it('rejects malformed --endpoint-url before setup key verification', async () => {
+    const { captured, deps } = makeCapture();
+    const fetchImpl = makeOkFetch();
+
+    await expect(
+      runInit(
+        makeBaseOpts({
+          fromEnv: true,
+          endpointUrl: 'not-a-url',
+          noAgent: true,
+          output: 'json',
+        }),
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          fetchImpl,
+          credentialsPath,
+          isTTY: false,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(captured.stderr.join('\n')).not.toContain('API key rejected');
+  });
+
   it('whoami banner uses --api-key, not a stale TESTSPRITE_API_KEY in env (E2E 2026-06-09)', async () => {
     const { captured, deps } = makeCapture();
     // Key-aware fetch: only the real key gets a 200 + identity; the stale env key 401s.

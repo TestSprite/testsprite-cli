@@ -1,5 +1,6 @@
 import { Command } from 'commander';
 import {
+  assertValidEndpointUrl,
   emitDryRunBanner,
   makeHttpClient,
   parseRequestTimeoutFlag,
@@ -87,8 +88,9 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   // Print the canned success shape so an agent sees exactly the JSON it
   // would get on a real configure (modulo the endpoint string).
   if (opts.dryRun) {
-    emitDryRunBanner(stderr);
     const apiUrl = opts.endpointUrl ?? envApiUrl ?? DEFAULT_API_URL;
+    assertValidEndpointUrl(apiUrl);
+    emitDryRunBanner(stderr);
     stderr(`[dry-run] would write credentials for profile="${opts.profile}" to ${credentialsPath}`);
     out.print({ profile: opts.profile, apiUrl, status: 'configured' }, data => {
       const d = data as { profile: string; apiUrl: string };
@@ -114,6 +116,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   // api_url doesn't silently validate a new key against the default endpoint.
   const resolvedFromProfile = existingProfile?.apiUrl;
   const apiUrl = opts.endpointUrl ?? envApiUrl ?? resolvedFromProfile ?? DEFAULT_API_URL;
+  assertValidEndpointUrl(apiUrl);
 
   if (opts.fromEnv) {
     apiKey = env.TESTSPRITE_API_KEY?.trim();

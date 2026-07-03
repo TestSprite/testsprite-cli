@@ -164,6 +164,100 @@ describe('runConfigure', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 
+  it('rejects a malformed endpoint before key validation fetch', async () => {
+    const { capture, deps } = makeCapture();
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          fromEnv: true,
+          endpointUrl: 'not-a-url',
+        },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(capture.stderr.join('\n')).not.toContain('API key rejected');
+  });
+
+  it('rejects a non-http endpoint before key validation fetch', async () => {
+    const { deps } = makeCapture();
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          fromEnv: true,
+          endpointUrl: 'ftp://example.com',
+        },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+  });
+
+  it('rejects a malformed dry-run endpoint before emitting dry-run output', async () => {
+    const { capture, deps } = makeCapture();
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          fromEnv: false,
+          dryRun: true,
+          endpointUrl: 'not-a-url',
+        },
+        {
+          ...deps,
+          env: {},
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(capture.stderr.join('\n')).not.toContain('[dry-run]');
+    expect(capture.stdout).toEqual([]);
+  });
+
   it('prompts only for the API key (never the endpoint) and defaults to prod', async () => {
     const { capture, deps } = makeCapture();
     // Prompt object exposes ONLY `secret`. If runConfigure tried to prompt for
