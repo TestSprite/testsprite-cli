@@ -20,6 +20,8 @@ export interface ProxyDeps {
   env?: NodeJS.ProcessEnv;
   /** Dispatcher installer. Defaults to undici's setGlobalDispatcher. */
   install?: (agent: Dispatcher) => void;
+  /** Warning sink. Defaults to `process.stderr`. */
+  stderr?: (line: string) => void;
 }
 
 /**
@@ -36,6 +38,21 @@ export function maybeInstallProxyAgent(deps: ProxyDeps = {}): boolean {
   const install = deps.install ?? setGlobalDispatcher;
   // EnvHttpProxyAgent reads HTTPS_PROXY/HTTP_PROXY/NO_PROXY itself, per
   // request, so NO_PROXY exemptions apply without extra plumbing here.
-  install(new EnvHttpProxyAgent());
-  return true;
+  //
+  // A malformed or unsupported proxy value (e.g. `socks5://...`) makes the
+  // agent throw. Because this runs at startup, an unguarded throw would abort
+  // every command before the CLI's own error handling — so fall back to the
+  // default (proxy-less) dispatcher and warn instead of crashing.
+  try {
+    install(new EnvHttpProxyAgent());
+    return true;
+  } catch (error) {
+    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    stderr(
+      `warning: ignoring proxy environment (could not initialize proxy agent): ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return false;
+  }
 }
