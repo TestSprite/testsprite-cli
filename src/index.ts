@@ -12,6 +12,7 @@ import { createTestCommand } from './commands/test.js';
 import { createUsageCommand } from './commands/usage.js';
 import { ApiError, CLIError, RequestTimeoutError } from './lib/errors.js';
 import { Output, isOutputMode } from './lib/output.js';
+import { maybeInstallProxyAgent } from './lib/proxy.js';
 import { renderCommanderError, rephraseUnknownOption } from './lib/render-error.js';
 import { maybeEmitSkillNudge } from './lib/skill-nudge.js';
 import { VERSION } from './version.js';
@@ -137,6 +138,10 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     env: process.env,
   });
 });
+
+// Corporate/CI proxies: honor HTTPS_PROXY/HTTP_PROXY/NO_PROXY (Node's fetch
+// ignores them by default). No-op when no proxy variable is set.
+maybeInstallProxyAgent();
 
 try {
   await program.parseAsync(process.argv);
