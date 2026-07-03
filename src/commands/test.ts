@@ -452,6 +452,12 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
     maxItems: opts.maxItems,
   });
 
+  // M2.1 piece 2: validate `--status` tokens client-side before
+  // sending. Friendlier error than waiting for the server's 400 with
+  // a list of accepted tokens — and lets the user fix typos without
+  // a round trip.
+  validateStatusFilter(opts.status);
+
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
 
@@ -459,12 +465,6 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
   // operator can grab one slice + cursor without auto-paging through a
   // huge project.
   const useSinglePage = opts.pageSize !== undefined && opts.maxItems === undefined;
-
-  // M2.1 piece 2: validate `--status` tokens client-side before
-  // sending. Friendlier error than waiting for the server's 400 with
-  // a list of accepted tokens — and lets the user fix typos without
-  // a round trip.
-  validateStatusFilter(opts.status);
 
   const baseQuery: Record<string, string | number | boolean | undefined> = {
     projectId: opts.projectId,

@@ -475,6 +475,34 @@ describe('runList', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', details: { field: 'page-size' } });
   });
 
+  it('rejects invalid --status before requiring credentials', async () => {
+    const credentialsPath = join(mkdtempSync(join(tmpdir(), 'cli-list-status-')), 'credentials');
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runList(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_alice',
+          status: 'notastatus',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => undefined,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'status' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('forwards a server-side VALIDATION_ERROR envelope as ApiError exit 5', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(() => ({
