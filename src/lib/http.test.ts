@@ -140,6 +140,53 @@ describe('HttpClient happy path', () => {
   });
 });
 
+describe('HttpClient — 200 response with a non-JSON body', () => {
+  function htmlResponse(status = 200): Response {
+    return new Response('<!DOCTYPE html><html><body>Login</body></html>', {
+      status,
+      headers: { 'content-type': 'text/html' },
+    });
+  }
+
+  it('throws a typed INTERNAL ApiError (not a raw SyntaxError) with the requestId and details', async () => {
+    const fetchImpl = vi.fn(async () => htmlResponse());
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    let caught: unknown;
+    try {
+      await client.get('/me');
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ApiError);
+    const apiErr = caught as ApiError;
+    expect(apiErr.code).toBe('INTERNAL');
+    expect(apiErr.exitCode).toBe(1);
+    expect(apiErr.requestId).toMatch(/^cli_/);
+    expect(apiErr.message).toContain('non-JSON response');
+    expect(apiErr.nextAction).toContain('TESTSPRITE_API_URL');
+    expect(apiErr.details).toMatchObject({ httpStatus: 200, contentType: 'text/html' });
+    expect(String(apiErr.details.parseError)).toContain('JSON');
+  });
+
+  it('does not retry a malformed 200 body (single fetch call)', async () => {
+    const fetchImpl = vi.fn(async () => htmlResponse());
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.get('/me')).rejects.toBeInstanceOf(ApiError);
+    // A non-JSON success body is a hard config error, not a transient transport
+    // failure — it must not burn the retry budget.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('handles an empty 200 body the same way', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response('', { status: 200, headers: { 'content-type': 'application/json' } }),
+    );
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.get('/me')).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+  });
+});
+
 describe('HttpClient error mapping', () => {
   it('does not retry AUTH_INVALID and exits 3', async () => {
     const fetchImpl = vi.fn(async () => errorEnvelopeResponse(401, 'AUTH_INVALID'));

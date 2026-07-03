@@ -498,7 +498,13 @@ export class HttpClient {
         } catch (err) {
           // A timeout/abort can fire mid-body-read (headers received, stream stalls).
           this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId);
-          throw err;
+          // Otherwise the successful response body was not valid JSON — a
+          // misconfigured endpoint, a proxy / captive-portal / login page that
+          // returns HTML with a 200 status, or an empty body. Surface a typed
+          // error carrying the requestId instead of letting the raw SyntaxError
+          // escape to index.ts, where it would print a bare `{"error":"..."}`
+          // and break the --output json envelope contract.
+          throw malformedResponseError(response, requestId, err);
         }
       }
 
@@ -690,6 +696,53 @@ async function safeReadJson(response: Response): Promise<unknown> {
     if (isAbortError(err) || isTimeoutError(err)) throw err;
     return null;
   }
+}
+
+/**
+ * Build a typed error for a successful response whose body could not be parsed
+ * as JSON.
+ *
+ * The CLI expects every API response to be a JSON envelope. When a `200 OK`
+ * carries a non-JSON body — a misconfigured endpoint, a proxy / captive-portal
+ * / SSO login page returning HTML with a success status, or an empty body —
+ * `response.json()` throws a raw `SyntaxError`. Left unhandled it escapes to
+ * the top-level handler in `index.ts`, which prints a bare
+ * `{"error":"<parse message>"}` under `--output json` (breaking the
+ * typed-envelope contract every other error honors) and gives the operator no
+ * actionable context.
+ *
+ * This wraps it in a typed `INTERNAL` `ApiError` (exit 1, unchanged) that
+ * carries the `requestId`, names the likely cause, and points the operator at
+ * their endpoint configuration. `details` includes the HTTP status, the
+ * response `content-type` (when present), and the underlying parse message.
+ */
+export function malformedResponseError(
+  response: Response,
+  requestId: string,
+  cause: unknown,
+): ApiError {
+  const contentType = response.headers.get('content-type') ?? undefined;
+  const parseError = cause instanceof Error ? cause.message : String(cause);
+  const contentTypeNote = contentType ? ` (content-type: ${contentType})` : '';
+  return new ApiError(
+    {
+      code: 'INTERNAL',
+      message:
+        `The server returned a non-JSON response${contentTypeNote} for an HTTP ${response.status}. ` +
+        `This usually means the endpoint is not the TestSprite API — a proxy, captive portal, or ` +
+        `login page can return HTML with a success status.`,
+      nextAction:
+        'Check that --endpoint-url / TESTSPRITE_API_URL points at the TestSprite API ' +
+        '(default https://api.testsprite.com), then retry.',
+      requestId,
+      details: {
+        httpStatus: response.status,
+        ...(contentType ? { contentType } : {}),
+        parseError,
+      },
+    },
+    response.status,
+  );
 }
 
 export function parseRetryAfter(headerValue: string | null): number | undefined {
