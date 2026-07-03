@@ -543,6 +543,30 @@ async function freshTmpDir(dir: string): Promise<string> {
  * caught reading the dir during it sees no meta and refuses to consume
  * (per §7.3). That's what we want.
  */
+/**
+ * Whether a top-level directory entry belongs to the bundle format —
+ * i.e. something a prior `writeBundle` could have produced and this
+ * commit is therefore allowed to clean up. `code.<ext>` is matched by
+ * pattern (not the current run's extension) so a stale `code.py` is
+ * still swept when the new bundle writes `code.ts`. Everything else in
+ * the directory is the user's and must never be deleted (`--out` can
+ * point at a pre-existing, populated directory).
+ */
+export function isBundleOwnedEntry(entry: string): boolean {
+  if (
+    entry === 'result.json' ||
+    entry === 'failure.json' ||
+    entry === 'video.mp4' ||
+    entry === 'meta.json' ||
+    entry === 'steps' ||
+    entry === '.tmp' ||
+    entry === '.partial'
+  ) {
+    return true;
+  }
+  return /^code\.[A-Za-z0-9]+$/.test(entry);
+}
+
 async function commitBundle(
   tmpDir: string,
   dir: string,
@@ -553,20 +577,22 @@ async function commitBundle(
 
   // (2) Sweep stale top-level files that the new bundle won't write.
   // If the prior run wrote `video.mp4` and the new run has no video,
-  // an in-place rename leaves the old video lingering. Enumerate
-  // current top-level entries and remove anything that isn't being
-  // freshly renamed in.
+  // an in-place rename leaves the old video lingering. Only entries the
+  // bundle format OWNS are candidates: `--out` may point at a directory
+  // that also holds the user's unrelated files, and those must survive
+  // the commit (deleting them would be silent data loss).
   const topLevel = files.filter(f => !f.startsWith('steps/'));
   const newTopLevelSet = new Set(topLevel);
   newTopLevelSet.add('meta.json'); // about to land last, do not delete
   const existing = await readdir(dir).catch(() => [] as string[]);
   for (const entry of existing) {
     // Preserve the writer's own scratch dir + the .partial marker
-    // (we'll re-evaluate .partial at the end of commit). Anything else
-    // not-listed in the new bundle is stale.
+    // (we'll re-evaluate .partial at the end of commit). Any other
+    // bundle-owned entry not-listed in the new bundle is stale.
     if (entry === '.tmp' || entry === '.partial') continue;
     if (newTopLevelSet.has(entry)) continue;
     if (entry === 'steps') continue; // handled below
+    if (!isBundleOwnedEntry(entry)) continue; // foreign file — never touch
     await rm(join(dir, entry), { recursive: true, force: true });
   }
 

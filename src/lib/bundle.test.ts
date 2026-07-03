@@ -8,7 +8,7 @@
  * the full http+fetch path is wired against MSW).
  */
 
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -18,6 +18,7 @@ import {
   assertNoEscape,
   BUNDLE_SCHEMA_VERSION,
   buildMeta,
+  isBundleOwnedEntry,
   pickCodeExtension,
   resolveBundleDir,
   STREAM_URL_MAX_RETRIES,
@@ -694,6 +695,37 @@ describe('streamUrlToFile retry', () => {
   });
 });
 
+describe('isBundleOwnedEntry', () => {
+  it('owns the fixed bundle file set', () => {
+    for (const entry of [
+      'result.json',
+      'failure.json',
+      'video.mp4',
+      'meta.json',
+      'steps',
+      '.tmp',
+      '.partial',
+    ]) {
+      expect(isBundleOwnedEntry(entry)).toBe(true);
+    }
+  });
+
+  it('owns code.<ext> for any single-token extension', () => {
+    expect(isBundleOwnedEntry('code.ts')).toBe(true);
+    expect(isBundleOwnedEntry('code.js')).toBe(true);
+    expect(isBundleOwnedEntry('code.py')).toBe(true);
+  });
+
+  it('does not own foreign entries', () => {
+    expect(isBundleOwnedEntry('notes.txt')).toBe(false);
+    expect(isBundleOwnedEntry('src')).toBe(false);
+    expect(isBundleOwnedEntry('.git')).toBe(false);
+    expect(isBundleOwnedEntry('code.tar.gz')).toBe(false);
+    expect(isBundleOwnedEntry('mycode.ts')).toBe(false);
+    expect(isBundleOwnedEntry('code.')).toBe(false);
+  });
+});
+
 describe('step artifact path validation', () => {
   // A fetchImpl that fails the test if called — proves validation rejects
   // before any write happens.
@@ -805,6 +837,49 @@ describe('step artifact path validation', () => {
     });
     expect(res.files).toContain('meta.json');
     expect(existsSync(join(res.dir, 'meta.json'))).toBe(true);
+  });
+
+  describe('commit sweep ownership (data-loss guard)', () => {
+    it('preserves pre-existing foreign files and directories in the --out dir', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'bundle-test-'));
+      writeFileSync(join(dir, 'notes.txt'), 'important notes\n', 'utf8');
+      mkdirSync(join(dir, 'src'));
+      writeFileSync(join(dir, 'src', 'app.js'), "console.log('app')\n", 'utf8');
+
+      const res = await writeBundle(stepCtx(3), {
+        dir,
+        failedOnly: false,
+        fetchImpl: throwIfFetched,
+      });
+
+      // The bundle landed…
+      expect(existsSync(join(res.dir, 'meta.json'))).toBe(true);
+      expect(existsSync(join(res.dir, 'result.json'))).toBe(true);
+      // …and the user's unrelated files survived the commit sweep.
+      expect(readFileSync(join(dir, 'notes.txt'), 'utf8')).toBe('important notes\n');
+      expect(readFileSync(join(dir, 'src', 'app.js'), 'utf8')).toBe("console.log('app')\n");
+    });
+
+    it('still sweeps a stale bundle-owned video.mp4 the new bundle does not write', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'bundle-test-'));
+      writeFileSync(join(dir, 'video.mp4'), 'stale-bytes', 'utf8');
+
+      // stepCtx has videoUrl: null → the fresh bundle ships no video.
+      await writeBundle(stepCtx(3), { dir, failedOnly: false, fetchImpl: throwIfFetched });
+
+      expect(existsSync(join(dir, 'video.mp4'))).toBe(false);
+    });
+
+    it('sweeps a stale code file with a different extension than the new bundle writes', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'bundle-test-'));
+      writeFileSync(join(dir, 'code.py'), '# stale python code\n', 'utf8');
+
+      // baseCtx.code.language is 'typescript' → the fresh bundle writes code.ts.
+      await writeBundle(stepCtx(3), { dir, failedOnly: false, fetchImpl: throwIfFetched });
+
+      expect(existsSync(join(dir, 'code.ts'))).toBe(true);
+      expect(existsSync(join(dir, 'code.py'))).toBe(false);
+    });
   });
 
   describe('assertNoEscape', () => {
