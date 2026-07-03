@@ -5653,6 +5653,18 @@ export async function runTestRerun(
       'provide at least one <test-id>, or use --all to rerun all tests in the project',
     );
   }
+  // Explicit ids + --all is ambiguous: the --all branch resolves the FULL
+  // project test set and overwrites the listed ids, so the user's narrowing
+  // intent would be silently replaced by a whole-project batch rerun —
+  // burning rerun/auto-heal credits. Reject early. (Mirrors `test run`'s
+  // positional+--all guard and delete-batch's ids+--all data-loss guard.)
+  if (opts.all && opts.testIds.length > 0) {
+    throw localValidationError(
+      'test-ids',
+      'pass either explicit test IDs or --all, not both — --all reruns every test in the ' +
+        'project and would ignore the listed IDs. Drop the IDs, or drop --all.',
+    );
+  }
   if (opts.all && !opts.projectId) {
     throw localValidationError(
       'project',
@@ -5669,6 +5681,24 @@ export async function runTestRerun(
       'filter',
       '--filter only applies with --all (it narrows which project tests get reran). ' +
         'Remove --filter, or add --all --project <id>.',
+    );
+  }
+  // --status and --skip-terminal are --all-only narrowing filters with the
+  // same silent-ignore failure mode as --filter above: without --all the
+  // explicit ids get reran unfiltered (and an invalid --status value is
+  // never even validated). Reject both, mirroring the --filter guard.
+  if (opts.statusFilter !== undefined && !opts.all) {
+    throw localValidationError(
+      'status',
+      '--status only applies with --all (it narrows which project tests get reran). ' +
+        'Remove --status, or add --all --project <id>.',
+    );
+  }
+  if (opts.skipTerminal && !opts.all) {
+    throw localValidationError(
+      'skip-terminal',
+      '--skip-terminal only applies with --all (it narrows which project tests get reran). ' +
+        'Remove --skip-terminal, or add --all --project <id>.',
     );
   }
   if (
