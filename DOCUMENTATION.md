@@ -426,12 +426,13 @@ These apply to every command:
 
 ### Environment variables
 
-| Variable                        | Purpose                                                                           |
-| ------------------------------- | --------------------------------------------------------------------------------- |
-| `TESTSPRITE_API_KEY`            | API key — overrides the credentials file                                          |
-| `TESTSPRITE_API_URL`            | API endpoint — overrides the credentials file                                     |
-| `TESTSPRITE_PROFILE`            | Active profile (below `--profile`, above `default`)                               |
-| `TESTSPRITE_REQUEST_TIMEOUT_MS` | Per-request timeout in **milliseconds** (default `120000`, range `1000`–`600000`) |
+| Variable                        | Purpose                                                                                          |
+| ------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `TESTSPRITE_API_KEY`            | API key — overrides the credentials file                                                         |
+| `TESTSPRITE_API_URL`            | API endpoint — overrides the credentials file                                                    |
+| `TESTSPRITE_PROFILE`            | Active profile (below `--profile`, above `default`)                                              |
+| `TESTSPRITE_PROJECT_ID`         | Default project for `test list`, `test create`, and `test run --all` when `--project` is omitted |
+| `TESTSPRITE_REQUEST_TIMEOUT_MS` | Per-request timeout in **milliseconds** (default `120000`, range `1000`–`600000`)                |
 
 ### Scopes
 

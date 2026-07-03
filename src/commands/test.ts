@@ -381,7 +381,7 @@ export interface TestDeps {
 type CommonOptions = FactoryCommonOptions;
 
 interface ListOptions extends CommonOptions {
-  projectId: string;
+  projectId?: string;
   type?: 'frontend' | 'backend';
   createdFrom?: 'portal' | 'mcp' | 'cli';
   /**
@@ -444,7 +444,8 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
   // (exit 3) when the caller also lacks a configured key. Order matters
   // for the CLI error spec §2 — bad input is a caller bug, not an auth
   // gate.
-  requireProjectId(opts.projectId);
+  const projectId = resolveProjectId(opts.projectId, deps);
+  requireProjectId(projectId);
 
   const paginationFlags: PaginationFlags = validatePaginationFlags({
     pageSize: opts.pageSize,
@@ -467,7 +468,7 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
   validateStatusFilter(opts.status);
 
   const baseQuery: Record<string, string | number | boolean | undefined> = {
-    projectId: opts.projectId,
+    projectId,
     type: opts.type,
     createdFrom: opts.createdFrom,
     status: opts.status,
@@ -523,7 +524,7 @@ export type CliCreatePriority = (typeof CLI_CREATE_PRIORITIES)[number];
 const MAX_INLINE_CODE_BYTES = 350 * 1024;
 
 interface CreateOptions extends CommonOptions {
-  projectId: string;
+  projectId?: string;
   type: 'frontend' | 'backend';
   name: string;
   description?: string;
@@ -671,7 +672,8 @@ export async function runCreate(
   assertChainedRunKeyFits(opts.run, opts.idempotencyKey);
   // Validate inputs before touching credentials or fs — matches the
   // M2 read commands' "input gates first, then auth, then I/O" ordering.
-  requireProjectId(opts.projectId);
+  const projectId = resolveProjectId(opts.projectId, deps);
+  requireProjectId(projectId);
   requireNonEmpty('name', opts.name);
   // P1-3: client-side length checks matching server limits (name ≤200,
   // description ≤2000) so the user gets instant, actionable errors instead
@@ -747,7 +749,7 @@ export async function runCreate(
   }
 
   const body: Record<string, unknown> = {
-    projectId: opts.projectId,
+    projectId,
     type: opts.type,
     name: opts.name,
     description: opts.description,
@@ -791,7 +793,7 @@ export async function runCreate(
   // B3: best-effort duplicate-name advisory. Skip under --dry-run.
   if (!opts.dryRun) {
     const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-    await emitDupNameAdvisoryIfNeeded(client, opts.projectId, opts.name, stderrFn);
+    await emitDupNameAdvisoryIfNeeded(client, projectId, opts.name, stderrFn);
   }
 
   const response = await client.post<CliCreateTestResponse>('/tests', {
@@ -811,7 +813,7 @@ export async function runCreate(
     // R1: suppress under --dry-run (fake canned test id).
     const chainDashboardUrl = opts.dryRun
       ? undefined
-      : resolvePortalUrl(resolveApiUrl(opts, deps), opts.projectId, response.testId);
+      : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId);
     const createContextWithUrl =
       chainDashboardUrl !== undefined ? { ...response, dashboardUrl: chainDashboardUrl } : response;
     await runTestRun(
@@ -841,7 +843,7 @@ export async function runCreate(
   // (e.g. "test_dryrun_create_2026") and a live-looking URL would mislead.
   const dashboardUrl = opts.dryRun
     ? undefined
-    : resolvePortalUrl(resolveApiUrl(opts, deps), opts.projectId, response.testId);
+    : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId);
   if (opts.output === 'json') {
     out.print(dashboardUrl !== undefined ? { ...response, dashboardUrl } : response, data =>
       renderCreateText(data as CliCreateTestResponse),
@@ -5060,7 +5062,7 @@ export async function runTestWait(
 
 interface RunTestRunAllOptions extends CommonOptions {
   /** projectId to run all BE tests in. */
-  projectId: string;
+  projectId?: string;
   /** --filter <substr>: only run tests whose name contains this substring (case-insensitive). */
   nameFilter?: string;
   /** --wait: block until terminal or --timeout. */
@@ -5097,7 +5099,8 @@ export async function runTestRunAll(
   deps: TestDeps = {},
 ): Promise<BatchRunFreshResponse | undefined> {
   assertIdempotencyKey(opts.idempotencyKey);
-  requireProjectId(opts.projectId);
+  const projectId = resolveProjectId(opts.projectId, deps);
+  requireProjectId(projectId);
   if (
     !Number.isInteger(opts.maxConcurrency) ||
     opts.maxConcurrency < 1 ||
@@ -5121,7 +5124,7 @@ export async function runTestRunAll(
       method: 'POST',
       path: '/api/cli/v1/tests/batch/run',
       body: {
-        projectId: opts.projectId,
+        projectId,
         testIds: opts.nameFilter ? ['<filtered by --filter>'] : undefined,
         source: 'cli' as const,
       },
@@ -5144,9 +5147,9 @@ export async function runTestRunAll(
   const projectDashboardUrl =
     batchPortalBase === undefined
       ? undefined
-      : `${batchPortalBase}/dashboard/tests/${encodeURIComponent(opts.projectId)}`;
+      : `${batchPortalBase}/dashboard/tests/${encodeURIComponent(projectId)}`;
   const withBatchDashboardUrl = <T extends { testId: string }>(item: T): T => {
-    const dashboardUrl = resolvePortalUrl(batchApiUrl, opts.projectId, item.testId);
+    const dashboardUrl = resolvePortalUrl(batchApiUrl, projectId, item.testId);
     return dashboardUrl !== undefined ? { ...item, dashboardUrl } : item;
   };
 
@@ -5162,7 +5165,7 @@ export async function runTestRunAll(
     const allPage = await paginate<CliTest>(
       async ({ pageSize, cursor }) =>
         client.get<Page<CliTest>>('/tests', {
-          query: { projectId: opts.projectId, pageSize, cursor },
+          query: { projectId, pageSize, cursor },
         }),
       {},
     );
@@ -5178,7 +5181,7 @@ export async function runTestRunAll(
     testIds = filtered.map(t => t.id);
     if (testIds.length === 0) {
       stderrFn(
-        `No tests found in project ${opts.projectId} matching --filter "${opts.nameFilter}" — nothing to run.`,
+        `No tests found in project ${projectId} matching --filter "${opts.nameFilter}" — nothing to run.`,
       );
       out.print({
         accepted: [],
@@ -5190,14 +5193,14 @@ export async function runTestRunAll(
       return undefined;
     }
     stderrFn(
-      `Resolved ${testIds.length} test${testIds.length !== 1 ? 's' : ''} in project ${opts.projectId} for batch run.`,
+      `Resolved ${testIds.length} test${testIds.length !== 1 ? 's' : ''} in project ${projectId} for batch run.`,
     );
   }
   // When no --filter, omit testIds → server runs ALL BE tests in the project.
 
   const batchResp = await client.triggerBatchRunFresh(
     {
-      projectId: opts.projectId,
+      projectId,
       ...(testIds !== undefined ? { testIds } : {}),
       source: 'cli',
     },
@@ -5341,7 +5344,7 @@ export async function runTestRunAll(
     try {
       retryResp = await client.triggerBatchRunFresh(
         {
-          projectId: opts.projectId,
+          projectId,
           testIds: retryIds,
           source: 'cli',
         },
@@ -7465,10 +7468,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
       if (isAll) {
         // --all path: wave-ordered fresh batch run.
-        if (!cmdOpts.project) {
+        const projectId = resolveProjectId(cmdOpts.project, deps);
+        if (!projectId) {
           throw localValidationError(
             'project',
-            '--all requires a project id — pass --project <id>',
+            '--all requires a project id - pass --project <id> or set TESTSPRITE_PROJECT_ID',
           );
         }
         // --target-url has no effect on the --all batch path: it is BE-only
@@ -7484,7 +7488,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         await runTestRunAll(
           {
             ...resolveCommonOptions(command),
-            projectId: cmdOpts.project,
+            projectId,
             nameFilter: cmdOpts.filter,
             wait: cmdOpts.wait === true,
             timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
@@ -7772,7 +7776,13 @@ interface StepsFlagOpts {
   runId?: string;
 }
 
-function requireProjectId(projectId: string): void {
+function resolveProjectId(projectId: string | undefined, deps: TestDeps): string | undefined {
+  if (projectId !== undefined) return projectId;
+  const envValue = (deps.env ?? process.env).TESTSPRITE_PROJECT_ID;
+  const trimmed = envValue?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+function requireProjectId(projectId: string | undefined): asserts projectId is string {
   if (typeof projectId !== 'string' || projectId.length === 0) {
     throw localValidationError('project', 'is required');
   }
