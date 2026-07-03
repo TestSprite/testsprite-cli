@@ -3803,12 +3803,20 @@ export function parseDuration(raw: string, now: Date = new Date()): string {
   const hourMatch = /^(\d+)h$/i.exec(raw);
   if (hourMatch) {
     const hours = Number(hourMatch[1]);
-    return new Date(now.getTime() - hours * 60 * 60 * 1000).toISOString();
+    const result = new Date(now.getTime() - hours * 60 * 60 * 1000);
+    if (!Number.isFinite(result.getTime())) {
+      throw localValidationError('since', 'duration is too large; maximum is ~1141552511h');
+    }
+    return result.toISOString();
   }
   const dayMatch = /^(\d+)d$/i.exec(raw);
   if (dayMatch) {
     const days = Number(dayMatch[1]);
-    return new Date(now.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
+    const result = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+    if (!Number.isFinite(result.getTime())) {
+      throw localValidationError('since', 'duration is too large; maximum is ~47564688d');
+    }
+    return result.toISOString();
   }
   // Pass-through: ISO timestamp or epoch value — server validates.
   return raw;
