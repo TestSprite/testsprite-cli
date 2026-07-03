@@ -199,6 +199,11 @@ Commands:
   steps [options] <test-id>             List the steps for a test (server
                                         returns the cumulative log across every
                                         run; use --run-id to scope to one run)
+  diff <run-a> <run-b>                  Compare two runs and print what
+                                        regressed: verdict, failureKind,
+                                        failedStepIndex, per-step status flips,
+                                        codeVersion drift. Exit 0 when verdicts
+                                        match, 1 when they differ.
   result [options] <test-id>            Get the latest result for a test (default) or list prior runs (--history).
   
   --output json shape differs by mode:

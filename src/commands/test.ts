@@ -3630,6 +3630,196 @@ function mapRunStepToCliTestStep(step: RunStepDto, run: RunResponse): CliTestSte
   };
 }
 
+export interface DiffOptions extends CommonOptions {
+  runA: string;
+  runB: string;
+}
+
+/** One step whose status flipped between the two compared runs. */
+export interface CliDiffStep {
+  stepIndex: number;
+  statusA: string;
+  statusB: string;
+  /** First divergent failing side's error text, when the wire carried one. */
+  errorA?: string | null;
+  errorB?: string | null;
+}
+
+export interface CliRunDiff {
+  runA: {
+    runId: string;
+    testId: string;
+    status: string;
+    failureKind: string | null;
+    failedStepIndex: number | null;
+    codeVersion: string | null;
+  };
+  runB: {
+    runId: string;
+    testId: string;
+    status: string;
+    failureKind: string | null;
+    failedStepIndex: number | null;
+    codeVersion: string | null;
+  };
+  verdictChanged: boolean;
+  failedStepIndexChanged: boolean;
+  failureKindChanged: boolean;
+  codeVersionChanged: boolean;
+  /** True when the two runs belong to DIFFERENT tests (deltas may be meaningless). */
+  crossTest: boolean;
+  changedSteps: CliDiffStep[];
+}
+
+/**
+ * `test diff <runA> <runB>` (issue #124): isolate what regressed between two
+ * runs, the first question when CI goes red ("what changed since the last
+ * green run?"). Pure client-side composition of the existing per-run read
+ * (`GET /runs/{id}?includeSteps=true`); the endpoint accepts any two run-ids,
+ * so a cross-test pair is a WARNING, not an error. Exit 0 when the verdicts
+ * match, exit 1 when they differ, so the command is CI-scriptable.
+ */
+export async function runDiff(opts: DiffOptions, deps: TestDeps = {}): Promise<CliRunDiff> {
+  const out = makeOutput(opts.output, deps);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+
+  if (opts.dryRun) {
+    emitDryRunBanner(stderrFn);
+    const sample: CliRunDiff = {
+      runA: {
+        runId: opts.runA,
+        testId: 'test_dryrun',
+        status: 'passed',
+        failureKind: null,
+        failedStepIndex: null,
+        codeVersion: 'v1',
+      },
+      runB: {
+        runId: opts.runB,
+        testId: 'test_dryrun',
+        status: 'failed',
+        failureKind: 'assertion',
+        failedStepIndex: 2,
+        codeVersion: 'v1',
+      },
+      verdictChanged: true,
+      failedStepIndexChanged: true,
+      failureKindChanged: true,
+      codeVersionChanged: false,
+      crossTest: false,
+      changedSteps: [{ stepIndex: 2, statusA: 'passed', statusB: 'failed' }],
+    };
+    out.print(sample, () => renderRunDiffText(sample));
+    return sample;
+  }
+
+  const client = makeClient(opts, deps);
+  const [runA, runB] = await Promise.all([
+    client.getRun(opts.runA, { includeSteps: true }),
+    client.getRun(opts.runB, { includeSteps: true }),
+  ]);
+
+  const crossTest = runA.testId !== runB.testId;
+  if (crossTest) {
+    stderrFn(
+      `⚠ the two runs belong to different tests (${runA.testId} vs ${runB.testId}) — step deltas may be meaningless`,
+    );
+  }
+
+  const stepsByIndex = (
+    run: RunResponse,
+  ): Map<number, { status: string; error: string | null }> => {
+    const map = new Map<number, { status: string; error: string | null }>();
+    for (const step of run.steps ?? []) {
+      const index = parseInt(step.stepIndex, 10);
+      if (Number.isInteger(index))
+        map.set(index, { status: step.status ?? 'unknown', error: step.error });
+    }
+    return map;
+  };
+  const stepsA = stepsByIndex(runA);
+  const stepsB = stepsByIndex(runB);
+  const allIndexes = [...new Set([...stepsA.keys(), ...stepsB.keys()])].sort(
+    (left, right) => left - right,
+  );
+  const changedSteps: CliDiffStep[] = [];
+  for (const index of allIndexes) {
+    const sideA = stepsA.get(index);
+    const sideB = stepsB.get(index);
+    const statusA = sideA?.status ?? 'absent';
+    const statusB = sideB?.status ?? 'absent';
+    if (statusA === statusB) continue;
+    changedSteps.push({
+      stepIndex: index,
+      statusA,
+      statusB,
+      ...(sideA?.error ? { errorA: sideA.error } : {}),
+      ...(sideB?.error ? { errorB: sideB.error } : {}),
+    });
+  }
+
+  const summarize = (run: RunResponse) => ({
+    runId: run.runId,
+    testId: run.testId,
+    status: run.status,
+    failureKind: run.failureKind ?? null,
+    failedStepIndex: run.failedStepIndex,
+    codeVersion: run.codeVersion ?? null,
+  });
+  const diff: CliRunDiff = {
+    runA: summarize(runA),
+    runB: summarize(runB),
+    verdictChanged: runA.status !== runB.status,
+    failedStepIndexChanged: runA.failedStepIndex !== runB.failedStepIndex,
+    failureKindChanged: (runA.failureKind ?? null) !== (runB.failureKind ?? null),
+    codeVersionChanged: (runA.codeVersion ?? null) !== (runB.codeVersion ?? null),
+    crossTest,
+    changedSteps,
+  };
+  out.print(diff, () => renderRunDiffText(diff));
+
+  if (diff.verdictChanged) {
+    // Result already printed; the typed exit makes `test diff` a CI gate.
+    throw new CLIError(
+      `verdicts differ: ${runA.runId}=${runA.status} vs ${runB.runId}=${runB.status}`,
+      1,
+    );
+  }
+  return diff;
+}
+
+function renderRunDiffText(diff: CliRunDiff): string {
+  const lines: string[] = [];
+  lines.push(`runA:  ${diff.runA.runId}  ${diff.runA.status}  (test ${diff.runA.testId})`);
+  lines.push(`runB:  ${diff.runB.runId}  ${diff.runB.status}  (test ${diff.runB.testId})`);
+  lines.push(
+    `verdict:          ${diff.verdictChanged ? `${diff.runA.status} -> ${diff.runB.status}` : `unchanged (${diff.runA.status})`}`,
+  );
+  if (diff.failureKindChanged)
+    lines.push(
+      `failureKind:      ${diff.runA.failureKind ?? '(none)'} -> ${diff.runB.failureKind ?? '(none)'}`,
+    );
+  if (diff.failedStepIndexChanged)
+    lines.push(
+      `failedStepIndex:  ${diff.runA.failedStepIndex ?? '(none)'} -> ${diff.runB.failedStepIndex ?? '(none)'}`,
+    );
+  lines.push(
+    `codeVersion:      ${diff.codeVersionChanged ? `${diff.runA.codeVersion ?? '(none)'} -> ${diff.runB.codeVersion ?? '(none)'} (code drift)` : 'unchanged'}`,
+  );
+  if (diff.changedSteps.length === 0) {
+    lines.push('steps:            no per-step status changes');
+  } else {
+    lines.push(`steps changed:    ${diff.changedSteps.length}`);
+    for (const step of diff.changedSteps) {
+      lines.push(`  #${step.stepIndex}  ${step.statusA} -> ${step.statusB}`);
+      if (step.errorB) lines.push(`      error(B): ${step.errorB.replace(/\s+/g, ' ').trim()}`);
+      else if (step.errorA)
+        lines.push(`      error(A): ${step.errorA.replace(/\s+/g, ' ').trim()}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 export async function runSteps(
   opts: StepsOptions,
   deps: TestDeps = {},
@@ -7232,6 +7422,16 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         },
         deps,
       );
+    });
+
+  test
+    .command('diff <run-a> <run-b>')
+    .description(
+      'Compare two runs and print what regressed: verdict, failureKind, failedStepIndex, per-step status flips, codeVersion drift. Exit 0 when verdicts match, 1 when they differ.',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (runA: string, runB: string, _cmdOpts: unknown, command: Command) => {
+      await runDiff({ ...resolveCommonOptions(command), runA, runB }, deps);
     });
 
   test

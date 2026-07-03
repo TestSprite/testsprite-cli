@@ -27,6 +27,7 @@ import {
   runCreateBatch,
   runCreateFromPlan,
   runDelete,
+  runDiff,
   runFailureGet,
   runFailureSummary,
   runGet,
@@ -121,6 +122,7 @@ describe('createTestCommand — surface', () => {
       'create-batch',
       'delete',
       'delete-batch',
+      'diff',
       'failure',
       'get',
       'list',
@@ -2718,6 +2720,106 @@ describe('runSteps', () => {
     const steps = test.commands.find(c => c.name() === 'steps')!;
     const flagNames = steps.options.map(o => o.long);
     expect(flagNames).toContain('--run-id');
+  });
+});
+
+describe('runDiff', () => {
+  const baseRun = {
+    testId: 'test_fe',
+    projectId: 'project_alice',
+    userId: 'u1',
+    source: 'cli',
+    createdAt: '2026-06-01T10:00:00.000Z',
+    startedAt: '2026-06-01T10:00:01.000Z',
+    finishedAt: '2026-06-01T10:00:30.000Z',
+    targetUrl: 'https://example.com',
+    createdFrom: null,
+    error: null,
+    videoUrl: null,
+    stepSummary: { total: 2, completed: 2, passedCount: 2, failedCount: 0 },
+  };
+  const makeStep = (index: string, status: string, error: string | null = null) => ({
+    stepIndex: index,
+    type: 'action',
+    action: `step ${index}`,
+    status,
+    description: `Step ${index}`,
+    error,
+    screenshotUrl: null,
+    htmlSnapshotUrl: null,
+    createdAt: '2026-06-01T10:00:05.000Z',
+  });
+  const RUN_GREEN = {
+    ...baseRun,
+    runId: 'run_green',
+    status: 'passed',
+    codeVersion: 'v1',
+    failedStepIndex: null,
+    failureKind: null,
+    steps: [makeStep('0001', 'passed'), makeStep('0002', 'passed')],
+  };
+  const RUN_RED = {
+    ...baseRun,
+    runId: 'run_red',
+    status: 'failed',
+    codeVersion: 'v2',
+    failedStepIndex: 2,
+    failureKind: 'assertion',
+    steps: [makeStep('0001', 'passed'), makeStep('0002', 'failed', 'heading not visible')],
+  };
+  const fetchForRuns = () =>
+    makeFetch(url => ({ body: url.includes('run_green') ? RUN_GREEN : RUN_RED }));
+
+  it('reports the verdict flip, the changed step with its error, and code drift, then exits 1', async () => {
+    const { credentialsPath } = makeCreds();
+    const out: string[] = [];
+    const rejection = await runDiff(
+      { profile: 'default', output: 'json', debug: false, runA: 'run_green', runB: 'run_red' },
+      { credentialsPath, fetchImpl: fetchForRuns(), stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 1 });
+    const printed = JSON.parse(out.join('')) as {
+      verdictChanged: boolean;
+      codeVersionChanged: boolean;
+      crossTest: boolean;
+      changedSteps: Array<{ stepIndex: number; statusA: string; statusB: string; errorB?: string }>;
+    };
+    expect(printed.verdictChanged).toBe(true);
+    expect(printed.codeVersionChanged).toBe(true);
+    expect(printed.crossTest).toBe(false);
+    expect(printed.changedSteps).toHaveLength(1);
+    expect(printed.changedSteps[0]).toMatchObject({
+      stepIndex: 2,
+      statusA: 'passed',
+      statusB: 'failed',
+      errorB: 'heading not visible',
+    });
+  });
+
+  it('identical verdicts resolve with exit 0 and no step changes', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: RUN_GREEN }));
+    const diff = await runDiff(
+      { profile: 'default', output: 'json', debug: false, runA: 'run_green', runB: 'run_green' },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(diff.verdictChanged).toBe(false);
+    expect(diff.changedSteps).toHaveLength(0);
+  });
+
+  it('warns (not fails) when the runs belong to different tests', async () => {
+    const { credentialsPath } = makeCreds();
+    const OTHER = { ...RUN_GREEN, runId: 'run_red', testId: 'test_other' };
+    const fetchImpl = makeFetch(url => ({
+      body: url.includes('run_green') ? RUN_GREEN : OTHER,
+    }));
+    const errs: string[] = [];
+    const diff = await runDiff(
+      { profile: 'default', output: 'json', debug: false, runA: 'run_green', runB: 'run_red' },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: line => errs.push(line) },
+    );
+    expect(diff.crossTest).toBe(true);
+    expect(errs.join('\n')).toContain('different tests');
   });
 });
 
