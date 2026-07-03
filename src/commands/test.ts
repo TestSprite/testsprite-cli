@@ -8255,6 +8255,19 @@ function renderStepsText(page: Page<CliTestStep>): string {
  * compact — JSON mode is the automation contract; this is for an
  * engineer running it interactively.
  */
+function redactUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return value;
+  }
+}
+
 function renderFailureContextText(ctx: CliFailureContext): string {
   const lines: string[] = [];
   lines.push(`status:           ${ctx.result.status}`);
@@ -8288,7 +8301,8 @@ function renderFailureContextText(ctx: CliFailureContext): string {
     const breakdown = [...counts.entries()].map(([k, n]) => `${k}×${n}`).join(', ');
     lines.push(`evidence:         ${ctx.failure.evidence.length} items (${breakdown})`);
   }
-  if (ctx.result.videoUrl !== null) lines.push(`videoUrl:         ${ctx.result.videoUrl}`);
+  if (ctx.result.videoUrl !== null)
+    lines.push(`videoUrl:         ${redactUrl(ctx.result.videoUrl)}`);
   return lines.join('\n');
 }
 
@@ -8408,8 +8422,9 @@ function renderResultText(r: CliLatestResult): string {
   if (r.codeVersion !== null) lines.push(`codeVersion:        ${r.codeVersion}`);
   if (r.targetUrl !== null) lines.push(`targetUrl:          ${r.targetUrl}`);
   lines.push(`summary:            ${r.summary}`);
-  if (r.videoUrl !== null) lines.push(`videoUrl:           ${r.videoUrl}`);
-  if (r.failureAnalysisUrl !== null) lines.push(`failureAnalysisUrl: ${r.failureAnalysisUrl}`);
+  if (r.videoUrl !== null) lines.push(`videoUrl:           ${redactUrl(r.videoUrl)}`);
+  if (r.failureAnalysisUrl !== null)
+    lines.push(`failureAnalysisUrl: ${redactUrl(r.failureAnalysisUrl)}`);
   if (r.analysis !== undefined) {
     // §6.5.1 (M2.1 piece 3) — render the inline analysis block under
     // the result summary. Only fires when the caller passed

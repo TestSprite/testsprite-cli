@@ -2737,6 +2737,8 @@ describe('runResult', () => {
     expect(seen[0]).toContain('/tests/test_fe/result');
     expect(got).toEqual(RESULT_FAILED);
     expect(JSON.parse(out[0]!)).toEqual(RESULT_FAILED);
+    expect(out[0]).toContain('video/run_abc.mp4?X');
+    expect(out[0]).toContain('analysis/run_abc.json?X');
   });
 
   it('text mode for a failed run highlights failureKind + failedStepIndex up top', async () => {
@@ -2766,7 +2768,14 @@ describe('runResult', () => {
     expect(block).toContain('verdict:            failed');
     expect(block).toContain('executionStatus:    completed');
     expect(block).toContain('summary:            Failed (assertion) on step 5');
-    expect(block).toContain('failureAnalysisUrl: ');
+    expect(block).toContain(
+      'videoUrl:           https://s3-presigned.example.com/video/run_abc.mp4',
+    );
+    expect(block).toContain(
+      'failureAnalysisUrl: https://s3-presigned.example.com/analysis/run_abc.json',
+    );
+    expect(block).not.toContain('video/run_abc.mp4?X');
+    expect(block).not.toContain('analysis/run_abc.json?X');
   });
 
   it('text mode for a passed run skips failureKind/failedStepIndex/failureAnalysisUrl', async () => {
@@ -3476,6 +3485,7 @@ describe('runFailureGet', () => {
     // their LLM consumer.
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0]!)).toEqual(ctx);
+    expect(out[0]).toContain('run_abc.mp4?sig');
   });
 
   it('text mode (no --out) prints the human summary block', async () => {
@@ -3502,7 +3512,8 @@ describe('runFailureGet', () => {
     expect(block).toContain('rootCause:        Submit button is disabled.');
     expect(block).toContain('recommendedFix:   kind=unknown');
     expect(block).toContain('evidence:         2 items (snapshot×2)');
-    expect(block).toContain('videoUrl:         https://video.example.com');
+    expect(block).toContain('videoUrl:         https://video.example.com/run_abc.mp4');
+    expect(block).not.toContain('run_abc.mp4?sig');
   });
 
   it('--out writes the §7 layout and prints a one-line confirmation', async () => {
