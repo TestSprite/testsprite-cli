@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DRY_RUN_API_KEY,
   DRY_RUN_BANNER,
+  assertValidApiKeyHeaderValue,
   assertValidEndpointUrl,
   emitDryRunBanner,
   makeHttpClient,
@@ -330,6 +331,58 @@ describe('makeHttpClient — real path (regression)', () => {
 // ---------------------------------------------------------------------------
 // assertValidEndpointUrl — endpoint syntax guard (NOT an SSRF guard)
 // ---------------------------------------------------------------------------
+
+describe('makeHttpClient - API key validation', () => {
+  it.each([
+    ['newline', 'sk-user-abc\ndef'],
+    ['carriage return', 'sk-user-abc\rdef'],
+    ['smart dash', 'sk-user-abc\u2013def'],
+    ['smart quote', 'sk-user-\u201cabc\u201d'],
+    ['emoji', 'sk-user-abc\u{1f600}'],
+    ['whitespace-only', '   '],
+  ])('rejects a malformed configured API key with %s before fetch/retry', (_label, apiKey) => {
+    const fetchImpl = vi.fn();
+    let caught: unknown;
+    try {
+      makeHttpClient(
+        { profile: 'default', output: 'json', debug: false, dryRun: false },
+        {
+          env: { TESTSPRITE_API_KEY: apiKey } as NodeJS.ProcessEnv,
+          credentialsPath: NO_CREDS_PATH,
+          fetchImpl,
+        },
+      );
+    } catch (err) {
+      caught = err;
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(caught).toBeInstanceOf(ApiError);
+    const apiErr = caught as ApiError;
+    expect(apiErr.code).toBe('VALIDATION_ERROR');
+    expect(apiErr.exitCode).toBe(5);
+    expect(apiErr.nextAction).toContain('api-key');
+  });
+});
+
+describe('assertValidApiKeyHeaderValue', () => {
+  it('accepts a normal ASCII API key value', () => {
+    expect(() => assertValidApiKeyHeaderValue('sk-user-abc-def_123')).not.toThrow();
+  });
+
+  it('throws a VALIDATION_ERROR (exit 5) for a key that cannot be sent as x-api-key', () => {
+    let caught: unknown;
+    try {
+      assertValidApiKeyHeaderValue('sk-user-abc\u2013def');
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ApiError);
+    const apiErr = caught as ApiError;
+    expect(apiErr.code).toBe('VALIDATION_ERROR');
+    expect(apiErr.exitCode).toBe(5);
+    expect(apiErr.nextAction).toContain('api-key');
+  });
+});
 
 describe('assertValidEndpointUrl', () => {
   it('accepts http(s) URLs, including private / localhost hosts (self-hosted, dev, mock)', () => {

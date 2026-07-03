@@ -180,6 +180,22 @@ export function assertValidEndpointUrl(rawUrl: string): void {
   }
 }
 
+export function assertValidApiKeyHeaderValue(apiKey: string): void {
+  const reason =
+    'must be a non-empty HTTP header value; paste the raw key without smart punctuation, emoji, or line breaks';
+
+  if (apiKey.trim().length === 0) {
+    throw localValidationError('api-key', reason, undefined, 'field');
+  }
+
+  for (let i = 0; i < apiKey.length; i += 1) {
+    const code = apiKey.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f || code > 0xff) {
+      throw localValidationError('api-key', reason, undefined, 'field');
+    }
+  }
+}
+
 /**
  * Parse the `--request-timeout <seconds>` flag value into milliseconds.
  *
@@ -251,6 +267,7 @@ export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}
   // VALIDATION_ERROR rather than an opaque URL throw or a retried "fetch failed".
   assertValidEndpointUrl(config.apiUrl);
   if (!config.apiKey) throw ApiError.authRequired();
+  assertValidApiKeyHeaderValue(config.apiKey);
   return new HttpClient({
     baseUrl: facadeBaseUrl(config.apiUrl),
     apiKey: config.apiKey,
