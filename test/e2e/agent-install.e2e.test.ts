@@ -430,13 +430,13 @@ describe('dry-run', () => {
 // ---------------------------------------------------------------------------
 
 describe('multi-target install', () => {
-  it('--target=claude,cursor,cline,antigravity,codex writes all targets + skills, exit 0', () => {
+  it('--target=claude,cursor,cline,antigravity,kiro,codex writes all targets + skills, exit 0', () => {
     const tmpDir = freshTmpDir();
 
     const result = runCli([
       'agent',
       'install',
-      '--target=claude,cursor,cline,antigravity,codex',
+      '--target=claude,cursor,cline,antigravity,kiro,codex',
       '--dir',
       tmpDir,
       '--output',
@@ -449,7 +449,7 @@ describe('multi-target install', () => {
       action: string;
       path: string;
     }>;
-    const allTargets: AgentTarget[] = ['claude', 'cursor', 'cline', 'antigravity', 'codex'];
+    const allTargets: AgentTarget[] = ['claude', 'cursor', 'cline', 'antigravity', 'kiro', 'codex'];
 
     for (const target of allTargets) {
       if (TARGETS[target].mode === 'managed-section') {
@@ -819,7 +819,14 @@ describe('agent list', () => {
 // ---------------------------------------------------------------------------
 describe('matrix coverage guard', () => {
   it('TARGETS matches the documented, e2e-covered set (update this list when adding a target)', () => {
-    expect(Object.keys(TARGETS)).toEqual(['claude', 'antigravity', 'cursor', 'cline', 'codex']);
+    expect(Object.keys(TARGETS)).toEqual([
+      'claude',
+      'antigravity',
+      'cursor',
+      'cline',
+      'kiro',
+      'codex',
+    ]);
   });
 
   it('SKILLS matches the documented, e2e-covered set (update this list when adding a skill)', () => {
