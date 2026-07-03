@@ -177,6 +177,19 @@ export interface CliTestStep {
    * that don't emit the field still type-check.
    */
   outcomeContributesToFailure?: boolean | null;
+  /**
+   * Per-step failure text, carried from `RunStepDto.error` on the run-scoped
+   * endpoint (`GET /runs/{id}?includeSteps=true`). Only present on `--run-id`
+   * responses; the cumulative `/tests/{id}/steps` rows do not carry it, so the
+   * field stays optional (additive, non-breaking for existing consumers).
+   */
+  error?: string | null;
+  /**
+   * Wire step kind from `RunStepDto.type` on the run-scoped endpoint. Same
+   * availability rules as `error`. Named `stepType` to avoid colliding with
+   * the free-form `action` label above.
+   */
+  stepType?: 'action' | 'assertion';
 }
 
 /**
@@ -3627,6 +3640,12 @@ function mapRunStepToCliTestStep(step: RunStepDto, run: RunResponse): CliTestSte
     // non-contributors. (Per the CliTestStep contract: null ≠ false.)
     outcomeContributesToFailure:
       run.failedStepIndex === null ? null : numericIndex === run.failedStepIndex,
+    // Carry the per-step failure text and the wire step kind through instead
+    // of dropping them: the agent asking "why did this step fail?" would
+    // otherwise have to download the whole artifact bundle to read a string
+    // this very response already contained.
+    error: step.error,
+    stepType: step.type,
   };
 }
 
@@ -3946,6 +3965,14 @@ const RUN_HISTORY_TABLE_COL_WIDTHS = {
  * out (dogfood 2026-06-04). `--output json` carries the full text.
  */
 const DESC_COL_MAX = 60;
+
+/**
+ * Cap, in chars, for the one-line `error:` sub-line under a failed step row
+ * in `renderStepsText`. Long enough for a full assertion message, short
+ * enough that a stack-trace blob can't flood the table. Full text is in
+ * `--output json`.
+ */
+const ERROR_SUBLINE_MAX = 200;
 
 /** Max chars to show in the TARGETURL sub-line (excess truncated with …). */
 const HISTORY_TARGET_URL_MAX = 80;
@@ -8221,9 +8248,9 @@ function renderStepsText(page: Page<CliTestStep>): string {
     '  ' +
     'UPDATED';
 
-  const rows = page.items.map(s => {
+  const rows = page.items.flatMap(s => {
     const marker = s.outcomeContributesToFailure === true ? '* ' : '  ';
-    return [
+    const row = [
       marker,
       pad(String(s.stepIndex), indexWidth),
       pad(s.action, actionWidth),
@@ -8231,6 +8258,19 @@ function renderStepsText(page: Page<CliTestStep>): string {
       pad(descOf(s), descWidth),
       s.updatedAt,
     ].join('  ');
+    // Run-scoped rows carry the per-step failure text; surface it as an
+    // indented sub-line under failed rows (mirrors the history table's
+    // `targetUrl:` sub-line). Collapsed to one line and capped so a huge
+    // stack blob can't wreck the table; full text ships in --output json.
+    if (s.status === 'failed' && typeof s.error === 'string' && s.error.length > 0) {
+      const oneLine = s.error.replace(/\s+/g, ' ').trim();
+      const shown =
+        oneLine.length > ERROR_SUBLINE_MAX
+          ? `${oneLine.slice(0, ERROR_SUBLINE_MAX - 1)}…`
+          : oneLine;
+      return [row, `     error: ${shown}`];
+    }
+    return [row];
   });
 
   const lines: string[] = [header, ...rows, ''];

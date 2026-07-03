@@ -2550,6 +2550,65 @@ describe('runSteps', () => {
     expect(step2.outcomeContributesToFailure).toBe(true);
   });
 
+  it('--run-id carries the per-step error text and stepType through to JSON (no silent drop)', async () => {
+    // Regression lock for the "steps discard RunStepDto.error" gap: the wire
+    // already returns the failure text in the same response; it must survive
+    // the CliTestStep mapping instead of forcing an artifact-bundle download.
+    const { credentialsPath } = makeCreds();
+    const runWithStepError = {
+      ...RUN_WITH_STEPS,
+      status: 'failed' as const,
+      failedStepIndex: 2,
+      steps: [
+        RUN_WITH_STEPS.steps[0]!,
+        {
+          ...RUN_WITH_STEPS.steps[1]!,
+          status: 'failed',
+          error: 'Expected heading "Order confirmed" to be visible, got hidden',
+        },
+      ],
+    };
+    const fetchImpl = makeFetch(() => ({ body: runWithStepError }));
+    const page = await runSteps(
+      { profile: 'default', output: 'json', debug: false, testId: 'test_fe', runId: 'run_scoped' },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    const passing = page.items.find(s => s.stepIndex === 1)!;
+    const failing = page.items.find(s => s.stepIndex === 2)!;
+    expect(failing.error).toBe('Expected heading "Order confirmed" to be visible, got hidden');
+    expect(failing.stepType).toBe('assertion');
+    expect(passing.error).toBeNull();
+    expect(passing.stepType).toBe('action');
+  });
+
+  it('--run-id text mode prints an indented error: sub-line under the failed row only', async () => {
+    const { credentialsPath } = makeCreds();
+    const runWithStepError = {
+      ...RUN_WITH_STEPS,
+      status: 'failed' as const,
+      failedStepIndex: 2,
+      steps: [
+        RUN_WITH_STEPS.steps[0]!,
+        {
+          ...RUN_WITH_STEPS.steps[1]!,
+          status: 'failed',
+          error: 'Locator resolved to hidden element\n  at assert heading',
+        },
+      ],
+    };
+    const fetchImpl = makeFetch(() => ({ body: runWithStepError }));
+    const out: string[] = [];
+    await runSteps(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe', runId: 'run_scoped' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    const block = out.join('\n');
+    // Newlines in the wire error collapse to one displayable line.
+    expect(block).toContain('error: Locator resolved to hidden element at assert heading');
+    // Exactly one sub-line: the passing step must not grow one.
+    expect(block.match(/error: /g)).toHaveLength(1);
+  });
+
   it('--run-id: rejects a runId that belongs to a different test (exit 4)', async () => {
     const { credentialsPath } = makeCreds();
     // The run-scoped endpoint returns a run whose testId differs from the
