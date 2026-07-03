@@ -2431,6 +2431,9 @@ describe('runTestRunAll — batch fresh run', () => {
     await expect(test.parseAsync(['run', '--all'], { from: 'user' })).rejects.toMatchObject({
       code: 'VALIDATION_ERROR',
       exitCode: 5,
+      details: expect.objectContaining({
+        reason: expect.stringContaining('TESTSPRITE_PROJECT_ID'),
+      }),
     });
   });
 
@@ -2456,6 +2459,30 @@ describe('runTestRunAll — batch fresh run', () => {
     const post = captured.find(c => c.method === 'POST' && c.url.includes('/tests/batch/run'))!;
     expect(post.body).toMatchObject({ projectId: 'project_env', source: 'cli' });
   });
+
+  it('run --all uses TESTSPRITE_PROJECT_ID when --project is blank', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const { credentialsPath } = makeCreds();
+    type Captured = { url: string; method: string; body: unknown };
+    const captured: Captured[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      captured.push({ url, method, body: init.body ? JSON.parse(init.body as string) : undefined });
+      return { body: BATCH_FRESH_RESP };
+    });
+    const test = createTestCommand({
+      credentialsPath,
+      env: { TESTSPRITE_PROJECT_ID: 'project_env' } as NodeJS.ProcessEnv,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: () => undefined,
+      sleep: instantSleep,
+    });
+    await test.parseAsync(['run', '--all', '--project', '   '], { from: 'user' });
+    const post = captured.find(c => c.method === 'POST' && c.url.includes('/tests/batch/run'))!;
+    expect(post.body).toMatchObject({ projectId: 'project_env', source: 'cli' });
+  });
+
   it('--all --target-url → exit 5 (target-url has no effect on BE-only batch)', async () => {
     const { createTestCommand } = await import('./test.js');
     const test = createTestCommand();
