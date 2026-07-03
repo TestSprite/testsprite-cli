@@ -9161,18 +9161,16 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       if (isAll) {
         // --all path: wave-ordered fresh batch run.
         const projectId = resolveProjectId(cmdOpts.project, deps);
-        if (!projectId) {
-          throw localValidationError(
-            'project',
-            '--all requires a project id - pass --project <id> or set TESTSPRITE_PROJECT_ID',
-          );
-        }
+        requireProjectId(
+          projectId,
+          '--all requires a project id - pass --project <id> or set TESTSPRITE_PROJECT_ID',
+        );
         // --target-url has no effect on the --all batch path: a BE test's base
         // URL is baked into its code, and the unified engine resolves each
         // project's configured environment server-side (per-run URL overrides
         // are not applied to batch FE runs either). Silently dropping it could
-        // run the suite against an unintended environment in the caller's mind
-        // — reject loudly instead.
+        // run the suite against an unintended environment in the caller's mind,
+        // so reject loudly.
         if (cmdOpts.targetUrl !== undefined && cmdOpts.targetUrl !== '') {
           throw localValidationError(
             'target-url',
@@ -9792,14 +9790,18 @@ interface StepsFlagOpts {
 }
 
 function resolveProjectId(projectId: string | undefined, deps: TestDeps): string | undefined {
-  if (projectId !== undefined) return projectId;
+  const explicit = projectId?.trim();
+  if (explicit && explicit.length > 0) return explicit;
   const envValue = (deps.env ?? process.env).TESTSPRITE_PROJECT_ID;
   const trimmed = envValue?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
-function requireProjectId(projectId: string | undefined): asserts projectId is string {
+function requireProjectId(
+  projectId: string | undefined,
+  message = 'is required; pass --project <id> or set TESTSPRITE_PROJECT_ID',
+): asserts projectId is string {
   if (typeof projectId !== 'string' || projectId.length === 0) {
-    throw localValidationError('project', 'is required');
+    throw localValidationError('project', message);
   }
 }
 

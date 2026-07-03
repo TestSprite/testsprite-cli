@@ -384,6 +384,25 @@ describe('runList', () => {
     expect(seen[0]).toContain('projectId=project_env');
   });
 
+  it('uses TESTSPRITE_PROJECT_ID when --project is blank', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      seen.push(url);
+      return { body: { items: [FE_TEST], nextToken: null } };
+    });
+    await runList(
+      { profile: 'default', output: 'json', debug: false, projectId: '   ' },
+      {
+        credentialsPath,
+        env: { TESTSPRITE_PROJECT_ID: 'project_env' } as NodeJS.ProcessEnv,
+        fetchImpl,
+        stdout: () => undefined,
+      },
+    );
+    expect(seen[0]).toContain('projectId=project_env');
+  });
+
   it('prefers explicit --project over TESTSPRITE_PROJECT_ID', async () => {
     const { credentialsPath } = makeCreds();
     const seen: string[] = [];
@@ -822,10 +841,15 @@ describe('createTestCommand list — required flag', () => {
       await test.parseAsync(['list'], { from: 'user' });
       expect.unreachable('expected ApiError');
     } catch (err) {
-      const apiErr = err as { code?: string; exitCode?: number; details?: { field?: string } };
+      const apiErr = err as {
+        code?: string;
+        exitCode?: number;
+        details?: { field?: string; reason?: string };
+      };
       expect(apiErr.code).toBe('VALIDATION_ERROR');
       expect(apiErr.exitCode).toBe(5);
       expect(apiErr.details?.field).toBe('project');
+      expect(apiErr.details?.reason).toContain('TESTSPRITE_PROJECT_ID');
     }
   });
 
