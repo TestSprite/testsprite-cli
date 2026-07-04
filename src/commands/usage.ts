@@ -200,7 +200,12 @@ export function createUsageCommand(deps: UsageDeps = {}): Command {
       '\nExamples:\n' +
         '  testsprite usage                 # show balance + plan\n' +
         '  testsprite usage --output json   # machine-readable balance\n' +
+        '  testsprite usage --debug         # trace HTTP method/path, request id, latency\n' +
         '  testsprite credits               # alias for usage\n' +
+        '\nExit codes:\n' +
+        '  0   success (or --dry-run)\n' +
+        '  3   auth error — run `testsprite setup` to configure credentials\n' +
+        '  10  transport/network failure (UNAVAILABLE) — retry the command\n' +
         '\nNote: credit balance requires a backend update to /me. Until shipped,\n' +
         "  check your portal's Billing page (/dashboard/settings/billing) for your balance.",
     )
