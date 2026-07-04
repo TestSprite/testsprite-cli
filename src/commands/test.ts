@@ -6772,8 +6772,9 @@ export interface ArtifactGetResult {
 
 export function resolveDefaultArtifactDir(runId: string, cwd: string = process.cwd()): string {
   requireNonEmpty('run-id', runId);
-  const windowsNormalizedSegment = runId.trimEnd();
+  const windowsNormalizedSegment = runId.replace(/[ .]+$/u, '');
   if (
+    windowsNormalizedSegment === '' ||
     windowsNormalizedSegment === '.' ||
     windowsNormalizedSegment === '..' ||
     runId.includes('/') ||

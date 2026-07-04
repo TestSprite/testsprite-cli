@@ -342,7 +342,20 @@ describe('runArtifactGet', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it.each(['.', '..', '. ', '.. ', '../outside', '..\\outside', 'nested/run', 'nested\\run', 'bad\0id'])(
+  it.each([
+    '.',
+    '..',
+    '. ',
+    '.. ',
+    '...',
+    '.. .',
+    '. .',
+    '../outside',
+    '..\\outside',
+    'nested/run',
+    'nested\\run',
+    'bad\0id',
+  ])(
     'rejects unsafe default artifact runId segment %j',
     runId => {
       expect(() => resolveDefaultArtifactDir(runId, '/repo')).toThrowError(
