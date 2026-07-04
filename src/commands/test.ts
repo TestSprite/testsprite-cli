@@ -6772,14 +6772,18 @@ export interface ArtifactGetResult {
 
 export function resolveDefaultArtifactDir(runId: string, cwd: string = process.cwd()): string {
   requireNonEmpty('run-id', runId);
-  if (runId === '.' || runId === '..' || runId.includes('/') || runId.includes('\\')) {
+  const windowsNormalizedSegment = runId.trimEnd();
+  if (
+    windowsNormalizedSegment === '.' ||
+    windowsNormalizedSegment === '..' ||
+    runId.includes('/') ||
+    runId.includes('\\') ||
+    runId.includes('\0')
+  ) {
     throw localValidationError(
       'run-id',
       'must be a single path-safe segment for the default output directory; pass --out <dir> to choose a custom path',
     );
-  }
-  if (runId.includes('\0')) {
-    throw localValidationError('run-id', 'must not contain NUL bytes');
   }
   return join(cwd, '.testsprite', 'runs', runId);
 }
