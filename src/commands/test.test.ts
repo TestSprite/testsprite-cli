@@ -3014,10 +3014,12 @@ describe('runLint', () => {
     expect(report).toMatchObject({ checked: 1, valid: 1, issues: [] });
   });
 
-  it('a JSONL file reports each bad line with its line number', async () => {
+  it('a JSONL file reports each bad line with its PHYSICAL line number (blank lines skipped, not renumbered)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cli-lint-jsonl-'));
     const file = join(dir, 'plans.jsonl');
-    writeFileSync(file, `${VALID_PLAN}\nnot json at all\n${INVALID_PLAN}\n`, 'utf8');
+    // A blank separator line sits between entries: line 1 valid, line 2 blank,
+    // line 3 bad JSON, line 4 invalid plan. Reported numbers must be 3 and 4.
+    writeFileSync(file, `${VALID_PLAN}\n\nnot json at all\n${INVALID_PLAN}\n`, 'utf8');
     const out: string[] = [];
     const rejection = await runLint(
       { profile: 'default', output: 'json', debug: false, plans: file },
@@ -3026,8 +3028,10 @@ describe('runLint', () => {
     expect(rejection).toMatchObject({ exitCode: 5 });
     const report = JSON.parse(out.join('')) as { checked: number; issues: Array<{ file: string }> };
     expect(report.checked).toBe(3);
-    expect(report.issues.some(issue => issue.file.endsWith(':2'))).toBe(true);
     expect(report.issues.some(issue => issue.file.endsWith(':3'))).toBe(true);
+    expect(report.issues.some(issue => issue.file.endsWith(':4'))).toBe(true);
+    // The blank line itself is not an entry and never reports.
+    expect(report.issues.some(issue => issue.file.endsWith(':2'))).toBe(false);
   });
 
   it('requires exactly one input source', async () => {

@@ -3952,27 +3952,30 @@ export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<C
     } catch {
       throw localValidationError('plans', `cannot read file: ${absolute}`);
     }
-    const lines = content
+    // Index lines BEFORE dropping blanks so every reported `file:N` points at
+    // the PHYSICAL line in the file (a blank separator line must not shift all
+    // subsequent line numbers).
+    const numberedLines = content
       .split('\n')
-      .map(line => line.trim())
-      .filter(line => line.length > 0);
-    if (lines.length === 0) throw localValidationError('plans', 'contains no plan lines');
-    lines.forEach((line, index) => {
-      collect(`${opts.plans}:${index + 1}`, () => {
+      .map((rawLine, physicalIndex) => ({ line: rawLine.trim(), lineNo: physicalIndex + 1 }))
+      .filter(entry => entry.line.length > 0);
+    if (numberedLines.length === 0) throw localValidationError('plans', 'contains no plan lines');
+    for (const { line, lineNo } of numberedLines) {
+      collect(`${opts.plans}:${lineNo}`, () => {
         let parsed: unknown;
         try {
           parsed = JSON.parse(line);
         } catch {
           throw localValidationError(
             'plans',
-            `line ${index + 1} is not valid JSON`,
+            `line ${lineNo} is not valid JSON`,
             undefined,
             'field',
           );
         }
-        assertPlanShape(parsed, { specIndex: index });
+        assertPlanShape(parsed, { specIndex: lineNo - 1 });
       });
-    });
+    }
   }
 
   const filesWithIssues = new Set(issues.map(issue => issue.file)).size;
