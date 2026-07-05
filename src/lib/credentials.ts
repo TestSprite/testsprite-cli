@@ -71,20 +71,39 @@ const FIELD_TO_FILE_KEY: Record<keyof ProfileEntry, string> = {
   apiUrl: 'api_url',
 };
 
-export function parseCredentials(content: string): CredentialsFile {
-  const result: CredentialsFile = {};
-  let currentEntry: ProfileEntry | null = null;
+/**
+ * Generic hardened INI walk shared by the credentials file and the settings
+ * config file (`~/.testsprite/config`). Returns every `[section]`'s raw
+ * key=value pairs; callers map the keys they understand.
+ */
+export function parseIniFile(content: string): Record<string, Record<string, string>> {
+  // Null-prototype accumulator so a `[__proto__]` / `[constructor]` section
+  // cannot alias a shared prototype object and let the following key=value
+  // lines pollute every object in the process (prototype-pollution hardening).
+  // The result is copied into a plain object on return for caller back-compat.
+  const result: Record<string, Record<string, string>> = Object.create(null);
+  let currentEntry: Record<string, string> | null = null;
   for (const rawLine of content.split('\n')) {
     const line = rawLine.trim();
     if (line === '' || line.startsWith('#') || line.startsWith(';')) continue;
     const sectionMatch = /^\[([^\]]+)\]$/.exec(line);
     if (sectionMatch) {
       const sectionName = sectionMatch[1]!.trim();
+      // Defense in depth alongside the null-prototype accumulator: never treat a
+      // prototype-polluting key as a profile section. Skip its key=value lines.
+      if (
+        sectionName === '__proto__' ||
+        sectionName === 'constructor' ||
+        sectionName === 'prototype'
+      ) {
+        currentEntry = null;
+        continue;
+      }
       const existing = result[sectionName];
       if (existing) {
         currentEntry = existing;
       } else {
-        const newEntry: ProfileEntry = {};
+        const newEntry: Record<string, string> = Object.create(null) as Record<string, string>;
         result[sectionName] = newEntry;
         currentEntry = newEntry;
       }
@@ -95,8 +114,27 @@ export function parseCredentials(content: string): CredentialsFile {
     if (eqIndex < 0) continue;
     const rawKey = line.slice(0, eqIndex).trim();
     const rawValue = line.slice(eqIndex + 1).trim();
-    const field = FILE_KEY_TO_FIELD[rawKey];
-    if (field) currentEntry[field] = rawValue;
+    // Same guard for keys: `__proto__ = x` must never become a property write
+    // on a shared prototype when a caller copies the section into a plain map.
+    if (rawKey === '__proto__' || rawKey === 'constructor' || rawKey === 'prototype') continue;
+    currentEntry[rawKey] = rawValue;
+  }
+  // Return plain objects so callers (and test matchers) see normal prototypes.
+  const plain: Record<string, Record<string, string>> = {};
+  for (const [name, entry] of Object.entries(result)) plain[name] = { ...entry };
+  return plain;
+}
+
+export function parseCredentials(content: string): CredentialsFile {
+  const sections = parseIniFile(content);
+  const result: CredentialsFile = {};
+  for (const [name, keyValues] of Object.entries(sections)) {
+    const entry: ProfileEntry = {};
+    for (const [rawKey, rawValue] of Object.entries(keyValues)) {
+      const field = FILE_KEY_TO_FIELD[rawKey];
+      if (field) entry[field] = rawValue;
+    }
+    result[name] = entry;
   }
   return result;
 }

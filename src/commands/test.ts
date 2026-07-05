@@ -81,7 +81,7 @@ import { assertNotLocal } from '../lib/target-url.js';
 import { createTicker } from '../lib/ticker.js';
 import { RateThrottle } from '../lib/rate-throttle.js';
 import { resolvePortalBase, resolvePortalUrl } from '../lib/facade.js';
-import { loadConfig } from '../lib/config.js';
+import { loadConfig, readConfigFileSettings } from '../lib/config.js';
 import {
   flakyExitCode,
   renderFlakyText,
@@ -481,7 +481,7 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
   // (exit 3) when the caller also lacks a configured key. Order matters
   // for the CLI error spec §2 — bad input is a caller bug, not an auth
   // gate.
-  requireProjectId(opts.projectId);
+  opts.projectId = requireProjectId(opts.projectId, opts.profile);
 
   const paginationFlags: PaginationFlags = validatePaginationFlags({
     pageSize: opts.pageSize,
@@ -708,7 +708,7 @@ export async function runCreate(
   assertChainedRunKeyFits(opts.run, opts.idempotencyKey);
   // Validate inputs before touching credentials or fs — matches the
   // M2 read commands' "input gates first, then auth, then I/O" ordering.
-  requireProjectId(opts.projectId);
+  opts.projectId = requireProjectId(opts.projectId, opts.profile);
   requireNonEmpty('name', opts.name);
   // P1-3: client-side length checks matching server limits (name ≤200,
   // description ≤2000) so the user gets instant, actionable errors instead
@@ -5869,7 +5869,7 @@ export async function runTestRunAll(
   deps: TestDeps = {},
 ): Promise<BatchRunFreshResponse | undefined> {
   assertIdempotencyKey(opts.idempotencyKey);
-  requireProjectId(opts.projectId);
+  opts.projectId = requireProjectId(opts.projectId, opts.profile);
   if (
     !Number.isInteger(opts.maxConcurrency) ||
     opts.maxConcurrency < 1 ||
@@ -9059,10 +9059,25 @@ interface StepsFlagOpts {
   runId?: string;
 }
 
-function requireProjectId(projectId: string): void {
-  if (typeof projectId !== 'string' || projectId.length === 0) {
-    throw localValidationError('project', 'is required');
+/**
+ * Resolve the effective project id: the `--project` flag when set, otherwise
+ * the `project_id` persisted in the settings config file
+ * (`~/.testsprite/config`), so a repo/agent can pin the project once instead
+ * of repeating it per command. Throws VALIDATION_ERROR (exit 5) when neither
+ * is present.
+ */
+function requireProjectId(projectId: string | undefined, profile = 'default'): string {
+  const resolved =
+    typeof projectId === 'string' && projectId.length > 0
+      ? projectId
+      : readConfigFileSettings(profile).projectId;
+  if (typeof resolved !== 'string' || resolved.length === 0) {
+    throw localValidationError(
+      'project',
+      'is required (pass --project or set project_id in ~/.testsprite/config)',
+    );
   }
+  return resolved;
 }
 
 /**
