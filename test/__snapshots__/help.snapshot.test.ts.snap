@@ -208,6 +208,11 @@ Commands:
                                         failedStepIndex, per-step status flips,
                                         codeVersion drift. Exit 0 when verdicts
                                         match, 1 when they differ.
+  lint [options]                        Validate plan/steps files offline with
+                                        the same validators \`create\` runs,
+                                        collecting EVERY problem. No network,
+                                        no credentials. Exit 0 when all valid,
+                                        5 otherwise.
   result [options] <test-id>            Get the latest result for a test (default) or list prior runs (--history).
   
   --output json shape differs by mode:

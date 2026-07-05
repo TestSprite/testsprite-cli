@@ -3854,6 +3854,141 @@ function renderRunDiffText(diff: CliRunDiff): string {
   return lines.join('\n');
 }
 
+export interface LintOptions extends CommonOptions {
+  planFrom?: string;
+  planFromDir?: string;
+  plans?: string;
+  steps?: string;
+}
+
+export interface CliLintIssue {
+  file: string;
+  field: string;
+  reason: string;
+}
+
+export interface CliLintReport {
+  checked: number;
+  valid: number;
+  issues: CliLintIssue[];
+}
+
+/**
+ * `test lint` (issue #98): validate plan/steps files fully OFFLINE with the
+ * SAME validators the create paths run, but collecting EVERY problem instead
+ * of dying on the first one, and without any network write. The create-batch
+ * reader is first-error-fatal and only reachable through a command that POSTs,
+ * so authoring a 12-plan directory meant one error per paid round-trip. Zero
+ * network, zero credentials: exit 0 when everything is valid, 5 otherwise, so
+ * it drops into a pre-commit hook or CI step before `create-batch`.
+ */
+export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<CliLintReport> {
+  const out = makeOutput(opts.output, deps);
+  const sources = [opts.planFrom, opts.planFromDir, opts.plans, opts.steps].filter(
+    source => source !== undefined,
+  );
+  if (sources.length !== 1) {
+    throw localValidationError(
+      'plan-from',
+      'exactly one of --plan-from, --plan-from-dir, --plans, or --steps is required',
+    );
+  }
+
+  const issues: CliLintIssue[] = [];
+  let checked = 0;
+  // Run one existing validator, converting its typed throw into a report row
+  // (same envelopes, so `details.field` pointers like planSteps[2].type
+  // survive verbatim).
+  const collect = (file: string, validate: () => void): void => {
+    checked += 1;
+    try {
+      validate();
+    } catch (err) {
+      if (err instanceof ApiError) {
+        issues.push({
+          file,
+          field: String(err.getDetail('field') ?? '(file)'),
+          reason: String(err.getDetail('reason') ?? err.nextAction ?? err.message),
+        });
+      } else {
+        issues.push({
+          file,
+          field: '(file)',
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  };
+
+  if (opts.planFrom !== undefined) {
+    const planFrom = opts.planFrom;
+    collect(planFrom, () => void readPlanFromGuarded(planFrom));
+  } else if (opts.steps !== undefined) {
+    const steps = opts.steps;
+    collect(steps, () => void readPlanStepsFileGuarded(steps));
+  } else if (opts.planFromDir !== undefined) {
+    const dir = resolveAbsolute(opts.planFromDir);
+    let entries: string[];
+    try {
+      entries = readdirSync(dir)
+        .filter(name => name.endsWith('.json'))
+        .sort();
+    } catch {
+      throw localValidationError('plan-from-dir', `cannot read directory: ${dir}`);
+    }
+    if (entries.length === 0) {
+      throw localValidationError('plan-from-dir', 'contains no *.json plan files');
+    }
+    for (const entry of entries) {
+      collect(entry, () => void readPlanFromGuarded(join(dir, entry)));
+    }
+  } else if (opts.plans !== undefined) {
+    // JSONL: validate PER LINE so every bad line reports (the create path's
+    // reader stays throw-on-first; this is the collecting counterpart).
+    const absolute = resolveAbsolute(opts.plans);
+    let content: string;
+    try {
+      content = readFileSync(absolute, 'utf8');
+    } catch {
+      throw localValidationError('plans', `cannot read file: ${absolute}`);
+    }
+    const lines = content
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0);
+    if (lines.length === 0) throw localValidationError('plans', 'contains no plan lines');
+    lines.forEach((line, index) => {
+      collect(`${opts.plans}:${index + 1}`, () => {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          throw localValidationError(
+            'plans',
+            `line ${index + 1} is not valid JSON`,
+            undefined,
+            'field',
+          );
+        }
+        assertPlanShape(parsed, { specIndex: index });
+      });
+    });
+  }
+
+  const filesWithIssues = new Set(issues.map(issue => issue.file)).size;
+  const report: CliLintReport = { checked, valid: checked - filesWithIssues, issues };
+  out.print(report, () =>
+    [
+      ...issues.map(issue => `${issue.file}: ${issue.field}: ${issue.reason}`),
+      `${report.valid}/${report.checked} valid, ${issues.length} problem(s)`,
+    ].join('\n'),
+  );
+  if (issues.length > 0) {
+    throw new CLIError(`lint: ${issues.length} problem(s) across ${report.checked} file(s)`, 5);
+  }
+  return report;
+}
+
 export async function runSteps(
   opts: StepsOptions,
   deps: TestDeps = {},
@@ -7660,6 +7795,37 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .action(async (runA: string, runB: string, _cmdOpts: unknown, command: Command) => {
       await runDiff({ ...resolveCommonOptions(command), runA, runB }, deps);
     });
+
+  test
+    .command('lint')
+    .description(
+      'Validate plan/steps files offline with the same validators `create` runs, collecting EVERY problem. No network, no credentials. Exit 0 when all valid, 5 otherwise.',
+    )
+    .option('--plan-from <file>', 'single plan JSON file')
+    .option(
+      '--plan-from-dir <dir>',
+      'directory of *.json plan files (each checked, all errors reported)',
+    )
+    .option('--plans <file>', 'JSONL file with one plan spec per line (each line checked)')
+    .option('--steps <file>', 'plan-steps JSON file (the shape `test plan put` ingests)')
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(
+      async (
+        cmdOpts: { planFrom?: string; planFromDir?: string; plans?: string; steps?: string },
+        command: Command,
+      ) => {
+        await runLint(
+          {
+            ...resolveCommonOptions(command),
+            planFrom: cmdOpts.planFrom,
+            planFromDir: cmdOpts.planFromDir,
+            plans: cmdOpts.plans,
+            steps: cmdOpts.steps,
+          },
+          deps,
+        );
+      },
+    );
 
   test
     .command('result <test-id>')

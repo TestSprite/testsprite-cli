@@ -31,6 +31,7 @@ import {
   runFailureGet,
   runFailureSummary,
   runGet,
+  runLint,
   runList,
   runPlanPut,
   runResult,
@@ -125,6 +126,7 @@ describe('createTestCommand — surface', () => {
       'diff',
       'failure',
       'get',
+      'lint',
       'list',
       'plan',
       'rerun',
@@ -2957,6 +2959,81 @@ describe('runDiff', () => {
       statusA: 'passed',
       statusB: 'failed',
     });
+  });
+});
+
+describe('runLint', () => {
+  const VALID_PLAN = JSON.stringify({
+    projectId: 'project_alice',
+    type: 'frontend',
+    name: 'Checkout works',
+    planSteps: [
+      { type: 'action', description: 'Open the cart' },
+      { type: 'assertion', description: 'Assert the total is visible' },
+    ],
+  });
+  const INVALID_PLAN = JSON.stringify({
+    projectId: 'project_alice',
+    type: 'frontend',
+    name: 'Broken',
+    planSteps: [{ type: 'hover', description: 'Bad step type' }],
+  });
+
+  it('a directory with valid and invalid plans reports EVERY problem and exits 5', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-'));
+    writeFileSync(join(dir, 'a-valid.json'), VALID_PLAN, 'utf8');
+    writeFileSync(join(dir, 'b-invalid.json'), INVALID_PLAN, 'utf8');
+    writeFileSync(join(dir, 'c-notjson.json'), '{oops', 'utf8');
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, planFromDir: dir },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as {
+      checked: number;
+      valid: number;
+      issues: Array<{ file: string; field: string }>;
+    };
+    // All three files were checked (no first-error-fatal bailout).
+    expect(report.checked).toBe(3);
+    expect(report.valid).toBe(1);
+    expect(report.issues.map(issue => issue.file).sort()).toEqual([
+      'b-invalid.json',
+      'c-notjson.json',
+    ]);
+  });
+
+  it('an all-valid directory resolves with exit 0 and no network/credentials needed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-ok-'));
+    writeFileSync(join(dir, 'a.json'), VALID_PLAN, 'utf8');
+    const report = await runLint(
+      { profile: 'default', output: 'json', debug: false, planFromDir: dir },
+      { stdout: () => undefined },
+    );
+    expect(report).toMatchObject({ checked: 1, valid: 1, issues: [] });
+  });
+
+  it('a JSONL file reports each bad line with its line number', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-jsonl-'));
+    const file = join(dir, 'plans.jsonl');
+    writeFileSync(file, `${VALID_PLAN}\nnot json at all\n${INVALID_PLAN}\n`, 'utf8');
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, plans: file },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as { checked: number; issues: Array<{ file: string }> };
+    expect(report.checked).toBe(3);
+    expect(report.issues.some(issue => issue.file.endsWith(':2'))).toBe(true);
+    expect(report.issues.some(issue => issue.file.endsWith(':3'))).toBe(true);
+  });
+
+  it('requires exactly one input source', async () => {
+    await expect(
+      runLint({ profile: 'default', output: 'json', debug: false }, { stdout: () => undefined }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 });
 
