@@ -5396,6 +5396,11 @@ export async function runTestWaitMany(
     | { kind: 'error'; code: string; exitCode: number };
 
   const pollOne = async (runId: string): Promise<WaitOutcome> => {
+    // A member dequeued AFTER the shared deadline has passed must not be
+    // granted a fresh minimum poll window (with --max-concurrency 1 that
+    // would extend the invocation by ~1s per queued run past --timeout).
+    const remainingSeconds = Math.ceil((deadlineMs - Date.now()) / 1000);
+    if (remainingSeconds <= 0) return { kind: 'timeout' };
     const resolveAlternate = makeBackendWaitFallback({
       client,
       resolveTestId: run => run.testId,
@@ -5404,7 +5409,7 @@ export async function runTestWaitMany(
     });
     try {
       const run = await pollRunUntilTerminal(client, runId, {
-        timeoutSeconds: Math.max(1, Math.ceil((deadlineMs - Date.now()) / 1000)),
+        timeoutSeconds: remainingSeconds,
         sleep: deps.sleep,
         onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
         onTick: (run, elapsedMs) => {
@@ -5448,14 +5453,27 @@ export async function runTestWaitMany(
   } catch (fanOutErr) {
     if (fanOutErr instanceof RequestTimeoutError) {
       // Same contract as the batch pollers: leave stdout parseable before
-      // exiting 7 — every dispatched id is re-attachable in one command.
+      // exiting 7. Members that already settled keep their real status; only
+      // the still-unfinished ids are marked running and named in the hint
+      // (re-attaching to an already-terminal run would be a wasted command).
       ticker.finalize('Multi-run wait — request timed out');
       const partial = {
-        results: opts.runIds.map(runId => ({ runId, status: 'running' })),
+        results: opts.runIds.map((runId): CliMultiWaitResult => {
+          const outcome = outcomes.get(runId);
+          if (outcome === undefined) return { runId, status: 'running' };
+          if (outcome.kind === 'timeout') return { runId, status: 'timeout' };
+          if (outcome.kind === 'error') return { runId, status: `error:${outcome.code}` };
+          return { runId, status: outcome.run.status, testId: outcome.run.testId };
+        }),
         summary: { total: opts.runIds.length },
       };
-      out.print(partial, () => partial.results.map(r => `${r.runId}  running`).join('\n'));
-      stderrFn(`Re-attach with: testsprite test wait ${opts.runIds.join(' ')}`);
+      out.print(partial, () => partial.results.map(r => `${r.runId}  ${r.status}`).join('\n'));
+      const unfinished = partial.results
+        .filter(r => r.status === 'running' || r.status === 'timeout')
+        .map(r => r.runId);
+      if (unfinished.length > 0) {
+        stderrFn(`Re-attach with: testsprite test wait ${unfinished.join(' ')}`);
+      }
     }
     throw fanOutErr;
   }
@@ -5483,9 +5501,14 @@ export async function runTestWaitMany(
     ].join('\n'),
   );
 
-  const timedOutIds = results.filter(r => r.status === 'timeout').map(r => r.runId);
-  if (timedOutIds.length > 0) {
-    stderrFn(`Re-attach with: testsprite test wait ${timedOutIds.join(' ')}`);
+  // Every member that did not reach a terminal verdict is re-attachable:
+  // timeouts (still running server-side) and poll errors (e.g. a transient
+  // transport failure) both belong in the hint; terminal runs do not.
+  const unfinishedIds = results
+    .filter(r => r.status === 'timeout' || r.status.startsWith('error:'))
+    .map(r => r.runId);
+  if (unfinishedIds.length > 0) {
+    stderrFn(`Re-attach with: testsprite test wait ${unfinishedIds.join(' ')}`);
   }
 
   // Worst-status exit: auth escalates (a rejected key fails every member the
@@ -8333,8 +8356,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '  0  passed\n' +
         '  1  failed / blocked / cancelled\n' +
         '  3  auth error\n' +
-        '  4  run not found\n' +
-        '  7  timeout — resume with: testsprite test wait <run-id...>\n' +
+        '  4  run not found (single run-id; with several ids a per-member poll error\n' +
+        '     is recorded as error:<CODE> in its row and folded into exit 7)\n' +
+        '  7  timeout or per-member poll error — resume with: testsprite test wait <run-id...>\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
         '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>',
     )

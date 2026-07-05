@@ -3112,6 +3112,7 @@ describe('runTestWaitMany', () => {
       return { body: terminalRun('run_ok', 'passed') };
     });
     const out: string[] = [];
+    const errs: string[] = [];
     const rejection = await runTestWaitMany(
       {
         profile: 'default',
@@ -3121,7 +3122,12 @@ describe('runTestWaitMany', () => {
         timeoutSeconds: 30,
         maxConcurrency: 2,
       },
-      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => errs.push(line),
+      },
     ).catch((error: unknown) => error);
     expect(rejection).toMatchObject({ exitCode: 7 });
     const payload = JSON.parse(out.join('')) as {
@@ -3130,6 +3136,36 @@ describe('runTestWaitMany', () => {
     // The failing member did not abort the pool: the passed verdict survived.
     expect(payload.results[0]).toMatchObject({ runId: 'run_ok', status: 'passed' });
     expect(payload.results[1]!.status).toBe('error:NOT_FOUND');
+    // The re-attach hint names the errored member (resumable) but NOT the
+    // already-terminal passed one.
+    const hint = errs.find(line => line.includes('Re-attach with:'));
+    expect(hint).toContain('run_gone');
+    expect(hint).not.toContain('run_ok');
+  });
+
+  it('members dequeued after the shared deadline are not granted extra poll time', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetches = 0;
+    const fetchImpl = makeFetch(() => {
+      fetches += 1;
+      return { body: terminalRun('run_any', 'passed') };
+    });
+    // timeoutSeconds 0: the shared deadline is already in the past when the
+    // pool starts, so every member must resolve to timeout WITHOUT polling
+    // (previously each dequeued member was granted a fresh 1s minimum).
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_a', 'run_b', 'run_c'],
+        timeoutSeconds: 0,
+        maxConcurrency: 1,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 7 });
+    expect(fetches).toBe(0);
   });
 
   it('an auth error escalates the exit code to 3', async () => {

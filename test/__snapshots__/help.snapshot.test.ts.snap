@@ -262,8 +262,9 @@ Commands:
     0  passed
     1  failed / blocked / cancelled
     3  auth error
-    4  run not found
-    7  timeout — resume with: testsprite test wait <run-id...>
+    4  run not found (single run-id; with several ids a per-member poll error
+       is recorded as error:<CODE> in its row and folded into exit 7)
+    7  timeout or per-member poll error — resume with: testsprite test wait <run-id...>
    10  transport/network failure (UNAVAILABLE) — retry the command
   
   On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
