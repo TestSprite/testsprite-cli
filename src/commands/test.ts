@@ -6842,9 +6842,7 @@ export async function runArtifactGet(
 
   // Resolve output dir: explicit --out or the default .testsprite/runs/<runId>/
   const resolvedDir =
-    opts.out !== undefined
-      ? resolveBundleDir(opts.out)
-      : resolveDefaultArtifactDir(runId);
+    opts.out !== undefined ? resolveBundleDir(opts.out) : resolveDefaultArtifactDir(runId);
 
   // --dry-run: no network, no disk write.
   // The client (makeClient) is already wired with createDryRunFetch() when

@@ -355,17 +355,14 @@ describe('runArtifactGet', () => {
     'nested/run',
     'nested\\run',
     'bad\0id',
-  ])(
-    'rejects unsafe default artifact runId segment %j',
-    runId => {
-      expect(() => resolveDefaultArtifactDir(runId, '/repo')).toThrowError(
-        expect.objectContaining({
-          code: 'VALIDATION_ERROR',
-          details: expect.objectContaining({ field: 'run-id' }),
-        }),
-      );
-    },
-  );
+  ])('rejects unsafe default artifact runId segment %j', runId => {
+    expect(() => resolveDefaultArtifactDir(runId, '/repo')).toThrowError(
+      expect.objectContaining({
+        code: 'VALIDATION_ERROR',
+        details: expect.objectContaining({ field: 'run-id' }),
+      }),
+    );
+  });
 
   it('keeps the documented default directory for path-safe runIds', () => {
     expect(resolveDefaultArtifactDir(SAMPLE_RUN_ID, '/repo')).toBe(
