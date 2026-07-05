@@ -14,6 +14,7 @@ import { ApiError, CLIError, RequestTimeoutError } from './lib/errors.js';
 import { Output, isOutputMode } from './lib/output.js';
 import { renderCommanderError, rephraseUnknownOption } from './lib/render-error.js';
 import { maybeEmitSkillNudge } from './lib/skill-nudge.js';
+import { maybeNotifyUpdate } from './lib/update-check.js';
 import { VERSION } from './version.js';
 
 const program = new Command();
@@ -128,14 +129,24 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     profile?: string;
     dryRun?: boolean;
   };
+  const commandPath = commandPathOf(actionCommand);
   maybeEmitSkillNudge({
-    commandPath: commandPathOf(actionCommand),
+    commandPath,
     output: isOutputMode(globals.output) ? globals.output : 'text',
     dryRun: globals.dryRun ?? false,
     profile: globals.profile ?? 'default',
     cwd: process.cwd(),
     env: process.env,
   });
+
+  // Best-effort update notice (see lib/update-check.ts): self-gates on the
+  // opt-out env, CI, TTY, and a 24h cache; the wiring adds the flag-level
+  // gates the lib cannot see. Skipped for `completion` (its stdout is eval'd
+  // by shells), under --output json, and under --dry-run. Deliberately not
+  // awaited: an advisory must never delay the real command.
+  if (globals.output !== 'json' && globals.dryRun !== true && commandPath !== 'completion') {
+    void maybeNotifyUpdate();
+  }
 });
 
 try {

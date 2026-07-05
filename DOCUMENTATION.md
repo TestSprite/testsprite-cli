@@ -454,7 +454,19 @@ These apply to every command:
 | `TESTSPRITE_API_URL`            | API endpoint — overrides the credentials file                                           |
 | `TESTSPRITE_PROFILE`            | Active profile (below `--profile`, above `default`)                                     |
 | `TESTSPRITE_REQUEST_TIMEOUT_MS` | Per-request timeout in **milliseconds** (default `120000`, range `1000`–`600000`)       |
+| `TESTSPRITE_NO_UPDATE_NOTIFIER` | Any non-empty value disables the once-per-24h "new version available" notice            |
 | `NO_COLOR`                      | Suppress ANSI escape sequences in ticker output ([no-color.org](https://no-color.org/)) |
+
+### Update notice
+
+Interactive runs print a one-line "new version available" notice on stderr when
+a newer release exists. To learn this, the CLI contacts the public npm registry
+(`registry.npmjs.org`) at most once per 24 hours; the request carries the
+package name only — never your API key, project data, or command line. The
+check is skipped in CI, when stderr is not a TTY, under `--output json` /
+`--dry-run`, and entirely when `TESTSPRITE_NO_UPDATE_NOTIFIER` is set. Any
+failure is silent: the notice can never break or delay a command. This is the
+only outbound call the CLI makes besides your configured API endpoint.
 
 ### Scopes
 
