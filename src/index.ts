@@ -3,6 +3,7 @@
 import { Command, CommanderError } from 'commander';
 import { createAgentCommand } from './commands/agent.js';
 import { createAuthCommand } from './commands/auth.js';
+import { createDoctorCommand } from './commands/doctor.js';
 import {
   createDeprecatedInitCommand,
   createSetupCommand,
@@ -89,6 +90,7 @@ program.addCommand(createProjectCommand({}));
 program.addCommand(createTestCommand());
 program.addCommand(createAgentCommand({}));
 program.addCommand(createUsageCommand());
+program.addCommand(createDoctorCommand());
 
 // Buffer Commander error messages instead of writing immediately. The catch
 // block re-emits in the correct format (JSON or text) once the requested

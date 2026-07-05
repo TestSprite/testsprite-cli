@@ -654,6 +654,8 @@ Commands:
                                Antigravity, Codex)
   usage|credits                Show credit balance and plan/entitlement info
                                (proactive pre-flight before a large test run)
+  doctor                       Diagnose CLI setup: version, Node, profile,
+                               endpoint, credentials, connectivity, skill
   help [command]               display help for command
 "
 `;
