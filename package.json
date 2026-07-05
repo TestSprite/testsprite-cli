@@ -50,7 +50,7 @@
   "license": "Apache-2.0",
   "dependencies": {
     "commander": "^12.1.0",
-    "undici": "^8.5.0",
+    "undici": "^7.16.0",
     "valibot": "^1.4.1"
   },
   "devDependencies": {
