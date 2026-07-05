@@ -92,7 +92,7 @@ import {
 import { createTicker } from '../lib/ticker.js';
 import { RateThrottle } from '../lib/rate-throttle.js';
 import { resolvePortalBase, resolvePortalUrl } from '../lib/facade.js';
-import { loadConfig } from '../lib/config.js';
+import { loadConfig, readConfigFileSettings } from '../lib/config.js';
 import {
   flakyExitCode,
   renderFlakyText,
@@ -552,7 +552,7 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
   // (exit 3) when the caller also lacks a configured key. Order matters
   // for the CLI error spec §2 — bad input is a caller bug, not an auth
   // gate.
-  const projectId = resolveProjectId(opts.projectId, deps);
+  const projectId = resolveProjectId(opts.projectId, deps, opts.profile);
   requireProjectId(projectId);
 
   const paginationFlags: PaginationFlags = validatePaginationFlags({
@@ -791,7 +791,7 @@ export async function runCreate(
   assertChainedRunKeyFits(opts.run, opts.idempotencyKey);
   // Validate inputs before touching credentials or fs — matches the
   // M2 read commands' "input gates first, then auth, then I/O" ordering.
-  const projectId = resolveProjectId(opts.projectId, deps);
+  const projectId = resolveProjectId(opts.projectId, deps, opts.profile);
   requireProjectId(projectId);
   requireNonEmpty('name', opts.name);
   // P1-3: client-side length checks matching server limits (name ≤200,
@@ -6411,7 +6411,7 @@ export async function runTestRunAll(
   deps: TestDeps = {},
 ): Promise<BatchRunFreshResponse | undefined> {
   assertIdempotencyKey(opts.idempotencyKey);
-  const projectId = resolveProjectId(opts.projectId, deps);
+  const projectId = resolveProjectId(opts.projectId, deps, opts.profile);
   requireProjectId(projectId);
   if (
     !Number.isInteger(opts.maxConcurrency) ||
@@ -9176,7 +9176,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
       if (isAll) {
         // --all path: wave-ordered fresh batch run.
-        const projectId = resolveProjectId(cmdOpts.project, deps);
+        const projectId = resolveProjectId(cmdOpts.project, deps, resolveCommonOptions(command).profile);
         requireProjectId(
           projectId,
           '--all requires a project id - pass --project <id> or set TESTSPRITE_PROJECT_ID',
@@ -9805,16 +9805,28 @@ interface StepsFlagOpts {
   runId?: string;
 }
 
-function resolveProjectId(projectId: string | undefined, deps: TestDeps): string | undefined {
+/**
+ * Resolve the effective project id: the `--project` flag when set, then the
+ * `TESTSPRITE_PROJECT_ID` env var, then the `project_id` persisted in the
+ * settings config file (`~/.testsprite/config`) — flag > env > config file —
+ * so a repo/agent can pin the project once instead of repeating it per command.
+ */
+function resolveProjectId(
+  projectId: string | undefined,
+  deps: TestDeps,
+  profile = 'default',
+): string | undefined {
   const explicit = projectId?.trim();
   if (explicit && explicit.length > 0) return explicit;
   const envValue = (deps.env ?? process.env).TESTSPRITE_PROJECT_ID;
   const trimmed = envValue?.trim();
-  return trimmed && trimmed.length > 0 ? trimmed : undefined;
+  if (trimmed && trimmed.length > 0) return trimmed;
+  const fromConfig = readConfigFileSettings(profile, { env: deps.env }).projectId;
+  return typeof fromConfig === 'string' && fromConfig.length > 0 ? fromConfig : undefined;
 }
 function requireProjectId(
   projectId: string | undefined,
-  message = 'is required; pass --project <id> or set TESTSPRITE_PROJECT_ID',
+  message = 'is required; pass --project <id>, set TESTSPRITE_PROJECT_ID, or set project_id in ~/.testsprite/config',
 ): asserts projectId is string {
   if (typeof projectId !== 'string' || projectId.length === 0) {
     throw localValidationError('project', message);
