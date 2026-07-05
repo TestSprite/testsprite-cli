@@ -33,6 +33,7 @@ import {
   runGet,
   runLint,
   runList,
+  runOpen,
   runPlanPut,
   runResult,
   runScaffold,
@@ -131,6 +132,7 @@ describe('createTestCommand — surface', () => {
       'get',
       'lint',
       'list',
+      'open',
       'plan',
       'rerun',
       'result',
@@ -2412,6 +2414,94 @@ describe('runScaffold', () => {
         { stdout: () => undefined, stderr: () => undefined, env: {} },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+});
+
+describe('runOpen', () => {
+  // The mock endpoint host has no portal mapping; the operator override is the
+  // supported escape hatch and gives the tests a deterministic base.
+  beforeEach(() => {
+    process.env.TESTSPRITE_PORTAL_URL = 'https://portal.example.com';
+  });
+  afterEach(() => {
+    delete process.env.TESTSPRITE_PORTAL_URL;
+  });
+
+  const TEST_ROW = {
+    id: 'test_open_me',
+    projectId: 'project_alice',
+    projectName: 'Alice',
+    name: 'Checkout',
+    type: 'frontend',
+    createdFrom: 'cli',
+    status: 'ready',
+    createdAt: '2026-06-01T10:00:00.000Z',
+    updatedAt: '2026-06-01T10:00:00.000Z',
+  };
+
+  it('prints the dashboard URL and spawns the opener with it', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: TEST_ROW }));
+    const out: string[] = [];
+    const opened: string[] = [];
+    const result = await runOpen(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        testId: 'test_open_me',
+        noBrowser: false,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+      url => opened.push(url),
+    );
+    expect(result.dashboardUrl).toContain('/dashboard/tests/project_alice/test/test_open_me');
+    expect(out.join('\n')).toContain(result.dashboardUrl);
+    expect(opened).toEqual([result.dashboardUrl]);
+  });
+
+  it('--no-browser prints the URL but never spawns', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: TEST_ROW }));
+    const out: string[] = [];
+    const opened: string[] = [];
+    await runOpen(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_open_me',
+        noBrowser: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+      url => opened.push(url),
+    );
+    expect(opened).toEqual([]);
+    expect((JSON.parse(out.join('')) as { dashboardUrl: string }).dashboardUrl).toContain(
+      'test_open_me',
+    );
+  });
+
+  it('a broken opener downgrades to a stderr hint, never a failure', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: TEST_ROW }));
+    const errs: string[] = [];
+    await expect(
+      runOpen(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          testId: 'test_open_me',
+          noBrowser: false,
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: line => errs.push(line) },
+        () => {
+          throw new Error('no display');
+        },
+      ),
+    ).resolves.toBeDefined();
+    expect(errs.join('\n')).toContain('could not launch a browser');
   });
 });
 

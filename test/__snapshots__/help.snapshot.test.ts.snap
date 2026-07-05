@@ -205,6 +205,10 @@ Commands:
                                         definition (frontend plan JSON by
                                         default, or a backend Python skeleton).
                                         Pure-local: no network, no credentials.
+  open [options] <test-id>              Open the test in the TestSprite
+                                        dashboard: prints the deep-link URL,
+                                        then spawns your default browser unless
+                                        --no-browser.
   steps [options] <test-id>             List the steps for a test (server
                                         returns the cumulative log across every
                                         run; use --run-id to scope to one run)

@@ -10,6 +10,7 @@ import { rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Command } from 'commander';
+import { openInBrowser } from '../lib/browser.js';
 import {
   emitDryRunBanner,
   makeHttpClient,
@@ -4115,6 +4116,61 @@ export async function runScaffold(
   return payload;
 }
 
+export interface OpenOptions extends CommonOptions {
+  testId: string;
+  /** Print the URL only; never spawn a browser (SSH/headless/CI/agents). */
+  noBrowser: boolean;
+}
+
+/**
+ * `test open <test-id>` (issue #121): jump from the terminal to the test's
+ * dashboard page. The CLI already computes this deep-link and prints it as
+ * text on other commands; this closes the last inch (the `gh browse` /
+ * `cypress open` hop). The URL is ALWAYS printed to stdout (so `--no-browser`
+ * and headless use still compose), then the OS browser is spawned unless
+ * --no-browser. An endpoint with no known portal mapping is a hard error
+ * rather than a silent no-op.
+ */
+export async function runOpen(
+  opts: OpenOptions,
+  deps: TestDeps = {},
+  opener: (url: string) => void = openInBrowser,
+): Promise<{ dashboardUrl: string }> {
+  const out = makeOutput(opts.output, deps);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+
+  if (opts.dryRun) {
+    emitDryRunBanner(stderrFn);
+    const sample = {
+      dashboardUrl: `https://www.testsprite.com/dashboard/tests/p_dryrun_2026/test/${opts.testId}`,
+    };
+    out.print(sample, data => (data as { dashboardUrl: string }).dashboardUrl);
+    return sample;
+  }
+
+  const client = makeClient(opts, deps);
+  // The deep-link needs the projectId; the test record is the source of truth.
+  const test = await client.get<CliTest>(`/tests/${encodeURIComponent(opts.testId)}`);
+  const dashboardUrl = resolvePortalUrl(resolveApiUrl(opts, deps), test.projectId, opts.testId);
+  if (dashboardUrl === undefined) {
+    throw new CLIError(
+      `no dashboard mapping for this API endpoint; set TESTSPRITE_PORTAL_URL to your Portal origin`,
+      1,
+    );
+  }
+  out.print({ dashboardUrl }, () => dashboardUrl);
+  if (!opts.noBrowser) {
+    try {
+      opener(dashboardUrl);
+    } catch {
+      // The URL is already on stdout; a missing opener (containers, minimal
+      // hosts) downgrades to "open it yourself" instead of a hard failure.
+      stderrFn('could not launch a browser; open the URL above manually (or use --no-browser)');
+    }
+  }
+  return { dashboardUrl };
+}
+
 export async function runSteps(
   opts: StepsOptions,
   deps: TestDeps = {},
@@ -8145,6 +8201,24 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           scaffoldType: parseEnumFlag(cmdOpts.type, 'type', TEST_TYPES) ?? 'frontend',
           out: cmdOpts.out,
           force: cmdOpts.force === true,
+        },
+        deps,
+      );
+    });
+
+  test
+    .command('open <test-id>')
+    .description(
+      'Open the test in the TestSprite dashboard: prints the deep-link URL, then spawns your default browser unless --no-browser.',
+    )
+    .option('--no-browser', 'print the URL only (SSH, headless, CI, agents)')
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (testId: string, cmdOpts: { browser?: boolean }, command: Command) => {
+      await runOpen(
+        {
+          ...resolveCommonOptions(command),
+          testId,
+          noBrowser: cmdOpts.browser === false,
         },
         deps,
       );
