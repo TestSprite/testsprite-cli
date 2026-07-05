@@ -14,6 +14,9 @@ Commands:
                      first-run onboarding) into a project for a coding agent
   list               List supported agent targets and skills, their status, and
                      landing paths
+  status [options]   Check installed TestSprite skill files against this CLI
+                     version: ok, stale, modified, unmarked, absent, or corrupt
+                     (exits 1 when anything needs attention, so it can gate CI)
   help [command]     display help for command
 "
 `;

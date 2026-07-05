@@ -9,13 +9,21 @@ import {
   MANAGED_SECTION_END,
   ONBOARD_CODEX_LINE,
   SKILLS,
+  buildSkillMarker,
   pathFor,
   renderForTarget,
+  renderOwnFileWithMarker,
   TARGETS,
   type AgentTarget,
 } from '../lib/agent-targets.js';
-import type { AgentDeps, AgentFs, InstallResult, ListResult } from './agent.js';
-import { AGENTS_MD_CODEX_BUDGET_BYTES, createAgentCommand, runInstall, runList } from './agent.js';
+import type { AgentDeps, AgentFs, InstallResult, ListResult, StatusResult } from './agent.js';
+import {
+  AGENTS_MD_CODEX_BUDGET_BYTES,
+  createAgentCommand,
+  runInstall,
+  runList,
+  runStatus,
+} from './agent.js';
 
 // ---------------------------------------------------------------------------
 // In-memory AgentFs backed by a Map
@@ -2425,5 +2433,122 @@ describe('runInstall — SKILLS registry / DEFAULT_SKILLS contract', () => {
   it('ONBOARD_CODEX_LINE is the one-liner used in the codex section', () => {
     expect(typeof ONBOARD_CODEX_LINE).toBe('string');
     expect(ONBOARD_CODEX_LINE).toContain('**First-time setup:**');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runStatus — `agent status` (issue #123)
+// ---------------------------------------------------------------------------
+
+describe('runStatus — agent status (issue #123)', () => {
+  const statusOpts = {
+    profile: 'default' as const,
+    output: 'json' as const,
+    debug: false,
+    dryRun: false,
+  };
+
+  /** Run status against the given fs and return the printed rows. */
+  async function statusRows(agentFs: AgentFs): Promise<{ rows: StatusResult[]; thrown: unknown }> {
+    const { capture, deps } = makeCapture();
+    let thrown: unknown;
+    try {
+      await runStatus(statusOpts, { cwd: CWD, fs: agentFs, ...deps });
+    } catch (err) {
+      thrown = err;
+    }
+    return { rows: JSON.parse(capture.stdout.join('')) as StatusResult[], thrown };
+  }
+
+  it('nothing installed: every row is absent and the command exits 0', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(thrown).toBeUndefined();
+    expect(rows).toHaveLength(Object.keys(TARGETS).length * DEFAULT_SKILLS.length);
+    expect(rows.every(row => row.state === 'absent')).toBe(true);
+  });
+
+  it('fresh installs read ok (own-file and codex managed section), exit 0', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+    await runInstall(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        target: ['claude', 'codex'],
+        skills: [...DEFAULT_SKILLS],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(thrown).toBeUndefined();
+    for (const skill of DEFAULT_SKILLS) {
+      expect(rows.find(r => r.target === 'claude' && r.skill === skill)?.state).toBe('ok');
+      expect(rows.find(r => r.target === 'codex' && r.skill === skill)?.state).toBe('ok');
+      expect(rows.find(r => r.target === 'cursor' && r.skill === skill)?.state).toBe('absent');
+    }
+  });
+
+  it('stale: a marker whose hash matches an OLDER body reads stale and exits 1', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const oldBody = '# TestSprite Verification Loop\n\nold body from a previous CLI release\n';
+    seedFile(
+      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
+      renderOwnFileWithMarker(
+        'claude',
+        'testsprite-verify',
+        buildSkillMarker('testsprite-verify', oldBody),
+        oldBody,
+      ),
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(rows.find(r => r.target === 'claude' && r.skill === 'testsprite-verify')?.state).toBe(
+      'stale',
+    );
+    expect(thrown).toBeInstanceOf(CLIError);
+    expect((thrown as CLIError).exitCode).toBe(1);
+    expect((thrown as CLIError).message).toContain('need attention');
+  });
+
+  it('modified: current hash but edited bytes reads modified and exits 1', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const canonical = renderForTarget('claude', 'testsprite-verify').content;
+    seedFile(
+      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
+      `${canonical}\n<!-- my local tweak -->\n`,
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(rows.find(r => r.target === 'claude' && r.skill === 'testsprite-verify')?.state).toBe(
+      'modified',
+    );
+    expect((thrown as CLIError).exitCode).toBe(1);
+  });
+
+  it('unmarked: an artifact without a marker line reads unmarked and exits 1', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    seedFile(
+      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
+      '# hand-rolled skill file with no marker\n',
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(rows.find(r => r.target === 'claude' && r.skill === 'testsprite-verify')?.state).toBe(
+      'unmarked',
+    );
+    expect((thrown as CLIError).exitCode).toBe(1);
+  });
+
+  it('rejects an explicit empty --dir (exit 5), matching the resolve-to-cwd hazard', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+    await expect(
+      runStatus({ ...statusOpts, dir: '   ' }, { cwd: CWD, fs: agentFs, ...deps }),
+    ).rejects.toMatchObject({ exitCode: 5 });
   });
 });

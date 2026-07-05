@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { VERSION } from '../version.js';
 
 export type AgentTarget = 'claude' | 'cursor' | 'cline' | 'antigravity' | 'codex';
 
@@ -201,6 +203,85 @@ export const MANAGED_SECTION_BEGIN =
   '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install codex) -->';
 export const MANAGED_SECTION_END = '<!-- END TESTSPRITE AGENT SECTION -->';
 
+// ---------------------------------------------------------------------------
+// Install marker (stale-skill detection, issue #123)
+// ---------------------------------------------------------------------------
+
+/**
+ * Hex characters of the canonical body's SHA-256 kept in the install marker.
+ * 12 hex chars (48 bits) is ample for drift DETECTION (equality against bodies
+ * this CLI ships); the marker is provenance metadata, not a security boundary.
+ */
+const MARKER_HASH_HEX_LENGTH = 12;
+
+/**
+ * When one marker covers several skills (the codex managed section aggregates
+ * every installed skill), their names are joined with this separator in the
+ * marker's skill field. Skill names never contain '+' (see {@link SKILLS} keys).
+ */
+export const MARKER_SKILL_SEPARATOR = '+';
+
+/**
+ * Marker line shape: `<!-- testsprite-skill: <name> v<version> sha256:<hash> -->`.
+ * An HTML comment is inert in every target format (SKILL.md, .mdc, .clinerules
+ * markdown, AGENTS.md). Built via `new RegExp` so the hash length stays bound
+ * to {@link MARKER_HASH_HEX_LENGTH}.
+ */
+const SKILL_MARKER_LINE_RE = new RegExp(
+  `^<!-- testsprite-skill: (\\S+) v(\\S+) sha256:([0-9a-f]{${MARKER_HASH_HEX_LENGTH}}) -->$`,
+);
+
+/**
+ * First {@link MARKER_HASH_HEX_LENGTH} hex chars of the SHA-256 of a canonical
+ * skill body. The hash covers the CANONICAL BODY ONLY (pre-wrap, pre-marker),
+ * so writing the marker into the rendered artifact never changes the hash the
+ * marker itself carries.
+ */
+export function bodyHash12(canonicalBody: string): string {
+  return createHash('sha256')
+    .update(canonicalBody, 'utf8')
+    .digest('hex')
+    .slice(0, MARKER_HASH_HEX_LENGTH);
+}
+
+/**
+ * Build the provenance marker line for a skill (or a
+ * {@link MARKER_SKILL_SEPARATOR}-joined skill set) and its canonical body.
+ * `agent status` compares this fingerprint against the bodies the running CLI
+ * ships to detect silently stale installs.
+ */
+export function buildSkillMarker(skillName: string, canonicalBody: string): string {
+  return `<!-- testsprite-skill: ${skillName} v${VERSION} sha256:${bodyHash12(canonicalBody)} -->`;
+}
+
+/** A marker line parsed back into its fields. */
+export interface ParsedSkillMarker {
+  /** Skill name, or several names joined with {@link MARKER_SKILL_SEPARATOR}. */
+  skill: string;
+  /** CLI version that wrote the artifact. */
+  version: string;
+  /** First 12 hex chars of the canonical body's SHA-256 at install time. */
+  hash12: string;
+  /** The exact marker line (trailing CR/whitespace stripped) as found. */
+  line: string;
+}
+
+/**
+ * Find the first testsprite-skill marker line in `content`, or null when the
+ * content carries none (a pre-marker install). Lines are matched whole with
+ * trailing CR/whitespace stripped, so CRLF checkouts parse identically.
+ */
+export function parseSkillMarker(content: string): ParsedSkillMarker | null {
+  for (const rawLine of content.split('\n')) {
+    const line = rawLine.trimEnd();
+    const matched = SKILL_MARKER_LINE_RE.exec(line);
+    if (matched) {
+      return { skill: matched[1]!, version: matched[2]!, hash12: matched[3]!, line };
+    }
+  }
+  return null;
+}
+
 type ReadFn = (url: URL) => string;
 
 const defaultRead: ReadFn = (url: URL) => readFileSync(url, 'utf8');
@@ -276,14 +357,66 @@ export function loadCodexSkillBody(read: ReadFn = defaultRead): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * Place the marker line inside a wrapped own-file render.
+ *
+ * - Wraps that emit YAML frontmatter (claude/antigravity/cursor): the marker
+ *   lands on the line right after the closing `---` fence, before the body.
+ * - Wrapless targets (cline, body verbatim): the marker is appended as the
+ *   LAST line instead. Cline surfaces the file's first heading as the rule
+ *   title, so a leading comment would displace the body's H1.
+ */
+function injectMarkerLine(wrapped: string, markerLine: string): string {
+  if (wrapped.startsWith('---\n')) {
+    // The name/description frontmatter values are single-line, so the first
+    // `\n---\n` after the opening fence is always the closing fence.
+    const closingFence = '\n---\n';
+    const fenceIdx = wrapped.indexOf(closingFence);
+    if (fenceIdx !== -1) {
+      const insertAt = fenceIdx + closingFence.length;
+      return `${wrapped.slice(0, insertAt)}${markerLine}\n${wrapped.slice(insertAt)}`;
+    }
+  }
+  const separator = wrapped.endsWith('\n') ? '' : '\n';
+  return `${wrapped}${separator}${markerLine}\n`;
+}
+
+/**
+ * Exact own-file bytes for a skill on a target, carrying the GIVEN marker line.
+ * `agent status` uses this to re-render the current canonical body with a
+ * file's own (possibly older-versioned) marker: when only the marker's version
+ * string lags but the body is unchanged, the artifact still compares pristine.
+ */
+export function renderOwnFileWithMarker(
+  target: AgentTarget,
+  skill: string,
+  markerLine: string,
+  body?: string,
+): string {
+  const spec = TARGETS[target];
+  if (spec.mode !== 'own-file') {
+    throw new Error(`renderOwnFileWithMarker: ${target} is not an own-file target`);
+  }
+  const skillSpec = SKILLS[skill];
+  if (!skillSpec) throw new Error(`unknown skill: ${skill}`);
+  const resolvedBody = body !== undefined ? body : loadSkillBodyFor(skill);
+  return injectMarkerLine(
+    spec.wrap(skillSpec.name, skillSpec.description, resolvedBody),
+    markerLine,
+  );
+}
+
+/**
  * The exact bytes to write for one skill on one target.
  *
  * - own-file targets: `body` defaults to the skill's own-file asset, wrapped in
- *   the target's frontmatter/header.
+ *   the target's frontmatter/header, and carrying a provenance marker line so
+ *   `agent status` can tell fresh, stale, and hand-edited installs apart.
  * - codex (managed-section): returns the skill's codex contribution unwrapped
- *   (plain Markdown, no frontmatter). The real install does NOT call this for
- *   codex — it aggregates all skills via {@link buildCodexAggregate} — but it is
- *   kept single-skill here for tests and parity. Pass an explicit `body` to override.
+ *   and marker-free (plain Markdown, no frontmatter). The real install does NOT
+ *   call this for codex: it aggregates all skills via
+ *   {@link buildCodexAggregate} and writes ONE marker just inside the BEGIN
+ *   sentinel. It is kept single-skill here for tests and parity. Pass an
+ *   explicit `body` to override.
  */
 export function renderForTarget(
   t: AgentTarget,
@@ -299,5 +432,8 @@ export function renderForTarget(
     return { path, content: spec.wrap(skillSpec.name, skillSpec.description, resolvedBody) };
   }
   const resolvedBody = body !== undefined ? body : loadSkillBodyFor(skill);
-  return { path, content: spec.wrap(skillSpec.name, skillSpec.description, resolvedBody) };
+  return {
+    path,
+    content: renderOwnFileWithMarker(t, skill, buildSkillMarker(skill, resolvedBody), resolvedBody),
+  };
 }

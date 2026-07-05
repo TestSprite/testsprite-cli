@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { VERSION } from '../version.js';
 import {
   DEFAULT_SKILLS,
   MANAGED_SECTION_BEGIN,
@@ -9,13 +11,17 @@ import {
   SKILL_NAME,
   SKILLS,
   TARGETS,
+  bodyHash12,
   buildCodexAggregate,
+  buildSkillMarker,
   codexContentFor,
   loadCodexSkillBody,
   loadSkillBody,
   loadSkillBodyFor,
+  parseSkillMarker,
   pathFor,
   renderForTarget,
+  renderOwnFileWithMarker,
 } from './agent-targets.js';
 
 // ---------------------------------------------------------------------------
@@ -678,5 +684,112 @@ describe('renderForTarget for testsprite-onboard', () => {
 
   it('unknown skill throws for renderForTarget', () => {
     expect(() => renderForTarget('claude', 'testsprite-unknown')).toThrow('unknown skill');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Install marker (issue #123): format, parsing, and render placement
+// ---------------------------------------------------------------------------
+
+describe('buildSkillMarker / parseSkillMarker / bodyHash12', () => {
+  it('marker line is an HTML comment carrying name, vVERSION, and a 12-hex hash', () => {
+    const marker = buildSkillMarker('testsprite-verify', STUB_BODY);
+    expect(marker).toBe(
+      `<!-- testsprite-skill: testsprite-verify v${VERSION} sha256:${bodyHash12(STUB_BODY)} -->`,
+    );
+    expect(marker).toMatch(
+      /^<!-- testsprite-skill: testsprite-verify v\S+ sha256:[0-9a-f]{12} -->$/,
+    );
+  });
+
+  it('bodyHash12 equals the first 12 hex chars of the body SHA-256', () => {
+    const fullHex = createHash('sha256').update(STUB_BODY, 'utf8').digest('hex');
+    expect(bodyHash12(STUB_BODY)).toBe(fullHex.slice(0, 12));
+  });
+
+  it('parseSkillMarker round-trips a built marker embedded in surrounding content', () => {
+    const marker = buildSkillMarker('testsprite-verify', STUB_BODY);
+    const parsed = parseSkillMarker(`# heading\n${marker}\nbody text\n`);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.skill).toBe('testsprite-verify');
+    expect(parsed?.version).toBe(VERSION);
+    expect(parsed?.hash12).toBe(bodyHash12(STUB_BODY));
+    expect(parsed?.line).toBe(marker);
+  });
+
+  it('parseSkillMarker strips a trailing CR so CRLF checkouts parse identically', () => {
+    const marker = buildSkillMarker('testsprite-verify', STUB_BODY);
+    const parsed = parseSkillMarker(`${marker}\r\nrest\r\n`);
+    expect(parsed?.line).toBe(marker);
+  });
+
+  it('parseSkillMarker returns null when no marker line is present', () => {
+    expect(parseSkillMarker('# Just a heading\n\nProse without any marker.\n')).toBeNull();
+  });
+
+  it('parseSkillMarker ignores the managed-section sentinels (also HTML comments)', () => {
+    expect(parseSkillMarker(`${MANAGED_SECTION_BEGIN}\nbody\n${MANAGED_SECTION_END}\n`)).toBeNull();
+  });
+});
+
+describe('render marker placement (own-file targets)', () => {
+  it('claude render carries the marker on the line right after the closing frontmatter fence', () => {
+    const { content } = renderForTarget('claude', 'testsprite-verify', STUB_BODY);
+    const closingFence = '\n---\n';
+    const fenceEnd = content.indexOf(closingFence) + closingFence.length;
+    expect(content.slice(fenceEnd).startsWith('<!-- testsprite-skill: testsprite-verify ')).toBe(
+      true,
+    );
+  });
+
+  it('cline render appends the marker as the LAST line so the body H1 stays first', () => {
+    const { content } = renderForTarget('cline', 'testsprite-verify', STUB_BODY);
+    expect(content.trimStart().startsWith('# TestSprite Verification Loop')).toBe(true);
+    const lines = content.trimEnd().split('\n');
+    expect(lines[lines.length - 1]).toBe(buildSkillMarker('testsprite-verify', STUB_BODY));
+  });
+
+  it('marker hash covers the canonical body only: same body renders the same hash on every target', () => {
+    const claudeMarker = parseSkillMarker(
+      renderForTarget('claude', 'testsprite-verify', STUB_BODY).content,
+    );
+    const cursorMarker = parseSkillMarker(
+      renderForTarget('cursor', 'testsprite-verify', STUB_BODY).content,
+    );
+    expect(claudeMarker?.hash12).toBe(bodyHash12(STUB_BODY));
+    expect(cursorMarker?.hash12).toBe(bodyHash12(STUB_BODY));
+  });
+
+  it('renderForTarget("codex") stays marker-free (the install writes the section marker)', () => {
+    const result = renderForTarget('codex', 'testsprite-verify', '# codex stub\n');
+    expect(result.content).toBe('# codex stub\n');
+    expect(parseSkillMarker(result.content)).toBeNull();
+  });
+
+  it('renderOwnFileWithMarker splices an arbitrary marker line into the canonical render', () => {
+    const foreignMarker = '<!-- testsprite-skill: testsprite-verify v0.0.1 sha256:0123456789ab -->';
+    const withForeign = renderOwnFileWithMarker(
+      'claude',
+      'testsprite-verify',
+      foreignMarker,
+      STUB_BODY,
+    );
+    expect(withForeign).toContain(foreignMarker);
+    // Marker line aside, the bytes match the canonical render exactly.
+    const canonical = renderForTarget('claude', 'testsprite-verify', STUB_BODY).content;
+    const currentMarker = buildSkillMarker('testsprite-verify', STUB_BODY);
+    expect(withForeign.replace(foreignMarker, currentMarker)).toBe(canonical);
+  });
+
+  it('renderOwnFileWithMarker rejects the managed-section target', () => {
+    expect(() => renderOwnFileWithMarker('codex', 'testsprite-verify', 'marker', 'body')).toThrow(
+      'own-file',
+    );
+  });
+
+  it('renderOwnFileWithMarker throws on an unknown skill', () => {
+    expect(() => renderOwnFileWithMarker('claude', 'testsprite-unknown', 'marker')).toThrow(
+      'unknown skill',
+    );
   });
 });
