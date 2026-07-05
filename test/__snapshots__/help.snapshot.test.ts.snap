@@ -200,6 +200,10 @@ Commands:
                                         (--plan-from, FE-only, M3.2 piece-5)
   create-batch [options]                Create multiple FE tests from a JSONL
                                         of plan specs (FE-only)
+  scaffold [options]                    Emit a schema-correct starter test
+                                        definition (frontend plan JSON by
+                                        default, or a backend Python skeleton).
+                                        Pure-local: no network, no credentials.
   steps [options] <test-id>             List the steps for a test (server
                                         returns the cumulative log across every
                                         run; use --run-id to scope to one run)

@@ -1,4 +1,11 @@
-import { createWriteStream, readFileSync, readdirSync, statSync, type WriteStream } from 'node:fs';
+import {
+  createWriteStream,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  type WriteStream,
+} from 'node:fs';
 import { rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -4000,6 +4007,114 @@ export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<C
   return report;
 }
 
+/** Flag options for `test scaffold`. */
+interface ScaffoldFlagOpts {
+  type?: string;
+  out?: string;
+  force?: boolean;
+}
+
+export interface ScaffoldOptions extends CommonOptions {
+  scaffoldType: 'frontend' | 'backend';
+  out?: string;
+  force: boolean;
+}
+
+/** JSON payload `test scaffold --type backend` prints under --output json. */
+export interface CliBackendScaffold {
+  type: 'backend';
+  language: 'python';
+  code: string;
+}
+
+/**
+ * `test scaffold` — emit a schema-correct starter test definition so a first
+ * test never starts from hand-copied JSON. Pure-local: no network, no
+ * credentials, no filesystem reads. The frontend template is a `CliPlanInput`
+ * (the exact shape `--plan-from` ingests; sourceRef: CliPlanInput /
+ * PLAN_STEP_TYPES above), so `scaffold | create --plan-from -`-style flows
+ * validate out of the box. The backend template is the minimal `requests`
+ * script the onboarding skill mandates: define a test function with a
+ * concrete status assertion, then CALL it (a defined-but-never-called test
+ * would pass without asserting anything).
+ */
+export async function runScaffold(
+  opts: ScaffoldOptions,
+  deps: TestDeps = {},
+): Promise<CliPlanInput | CliBackendScaffold> {
+  const out = makeOutput(opts.output, deps);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const env = deps.env ?? process.env;
+  // Pre-fill the project id from TESTSPRITE_PROJECT_ID when the caller's
+  // environment carries one; otherwise a clearly-marked placeholder the user
+  // swaps after running `testsprite project list`.
+  const projectId =
+    typeof env.TESTSPRITE_PROJECT_ID === 'string' && env.TESTSPRITE_PROJECT_ID.length > 0
+      ? env.TESTSPRITE_PROJECT_ID
+      : '<run: testsprite project list>';
+
+  let payload: CliPlanInput | CliBackendScaffold;
+  let body: string;
+  if (opts.scaffoldType === 'frontend') {
+    const plan: CliPlanInput = {
+      projectId,
+      type: 'frontend',
+      name: 'My first frontend test',
+      description: 'Replace with one sentence describing what this test verifies.',
+      priority: 'p2',
+      planSteps: [
+        {
+          type: 'action',
+          description: 'Navigate to /login and sign in with a seeded test account',
+        },
+        { type: 'action', description: 'Open the first product page and click "Add to cart"' },
+        { type: 'assertion', description: 'Assert that the cart badge shows 1 item' },
+      ],
+    };
+    payload = plan;
+    body = `${JSON.stringify(plan, null, 2)}\n`;
+  } else {
+    const code = [
+      'import requests',
+      '',
+      '# Replace with your API base URL (must be reachable from the internet).',
+      'BASE_URL = "https://staging.example.com"',
+      '',
+      '',
+      'def test_health_endpoint() -> None:',
+      '    response = requests.get(f"{BASE_URL}/health", timeout=30)',
+      '    assert response.status_code == 200, f"expected 200, got {response.status_code}"',
+      '',
+      '',
+      '# The test function MUST be called: TestSprite executes this file top to',
+      '# bottom, so a defined-but-never-called function would pass vacuously.',
+      'test_health_endpoint()',
+      '',
+    ].join('\n');
+    payload = { type: 'backend', language: 'python', code };
+    body = code;
+  }
+
+  if (opts.out !== undefined) {
+    const resolved = isAbsolute(opts.out) ? opts.out : resolve(process.cwd(), opts.out);
+    // Never clobber silently: scaffolds are starting points the user edits, so
+    // an accidental re-run must not erase their work. --force opts in.
+    if (!opts.force && existsSync(resolved)) {
+      throw localValidationError('out', `already exists: ${resolved}. Pass --force to overwrite`);
+    }
+    const sink = openOutputFile(opts.out); // reuses the directory/parent guards
+    const fileOut = makeFileOutput(opts.output, sink);
+    await fileOut.writeChunk(body);
+    await closeOutputFile(sink, true);
+    stderrFn(`Scaffold written to ${resolved}`);
+    return payload;
+  }
+
+  // No --out: the scaffold body IS the stdout payload (`> plan.json` works).
+  out.print(payload, () => body.trimEnd());
+  return payload;
+}
+
 export async function runSteps(
   opts: StepsOptions,
   deps: TestDeps = {},
@@ -7765,6 +7880,34 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
           targetUrl: cmdOpts.targetUrl,
           idempotencyKey: cmdOpts.idempotencyKey,
+        },
+        deps,
+      );
+    });
+
+  test
+    .command('scaffold')
+    .description(
+      'Emit a schema-correct starter test definition (frontend plan JSON by default, or a backend Python skeleton). Pure-local: no network, no credentials.',
+    )
+    .option('--type <type>', 'frontend|backend (default: frontend)')
+    .option('--out <path>', 'write the scaffold to a file instead of stdout')
+    .option('--force', 'overwrite an existing --out file', false)
+    .addHelpText(
+      'after',
+      '\nExamples:\n' +
+        '  testsprite test scaffold > first-test.plan.json\n' +
+        '  testsprite test scaffold --type backend --out tests/health.py\n' +
+        '  testsprite test scaffold --out plan.json   # then edit, and create with --plan-from plan.json',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (cmdOpts: ScaffoldFlagOpts, command: Command) => {
+      await runScaffold(
+        {
+          ...resolveCommonOptions(command),
+          scaffoldType: parseEnumFlag(cmdOpts.type, 'type', TEST_TYPES) ?? 'frontend',
+          out: cmdOpts.out,
+          force: cmdOpts.force === true,
         },
         deps,
       );

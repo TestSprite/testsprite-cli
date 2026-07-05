@@ -35,6 +35,7 @@ import {
   runList,
   runPlanPut,
   runResult,
+  runScaffold,
   runSteps,
   runUpdate,
 } from './test.js';
@@ -133,6 +134,7 @@ describe('createTestCommand — surface', () => {
       'rerun',
       'result',
       'run',
+      'scaffold',
       'steps',
       'update',
       'wait',
@@ -2321,6 +2323,94 @@ describe('runCodePut', () => {
     // And the hint must come from the server's v7, not simulate's canned v99.
     expect(stderrLines.some(l => l.includes('v7'))).toBe(true);
     expect(stderrLines.some(l => l.includes('v99'))).toBe(false);
+  });
+});
+
+describe('runScaffold', () => {
+  it('frontend scaffold is a valid CliPlanInput and prints as JSON on stdout', async () => {
+    const out: string[] = [];
+    const result = await runScaffold(
+      { profile: 'default', output: 'text', debug: false, scaffoldType: 'frontend', force: false },
+      { stdout: line => out.push(line), stderr: () => undefined, env: {} },
+    );
+    const plan = result as { projectId: string; type: string; planSteps: Array<{ type: string }> };
+    expect(plan.type).toBe('frontend');
+    // Placeholder project id when TESTSPRITE_PROJECT_ID is unset.
+    expect(plan.projectId).toContain('testsprite project list');
+    expect(plan.planSteps.length).toBeGreaterThanOrEqual(2);
+    // Every emitted step type must come from the real enum (no drift).
+    for (const step of plan.planSteps) expect(['action', 'assertion']).toContain(step.type);
+    // At least one assertion step so the scaffold is a meaningful test.
+    expect(plan.planSteps.some(step => step.type === 'assertion')).toBe(true);
+    // stdout body parses back to the same plan (`> plan.json` works).
+    expect(JSON.parse(out.join('\n'))).toEqual(plan);
+  });
+
+  it('pre-fills projectId from TESTSPRITE_PROJECT_ID when set', async () => {
+    const result = await runScaffold(
+      { profile: 'default', output: 'json', debug: false, scaffoldType: 'frontend', force: false },
+      {
+        stdout: () => undefined,
+        stderr: () => undefined,
+        env: { TESTSPRITE_PROJECT_ID: 'project_env' },
+      },
+    );
+    expect((result as { projectId: string }).projectId).toBe('project_env');
+  });
+
+  it('backend scaffold defines a requests test with a status assertion AND calls it', async () => {
+    const out: string[] = [];
+    const result = await runScaffold(
+      { profile: 'default', output: 'text', debug: false, scaffoldType: 'backend', force: false },
+      { stdout: line => out.push(line), stderr: () => undefined, env: {} },
+    );
+    const code = (result as { code: string }).code;
+    expect(code).toContain('import requests');
+    expect(code).toContain('assert response.status_code == 200');
+    // The onboarding rule: the function must be CALLED, not just defined.
+    expect(code).toContain('\ntest_health_endpoint()');
+    expect(out.join('\n')).toContain('import requests');
+  });
+
+  it('--out writes the file and refuses to overwrite without --force', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-scaffold-'));
+    const target = join(dir, 'plan.json');
+    const opts = {
+      profile: 'default',
+      output: 'text',
+      debug: false,
+      scaffoldType: 'frontend',
+      out: target,
+      force: false,
+    } as const;
+    const deps = { stdout: () => undefined, stderr: () => undefined, env: {} };
+    await runScaffold({ ...opts }, deps);
+    const written = JSON.parse(readFileSync(target, 'utf8')) as { type: string };
+    expect(written.type).toBe('frontend');
+    // Second run without --force must not clobber the (possibly edited) file.
+    await expect(runScaffold({ ...opts }, deps)).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+    });
+    // --force overwrites.
+    await expect(runScaffold({ ...opts, force: true }, deps)).resolves.toBeDefined();
+  });
+
+  it('--out pointing at an existing path (here a directory) rejects without --force', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-scaffold-dir-'));
+    await expect(
+      runScaffold(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          scaffoldType: 'frontend',
+          out: dir,
+          force: false,
+        },
+        { stdout: () => undefined, stderr: () => undefined, env: {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 });
 
