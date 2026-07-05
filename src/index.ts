@@ -35,13 +35,31 @@ if (shouldRejectNodeVersion(process.versions.node)) {
 const program = new Command();
 
 /**
- * Default for the global `--output` flag: the `output` key of the profile's
- * section in `~/.testsprite/config` when present. Flag values and the
- * env-selected profile still win; an invalid or absent value falls back to
+ * Profile used for CONFIG-FILE DEFAULTS. The `--output` default must be
+ * computed before Commander parses argv, so honor the same precedence the
+ * real resolution uses (`--profile` flag > TESTSPRITE_PROFILE > "default")
+ * by peeking argv for the flag. Both `--profile <name>` and `--profile=<name>`
+ * spellings are recognized; anything unparseable falls back down the chain.
+ */
+function profileForDefaults(): string {
+  const argv = process.argv;
+  const flagIndex = argv.indexOf('--profile');
+  const next = flagIndex !== -1 ? argv[flagIndex + 1] : undefined;
+  if (typeof next === 'string' && next.length > 0 && !next.startsWith('-')) return next;
+  const inline = argv.find(arg => arg.startsWith('--profile='));
+  const inlineValue = inline?.slice('--profile='.length);
+  if (typeof inlineValue === 'string' && inlineValue.length > 0) return inlineValue;
+  return process.env.TESTSPRITE_PROFILE ?? 'default';
+}
+
+/**
+ * Default for the global `--output` flag: the `output` key of the selected
+ * profile's section in `~/.testsprite/config` when present. An explicit
+ * `--output` flag still wins; an invalid or absent value falls back to
  * 'text' (the historical default).
  */
 function configFileOutputDefault(): string {
-  const settings = readConfigFileSettings(process.env.TESTSPRITE_PROFILE ?? 'default');
+  const settings = readConfigFileSettings(profileForDefaults());
   return isOutputMode(settings.output) ? settings.output : 'text';
 }
 
