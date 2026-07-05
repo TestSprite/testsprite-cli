@@ -31,6 +31,15 @@ export function openInBrowser(url: string, deps: OpenInBrowserDeps = {}): void {
     deps.exec ??
     ((command: string, args: readonly string[]) => {
       const child = spawn(command, [...args], { detached: true, stdio: 'ignore' });
+      // spawn() reports a missing binary (ENOENT) ASYNCHRONOUSLY on the child,
+      // so the caller's try/catch cannot see it — and an unhandled 'error'
+      // event would crash the whole CLI. The URL is already on stdout, so
+      // degrade to the same manual-open hint the sync failure path prints.
+      child.on('error', () => {
+        process.stderr.write(
+          'could not launch a browser; open the URL above manually (or use --no-browser)\n',
+        );
+      });
       child.unref();
     });
 

@@ -4141,8 +4141,14 @@ export async function runOpen(
 
   if (opts.dryRun) {
     emitDryRunBanner(stderrFn);
+    // Derive the sample through the SAME resolver as the live path (against
+    // the canonical prod endpoint and the dry-run project id) so the two can
+    // never drift; the ?? arm is unreachable for the prod mapping but keeps
+    // the type total.
     const sample = {
-      dashboardUrl: `https://www.testsprite.com/dashboard/tests/p_dryrun_2026/test/${opts.testId}`,
+      dashboardUrl:
+        resolvePortalUrl('https://api.testsprite.com', 'p_dryrun_2026', opts.testId) ??
+        `https://www.testsprite.com/dashboard/tests/p_dryrun_2026/test/${encodeURIComponent(opts.testId)}`,
     };
     out.print(sample, data => (data as { dashboardUrl: string }).dashboardUrl);
     return sample;

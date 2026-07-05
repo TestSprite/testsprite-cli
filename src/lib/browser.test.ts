@@ -61,10 +61,34 @@ describe('openInBrowser', () => {
 
     it('spawns detached, ignores stdio, and unrefs the child', () => {
       const unref = vi.fn();
-      spawnMock.mockReturnValue({ unref });
+      spawnMock.mockReturnValue({ unref, on: vi.fn() });
       openInBrowser(url, { platform: 'darwin' });
       expect(spawnMock).toHaveBeenCalledWith('open', [url], { detached: true, stdio: 'ignore' });
       expect(unref).toHaveBeenCalledTimes(1);
+    });
+
+    it("handles the child's async 'error' (missing binary) with a stderr hint, not a crash", () => {
+      // spawn() reports ENOENT asynchronously on the child; an unhandled
+      // 'error' event would crash the CLI. The default spawner must register
+      // a listener that degrades to the manual-open hint.
+      const listeners = new Map<string, (err: Error) => void>();
+      spawnMock.mockReturnValue({
+        unref: vi.fn(),
+        on: (event: string, listener: (err: Error) => void) => {
+          listeners.set(event, listener);
+        },
+      });
+      const stderrSpy = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      try {
+        openInBrowser(url, { platform: 'linux' });
+        const onError = listeners.get('error');
+        expect(onError).toBeDefined();
+        // Firing the listener must not throw and must print the hint.
+        expect(() => onError!(new Error('spawn xdg-open ENOENT'))).not.toThrow();
+        expect(String(stderrSpy.mock.calls.at(-1)?.[0])).toContain('could not launch a browser');
+      } finally {
+        stderrSpy.mockRestore();
+      }
     });
   });
 });
