@@ -251,14 +251,19 @@ Commands:
    11  rate limited — honor Retry-After
   
   On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
-  wait [options] <run-id>               Wait for a run to reach a terminal status.
+  wait [options] <run-id...>            Wait for one or more runs to reach a terminal status.
+  
+  With several run-ids the runs are polled concurrently under one shared
+  --timeout and a {results, summary} envelope is printed (worst status wins
+  the exit code), so every re-attach hint the CLI prints can be pasted as
+  ONE command.
   
   Exit codes:
     0  passed
     1  failed / blocked / cancelled
     3  auth error
     4  run not found
-    7  timeout — resume with: testsprite test wait <run-id>
+    7  timeout — resume with: testsprite test wait <run-id...>
    10  transport/network failure (UNAVAILABLE) — retry the command
   
   On failure/blocked/cancelled, run: testsprite test artifact get <run-id>

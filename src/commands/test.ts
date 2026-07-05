@@ -5331,6 +5331,188 @@ export async function runTestRun(
   return finalRun;
 }
 
+/** One row of the `test wait <run-id...>` multi-run payload. */
+export interface CliMultiWaitResult {
+  runId: string;
+  /** Terminal run status, or 'timeout', or 'error:<CODE>' when the poll failed. */
+  status: string;
+  /** Test the run belongs to, when the poll observed it. */
+  testId?: string;
+}
+
+export interface RunTestWaitManyOptions extends CommonOptions {
+  runIds: string[];
+  timeoutSeconds: number;
+  maxConcurrency: number;
+}
+
+/**
+ * `test wait <run-id...>` with two or more ids: attach to N already-dispatched
+ * runs in ONE invocation. This closes the loop the CLI itself opens: every
+ * batch/closure timeout prints one `testsprite test wait <runId>` hint PER
+ * member, which previously meant N sequential blocking invocations. The runs
+ * are polled concurrently under a bounded pool with ONE shared deadline
+ * (`--timeout` bounds the whole invocation, not each member), each member's
+ * poll is total (a transient error on one run never discards the others), and
+ * the exit code is the worst status across members: auth errors escalate to
+ * exit 3, any timeout or poll error exits 7, any non-passed terminal exits 1.
+ * Distinct from a run journal (issue #80): no persistence, just N known ids.
+ */
+export async function runTestWaitMany(
+  opts: RunTestWaitManyOptions,
+  deps: TestDeps = {},
+): Promise<{ results: CliMultiWaitResult[]; summary: Record<string, number> }> {
+  const out = makeOutput(opts.output, deps);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+
+  if (opts.dryRun) {
+    emitDryRunBanner(stderrFn);
+    const results: CliMultiWaitResult[] = opts.runIds.map(runId => ({
+      runId,
+      status: 'passed',
+    }));
+    const payload = {
+      results,
+      summary: { total: results.length, passed: results.length, failed: 0, timedOut: 0, errors: 0 },
+    };
+    out.print(payload, () => results.map(r => `${r.runId}  ${r.status}`).join('\n'));
+    return payload;
+  }
+
+  const client = makeClient(
+    { ...opts, requestTimeoutMs: resolveWaitRequestTimeoutMs({ ...opts, wait: true }) },
+    deps,
+  );
+  const ticker = createTicker(stderrFn, opts.output === 'json' ? false : undefined);
+
+  // One shared deadline across every member (the whole point of the shared
+  // pool: `--timeout 600` means the invocation ends within ~600s, not
+  // 600s x ceil(N/concurrency)).
+  const deadlineMs = Date.now() + opts.timeoutSeconds * 1000;
+
+  type WaitOutcome =
+    | { kind: 'result'; run: RunResponse }
+    | { kind: 'timeout' }
+    | { kind: 'error'; code: string; exitCode: number };
+
+  const pollOne = async (runId: string): Promise<WaitOutcome> => {
+    const resolveAlternate = makeBackendWaitFallback({
+      client,
+      resolveTestId: run => run.testId,
+      resolveNotBefore: run => run.createdAt,
+      onResolved: () => undefined,
+    });
+    try {
+      const run = await pollRunUntilTerminal(client, runId, {
+        timeoutSeconds: Math.max(1, Math.ceil((deadlineMs - Date.now()) / 1000)),
+        sleep: deps.sleep,
+        onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
+        onTick: (run, elapsedMs) => {
+          const elapsed = Math.round(elapsedMs / 1000);
+          ticker.update(`Run ${run.runId} — ${run.status} (elapsed=${elapsed}s)`);
+        },
+        resolveAlternate,
+      });
+      return { kind: 'result', run };
+    } catch (err) {
+      if (err instanceof TimeoutError) return { kind: 'timeout' };
+      if (err instanceof RequestTimeoutError) throw err;
+      if (err instanceof ApiError) return { kind: 'error', code: err.code, exitCode: err.exitCode };
+      return { kind: 'error', code: 'TRANSPORT', exitCode: 10 };
+    }
+  };
+
+  const outcomes = new Map<string, WaitOutcome>();
+  let inFlight = 0;
+  let nextIdx = 0;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const startNext = (): void => {
+        while (inFlight < opts.maxConcurrency && nextIdx < opts.runIds.length) {
+          const runId = opts.runIds[nextIdx++]!;
+          inFlight++;
+          pollOne(runId)
+            .then(outcome => {
+              outcomes.set(runId, outcome);
+              inFlight--;
+              startNext();
+              if (inFlight === 0 && nextIdx >= opts.runIds.length) resolve();
+            })
+            // pollOne is total except for RequestTimeoutError (handled below).
+            .catch(reject);
+        }
+      };
+      startNext();
+      if (opts.runIds.length === 0) resolve();
+    });
+  } catch (fanOutErr) {
+    if (fanOutErr instanceof RequestTimeoutError) {
+      // Same contract as the batch pollers: leave stdout parseable before
+      // exiting 7 — every dispatched id is re-attachable in one command.
+      ticker.finalize('Multi-run wait — request timed out');
+      const partial = {
+        results: opts.runIds.map(runId => ({ runId, status: 'running' })),
+        summary: { total: opts.runIds.length },
+      };
+      out.print(partial, () => partial.results.map(r => `${r.runId}  running`).join('\n'));
+      stderrFn(`Re-attach with: testsprite test wait ${opts.runIds.join(' ')}`);
+    }
+    throw fanOutErr;
+  }
+  ticker.finalize();
+
+  const results: CliMultiWaitResult[] = opts.runIds.map(runId => {
+    const outcome = outcomes.get(runId);
+    if (outcome === undefined || outcome.kind === 'timeout') return { runId, status: 'timeout' };
+    if (outcome.kind === 'error') return { runId, status: `error:${outcome.code}` };
+    return { runId, status: outcome.run.status, testId: outcome.run.testId };
+  });
+  const passed = results.filter(r => r.status === 'passed').length;
+  const timedOut = results.filter(r => r.status === 'timeout').length;
+  const errors = results.filter(r => r.status.startsWith('error:')).length;
+  const failed = results.length - passed - timedOut - errors;
+  const payload = {
+    results,
+    summary: { total: results.length, passed, failed, timedOut, errors },
+  };
+  out.print(payload, () =>
+    [
+      ...results.map(r => `${r.runId}  ${r.status}`),
+      '',
+      `${passed}/${results.length} passed, ${failed} failed/blocked, ${timedOut} timed out, ${errors} poll errors`,
+    ].join('\n'),
+  );
+
+  const timedOutIds = results.filter(r => r.status === 'timeout').map(r => r.runId);
+  if (timedOutIds.length > 0) {
+    stderrFn(`Re-attach with: testsprite test wait ${timedOutIds.join(' ')}`);
+  }
+
+  // Worst-status exit: auth escalates (a rejected key fails every member the
+  // same way), then timeout/poll-error (7, resumable), then plain failure (1).
+  const authError = [...outcomes.values()].find(
+    o =>
+      o.kind === 'error' &&
+      (o.code === 'AUTH_REQUIRED' || o.code === 'AUTH_INVALID' || o.code === 'AUTH_FORBIDDEN'),
+  );
+  if (authError !== undefined && authError.kind === 'error') {
+    throw new CLIError(
+      `Multi-run wait: authentication failed (${authError.code})`,
+      authError.exitCode,
+    );
+  }
+  if (timedOut > 0 || errors > 0) {
+    throw new CLIError(
+      `Multi-run wait: ${timedOut} timed out, ${errors} poll error(s) out of ${results.length} runs`,
+      7,
+    );
+  }
+  if (failed > 0) {
+    throw new CLIError(`Multi-run wait: ${failed} run(s) finished non-passed`, 1);
+  }
+  return payload;
+}
+
 /**
  * `test wait <run-id>` — M3.3 piece-3.
  *
@@ -8140,26 +8322,52 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     });
 
   test
-    .command('wait <run-id>')
+    .command('wait <run-id...>')
     .description(
-      'Wait for a run to reach a terminal status.\n' +
+      'Wait for one or more runs to reach a terminal status.\n' +
+        '\nWith several run-ids the runs are polled concurrently under one shared\n' +
+        '--timeout and a {results, summary} envelope is printed (worst status wins\n' +
+        'the exit code), so every re-attach hint the CLI prints can be pasted as\n' +
+        'ONE command.\n' +
         '\nExit codes:\n' +
         '  0  passed\n' +
         '  1  failed / blocked / cancelled\n' +
         '  3  auth error\n' +
         '  4  run not found\n' +
-        '  7  timeout — resume with: testsprite test wait <run-id>\n' +
+        '  7  timeout — resume with: testsprite test wait <run-id...>\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
         '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>',
     )
     .option('--timeout <s>', `max seconds to wait (1–3600, default ${DEFAULT_RUN_TIMEOUT_SECONDS})`)
+    .option(
+      '--max-concurrency <n>',
+      'with several run-ids, max concurrent polls (1-100, default: 10)',
+    )
     .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(async (runId: string, cmdOpts: WaitFlagOpts, command: Command) => {
-      await runTestWait(
+    .action(async (runIds: string[], cmdOpts: WaitFlagOpts, command: Command) => {
+      // One id keeps the historical single-run path byte-identical (same
+      // output shape, same exit codes); two or more fan out.
+      if (runIds.length === 1) {
+        await runTestWait(
+          {
+            ...resolveCommonOptions(command),
+            runId: runIds[0]!,
+            timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
+          },
+          deps,
+        );
+        return;
+      }
+      const maxConcurrency = parseNumericFlag(cmdOpts.maxConcurrency, 'max-concurrency') ?? 10;
+      if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 100) {
+        throw localValidationError('max-concurrency', 'must be an integer between 1 and 100');
+      }
+      await runTestWaitMany(
         {
           ...resolveCommonOptions(command),
-          runId,
+          runIds,
           timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
+          maxConcurrency,
         },
         deps,
       );
@@ -8545,6 +8753,7 @@ interface RunFlagOpts {
 
 interface WaitFlagOpts {
   timeout?: string;
+  maxConcurrency?: string;
 }
 
 interface RerunFlagOpts {
