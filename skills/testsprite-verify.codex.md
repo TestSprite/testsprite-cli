@@ -16,11 +16,11 @@ build/config changes, or when the repo has no TestSprite project linked.
 
 ```bash
 testsprite --version          # CLI installed?
-testsprite auth whoami        # credentials valid?
+testsprite auth status        # credentials valid?
 ```
 
 If `--version` fails, tell the user to install the CLI and stop.
-If `auth whoami` fails, tell the user to run `testsprite auth configure` and stop.
+If `auth status` fails, tell the user to run `testsprite setup` and stop.
 
 ### 2. Find the project
 

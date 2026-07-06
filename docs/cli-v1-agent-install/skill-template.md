@@ -61,13 +61,13 @@ because <X>. Treat this as unverified until that's resolved." Don't claim done.
 
 ```bash
 testsprite --version              # CLI installed?
-testsprite auth whoami            # credentials configured?
+testsprite auth status            # credentials configured?
 ```
 
 - `--version` fails → the CLI isn't installed. Tell the user to install the
   TestSprite CLI (see the TestSprite docs) and stop; don't install it for them.
-- `auth whoami` fails → no credentials. Tell the user they can run
-  `testsprite auth configure`, then stop.
+- `auth status` fails → no credentials. Tell the user they can run
+  `testsprite setup`, then stop.
 
 ## 2. Find the project
 

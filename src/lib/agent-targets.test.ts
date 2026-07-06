@@ -448,6 +448,27 @@ describe('loadCodexSkillBody', () => {
 });
 
 // ---------------------------------------------------------------------------
+// content integrity — current auth command names
+// ---------------------------------------------------------------------------
+
+describe('content integrity — testsprite-verify auth commands', () => {
+  it('uses current auth/setup commands in every canonical verify skill asset', () => {
+    const assets = [
+      ['docs template', templateRaw],
+      ['own-file skill body', loadSkillBodyFor('testsprite-verify')],
+      ['codex skill body', codexContentFor('testsprite-verify')],
+    ] as const;
+
+    for (const [name, content] of assets) {
+      expect(content, name).toContain('testsprite auth status');
+      expect(content, name).toContain('testsprite setup');
+      expect(content, name).not.toContain('auth whoami');
+      expect(content, name).not.toContain('auth configure');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // MANAGED_SECTION sentinels
 // ---------------------------------------------------------------------------
 
