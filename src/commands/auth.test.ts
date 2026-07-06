@@ -858,7 +858,6 @@ describe('runWhoami', () => {
         ...deps,
         env: { TESTSPRITE_API_URL: '   ' },
         credentialsPath,
-        fetchImpl: makeFetch(meResponse()),
       },
     );
     const out = capture.stdout.join('\n');

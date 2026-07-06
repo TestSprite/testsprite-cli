@@ -339,7 +339,6 @@ describe('makeHttpClient - API key validation', () => {
     ['smart dash', 'sk-user-abc\u2013def'],
     ['smart quote', 'sk-user-\u201cabc\u201d'],
     ['emoji', 'sk-user-abc\u{1f600}'],
-    ['whitespace-only', '   '],
   ])('rejects a malformed configured API key with %s before fetch/retry', (_label, apiKey) => {
     const fetchImpl = vi.fn();
     let caught: unknown;
@@ -361,6 +360,26 @@ describe('makeHttpClient - API key validation', () => {
     expect(apiErr.code).toBe('VALIDATION_ERROR');
     expect(apiErr.exitCode).toBe(5);
     expect(apiErr.nextAction).toContain('api-key');
+  });
+
+  it('treats a whitespace-only TESTSPRITE_API_KEY env var as unset (AUTH_REQUIRED)', () => {
+    const fetchImpl = vi.fn();
+    let caught: unknown;
+    try {
+      makeHttpClient(
+        { profile: 'default', output: 'json', debug: false, dryRun: false },
+        {
+          env: { TESTSPRITE_API_KEY: '   ' } as NodeJS.ProcessEnv,
+          credentialsPath: NO_CREDS_PATH,
+          fetchImpl,
+        },
+      );
+    } catch (err) {
+      caught = err;
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).code).toBe('AUTH_REQUIRED');
   });
 });
 
