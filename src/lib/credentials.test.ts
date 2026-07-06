@@ -118,7 +118,11 @@ describe('writeProfile', () => {
 
   it('preserves other profiles when updating one', async () => {
     await writeProfile('default', { apiKey: 'sk-d' }, { path: credentialsPath });
-    await writeProfile('dev', { apiKey: 'sk-dev', apiUrl: 'https://dev' }, { path: credentialsPath });
+    await writeProfile(
+      'dev',
+      { apiKey: 'sk-dev', apiUrl: 'https://dev' },
+      { path: credentialsPath },
+    );
     await writeProfile('default', { apiUrl: 'https://prod' }, { path: credentialsPath });
 
     const file = readCredentialsFile({ path: credentialsPath });
@@ -261,9 +265,9 @@ describe('assertValidProfileName / profile-name guard', () => {
   });
 
   it('writeProfile rejects a malformed name and does NOT create the file', async () => {
-    await expect(writeProfile('prod]', { apiKey: 'sk-1' }, { path: credentialsPath })).rejects.toThrow(
-      ApiError,
-    );
+    await expect(
+      writeProfile('prod]', { apiKey: 'sk-1' }, { path: credentialsPath }),
+    ).rejects.toThrow(ApiError);
     expect(existsSync(credentialsPath)).toBe(false);
   });
 

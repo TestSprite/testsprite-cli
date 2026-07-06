@@ -273,5 +273,3 @@ function isStaleCredentialsLock(lockPath: string): boolean {
     return false;
   }
 }
-
-

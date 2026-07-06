@@ -22,7 +22,11 @@ describe('loadConfig', () => {
   });
 
   it('honors TESTSPRITE_API_URL over the file', async () => {
-    await writeProfile('default', { apiUrl: 'https://from-file.example.com' }, { path: credentialsPath });
+    await writeProfile(
+      'default',
+      { apiUrl: 'https://from-file.example.com' },
+      { path: credentialsPath },
+    );
     const config = loadConfig({
       env: { TESTSPRITE_API_URL: 'https://from-env.example.com' },
       credentialsPath,
