@@ -115,14 +115,15 @@ testsprite agent install cline      # .clinerules/testsprite-verify.md
 testsprite agent install windsurf   # .windsurf/rules/testsprite-verify.md
 testsprite agent install antigravity  # .agents/skills/testsprite-verify/SKILL.md
 testsprite agent install kiro       # .kiro/skills/testsprite-verify/SKILL.md
-testsprite agent list               # list all 7 targets with status + mode + path
+testsprite agent install copilot    # .github/instructions/testsprite-verify.instructions.md
+testsprite agent list               # list all 8 targets with status + mode + path
 ```
 
-Supported targets: `claude` (GA), `codex` (experimental), `cursor` (experimental), `cline` (experimental), `antigravity` (experimental), `kiro` (experimental), `windsurf` (experimental).
+Supported targets: `claude` (GA), `codex` (experimental), `cursor` (experimental), `cline` (experimental), `antigravity` (experimental), `kiro` (experimental), `windsurf` (experimental), `copilot` (experimental).
 
 The `codex` target uses **managed-section mode** — it writes only a sentinel-delimited section inside your existing `AGENTS.md`, so your project instructions are never clobbered. Re-running without `--force` replaces the section in-place; user content outside the sentinels is always preserved.
 
-Re-running with `--force` on **own-file targets** (claude, cursor, cline, antigravity, kiro, windsurf) backs up the existing file to `<path>.bak` first.
+Re-running with `--force` on **own-file targets** (claude, cursor, cline, antigravity, kiro, windsurf, copilot) backs up the existing file to `<path>.bak` first.
 
 ## Command reference
 

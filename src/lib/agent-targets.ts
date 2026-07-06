@@ -9,7 +9,8 @@ export type AgentTarget =
   | 'antigravity'
   | 'codex'
   | 'kiro'
-  | 'windsurf';
+  | 'windsurf'
+  | 'copilot';
 
 export interface TargetSpec {
   status: 'ga' | 'experimental';
@@ -149,6 +150,19 @@ function wrapWindsurf(_name: string, description: string, body: string): string 
   return `---\ntrigger: model_decision\ndescription: ${description}\n---\n\n${body}\n`;
 }
 
+/**
+ * GitHub Copilot reads path-specific custom instructions from
+ * `.github/instructions/*.instructions.md` (VS Code / Visual Studio / GitHub
+ * Copilot Chat). Each file carries YAML frontmatter with `applyTo` — a glob that
+ * scopes when the instructions attach. `applyTo: '**'` attaches the guidance to
+ * every request in the repo, which is what a persistent verification skill wants
+ * (there is no on-demand "model decides" mode for Copilot instruction files, so
+ * always-apply is the correct idiom). `description` is surfaced in Copilot's UI.
+ */
+function wrapCopilot(_name: string, description: string, body: string): string {
+  return `---\ndescription: ${description}\napplyTo: '**'\n---\n\n${body}\n`;
+}
+
 // ---------------------------------------------------------------------------
 // Landing paths
 // ---------------------------------------------------------------------------
@@ -173,6 +187,8 @@ export function pathFor(target: AgentTarget, skill: string): string {
       return `.kiro/skills/${skill}/SKILL.md`;
     case 'windsurf':
       return `.windsurf/rules/${skill}.md`;
+    case 'copilot':
+      return `.github/instructions/${skill}.instructions.md`;
     case 'codex':
       return 'AGENTS.md';
   }
@@ -219,6 +235,18 @@ export const TARGETS: Record<AgentTarget, TargetSpec> = {
     // so render the compact body per skill (see compactBodyFor).
     compactBody: true,
     wrap: wrapWindsurf,
+  },
+  copilot: {
+    status: 'experimental',
+    path: pathFor('copilot', SKILL_NAME),
+    mode: 'own-file',
+    // GitHub Copilot path-specific instructions: frontmatter carries `applyTo`.
+    // `applyTo: '**'` means the file is ALWAYS injected into Copilot requests
+    // (there is no on-demand "model decides" mode like Cursor/Windsurf), so
+    // render the compact body to keep the always-on context cost small — the
+    // same reasoning that drives windsurf's compact render.
+    compactBody: true,
+    wrap: wrapCopilot,
   },
   /**
    * codex target — managed-section mode.
