@@ -18,6 +18,7 @@ import { runFlaky } from './test.js';
 
 type FetchInput = Parameters<typeof globalThis.fetch>[0];
 type RunStatus = 'passed' | 'failed' | 'blocked' | 'cancelled';
+type TriggerAuthErrorCode = 'AUTH_REQUIRED' | 'AUTH_INVALID' | 'AUTH_FORBIDDEN';
 
 function urlOf(input: FetchInput): string {
   return typeof input === 'string'
@@ -46,6 +47,7 @@ function makeFlakyFetch(opts: {
   statuses: RunStatus[];
   testType?: 'frontend' | 'backend';
   notFoundOnTrigger?: boolean;
+  triggerAuthError?: TriggerAuthErrorCode;
 }): { fetchImpl: FetchImpl; triggerCount: () => number } {
   let triggers = 0;
   const testType = opts.testType ?? 'frontend';
@@ -67,6 +69,17 @@ function makeFlakyFetch(opts: {
     }
 
     if (method === 'POST' && url.includes('/runs/rerun')) {
+      if (opts.triggerAuthError) {
+        return jsonResponse(opts.triggerAuthError === 'AUTH_FORBIDDEN' ? 403 : 401, {
+          error: {
+            code: opts.triggerAuthError,
+            message: 'auth failed',
+            nextAction: 'run setup',
+            requestId: 'req_auth',
+            details: {},
+          },
+        });
+      }
       if (opts.notFoundOnTrigger) {
         return jsonResponse(404, {
           error: {
@@ -344,6 +357,35 @@ describe('runFlaky', () => {
     expect(err).toBeInstanceOf(ApiError);
     expect((err as ApiError).code).toBe('NOT_FOUND');
   });
+
+  it.each(['AUTH_REQUIRED', 'AUTH_INVALID', 'AUTH_FORBIDDEN'] as const)(
+    'propagates %s during trigger instead of scoring an error attempt',
+    async code => {
+      const { fetchImpl, triggerCount } = makeFlakyFetch({
+        statuses: [],
+        triggerAuthError: code,
+      });
+      const { deps, stdout } = makeDeps(fetchImpl);
+      const err = await runFlaky(
+        {
+          profile: 'default',
+          output: 'json',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+          testId: 'test_x',
+          runs: 3,
+          untilFail: false,
+          timeoutSeconds: 600,
+        },
+        deps,
+      ).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err).toMatchObject({ code, exitCode: 3 });
+      expect(stdout).toEqual([]);
+      expect(triggerCount()).toBe(0);
+    },
+  );
 
   it('rejects --runs below the range (0) with a validation error (exit 5)', async () => {
     const { fetchImpl } = makeFlakyFetch({ statuses: [] });

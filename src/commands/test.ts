@@ -8369,6 +8369,18 @@ const MAX_FLAKY_RUNS = 10;
 /** Default replay count when `--runs` is omitted. */
 const DEFAULT_FLAKY_RUNS = 5;
 
+function isFlakyFatalTriggerError(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return false;
+  switch (err.code) {
+    case 'AUTH_REQUIRED':
+    case 'AUTH_INVALID':
+    case 'AUTH_FORBIDDEN':
+      return true;
+    default:
+      return false;
+  }
+}
+
 interface RunTestFlakyOptions extends CommonOptions {
   testId: string;
   /** Number of replays to run (1..MAX_FLAKY_RUNS). */
@@ -8466,6 +8478,9 @@ export async function runFlaky(
             details: { testId: opts.testId, reason: 'no_replayable_run' },
           },
         });
+      }
+      if (isFlakyFatalTriggerError(err)) {
+        throw err;
       }
       // Any other trigger error is recorded as an errored attempt so a single
       // transient blip doesn't abort a long stability probe.
