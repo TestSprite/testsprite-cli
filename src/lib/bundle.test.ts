@@ -601,6 +601,10 @@ describe('resolveBundleDir', () => {
     const out = resolveBundleDir('/tmp/x/');
     expect(out).toBe('/tmp/x');
   });
+
+  it('preserves the filesystem root path', () => {
+    expect(resolveBundleDir('/')).toBe('/');
+  });
 });
 
 describe('streamUrlToFile retry', () => {

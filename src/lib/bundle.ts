@@ -325,7 +325,7 @@ export function resolveBundleDir(rawPath: string): string {
       },
     });
   }
-  const trimmed = rawPath.endsWith('/') ? rawPath.slice(0, -1) : rawPath;
+  const trimmed = rawPath.endsWith('/') && rawPath.length > 1 ? rawPath.slice(0, -1) : rawPath;
   return isAbsolute(trimmed) ? trimmed : resolve(process.cwd(), trimmed);
 }
 
