@@ -9,6 +9,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 import { openInBrowser } from './browser.js';
+import { ApiError } from './errors.js';
 
 describe('openInBrowser', () => {
   const url = 'https://portal.example.com/tests/t_123';
@@ -40,11 +41,16 @@ describe('openInBrowser', () => {
     expect(calls).toEqual([{ command: 'xdg-open', args: [url] }]);
   });
 
-  it('refuses a non-http(s) URL before spawning', () => {
+  it('refuses a non-http(s) URL with exit 5 before spawning', () => {
     const exec = vi.fn();
-    expect(() => openInBrowser('file:///etc/passwd', { platform: 'linux', exec })).toThrow(
-      /non-http\(s\)/,
-    );
+    let error: unknown;
+    try {
+      openInBrowser('file:///etc/passwd', { platform: 'linux', exec });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).exitCode).toBe(5);
     expect(exec).not.toHaveBeenCalled();
   });
 

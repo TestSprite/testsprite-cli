@@ -14,6 +14,7 @@
  * are the caller's to surface (it already printed the URL as the fallback).
  */
 import { spawn } from 'node:child_process';
+import { localValidationError } from './errors.js';
 
 export interface OpenInBrowserDeps {
   platform?: NodeJS.Platform;
@@ -24,7 +25,14 @@ export interface OpenInBrowserDeps {
 export function openInBrowser(url: string, deps: OpenInBrowserDeps = {}): void {
   const parsed = new URL(url);
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-    throw new Error(`refusing to open a non-http(s) URL (${parsed.protocol})`);
+    // User-input error, not an internal failure: classify as VALIDATION_ERROR
+    // so it maps to exit 5 (like every other bad-argument path), not exit 1.
+    throw localValidationError(
+      'url',
+      `must be an http(s) URL (got ${parsed.protocol})`,
+      undefined,
+      'field',
+    );
   }
   const platform = deps.platform ?? process.platform;
   const exec =
