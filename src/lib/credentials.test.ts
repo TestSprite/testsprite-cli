@@ -108,26 +108,26 @@ describe('readCredentialsFile / readProfile', () => {
 });
 
 describe('writeProfile', () => {
-  it('creates the file with mode 0600 and writes the profile', () => {
-    writeProfile(DEFAULT_PROFILE, { apiKey: 'sk-new' }, { path: credentialsPath });
+  it('creates the file with mode 0600 and writes the profile', async () => {
+    await writeProfile(DEFAULT_PROFILE, { apiKey: 'sk-new' }, { path: credentialsPath });
     expect(existsSync(credentialsPath)).toBe(true);
     const mode = statSync(credentialsPath).mode & 0o777;
     expect(mode).toBe(0o600);
     expect(readProfile(DEFAULT_PROFILE, { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
   });
 
-  it('preserves other profiles when updating one', () => {
-    writeProfile('default', { apiKey: 'sk-d' }, { path: credentialsPath });
-    writeProfile('dev', { apiKey: 'sk-dev', apiUrl: 'https://dev' }, { path: credentialsPath });
-    writeProfile('default', { apiUrl: 'https://prod' }, { path: credentialsPath });
+  it('preserves other profiles when updating one', async () => {
+    await writeProfile('default', { apiKey: 'sk-d' }, { path: credentialsPath });
+    await writeProfile('dev', { apiKey: 'sk-dev', apiUrl: 'https://dev' }, { path: credentialsPath });
+    await writeProfile('default', { apiUrl: 'https://prod' }, { path: credentialsPath });
 
     const file = readCredentialsFile({ path: credentialsPath });
     expect(file.default).toEqual({ apiKey: 'sk-d', apiUrl: 'https://prod' });
     expect(file.dev).toEqual({ apiKey: 'sk-dev', apiUrl: 'https://dev' });
   });
 
-  it('does not leak the api key into the on-disk file format aside from the value itself', () => {
-    writeProfile('default', { apiKey: 'sk-secret-12345' }, { path: credentialsPath });
+  it('does not leak the api key into the on-disk file format aside from the value itself', async () => {
+    await writeProfile('default', { apiKey: 'sk-secret-12345' }, { path: credentialsPath });
     const onDisk = readFileSync(credentialsPath, 'utf-8');
     expect(onDisk).toContain('api_key = sk-secret-12345');
     expect(onDisk.split('\n').filter(line => line.includes('sk-secret-12345'))).toHaveLength(1);
@@ -135,21 +135,21 @@ describe('writeProfile', () => {
 });
 
 describe('deleteProfile', () => {
-  it('returns false when the profile is missing', () => {
-    expect(deleteProfile('nope', { path: credentialsPath })).toBe(false);
+  it('returns false when the profile is missing', async () => {
+    expect(await deleteProfile('nope', { path: credentialsPath })).toBe(false);
   });
 
-  it('removes the named profile and leaves others intact', () => {
-    writeProfile('default', { apiKey: 'sk-d' }, { path: credentialsPath });
-    writeProfile('dev', { apiKey: 'sk-dev' }, { path: credentialsPath });
-    expect(deleteProfile('dev', { path: credentialsPath })).toBe(true);
+  it('removes the named profile and leaves others intact', async () => {
+    await writeProfile('default', { apiKey: 'sk-d' }, { path: credentialsPath });
+    await writeProfile('dev', { apiKey: 'sk-dev' }, { path: credentialsPath });
+    expect(await deleteProfile('dev', { path: credentialsPath })).toBe(true);
     expect(readProfile('dev', { path: credentialsPath })).toBeUndefined();
     expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-d' });
   });
 
-  it('leaves an empty file when the last profile is removed', () => {
-    writeProfile('default', { apiKey: 'sk-d' }, { path: credentialsPath });
-    expect(deleteProfile('default', { path: credentialsPath })).toBe(true);
+  it('leaves an empty file when the last profile is removed', async () => {
+    await writeProfile('default', { apiKey: 'sk-d' }, { path: credentialsPath });
+    expect(await deleteProfile('default', { path: credentialsPath })).toBe(true);
     expect(readCredentialsFile({ path: credentialsPath })).toEqual({});
     expect(existsSync(credentialsPath)).toBe(true);
   });
@@ -221,15 +221,15 @@ describe('credentials write lock', () => {
     expect(file.staging).toEqual({ apiKey: 'sk-staging' });
   });
 
-  it('removes the lock file after writeProfile completes', () => {
-    writeProfile('default', { apiKey: 'sk-lock-cleanup' }, { path: credentialsPath });
+  it('removes the lock file after writeProfile completes', async () => {
+    await writeProfile('default', { apiKey: 'sk-lock-cleanup' }, { path: credentialsPath });
     expect(existsSync(`${credentialsPath}.lock`)).toBe(false);
   });
 
-  it('removes the lock file after deleteProfile completes', () => {
-    writeProfile('default', { apiKey: 'sk-d' }, { path: credentialsPath });
-    writeProfile('dev', { apiKey: 'sk-dev' }, { path: credentialsPath });
-    expect(deleteProfile('dev', { path: credentialsPath })).toBe(true);
+  it('removes the lock file after deleteProfile completes', async () => {
+    await writeProfile('default', { apiKey: 'sk-d' }, { path: credentialsPath });
+    await writeProfile('dev', { apiKey: 'sk-dev' }, { path: credentialsPath });
+    expect(await deleteProfile('dev', { path: credentialsPath })).toBe(true);
     expect(existsSync(`${credentialsPath}.lock`)).toBe(false);
   });
 });
@@ -260,15 +260,15 @@ describe('assertValidProfileName / profile-name guard', () => {
     }
   });
 
-  it('writeProfile rejects a malformed name and does NOT create the file', () => {
-    expect(() => writeProfile('prod]', { apiKey: 'sk-1' }, { path: credentialsPath })).toThrow(
+  it('writeProfile rejects a malformed name and does NOT create the file', async () => {
+    await expect(writeProfile('prod]', { apiKey: 'sk-1' }, { path: credentialsPath })).rejects.toThrow(
       ApiError,
     );
     expect(existsSync(credentialsPath)).toBe(false);
   });
 
-  it('readProfile and deleteProfile reject a malformed name', () => {
+  it('readProfile and deleteProfile reject a malformed name', async () => {
     expect(() => readProfile('a\nb', { path: credentialsPath })).toThrow(ApiError);
-    expect(() => deleteProfile('a\nb', { path: credentialsPath })).toThrow(ApiError);
+    await expect(deleteProfile('a\nb', { path: credentialsPath })).rejects.toThrow(ApiError);
   });
 });

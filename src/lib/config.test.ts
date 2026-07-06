@@ -21,8 +21,8 @@ describe('loadConfig', () => {
     expect(config.profile).toBe('default');
   });
 
-  it('honors TESTSPRITE_API_URL over the file', () => {
-    writeProfile('default', { apiUrl: 'https://from-file.example.com' }, { path: credentialsPath });
+  it('honors TESTSPRITE_API_URL over the file', async () => {
+    await writeProfile('default', { apiUrl: 'https://from-file.example.com' }, { path: credentialsPath });
     const config = loadConfig({
       env: { TESTSPRITE_API_URL: 'https://from-env.example.com' },
       credentialsPath,
@@ -30,8 +30,8 @@ describe('loadConfig', () => {
     expect(config.apiUrl).toBe('https://from-env.example.com');
   });
 
-  it('honors TESTSPRITE_API_KEY over the file', () => {
-    writeProfile('default', { apiKey: 'sk-from-file' }, { path: credentialsPath });
+  it('honors TESTSPRITE_API_KEY over the file', async () => {
+    await writeProfile('default', { apiKey: 'sk-from-file' }, { path: credentialsPath });
     const config = loadConfig({
       env: { TESTSPRITE_API_KEY: 'sk-from-env' },
       credentialsPath,
@@ -55,8 +55,8 @@ describe('loadConfig', () => {
     ).toBe('option-profile');
   });
 
-  it('option.endpointUrl overrides everything', () => {
-    writeProfile('default', { apiUrl: 'https://file' }, { path: credentialsPath });
+  it('option.endpointUrl overrides everything', async () => {
+    await writeProfile('default', { apiUrl: 'https://file' }, { path: credentialsPath });
     const config = loadConfig({
       endpointUrl: 'https://flag',
       env: { TESTSPRITE_API_URL: 'https://env' },
@@ -65,8 +65,8 @@ describe('loadConfig', () => {
     expect(config.apiUrl).toBe('https://flag');
   });
 
-  it('falls back to credentials file when env is unset', () => {
-    writeProfile(
+  it('falls back to credentials file when env is unset', async () => {
+    await writeProfile(
       'default',
       { apiKey: 'sk-file', apiUrl: 'https://from-file.example.com' },
       { path: credentialsPath },
@@ -76,8 +76,8 @@ describe('loadConfig', () => {
     expect(config.apiUrl).toBe('https://from-file.example.com');
   });
 
-  it('reads the requested profile, not just default', () => {
-    writeProfile('dev', { apiKey: 'sk-dev' }, { path: credentialsPath });
+  it('reads the requested profile, not just default', async () => {
+    await writeProfile('dev', { apiKey: 'sk-dev' }, { path: credentialsPath });
     const config = loadConfig({ profile: 'dev', env: {}, credentialsPath });
     expect(config.apiKey).toBe('sk-dev');
   });

@@ -97,7 +97,7 @@ describe('runUsage — dry-run', () => {
 
 describe('runUsage — real path without credits (current backend)', () => {
   it('returns the /me response and emits a note about missing balance', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const result = await runUsage(
       { profile: 'default', output: 'text', debug: false },
@@ -116,7 +116,7 @@ describe('runUsage — real path without credits (current backend)', () => {
   });
 
   it('text output includes identity fields even without credits', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runUsage(
       { profile: 'default', output: 'text', debug: false },
@@ -132,7 +132,7 @@ describe('runUsage — real path without credits (current backend)', () => {
   });
 
   it('JSON output passes the raw /me response through (no credits key present)', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runUsage(
       { profile: 'default', output: 'json', debug: false },
@@ -150,7 +150,7 @@ describe('runUsage — real path without credits (current backend)', () => {
 
 describe('runUsage — real path with credits (future backend)', () => {
   it('renders balance block when credits + subPlan are present', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runUsage(
       { profile: 'default', output: 'text', debug: false },
@@ -173,7 +173,7 @@ describe('runUsage — real path with credits (future backend)', () => {
   });
 
   it('does NOT emit the missing-balance note when credits are present', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runUsage(
       { profile: 'default', output: 'text', debug: false },
@@ -189,7 +189,7 @@ describe('runUsage — real path with credits (future backend)', () => {
   });
 
   it('emits low-balance warning when credits < creditsPerRun', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const lowBalance: UsageResponse = { ...meWithCredits, credits: 1, creditsPerRun: 2 };
     await runUsage(
@@ -206,7 +206,7 @@ describe('runUsage — real path with credits (future backend)', () => {
   });
 
   it('emits free-plan upgrade hint when subPlan is Free', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const freePlan: UsageResponse = { ...meWithCredits, subPlan: 'Free', credits: 10 };
     await runUsage(
@@ -223,7 +223,7 @@ describe('runUsage — real path with credits (future backend)', () => {
   });
 
   it('JSON output passes credits and subPlan through verbatim', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runUsage(
       { profile: 'default', output: 'json', debug: false },
@@ -249,7 +249,7 @@ describe('runUsage — error handling', () => {
   });
 
   it('forwards server AUTH_INVALID with exit code 3', async () => {
-    writeProfile('default', { apiKey: 'sk-bad' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-bad' }, { path: credentialsPath });
     const { deps } = makeCapture();
     const errorBody = {
       error: {
@@ -273,7 +273,7 @@ describe('runUsage — error handling', () => {
   });
 
   it('re-maps INSUFFICIENT_CREDITS (rate_limited with credits sub-case) to exit 12', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { deps } = makeCapture();
     const creditError = {
       error: {

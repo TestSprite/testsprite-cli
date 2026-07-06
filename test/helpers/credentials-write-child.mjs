@@ -9,4 +9,4 @@ if (!profile || !credentialsPath || !apiKey) {
   process.exit(1);
 }
 
-writeProfile(profile, { apiKey }, { path: credentialsPath });
+await writeProfile(profile, { apiKey }, { path: credentialsPath });

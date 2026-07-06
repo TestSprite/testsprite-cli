@@ -168,7 +168,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
     );
   }
 
-  writeProfile(opts.profile, { apiKey, apiUrl }, { path: credentialsPath });
+  await writeProfile(opts.profile, { apiKey, apiUrl }, { path: credentialsPath });
 
   out.print({ profile: opts.profile, apiUrl, status: 'configured' }, data => {
     const d = data as { profile: string; apiUrl: string };
@@ -258,7 +258,7 @@ export async function runLogout(opts: CommonOptions, deps: AuthDeps = {}): Promi
     return;
   }
 
-  const removed = deleteProfile(opts.profile, { path: credentialsPath });
+  const removed = await deleteProfile(opts.profile, { path: credentialsPath });
   out.print({ profile: opts.profile, status: removed ? 'logged_out' : 'no_credentials' }, data => {
     const d = data as { profile: string; status: string };
     return d.status === 'logged_out'

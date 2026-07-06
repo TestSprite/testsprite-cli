@@ -165,7 +165,7 @@ describe('runConfigure', () => {
     const { capture, deps } = makeCapture();
     // Pre-existing dev profile — re-running configure interactively must keep it
     // (the internal dogfooding flow) without ever prompting for the endpoint.
-    writeProfile(
+    await writeProfile(
       'dev',
       { apiKey: 'sk-old', apiUrl: 'https://api.example.com:8443' },
       { path: credentialsPath },
@@ -350,7 +350,7 @@ describe('runConfigure', () => {
   it('dogfood-2026-05-25 — --from-env without TESTSPRITE_API_URL inherits existing profile api_url AND validates against it', async () => {
     const { capture, deps } = makeCapture();
     // Pre-write an existing profile with a custom (non-default) endpoint.
-    writeProfile(
+    await writeProfile(
       'default',
       { apiKey: 'sk-old', apiUrl: 'https://api.example.com' },
       { path: credentialsPath },
@@ -398,7 +398,7 @@ describe('runConfigure', () => {
 
   it('dogfood-2026-05-25 — --endpoint-url flag overrides existing profile api_url', async () => {
     const { capture, deps } = makeCapture();
-    writeProfile(
+    await writeProfile(
       'default',
       { apiKey: 'sk-old', apiUrl: 'https://api.example.com' },
       { path: credentialsPath },
@@ -428,7 +428,7 @@ describe('runConfigure', () => {
   it('dogfood-2026-05-25 — no advisory when inherited url equals DEFAULT_API_URL', async () => {
     const { capture, deps } = makeCapture();
     // Existing profile has the default prod endpoint — no advisory needed.
-    writeProfile(
+    await writeProfile(
       'default',
       { apiKey: 'sk-old', apiUrl: 'https://api.testsprite.com' },
       { path: credentialsPath },
@@ -504,7 +504,7 @@ describe('runConfigure', () => {
     // An exported-but-empty env var (`export TESTSPRITE_API_URL=`) must not
     // short-circuit the `??` chain to an empty endpoint; it should fall through
     // to the existing profile's api_url.
-    writeProfile(
+    await writeProfile(
       'default',
       { apiKey: 'sk-old', apiUrl: 'https://api.example.com:8443' },
       { path: credentialsPath },
@@ -610,7 +610,7 @@ describe('runWhoami', () => {
   }
 
   it('calls GET /me using the configured profile and prints text output', async () => {
-    writeProfile(
+    await writeProfile(
       'default',
       { apiKey: 'sk-stored', apiUrl: 'https://api.example.com' },
       { path: credentialsPath },
@@ -633,7 +633,7 @@ describe('runWhoami', () => {
   });
 
   it('emits JSON when --output json', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runWhoami(
       { profile: 'default', output: 'json', debug: false },
@@ -644,7 +644,7 @@ describe('runWhoami', () => {
   });
 
   it('L1788: text output includes the resolved endpoint URL', async () => {
-    writeProfile(
+    await writeProfile(
       'default',
       { apiKey: 'sk-stored', apiUrl: 'https://api.example.com' },
       { path: credentialsPath },
@@ -672,7 +672,7 @@ describe('runWhoami', () => {
   });
 
   it('L1788: JSON output does NOT add endpoint (raw /me envelope is passed through)', async () => {
-    writeProfile(
+    await writeProfile(
       'default',
       { apiKey: 'sk-stored', apiUrl: 'https://api.example.com' },
       { path: credentialsPath },
@@ -701,7 +701,7 @@ describe('runWhoami', () => {
   });
 
   it('L1866: renders email + name in text mode when the backend supplies them', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const meWithEmail = new Response(
       JSON.stringify({ ...sampleMe, email: 'alice@example.com', displayName: 'Alice' }),
@@ -718,7 +718,7 @@ describe('runWhoami', () => {
   });
 
   it('L1866: omits email/name lines when the backend does not return them', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runWhoami(
       { profile: 'default', output: 'text', debug: false },
@@ -731,7 +731,7 @@ describe('runWhoami', () => {
   });
 
   it('L1866: passes email through verbatim in JSON mode when present', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const meWithEmail = new Response(JSON.stringify({ ...sampleMe, email: 'alice@example.com' }), {
       status: 200,
@@ -769,7 +769,7 @@ describe('runWhoami', () => {
   });
 
   it('emits debug events to stderr when debug is enabled', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runWhoami(
       { profile: 'default', output: 'json', debug: true },
@@ -782,7 +782,7 @@ describe('runWhoami', () => {
   });
 
   it('forwards server AUTH_INVALID with exit code 3', async () => {
-    writeProfile('default', { apiKey: 'sk-bad' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-bad' }, { path: credentialsPath });
     const { deps } = makeCapture();
     const errorBody = {
       error: {
@@ -812,7 +812,7 @@ describe('runWhoami', () => {
       ...sampleMe,
       scopes: ['read:projects', 'read:tests'],
     };
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const fetchImpl = makeFetch(
       new Response(JSON.stringify(readOnlyMe), {
@@ -835,7 +835,7 @@ describe('runWhoami', () => {
       ...sampleMe,
       scopes: ['read:projects', 'read:tests', 'write:tests', 'run:tests'],
     };
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const fetchImpl = makeFetch(
       new Response(JSON.stringify(fullMe), {
@@ -856,7 +856,7 @@ describe('runWhoami', () => {
       ...sampleMe,
       scopes: ['read:projects', 'read:tests'],
     };
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const fetchImpl = makeFetch(
       new Response(JSON.stringify(readOnlyMe), {
@@ -878,8 +878,8 @@ describe('runWhoami', () => {
 
 describe('runLogout', () => {
   it('removes the profile and reports success', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
-    writeProfile('dev', { apiKey: 'sk-dev' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    await writeProfile('dev', { apiKey: 'sk-dev' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runLogout(
       { profile: 'default', output: 'text', debug: false },
@@ -927,7 +927,7 @@ describe('createAuthCommand wiring', () => {
   });
 
   it('remove deletes the active profile and exits 0', async () => {
-    writeProfile('default', { apiKey: 'sk-remove' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-remove' }, { path: credentialsPath });
     const { deps } = makeCapture();
     const auth = createAuthCommand({ ...deps, credentialsPath });
     auth.exitOverride();
@@ -937,7 +937,7 @@ describe('createAuthCommand wiring', () => {
   });
 
   it('deprecated `whoami` alias emits a deprecation notice pointing at `auth status`', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const auth = createAuthCommand({
       ...deps,
@@ -953,7 +953,7 @@ describe('createAuthCommand wiring', () => {
   });
 
   it('whoami uses injected fetch and exits 0', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { deps } = makeCapture();
     const fetchImpl = vi.fn(
       async () =>
@@ -970,7 +970,7 @@ describe('createAuthCommand wiring', () => {
   });
 
   it('L1802: `status` alias resolves to the whoami action', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { deps } = makeCapture();
     const fetchImpl = vi.fn(
       async () =>
@@ -987,7 +987,7 @@ describe('createAuthCommand wiring', () => {
   });
 
   it('logout removes the profile', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { deps } = makeCapture();
     const auth = createAuthCommand({ ...deps, credentialsPath });
     auth.exitOverride();

@@ -139,24 +139,27 @@ export function readProfile(
   return file[profile];
 }
 
-export function writeProfile(
+export async function writeProfile(
   profile: string,
   entry: ProfileEntry,
   options: CredentialsOptions = {},
-): void {
+): Promise<void> {
   assertValidProfileName(profile);
   const path = resolvePath(options);
-  withCredentialsLock(path, () => {
+  await withCredentialsLock(path, () => {
     const file = readCredentialsFile(options);
     file[profile] = { ...file[profile], ...entry };
     writeCredentialsAtomic(path, file);
   });
 }
 
-export function deleteProfile(profile: string, options: CredentialsOptions = {}): boolean {
+export async function deleteProfile(
+  profile: string,
+  options: CredentialsOptions = {},
+): Promise<boolean> {
   assertValidProfileName(profile);
   const path = resolvePath(options);
-  return withCredentialsLock(path, () => {
+  return await withCredentialsLock(path, () => {
     const file = readCredentialsFile(options);
     if (!(profile in file)) return false;
     delete file[profile];
@@ -204,8 +207,8 @@ function credentialsLockPath(credentialsPath: string): string {
  * lock, concurrent `writeProfile` / `deleteProfile` calls can each read the
  * same snapshot and the last rename wins — silently dropping the other update.
  */
-function withCredentialsLock<T>(credentialsPath: string, fn: () => T): T {
-  acquireCredentialsLock(credentialsPath);
+async function withCredentialsLock<T>(credentialsPath: string, fn: () => T): Promise<T> {
+  await acquireCredentialsLock(credentialsPath);
   try {
     return fn();
   } finally {
@@ -213,7 +216,7 @@ function withCredentialsLock<T>(credentialsPath: string, fn: () => T): T {
   }
 }
 
-function acquireCredentialsLock(credentialsPath: string): void {
+async function acquireCredentialsLock(credentialsPath: string): Promise<void> {
   const lockPath = credentialsLockPath(credentialsPath);
   // Ensure the credentials directory exists before creating the lock file.
   // writeCredentialsAtomic also mkdirs, but only after the lock is held.
@@ -234,7 +237,7 @@ function acquireCredentialsLock(credentialsPath: string): void {
         }
         continue;
       }
-      syncSleep(CREDENTIALS_LOCK_RETRY_MS);
+      await new Promise(resolve => setTimeout(resolve, CREDENTIALS_LOCK_RETRY_MS));
     }
   }
   throw new Error(`Timed out acquiring credentials lock: ${lockPath}`);
@@ -271,9 +274,4 @@ function isStaleCredentialsLock(lockPath: string): boolean {
   }
 }
 
-function syncSleep(ms: number): void {
-  const until = Date.now() + ms;
-  while (Date.now() < until) {
-    // Busy-wait: credentials I/O is sync-only; sub-ms precision is unnecessary.
-  }
-}
+
