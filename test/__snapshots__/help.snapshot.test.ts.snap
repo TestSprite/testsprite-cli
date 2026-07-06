@@ -667,6 +667,7 @@ Commands:
                                (proactive pre-flight before a large test run)
   doctor                       Diagnose CLI setup: version, Node, profile,
                                endpoint, credentials, connectivity, skill
+  completion [shell]           Print a shell completion script (bash|zsh|fish)
   help [command]               display help for command
 "
 `;

@@ -3,6 +3,7 @@
 import { Command, CommanderError } from 'commander';
 import { createAgentCommand } from './commands/agent.js';
 import { createAuthCommand } from './commands/auth.js';
+import { createCompletionCommand, type CompletionSpec } from './commands/completion.js';
 import { createDoctorCommand } from './commands/doctor.js';
 import {
   createDeprecatedInitCommand,
@@ -92,6 +93,28 @@ program.addCommand(createTestCommand());
 program.addCommand(createAgentCommand({}));
 program.addCommand(createUsageCommand());
 program.addCommand(createDoctorCommand());
+program.addCommand(createCompletionCommand(() => buildCompletionSpec()));
+
+// Derive the shell-completion spec from the fully-assembled command tree at call
+// time (not module-load), so `testsprite completion` can never drift from the
+// real commands, subcommands, and global flags.
+function buildCompletionSpec(): CompletionSpec {
+  const subcommands: Record<string, string[]> = {};
+  for (const command of program.commands) {
+    const subs = command.commands.map(sub => sub.name()).filter(name => name !== 'help');
+    if (subs.length > 0) subcommands[command.name()] = subs;
+  }
+  const flags = program.options
+    .map(option => option.long)
+    .filter((long): long is string => typeof long === 'string');
+  if (!flags.includes('--help')) flags.push('--help');
+  return {
+    program: 'testsprite',
+    commands: [...new Set([...program.commands.map(command => command.name()), 'help'])],
+    subcommands,
+    globalFlags: flags,
+  };
+}
 
 // Buffer Commander error messages instead of writing immediately. The catch
 // block re-emits in the correct format (JSON or text) once the requested
