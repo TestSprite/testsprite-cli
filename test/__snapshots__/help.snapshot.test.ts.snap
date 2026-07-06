@@ -4,7 +4,7 @@ exports[`--help snapshots > agent 1`] = `
 "Usage: testsprite agent [options] [command]
 
 Install TestSprite guidance into coding-agent config (Claude Code, Cursor,
-Cline, Windsurf, Copilot, Antigravity, Codex)
+Cline, Antigravity, Kiro, Windsurf, Copilot, Codex)
 
 Options:
   -h, --help         display help for command
@@ -651,8 +651,8 @@ Commands:
   project                      Manage TestSprite projects
   test                         Inspect TestSprite tests
   agent                        Install TestSprite guidance into coding-agent
-                               config (Claude Code, Cursor, Cline, Windsurf,
-                               Copilot, Antigravity, Codex)
+                               config (Claude Code, Cursor, Cline, Antigravity,
+                               Kiro, Windsurf, Copilot, Codex)
   usage|credits                Show credit balance and plan/entitlement info
                                (proactive pre-flight before a large test run)
   help [command]               display help for command
