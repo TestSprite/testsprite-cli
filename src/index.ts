@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+
 import { Command, CommanderError } from 'commander';
 import { createAgentCommand } from './commands/agent.js';
 import { createAuthCommand } from './commands/auth.js';
@@ -12,9 +13,21 @@ import { createTestCommand } from './commands/test.js';
 import { createUsageCommand } from './commands/usage.js';
 import { ApiError, CLIError, RequestTimeoutError } from './lib/errors.js';
 import { Output, isOutputMode } from './lib/output.js';
+import { maybeInstallProxyAgent } from './lib/proxy.js';
 import { renderCommanderError, rephraseUnknownOption } from './lib/render-error.js';
 import { maybeEmitSkillNudge } from './lib/skill-nudge.js';
+import { maybeNotifyUpdate } from './lib/update-check.js';
 import { VERSION } from './version.js';
+import { shouldRejectNodeVersion } from './version-guard.js';
+
+// Guard: exit early with a clear message on unsupported Node.js versions,
+// rather than failing later with a cryptic ESM/runtime error.
+if (shouldRejectNodeVersion(process.versions.node)) {
+  process.stderr.write(
+    `Error: testsprite requires Node.js >= 20 (found ${process.versions.node}).\nInstall the latest LTS from https://nodejs.org\n`,
+  );
+  process.exit(1);
+}
 
 const program = new Command();
 
@@ -128,15 +141,29 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     profile?: string;
     dryRun?: boolean;
   };
+  const commandPath = commandPathOf(actionCommand);
   maybeEmitSkillNudge({
-    commandPath: commandPathOf(actionCommand),
+    commandPath,
     output: isOutputMode(globals.output) ? globals.output : 'text',
     dryRun: globals.dryRun ?? false,
     profile: globals.profile ?? 'default',
     cwd: process.cwd(),
     env: process.env,
   });
+
+  // Best-effort update notice (see lib/update-check.ts): self-gates on the
+  // opt-out env, CI, TTY, and a 24h cache; the wiring adds the flag-level
+  // gates the lib cannot see. Skipped for `completion` (its stdout is eval'd
+  // by shells), under --output json, and under --dry-run. Deliberately not
+  // awaited: an advisory must never delay the real command.
+  if (globals.output !== 'json' && globals.dryRun !== true && commandPath !== 'completion') {
+    void maybeNotifyUpdate();
+  }
 });
+
+// Corporate/CI proxies: honor HTTPS_PROXY/HTTP_PROXY/NO_PROXY (Node's fetch
+// ignores them by default). No-op when no proxy variable is set.
+maybeInstallProxyAgent();
 
 try {
   await program.parseAsync(process.argv);

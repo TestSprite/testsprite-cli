@@ -48,15 +48,18 @@ jobs:
       - run: npm run typecheck
 
   test:
-    name: Unit Tests
+    name: Unit Tests (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: 'npm'
 
       - run: npm ci
@@ -66,15 +69,18 @@ jobs:
           CI: true
 
   build:
-    name: Build
+    name: Build (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: 'npm'
 
       - run: npm ci

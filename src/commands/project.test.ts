@@ -199,6 +199,47 @@ describe('runList', () => {
     });
   });
 
+  it('rejects invalid pagination before requiring credentials', async () => {
+    const credentialsPath = join(mkdtempSync(join(tmpdir(), 'cli-p2-no-creds-')), 'credentials');
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runList(
+        { profile: 'default', output: 'json', debug: false, pageSize: 1.5 },
+        { credentialsPath, fetchImpl: fetchImpl as unknown as typeof globalThis.fetch },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'page-size' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('rejects invalid dry-run pagination before emitting the dry-run banner', async () => {
+    const stderr: string[] = [];
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runList(
+        { profile: 'default', output: 'json', debug: false, dryRun: true, pageSize: 1.5 },
+        {
+          credentialsPath: join(mkdtempSync(join(tmpdir(), 'cli-p2-dryrun-')), 'credentials'),
+          fetchImpl: fetchImpl as unknown as typeof globalThis.fetch,
+          stderr: line => stderr.push(line),
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'page-size' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(stderr.join('\n')).not.toContain(DRY_RUN_BANNER);
+  });
+
   it('rejects pageSize=101 with VALIDATION_ERROR exit 5 (Fix 7 — upper-bound enforced client-side)', async () => {
     // Previously silently clamped to 100; now rejected so callers get fast feedback.
     const { credentialsPath } = makeCreds();
@@ -569,6 +610,60 @@ describe('runCreate', () => {
     ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it('rejects a whitespace-only --name with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network — validation must fire client-side');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'frontend',
+          name: '   ',
+          targetUrl: 'https://example.com',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+  it('rejects a whitespace-only --password with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network - validation must fire client-side');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'frontend',
+          name: 'Password Guard Project',
+          targetUrl: 'https://example.com',
+          password: '   ',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -646,6 +741,55 @@ describe('runUpdate', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it('rejects a whitespace-only --name with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not be called');
+    });
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          name: '   ',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('rejects a whitespace-only --password with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not be called');
+    });
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          password: '   ',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
   it('P7 — dry-run returns canned shape without network call', async () => {
     resetDryRunBannerForTesting();
     const { credentialsPath } = makeCreds();
@@ -675,6 +819,33 @@ describe('runUpdate', () => {
     expect(result.updatedFields).toContain('name');
     // DEV-247: the canned sample must carry the "not from the server" banner.
     expect(err).toContain(DRY_RUN_BANNER);
+  });
+
+  it('P7 — dry-run with --password-file does not read the filesystem', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network');
+    });
+    const result = await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'proj_dry',
+        passwordFile: '/tmp/definitely-not-here-testsprite',
+      },
+      {
+        credentialsPath,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(result.id).toBe('proj_dry');
+    expect(result.updatedFields).toContain('password');
   });
 
   it('P7 — renders text mode with updatedFields and updatedAt', async () => {

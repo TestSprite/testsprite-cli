@@ -110,6 +110,50 @@ describe('runConfigure', () => {
     );
   });
 
+  it('uses requestTimeoutMs for the pre-write key validation ping', async () => {
+    const { deps } = makeCapture();
+    let sawAbort = false;
+    const fetchImpl = vi.fn(
+      async (_input: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          const timeout = setTimeout(() => {
+            reject(new Error('requestTimeoutMs was not applied to the validation ping'));
+          }, 50);
+          signal?.addEventListener(
+            'abort',
+            () => {
+              sawAbort = true;
+              clearTimeout(timeout);
+              reject(new DOMException('The operation timed out.', 'TimeoutError'));
+            },
+            { once: true },
+          );
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          fromEnv: true,
+          requestTimeoutMs: 1,
+        },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          credentialsPath,
+          fetchImpl,
+        },
+      ),
+    ).rejects.toBeInstanceOf(CLIError);
+
+    expect(sawAbort).toBe(true);
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+  });
+
   it('throws VALIDATION_ERROR when --from-env is set but key is missing', async () => {
     const { deps } = makeCapture();
     await expect(
@@ -118,6 +162,100 @@ describe('runConfigure', () => {
         { ...deps, env: {}, credentialsPath },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('rejects a malformed endpoint before key validation fetch', async () => {
+    const { capture, deps } = makeCapture();
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          fromEnv: true,
+          endpointUrl: 'not-a-url',
+        },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(capture.stderr.join('\n')).not.toContain('API key rejected');
+  });
+
+  it('rejects a non-http endpoint before key validation fetch', async () => {
+    const { deps } = makeCapture();
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          fromEnv: true,
+          endpointUrl: 'ftp://example.com',
+        },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+  });
+
+  it('rejects a malformed dry-run endpoint before emitting dry-run output', async () => {
+    const { capture, deps } = makeCapture();
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          fromEnv: false,
+          dryRun: true,
+          endpointUrl: 'not-a-url',
+        },
+        {
+          ...deps,
+          env: {},
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(capture.stderr.join('\n')).not.toContain('[dry-run]');
+    expect(capture.stdout).toEqual([]);
   });
 
   it('prompts only for the API key (never the endpoint) and defaults to prod', async () => {
@@ -138,6 +276,35 @@ describe('runConfigure', () => {
       apiUrl: 'https://api.testsprite.com',
     });
     expect(capture.prelude.join('')).toContain('Configuring profile "default"');
+  });
+
+  it('routes the interactive prelude to stderr by default, keeping stdout for the result', async () => {
+    // Regression: the prelude used to default to process.stdout, polluting the
+    // result stream (and the JSON document under --output json). With no
+    // injected preludeWrite/stderr, the default must land on stderr, not stdout.
+    const stdout: string[] = [];
+    const errChunks: string[] = [];
+    const origErr = process.stderr.write.bind(process.stderr);
+    (process.stderr as unknown as { write: (c: string) => boolean }).write = c => {
+      errChunks.push(String(c));
+      return true;
+    };
+    try {
+      await runConfigure(
+        { profile: 'default', output: 'text', debug: false, fromEnv: false },
+        {
+          stdout: line => stdout.push(line),
+          prompt: { secret: vi.fn(async () => 'sk-typed') },
+          fetchImpl: meOkFetch,
+          credentialsPath,
+          env: {},
+        },
+      );
+    } finally {
+      (process.stderr as unknown as { write: typeof origErr }).write = origErr;
+    }
+    expect(errChunks.join('')).toContain('Configuring profile "default"');
+    expect(stdout.join('\n')).not.toContain('Configuring profile');
   });
 
   it('interactive path resolves the endpoint from TESTSPRITE_API_URL without prompting', async () => {
@@ -266,6 +433,46 @@ describe('runConfigure', () => {
     expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
     // Stderr must mention the rejection.
     expect(capture.stderr.join('\n')).toContain('profile NOT updated');
+  });
+
+  it('key-rejected error preserves the typed ApiError envelope (JSON contract)', async () => {
+    const { deps } = makeCapture();
+    const rejectedFetch: AuthDeps['fetchImpl'] = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 'AUTH_INVALID',
+              message: 'API key is invalid or revoked.',
+              nextAction: 'Rotate your key.',
+              requestId: 'req_reject',
+              details: { reason: 'malformed' },
+            },
+          }),
+          { status: 401, headers: { 'content-type': 'application/json' } },
+        ),
+    ) as unknown as AuthDeps['fetchImpl'];
+
+    // The thrown error must be an ApiError (with code, nextAction, requestId)
+    // — not a CLIError wrapper that drops those fields. Under --output json,
+    // index.ts renders ApiError as the full typed envelope; CLIError would
+    // render only {"error":"...string..."}, violating the JSON contract.
+    await expect(
+      runConfigure(
+        { profile: 'default', output: 'json', debug: false, fromEnv: true },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk-bad' },
+          credentialsPath,
+          fetchImpl: rejectedFetch,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'AUTH_INVALID',
+      exitCode: 3,
+      nextAction: 'Rotate your key.',
+      requestId: 'req_reject',
+    });
   });
 
   // The old "run `testsprite agent install`" self-bootstrap tip was removed with

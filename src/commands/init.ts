@@ -11,10 +11,13 @@
  */
 
 import { Command } from 'commander';
-import type { CommonOptions as FactoryCommonOptions } from '../lib/client-factory.js';
+import {
+  parseRequestTimeoutFlag,
+  type CommonOptions as FactoryCommonOptions,
+} from '../lib/client-factory.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
 import { CLIError } from '../lib/errors.js';
-import { GLOBAL_OPTS_HINT, Output } from '../lib/output.js';
+import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import type { AuthDeps, MeResponse } from './auth.js';
 import { runConfigure, runWhoami } from './auth.js';
 import type { AgentDeps, AgentFs, InstallResult } from './agent.js';
@@ -424,20 +427,13 @@ function resolveCommonOptions(command: Command): CommonOptions {
   };
   return {
     profile: globals.profile ?? 'default',
-    output: globals.output ?? 'text',
+    output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
     verbose: globals.verbose ?? false,
     dryRun: globals.dryRun ?? false,
     requestTimeoutMs: parseRequestTimeoutFlag(globals.requestTimeout),
   };
-}
-
-function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
-  if (raw === undefined) return undefined;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return undefined;
-  return Math.round(n * 1000);
 }
 
 const SETUP_DESCRIPTION =

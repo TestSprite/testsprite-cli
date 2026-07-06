@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { VERSION } from '../version.js';
 import {
   DEFAULT_SKILLS,
   MANAGED_SECTION_BEGIN,
@@ -9,13 +11,17 @@ import {
   SKILL_NAME,
   SKILLS,
   TARGETS,
+  bodyHash12,
   buildCodexAggregate,
+  buildSkillMarker,
   codexContentFor,
   loadCodexSkillBody,
   loadSkillBody,
   loadSkillBodyFor,
+  parseSkillMarker,
   pathFor,
   renderForTarget,
+  renderOwnFileWithMarker,
 } from './agent-targets.js';
 
 // ---------------------------------------------------------------------------
@@ -74,19 +80,21 @@ testsprite test artifact get <run-id> --out ./out/
 // ---------------------------------------------------------------------------
 
 describe('TARGETS', () => {
-  it('has all five required keys', () => {
+  it('has all seven required keys', () => {
     const keys = Object.keys(TARGETS).sort();
-    expect(keys).toEqual(['antigravity', 'claude', 'cline', 'codex', 'cursor']);
+    expect(keys).toEqual(['antigravity', 'claude', 'cline', 'codex', 'cursor', 'kiro', 'windsurf']);
   });
 
   it('claude is GA', () => {
     expect(TARGETS.claude.status).toBe('ga');
   });
 
-  it('cursor, cline, antigravity, and codex are experimental', () => {
+  it('cursor, cline, windsurf, antigravity, kiro, and codex are experimental', () => {
     expect(TARGETS.cursor.status).toBe('experimental');
     expect(TARGETS.cline.status).toBe('experimental');
+    expect(TARGETS.windsurf.status).toBe('experimental');
     expect(TARGETS.antigravity.status).toBe('experimental');
+    expect(TARGETS.kiro.status).toBe('experimental');
     expect(TARGETS.codex.status).toBe('experimental');
   });
 
@@ -102,6 +110,8 @@ describe('TARGETS', () => {
     expect(TARGETS.antigravity.mode).toBe('own-file');
     expect(TARGETS.cursor.mode).toBe('own-file');
     expect(TARGETS.cline.mode).toBe('own-file');
+    expect(TARGETS.kiro.mode).toBe('own-file');
+    expect(TARGETS.windsurf.mode).toBe('own-file');
   });
 
   it('codex target has mode managed-section', () => {
@@ -200,6 +210,22 @@ describe('renderForTarget("antigravity")', () => {
   });
 });
 
+describe('renderForTarget("kiro")', () => {
+  const result = renderForTarget('kiro', 'testsprite-verify', STUB_BODY);
+
+  it('returns the correct path', () => {
+    expect(result.path).toBe('.kiro/skills/testsprite-verify/SKILL.md');
+  });
+
+  it('frontmatter contains name: testsprite-verify', () => {
+    expect(result.content).toContain('name: testsprite-verify');
+  });
+
+  it('frontmatter contains description:', () => {
+    expect(result.content).toContain(`description: ${SKILL_DESCRIPTION}`);
+  });
+});
+
 describe('renderForTarget("claude") vs renderForTarget("antigravity")', () => {
   it('produce the same frontmatter lines (name + description)', () => {
     const claude = renderForTarget('claude', 'testsprite-verify', STUB_BODY);
@@ -269,16 +295,63 @@ describe('renderForTarget("cline")', () => {
   });
 });
 
+describe('renderForTarget("windsurf")', () => {
+  const result = renderForTarget('windsurf', 'testsprite-verify', STUB_BODY);
+
+  it('returns the .windsurf/rules path', () => {
+    expect(result.path).toBe('.windsurf/rules/testsprite-verify.md');
+  });
+
+  it('uses the Cascade frontmatter (trigger: model_decision + description)', () => {
+    expect(result.content.startsWith('---\n')).toBe(true);
+    expect(result.content).toContain('trigger: model_decision');
+    expect(result.content).toContain(`description: ${SKILL_DESCRIPTION}`);
+  });
+
+  it('does NOT carry the Claude/Cursor frontmatter keys', () => {
+    const match = /^---\n([\s\S]*?)\n---/.exec(result.content);
+    const fm = match?.[1] ?? '';
+    expect(fm).not.toContain('name:'); // claude key
+    expect(fm).not.toContain('alwaysApply:'); // cursor .mdc key
+  });
+});
+
+describe('windsurf renders within the rules-file budget', () => {
+  // Regression: a `.windsurf/rules/*.md` file caps at ~12 K characters and
+  // Cascade silently truncates beyond that. The full verify body (~22 KB) would
+  // be cut in half, so windsurf renders the COMPACT body for verify (its trimmed
+  // codex asset) and the full body for onboard (which already fits). Uses the
+  // REAL bodies (no stub) so the size reflects what a user receives.
+  for (const skill of DEFAULT_SKILLS) {
+    it(`${skill} fits under 12 000 characters`, () => {
+      const r = renderForTarget('windsurf', skill);
+      expect(r.content.length).toBeLessThan(12_000);
+    });
+  }
+
+  it('verify uses the compact body (smaller than the full claude render)', () => {
+    const windsurf = renderForTarget('windsurf', 'testsprite-verify');
+    const claude = renderForTarget('claude', 'testsprite-verify');
+    expect(windsurf.content.length).toBeLessThan(claude.content.length);
+    // The full-body-only intro line is absent from the compact body...
+    expect(claude.content).toContain('The verification loop that flies');
+    expect(windsurf.content).not.toContain('The verification loop that flies');
+    // ...but the load-bearing command survives.
+    expect(windsurf.content).toContain('testsprite test run');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Content integrity — load-bearing command strings must survive any body trim
 // ---------------------------------------------------------------------------
 
 describe('content integrity — own-file targets', () => {
-  const ownFileTargets: Array<'claude' | 'cursor' | 'cline' | 'antigravity'> = [
+  const ownFileTargets: Array<'claude' | 'cursor' | 'cline' | 'antigravity' | 'kiro'> = [
     'claude',
     'cursor',
     'cline',
     'antigravity',
+    'kiro',
   ];
 
   // Use the real body for these checks, since we're guarding against trimming.
@@ -678,5 +751,112 @@ describe('renderForTarget for testsprite-onboard', () => {
 
   it('unknown skill throws for renderForTarget', () => {
     expect(() => renderForTarget('claude', 'testsprite-unknown')).toThrow('unknown skill');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Install marker (issue #123): format, parsing, and render placement
+// ---------------------------------------------------------------------------
+
+describe('buildSkillMarker / parseSkillMarker / bodyHash12', () => {
+  it('marker line is an HTML comment carrying name, vVERSION, and a 12-hex hash', () => {
+    const marker = buildSkillMarker('testsprite-verify', STUB_BODY);
+    expect(marker).toBe(
+      `<!-- testsprite-skill: testsprite-verify v${VERSION} sha256:${bodyHash12(STUB_BODY)} -->`,
+    );
+    expect(marker).toMatch(
+      /^<!-- testsprite-skill: testsprite-verify v\S+ sha256:[0-9a-f]{12} -->$/,
+    );
+  });
+
+  it('bodyHash12 equals the first 12 hex chars of the body SHA-256', () => {
+    const fullHex = createHash('sha256').update(STUB_BODY, 'utf8').digest('hex');
+    expect(bodyHash12(STUB_BODY)).toBe(fullHex.slice(0, 12));
+  });
+
+  it('parseSkillMarker round-trips a built marker embedded in surrounding content', () => {
+    const marker = buildSkillMarker('testsprite-verify', STUB_BODY);
+    const parsed = parseSkillMarker(`# heading\n${marker}\nbody text\n`);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.skill).toBe('testsprite-verify');
+    expect(parsed?.version).toBe(VERSION);
+    expect(parsed?.hash12).toBe(bodyHash12(STUB_BODY));
+    expect(parsed?.line).toBe(marker);
+  });
+
+  it('parseSkillMarker strips a trailing CR so CRLF checkouts parse identically', () => {
+    const marker = buildSkillMarker('testsprite-verify', STUB_BODY);
+    const parsed = parseSkillMarker(`${marker}\r\nrest\r\n`);
+    expect(parsed?.line).toBe(marker);
+  });
+
+  it('parseSkillMarker returns null when no marker line is present', () => {
+    expect(parseSkillMarker('# Just a heading\n\nProse without any marker.\n')).toBeNull();
+  });
+
+  it('parseSkillMarker ignores the managed-section sentinels (also HTML comments)', () => {
+    expect(parseSkillMarker(`${MANAGED_SECTION_BEGIN}\nbody\n${MANAGED_SECTION_END}\n`)).toBeNull();
+  });
+});
+
+describe('render marker placement (own-file targets)', () => {
+  it('claude render carries the marker on the line right after the closing frontmatter fence', () => {
+    const { content } = renderForTarget('claude', 'testsprite-verify', STUB_BODY);
+    const closingFence = '\n---\n';
+    const fenceEnd = content.indexOf(closingFence) + closingFence.length;
+    expect(content.slice(fenceEnd).startsWith('<!-- testsprite-skill: testsprite-verify ')).toBe(
+      true,
+    );
+  });
+
+  it('cline render appends the marker as the LAST line so the body H1 stays first', () => {
+    const { content } = renderForTarget('cline', 'testsprite-verify', STUB_BODY);
+    expect(content.trimStart().startsWith('# TestSprite Verification Loop')).toBe(true);
+    const lines = content.trimEnd().split('\n');
+    expect(lines[lines.length - 1]).toBe(buildSkillMarker('testsprite-verify', STUB_BODY));
+  });
+
+  it('marker hash covers the canonical body only: same body renders the same hash on every target', () => {
+    const claudeMarker = parseSkillMarker(
+      renderForTarget('claude', 'testsprite-verify', STUB_BODY).content,
+    );
+    const cursorMarker = parseSkillMarker(
+      renderForTarget('cursor', 'testsprite-verify', STUB_BODY).content,
+    );
+    expect(claudeMarker?.hash12).toBe(bodyHash12(STUB_BODY));
+    expect(cursorMarker?.hash12).toBe(bodyHash12(STUB_BODY));
+  });
+
+  it('renderForTarget("codex") stays marker-free (the install writes the section marker)', () => {
+    const result = renderForTarget('codex', 'testsprite-verify', '# codex stub\n');
+    expect(result.content).toBe('# codex stub\n');
+    expect(parseSkillMarker(result.content)).toBeNull();
+  });
+
+  it('renderOwnFileWithMarker splices an arbitrary marker line into the canonical render', () => {
+    const foreignMarker = '<!-- testsprite-skill: testsprite-verify v0.0.1 sha256:0123456789ab -->';
+    const withForeign = renderOwnFileWithMarker(
+      'claude',
+      'testsprite-verify',
+      foreignMarker,
+      STUB_BODY,
+    );
+    expect(withForeign).toContain(foreignMarker);
+    // Marker line aside, the bytes match the canonical render exactly.
+    const canonical = renderForTarget('claude', 'testsprite-verify', STUB_BODY).content;
+    const currentMarker = buildSkillMarker('testsprite-verify', STUB_BODY);
+    expect(withForeign.replace(foreignMarker, currentMarker)).toBe(canonical);
+  });
+
+  it('renderOwnFileWithMarker rejects the managed-section target', () => {
+    expect(() => renderOwnFileWithMarker('codex', 'testsprite-verify', 'marker', 'body')).toThrow(
+      'own-file',
+    );
+  });
+
+  it('renderOwnFileWithMarker throws on an unknown skill', () => {
+    expect(() => renderOwnFileWithMarker('claude', 'testsprite-unknown', 'marker')).toThrow(
+      'unknown skill',
+    );
   });
 });

@@ -169,6 +169,24 @@ describe('parseDuration', () => {
   it('case-insensitive day suffix', () => {
     expect(parseDuration('7D', NOW)).toBe('2026-05-27T12:00:00.000Z');
   });
+
+  it('overflow hours throws VALIDATION_ERROR instead of crashing', () => {
+    expect(() => parseDuration('99999999999h', NOW)).toThrow();
+    try {
+      parseDuration('99999999999h', NOW);
+    } catch (err: unknown) {
+      expect((err as { code?: string }).code).toBe('VALIDATION_ERROR');
+    }
+  });
+
+  it('overflow days throws VALIDATION_ERROR instead of crashing', () => {
+    expect(() => parseDuration('99999999999d', NOW)).toThrow();
+    try {
+      parseDuration('99999999999d', NOW);
+    } catch (err: unknown) {
+      expect((err as { code?: string }).code).toBe('VALIDATION_ERROR');
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -534,6 +552,32 @@ describe('runResultHistory — pagination', () => {
     );
 
     expect(capturedUrl).toContain('pageSize=5');
+  });
+
+  it('rejects fractional --page-size before making a request', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => {
+      throw new Error('should not be called');
+    });
+
+    await expect(
+      runResultHistory(
+        {
+          output: 'json',
+          testId: 'test_abc',
+          pageSize: 1.5,
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { credentialsPath, fetchImpl, stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'page-size' }),
+    });
   });
 });
 

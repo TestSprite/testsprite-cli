@@ -499,6 +499,24 @@ describe('project list subprocess', () => {
     const parsed = JSON.parse(result.stderr) as { error: { code: string } };
     expect(parsed.error.code).toBe('VALIDATION_ERROR');
   }, 30_000);
+
+  it('--request-timeout 30s exits 5 (VALIDATION_ERROR), not a silent fallback to 120s', async () => {
+    // Previously an invalid flag value resolved to `undefined` and the command
+    // silently ran with the default 120s deadline — the operator believed they
+    // had set a timeout but had not. Now the explicit flag is validated like
+    // every other flag.
+    const result = await runCli(
+      ['--output', 'json', '--request-timeout', '30s', 'project', 'list'],
+      {
+        TESTSPRITE_API_KEY: 'sk-subproc',
+        TESTSPRITE_API_URL: baseUrl,
+      },
+    );
+    expect(result.exitCode).toBe(5);
+    const parsed = JSON.parse(result.stderr) as { error: { code: string; nextAction: string } };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error.nextAction).toContain('request-timeout');
+  }, 30_000);
 });
 
 describe('malformed --endpoint-url is rejected (exit 5), not retried as a network error', () => {
@@ -527,6 +545,33 @@ describe('malformed --endpoint-url is rejected (exit 5), not retried as a networ
     expect(result.exitCode).toBe(5);
     const parsed = JSON.parse(result.stderr) as { error: { code: string } };
     expect(parsed.error.code).toBe('VALIDATION_ERROR');
+  }, 30_000);
+});
+
+describe('invalid --output is rejected uniformly (exit 5)', () => {
+  // Regression: previously only `test` and `project` validated `--output`;
+  // `auth`, `usage`, `agent`, and `init` silently coerced an unknown value to
+  // text mode. An agent that asked for `--output json` but mistyped it then
+  // received a text payload it could not parse, with no signal as to why. Every
+  // command group now routes through resolveOutputMode (exit 5 on bad input).
+
+  // Note: when `--output` itself is the invalid value, the requested mode is
+  // unusable for the error envelope, so it is rendered in text mode (the catch
+  // block in index.ts falls back to text for an unrecognised --output).
+
+  it('agent list --output josn exits 5 with an actionable message (offline command)', async () => {
+    const result = await runCli(['--output', 'josn', 'agent', 'list'], {});
+    expect(result.exitCode).toBe(5);
+    expect(result.stderr).toContain('must be one of: json, text');
+  }, 30_000);
+
+  it('auth status --output yaml exits 5 before any network call', async () => {
+    const result = await runCli(['--output', 'yaml', 'auth', 'status'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    expect(result.stderr).toContain('must be one of: json, text');
   }, 30_000);
 });
 
@@ -894,6 +939,22 @@ describe('--dry-run subprocess smoke', () => {
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(result.stdout) as { id: string };
     expect(parsed.id).toBeTruthy();
+  }, 30_000);
+
+  it('project update --dry-run does not read a missing --password-file', async () => {
+    const result = await runCli([
+      'project',
+      'update',
+      'proj_anything',
+      '--password-file',
+      '/tmp/definitely-not-here-testsprite',
+      '--dry-run',
+      '--output',
+      'json',
+    ]);
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as { updatedFields: string[] };
+    expect(parsed.updatedFields).toContain('password');
   }, 30_000);
 
   it('test list --dry-run returns canned TestList', async () => {

@@ -34,7 +34,7 @@ the thread or in Discord is welcome.
 
 ## Prerequisites
 
-- Node 20 or newer (development happens on Node 22).
+- Node 20.19+, Node 22.13+, or Node 24+ (development happens on Node 22).
 
 ## Build from source
 

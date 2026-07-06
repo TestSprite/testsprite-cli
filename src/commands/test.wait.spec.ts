@@ -1022,6 +1022,69 @@ describe('runTestWait: Fix 3 — RequestTimeoutError writes partial JSON to stdo
 });
 
 // ---------------------------------------------------------------------------
+// TimeoutError on test wait: partial stdout + exit 7
+// ---------------------------------------------------------------------------
+
+describe('runTestWait: TimeoutError writes partial JSON to stdout', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+    errorSpy.mockRestore();
+  });
+
+  it('exit 7 AND stdout contains {runId, status:"running"} when --timeout polling deadline is exceeded', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: makeRun('running') }));
+
+    let callCount = 0;
+    const base = Date.now();
+    const realDateNow = Date.now;
+    Date.now = () => (callCount++ > 4 ? base + 2000 : base);
+
+    try {
+      const stdoutLines: string[] = [];
+      const stderrLines: string[] = [];
+
+      await expect(
+        runTestWait(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            dryRun: false,
+            runId: 'run_abc',
+            timeoutSeconds: 1,
+          },
+          {
+            credentialsPath,
+            fetchImpl,
+            stdout: line => stdoutLines.push(line),
+            stderr: line => stderrLines.push(line),
+            sleep: instantSleep,
+          },
+        ),
+      ).rejects.toMatchObject({ exitCode: 7 });
+
+      const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
+        runId: string;
+        status: string;
+      };
+      expect(stdoutJson.runId).toBe('run_abc');
+      expect(stdoutJson.status).toBe('running');
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // FIX 4 — D5-UX: text mode shows the `error` string for failed/blocked runs
 // ---------------------------------------------------------------------------
 describe('[fix-4-ux] runTestWait — text mode shows error string for failed/blocked runs', () => {

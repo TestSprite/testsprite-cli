@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Output, isOutputMode } from './output.js';
+import { Output, isOutputMode, resolveOutputMode } from './output.js';
+import { ApiError } from './errors.js';
 
 describe('isOutputMode', () => {
   it('accepts json and text', () => {
@@ -12,6 +13,36 @@ describe('isOutputMode', () => {
     expect(isOutputMode(undefined)).toBe(false);
     expect(isOutputMode(null)).toBe(false);
     expect(isOutputMode(42)).toBe(false);
+  });
+});
+
+describe('resolveOutputMode', () => {
+  it('returns the mode verbatim for valid values', () => {
+    expect(resolveOutputMode('json')).toBe('json');
+    expect(resolveOutputMode('text')).toBe('text');
+  });
+
+  it('defaults to text when the flag is omitted (undefined)', () => {
+    expect(resolveOutputMode(undefined)).toBe('text');
+  });
+
+  it('throws a typed VALIDATION_ERROR (exit 5) instead of silently falling back to text', () => {
+    // The footgun this guards against: an agent that asks for `--output json`
+    // but mistypes it would otherwise receive a text payload and fail to parse
+    // it as JSON with no signal. Every command group must reject, not coerce.
+    for (const bad of ['josn', 'yaml', 'JSON', 'Text', '']) {
+      let caught: unknown;
+      try {
+        resolveOutputMode(bad);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(ApiError);
+      const apiErr = caught as ApiError;
+      expect(apiErr.code).toBe('VALIDATION_ERROR');
+      expect(apiErr.exitCode).toBe(5);
+      expect(apiErr.nextAction).toContain('must be one of: json, text');
+    }
   });
 });
 

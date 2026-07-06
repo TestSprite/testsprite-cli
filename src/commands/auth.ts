@@ -1,7 +1,9 @@
 import { Command } from 'commander';
 import {
+  assertValidEndpointUrl,
   emitDryRunBanner,
   makeHttpClient,
+  parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import type { ErrorCode } from '../lib/errors.js';
@@ -18,7 +20,7 @@ import {
 import { loadConfig } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
 import type { OutputMode } from '../lib/output.js';
-import { GLOBAL_OPTS_HINT, Output } from '../lib/output.js';
+import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptSecret } from '../lib/prompt.js';
 
 export interface MeResponse {
@@ -73,7 +75,10 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   const env = deps.env ?? process.env;
   const credentialsPath = deps.credentialsPath ?? defaultCredentialsPath();
   const out = makeOutput(opts.output, deps);
-  const prelude = deps.preludeWrite ?? ((chunk: string) => process.stdout.write(chunk));
+  // The "Configuring profile …" prelude is informational, not result data, so
+  // it defaults to stderr — stdout stays a pure result stream (the configured
+  // JSON/text), which matters under `--output json` (§8.1 stdout purity).
+  const prelude = deps.preludeWrite ?? ((chunk: string) => process.stderr.write(chunk));
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   // Normalize the env endpoint: an empty / whitespace-only TESTSPRITE_API_URL is
@@ -86,8 +91,9 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   // Print the canned success shape so an agent sees exactly the JSON it
   // would get on a real configure (modulo the endpoint string).
   if (opts.dryRun) {
-    emitDryRunBanner(stderr);
     const apiUrl = opts.endpointUrl ?? envApiUrl ?? DEFAULT_API_URL;
+    assertValidEndpointUrl(apiUrl);
+    emitDryRunBanner(stderr);
     stderr(`[dry-run] would write credentials for profile="${opts.profile}" to ${credentialsPath}`);
     out.print({ profile: opts.profile, apiUrl, status: 'configured' }, data => {
       const d = data as { profile: string; apiUrl: string };
@@ -113,6 +119,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   // api_url doesn't silently validate a new key against the default endpoint.
   const resolvedFromProfile = existingProfile?.apiUrl;
   const apiUrl = opts.endpointUrl ?? envApiUrl ?? resolvedFromProfile ?? DEFAULT_API_URL;
+  assertValidEndpointUrl(apiUrl);
 
   if (opts.fromEnv) {
     apiKey = env.TESTSPRITE_API_KEY?.trim();
@@ -145,6 +152,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
     baseUrl: facadeBaseUrl(apiUrl),
     apiKey,
     fetchImpl: deps.fetchImpl,
+    requestTimeoutMs: opts.requestTimeoutMs,
   });
   try {
     // Tag the validation call with the originating command (when provided) so
@@ -158,13 +166,22 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     stderr(`API key rejected by ${apiUrl}: ${message} — profile NOT updated`);
-    const exitCode = err instanceof ApiError ? err.exitCode : 3;
-    // Include the resolved endpoint in the thrown message so the user knows
-    // which host rejected the key. This prevents the "invalid or revoked"
-    // message from being ambiguous when the key is valid for a different env.
+    // When the verification call returned a typed API error (AUTH_INVALID,
+    // AUTH_FORBIDDEN, etc.), re-throw it directly so `index.ts` renders the
+    // full typed envelope under `--output json` (code, nextAction, requestId,
+    // details). Previously wrapping it in CLIError discarded those fields and
+    // emitted a bare `{"error":"...string..."}` — violating the JSON contract.
+    // Augment the message with the endpoint context so text-mode users still
+    // see which host rejected the key.
+    if (err instanceof ApiError) {
+      err.message = `API key rejected by ${apiUrl}: ${message} — did you mean to set TESTSPRITE_API_URL?`;
+      throw err;
+    }
+    // Non-ApiError (truly unexpected throws like a TypeError from a
+    // misconfigured fetchImpl). Exit 3 (auth family).
     throw new CLIError(
       `API key rejected by ${apiUrl}: ${message} — did you mean to set TESTSPRITE_API_URL?`,
-      exitCode,
+      3,
     );
   }
 
@@ -318,26 +335,13 @@ function resolveCommonOptions(command: Command): CommonOptions {
   };
   return {
     profile: globals.profile ?? 'default',
-    output: globals.output ?? 'text',
+    output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
     verbose: globals.verbose ?? false,
     dryRun: globals.dryRun ?? false,
     requestTimeoutMs: parseRequestTimeoutFlag(globals.requestTimeout),
   };
-}
-
-/**
- * Parse the `--request-timeout <seconds>` flag value into milliseconds.
- * Returns `undefined` when the flag was not supplied (factory falls back to
- * the env var / default). Silently clamps out-of-range values — the
- * factory applies the same clamp so there is no double-clamp risk.
- */
-function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
-  if (raw === undefined) return undefined;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return undefined;
-  return Math.round(n * 1000); // seconds → milliseconds
 }
 
 function makeOutput(mode: OutputMode, deps: AuthDeps): Output {

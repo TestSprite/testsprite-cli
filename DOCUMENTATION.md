@@ -35,7 +35,7 @@ Or run it without installing:
 npx @testsprite/testsprite-cli --version
 ```
 
-Requires **Node.js ≥ 20**.
+Requires **Node.js 20.19+**, **22.13+**, or **24+**.
 
 Confirm the binary works **without** configuring an API key:
 
@@ -112,15 +112,17 @@ testsprite agent install claude     # install the skill for Claude Code
 testsprite agent install codex      # install into AGENTS.md for Codex (managed-section)
 testsprite agent install cursor     # .cursor/rules/testsprite-verify.mdc
 testsprite agent install cline      # .clinerules/testsprite-verify.md
+testsprite agent install windsurf   # .windsurf/rules/testsprite-verify.md
 testsprite agent install antigravity  # .agents/skills/testsprite-verify/SKILL.md
-testsprite agent list               # list all 5 targets with status + mode + path
+testsprite agent install kiro       # .kiro/skills/testsprite-verify/SKILL.md
+testsprite agent list               # list all 7 targets with status + mode + path
 ```
 
-Supported targets: `claude` (GA), `codex` (experimental), `cursor` (experimental), `cline` (experimental), `antigravity` (experimental).
+Supported targets: `claude` (GA), `codex` (experimental), `cursor` (experimental), `cline` (experimental), `antigravity` (experimental), `kiro` (experimental), `windsurf` (experimental).
 
 The `codex` target uses **managed-section mode** — it writes only a sentinel-delimited section inside your existing `AGENTS.md`, so your project instructions are never clobbered. Re-running without `--force` replaces the section in-place; user content outside the sentinels is always preserved.
 
-Re-running with `--force` on **own-file targets** (claude, cursor, cline, antigravity) backs up the existing file to `<path>.bak` first.
+Re-running with `--force` on **own-file targets** (claude, cursor, cline, antigravity, kiro, windsurf) backs up the existing file to `<path>.bak` first.
 
 ## Command reference
 
@@ -344,10 +346,10 @@ testsprite test plan put test_xxxxxxxx --steps ./refined.plan.json --dry-run --o
 
 #### `testsprite project create` / `project update`
 
-Manage projects from the CLI. Both pre-flight `--target-url` against local addresses for fast feedback.
+Manage projects from the CLI. Both pre-flight `--url` against local addresses for fast feedback.
 
 ```bash
-testsprite project create --name "Checkout" --target-url https://staging.example.com
+testsprite project create --type frontend --name "Checkout" --url https://staging.example.com
 testsprite project update proj_xxxxxxxx --name "Checkout v2"
 ```
 
@@ -369,9 +371,19 @@ testsprite test run test_xxxxxxxx --target-url https://staging.example.com \
 
 # Dry-run prints a canned queued response (no network, no credentials)
 testsprite test run test_xxxxxxxx --dry-run --output json
+
+# Batch BE run with JUnit XML for CI (sidecar; --output json unchanged)
+testsprite test run --all --project proj_xxxxxxxx --wait \
+  --report junit --report-file ./results.xml --output json
+
+# Optional custom suite name (default: testsprite:<projectId>)
+testsprite test run --all --project proj_xxxxxxxx --wait \
+  --report junit --report-file ./results.xml --report-suite-name my-ci-suite --output json
 ```
 
-`--target-url` must be a publicly reachable URL — the CLI pre-flights it against local addresses (`localhost`, `127.x`, `::1`, `0.0.0.0`, `169.254.x`, RFC1918) and the backend resolves it via DNS. For testing against localhost, use the [TestSprite MCP plugin](https://www.testsprite.com/docs), which handles the local tunnel. The CLI auto-mints an idempotency key (printed to stderr at `--verbose`); pass `--idempotency-key <uuid>` to control it explicitly.
+Batch `--report` flags apply only to `test run --all --wait` (and batch `test rerun --wait`). `--report junit --report-file <path>` writes a JUnit XML sidecar after polling completes (atomic write); `--output json` is unchanged. Optional `--report-suite-name <name>` overrides the default `testsprite:<projectId>` suite name.
+
+`--target-url` must be a publicly reachable URL — the CLI pre-flights it against local addresses (`localhost`, `127.x`, `::1`, `0.0.0.0`, `169.254.x`, RFC1918) and the backend resolves it via DNS. For testing against localhost, use the [TestSprite MCP plugin](https://www.testsprite.com/docs), which handles the local tunnel. The CLI auto-mints an idempotency key (printed to stderr under `--output json`, `--verbose`, or `--debug`); pass `--idempotency-key <uuid>` to control it explicitly.
 
 #### `testsprite test rerun [test-id...]`
 
@@ -390,9 +402,19 @@ testsprite test rerun test_be_xxxx --skip-dependencies --output json
 # Rerun every test in a project (batch)
 testsprite test rerun --all --project proj_xxxxxxxx --wait --max-concurrency 4 --output json
 
+# Batch rerun with JUnit XML for CI
+testsprite test rerun --all --project proj_xxxxxxxx --wait \
+  --report junit --report-file ./results.xml --output json
+
+# Optional custom suite name (default: testsprite:<projectId>)
+testsprite test rerun --all --project proj_xxxxxxxx --wait \
+  --report junit --report-file ./results.xml --report-suite-name my-ci-suite --output json
+
 # Several specific tests
 testsprite test rerun test_aaaa test_bbbb --wait --output json
 ```
+
+Batch `--report` flags apply only to batch `--wait` reruns (`--all` or multiple test ids). `--report junit --report-file <path>` writes a JUnit XML sidecar after polling completes (atomic write); `--output json` is unchanged. When `--project` is omitted, the CLI infers `projectId` from polled run rows for classname / default suite naming; if inference fails, pass `--project <id>` explicitly (required under `--dry-run`).
 
 Flags:
 
@@ -401,9 +423,33 @@ Flags:
 - `--auto-heal` / `--no-auto-heal` — frontend AI heal-on-drift, **on by default** for FE reruns; opt out with `--no-auto-heal`. Verbatim-replay passes are free; a heal engage costs a small amount of credit. Ignored for backend tests.
 - `--skip-dependencies` — backend only: rerun just the named test without expanding the producer/teardown closure.
 - `--max-concurrency <n>` — with `--wait`, cap on in-flight polls during a batch rerun.
-- `--idempotency-key <key>` — auto-minted when omitted.
+- `--idempotency-key <key>` — auto-minted when omitted (the minted key is printed to stderr under `--output json`, `--verbose`, or `--debug`).
+- `--report junit --report-file <path>` — with batch `--wait`, write a JUnit XML sidecar after polling (atomic write). Optional `--report-suite-name <name>` overrides the default `testsprite:<projectId>` suite name. Requires `--wait`; not available on single-test reruns.
 
 A batch rerun returns `accepted[]` (one `runId` per dispatched test) plus `deferred[]` for any test shed by the per-key run-rate limit; under `--wait`, a non-empty `deferred[]` exits 7 with a `nextAction` you can retry with a fresh idempotency key.
+
+#### `testsprite test flaky <test-id>`
+
+Detect a **flaky** test by replaying it several times and reporting how often it passes. Each attempt is a rerun with auto-heal **off** (a strict verbatim replay), so healed drift can't disguise a nondeterministic pass/fail — this measures the replay stability of the saved script against the configured URL. Frontend replays are free verbatim script replays; backend tests re-run their dependency closure and may cost credits (a one-line stderr advisory is printed before the run).
+
+```bash
+# Replay 10 times and print a stability score
+testsprite test flaky test_xxxxxxxx --runs 10
+
+# Fast "is it flaky at all?" — stop at the first non-passing attempt
+testsprite test flaky test_xxxxxxxx --runs 10 --until-fail
+
+# Machine-readable stability report for CI
+testsprite test flaky test_xxxxxxxx --runs 10 --output json
+```
+
+Flags:
+
+- `--runs <n>` — number of replays (1–10, default 5).
+- `--until-fail` — stop at the first attempt that does not pass.
+- `--timeout <s>` — per-attempt polling deadline (same semantics as `test wait`).
+
+`--output json` emits `{ testId, runs, passed, failed, stableRatio, verdict, failures: [{ attempt, runId, outcome, failureKind }] }`. Exit codes: **0** when every observed attempt passed (`stable`); **1** when any attempt did not pass (`flaky` or `failing`); **4** when the test has no replayable run (trigger `testsprite test run <id>` first); **5** on a validation error.
 
 #### `testsprite test wait <run-id>`
 
@@ -451,12 +497,25 @@ These apply to every command:
 
 ### Environment variables
 
-| Variable                        | Purpose                                                                           |
-| ------------------------------- | --------------------------------------------------------------------------------- |
-| `TESTSPRITE_API_KEY`            | API key — overrides the credentials file                                          |
-| `TESTSPRITE_API_URL`            | API endpoint — overrides the credentials file                                     |
-| `TESTSPRITE_PROFILE`            | Active profile (below `--profile`, above `default`)                               |
-| `TESTSPRITE_REQUEST_TIMEOUT_MS` | Per-request timeout in **milliseconds** (default `120000`, range `1000`–`600000`) |
+| Variable                        | Purpose                                                                                 |
+| ------------------------------- | --------------------------------------------------------------------------------------- |
+| `TESTSPRITE_API_KEY`            | API key — overrides the credentials file                                                |
+| `TESTSPRITE_API_URL`            | API endpoint — overrides the credentials file                                           |
+| `TESTSPRITE_PROFILE`            | Active profile (below `--profile`, above `default`)                                     |
+| `TESTSPRITE_REQUEST_TIMEOUT_MS` | Per-request timeout in **milliseconds** (default `120000`, range `1000`–`600000`)       |
+| `TESTSPRITE_NO_UPDATE_NOTIFIER` | Any non-empty value disables the once-per-24h "new version available" notice            |
+| `NO_COLOR`                      | Suppress ANSI escape sequences in ticker output ([no-color.org](https://no-color.org/)) |
+
+### Update notice
+
+Interactive runs print a one-line "new version available" notice on stderr when
+a newer release exists. To learn this, the CLI contacts the public npm registry
+(`registry.npmjs.org`) at most once per 24 hours; the request carries the
+package name only — never your API key, project data, or command line. The
+check is skipped in CI, when stderr is not a TTY, under `--output json` /
+`--dry-run`, and entirely when `TESTSPRITE_NO_UPDATE_NOTIFIER` is set. Any
+failure is silent: the notice can never break or delay a command. This is the
+only outbound call the CLI makes besides your configured API endpoint.
 
 ### Scopes
 

@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { MANAGED_SECTION_BEGIN, TARGETS } from './agent-targets.js';
+import { MANAGED_SECTION_BEGIN, MANAGED_SECTION_END, TARGETS } from './agent-targets.js';
 import { defaultCredentialsPath, readProfile } from './credentials.js';
 import type { OutputMode } from './output.js';
 
@@ -44,8 +44,8 @@ export interface SkillPresenceDeps {
  * True if the `testsprite-verify` skill is installed for ANY supported agent in
  * `dir`. own-file targets (claude/cursor/cline/antigravity): the landing file
  * exists. managed-section target (codex / AGENTS.md): the file exists AND
- * carries our BEGIN sentinel — a user-authored AGENTS.md without the sentinel
- * does NOT count as our skill.
+ * carries one complete managed section — a user-authored AGENTS.md without the
+ * sentinels, or with a truncated section, does NOT count as our skill.
  *
  * The TARGETS table is the single source of truth for landing paths, so this
  * stays in lockstep with `agent install` without re-listing paths. Best-effort:
@@ -59,7 +59,7 @@ export function isVerifySkillInstalled(dir: string, deps: SkillPresenceDeps = {}
     if (!exists(full)) continue;
     if (spec.mode === 'managed-section') {
       try {
-        if (read(full).includes(MANAGED_SECTION_BEGIN)) return true;
+        if (hasCompleteManagedSection(read(full))) return true;
       } catch {
         // unreadable AGENTS.md → treat this target as absent, keep checking
       }
@@ -68,6 +68,14 @@ export function isVerifySkillInstalled(dir: string, deps: SkillPresenceDeps = {}
     return true; // own-file landing file present
   }
   return false;
+}
+
+/** True when a managed-section file contains an ordered TestSprite BEGIN/END pair. */
+function hasCompleteManagedSection(content: string): boolean {
+  const begin = content.indexOf(MANAGED_SECTION_BEGIN);
+  if (begin === -1) return false;
+  const end = content.indexOf(MANAGED_SECTION_END, begin + MANAGED_SECTION_BEGIN.length);
+  return end !== -1;
 }
 
 export interface SkillNudgeContext {
@@ -133,6 +141,7 @@ export function maybeEmitSkillNudge(ctx: SkillNudgeContext): void {
   }
 }
 
+/** Interpret common env-var spellings for an enabled opt-out flag. */
 function isTruthyEnv(v: string | undefined): boolean {
   if (v === undefined) return false;
   const s = v.trim().toLowerCase();

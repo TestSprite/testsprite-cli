@@ -4,17 +4,23 @@ import { Command } from 'commander';
 import type { CommonOptions as FactoryCommonOptions } from '../lib/client-factory.js';
 import { CLIError, localValidationError } from '../lib/errors.js';
 import type { OutputMode } from '../lib/output.js';
-import { GLOBAL_OPTS_HINT, Output } from '../lib/output.js';
+import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptText } from '../lib/prompt.js';
 import {
   type AgentTarget,
   TARGETS,
   SKILLS,
   DEFAULT_SKILLS,
+  MARKER_SKILL_SEPARATOR,
   pathFor,
   loadSkillBodyFor,
+  bodyHash12,
+  compactBodyFor,
   buildCodexAggregate,
+  buildSkillMarker,
+  parseSkillMarker,
   renderForTarget,
+  renderOwnFileWithMarker,
   MANAGED_SECTION_BEGIN,
   MANAGED_SECTION_END,
 } from '../lib/agent-targets.js';
@@ -150,11 +156,15 @@ async function writeBackup(agentFs: AgentFs, abs: string, existing: string): Pro
 // ---------------------------------------------------------------------------
 
 /**
- * Build the section block to inject (sentinels + body + trailing newline).
+ * Build the section block to inject (sentinels + marker + body + trailing
+ * newline). The provenance marker line sits just inside the BEGIN sentinel so
+ * `agent status` can fingerprint the section. The same skill set + CLI version
+ * + body always produce byte-identical output, so the classifySection
+ * 'unchanged' fast-path keeps working across re-installs.
  * Uses \n throughout; the caller handles CRLF normalisation.
  */
-function buildSection(body: string): string {
-  return `${MANAGED_SECTION_BEGIN}\n${body.trimEnd()}\n${MANAGED_SECTION_END}\n`;
+function buildSection(body: string, markerLine: string): string {
+  return `${MANAGED_SECTION_BEGIN}\n${markerLine}\n${body.trimEnd()}\n${MANAGED_SECTION_END}\n`;
 }
 
 /**
@@ -434,10 +444,32 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
     }
     return b;
   };
+  // Budget-capped own-file targets (e.g. windsurf) render the compact per-skill
+  // body so the rule file isn't truncated by the agent. Cached separately; must
+  // match renderForTarget's default selection so written bytes equal the asserted
+  // render.
+  const compactBodyCache = new Map<string, string>();
+  const compactBodyForSkill = (skill: string): string => {
+    let b = compactBodyCache.get(skill);
+    if (b === undefined) {
+      b = compactBodyFor(skill);
+      compactBodyCache.set(skill, b);
+    }
+    return b;
+  };
+  const ownFileBodyFor = (t: AgentTarget, skill: string): string =>
+    TARGETS[t].compactBody ? compactBodyForSkill(skill) : bodyForSkill(skill);
   let codexSectionCache: string | undefined;
   const getCodexSection = (): string => {
     if (codexSectionCache === undefined) {
-      codexSectionCache = buildSection(buildCodexAggregate(skills));
+      const aggregate = buildCodexAggregate(skills);
+      // ONE marker for the whole managed section: it names every aggregated
+      // skill ('+'-joined) and hashes the canonical aggregate body, so
+      // `agent status` can attribute and fingerprint the section per skill.
+      codexSectionCache = buildSection(
+        aggregate,
+        buildSkillMarker(skills.join(MARKER_SKILL_SEPARATOR), aggregate),
+      );
     }
     return codexSectionCache;
   };
@@ -635,9 +667,20 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
       if (abs !== root && !abs.startsWith(root + path.sep)) {
         throw new CLIError(`refusing to write outside --dir: ${relPath}`, 5);
       }
-      const content = renderForTarget(t, skill, bodyForSkill(skill)).content;
+      const content = renderForTarget(t, skill, ownFileBodyFor(t, skill)).content;
 
       if (opts.dryRun) {
+        // Apply the SAME symlink fail-close guard as the real install path
+        // below (the codex managed-section branch already does this). Without
+        // it, dry-run reports success for a planted symlink that the real
+        // install would refuse with exit 5.
+        const dryRunSt = await inspectTargetPath(agentFs, root, relPath);
+        if (dryRunSt !== null && !dryRunSt.isFile) {
+          throw new CLIError(
+            `${relPath} exists but is not a regular file — remove it and re-run.`,
+            5,
+          );
+        }
         const bytes = Buffer.byteLength(content, 'utf8');
         dryRunLines.push({ abs, bytes, note: '' });
         results.push({ target: t, path: relPath, action: 'dry-run', skills: [skill] });
@@ -779,6 +822,236 @@ export async function runList(opts: CommonOptions, deps: AgentDeps = {}): Promis
 }
 
 // ---------------------------------------------------------------------------
+// runStatus (issue #123: detect silently stale installed skill files)
+// ---------------------------------------------------------------------------
+
+/**
+ * Health of one installed skill artifact, as reported by `agent status`.
+ *
+ * Decision order (first match wins):
+ *  - 'absent'   : nothing at the landing path (codex: no managed section,
+ *                 including an AGENTS.md that exists without our sentinels).
+ *  - 'corrupt'  : codex only. Dangling or duplicated sentinels, the same
+ *                 classification `agent install` refuses on; status REPORTS it
+ *                 instead of refusing.
+ *  - 'unmarked' : artifact present but carries no testsprite-skill marker
+ *                 (installed before markers existed), or the landing path is
+ *                 occupied by a non-regular file (never followed).
+ *  - 'stale'    : marker present, but its hash differs from the current
+ *                 canonical body: a re-install would change the content. Edits
+ *                 on top of an OLD install also read stale (older renders
+ *                 cannot be reproduced); the remedy is the same re-install.
+ *  - 'modified' : marker hash matches the current body, but the artifact bytes
+ *                 differ from the canonical render carrying that same marker
+ *                 line: the user edited the artifact after install.
+ *  - 'ok'       : marker hash matches and the bytes equal the canonical render
+ *                 with the file's own marker line (a version-string-only lag
+ *                 with an unchanged body still reads ok).
+ *
+ * For the codex managed section, ONE marker names every aggregated skill
+ * ('+'-joined); skills not named by the marker report 'absent'.
+ */
+export type SkillArtifactState = 'ok' | 'stale' | 'modified' | 'unmarked' | 'absent' | 'corrupt';
+
+export interface StatusResult {
+  target: AgentTarget;
+  skill: string;
+  path: string;
+  state: SkillArtifactState;
+}
+
+interface StatusOptions extends CommonOptions {
+  dir?: string;
+}
+
+/**
+ * Classify one own-file artifact per the {@link SkillArtifactState} contract.
+ * Comparisons are byte-exact, matching the installer's own skipped/blocked
+ * comparison for own-file targets.
+ */
+async function classifyOwnFileState(
+  agentFs: AgentFs,
+  abs: string,
+  target: AgentTarget,
+  skill: string,
+  bodyForSkill: (skill: string) => string,
+): Promise<SkillArtifactState> {
+  const stat = await agentFs.lstat(abs);
+  if (stat === null) return 'absent';
+  // Occupied by a directory or symlink: not something our installer wrote, and
+  // never followed (mirrors the installer's fail-closed stance on symlinks).
+  if (!stat.isFile) return 'unmarked';
+
+  const existing = await agentFs.readFile(abs);
+  const marker = parseSkillMarker(existing);
+  if (marker === null) return 'unmarked';
+
+  const canonicalBody = bodyForSkill(skill);
+  if (marker.hash12 !== bodyHash12(canonicalBody)) return 'stale';
+
+  // Hash matches the current body: pristine iff the file equals the canonical
+  // render carrying its own marker line, so a marker whose version string lags
+  // behind an unchanged body still reads ok.
+  const reRender = renderOwnFileWithMarker(target, skill, marker.line, canonicalBody);
+  return existing === reRender ? 'ok' : 'modified';
+}
+
+/**
+ * Classify the codex managed section per skill. The section is ONE artifact
+ * carrying ONE marker that names every aggregated skill, so a single
+ * inspection answers all skill rows; the returned function maps a skill name
+ * to its state. Comparisons are CRLF-insensitive on the section bytes.
+ */
+async function classifyManagedSectionStates(
+  agentFs: AgentFs,
+  abs: string,
+): Promise<(skill: string) => SkillArtifactState> {
+  const constantState =
+    (state: SkillArtifactState): ((skill: string) => SkillArtifactState) =>
+    () =>
+      state;
+
+  const stat = await agentFs.lstat(abs);
+  if (stat === null) return constantState('absent');
+  // Occupied by a directory or symlink: never followed (fail-closed).
+  if (!stat.isFile) return constantState('unmarked');
+
+  const existing = await agentFs.readFile(abs);
+
+  // Current canonical section for the default skill set. classifySection's
+  // 'unchanged' answers the common all-defaults-fresh case; its
+  // corrupt/append classification is reused verbatim for status verdicts.
+  const defaultAggregate = buildCodexAggregate(DEFAULT_SKILLS);
+  const defaultSection = buildSection(
+    defaultAggregate,
+    buildSkillMarker(DEFAULT_SKILLS.join(MARKER_SKILL_SEPARATOR), defaultAggregate),
+  );
+  const sectionState = classifySection(existing, defaultSection);
+
+  if (sectionState.kind === 'corrupt') return constantState('corrupt');
+  // No standalone sentinels anywhere: the managed section is not installed.
+  if (sectionState.kind === 'append') return constantState('absent');
+  if (sectionState.kind === 'unchanged') {
+    // Byte-identical to today's default install.
+    return skill => ((DEFAULT_SKILLS as readonly string[]).includes(skill) ? 'ok' : 'absent');
+  }
+  if (sectionState.kind !== 'replace') {
+    // 'create' is unreachable when the file exists; treat defensively as absent.
+    return constantState('absent');
+  }
+
+  // Sentinels are present but the section differs from today's default
+  // canonical: slice the live section bytes out of the file and inspect its
+  // own marker (before/after are exact byte prefix/suffix around the section).
+  const sectionContent = existing.slice(
+    sectionState.before.length,
+    existing.length - sectionState.after.length,
+  );
+  const marker = parseSkillMarker(sectionContent);
+  if (marker === null) return constantState('unmarked');
+
+  const installedSkills = marker.skill.split(MARKER_SKILL_SEPARATOR);
+  const coversSkill = (skill: string): boolean => installedSkills.includes(skill);
+
+  // A marker naming a skill this CLI does not ship cannot be re-rendered;
+  // report the named skills stale (a re-install refreshes the section).
+  if (installedSkills.some(name => SKILLS[name] === undefined)) {
+    return skill => (coversSkill(skill) ? 'stale' : 'absent');
+  }
+
+  const canonicalAggregate = buildCodexAggregate(installedSkills);
+  if (marker.hash12 !== bodyHash12(canonicalAggregate)) {
+    return skill => (coversSkill(skill) ? 'stale' : 'absent');
+  }
+
+  // Hash matches the current aggregate: the section is pristine iff its bytes
+  // equal a re-render carrying its own marker line (version-string-only lag
+  // with an unchanged body still reads ok).
+  const pristine =
+    sectionContent.replace(/\r\n/g, '\n') === buildSection(canonicalAggregate, marker.line);
+  return skill => (coversSkill(skill) ? (pristine ? 'ok' : 'modified') : 'absent');
+}
+
+/**
+ * `agent status`: one row per (target × default skill), each classified per
+ * the {@link SkillArtifactState} contract. Exit contract: returns normally
+ * (exit 0) when every row is 'ok' or 'absent'; throws CLIError exit 1 when any
+ * row is stale/modified/unmarked/corrupt, so the command can gate CI.
+ */
+export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Promise<void> {
+  const agentFs = deps.fs ?? defaultAgentFs;
+  const out = makeOutput(opts.output, deps);
+
+  // An explicit but empty --dir must not silently resolve to cwd
+  // (path.resolve('') === cwd).
+  if (opts.dir !== undefined && opts.dir.trim() === '') {
+    throw localValidationError('dir', 'must not be empty');
+  }
+  const dir = opts.dir !== undefined ? opts.dir.trim() : (deps.cwd ?? process.cwd());
+  const root = path.resolve(dir);
+
+  // Canonical own-file bodies, read once per skill (same lazy caching pattern
+  // as runInstall's bodyForSkill).
+  const skillBodyCache = new Map<string, string>();
+  const bodyForSkill = (skill: string): string => {
+    let cachedBody = skillBodyCache.get(skill);
+    if (cachedBody === undefined) {
+      cachedBody = loadSkillBodyFor(skill);
+      skillBodyCache.set(skill, cachedBody);
+    }
+    return cachedBody;
+  };
+
+  const results: StatusResult[] = [];
+  for (const [target, spec] of Object.entries(TARGETS) as [
+    AgentTarget,
+    { mode: string; path: string },
+  ][]) {
+    if (spec.mode === 'managed-section') {
+      const stateFor = await classifyManagedSectionStates(agentFs, path.resolve(root, spec.path));
+      for (const skill of DEFAULT_SKILLS) {
+        results.push({ target, skill, path: spec.path, state: stateFor(skill) });
+      }
+      continue;
+    }
+    for (const skill of DEFAULT_SKILLS) {
+      const relPath = pathFor(target, skill);
+      results.push({
+        target,
+        skill,
+        path: relPath,
+        state: await classifyOwnFileState(
+          agentFs,
+          path.resolve(root, relPath),
+          target,
+          skill,
+          bodyForSkill,
+        ),
+      });
+    }
+  }
+
+  out.print(results, data => {
+    const items = data as StatusResult[];
+    const header = `${'TARGET'.padEnd(14)} ${'SKILL'.padEnd(20)} ${'STATE'.padEnd(10)} PATH`;
+    const rows = items.map(
+      row => `${row.target.padEnd(14)} ${row.skill.padEnd(20)} ${row.state.padEnd(10)} ${row.path}`,
+    );
+    return [header, ...rows].join('\n');
+  });
+
+  const needingAttention = results.filter(
+    result => result.state !== 'ok' && result.state !== 'absent',
+  );
+  if (needingAttention.length > 0) {
+    throw new CLIError(
+      `${needingAttention.length} skill artifact(s) need attention (stale/modified/unmarked/corrupt); re-run \`testsprite agent install\` (add --force for own-file targets) to refresh them.`,
+      1,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Command factory
 // ---------------------------------------------------------------------------
 
@@ -788,7 +1061,7 @@ function collect(v: string, prev: string[]): string[] {
 
 export function createAgentCommand(deps: AgentDeps = {}): Command {
   const agent = new Command('agent').description(
-    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Codex)',
+    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Windsurf, Antigravity, Codex)',
   );
 
   agent
@@ -798,7 +1071,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
     )
     .option(
       '--target <t>',
-      'Agent target(s): claude, cursor, cline, antigravity, codex (comma-separated or repeated)',
+      'Agent target(s): claude, cursor, cline, antigravity, kiro, windsurf, codex (comma-separated or repeated)',
       collect,
       [],
     )
@@ -841,6 +1114,17 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
       await runList(resolveCommonOptions(command), deps);
     });
 
+  agent
+    .command('status')
+    .description(
+      'Check installed TestSprite skill files against this CLI version: ok, stale, modified, unmarked, absent, or corrupt (exits 1 when anything needs attention, so it can gate CI)',
+    )
+    .option('--dir <path>', 'Project root to inspect (default: cwd)')
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (cmdOpts: { dir?: string }, command: Command) => {
+      await runStatus({ ...resolveCommonOptions(command), dir: cmdOpts.dir }, deps);
+    });
+
   return agent;
 }
 
@@ -852,7 +1136,7 @@ function resolveCommonOptions(command: Command): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions>;
   return {
     profile: globals.profile ?? 'default',
-    output: globals.output ?? 'text',
+    output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
     verbose: globals.verbose ?? false,

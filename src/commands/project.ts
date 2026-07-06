@@ -4,12 +4,13 @@ import { Command } from 'commander';
 import {
   emitDryRunBanner,
   makeHttpClient,
+  parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { ApiError } from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
-import { GLOBAL_OPTS_HINT, Output, type OutputMode } from '../lib/output.js';
+import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
 import {
@@ -50,13 +51,13 @@ export async function runList(
   deps: ProjectDeps = {},
 ): Promise<Page<CliProject>> {
   const out = makeOutput(opts.output, deps);
-  const client = makeClient(opts, deps);
 
   const paginationFlags: PaginationFlags = validatePaginationFlags({
     pageSize: opts.pageSize,
     startingToken: opts.startingToken,
     maxItems: opts.maxItems,
   });
+  const client = makeClient(opts, deps);
 
   // When the user explicitly passed a page-size flag and did NOT ask
   // for --max-items, treat that as a "give me one page and the cursor"
@@ -140,6 +141,18 @@ export async function runCreate(
   // Non-ASCII chars cause a ByteString TypeError at the transport layer
   // (exit 10 UNAVAILABLE) — fail fast with a clear exit 5 instead.
   assertIdempotencyKey(opts.idempotencyKey);
+
+  // Reject empty / whitespace-only names so a junk record never reaches the
+  // backend — matches the `requireString` whitespace guard `test create` uses
+  // (dogfood P1 fix #1). Without this, `--name "   "` passes the action
+  // handler's `if (!name)` check (a non-empty string is truthy) and is sent
+  // verbatim, creating a blank-named project.
+  if (opts.name !== undefined && opts.name.trim().length === 0) {
+    throw localValidationError('--name must not be empty or whitespace-only');
+  }
+  if (opts.password !== undefined && opts.password.trim().length === 0) {
+    throw localValidationError('--password must not be empty or whitespace-only');
+  }
 
   // P1-3: client-side length checks matching server limits.
   if (opts.name !== undefined && opts.name.length > 200) {
@@ -251,6 +264,12 @@ export async function runUpdate(
   assertIdempotencyKey(opts.idempotencyKey);
 
   // P1-3: client-side length checks matching server limits.
+  if (opts.name !== undefined && opts.name.trim().length === 0) {
+    throw localValidationError('--name must not be empty or whitespace-only');
+  }
+  if (opts.password !== undefined && opts.password.trim().length === 0) {
+    throw localValidationError('--password must not be empty or whitespace-only');
+  }
   if (opts.name !== undefined && opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
   }
@@ -258,27 +277,24 @@ export async function runUpdate(
     throw localValidationError('--description must be at most 2000 characters');
   }
 
-  // Resolve password
-  let password = opts.password;
-  if (password === undefined && opts.passwordFile !== undefined) {
-    password = readFileSync(opts.passwordFile, 'utf8').trim();
-  }
-
   // P2-7: guard --url against localhost/RFC1918/non-http(s).
   if (opts.targetUrl !== undefined) {
     assertNotLocal(opts.targetUrl);
   }
 
-  const mutableFields: Record<string, string | undefined> = {
-    name: opts.name,
-    targetUrl: opts.targetUrl,
-    username: opts.username,
-    password,
-    description: opts.description,
-    instruction: opts.instruction,
+  const passwordSupplied = opts.password !== undefined || opts.passwordFile !== undefined;
+  const mutableFields: Record<string, boolean> = {
+    name: opts.name !== undefined,
+    targetUrl: opts.targetUrl !== undefined,
+    username: opts.username !== undefined,
+    password: passwordSupplied,
+    description: opts.description !== undefined,
+    instruction: opts.instruction !== undefined,
   };
-  const presentFields = Object.entries(mutableFields).filter(([, v]) => v !== undefined);
-  if (presentFields.length === 0) {
+  const presentFieldNames = Object.entries(mutableFields)
+    .filter(([, present]) => present)
+    .map(([field]) => field);
+  if (presentFieldNames.length === 0) {
     throw localValidationError(
       'At least one mutable flag is required: --name, --url, --username, --password/--password-file, --description, or --instruction.',
     );
@@ -296,11 +312,18 @@ export async function runUpdate(
     }
     const sample: CliUpdateProjectResponse = {
       id: opts.projectId,
-      updatedFields: presentFields.map(([k]) => k),
+      updatedFields: presentFieldNames,
       updatedAt: '2026-05-16T00:00:00.000Z',
     };
     out.print(sample, data => renderUpdateText(data as CliUpdateProjectResponse));
     return sample;
+  }
+
+  // Resolve password only on the real path. Dry-run must not touch the
+  // filesystem, even when --password-file is present.
+  let password = opts.password;
+  if (password === undefined && opts.passwordFile !== undefined) {
+    password = readFileSync(opts.passwordFile, 'utf8').trim();
   }
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-update-${randomUUID()}`;
@@ -308,7 +331,17 @@ export async function runUpdate(
     stderr(`idempotency-key: ${idempotencyKey}`);
   }
 
-  const body = Object.fromEntries(presentFields) as Record<string, string>;
+  const bodyFields: Record<string, string | undefined> = {
+    name: opts.name,
+    targetUrl: opts.targetUrl,
+    username: opts.username,
+    password,
+    description: opts.description,
+    instruction: opts.instruction,
+  };
+  const body = Object.fromEntries(
+    Object.entries(bodyFields).filter(([, v]) => v !== undefined),
+  ) as Record<string, string>;
   const client = makeClient(opts, deps);
   const updated = await client.patch<CliUpdateProjectResponse>(
     `/projects/${encodeURIComponent(opts.projectId)}`,
@@ -494,31 +527,15 @@ function resolveCommonOptions(command: Command): CommonOptions {
     requestTimeout?: string;
   };
   // P2-8: validate --output before allowing silent fallback to 'text'.
-  const rawOutput = globals.output;
-  if (rawOutput !== undefined && rawOutput !== 'json' && rawOutput !== 'text') {
-    throw localValidationError('--output must be one of: json, text');
-  }
   return {
     profile: globals.profile ?? 'default',
-    output: (globals.output as OutputMode | undefined) ?? 'text',
+    output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
     verbose: globals.verbose ?? false,
     dryRun: globals.dryRun ?? false,
     requestTimeoutMs: parseRequestTimeoutFlag(globals.requestTimeout),
   };
-}
-
-/**
- * Parse the `--request-timeout <seconds>` flag value into milliseconds.
- * Returns `undefined` when the flag was not supplied (factory falls back to
- * the env var / default). Silently clamps out-of-range values.
- */
-function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
-  if (raw === undefined) return undefined;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return undefined;
-  return Math.round(n * 1000); // seconds → milliseconds
 }
 
 function makeClient(opts: CommonOptions, deps: ProjectDeps): HttpClient {

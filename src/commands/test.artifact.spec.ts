@@ -21,6 +21,7 @@ import {
   assertOutDirParentExists,
   createTestArtifactCommand,
   createTestCommand,
+  resolveDefaultArtifactDir,
   runArtifactGet,
   runFailureGet,
 } from './test.js';
@@ -320,6 +321,53 @@ describe('runArtifactGet', () => {
     } finally {
       cwdSpy.mockRestore();
     }
+  });
+
+  it('rejects path-like runId before auth or fetch when default --out is used', async () => {
+    const fetchImpl = vi.fn<typeof globalThis.fetch>();
+
+    await expect(
+      runArtifactGet(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          runId: '../../outside',
+          failedOnly: false,
+        },
+        { fetchImpl, stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    '.',
+    '..',
+    '. ',
+    '.. ',
+    '...',
+    '.. .',
+    '. .',
+    '../outside',
+    '..\\outside',
+    'nested/run',
+    'nested\\run',
+    'bad\0id',
+  ])('rejects unsafe default artifact runId segment %j', runId => {
+    expect(() => resolveDefaultArtifactDir(runId, '/repo')).toThrowError(
+      expect.objectContaining({
+        code: 'VALIDATION_ERROR',
+        details: expect.objectContaining({ field: 'run-id' }),
+      }),
+    );
+  });
+
+  it('keeps the documented default directory for path-safe runIds', () => {
+    expect(resolveDefaultArtifactDir(SAMPLE_RUN_ID, '/repo')).toBe(
+      join('/repo', '.testsprite', 'runs', SAMPLE_RUN_ID),
+    );
   });
 
   // ---- --failed-only passed through to writeBundle ----

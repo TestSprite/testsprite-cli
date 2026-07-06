@@ -28,7 +28,7 @@
     "test:e2e": "npm run build && vitest run -c vitest.e2e.config.ts"
   },
   "engines": {
-    "node": ">=20"
+    "node": "^20.19.0 || ^22.13.0 || >=24"
   },
   "publishConfig": {
     "access": "public"
@@ -50,6 +50,7 @@
   "license": "Apache-2.0",
   "dependencies": {
     "commander": "^12.1.0",
+    "undici": "^7.16.0",
     "valibot": "^1.4.1"
   },
   "devDependencies": {

@@ -222,7 +222,15 @@ describe('deprecated `init` alias', () => {
 
 describe('matrix coverage guard', () => {
   it('TARGETS matches the documented set (update this list when adding a target)', () => {
-    expect(Object.keys(TARGETS)).toEqual(['claude', 'antigravity', 'cursor', 'cline', 'codex']);
+    expect(Object.keys(TARGETS)).toEqual([
+      'claude',
+      'antigravity',
+      'cursor',
+      'cline',
+      'kiro',
+      'windsurf',
+      'codex',
+    ]);
   });
 });
 

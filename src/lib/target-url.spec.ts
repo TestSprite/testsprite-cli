@@ -210,6 +210,31 @@ describe('assertNotLocal — IPv6 hardening (SSRF bypass guard)', () => {
   });
 });
 
+describe('assertNotLocal — trailing-dot FQDN normalization (SSRF bypass guard)', () => {
+  // `localhost.` is the fully-qualified form of `localhost` (RFC 6761 reserves
+  // both to resolve to loopback). It previously bypassed the
+  // `host === 'localhost'` check because the WHATWG URL parser keeps the
+  // trailing dot on named hosts (IP literals are dot-normalized, named hosts
+  // are not).
+  it('blocks http://localhost. (trailing-dot loopback)', () => {
+    expectBlocked('http://localhost.');
+  });
+
+  it('blocks http://localhost.:8080 (trailing-dot loopback with port)', () => {
+    expectBlocked('http://localhost.:8080');
+  });
+
+  it('blocks http://localhost%2e (percent-encoded trailing dot)', () => {
+    expectBlocked('http://localhost%2e');
+  });
+
+  // A legitimate public FQDN with a trailing dot must still be allowed
+  // (no false positive from the dot strip).
+  it('allows https://example.com. (public FQDN with trailing dot)', () => {
+    expectAllowed('https://example.com.');
+  });
+});
+
 describe('assertNotLocal — allowed public URLs', () => {
   it('allows https://example.com', () => {
     expectAllowed('https://example.com');

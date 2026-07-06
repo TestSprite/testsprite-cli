@@ -40,6 +40,7 @@ const cases: Array<[string, string[]]> = [
   ['test failure get', ['test', 'failure', 'get', '--help']],
   ['test failure triage', ['test', 'failure', 'triage', '--help']],
   ['test rerun', ['test', 'rerun', '--help']],
+  ['test flaky', ['test', 'flaky', '--help']],
   // R5: regression guard for commands that gained new flag wording
   ['test create-batch', ['test', 'create-batch', '--help']],
   ['test run', ['test', 'run', '--help']],
