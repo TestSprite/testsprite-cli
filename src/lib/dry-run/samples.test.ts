@@ -407,20 +407,41 @@ describe('findSample', () => {
     expect(e).toBeUndefined();
   });
 
-  // defect-2 fix: getRun sample must return the passed shape (first-match-wins
-  // in findSample). Prior to fix, a duplicate failed-shape entry appeared
-  // before the passed-shape entry; `test wait --dry-run` always resolved to
-  // status: "failed", giving agents the wrong happy-path canned response.
-  it('GET /runs/{runId} resolves to the passed-shape getRun (not the failed shape)', () => {
+  it('GET /runs/{runId} sample includes a failed run-scoped step', () => {
     const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/runs/run_xyz');
     expect(e?.operationId).toBe('getRun');
     const body = e?.body() as {
       status: string;
       runId: string;
-      stepSummary: { failedCount: number };
+      failedStepIndex: number | null;
+      failureKind: string | null;
+      error: string | null;
+      stepSummary: { total: number; completed: number; passedCount: number; failedCount: number };
+      steps: Array<{
+        stepIndex: string;
+        type: string;
+        status: string | null;
+        error: string | null;
+      }>;
     };
-    expect(body.status).toBe('passed');
-    expect(body.stepSummary.failedCount).toBe(0);
+    expect(body.status).toBe('failed');
+    expect(body.failedStepIndex).toBe(3);
+    expect(body.failureKind).toBe('assertion');
+    expect(body.error).toEqual(expect.any(String));
+    expect(body.stepSummary).toMatchObject({
+      total: 3,
+      completed: 3,
+      passedCount: 2,
+      failedCount: 1,
+    });
+
+    const failingStep = body.steps.find(step => step.stepIndex === '0003');
+    expect(failingStep).toMatchObject({
+      type: 'assertion',
+      status: 'failed',
+      error: expect.any(String),
+    });
+    expect(failingStep?.error).not.toBe('');
   });
 
   it('getTest sample carries priority field (G1a)', () => {

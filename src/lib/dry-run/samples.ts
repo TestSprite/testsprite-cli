@@ -691,17 +691,15 @@ const ENTRIES: DryRunSampleEntry[] = [
     },
   } satisfies BatchRerunResponse),
   // M3.3 piece-3 — GET /runs/{runId} (live status / long-poll).
-  // A terminal `passed` row is the most useful dry-run shape: agents see
-  // what a completed run looks like, and `--wait` terminates immediately.
-  // fix(2026-05-21): a duplicate failed-shape entry that appeared before
-  // this entry was removed; findSample first-match-wins was always
-  // returning status: "failed" for `test wait --dry-run`.
+  // Use a terminal failed row with a concrete failed step so
+  // `test steps --run-id <id> --dry-run` demonstrates the run-scoped
+  // error + failedStepIndex mapping without needing live credentials.
   entry('getRun', 'GET', '/runs/{runId}', {
     runId: SAMPLE_RUN_ID,
-    testId: SAMPLE_TEST_ID_PASSED,
+    testId: SAMPLE_TEST_ID_FAILED,
     projectId: SAMPLE_PROJECT_ID,
     userId: SAMPLE_USER_ID,
-    status: 'passed',
+    status: 'failed',
     source: 'cli',
     createdAt: '2026-05-15T19:32:00.000Z',
     startedAt: '2026-05-15T19:32:05.000Z',
@@ -709,19 +707,19 @@ const ENTRIES: DryRunSampleEntry[] = [
     codeVersion: 'v1',
     targetUrl: SAMPLE_TARGET_URL,
     createdFrom: null,
-    failedStepIndex: null,
-    failureKind: null,
-    error: null,
+    failedStepIndex: 3,
+    failureKind: 'assertion',
+    error: 'Expected billing status badge to be visible, but it was not found.',
     videoUrl: null,
     stepSummary: {
-      total: 8,
-      completed: 8,
-      passedCount: 8,
-      failedCount: 0,
+      total: 3,
+      completed: 3,
+      passedCount: 2,
+      failedCount: 1,
     },
     // Representative per-run steps so `test steps --run-id <id> --dry-run`
     // demonstrates real output instead of an empty list (the generic
-    // `/runs/{runId}` sample is also used by `test wait`, which ignores steps).
+    // `/runs/{runId}` sample is also safe for wait flows, which ignore steps).
     steps: [
       {
         stepIndex: '0001',
@@ -744,6 +742,17 @@ const ENTRIES: DryRunSampleEntry[] = [
         screenshotUrl: null,
         htmlSnapshotUrl: null,
         createdAt: '2026-05-15T19:32:20.000Z',
+      },
+      {
+        stepIndex: '0003',
+        type: 'assertion',
+        action: 'assert_visible',
+        status: 'failed',
+        description: 'Billing status badge is visible',
+        error: 'Expected billing status badge to be visible, but it was not found.',
+        screenshotUrl: null,
+        htmlSnapshotUrl: null,
+        createdAt: '2026-05-15T19:32:30.000Z',
       },
     ],
   } satisfies RunResponse),
