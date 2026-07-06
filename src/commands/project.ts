@@ -202,7 +202,7 @@ export async function runCreate(
   // Resolve password: flag > file > none
   let password = opts.password;
   if (password === undefined && opts.passwordFile !== undefined) {
-    password = readFileSync(opts.passwordFile, 'utf8').trim();
+    password = readPasswordFile(opts.passwordFile);
   }
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-create-${randomUUID()}`;
@@ -323,7 +323,7 @@ export async function runUpdate(
   // filesystem, even when --password-file is present.
   let password = opts.password;
   if (password === undefined && opts.passwordFile !== undefined) {
-    password = readFileSync(opts.passwordFile, 'utf8').trim();
+    password = readPasswordFile(opts.passwordFile);
   }
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-update-${randomUUID()}`;
@@ -628,4 +628,32 @@ function localValidationError(message: string): ApiError {
       details: { reason: 'missing_required_flag' },
     },
   });
+}
+
+function passwordFileValidationError(path: string, reason: string): ApiError {
+  return ApiError.fromEnvelope({
+    error: {
+      code: 'VALIDATION_ERROR',
+      message: 'Invalid request.',
+      nextAction: reason,
+      requestId: 'local',
+      details: { field: 'password-file', path, reason },
+    },
+  });
+}
+
+function readPasswordFile(path: string): string {
+  try {
+    return readFileSync(path, 'utf8').trim();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      throw passwordFileValidationError(path, `file does not exist: ${path}`);
+    }
+    if (code === 'EACCES') {
+      throw passwordFileValidationError(path, `permission denied reading ${path}`);
+    }
+    const reason = err instanceof Error ? err.message : 'unknown error';
+    throw passwordFileValidationError(path, `cannot read ${path}: ${reason}`);
+  }
 }

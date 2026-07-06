@@ -664,6 +664,39 @@ describe('runCreate', () => {
     ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it('rejects a missing --password-file with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const missingPasswordFile = join(mkdtempSync(join(tmpdir(), 'cli-pwfile-')), 'password.txt');
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network - validation must fire client-side');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'frontend',
+          name: 'Password File Guard Project',
+          targetUrl: 'https://example.com',
+          passwordFile: missingPasswordFile,
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'password-file' }),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -790,6 +823,38 @@ describe('runUpdate', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it('rejects a missing --password-file with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const missingPasswordFile = join(mkdtempSync(join(tmpdir(), 'cli-pwfile-')), 'password.txt');
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not be called');
+    });
+
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          passwordFile: missingPasswordFile,
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'password-file' }),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('P7 — dry-run returns canned shape without network call', async () => {
     resetDryRunBannerForTesting();
     const { credentialsPath } = makeCreds();
