@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { writeSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import {
   SIGINT_EXIT_CODE,
@@ -7,6 +8,13 @@ import {
   installBrokenPipeGuard,
   installSignalHandlers,
 } from './interrupt.js';
+
+// installSignalHandlers' default stderr writes via fs.writeSync (synchronous, so
+// the hint survives a piped stderr before exit); mock it to assert on that path.
+vi.mock('node:fs', async importOriginal => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return { ...actual, writeSync: vi.fn() };
+});
 
 describe('formatInterruptMessage', () => {
   it('defaults to SIGINT and explains the run continues server-side', () => {
@@ -51,6 +59,24 @@ describe('installSignalHandlers', () => {
     expect(SIGINT_EXIT_CODE).toBe(130);
     expect(TERMINATION_EXIT_CODES.SIGTERM).toBe(143);
     expect(TERMINATION_EXIT_CODES.SIGHUP).toBe(129);
+  });
+
+  it('writes the hint synchronously via writeSync before exit (survives a piped stderr)', () => {
+    vi.mocked(writeSync).mockClear();
+    const handlers = new Map<string, () => void>();
+    const exit = vi.fn();
+    // No stderr dep: exercise the synchronous default path.
+    installSignalHandlers({
+      on: (signal, handler) => handlers.set(signal, handler),
+      exit,
+    });
+    handlers.get('SIGINT')!();
+    expect(exit).toHaveBeenCalledWith(130);
+    const written = vi
+      .mocked(writeSync)
+      .mock.calls.map(call => String(call[1]))
+      .join('');
+    expect(written).toContain('Interrupted (SIGINT)');
   });
 });
 

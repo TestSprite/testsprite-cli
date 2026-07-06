@@ -19,6 +19,8 @@
  * without spawning a subprocess or sending a real signal.
  */
 
+import { writeSync } from 'node:fs';
+
 /**
  * Termination signals handled, mapped to their conventional `128 + signum`
  * exit code. sourceRef: POSIX signal numbers (SIGHUP=1, SIGINT=2, SIGTERM=15).
@@ -60,7 +62,18 @@ export function installSignalHandlers(deps: InterruptDeps = {}): void {
     ((signal: TerminationSignal, handler: () => void) => {
       process.on(signal, handler);
     });
-  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const stderr =
+    deps.stderr ??
+    ((line: string) => {
+      // A signal handler calls process.exit() right after writing, which can
+      // truncate an async process.stderr.write() when stderr is a pipe. Write
+      // synchronously so the interrupt hint is flushed before the process exits.
+      try {
+        writeSync(process.stderr.fd, `${line}\n`);
+      } catch {
+        // Best-effort: if stderr is already gone (EPIPE), still exit cleanly.
+      }
+    });
   const exit = deps.exit ?? ((code: number) => process.exit(code));
 
   for (const signal of Object.keys(TERMINATION_EXIT_CODES) as TerminationSignal[]) {
