@@ -17,7 +17,7 @@ import {
   readProfile,
   writeProfile,
 } from '../lib/credentials.js';
-import { loadConfig } from '../lib/config.js';
+import { loadConfig, normalizeEnvVar } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
 import type { OutputMode } from '../lib/output.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
@@ -85,7 +85,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   // treated as unset. Without this, `''` (e.g. `export TESTSPRITE_API_URL=` in a
   // shell profile) is non-nullish and would short-circuit the `??` chains below to
   // an empty endpoint instead of falling through to the profile / prod default.
-  const envApiUrl = env.TESTSPRITE_API_URL?.trim() || undefined;
+  const envApiUrl = normalizeEnvVar(env.TESTSPRITE_API_URL);
 
   // Dry-run: do not prompt, do not read env, do not write credentials.
   // Print the canned success shape so an agent sees exactly the JSON it
@@ -208,7 +208,8 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
   // displayed URL always matches where requests actually go (dogfood L1788).
   let resolvedEndpoint: string;
   if (opts.dryRun) {
-    resolvedEndpoint = opts.endpointUrl ?? env.TESTSPRITE_API_URL ?? 'https://api.testsprite.com';
+    resolvedEndpoint =
+      opts.endpointUrl ?? normalizeEnvVar(env.TESTSPRITE_API_URL) ?? 'https://api.testsprite.com';
   } else {
     const credentialsPath = deps.credentialsPath ?? defaultCredentialsPath();
     const config = loadConfig({

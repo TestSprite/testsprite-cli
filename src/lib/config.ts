@@ -17,6 +17,11 @@ export interface LoadConfigOptions {
 
 const DEFAULT_API_URL = 'https://api.testsprite.com';
 
+/** Treat empty / whitespace-only env values as unset for `??` resolution chains. */
+export function normalizeEnvVar(value: string | undefined): string | undefined {
+  return value?.trim() || undefined;
+}
+
 export function defaultConfigPath(): string {
   return join(homedir(), '.testsprite', 'config');
 }
@@ -38,9 +43,15 @@ export function loadConfig(options: LoadConfigOptions = {}): Config {
   const credentialsPath = options.credentialsPath ?? defaultCredentialsPath();
   const fileEntry = readProfile(profile, { path: credentialsPath });
 
+  // Empty / whitespace-only env vars are treated as unset so they do not
+  // short-circuit the `??` chain (e.g. `export TESTSPRITE_API_URL=` in a shell
+  // profile). Matches the normalization in auth configure and init/setup.
+  const envApiUrl = normalizeEnvVar(env.TESTSPRITE_API_URL);
+  const envApiKey = normalizeEnvVar(env.TESTSPRITE_API_KEY);
+
   return {
-    apiUrl: options.endpointUrl ?? env.TESTSPRITE_API_URL ?? fileEntry?.apiUrl ?? DEFAULT_API_URL,
-    apiKey: env.TESTSPRITE_API_KEY ?? fileEntry?.apiKey,
+    apiUrl: options.endpointUrl ?? envApiUrl ?? fileEntry?.apiUrl ?? DEFAULT_API_URL,
+    apiKey: envApiKey ?? fileEntry?.apiKey,
     profile,
   };
 }
