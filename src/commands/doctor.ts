@@ -22,14 +22,12 @@ import {
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { loadConfig } from '../lib/config.js';
-import { ApiError, CLIError } from '../lib/errors.js';
+import { ApiError, CLIError, localValidationError } from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, type OutputMode } from '../lib/output.js';
 import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
 import { VERSION } from '../version.js';
-
-/** Minimum Node major version. sourceRef: package.json engines.node ">=20". */
-const MIN_NODE_MAJOR = 20;
+import { MIN_SUPPORTED_NODE_MAJOR, shouldRejectNodeVersion } from '../version-guard.js';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -113,14 +111,17 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
 }
 
 function checkNodeVersion(nodeVersion: string): DoctorCheck {
-  const major = parseInt(nodeVersion.split('.')[0] ?? '', 10);
-  const ok = Number.isInteger(major) && major >= MIN_NODE_MAJOR;
+  // Reuse the CLI's own runtime guard so the verdict matches exactly what the
+  // entrypoint enforces at startup, rather than a divergent hardcoded check.
+  // The precise engines floor (20.19+/22.13+/24+) is enforced by npm at install
+  // time via .npmrc engine-strict. sourceRef: src/version-guard.ts.
+  const rejected = shouldRejectNodeVersion(nodeVersion);
   return {
     name: 'Node.js',
-    status: ok ? 'ok' : 'fail',
-    detail: ok
-      ? `v${nodeVersion} (>=${MIN_NODE_MAJOR} required)`
-      : `v${nodeVersion} is below the required Node ${MIN_NODE_MAJOR}; upgrade Node.js`,
+    status: rejected ? 'fail' : 'ok',
+    detail: rejected
+      ? `v${nodeVersion} is below the required Node ${MIN_SUPPORTED_NODE_MAJOR}; upgrade Node.js`
+      : `v${nodeVersion} (>=${MIN_SUPPORTED_NODE_MAJOR} required)`,
   };
 }
 
@@ -268,7 +269,14 @@ function resolveCommonOptions(command: Command): CommonOptions {
 function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
   if (raw === undefined) return undefined;
   const seconds = Number(raw);
-  if (!Number.isFinite(seconds) || seconds <= 0) return undefined;
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    // Match the other commands: a malformed --request-timeout is a validation
+    // error, not a silently-ignored default.
+    throw localValidationError(
+      'request-timeout',
+      `must be a positive number of seconds (got "${raw}")`,
+    );
+  }
   return Math.round(seconds * 1000);
 }
 

@@ -89,14 +89,18 @@ describe('runDoctor — healthy environment', () => {
     expect(all).not.toContain('sk-super-secret-value');
   });
 
-  it('emits a machine-readable report under --output json', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+  it('emits a machine-readable report under --output json without leaking the API key', async () => {
+    writeProfile('default', { apiKey: 'sk-json-secret-value' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runDoctor(
       { profile: 'default', output: 'json', debug: false },
       { ...healthyDeps(credentialsPath), ...deps },
     );
-    const parsed = JSON.parse(capture.stdout.join('')) as DoctorReport;
+    const raw = capture.stdout.join('');
+    // Security: the JSON serialization path is distinct from the text renderer,
+    // so assert the key never leaks here either.
+    expect(raw).not.toContain('sk-json-secret-value');
+    const parsed = JSON.parse(raw) as DoctorReport;
     expect(parsed.failures).toBe(0);
     expect(Array.isArray(parsed.checks)).toBe(true);
     expect(
