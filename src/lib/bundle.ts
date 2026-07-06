@@ -551,10 +551,11 @@ export function isBundleOwnedEntry(entry: string): boolean {
  * names are moved aside or replaced — foreign files in `--out` survive.
  *
  * Re-commit safety: bundle-owned entries are renamed to a sibling
- * aside directory before the new artifacts land. `meta.json` is installed
- * last so its presence remains the completion signal. On failure, aside
- * entries are restored so a failed re-commit never deletes `meta.json`
- * without leaving a usable prior bundle (or the prior bundle restored).
+ * aside directory before the new artifacts land. The prior `meta.json`
+ * is moved aside first (§3/§7.3 — no meta ⇒ refuse to consume) so a
+ * concurrent reader never sees meta pointing at steps already gone.
+ * The new `meta.json` is installed last. On failure, aside entries are
+ * restored so a failed re-commit never leaves the directory unusable.
  */
 export async function commitBundle(
   tmpDir: string,
@@ -588,9 +589,13 @@ export async function commitBundle(
     const newTopLevelSet = new Set(topLevel);
     newTopLevelSet.add('meta.json');
 
+    // meta.json first — its presence is the completion signal; do not
+    // move steps (or anything else) aside while a stale meta is still visible.
+    await asideIfPresent('meta.json');
+
     const existing = await readdir(dir).catch(() => [] as string[]);
     for (const entry of existing) {
-      if (entry === '.tmp') continue;
+      if (entry === '.tmp' || entry === 'meta.json') continue;
       if (!isBundleOwnedEntry(entry)) continue;
 
       const isStale = entry !== 'steps' && entry !== '.partial' && !newTopLevelSet.has(entry);
