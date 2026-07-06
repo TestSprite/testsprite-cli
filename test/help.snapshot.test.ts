@@ -5,14 +5,14 @@
  *
  * Lives under `test/`
  * (not `src/`) to mirror the existing subprocess test pattern — the
- * snapshot runs the real built binary and therefore needs a build in
- * `beforeAll`, the same way `test/cli.subprocess.test.ts` does.
+ * snapshot runs the real built binary; `test/global-setup.mjs` builds
+ * `dist/` once before any worker starts.
  */
 
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..');
@@ -45,10 +45,6 @@ const cases: Array<[string, string[]]> = [
 ];
 
 describe('--help snapshots', () => {
-  beforeAll(() => {
-    execFileSync('npm', ['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
-  });
-
   for (const [name, args] of cases) {
     it(name, () => {
       const out = execFileSync('node', [BIN_PATH, ...args], {

@@ -32,12 +32,8 @@ let baseUrl: string;
 let tmpHome: string;
 
 beforeAll(async () => {
-  // Always rebuild — `npm run build` is fast and a stale `dist/index.js`
-  // would silently mask ESM/import regressions in this suite. The
-  // existsSync skip we used to do here let `dist` rot under
-  // refactors and gave false-green on `project list` once
-  // already.
-  execFileSync('npm', ['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
+  // `test/global-setup.mjs` builds dist/ once before workers start (skips when
+  // dist/index.js is newer than src/). CI also pre-builds before npm test.
   server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const url = req.url ?? '/';
     if (url.startsWith('/api/cli/v1/projects/')) {

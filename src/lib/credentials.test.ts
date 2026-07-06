@@ -1,11 +1,10 @@
-import { execSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   DEFAULT_PROFILE,
   assertValidProfileName,
@@ -209,10 +208,6 @@ function spawnCredentialsWriter(profile: string, apiKey: string, path: string): 
 }
 
 describe('credentials write lock', () => {
-  beforeAll(() => {
-    execSync('npm run build', { cwd: projectRoot, stdio: 'pipe' });
-  });
-
   it('serializes cross-process writes so concurrent profile updates are not lost', async () => {
     const children = [
       spawnCredentialsWriter('dev', 'sk-dev', credentialsPath),
