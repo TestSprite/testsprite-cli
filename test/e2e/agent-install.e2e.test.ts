@@ -19,6 +19,9 @@ import {
   MANAGED_SECTION_BEGIN,
   MANAGED_SECTION_END,
   TARGETS,
+  SKILLS,
+  DEFAULT_SKILLS,
+  pathFor,
   renderForTarget,
   type AgentTarget,
 } from '../../src/lib/agent-targets.js';
@@ -88,7 +91,7 @@ describe('fresh install (per target)', () => {
   const allTargets = Object.keys(TARGETS) as AgentTarget[];
 
   for (const target of allTargets) {
-    it(`installs ${target} → exit 0, file at matrix path, action: written/section-installed`, () => {
+    it(`installs ${target} → exit 0, all skill files land, action: written/section-installed`, () => {
       const tmpDir = freshTmpDir();
       const result = runCli([
         'agent',
@@ -106,23 +109,31 @@ describe('fresh install (per target)', () => {
         target: string;
         path: string;
         action: string;
+        skills: string[];
       }>;
       expect(Array.isArray(parsed), 'output should be a JSON array').toBe(true);
-      const entry = parsed.find(r => r.target === target);
-      expect(entry, `entry for ${target}`).toBeDefined();
 
-      // managed-section targets report 'section-installed'; own-file targets report 'written'
-      const expectedAction =
-        TARGETS[target].mode === 'managed-section' ? 'section-installed' : 'written';
-      expect(entry!.action, `action for ${target}`).toBe(expectedAction);
-      expect(entry!.path).toBe(TARGETS[target].path);
+      if (TARGETS[target].mode === 'managed-section') {
+        // codex: ONE result aggregating all skills
+        const entry = parsed.find(r => r.target === target);
+        expect(entry, `entry for ${target}`).toBeDefined();
+        expect(entry!.action, `action for ${target}`).toBe('section-installed');
+        expect(entry!.path).toBe(TARGETS[target].path);
+        const absPath = join(tmpDir, TARGETS[target].path);
+        expect(existsSync(absPath), `file at ${absPath}`).toBe(true);
+        expect(existsSync(dirname(absPath))).toBe(true);
+      } else {
+        // own-file: one result per skill, one file per skill
+        for (const skill of DEFAULT_SKILLS) {
+          const entry = parsed.find(r => r.target === target && r.path === pathFor(target, skill));
+          expect(entry, `entry for ${target}/${skill}`).toBeDefined();
+          expect(entry!.action, `action for ${target}/${skill}`).toBe('written');
 
-      // File must exist at the matrix path
-      const expectedAbsPath = join(tmpDir, TARGETS[target].path);
-      expect(existsSync(expectedAbsPath), `file at ${expectedAbsPath}`).toBe(true);
-
-      // Parent dirs must have been created
-      expect(existsSync(dirname(expectedAbsPath))).toBe(true);
+          const absPath = join(tmpDir, pathFor(target, skill));
+          expect(existsSync(absPath), `file at ${absPath}`).toBe(true);
+          expect(existsSync(dirname(absPath))).toBe(true);
+        }
+      }
     });
   }
 });
@@ -132,76 +143,118 @@ describe('fresh install (per target)', () => {
 // ---------------------------------------------------------------------------
 
 describe('content integrity', () => {
-  // own-file targets: full skill body with frontmatter
+  // own-file targets: both skill files land with correct structure
   const ownFileTargets = (Object.keys(TARGETS) as AgentTarget[]).filter(
     t => TARGETS[t].mode === 'own-file',
   );
 
   for (const target of ownFileTargets) {
-    it(`${target} file has correct structure and load-bearing strings`, () => {
+    it(`${target} testsprite-verify file has correct structure and load-bearing strings`, () => {
       const tmpDir = freshTmpDir();
       runCli(['agent', 'install', `--target=${target}`, '--dir', tmpDir, '--output', 'json']);
 
-      const filePath = join(tmpDir, TARGETS[target].path);
+      const filePath = join(tmpDir, pathFor(target, 'testsprite-verify'));
       const content = readFileSync(filePath, 'utf8');
 
       // (a) Frontmatter check
       if (target === 'claude' || target === 'antigravity') {
-        // Must start with --- (SKILL.md frontmatter)
         expect(content.startsWith('---'), `${target}: should start with ---`).toBe(true);
         expect(content).toContain('name: testsprite-verify');
       } else if (target === 'cursor') {
         expect(content.startsWith('---'), `cursor: should start with ---`).toBe(true);
         expect(content).toContain('alwaysApply: false');
       } else if (target === 'cline') {
-        // cline has NO frontmatter fence
         expect(content.startsWith('---'), `cline: must NOT start with ---`).toBe(false);
-        // cline body starts with the skill heading
         expect(
           content.trimStart().startsWith('#'),
           `cline: should start with a markdown heading`,
         ).toBe(true);
+      } else if (target === 'windsurf') {
+        // Windsurf Cascade frontmatter: trigger + description (no name/alwaysApply)
+        expect(content.startsWith('---'), `windsurf: should start with ---`).toBe(true);
+        expect(content).toContain('trigger: model_decision');
+        expect(content).toContain('description:');
       }
 
-      // (b) branding — the renamed H1 must be present.
-
+      // (b) branding — the renamed H1 must be present in every body variant
       expect(content).toContain('TestSprite Verification Loop');
-      // Match the verification-loop intro line used in the asset
-      expect(content).toContain('The verification loop that flies');
+      // The full-body intro line lives only in the FULL body; compact-body targets
+      // (e.g. windsurf, budget-capped) ship the trimmed verify body and omit it.
+      if (!TARGETS[target].compactBody) {
+        expect(content).toContain('The verification loop that flies');
+      }
 
-      // (c) Load-bearing command strings — a body trim that drops these must fail CI
+      // (c) Load-bearing command strings
       expect(content, `${target}: missing 'testsprite test run'`).toContain('testsprite test run');
       expect(content, `${target}: missing '--wait'`).toContain('--wait');
       expect(content, `${target}: missing 'test artifact get'`).toContain('test artifact get');
     });
+
+    it(`${target} testsprite-onboard file lands and has correct structure`, () => {
+      const tmpDir = freshTmpDir();
+      runCli(['agent', 'install', `--target=${target}`, '--dir', tmpDir, '--output', 'json']);
+
+      const filePath = join(tmpDir, pathFor(target, 'testsprite-onboard'));
+      expect(existsSync(filePath), `onboard file must exist at ${filePath}`).toBe(true);
+      const content = readFileSync(filePath, 'utf8');
+
+      // Frontmatter check for onboard skill
+      if (target === 'claude' || target === 'antigravity') {
+        expect(content.startsWith('---'), `${target}/onboard: should start with ---`).toBe(true);
+        expect(content).toContain('name: testsprite-onboard');
+      } else if (target === 'cursor') {
+        expect(content.startsWith('---'), `cursor/onboard: should start with ---`).toBe(true);
+        expect(content).toContain('alwaysApply: false');
+      } else if (target === 'cline') {
+        expect(content.startsWith('---'), `cline/onboard: must NOT start with ---`).toBe(false);
+      } else if (target === 'windsurf') {
+        expect(content.startsWith('---'), `windsurf/onboard: should start with ---`).toBe(true);
+        expect(content).toContain('trigger: model_decision');
+        expect(content).toContain('description:');
+      }
+
+      // Load-bearing onboard string: the skill body must reference setup
+      expect(content).toContain('testsprite');
+    });
   }
 
-  // codex: managed-section target — trimmed body, sentinels wrapping content, no frontmatter
-  it('codex AGENTS.md contains sentinels and load-bearing command strings', () => {
+  // codex: ONE managed section containing BOTH verify body and onboard one-liner
+  it('codex AGENTS.md contains ONE managed section with both verify and onboard content', () => {
     const tmpDir = freshTmpDir();
     runCli(['agent', 'install', '--target=codex', '--dir', tmpDir, '--output', 'json']);
 
     const filePath = join(tmpDir, TARGETS.codex.path);
     const content = readFileSync(filePath, 'utf8');
 
-    // (a) Sentinels must be present
-    expect(content).toContain(MANAGED_SECTION_BEGIN);
-    expect(content).toContain(MANAGED_SECTION_END);
+    // (a) Exactly ONE pair of sentinels
+    const beginCount = (
+      content.match(
+        new RegExp(MANAGED_SECTION_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'),
+      ) ?? []
+    ).length;
+    const endCount = (
+      content.match(new RegExp(MANAGED_SECTION_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) ??
+      []
+    ).length;
+    expect(beginCount, 'exactly one BEGIN sentinel').toBe(1);
+    expect(endCount, 'exactly one END sentinel').toBe(1);
+
     // BEGIN must come before END
     expect(content.indexOf(MANAGED_SECTION_BEGIN)).toBeLessThan(
       content.indexOf(MANAGED_SECTION_END),
     );
 
-    // (b) branding (trimmed asset shares the renamed H1)
+    // (b) Verify content: branding heading + load-bearing command strings
     expect(content).toContain('TestSprite Verification Loop');
-
-    // (c) No frontmatter fence — AGENTS.md is plain prose
-    expect(content.startsWith('---'), 'codex: must NOT start with ---').toBe(false);
-
-    // (d) Load-bearing command strings
     expect(content).toContain('testsprite test run');
     expect(content).toContain('--wait');
     expect(content).toContain('test artifact get');
+
+    // (c) Onboard content: the one-liner must be inside the managed section
+    expect(content).toContain('First-time setup');
+
+    // (d) No frontmatter fence — AGENTS.md is plain prose
+    expect(content.startsWith('---'), 'codex: must NOT start with ---').toBe(false);
   });
 });
 
@@ -210,7 +263,7 @@ describe('content integrity', () => {
 // ---------------------------------------------------------------------------
 
 describe('idempotent re-run', () => {
-  it('second install exits 0 with action: skipped and file is byte-identical', () => {
+  it('second install exits 0 with all actions: skipped, files byte-identical', () => {
     const tmpDir = freshTmpDir();
 
     // First install
@@ -224,12 +277,15 @@ describe('idempotent re-run', () => {
       'json',
     ]);
     expect(first.status).toBe(0);
-    const firstParsed = JSON.parse(first.stdout) as Array<{ action: string }>;
-    expect(firstParsed[0]!.action).toBe('written');
+    const firstParsed = JSON.parse(first.stdout) as Array<{ path: string; action: string }>;
+    // Both skills written on first install
+    expect(firstParsed.every(r => r.action === 'written')).toBe(true);
 
-    // Capture file content before second run
-    const filePath = join(tmpDir, TARGETS.claude.path);
-    const contentBefore = readFileSync(filePath, 'utf8');
+    // Capture file contents before second run
+    const verifyPath = join(tmpDir, pathFor('claude', 'testsprite-verify'));
+    const onboardPath = join(tmpDir, pathFor('claude', 'testsprite-onboard'));
+    const verifyBefore = readFileSync(verifyPath, 'utf8');
+    const onboardBefore = readFileSync(onboardPath, 'utf8');
 
     // Second install
     const second = runCli([
@@ -242,12 +298,13 @@ describe('idempotent re-run', () => {
       'json',
     ]);
     expect(second.status).toBe(0);
-    const secondParsed = JSON.parse(second.stdout) as Array<{ action: string }>;
-    expect(secondParsed[0]!.action).toBe('skipped');
+    const secondParsed = JSON.parse(second.stdout) as Array<{ path: string; action: string }>;
+    // Both skills skipped on second install
+    expect(secondParsed.every(r => r.action === 'skipped')).toBe(true);
 
-    // File must be byte-identical
-    const contentAfter = readFileSync(filePath, 'utf8');
-    expect(contentAfter).toBe(contentBefore);
+    // Files must be byte-identical
+    expect(readFileSync(verifyPath, 'utf8')).toBe(verifyBefore);
+    expect(readFileSync(onboardPath, 'utf8')).toBe(onboardBefore);
   });
 });
 
@@ -256,7 +313,7 @@ describe('idempotent re-run', () => {
 // ---------------------------------------------------------------------------
 
 describe('conflict handling', () => {
-  it('exits 6 with action: blocked when file differs and no --force', () => {
+  it('exits 6 with action: blocked when verify file differs and no --force', () => {
     const tmpDir = freshTmpDir();
 
     // First install
@@ -271,11 +328,11 @@ describe('conflict handling', () => {
     ]);
     expect(first.status).toBe(0);
 
-    // Hand-edit the file
-    const filePath = join(tmpDir, TARGETS.claude.path);
-    const originalContent = readFileSync(filePath, 'utf8');
+    // Hand-edit the verify file
+    const verifyFilePath = join(tmpDir, pathFor('claude', 'testsprite-verify'));
+    const originalContent = readFileSync(verifyFilePath, 'utf8');
     const editedContent = originalContent + '\n\n<!-- HAND-EDITED: do not overwrite -->';
-    writeFileSync(filePath, editedContent, 'utf8');
+    writeFileSync(verifyFilePath, editedContent, 'utf8');
 
     // Re-run without --force
     const second = runCli([
@@ -289,12 +346,14 @@ describe('conflict handling', () => {
     ]);
     expect(second.status).toBe(6);
 
-    // action: blocked in JSON
-    const parsed = JSON.parse(second.stdout) as Array<{ action: string }>;
-    expect(parsed[0]!.action).toBe('blocked');
+    // At least one entry must be blocked (the verify file)
+    const parsed = JSON.parse(second.stdout) as Array<{ path: string; action: string }>;
+    const blockedEntry = parsed.find(r => r.path === pathFor('claude', 'testsprite-verify'));
+    expect(blockedEntry, 'verify entry should be blocked').toBeDefined();
+    expect(blockedEntry!.action).toBe('blocked');
 
     // File must be unchanged (not overwritten)
-    expect(readFileSync(filePath, 'utf8')).toBe(editedContent);
+    expect(readFileSync(verifyFilePath, 'utf8')).toBe(editedContent);
 
     // Stderr must contain --force hint
     expect(second.stderr).toContain('--force');
@@ -306,16 +365,16 @@ describe('conflict handling', () => {
 // ---------------------------------------------------------------------------
 
 describe('force overwrite with backup', () => {
-  it('--force exits 0 with action: updated, file = canonical, .bak holds edited bytes', () => {
+  it('--force exits 0 with action: updated for edited file, .bak holds edited bytes', () => {
     const tmpDir = freshTmpDir();
 
     // First install
     runCli(['agent', 'install', '--target=claude', '--dir', tmpDir, '--output', 'json']);
 
-    // Hand-edit the file
-    const filePath = join(tmpDir, TARGETS.claude.path);
-    const editedContent = readFileSync(filePath, 'utf8') + '\n\n<!-- EDITED -->';
-    writeFileSync(filePath, editedContent, 'utf8');
+    // Hand-edit the verify file
+    const verifyFilePath = join(tmpDir, pathFor('claude', 'testsprite-verify'));
+    const editedContent = readFileSync(verifyFilePath, 'utf8') + '\n\n<!-- EDITED -->';
+    writeFileSync(verifyFilePath, editedContent, 'utf8');
 
     // Re-run with --force
     const forced = runCli([
@@ -330,15 +389,17 @@ describe('force overwrite with backup', () => {
     ]);
     expect(forced.status).toBe(0);
 
-    const parsed = JSON.parse(forced.stdout) as Array<{ action: string }>;
-    expect(parsed[0]!.action).toBe('updated');
+    const parsed = JSON.parse(forced.stdout) as Array<{ path: string; action: string }>;
+    const verifyEntry = parsed.find(r => r.path === pathFor('claude', 'testsprite-verify'));
+    expect(verifyEntry, 'verify entry must be present').toBeDefined();
+    expect(verifyEntry!.action).toBe('updated');
 
-    // File must now equal canonical content
-    const { content: canonical } = renderForTarget('claude');
-    expect(readFileSync(filePath, 'utf8')).toBe(canonical);
+    // Verify file must now equal canonical content
+    const { content: canonicalVerify } = renderForTarget('claude', 'testsprite-verify');
+    expect(readFileSync(verifyFilePath, 'utf8')).toBe(canonicalVerify);
 
     // .bak must hold the edited bytes
-    const bakPath = filePath + '.bak';
+    const bakPath = verifyFilePath + '.bak';
     expect(existsSync(bakPath), '.bak file must exist').toBe(true);
     expect(readFileSync(bakPath, 'utf8')).toBe(editedContent);
   });
@@ -349,7 +410,7 @@ describe('force overwrite with backup', () => {
 // ---------------------------------------------------------------------------
 
 describe('dry-run', () => {
-  it('--dry-run exits 0, prints path + byte count to stderr, creates no file', () => {
+  it('--dry-run exits 0, prints both skill paths to stderr, creates no files', () => {
     const tmpDir = freshTmpDir();
 
     const result = runCli([
@@ -364,15 +425,16 @@ describe('dry-run', () => {
     ]);
     expect(result.status).toBe(0);
 
-    // Stderr shows the intended path (absolute resolved path) and byte count
-    // The CLI emits "[dry-run] would write <absPath> (<bytes> bytes)"
-    expect(result.stderr).toContain(TARGETS.claude.path);
-    // "would write" banner
+    // Stderr shows both skill paths and "would write" banner
     expect(result.stderr).toContain('would write');
+    expect(result.stderr).toContain(pathFor('claude', 'testsprite-verify'));
+    expect(result.stderr).toContain(pathFor('claude', 'testsprite-onboard'));
 
-    // No file created on disk
-    const filePath = join(tmpDir, TARGETS.claude.path);
-    expect(existsSync(filePath), 'file must NOT be created in dry-run').toBe(false);
+    // No files created on disk for either skill
+    for (const skill of DEFAULT_SKILLS) {
+      const filePath = join(tmpDir, pathFor('claude', skill));
+      expect(existsSync(filePath), `file must NOT be created in dry-run: ${skill}`).toBe(false);
+    }
   });
 });
 
@@ -381,13 +443,13 @@ describe('dry-run', () => {
 // ---------------------------------------------------------------------------
 
 describe('multi-target install', () => {
-  it('--target=claude,cursor,cline,antigravity,codex writes all five targets, exit 0', () => {
+  it('--target=claude,cursor,cline,antigravity,kiro,codex writes all targets + skills, exit 0', () => {
     const tmpDir = freshTmpDir();
 
     const result = runCli([
       'agent',
       'install',
-      '--target=claude,cursor,cline,antigravity,codex',
+      '--target=claude,cursor,cline,antigravity,kiro,codex',
       '--dir',
       tmpDir,
       '--output',
@@ -400,18 +462,27 @@ describe('multi-target install', () => {
       action: string;
       path: string;
     }>;
-    const allTargets: AgentTarget[] = ['claude', 'cursor', 'cline', 'antigravity', 'codex'];
+    const allTargets: AgentTarget[] = ['claude', 'cursor', 'cline', 'antigravity', 'kiro', 'codex'];
 
     for (const target of allTargets) {
-      const entry = parsed.find(r => r.target === target);
-      expect(entry, `entry for ${target}`).toBeDefined();
-
-      const expectedAction =
-        TARGETS[target].mode === 'managed-section' ? 'section-installed' : 'written';
-      expect(entry!.action, `action for ${target}`).toBe(expectedAction);
-
-      const absPath = join(tmpDir, TARGETS[target].path);
-      expect(existsSync(absPath), `file at ${absPath}`).toBe(true);
+      if (TARGETS[target].mode === 'managed-section') {
+        // codex: one result aggregating all skills
+        const entry = parsed.find(r => r.target === target);
+        expect(entry, `entry for ${target}`).toBeDefined();
+        expect(entry!.action, `action for ${target}`).toBe('section-installed');
+        const absPath = join(tmpDir, TARGETS[target].path);
+        expect(existsSync(absPath), `file at ${absPath}`).toBe(true);
+      } else {
+        // own-file: one result per skill
+        for (const skill of DEFAULT_SKILLS) {
+          const skillPath = pathFor(target, skill);
+          const entry = parsed.find(r => r.target === target && r.path === skillPath);
+          expect(entry, `entry for ${target}/${skill}`).toBeDefined();
+          expect(entry!.action, `action for ${target}/${skill}`).toBe('written');
+          const absPath = join(tmpDir, skillPath);
+          expect(existsSync(absPath), `file at ${absPath}`).toBe(true);
+        }
+      }
     }
   });
 });
@@ -631,12 +702,149 @@ describe('managed-section (codex target)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 10. Matrix-coverage guard — hardcoded list forces a conscious update when
+// 10. --skill flag: install a single named skill
+// ---------------------------------------------------------------------------
+
+describe('--skill flag', () => {
+  it('--skill testsprite-onboard installs only the onboard file, not verify', () => {
+    const tmpDir = freshTmpDir();
+
+    const result = runCli([
+      'agent',
+      'install',
+      '--target=claude',
+      '--skill',
+      'testsprite-onboard',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
+    expect(result.status).toBe(0);
+
+    const parsed = JSON.parse(result.stdout) as Array<{ path: string; action: string }>;
+    // Only one result — the onboard skill
+    expect(parsed.length).toBe(1);
+    expect(parsed[0]!.path).toBe(pathFor('claude', 'testsprite-onboard'));
+    expect(parsed[0]!.action).toBe('written');
+
+    // Onboard file must exist
+    const onboardPath = join(tmpDir, pathFor('claude', 'testsprite-onboard'));
+    expect(existsSync(onboardPath), 'onboard file must exist').toBe(true);
+
+    // Verify file must NOT exist
+    const verifyPath = join(tmpDir, pathFor('claude', 'testsprite-verify'));
+    expect(existsSync(verifyPath), 'verify file must NOT exist').toBe(false);
+  });
+
+  it('unknown --skill bogus exits 5 with documented error message', () => {
+    const tmpDir = freshTmpDir();
+
+    const result = runCli([
+      'agent',
+      'install',
+      '--target=claude',
+      '--skill',
+      'bogus',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
+    expect(result.status).toBe(5);
+
+    // The error message must name the unknown skill and list supported skills
+    expect(result.stderr).toContain('bogus');
+    expect(result.stderr).toContain('testsprite-verify');
+    expect(result.stderr).toContain('testsprite-onboard');
+
+    // Nothing written to disk
+    for (const skill of Object.keys(SKILLS)) {
+      const absPath = join(tmpDir, pathFor('claude', skill));
+      expect(existsSync(absPath), `unexpected file at ${absPath}`).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 11. agent list — includes SKILL column with both skill names
+// ---------------------------------------------------------------------------
+
+describe('agent list', () => {
+  it('output includes TARGET, SKILL column header and both default skill names', () => {
+    const result = runCli(['agent', 'list']);
+    expect(result.status).toBe(0);
+
+    // Header must include TARGET and SKILL columns
+    expect(result.stdout).toContain('TARGET');
+    expect(result.stdout).toContain('SKILL');
+
+    // Both default skills must appear in the output
+    for (const skill of DEFAULT_SKILLS) {
+      expect(result.stdout, `${skill} should appear in agent list`).toContain(skill);
+    }
+
+    // All targets must appear
+    for (const target of Object.keys(TARGETS)) {
+      expect(result.stdout, `${target} should appear in agent list`).toContain(target);
+    }
+  });
+
+  it('--output json returns an array with one entry per (target × skill)', () => {
+    const result = runCli(['agent', 'list', '--output', 'json']);
+    expect(result.status).toBe(0);
+
+    const parsed = JSON.parse(result.stdout) as Array<{
+      target: string;
+      skill: string;
+      status: string;
+      mode: string;
+      path: string;
+    }>;
+    expect(Array.isArray(parsed)).toBe(true);
+
+    // Expected: 7 targets × 2 skills = 14 rows
+    const expectedCount = Object.keys(TARGETS).length * DEFAULT_SKILLS.length;
+    expect(parsed.length).toBe(expectedCount);
+
+    // Every row must have a non-empty skill field from DEFAULT_SKILLS
+    for (const row of parsed) {
+      expect(DEFAULT_SKILLS as readonly string[]).toContain(row.skill);
+    }
+
+    // Claude verify row must have the verify path
+    const claudeVerify = parsed.find(r => r.target === 'claude' && r.skill === 'testsprite-verify');
+    expect(claudeVerify).toBeDefined();
+    expect(claudeVerify!.path).toBe(pathFor('claude', 'testsprite-verify'));
+
+    // Claude onboard row must have the onboard path
+    const claudeOnboard = parsed.find(
+      r => r.target === 'claude' && r.skill === 'testsprite-onboard',
+    );
+    expect(claudeOnboard).toBeDefined();
+    expect(claudeOnboard!.path).toBe(pathFor('claude', 'testsprite-onboard'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 12. Matrix-coverage guard — hardcoded list forces a conscious update when
 //     a target is added or removed from TARGETS.
 // ---------------------------------------------------------------------------
 describe('matrix coverage guard', () => {
   it('TARGETS matches the documented, e2e-covered set (update this list when adding a target)', () => {
-    expect(Object.keys(TARGETS)).toEqual(['claude', 'antigravity', 'cursor', 'cline', 'codex']);
+    expect(Object.keys(TARGETS)).toEqual([
+      'claude',
+      'antigravity',
+      'cursor',
+      'cline',
+      'kiro',
+      'windsurf',
+      'codex',
+    ]);
+  });
+
+  it('SKILLS matches the documented, e2e-covered set (update this list when adding a skill)', () => {
+    expect(Object.keys(SKILLS)).toEqual(['testsprite-verify', 'testsprite-onboard']);
   });
 });
 

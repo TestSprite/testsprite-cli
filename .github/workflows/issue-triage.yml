@@ -1,0 +1,108 @@
+# P1-2 issue auto-assign + 3-slot-cap bot (InsForge `agent-zhang-beihai` pattern).
+# Posts as the `alfheim-agent` GitHub App ⇒ `alfheim-agent[bot]`.
+#
+# Setup (one-time, by an org admin):
+#   1. Create a GitHub App named `alfheim-agent` (org Settings → Developer settings →
+#      GitHub Apps → New). Permissions: Issues = Read & write, Metadata = Read. No webhook.
+#      Generate a private key; install the App on the public testsprite-cli repo.
+#   2. Add two repo (or org) secrets:
+#        ALFHEIM_AGENT_APP_ID         = the App's numeric App ID
+#        ALFHEIM_AGENT_PRIVATE_KEY    = the App's .pem private key (full contents)
+#   Until those exist, the bot gracefully falls back to github-actions[bot] (still works).
+#
+# Fires on each new issue comment; assigns the commenter when they claim an issue
+# (e.g. "/assign" or "I'd like to work on this") and reports their open-assignment count.
+name: Issue triage (auto-assign + slot cap)
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write # assign/unassign + comment + (re)label; nothing else
+
+env:
+  SLOT_CAP: '3'
+  # D2: the cap ships ARMED, NOT ENFORCED. report-only by default — assigns anyway,
+  # just surfaces slot usage. Flip to 'true' if an AI-PR flood appears.
+  ENFORCE_CAP: 'false'
+
+jobs:
+  triage:
+    # issues only (issue_comment also fires on PRs), and never react to a bot's own
+    # comment — incl. our own alfheim-agent[bot], which (unlike GITHUB_TOKEN) would
+    # otherwise re-trigger this workflow. `type == 'Bot'` covers both bot identities.
+    if: ${{ !github.event.issue.pull_request && github.event.comment.user.type != 'Bot' }}
+    runs-on: ubuntu-latest
+    steps:
+      # Mint a token for the alfheim-agent App so comments post as alfheim-agent[bot].
+      # continue-on-error: until the App + secrets exist this no-ops and we fall back below.
+      - id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.ALFHEIM_AGENT_APP_ID }}
+          private-key: ${{ secrets.ALFHEIM_AGENT_PRIVATE_KEY }}
+
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.0.1
+        with:
+          # App token when available (→ alfheim-agent[bot]); else the default
+          # GITHUB_TOKEN (→ github-actions[bot]). Either way the logic is identical.
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
+          script: |
+            const cap = parseInt(process.env.SLOT_CAP, 10);
+            const enforce = process.env.ENFORCE_CAP === 'true';
+            const { owner, repo } = context.repo;
+            const issue = context.payload.issue.number;
+            const user = context.payload.comment.user.login;
+            const body = (context.payload.comment.body || '').toLowerCase();
+
+            const wantsAssign = /(^|\s)\/assign\b/.test(body)
+              || /\bi('?d| would)? ?(like|want) to (work on|take|tackle) this\b/.test(body)
+              || /\bcan i (work on|take|have|grab) this\b/.test(body)
+              || /\bi'?ll (work on|take|tackle) this\b/.test(body);
+            const wantsUnassign = /(^|\s)\/unassign\b/.test(body)
+              || /\bi (can'?t|cannot) (continue|work on this)\b/.test(body);
+            if (!wantsAssign && !wantsUnassign) return; // nothing to do
+
+            // List THIS user's currently-open assigned issues (exclude PRs).
+            const assigned = (await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', assignee: user, per_page: 100,
+            })).filter(i => !i.pull_request);
+            const list = assigned.length
+              ? assigned.map(i => `- ${owner}/${repo}#${i.number} — ${i.title}`).join('\n')
+              : '_(none)_';
+
+            if (wantsUnassign) {
+              await github.rest.issues.removeAssignees({ owner, repo, issue_number: issue, assignees: [user] });
+              await github.rest.issues.createComment({ owner, repo, issue_number: issue,
+                body: `Unassigned @${user}. Thanks for the update — freeing this up for someone else.` });
+              return;
+            }
+
+            const already = assigned.some(i => i.number === issue);
+            const atCap = assigned.length >= cap;
+
+            if (atCap && enforce && !already) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: issue,
+                body: `Thanks @${user}! You're at the ${cap}-issue limit, so I haven't assigned this one. `
+                    + `Please finish or \`/unassign\` one first, then comment again here.\n\n`
+                    + `Your open assigned issues (${assigned.length}/${cap}):\n${list}` });
+              return;
+            }
+
+            if (!already) {
+              await github.rest.issues.addAssignees({ owner, repo, issue_number: issue, assignees: [user] });
+              // label hygiene: move needs-triage → in-progress (best-effort)
+              try { await github.rest.issues.removeLabel({ owner, repo, issue_number: issue, name: 'needs-triage' }); } catch {}
+              try { await github.rest.issues.addLabels({ owner, repo, issue_number: issue, labels: ['in-progress'] }); } catch {}
+            }
+            const countNow = already ? assigned.length : assigned.length + 1;
+            const remaining = Math.max(0, cap - countNow);
+            const overCap = countNow > cap; // only possible in report-only mode
+            const slots = overCap
+              ? `⚠️ You're now over the soft ${cap}-issue limit (${countNow}/${cap}). Consider finishing one before taking more.`
+              : `(${remaining} more slot${remaining === 1 ? '' : 's'} available.)`;
+            await github.rest.issues.createComment({ owner, repo, issue_number: issue,
+              body: `Assigned to @${user}. Thanks for taking this on. ${slots}\n\n`
+                  + `Your open assigned issues (${countNow}/${cap}):\n${list}` });

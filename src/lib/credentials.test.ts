@@ -88,6 +88,38 @@ describe('serializeCredentials', () => {
     expect(text).toContain('api_key = sk');
     expect(text).not.toContain('api_url');
   });
+
+  it('strips newline characters from values to prevent INI injection', () => {
+    // A malicious apiUrl with embedded newlines could inject new key-value
+    // pairs or section headers into the credentials file. The serializer
+    // must strip \n and \r so the written file has exactly one value per
+    // field and no injected content parsed as separate keys/sections.
+    const malicious = 'https://evil.com\napi_key = sk-HIJACKED\n[admin]\napi_key = sk-admin';
+    const text = serializeCredentials({ default: { apiKey: 'sk-real', apiUrl: malicious } });
+    // The output must NOT contain a standalone [admin] section header
+    // (it would be on its own line if injection succeeded)
+    const lines = text.split('\n');
+    // Only one section header exists: [default]
+    const sectionHeaders = lines.filter(l => /^\[.+\]$/.test(l.trim()));
+    expect(sectionHeaders).toEqual(['[default]']);
+    // Only one api_key line exists (the real one, not an injected duplicate)
+    const apiKeyLines = lines.filter(l => l.trim().startsWith('api_key'));
+    expect(apiKeyLines).toHaveLength(1);
+    expect(apiKeyLines[0]).toContain('sk-real');
+    // Round-trip: reading back must return only the real key, not the injected one
+    const parsed = parseCredentials(text);
+    expect(parsed['default']?.apiKey).toBe('sk-real');
+    expect(parsed['admin']).toBeUndefined();
+  });
+
+  it('strips \\r\\n (CRLF) injection from values', () => {
+    const text = serializeCredentials({ default: { apiUrl: 'https://x.com\r\napi_key = pwned' } });
+    const parsed = parseCredentials(text);
+    // The injected api_key must NOT be parsed as a real key
+    expect(parsed['default']?.apiKey).toBeUndefined();
+    // The api_url value is on one line (newlines stripped)
+    expect(parsed['default']?.apiUrl).toContain('https://x.com');
+  });
 });
 
 describe('readCredentialsFile / readProfile', () => {

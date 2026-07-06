@@ -4,16 +4,19 @@ exports[`--help snapshots > agent 1`] = `
 "Usage: testsprite agent [options] [command]
 
 Install TestSprite guidance into coding-agent config (Claude Code, Cursor,
-Cline, Antigravity, Codex)
+Cline, Windsurf, Antigravity, Codex)
 
 Options:
   -h, --help         display help for command
 
 Commands:
-  install [options]  Write the TestSprite verification-loop skill file into a
-                     project for a coding agent
-  list               List supported agent targets, their status, and landing
-                     paths
+  install [options]  Write the TestSprite agent skills (verification loop +
+                     first-run onboarding) into a project for a coding agent
+  list               List supported agent targets and skills, their status, and
+                     landing paths
+  status [options]   Check installed TestSprite skill files against this CLI
+                     version: ok, stale, modified, unmarked, absent, or corrupt
+                     (exits 1 when anything needs attention, so it can gate CI)
   help [command]     display help for command
 "
 `;
@@ -21,20 +24,22 @@ Commands:
 exports[`--help snapshots > agent install 1`] = `
 "Usage: testsprite agent install [options]
 
-Write the TestSprite verification-loop skill file into a project for a coding
-agent
+Write the TestSprite agent skills (verification loop + first-run onboarding)
+into a project for a coding agent
 
 Options:
-  --target <t>  Agent target(s): claude, cursor, cline, antigravity, codex
-                (comma-separated or repeated) (default: [])
-  --dir <path>  Project root to write into (default: cwd)
-  --force       For own-file targets: overwrite existing file (a .bak backup is
-                kept). For codex (managed-section): replaces the section
-                unconditionally; user content outside the section is never
-                destroyed.
-  -h, --help    display help for command
+  --target <t>    Agent target(s): claude, cursor, cline, antigravity, kiro,
+                  windsurf, codex (comma-separated or repeated) (default: [])
+  --skill <name>  Skill(s) to install: testsprite-verify, testsprite-onboard
+                  (comma-separated or repeated; default: all) (default: [])
+  --dir <path>    Project root to write into (default: cwd)
+  --force         For own-file targets: overwrite existing file (a .bak backup
+                  is kept). For codex (managed-section): replaces the section
+                  unconditionally; user content outside the section is never
+                  destroyed.
+  -h, --help      display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -42,12 +47,12 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --deb
 exports[`--help snapshots > agent list 1`] = `
 "Usage: testsprite agent list [options]
 
-List supported agent targets, their status, and landing paths
+List supported agent targets and skills, their status, and landing paths
 
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -84,7 +89,7 @@ exports[`--help snapshots > auth logout 1`] = `
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -95,7 +100,7 @@ exports[`--help snapshots > auth whoami 1`] = `
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -110,7 +115,8 @@ Options:
   --from-env        Read TESTSPRITE_API_KEY from the environment instead of
                     prompting (default: false)
   --agent <target>  Coding-agent target to install: claude, antigravity,
-                    cursor, cline, codex (default: claude) (default: "claude")
+                    cursor, cline, kiro, windsurf, codex (default: claude)
+                    (default: "claude")
   --no-agent        Skip the agent skill install (configure credentials only)
   --force           Overwrite an existing skill file (a .bak backup is kept)
   --dir <path>      Project root for the skill install (default: current
@@ -151,7 +157,7 @@ Get a project by id
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -173,7 +179,7 @@ Options:
   --max-items <n>           stop after this many items across auto-paged pages
   -h, --help                display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -197,6 +203,16 @@ Commands:
   steps [options] <test-id>             List the steps for a test (server
                                         returns the cumulative log across every
                                         run; use --run-id to scope to one run)
+  diff <run-a> <run-b>                  Compare two runs and print what
+                                        regressed: verdict, failureKind,
+                                        failedStepIndex, per-step status flips,
+                                        codeVersion drift. Exit 0 when verdicts
+                                        match, 1 when they differ.
+  lint [options]                        Validate plan/steps files offline with
+                                        the same validators \`create\` runs,
+                                        collecting EVERY problem. No network,
+                                        no credentials. Exit 0 when all valid,
+                                        5 otherwise.
   result [options] <test-id>            Get the latest result for a test (default) or list prior runs (--history).
   
   --output json shape differs by mode:
@@ -259,6 +275,15 @@ Commands:
    11  rate limited — honor Retry-After
   
   On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
+  flaky [options] <test-id>             Repeatedly replay a test to measure stability and surface flakiness.
+  Replays run with auto-heal OFF (strict verbatim) so healed drift cannot mask nondeterministic pass/fail.
+  
+  Exit codes:
+    0  stable (every attempt passed)
+    1  flaky or failing (at least one attempt did not pass)
+    3  auth error
+    4  test not found (no replayable run — trigger \`testsprite test run <id>\` first)
+    5  validation error
   code                                  Inspect and edit generated test code
   plan                                  Manage FE test plan-steps (FE-only)
   failure                               Export the latest-failure agent bundle
@@ -278,7 +303,7 @@ Options:
                 source body; json mode: wire envelope)
   -h, --help    display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -313,7 +338,7 @@ Options:
                              per invocation; pin one yourself for safe retries.
   -h, --help                 display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -329,7 +354,39 @@ Options:
   --failed-only  Keep only the failed step plus its immediate neighbors (±1)
   -h, --help     display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > test flaky 1`] = `
+"Usage: testsprite test flaky [options] <test-id>
+
+Repeatedly replay a test to measure stability and surface flakiness.
+Replays run with auto-heal OFF (strict verbatim) so healed drift cannot mask nondeterministic pass/fail.
+
+Exit codes:
+  0  stable (every attempt passed)
+  1  flaky or failing (at least one attempt did not pass)
+  3  auth error
+  4  test not found (no replayable run — trigger \`testsprite test run <id>\` first)
+  5  validation error
+
+Options:
+  --runs <n>     number of replays to run (1-10, default 5)
+  --until-fail   stop at the first non-passing attempt (fast "is it flaky at
+                 all?" check) (default: false)
+  --timeout <s>  per-attempt max seconds to wait (1-3600, default 600)
+  -h, --help     display help for command
+
+Notes:
+  • Frontend replays are free verbatim script replays (no credit); backend replays
+    re-run the dependency closure and may cost credits — a one-line advisory is printed.
+  • Replays use auto-heal OFF so a flaky test is not silently "healed" into a pass;
+    this measures replay stability of the saved script against the configured URL.
+  • \`--output json\` emits a machine-readable stability report for CI gating.
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -342,7 +399,7 @@ Get a test by id
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -367,7 +424,7 @@ Options:
   --max-items <n>           stop after this many items across auto-paged pages
   -h, --help                display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -390,32 +447,40 @@ Exit codes:
 On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
 
 Options:
-  --all                    rerun all tests in the resolved project (requires
-                           --project) (default: false)
-  --project <id>           project id (required with --all; returned by
-                           \`testsprite project list\`)
-  --skip-terminal          with --all: skip tests already in a terminal status
-                           (passed|failed|blocked|cancelled) (default: false)
-  --status <list>          with --all: only dispatch tests whose status matches
-                           one of these values (comma-separated; accepted:
-                           draft|ready|queued|running|passed|failed|blocked|cancelled|unknown)
-  --filter <substr>        with --all: only rerun tests whose name contains
-                           this substring (case-insensitive)
-  --wait                   block until terminal status or --timeout elapses
-                           (default: false)
-  --timeout <s>            with --wait, max seconds to wait (1–3600, default
-                           600)
-  --no-auto-heal           opt out of AI heal-on-drift for this FE rerun
-                           (default: auto-heal is ON). Costs 0.2 credits per
-                           engage when a step has drifted. Ignored for backend
-                           tests.
-  --skip-dependencies      BE only: rerun only the named test without expanding
-                           the producer/teardown closure (default: false)
-  --max-concurrency <n>    with --wait, max in-flight polls at once (1-100,
-                           default: 50)
-  --idempotency-key <key>  opaque key for safe retries (1–256 chars). Printed
-                           to stderr at --verbose if auto-generated.
-  -h, --help               display help for command
+  --all                       rerun all tests in the resolved project (requires
+                              --project) (default: false)
+  --project <id>              project id (required with --all; returned by
+                              \`testsprite project list\`)
+  --skip-terminal             with --all: skip tests already in a terminal
+                              status (passed|failed|blocked|cancelled)
+                              (default: false)
+  --status <list>             with --all: only dispatch tests whose status
+                              matches one of these values (comma-separated;
+                              accepted:
+                              draft|ready|queued|running|passed|failed|blocked|cancelled|unknown)
+  --filter <substr>           with --all: only rerun tests whose name contains
+                              this substring (case-insensitive)
+  --wait                      block until terminal status or --timeout elapses
+                              (default: false)
+  --timeout <s>               with --wait, max seconds to wait (1–3600, default
+                              600)
+  --no-auto-heal              opt out of AI heal-on-drift for this FE rerun
+                              (default: auto-heal is ON). Costs 0.2 credits per
+                              engage when a step has drifted. Ignored for
+                              backend tests.
+  --skip-dependencies         BE only: rerun only the named test without
+                              expanding the producer/teardown closure (default:
+                              false)
+  --max-concurrency <n>       with --wait, max in-flight polls at once (1-100,
+                              default: 50)
+  --idempotency-key <key>     opaque key for safe retries (1–256 chars).
+                              Printed to stderr at --verbose if auto-generated.
+  --report <format>           with batch --wait: write a JUnit XML sidecar
+                              report after polling (accepted: junit)
+  --report-file <path>        output path for --report (atomic write)
+  --report-suite-name <name>  optional JUnit <testsuite name=...> override
+                              (default: testsprite:<projectId>)
+  -h, --help                  display help for command
 
 Notes:
   • rerun replays a saved run/script and is MORE LENIENT than a fresh \`test run\`
@@ -431,7 +496,7 @@ Dry-run shape notes:
     omit \`closure\` (or return it as null) since there is no dependency expansion.
   • \`autoHeal\` defaults true for FE reruns; BE reruns ignore the field entirely.
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -463,7 +528,7 @@ Options:
   --cursor <token>    with --history: opaque cursor from a prior page
   -h, --help          display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -488,33 +553,39 @@ Exit codes:
 On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
 
 Options:
-  --target-url <url>       override the project default env URL for this run
-                           (http/https only, no localhost/private IPs)
-  --wait                   poll until terminal status or --timeout elapses
-                           (default: false)
-  --timeout <s>            with --wait, max seconds to wait (1–3600, default
-                           600)
-  --idempotency-key <key>  opaque key for safe retries (1–256 chars). Printed
-                           to stderr at --debug if auto-generated.
-  --all                    run all BE tests in the project (wave-ordered fresh
-                           run; requires --project). Mutually exclusive with
-                           <test-id>. (default: false)
-  --project <id>           project id (required with --all; returned by
-                           \`testsprite project list\`)
-  --filter <substr>        with --all: only run tests whose name contains this
-                           substring (case-insensitive)
-  --max-concurrency <n>    with --all --wait, max in-flight polls at once
-                           (1-100, default: 50)
-  -h, --help               display help for command
+  --target-url <url>          override the project default env URL for this run
+                              (http/https only, no localhost/private IPs)
+  --wait                      poll until terminal status or --timeout elapses
+                              (default: false)
+  --timeout <s>               with --wait, max seconds to wait (1–3600, default
+                              600)
+  --idempotency-key <key>     opaque key for safe retries (1–256 chars).
+                              Printed to stderr at --debug if auto-generated.
+  --all                       run all BE tests in the project (wave-ordered
+                              fresh run; requires --project). Mutually
+                              exclusive with <test-id>. (default: false)
+  --project <id>              project id (required with --all; returned by
+                              \`testsprite project list\`)
+  --filter <substr>           with --all: only run tests whose name contains
+                              this substring (case-insensitive)
+  --max-concurrency <n>       with --all --wait, max in-flight polls at once
+                              (1-100, default: 50)
+  --report <format>           with --all --wait: write a JUnit XML sidecar
+                              report after polling (accepted: junit)
+  --report-file <path>        output path for --report (atomic write)
+  --report-suite-name <name>  optional JUnit <testsuite name=...> override
+                              (default: testsprite:<projectId>)
+  -h, --help                  display help for command
 
 Dependency-aware fresh run (M4):
   testsprite test run --all --project <id>           run all BE tests in wave order
   testsprite test run --all --project <id> --filter <substr>  name-glob subset
+  testsprite test run --all --project <id> --wait --report junit --report-file ./results.xml
 
 BE tests can declare --produces/--needs at create time to drive wave ordering
 (see \`testsprite test create --help\` for details).
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -537,7 +608,7 @@ Options:
                             excluded when this flag is set.
   -h, --help                display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --verbose, --debug):
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -573,14 +644,14 @@ Options:
 
 Commands:
   setup [options]              Set up TestSprite: configure your API key and
-                               install the verification skill for your coding
-                               agent
+                               install the TestSprite agent skills for your
+                               coding agent
   auth                         Manage TestSprite credentials
   project                      Manage TestSprite projects
   test                         Inspect TestSprite tests
   agent                        Install TestSprite guidance into coding-agent
-                               config (Claude Code, Cursor, Cline, Antigravity,
-                               Codex)
+                               config (Claude Code, Cursor, Cline, Windsurf,
+                               Antigravity, Codex)
   usage|credits                Show credit balance and plan/entitlement info
                                (proactive pre-flight before a large test run)
   help [command]               display help for command

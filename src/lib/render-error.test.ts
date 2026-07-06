@@ -37,6 +37,12 @@ describe('rephraseUnknownOption', () => {
     expect(result).toContain('--endpoint-url');
   });
 
+  it('rephrases --request-timeout placed after subcommand', () => {
+    const result = rephraseUnknownOption("error: unknown option '--request-timeout'");
+    expect(result).not.toBeNull();
+    expect(result).toContain('--request-timeout');
+  });
+
   it('rephrases --debug placed after subcommand', () => {
     const result = rephraseUnknownOption("error: unknown option '--debug'");
     expect(result).not.toBeNull();
@@ -86,6 +92,12 @@ describe('rephraseUnknownOption', () => {
     const result = rephraseUnknownOption("error: unknown option '--endpoint-url'");
     expect(result).not.toBeNull();
     expect(result).toContain('testsprite --endpoint-url <value> <subcommand>');
+  });
+
+  it('value flag (--request-timeout) example DOES include a <value> placeholder', () => {
+    const result = rephraseUnknownOption("error: unknown option '--request-timeout'");
+    expect(result).not.toBeNull();
+    expect(result).toContain('testsprite --request-timeout <value> <subcommand>');
   });
 });
 

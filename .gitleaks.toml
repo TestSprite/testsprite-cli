@@ -1,0 +1,22 @@
+# gitleaks configuration for testsprite-cli.
+#
+# Used by the public-snapshot deep secret scan (scripts/make-public-snapshot.sh,
+# internal) and available to contributors who run `gitleaks detect` locally.
+# It extends gitleaks' default rule set and allowlists ONLY values that are
+# demonstrably not real secrets: unit-test dummy keys and the documented
+# placeholder keys used by the dry-run/sample fixtures. Anything else still
+# fails the scan (fail-closed). When a new test fixture trips the scan, add its
+# specific pattern here — do not allowlist whole paths.
+title = "testsprite-cli"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Unit-test dummy keys and documented placeholder keys (not real secrets)"
+regexes = [
+  # Unit-test fixtures, e.g. sk-secret-12345 in *.test.ts
+  '''sk-secret-[0-9]+''',
+  # Documented placeholder keys used by dry-run/sample responses
+  '''sk-user-(test|DRY-RUN)''',
+]

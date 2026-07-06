@@ -1,0 +1,80 @@
+name: 🐛 Bug report
+description: Report something that is broken or behaving unexpectedly in the CLI.
+title: 'bug: '
+labels: ['bug', 'needs-triage']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! Please search
+        [existing issues](https://github.com/TestSprite/testsprite-cli/issues)
+        first to avoid duplicates.
+
+        For **questions or usage help**, please use
+        [GitHub Discussions](https://github.com/TestSprite/testsprite-cli/discussions)
+        or [Discord](https://discord.gg/W4JDrZfdB) instead — issues are for bugs
+        and feature requests.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear and concise description of the bug, including what you expected to happen instead.
+      placeholder: When I run `testsprite test run ...`, I expected X but got Y.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran, in order. Redact any API keys or private URLs.
+      placeholder: |
+        1. testsprite setup ...
+        2. testsprite test run <id> --wait
+        3. ...
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: |
+        Paste the command output. Re-run with `--verbose` or `--debug` for more
+        detail if you can. **Remove any API keys, credentials, or private URLs.**
+      render: shell
+    validations:
+      required: false
+  - type: input
+    id: cli-version
+    attributes:
+      label: CLI version
+      description: Output of `testsprite --version`.
+      placeholder: e.g. 0.1.2
+    validations:
+      required: true
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      description: Output of `node --version` (the CLI requires Node >= 20).
+      placeholder: e.g. v22.11.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: e.g. macOS 15.5 / Ubuntu 24.04 / Windows 11
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmations
+      options:
+        - label: I have searched existing issues and this is not a duplicate.
+          required: true
+        - label: I am on the latest published version, or have noted why I cannot upgrade.
+          required: true
+        - label: I have removed any secrets (API keys, credentials, private URLs) from this report.
+          required: true

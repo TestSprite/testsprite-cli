@@ -1,0 +1,54 @@
+# CodeRabbit configuration — AI first-pass review on every PR.
+# Schema: https://docs.coderabbit.ai/reference/configuration
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: 'en-US'
+
+reviews:
+  profile: 'chill'
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - 'main'
+
+  # Skip generated / vendored / noise paths.
+  path_filters:
+    - '!dist/**'
+    - '!coverage/**'
+    - '!**/*.snap'
+    - '!package-lock.json'
+
+  path_instructions:
+    - path: 'src/**'
+      instructions: |
+        This is a thin client CLI. Focus a review on:
+        - Correctness and clear error handling.
+        - Exit-code mapping: error paths must map to the documented exit code
+          (see DOCUMENTATION.md / the exit-code table); don't introduce ad-hoc codes.
+        - Output discipline: machine output goes to stdout (JSON-clean under
+          --output json); human chatter, hints, and advisories go to stderr.
+        - Dry-run parity: a new endpoint needs a matching canned sample in
+          src/lib/dry-run/samples.ts (and its test) so --dry-run stays offline.
+        - No secrets, internal endpoints, or hard-coded credentials.
+    - path: 'test/**'
+      instructions: |
+        Tests must be deterministic and offline:
+        - No real network and no real timers — inject fetch/sleep via the test deps.
+        - Cover new behavior, including error and exit-code paths.
+    - path: '.github/workflows/**'
+      instructions: |
+        Workflow review:
+        - All third-party actions must be pinned to a full 40-char commit SHA.
+        - Prefer least-privilege `permissions:` blocks; never use
+          pull_request_target with a checkout of untrusted PR code.
+
+  tools:
+    github-checks:
+      enabled: true

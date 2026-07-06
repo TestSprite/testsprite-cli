@@ -4,6 +4,32 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **JUnit XML report export for batch `--wait` runs.** `test run --all` and batch `test rerun` (`--all` or multiple test ids) accept `--report junit --report-file <path>` to write a CI-friendly XML sidecar after polling completes. `--output json` is unchanged; the report is written even when the batch exits non-zero. `--dry-run` writes a canned sample without network calls.
+- **`testsprite test flaky <test-id>`** — repeat-run flaky-test detector. Replays a test N times (`--runs <n>`, default 5), aggregates the outcomes, and reports a stability verdict (`stable` / `flaky` / `failing`) plus the `runId` and `failureKind` of every attempt that did not pass. Replays run with auto-heal OFF (strict verbatim) so a healed drift can't mask a nondeterministic pass/fail. Exit code is 0 only when every attempt passed, so CI can gate a merge on flakiness (`testsprite test flaky <id> --runs 5 || exit 1`). Flags: `--runs <n>` (1–10), `--until-fail` (stop at the first non-passing attempt), `--timeout <s>` (per-attempt), and `--output json` for a machine-readable stability report. Frontend replays are free verbatim script replays; a one-line advisory is printed for backend tests, whose closure reruns may cost credits.
+
+## [0.2.0] - 2026-06-29
+
+### Added
+
+- **Seed-suite onboarding skill.** `agent install` now installs a second skill by default — `testsprite-onboard` — which guides your coding agent to create a first test suite in a repository that doesn't have one yet (alongside the existing `testsprite-verify` skill). Use `agent install --skill <name>` to install only a specific subset.
+
+### Changed
+
+- **`test result` now reports the test verdict and execution status as separate fields.** The latest-result output gains a `verdict` field (the run's pass / fail / blocked judgement) and an `executionStatus` field (how the run terminated); `summary` is now a human-readable string.
+  - **Breaking change to `--output json`:** `summary` was previously an object (`{ passed, failed, skipped }`). Scripts that read `summary.passed` / `.failed` / `.skipped` must move to the new `verdict` / `executionStatus` fields. The legacy `status` field is unchanged.
+- `project create`, `project update`, and `test run --all` now print the `[dry-run] sample response — not from the server` banner under `--dry-run`, consistent with every other command.
+- The CLI no longer suggests TypeScript/JavaScript test code is supported — TestSprite runs all test code as Python.
+
+### Fixed
+
+- **Security (failure-bundle writer):** `test failure get` and `test artifact get` now validate the response's step index and evidence kind before composing file paths, so a malformed or hostile API response can no longer write files outside the chosen `--out` directory.
+- `test create --type backend` and `test code put` now reject a non-Python `--code-file` immediately with a clear validation error, instead of failing late server-side.
+- `test failure get --out` is validated before the network call; `test code get --out` now writes atomically (no truncation if the fetch fails); artifact downloads retry on transient transport errors.
+- Clearer validation messages for malformed `--endpoint-url` values and profile names; argument-parse errors now emit a structured JSON envelope under `--output json`.
+- Batch rerun dispatch is de-duplicated and serialized.
+
 ## [0.1.2] - 2026-06-19
 
 ### Added

@@ -27,6 +27,7 @@ import type {
   CliTestStep,
 } from '../../commands/test.js';
 import type { MeResponse } from '../../commands/auth.js';
+import { buildJUnitReport } from '../junit-report.js';
 import type { Page } from '../pagination.js';
 import type {
   TriggerRunResponse,
@@ -66,6 +67,37 @@ const SAMPLE_TARGET_URL = 'https://staging.example.com/checkout';
 const SAMPLE_REQUEST_ID = 'req_dry-run';
 
 export const SAMPLE_DRY_RUN_REQUEST_ID = SAMPLE_REQUEST_ID;
+
+/**
+ * Canned JUnit XML for batch `--wait --report junit --dry-run`. Mirrors the
+ * fresh batch-run sample ids so agents can learn the sidecar shape offline.
+ */
+export function sampleJUnitReportXml(
+  projectId: string = SAMPLE_PROJECT_ID,
+  reportSuiteName?: string,
+): string {
+  return buildJUnitReport({
+    suiteName: reportSuiteName ?? `testsprite:${projectId}`,
+    classname: projectId,
+    results: [
+      {
+        testId: SAMPLE_TEST_ID_FRESH_1,
+        runId: SAMPLE_BATCH_FRESH_RUN_ID_1,
+        status: 'passed',
+      },
+      {
+        testId: SAMPLE_TEST_ID_FRESH_2,
+        runId: SAMPLE_BATCH_FRESH_RUN_ID_2,
+        status: 'failed',
+        error: {
+          code: 'ASSERTION',
+          message: 'Expected checkout heading to be visible',
+          exitCode: 1,
+        },
+      },
+    ],
+  });
+}
 
 const me: MeResponse = {
   userId: SAMPLE_USER_ID,
@@ -151,16 +183,31 @@ const tests: CliTest[] = [
 
 const testCode: CliTestCode = {
   testId: SAMPLE_TEST_ID_FAILED,
-  language: 'typescript',
+  language: 'python',
   framework: 'playwright',
+  // TestSprite test code is Python: frontend tests are Playwright
+  // (`playwright.async_api`); backend tests use `requests` + assertions.
   code: [
-    "import { test, expect } from '@playwright/test';",
-    "test('checkout happy path', async ({ page }) => {",
-    '  await page.goto(process.env.TARGET_URL!);',
-    '  await page.click(\'[data-testid="cart"]\');',
-    '  await page.click(\'[data-testid="submit"]\');',
-    "  await expect(page.getByRole('heading', { name: 'Order placed' })).toBeVisible();",
-    '});',
+    'import asyncio',
+    'from playwright.async_api import async_playwright, expect',
+    '',
+    '',
+    'async def run_test():',
+    '    async with async_playwright() as pw:',
+    '        browser = await pw.chromium.launch(headless=True)',
+    '        context = await browser.new_context()',
+    '        page = await context.new_page()',
+    '        try:',
+    '            await page.goto("https://example.com")  # target URL injected by the runner',
+    '            await page.click(\'[data-testid="cart"]\')',
+    '            await page.click(\'[data-testid="submit"]\')',
+    '            await expect(page.get_by_role("heading", name="Order placed")).to_be_visible()',
+    '        finally:',
+    '            await context.close()',
+    '            await browser.close()',
+    '',
+    '',
+    'asyncio.run(run_test())',
     '',
   ].join('\n'),
   codeVersion: 'v3',
@@ -233,7 +280,9 @@ const latestResult: CliLatestResult = {
   targetUrlSource: 'run',
   failedStepIndex: 5,
   failureKind: 'assertion',
-  summary: { passed: 4, failed: 1, skipped: 0 },
+  verdict: 'failed',
+  executionStatus: 'completed',
+  summary: 'Failed (assertion) on step 5: expected cart badge to show 1 item, but it was empty.',
 };
 
 const failureContext: CliFailureContext = {

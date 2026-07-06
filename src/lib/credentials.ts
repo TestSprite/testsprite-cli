@@ -116,7 +116,15 @@ export function serializeCredentials(file: CredentialsFile): string {
     for (const field of fields) {
       const value = entry[field];
       if (value === undefined || value === '') continue;
-      lines.push(`${FIELD_TO_FILE_KEY[field]} = ${value}`);
+      // Guard against INI injection: a value containing newline characters
+      // would be serialized across multiple lines, allowing an attacker to
+      // inject arbitrary key-value pairs (or new section headers) into the
+      // credentials file. A valid API key or URL never contains \n or \r.
+      // Strip them so a compromised env var or MITM'd backend response
+      // cannot override the stored api_key on subsequent reads.
+      const sanitized = value.replace(/[\r\n]/g, '');
+      if (sanitized === '') continue;
+      lines.push(`${FIELD_TO_FILE_KEY[field]} = ${sanitized}`);
     }
     lines.push('');
   }

@@ -8,6 +8,9 @@
  *  - Uses `\r` + ANSI clear-line to overwrite in place on TTY
  *  - On terminal, emits one final line + newline then prints the result
  *  - `--output json` disables the ticker (caller doesn't create one)
+ *  - Respects the NO_COLOR env var (https://no-color.org/): when set,
+ *    ANSI escape sequences are suppressed and updates are emitted as
+ *    plain lines instead of in-place overwrites.
  *
  * Overhead: <2ms per update (no syscalls beyond a single write).
  *
@@ -26,6 +29,15 @@ export interface Ticker {
 }
 
 /**
+ * Returns true when NO_COLOR is present in the environment and is not
+ * an empty string, per https://no-color.org/.
+ */
+export function isNoColor(env: NodeJS.ProcessEnv = process.env): boolean {
+  const value = env.NO_COLOR;
+  return typeof value === 'string' && value.length > 0;
+}
+
+/**
  * Create a ticker bound to the given stderr writer. Respects
  * `isTTY` to silently no-op in CI environments.
  *
@@ -35,11 +47,14 @@ export interface Ticker {
  * @param stderrRaw - optional raw writer (no \n appended); used for
  *   the carriage-return + clear-line trick. Defaults to
  *   `process.stderr.write.bind(process.stderr)`.
+ * @param noColor - whether to suppress ANSI escape sequences.
+ *   Defaults to checking `NO_COLOR` env var per https://no-color.org/.
  */
 export function createTicker(
   stderrWrite: (line: string) => void,
   isTTY?: boolean,
   stderrRaw?: (text: string) => void,
+  noColor?: boolean,
 ): Ticker {
   const tty = isTTY ?? (typeof process !== 'undefined' ? process.stderr.isTTY === true : false);
   const rawWrite =
@@ -47,6 +62,7 @@ export function createTicker(
     (typeof process !== 'undefined'
       ? (text: string) => process.stderr.write(text)
       : (_text: string) => undefined);
+  const suppressAnsi = noColor ?? isNoColor();
 
   let lastLength = 0;
 
@@ -55,6 +71,25 @@ export function createTicker(
     return {
       update: () => undefined,
       finalize: () => undefined,
+    };
+  }
+
+  if (suppressAnsi) {
+    // TTY but NO_COLOR: emit plain-text lines without ANSI escape sequences.
+    return {
+      update(line: string): void {
+        const stamped = `${new Date().toISOString()} ${line}`;
+        stderrWrite(stamped);
+        lastLength = stamped.length;
+      },
+      finalize(line?: string): void {
+        if (line !== undefined) {
+          const stamped = `${new Date().toISOString()} ${line}`;
+          stderrWrite(stamped);
+          lastLength = stamped.length;
+        }
+        void stderrWrite;
+      },
     };
   }
 

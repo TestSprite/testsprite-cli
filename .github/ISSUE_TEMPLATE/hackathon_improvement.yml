@@ -1,0 +1,45 @@
+name: 🏆 Hackathon Improvement
+description: Submit an improvement, fix, or contribution for the TestSprite CLI hackathon.
+title: '[Hackathon] '
+labels: ['hackathon', 'needs-triage']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for participating in the TestSprite CLI hackathon! 🎉
+
+        Please search
+        [existing issues](https://github.com/TestSprite/testsprite-cli/issues)
+        first to avoid duplicates. Questions? Join us on
+        [Discord](https://discord.gg/W4JDrZfdB).
+  - type: input
+    id: discord
+    attributes:
+      label: Discord Username / User ID
+      description: Please provide your exact Discord username or unique User ID so we can contact you regarding your reward.
+      placeholder: e.g. yourname or 123456789012345678
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What does this improvement do?
+      description: A clear and concise description of the improvement, fix, or contribution.
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details / implementation notes
+      description: Link a PR if you have one, describe your approach, and note anything reviewers should know.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmations
+      options:
+        - label: I have searched existing issues and this is not a duplicate.
+          required: true
+        - label: I have provided my Discord identity above for reward coordination.
+          required: true

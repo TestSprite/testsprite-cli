@@ -15,7 +15,7 @@ import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { TARGETS } from '../../src/lib/agent-targets.js';
+import { TARGETS, pathFor } from '../../src/lib/agent-targets.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '../..');
@@ -111,11 +111,11 @@ describe('setup --dry-run --no-agent', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3. setup --dry-run with default claude agent: shows would-write for claude
+// 3. setup --dry-run with default claude agent: shows would-write for both skills
 // ---------------------------------------------------------------------------
 
 describe('setup --dry-run (with agent)', () => {
-  it('exits 0, shows would-write preview for claude skill, no file created', () => {
+  it('exits 0, shows would-write preview for both claude skill files, no files created', () => {
     const tmpDir = freshTmpDir();
     const credsTmpDir = freshTmpDir();
 
@@ -135,10 +135,16 @@ describe('setup --dry-run (with agent)', () => {
 
     expect(result.status).toBe(0);
     expect(result.stderr).toContain('[dry-run]');
-    expect(result.stderr).toContain(TARGETS.claude.path);
 
-    const skillPath = join(tmpDir, TARGETS.claude.path);
-    expect(existsSync(skillPath)).toBe(false);
+    // Both skill paths must appear in the dry-run preview
+    const verifyPath = pathFor('claude', 'testsprite-verify');
+    const onboardPath = pathFor('claude', 'testsprite-onboard');
+    expect(result.stderr, 'verify path in dry-run preview').toContain(verifyPath);
+    expect(result.stderr, 'onboard path in dry-run preview').toContain(onboardPath);
+
+    // No files written under dry-run
+    expect(existsSync(join(tmpDir, verifyPath))).toBe(false);
+    expect(existsSync(join(tmpDir, onboardPath))).toBe(false);
   });
 });
 
@@ -216,7 +222,15 @@ describe('deprecated `init` alias', () => {
 
 describe('matrix coverage guard', () => {
   it('TARGETS matches the documented set (update this list when adding a target)', () => {
-    expect(Object.keys(TARGETS)).toEqual(['claude', 'antigravity', 'cursor', 'cline', 'codex']);
+    expect(Object.keys(TARGETS)).toEqual([
+      'claude',
+      'antigravity',
+      'cursor',
+      'cline',
+      'kiro',
+      'windsurf',
+      'codex',
+    ]);
   });
 });
 
