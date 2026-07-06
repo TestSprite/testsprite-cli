@@ -33,12 +33,13 @@
  *     when the agent re-runs. M3 may add resume.
  */
 
+import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import type { Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import { createWriteStream } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { CliFailureContext, CliTestStep } from '../commands/test.js';
 import { ApiError, TransportError, localValidationError } from './errors.js';
 import { requireEnum } from './validate.js';
@@ -520,30 +521,6 @@ async function freshTmpDir(dir: string): Promise<string> {
 }
 
 /**
- * Rename `<tmp>/<file>` → `<dir>/<file>` for every file in `files`.
- *
- * Critical ordering for atomicity (the §3 "agent-safe" contract):
- *
- *   1. **Remove the OLD `meta.json` first.** The bundle's completion
- *      signal is `meta.json`'s presence; an agent reading `<dir>` while
- *      we're mutating it must see "no meta → bundle absent or
- *      mid-write" rather than "meta points at a snapshot that's already
- *      been partially overwritten." Removing the old meta is what
- *      makes the rest of the swap safe to do in place.
- *   2. Wipe stale top-level files (e.g. an old `video.mp4` when the new
- *      bundle has no video). Without this, a fresh bundle could ship
- *      with a stale video lingering at the top level.
- *   3. Replace `<dir>/steps/` wholesale.
- *   4. Rename top-level files into place.
- *   5. **Rename `meta.json` LAST.** Its visible presence is the atomic
- *      completion signal; until step 5 lands, agents see "incomplete."
- *
- * The window between (1) and (5) is bounded by a handful of `rename`
- * syscalls — small enough that a SIGKILL there is rare, and any agent
- * caught reading the dir during it sees no meta and refuses to consume
- * (per §7.3). That's what we want.
- */
-/**
  * Whether a top-level directory entry belongs to the bundle format —
  * i.e. something a prior `writeBundle` could have produced and this
  * commit is therefore allowed to clean up. `code.<ext>` is matched by
@@ -567,62 +544,96 @@ export function isBundleOwnedEntry(entry: string): boolean {
   return /^code\.[A-Za-z0-9]+$/.test(entry);
 }
 
-async function commitBundle(
+/**
+ * Atomically install the complete bundle staged in `tmpDir` into `dir`.
+ *
+ * Compatible with the #162 data-loss guard: only `isBundleOwnedEntry`
+ * names are moved aside or replaced — foreign files in `--out` survive.
+ *
+ * Re-commit safety: bundle-owned entries are renamed to a sibling
+ * aside directory before the new artifacts land. `meta.json` is installed
+ * last so its presence remains the completion signal. On failure, aside
+ * entries are restored so a failed re-commit never deletes `meta.json`
+ * without leaving a usable prior bundle (or the prior bundle restored).
+ */
+export async function commitBundle(
   tmpDir: string,
   dir: string,
   files: ReadonlyArray<string>,
 ): Promise<void> {
-  // (1) Remove the prior bundle's completion signal FIRST.
-  await unlink(join(dir, 'meta.json')).catch(() => undefined);
+  const parent = dirname(dir);
+  const base = basename(dir);
+  const asideDir = join(parent, `.${base}.aside.${randomUUID()}`);
+  const asideLog: Array<{ asidePath: string; restorePath: string }> = [];
 
-  // (2) Sweep stale top-level files that the new bundle won't write.
-  // If the prior run wrote `video.mp4` and the new run has no video,
-  // an in-place rename leaves the old video lingering. Only entries the
-  // bundle format OWNS are candidates: `--out` may point at a directory
-  // that also holds the user's unrelated files, and those must survive
-  // the commit (deleting them would be silent data loss).
-  const topLevel = files.filter(f => !f.startsWith('steps/'));
-  const newTopLevelSet = new Set(topLevel);
-  newTopLevelSet.add('meta.json'); // about to land last, do not delete
-  const existing = await readdir(dir).catch(() => [] as string[]);
-  for (const entry of existing) {
-    // Preserve the writer's own scratch dir + the .partial marker
-    // (we'll re-evaluate .partial at the end of commit). Any other
-    // bundle-owned entry not-listed in the new bundle is stale.
-    if (entry === '.tmp' || entry === '.partial') continue;
-    if (newTopLevelSet.has(entry)) continue;
-    if (entry === 'steps') continue; // handled below
-    if (!isBundleOwnedEntry(entry)) continue; // foreign file — never touch
-    await rm(join(dir, entry), { recursive: true, force: true });
+  const asideIfPresent = async (entry: string): Promise<void> => {
+    const restorePath = join(dir, entry);
+    if (!(await pathExists(restorePath))) return;
+    const asidePath = join(asideDir, entry);
+    await mkdir(dirname(asidePath), { recursive: true });
+    await rename(restorePath, asidePath);
+    asideLog.push({ asidePath, restorePath });
+  };
+
+  const rollback = async (): Promise<void> => {
+    for (const { asidePath, restorePath } of [...asideLog].reverse()) {
+      await rm(restorePath, { recursive: true, force: true }).catch(() => undefined);
+      await rename(asidePath, restorePath).catch(() => undefined);
+    }
+    await rm(asideDir, { recursive: true, force: true }).catch(() => undefined);
+  };
+
+  try {
+    const topLevel = files.filter(f => !f.startsWith('steps/'));
+    const newTopLevelSet = new Set(topLevel);
+    newTopLevelSet.add('meta.json');
+
+    const existing = await readdir(dir).catch(() => [] as string[]);
+    for (const entry of existing) {
+      if (entry === '.tmp') continue;
+      if (!isBundleOwnedEntry(entry)) continue;
+
+      const isStale = entry !== 'steps' && entry !== '.partial' && !newTopLevelSet.has(entry);
+      const willReplace = entry === 'steps' || newTopLevelSet.has(entry);
+      if (isStale || willReplace) {
+        await asideIfPresent(entry);
+      }
+    }
+
+    const stepsTmp = join(tmpDir, 'steps');
+    const stepsDir = join(dir, 'steps');
+    if (await dirExists(stepsTmp)) {
+      await rename(stepsTmp, stepsDir);
+    }
+
+    const metaIdx = topLevel.indexOf('meta.json');
+    const beforeMeta = metaIdx >= 0 ? topLevel.filter((_, i) => i !== metaIdx) : topLevel;
+    for (const file of beforeMeta) {
+      await rename(join(tmpDir, file), join(dir, file));
+    }
+
+    if (metaIdx >= 0) {
+      await rename(join(tmpDir, 'meta.json'), join(dir, 'meta.json'));
+    }
+
+    await unlink(join(dir, '.partial')).catch(() => undefined);
+    await rm(tmpDir, { recursive: true, force: true });
+    // Best-effort aside cleanup — failures must not roll back a committed bundle.
+    await rm(asideDir, { recursive: true, force: true }).catch(() => undefined);
+  } catch (err) {
+    await rollback();
+    await rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+    throw err;
   }
+}
 
-  // (3) Replace `<dir>/steps/` with `<tmp>/steps/`.
-  const stepsTmp = join(tmpDir, 'steps');
-  const stepsDir = join(dir, 'steps');
-  await rm(stepsDir, { recursive: true, force: true });
-  if (await dirExists(stepsTmp)) {
-    await rename(stepsTmp, stepsDir);
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
   }
-
-  // (4) Top-level files (result/failure/code/video). meta.json renames
-  // LAST; track it separately.
-  const metaIdx = topLevel.indexOf('meta.json');
-  const beforeMeta = metaIdx >= 0 ? topLevel.filter((_, i) => i !== metaIdx) : topLevel;
-  for (const file of beforeMeta) {
-    await rename(join(tmpDir, file), join(dir, file));
-  }
-
-  // (5) meta.json LAST → atomic completion signal.
-  if (metaIdx >= 0) {
-    await rename(join(tmpDir, 'meta.json'), join(dir, 'meta.json'));
-  }
-
-  // .partial from a prior aborted run is now stale. Remove it so an
-  // agent inspecting the dir sees only the fresh bundle.
-  await unlink(join(dir, '.partial')).catch(() => undefined);
-
-  // Clean up the now-empty tmp dir.
-  await rm(tmpDir, { recursive: true, force: true });
 }
 
 async function dirExists(path: string): Promise<boolean> {
