@@ -2667,7 +2667,7 @@ describe('runSteps', () => {
     expect(block.match(/error: /g)).toHaveLength(1);
   });
 
-  it('--run-id dry-run sample maps the failed step error and failure contributor flag', async () => {
+  it('--run-id run_failed_sample dry-run sample maps the failed step error and contributor flag', async () => {
     const out: string[] = [];
     const page = await runSteps(
       {
@@ -2676,7 +2676,7 @@ describe('runSteps', () => {
         debug: false,
         dryRun: true,
         testId: 'test_fe',
-        runId: 'run_dry',
+        runId: 'run_failed_sample',
       },
       {
         env: {} as NodeJS.ProcessEnv,
