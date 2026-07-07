@@ -9,8 +9,9 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Command } from 'commander';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { CLIError } from '../lib/errors.js';
+import { ApiError, CLIError } from '../lib/errors.js';
 import { writeProfile } from '../lib/credentials.js';
 import type { DoctorDeps, DoctorReport } from './doctor.js';
 import { createDoctorCommand, runDoctor } from './doctor.js';
@@ -54,6 +55,14 @@ function healthyDeps(credentialsPath: string, extra: Partial<DoctorDeps> = {}): 
     fetchImpl: makeFetch(OK_ME),
     ...extra,
   };
+}
+
+function makeDoctorProgram(deps: DoctorDeps = {}): Command {
+  const program = new Command();
+  program.exitOverride();
+  program.option('--output <mode>', 'output', 'text');
+  program.addCommand(createDoctorCommand(deps));
+  return program;
 }
 
 let credentialsPath: string;
@@ -225,5 +234,37 @@ describe('createDoctorCommand wiring', () => {
 
   it('--help describes the diagnostic', () => {
     expect(createDoctorCommand().helpInformation()).toContain('Diagnose');
+  });
+
+  it('rejects invalid --output with the shared VALIDATION_ERROR', async () => {
+    const rejection = await makeDoctorProgram()
+      .parseAsync(['node', 'ts', '--output', 'yaml', 'doctor'])
+      .catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(ApiError);
+    expect(rejection).toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      nextAction: 'Flag `--output` is invalid: must be one of: json, text.',
+    });
+  });
+
+  it('accepts valid --output modes through command wiring', async () => {
+    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    for (const mode of ['text', 'json'] as const) {
+      const { capture, deps } = makeCapture();
+      await makeDoctorProgram({ ...healthyDeps(credentialsPath), ...deps }).parseAsync([
+        'node',
+        'ts',
+        '--output',
+        mode,
+        'doctor',
+      ]);
+      const raw = capture.stdout.join('');
+      if (mode === 'json') {
+        expect((JSON.parse(raw) as DoctorReport).failures).toBe(0);
+      } else {
+        expect(raw).toContain('All checks passed.');
+      }
+    }
   });
 });

@@ -24,7 +24,7 @@ import {
 import { loadConfig } from '../lib/config.js';
 import { ApiError, CLIError, localValidationError } from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
-import { GLOBAL_OPTS_HINT, Output, type OutputMode } from '../lib/output.js';
+import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
 import { VERSION } from '../version.js';
 import { MIN_SUPPORTED_NODE_MAJOR, shouldRejectNodeVersion } from '../version-guard.js';
@@ -257,7 +257,7 @@ function resolveCommonOptions(command: Command): CommonOptions {
   };
   return {
     profile: globals.profile ?? 'default',
-    output: globals.output ?? 'text',
+    output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
     verbose: globals.verbose ?? false,
