@@ -128,11 +128,13 @@ function readUpdateCheckCache(resolved: ResolvedUpdateCheckDeps): UpdateCheckCac
     const body: unknown = JSON.parse(raw);
     const parsed = v.safeParse(UPDATE_CHECK_CACHE_SCHEMA, body);
     return parsed.success ? parsed.output : undefined;
-  } catch {
+  } catch (err) {
+    if (process.argv.includes('--debug') || process.argv.includes('--verbose')) {
+      resolved.stderr(`[debug] readUpdateCheckCache: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
     // Missing or unreadable cache: treat as stale.
     return undefined;
   }
-}
 
 /**
  * Persist the cache, creating the parent directory when missing. Best-effort:
@@ -143,10 +145,12 @@ function writeUpdateCheckCache(resolved: ResolvedUpdateCheckDeps, cache: UpdateC
   try {
     resolved.mkdir(dirname(resolved.cachePath));
     resolved.writeFile(resolved.cachePath, `${JSON.stringify(cache)}\n`);
-  } catch {
+  } catch (err) {
+    if (process.argv.includes('--debug') || process.argv.includes('--verbose')) {
+      resolved.stderr(`[debug] writeUpdateCheckCache: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
     // Cache persistence is optional; never surface fs errors to the command.
   }
-}
 
 /**
  * True when every gate documented in the module header passes: no opt-out
