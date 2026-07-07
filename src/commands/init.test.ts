@@ -231,6 +231,45 @@ describe('runInit — happy path (interactive)', () => {
     expect(agent.skills).toContain('testsprite-verify');
     expect(agent.skills).toContain('testsprite-onboard');
   });
+
+  it('debug mode reports a display-only whoami lookup failure without corrupting JSON stdout', async () => {
+    const { captured, deps } = makeCapture();
+    let callCount = 0;
+    const fetchMock = vi.fn(async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        return new Response(JSON.stringify(ME), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response(
+        JSON.stringify({
+          error: {
+            code: 'AUTH_INVALID',
+            message: 'Invalid API key',
+            nextAction: 'Provide a valid key.',
+            requestId: 'r-whoami',
+          },
+        }),
+        { status: 401, headers: { 'content-type': 'application/json' } },
+      );
+    }) as unknown as InitDeps['fetchImpl'];
+
+    await runInit(
+      makeBaseOpts({ apiKey: 'sk-json-test', debug: true, noAgent: true, output: 'json' }),
+      {
+        ...deps,
+        fetchImpl: fetchMock,
+        credentialsPath,
+        isTTY: false,
+      },
+    );
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
+    expect(parsed.status).toBe('initialized');
+    expect(captured.stderr.some(line => line.includes('setup identity lookup failed'))).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

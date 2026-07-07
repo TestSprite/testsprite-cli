@@ -291,9 +291,13 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   let me: MeResponse;
   try {
     me = await runWhoami(opts, whoamiDeps);
-  } catch {
+  } catch (err) {
     // Whoami is display-only. If it fails after a successful configure,
     // continue with a minimal placeholder so the summary still prints.
+    if (opts.debug) {
+      const reason = err instanceof Error ? err.message : String(err);
+      stderrFn(`[debug] setup identity lookup failed after configure: ${reason}`);
+    }
     me = { userId: '', keyId: '', scopes: [], env: 'production' };
   }
 
