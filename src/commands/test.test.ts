@@ -464,6 +464,14 @@ describe('runList', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   });
 
+  it('rejects --status=junk before reading credentials', async () => {
+    const test = createTestCommand();
+    disableExits(test);
+    await expect(
+      test.parseAsync(['list', '--project', 'project_alice', '--status', 'junk'], { from: 'user' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
   it('rejects --page-size=0 locally with VALIDATION_ERROR (no network call)', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(() => {
