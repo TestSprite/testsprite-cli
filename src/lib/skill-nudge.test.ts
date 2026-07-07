@@ -9,28 +9,36 @@ import {
   type SkillNudgeContext,
 } from './skill-nudge.js';
 
+function posixPath(path: string): string {
+  return path.replace(/\\/g, '/');
+}
+
 // ---------------------------------------------------------------------------
 // isVerifySkillInstalled
 // ---------------------------------------------------------------------------
 
 describe('isVerifySkillInstalled', () => {
   it('true when the claude own-file SKILL.md exists', () => {
-    const existsSync = (p: string) => p.endsWith('.claude/skills/testsprite-verify/SKILL.md');
+    const existsSync = (p: string) =>
+      posixPath(p).endsWith('.claude/skills/testsprite-verify/SKILL.md');
     expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
   });
 
   it('true for the cursor .mdc landing file', () => {
-    const existsSync = (p: string) => p.endsWith('.cursor/rules/testsprite-verify.mdc');
+    const existsSync = (p: string) =>
+      posixPath(p).endsWith('.cursor/rules/testsprite-verify.mdc');
     expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
   });
 
   it('true for the cline landing file', () => {
-    const existsSync = (p: string) => p.endsWith('.clinerules/testsprite-verify.md');
+    const existsSync = (p: string) =>
+      posixPath(p).endsWith('.clinerules/testsprite-verify.md');
     expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
   });
 
   it('true for the antigravity landing file', () => {
-    const existsSync = (p: string) => p.endsWith('.agents/skills/testsprite-verify/SKILL.md');
+    const existsSync = (p: string) =>
+      posixPath(p).endsWith('.agents/skills/testsprite-verify/SKILL.md');
     expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
   });
 
@@ -73,7 +81,7 @@ describe('isVerifySkillInstalled', () => {
         return false;
       },
     });
-    expect(seen.every(p => p.startsWith('/some/proj'))).toBe(true);
+    expect(seen.every(p => posixPath(p).startsWith('/some/proj'))).toBe(true);
     // One probe per target landing path.
     expect(seen).toHaveLength(Object.keys(TARGETS).length);
   });
@@ -198,6 +206,6 @@ describe('maybeEmitSkillNudge', () => {
     });
     maybeEmitSkillNudge(ctx);
     expect(probed.length).toBeGreaterThan(0);
-    expect(probed.every(p => p.startsWith('/work/here'))).toBe(true);
+    expect(probed.every(p => posixPath(p).startsWith('/work/here'))).toBe(true);
   });
 });

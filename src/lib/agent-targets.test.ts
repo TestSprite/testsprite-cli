@@ -36,7 +36,8 @@ import {
 function parseFrontmatterDescription(content: string): string | undefined {
   const lines = content.split('\n');
   let inFrontmatter = false;
-  for (const line of lines) {
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\r$/, '');
     if (line.trim() === '---') {
       if (!inFrontmatter) {
         inFrontmatter = true;

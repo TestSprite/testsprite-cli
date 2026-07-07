@@ -1,5 +1,5 @@
 import { mkdtempSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
@@ -18,6 +18,11 @@ import { ApiError } from './errors.js';
 
 let tmpRoot: string;
 let credentialsPath: string;
+
+function expectPosixMode(path: string, expected: number): void {
+  if (process.platform === 'win32') return;
+  expect(statSync(path).mode & 0o777).toBe(expected);
+}
 
 beforeEach(() => {
   tmpRoot = mkdtempSync(join(tmpdir(), 'testsprite-creds-'));
@@ -139,8 +144,7 @@ describe('writeProfile', () => {
   it('creates the file with mode 0600 and writes the profile', () => {
     writeProfile(DEFAULT_PROFILE, { apiKey: 'sk-new' }, { path: credentialsPath });
     expect(existsSync(credentialsPath)).toBe(true);
-    const mode = statSync(credentialsPath).mode & 0o777;
-    expect(mode).toBe(0o600);
+    expectPosixMode(credentialsPath, 0o600);
     expect(readProfile(DEFAULT_PROFILE, { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
   });
 
@@ -192,14 +196,13 @@ describe('ensureRestrictiveMode', () => {
     mkdirSync(tmpRoot, { recursive: true });
     writeFileSync(credentialsPath, 'data', { mode: 0o644 });
     ensureRestrictiveMode(credentialsPath);
-    const mode = statSync(credentialsPath).mode & 0o777;
-    expect(mode).toBe(0o600);
+    expectPosixMode(credentialsPath, 0o600);
   });
 });
 
 describe('defaultCredentialsPath', () => {
   it('points at ~/.testsprite/credentials', () => {
-    expect(defaultCredentialsPath().endsWith('/.testsprite/credentials')).toBe(true);
+    expect(defaultCredentialsPath()).toBe(join(homedir(), '.testsprite', 'credentials'));
   });
 });
 

@@ -7,14 +7,15 @@
  * and runs `auth whoami` against the mock."
  */
 
-import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, statSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, renameSync, statSync } from 'node:fs';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { runNpmScript } from './helpers/npm.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..');
@@ -31,13 +32,18 @@ let server: Server;
 let baseUrl: string;
 let tmpHome: string;
 
+function expectPosixMode(path: string, expected: number): void {
+  if (process.platform === 'win32') return;
+  expect(statSync(path).mode & 0o777).toBe(expected);
+}
+
 beforeAll(async () => {
   // Always rebuild — `npm run build` is fast and a stale `dist/index.js`
   // would silently mask ESM/import regressions in this suite. The
   // existsSync skip we used to do here let `dist` rot under
   // refactors and gave false-green on `project list` once
   // already.
-  execFileSync('npm', ['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
+  runNpmScript('build', REPO_ROOT);
   server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const url = req.url ?? '/';
     if (url.startsWith('/api/cli/v1/projects/')) {
@@ -349,7 +355,7 @@ beforeAll(async () => {
 }, 60_000);
 
 afterAll(async () => {
-  await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+  if (server) await new Promise<void>(resolveClose => server.close(() => resolveClose()));
 });
 
 interface SpawnResult {
@@ -362,13 +368,7 @@ function runCli(args: string[], envOverrides: Record<string, string> = {}): Prom
   return new Promise((resolveResult, rejectResult) => {
     const child = spawn('node', [BIN_PATH, ...args], {
       cwd: REPO_ROOT,
-      env: {
-        ...process.env,
-        HOME: tmpHome,
-        TESTSPRITE_API_KEY: undefined,
-        TESTSPRITE_API_URL: undefined,
-        ...envOverrides,
-      } as NodeJS.ProcessEnv,
+      env: childEnv(envOverrides),
     });
     let stdout = '';
     let stderr = '';
@@ -377,6 +377,21 @@ function runCli(args: string[], envOverrides: Record<string, string> = {}): Prom
     child.on('error', rejectResult);
     child.on('close', code => resolveResult({ exitCode: code ?? -1, stdout, stderr }));
   });
+}
+
+function childEnv(envOverrides: Record<string, string>): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.toUpperCase() === 'TESTSPRITE_API_KEY' || key.toUpperCase() === 'TESTSPRITE_API_URL') {
+      delete env[key];
+    }
+  }
+  return {
+    ...env,
+    HOME: tmpHome,
+    USERPROFILE: tmpHome,
+    ...envOverrides,
+  };
 }
 
 describe('auth status subprocess (+ deprecated whoami alias)', () => {
@@ -897,7 +912,7 @@ describe('setup --from-env subprocess', () => {
     expect(result.exitCode).toBe(0);
     const credentialsPath = join(tmpHome, '.testsprite', 'credentials');
     expect(existsSync(credentialsPath)).toBe(true);
-    expect(statSync(credentialsPath).mode & 0o777).toBe(0o600);
+    expectPosixMode(credentialsPath, 0o600);
   }, 30_000);
 
   it('exits 5 with VALIDATION_ERROR when --from-env is set without TESTSPRITE_API_KEY', async () => {
@@ -1044,7 +1059,7 @@ describe('--dry-run subprocess smoke', () => {
     // skipped the prompt.
     const credPath = join(tmpHome, '.testsprite', 'credentials');
     // Make sure any previous test didn't leave one behind.
-    if (existsSync(credPath)) execFileSync('rm', [credPath]);
+    if (existsSync(credPath)) renameSync(credPath, `${credPath}.bak-${process.pid}-${Date.now()}`);
     const result = await runCli(['setup', '--dry-run', '--no-agent', '--output', 'json']);
     expect(result.exitCode).toBe(0);
     expect(existsSync(credPath)).toBe(false);

@@ -13,6 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { runNpmScript } from './helpers/npm.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..');
@@ -47,7 +48,7 @@ const cases: Array<[string, string[]]> = [
 
 describe('--help snapshots', () => {
   beforeAll(() => {
-    execFileSync('npm', ['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
+    runNpmScript('build', REPO_ROOT);
   });
 
   for (const [name, args] of cases) {
