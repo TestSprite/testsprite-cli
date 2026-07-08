@@ -1983,7 +1983,7 @@ export async function runCreateFromPlan(
   // create POST (see runCreate) so a near-limit base key fails fast instead
   // of orphaning a created test with no run.
   assertChainedRunKeyFits(opts.run, opts.idempotencyKey);
-  if (!opts.planFrom) {
+  if (!opts.planFrom && !opts.dryRun && opts.output !== 'json') {
     const interactivePath = await promptForPlanPath();
     if (interactivePath) {
       opts.planFrom = interactivePath;

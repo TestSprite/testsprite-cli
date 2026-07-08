@@ -134,7 +134,7 @@ function readUpdateCheckCache(resolved: ResolvedUpdateCheckDeps): UpdateCheckCac
     return parsed.success ? parsed.output : undefined;
   } catch (err) {
     if (isDebugLoggingEnabled()) {
-      resolved.stderr(`[debug] readUpdateCheckCache: ${err instanceof Error ? err.message : String(err)}\n`);
+      resolved.stderr(`[debug] readUpdateCheckCache: ${err instanceof Error ? err.message : String(err)}`);
     }
     // Missing or unreadable cache: treat as stale.
     return undefined;
@@ -152,7 +152,7 @@ function writeUpdateCheckCache(resolved: ResolvedUpdateCheckDeps, cache: UpdateC
     resolved.writeFile(resolved.cachePath, `${JSON.stringify(cache)}\n`);
   } catch (err) {
     if (isDebugLoggingEnabled()) {
-      resolved.stderr(`[debug] writeUpdateCheckCache: ${err instanceof Error ? err.message : String(err)}\n`);
+      resolved.stderr(`[debug] writeUpdateCheckCache: ${err instanceof Error ? err.message : String(err)}`);
     }
     // Cache persistence is optional; never surface fs errors to the command.
   }
@@ -285,8 +285,8 @@ export async function maybeNotifyUpdate(deps: UpdateCheckDeps = {}): Promise<voi
     // diagnostic log line; stderr keeps stdout parseable for scripts.
     resolved.stderr(
       `A new version of testsprite-cli is available: ${resolved.currentVersion} -> ${latest}. ` +
-        `Run npm install -g @testsprite/testsprite-cli to update. ` +
-        `(Disable with ${UPDATE_CHECK_OPT_OUT_ENV}=1)`,
+      `Run npm install -g @testsprite/testsprite-cli to update. ` +
+      `(Disable with ${UPDATE_CHECK_OPT_OUT_ENV}=1)`,
     );
   } catch {
     // An update notice must never break, delay, or alter the exit status of
