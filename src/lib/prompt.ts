@@ -161,3 +161,27 @@ function isInputEnded(input: NodeJS.ReadableStream): boolean {
 }
 
 export type { Writable };
+
+/**
+ * Interactive wizard helper: asks the user for a plan file path when omitted.
+ * Returns the provided path, a default fallback, or undefined if not in a TTY.
+ */
+export async function promptForPlanPath(question = 'Enter path to plan JSON file [default: plan.json]: ', fallback = 'plan.json', streams: PromptStreams = {}): Promise<string | undefined> {
+  const input = streams.input ?? process.stdin;
+  const output = streams.output ?? process.stderr;
+
+  const isInteractive = (input as { isTTY?: boolean }).isTTY === true &&
+    (output as { isTTY?: boolean }).isTTY === true &&
+    process.env.CI !== 'true' &&
+    process.env.CI !== '1';
+
+  if (!isInteractive) return undefined;
+
+  try {
+    const answer = await promptText(question, streams);
+    const trimmed = answer.trim();
+    return trimmed !== '' ? trimmed : fallback;
+  } catch {
+    return undefined;
+  }
+}

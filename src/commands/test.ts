@@ -90,7 +90,7 @@ import {
   type FlakyOutcome,
   type FlakyReport,
 } from '../lib/flaky.js';
-
+import { promptForPlanPath } from '../lib/prompt.js';
 /**
  * `details` debug block per the CLI OpenAPI `Test` schema
  * (M2.1 amendment). `processingStatus` / `testStatus` are the
@@ -621,7 +621,7 @@ function assertChainedRunKeyFits(
     throw localValidationError(
       'idempotencyKey',
       `must be at most ${256 - RUN_SUFFIX.length} characters when used with --run ` +
-        `(the chained trigger derives "<key>${RUN_SUFFIX}", which must stay within the 256-char limit)`,
+      `(the chained trigger derives "<key>${RUN_SUFFIX}", which must stay within the 256-char limit)`,
       undefined,
       'flag',
     );
@@ -666,7 +666,7 @@ async function emitDupNameAdvisoryIfNeeded(
     if (match) {
       stderrFn(
         `[advisory] A test named "${name}" already exists in this project (testId: ${match.id}). ` +
-          `Use \`testsprite test update ${match.id}\` to modify it, or proceed to create a duplicate.`,
+        `Use \`testsprite test update ${match.id}\` to modify it, or proceed to create a duplicate.`,
       );
     }
   } catch {
@@ -759,7 +759,7 @@ export async function runCreate(
       throw localValidationError(
         depFlags[0]!,
         `${depFlags.join(', ')} are backend-only flags; frontend plans have no wave model. ` +
-          `Remove ${depFlags.join('/')} or use --type backend.`,
+        `Remove ${depFlags.join('/')} or use --type backend.`,
       );
     }
   }
@@ -905,7 +905,7 @@ function assertPythonCodeFile(path: string): void {
     throw localValidationError(
       'code-file',
       'must be a Python (.py) file — TestSprite runs all test code as Python ' +
-        '(frontend: Playwright for Python; backend: requests + pytest).',
+      '(frontend: Playwright for Python; backend: requests + pytest).',
     );
   }
 }
@@ -1099,7 +1099,7 @@ export async function runPlanPut(
     const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
     stderr(
       `Plan-steps conflict. Server has a different step count than ${expectedCount}. ` +
-        `Re-fetch with 'testsprite test get ${opts.testId}' to see the current planSteps[] length and retry with --expected-step-count <current>.`,
+      `Re-fetch with 'testsprite test get ${opts.testId}' to see the current planSteps[] length and retry with --expected-step-count <current>.`,
     );
     throw ApiError.fromEnvelope(
       {
@@ -1518,7 +1518,7 @@ export async function runDeleteBatch(
     throw localValidationError(
       'status',
       '--status only applies with --all (it filters which project tests get deleted). ' +
-        'Remove --status, or add --all --project <id>.',
+      'Remove --status, or add --all --project <id>.',
     );
   }
 
@@ -1539,8 +1539,8 @@ export async function runDeleteBatch(
     if (opts.dryRun) {
       stderrFn(
         '[dry-run] WARNING: the preview below uses sample data and does NOT reflect the ' +
-          'real tests in your project. Remove --dry-run to see which tests would actually ' +
-          'be deleted.',
+        'real tests in your project. Remove --dry-run to see which tests would actually ' +
+        'be deleted.',
       );
     }
     // Resolve all tests in the project.
@@ -1983,6 +1983,13 @@ export async function runCreateFromPlan(
   // create POST (see runCreate) so a near-limit base key fails fast instead
   // of orphaning a created test with no run.
   assertChainedRunKeyFits(opts.run, opts.idempotencyKey);
+  if (!opts.planFrom) {
+    const interactivePath = await promptForPlanPath();
+    if (interactivePath) {
+      opts.planFrom = interactivePath;
+    }
+  }
+
   requireNonEmpty('plan-from', opts.planFrom);
 
   if (opts.targetUrl !== undefined) {
@@ -1999,7 +2006,7 @@ export async function runCreateFromPlan(
     const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
     stderr(
       `warning: --plan-from supplies the test definition; ignoring ${opts.ignoredFlags.join(', ')}. ` +
-        `Edit the plan JSON to change these fields.`,
+      `Edit the plan JSON to change these fields.`,
     );
   }
 
@@ -2413,16 +2420,16 @@ export async function runCreateBatch(
   const enrichedResponse: CliCreateBatchResponse =
     !opts.dryRun && opts.output === 'json'
       ? {
-          ...response,
-          results: response.results.map(r => {
-            if (r.status !== 'created' || r.testId === undefined) return r;
-            const spec = specs[r.specIndex];
-            const projectId = spec?.projectId;
-            if (!projectId) return r;
-            const dashboardUrl = resolvePortalUrl(apiUrlForDashboard, projectId, r.testId);
-            return dashboardUrl !== undefined ? { ...r, dashboardUrl } : r;
-          }),
-        }
+        ...response,
+        results: response.results.map(r => {
+          if (r.status !== 'created' || r.testId === undefined) return r;
+          const spec = specs[r.specIndex];
+          const projectId = spec?.projectId;
+          if (!projectId) return r;
+          const dashboardUrl = resolvePortalUrl(apiUrlForDashboard, projectId, r.testId);
+          return dashboardUrl !== undefined ? { ...r, dashboardUrl } : r;
+        }),
+      }
       : response;
 
   // --run: suppress the create output in JSON mode (we'll emit a single
@@ -2924,11 +2931,11 @@ async function runBatchRun(
     const enrichedResults =
       !opts.dryRun && testIdToProjectId !== undefined && apiUrlForDashboard !== undefined
         ? batchRunResults.map(r => {
-            const projectId = testIdToProjectId.get(r.testId);
-            if (!projectId || !r.testId) return r;
-            const dashboardUrl = resolvePortalUrl(apiUrlForDashboard, projectId, r.testId);
-            return dashboardUrl !== undefined ? { ...r, dashboardUrl } : r;
-          })
+          const projectId = testIdToProjectId.get(r.testId);
+          if (!projectId || !r.testId) return r;
+          const dashboardUrl = resolvePortalUrl(apiUrlForDashboard, projectId, r.testId);
+          return dashboardUrl !== undefined ? { ...r, dashboardUrl } : r;
+        })
         : batchRunResults;
     out.print({ results: enrichedResults });
   } else {
@@ -3594,7 +3601,7 @@ export async function runCodePut(
       if (serverVersion !== null) {
         stderr(
           `Code conflict. Server is at ${serverVersion}, you sent ${sentVersion}. ` +
-            `Re-fetch with 'testsprite test get ${opts.testId}' (or 'test code get') and retry with --expected-version ${serverVersion}.`,
+          `Re-fetch with 'testsprite test get ${opts.testId}' (or 'test code get') and retry with --expected-version ${serverVersion}.`,
         );
       } else {
         stderr(
@@ -4160,8 +4167,8 @@ export async function runSteps(
       } else {
         stderrFn(
           `[advisory] No step records found for run ${opts.runId}. ` +
-            `The run may have completed before steps were written, or this run type does not record per-step data. ` +
-            `For the full failure bundle use: testsprite test artifact get ${opts.runId}`,
+          `The run may have completed before steps were written, or this run type does not record per-step data. ` +
+          `For the full failure bundle use: testsprite test artifact get ${opts.runId}`,
         );
       }
       return page;
@@ -4208,7 +4215,7 @@ export async function runSteps(
   if (distinctRunIds.size > 1) {
     stderrFn(
       `[advisory] returned ${page.items.length} steps span ${distinctRunIds.size} distinct runs. ` +
-        `Pass --run-id <id> to scope to a single run.`,
+      `Pass --run-id <id> to scope to a single run.`,
     );
   }
 
@@ -4417,7 +4424,7 @@ export async function runResultHistory(
   if (resp.nextCursor !== null && resp.runs.length < pageSize) {
     stderr(
       `[hint] Fewer than ${pageSize} rows returned but more may exist — ` +
-        `source filter skipped some entries. Pass --cursor ${resp.nextCursor} to continue.`,
+      `source filter skipped some entries. Pass --cursor ${resp.nextCursor} to continue.`,
     );
   }
 
@@ -5225,8 +5232,8 @@ export async function runTestRun(
           }
           stderrFn(
             `[advisory] Run already in flight (runId: ${currentRunId}, ` +
-              `target: ${inFlightRun.targetUrl}). ` +
-              `Attaching to that run's --wait poll instead of creating a new one.`,
+            `target: ${inFlightRun.targetUrl}). ` +
+            `Attaching to that run's --wait poll instead of creating a new one.`,
           );
           triggerResponse = {
             runId: currentRunId,
@@ -5254,10 +5261,10 @@ export async function runTestRun(
           // they are attaching to the project default.
           stderrFn(
             `[advisory] Run already in flight (runId: ${currentRunId}` +
-              (inFlightTargetUrl ? `, target: ${inFlightTargetUrl}` : '') +
-              `). Auto-resuming wait on in-flight run. ` +
-              `If you needed a specific target URL, cancel with Ctrl-C and ` +
-              `re-trigger with --target-url.`,
+            (inFlightTargetUrl ? `, target: ${inFlightTargetUrl}` : '') +
+            `). Auto-resuming wait on in-flight run. ` +
+            `If you needed a specific target URL, cancel with Ctrl-C and ` +
+            `re-trigger with --target-url.`,
           );
           triggerResponse = {
             runId: currentRunId,
@@ -5315,8 +5322,8 @@ export async function runTestRun(
       beFallbackUsed = true;
       stderrFn(
         `[advisory] Backend run-surface row is not finalized server-side (dogfood L1888); ` +
-          `resolved the verdict from the test record (testId=${testId}). ` +
-          `Read full detail with: testsprite test result ${testId}`,
+        `resolved the verdict from the test record (testId=${testId}). ` +
+        `Read full detail with: testsprite test result ${testId}`,
       );
     },
   });
@@ -5394,7 +5401,7 @@ export async function runTestRun(
       });
       stderrFn(
         `Run ${triggerResponse.runId} is still in progress (request timed out). ` +
-          `Re-attach with: testsprite test wait ${triggerResponse.runId}`,
+        `Re-attach with: testsprite test wait ${triggerResponse.runId}`,
       );
       throw err;
     }
@@ -5700,8 +5707,8 @@ export async function runTestWait(
       beFallbackUsed = true;
       stderrFn(
         `[advisory] Backend run-surface row is not finalized server-side (dogfood L1888); ` +
-          `resolved the verdict from the test record (testId=${testId}). ` +
-          `Read full detail with: testsprite test result ${testId}`,
+        `resolved the verdict from the test record (testId=${testId}). ` +
+        `Read full detail with: testsprite test result ${testId}`,
       );
     },
   });
@@ -5762,7 +5769,7 @@ export async function runTestWait(
       });
       stderrFn(
         `Run ${opts.runId} is still in progress (request timed out). ` +
-          `Re-attach with: testsprite test wait ${opts.runId}`,
+        `Re-attach with: testsprite test wait ${opts.runId}`,
       );
       throw err;
     }
@@ -6000,7 +6007,7 @@ export async function runTestRunAll(
   if (skippedFrontend.length > 0) {
     stderrFn(
       `[advisory] ${skippedFrontend.length} frontend test${skippedFrontend.length !== 1 ? 's' : ''} skipped — the batch run endpoint uses the BE-only wave engine. ` +
-        `Use 'testsprite test run <id>' individually for FE tests.`,
+      `Use 'testsprite test run <id>' individually for FE tests.`,
     );
   }
   if (skippedIntegration.length > 0) {
@@ -6019,9 +6026,9 @@ export async function runTestRunAll(
 
   stderrFn(
     `Dispatched ${accepted.length} test${accepted.length !== 1 ? 's' : ''}` +
-      `${skippedFrontend.length > 0 ? ` (${skippedFrontend.length} FE skipped)` : ''}` +
-      `${conflicts.length > 0 ? ` (${conflicts.length} in flight)` : ''}` +
-      `${deferred.length > 0 ? ` (${deferred.length} rate-deferred)` : ''}.`,
+    `${skippedFrontend.length > 0 ? ` (${skippedFrontend.length} FE skipped)` : ''}` +
+    `${conflicts.length > 0 ? ` (${conflicts.length} in flight)` : ''}` +
+    `${deferred.length > 0 ? ` (${deferred.length} rate-deferred)` : ''}.`,
   );
 
   if (!opts.wait) {
@@ -6471,7 +6478,7 @@ export async function runTestRerun(
     throw localValidationError(
       'test-ids',
       'pass either explicit test IDs or --all, not both — --all reruns every test in the ' +
-        'project and would ignore the listed IDs. Drop the IDs, or drop --all.',
+      'project and would ignore the listed IDs. Drop the IDs, or drop --all.',
     );
   }
   if (opts.all && !opts.projectId) {
@@ -6489,7 +6496,7 @@ export async function runTestRerun(
     throw localValidationError(
       'filter',
       '--filter only applies with --all (it narrows which project tests get reran). ' +
-        'Remove --filter, or add --all --project <id>.',
+      'Remove --filter, or add --all --project <id>.',
     );
   }
   // --status and --skip-terminal are --all-only narrowing filters with the
@@ -6500,14 +6507,14 @@ export async function runTestRerun(
     throw localValidationError(
       'status',
       '--status only applies with --all (it narrows which project tests get reran). ' +
-        'Remove --status, or add --all --project <id>.',
+      'Remove --status, or add --all --project <id>.',
     );
   }
   if (opts.skipTerminal && !opts.all) {
     throw localValidationError(
       'skip-terminal',
       '--skip-terminal only applies with --all (it narrows which project tests get reran). ' +
-        'Remove --skip-terminal, or add --all --project <id>.',
+      'Remove --skip-terminal, or add --all --project <id>.',
     );
   }
   if (
@@ -6687,11 +6694,10 @@ export async function runTestRerun(
       const advisoryPortalBase = resolvePortalBase(resolveApiUrl(opts, deps));
       stderrFn(
         `[advisory] auto-heal was not applied by the server (verbatim replay).` +
-          ` If this was unexpected, check your balance at ${
-            advisoryPortalBase !== undefined
-              ? `${advisoryPortalBase}/dashboard/settings/billing`
-              : 'the portal Billing page (/dashboard/settings/billing)'
-          }.`,
+        ` If this was unexpected, check your balance at ${advisoryPortalBase !== undefined
+          ? `${advisoryPortalBase}/dashboard/settings/billing`
+          : 'the portal Billing page (/dashboard/settings/billing)'
+        }.`,
       );
     } else if (rerunResp.autoHeal) {
       stderrFn(
@@ -6720,8 +6726,8 @@ export async function runTestRerun(
       // up front so they don't trust `test result --history` to flag reruns.
       stderrFn(
         `[advisory] backend rerun history does not distinguish reruns — ` +
-          `'test result --history' shows isRerun:false / createdFrom:null for backend rows by design. ` +
-          `Rerun-ness lives in the audit trail only (command=test.rerun).`,
+        `'test result --history' shows isRerun:false / createdFrom:null for backend rows by design. ` +
+        `Rerun-ness lives in the audit trail only (command=test.rerun).`,
       );
     }
 
@@ -6951,7 +6957,7 @@ export async function runTestRerun(
         beFallbackUsed = true;
         stderrFn(
           `[advisory] Backend run-surface row is not finalized server-side; ` +
-            `resolved the verdict from the test record (testId=${tid}).`,
+          `resolved the verdict from the test record (testId=${tid}).`,
         );
       },
     });
@@ -6999,7 +7005,7 @@ export async function runTestRerun(
         });
         stderrFn(
           `Run ${rerunResp.runId} is still in progress (request timed out). ` +
-            `Re-attach with: testsprite test wait ${rerunResp.runId}`,
+          `Re-attach with: testsprite test wait ${rerunResp.runId}`,
         );
         throw err;
       }
@@ -7420,7 +7426,7 @@ export async function runTestRerun(
     if (deferred.length > 0) {
       throw new CLIError(
         `Batch rerun: no tests were accepted (${deferred.length} deferred). ` +
-          `Retry with: testsprite test rerun ${deferred.map(d => d.testId).join(' ')}`,
+        `Retry with: testsprite test rerun ${deferred.map(d => d.testId).join(' ')}`,
         7,
       );
     }
@@ -7958,7 +7964,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .option(
       '--plan-from <path>',
       'JSON file with the full FE test definition — projectId, type, name, planSteps[] all live in the file ' +
-        '(≤ 256 KB; mutually exclusive with --code-file). In this mode --project/--type/--name/--description/--priority are ignored.',
+      '(≤ 256 KB; mutually exclusive with --code-file). In this mode --project/--type/--name/--description/--priority are ignored.',
     )
     .option(
       '--run',
@@ -7991,9 +7997,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .addHelpText(
       'after',
       '\nBE dependency authoring (M4):\n' +
-        '  --produces/--needs drive wave ordering on `test rerun` + `test run --all`.\n' +
-        '  --category teardown  marks a final-wave cleanup test.\n' +
-        '  These flags are backend-only; supplying with --type frontend is an error (exit 5).',
+      '  --produces/--needs drive wave ordering on `test rerun` + `test run --all`.\n' +
+      '  --category teardown  marks a final-wave cleanup test.\n' +
+      '  These flags are backend-only; supplying with --type frontend is an error (exit 5).',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts: CreateFlagOpts, command: Command) => {
@@ -8133,9 +8139,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .addHelpText(
       'after',
       '\nExamples:\n' +
-        '  testsprite test scaffold > first-test.plan.json\n' +
-        '  testsprite test scaffold --type backend --out tests/health.py\n' +
-        '  testsprite test scaffold --out plan.json   # then edit, and create with --plan-from plan.json',
+      '  testsprite test scaffold > first-test.plan.json\n' +
+      '  testsprite test scaffold --type backend --out tests/health.py\n' +
+      '  testsprite test scaffold --out plan.json   # then edit, and create with --plan-from plan.json',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts: ScaffoldFlagOpts, command: Command) => {
@@ -8222,11 +8228,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .command('result <test-id>')
     .description(
       'Get the latest result for a test (default) or list prior runs (--history).\n' +
-        '\n--output json shape differs by mode:\n' +
-        '  (default)  single CliLatestResult object\n' +
-        '  --history  { runs: RunHistoryItem[], nextCursor: string|null }\n' +
-        '\nPer-run detail: testsprite test wait <run-id>\n' +
-        'Failure bundle:  testsprite test artifact get <run-id>',
+      '\n--output json shape differs by mode:\n' +
+      '  (default)  single CliLatestResult object\n' +
+      '  --history  { runs: RunHistoryItem[], nextCursor: string|null }\n' +
+      '\nPer-run detail: testsprite test wait <run-id>\n' +
+      'Failure bundle:  testsprite test artifact get <run-id>',
     )
     .option(
       '--include-analysis',
@@ -8328,13 +8334,13 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .command('delete-batch [test-ids...]')
     .description(
       'Permanently delete multiple tests in one command. Requires --confirm.\n' +
-        'Use --all --project <id> to delete all tests in a project (optionally filtered by --status).\n' +
-        '\nPrints a per-test summary (Deleted N, Skipped M, Failed K) to stdout.\n' +
-        '\nExit codes:\n' +
-        '  0  all targeted tests deleted (or --dry-run)\n' +
-        '  1  one or more deletions failed (server error)\n' +
-        '  5  validation error (missing --confirm, missing --project with --all, etc.)\n' +
-        '\nNote: a 404 "not found" response is counted as skipped in the summary, not an error.',
+      'Use --all --project <id> to delete all tests in a project (optionally filtered by --status).\n' +
+      '\nPrints a per-test summary (Deleted N, Skipped M, Failed K) to stdout.\n' +
+      '\nExit codes:\n' +
+      '  0  all targeted tests deleted (or --dry-run)\n' +
+      '  1  one or more deletions failed (server error)\n' +
+      '  5  validation error (missing --confirm, missing --project with --all, etc.)\n' +
+      '\nNote: a 404 "not found" response is counted as skipped in the summary, not an error.',
     )
     .option('--confirm', 'required: explicit confirmation for the destructive operation', false)
     .option('--all', 'delete all tests in the resolved project (requires --project)', false)
@@ -8369,18 +8375,18 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .command('run [test-id]')
     .description(
       'Trigger a test run. With --wait, polls until terminal status.\n' +
-        'Use --all --project <id> for a wave-ordered batch run of all BE tests (M4).\n' +
-        '\nExit codes:\n' +
-        '  0  passed (or queued without --wait)\n' +
-        '  1  failed / blocked / cancelled\n' +
-        '  3  auth error\n' +
-        '  4  test not found\n' +
-        '  5  validation error (e.g., bad --target-url, or positional + --all both set)\n' +
-        '  6  conflict (already running — see nextAction for the active runId)\n' +
-        '  7  timeout — resume with: testsprite test wait <run-id>\n' +
-        ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
-        ' 11  rate limited — honor Retry-After\n' +
-        '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>',
+      'Use --all --project <id> for a wave-ordered batch run of all BE tests (M4).\n' +
+      '\nExit codes:\n' +
+      '  0  passed (or queued without --wait)\n' +
+      '  1  failed / blocked / cancelled\n' +
+      '  3  auth error\n' +
+      '  4  test not found\n' +
+      '  5  validation error (e.g., bad --target-url, or positional + --all both set)\n' +
+      '  6  conflict (already running — see nextAction for the active runId)\n' +
+      '  7  timeout — resume with: testsprite test wait <run-id>\n' +
+      ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
+      ' 11  rate limited — honor Retry-After\n' +
+      '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>',
     )
     .option(
       '--target-url <url>',
@@ -8424,11 +8430,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .addHelpText(
       'after',
       '\nDependency-aware fresh run (M4):\n' +
-        '  testsprite test run --all --project <id>           run all BE tests in wave order\n' +
-        '  testsprite test run --all --project <id> --filter <substr>  name-glob subset\n' +
-        '  testsprite test run --all --project <id> --wait --report junit --report-file ./results.xml\n' +
-        '\nBE tests can declare --produces/--needs at create time to drive wave ordering\n' +
-        '(see `testsprite test create --help` for details).',
+      '  testsprite test run --all --project <id>           run all BE tests in wave order\n' +
+      '  testsprite test run --all --project <id> --filter <substr>  name-glob subset\n' +
+      '  testsprite test run --all --project <id> --wait --report junit --report-file ./results.xml\n' +
+      '\nBE tests can declare --produces/--needs at create time to drive wave ordering\n' +
+      '(see `testsprite test create --help` for details).',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testIdArg: string | undefined, cmdOpts: RunFlagOpts, command: Command) => {
@@ -8523,19 +8529,19 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .command('wait <run-id...>')
     .description(
       'Wait for one or more runs to reach a terminal status.\n' +
-        '\nWith several run-ids the runs are polled concurrently under one shared\n' +
-        '--timeout and a {results, summary} envelope is printed (worst status wins\n' +
-        'the exit code), so every re-attach hint the CLI prints can be pasted as\n' +
-        'ONE command.\n' +
-        '\nExit codes:\n' +
-        '  0  passed\n' +
-        '  1  failed / blocked / cancelled\n' +
-        '  3  auth error\n' +
-        '  4  run not found (single run-id; with several ids a per-member poll error\n' +
-        '     is recorded as error:<CODE> in its row and folded into exit 7)\n' +
-        '  7  timeout or per-member poll error — resume with: testsprite test wait <run-id...>\n' +
-        ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
-        '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>',
+      '\nWith several run-ids the runs are polled concurrently under one shared\n' +
+      '--timeout and a {results, summary} envelope is printed (worst status wins\n' +
+      'the exit code), so every re-attach hint the CLI prints can be pasted as\n' +
+      'ONE command.\n' +
+      '\nExit codes:\n' +
+      '  0  passed\n' +
+      '  1  failed / blocked / cancelled\n' +
+      '  3  auth error\n' +
+      '  4  run not found (single run-id; with several ids a per-member poll error\n' +
+      '     is recorded as error:<CODE> in its row and folded into exit 7)\n' +
+      '  7  timeout or per-member poll error — resume with: testsprite test wait <run-id...>\n' +
+      ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
+      '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>',
     )
     .option('--timeout <s>', `max seconds to wait (1–3600, default ${DEFAULT_RUN_TIMEOUT_SECONDS})`)
     .option(
@@ -8580,16 +8586,16 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .command('rerun [test-ids...]')
     .description(
       'Re-execute a test (or multiple) as a cheap replay — FE replays the saved script (no credit), BE re-runs the dependency closure.\n' +
-        '\nExit codes:\n' +
-        '  0  passed (or queued without --wait)\n' +
-        '  1  failed / blocked / cancelled\n' +
-        '  3  auth error\n' +
-        '  4  test not found\n' +
-        '  5  validation error\n' +
-        '  6  conflict (already running — see nextAction for the active runId)\n' +
-        '  7  timeout or deferred — resume with: testsprite test wait <run-id>\n' +
-        ' 11  rate limited — honor Retry-After\n' +
-        '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>',
+      '\nExit codes:\n' +
+      '  0  passed (or queued without --wait)\n' +
+      '  1  failed / blocked / cancelled\n' +
+      '  3  auth error\n' +
+      '  4  test not found\n' +
+      '  5  validation error\n' +
+      '  6  conflict (already running — see nextAction for the active runId)\n' +
+      '  7  timeout or deferred — resume with: testsprite test wait <run-id>\n' +
+      ' 11  rate limited — honor Retry-After\n' +
+      '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>',
     )
     .option('--all', 'rerun all tests in the resolved project (requires --project)', false)
     .option(
@@ -8643,20 +8649,20 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .addHelpText(
       'after',
       '\nNotes:\n' +
-        '  • rerun replays a saved run/script and is MORE LENIENT than a fresh `test run`\n' +
-        '    (auto-heal can pass steps that have drifted) — for strict scoring/regression,\n' +
-        '    prefer `test run`. The two are not interchangeable for pass-rate measurement.\n' +
-        '  • Under --wait the per-request HTTP timeout is auto-raised to cover --timeout so a\n' +
-        '    slow trigger/poll under load is not cut at the 120s default (see --request-timeout).\n' +
-        '  • Batch --wait: rate-deferred tests appear in `deferred[]` and `summary.deferred`,\n' +
-        '    and force a non-zero exit — they are NOT counted in `summary.total` (dispatched only).',
+      '  • rerun replays a saved run/script and is MORE LENIENT than a fresh `test run`\n' +
+      '    (auto-heal can pass steps that have drifted) — for strict scoring/regression,\n' +
+      '    prefer `test run`. The two are not interchangeable for pass-rate measurement.\n' +
+      '  • Under --wait the per-request HTTP timeout is auto-raised to cover --timeout so a\n' +
+      '    slow trigger/poll under load is not cut at the 120s default (see --request-timeout).\n' +
+      '  • Batch --wait: rate-deferred tests appear in `deferred[]` and `summary.deferred`,\n' +
+      '    and force a non-zero exit — they are NOT counted in `summary.total` (dispatched only).',
     )
     .addHelpText(
       'after',
       '\nDry-run shape notes:\n' +
-        '  • --dry-run shows the BE rerun wire shape (includes `closure{}`); FE rerun responses\n' +
-        '    omit `closure` (or return it as null) since there is no dependency expansion.\n' +
-        '  • `autoHeal` defaults true for FE reruns; BE reruns ignore the field entirely.',
+      '  • --dry-run shows the BE rerun wire shape (includes `closure{}`); FE rerun responses\n' +
+      '    omit `closure` (or return it as null) since there is no dependency expansion.\n' +
+      '  • `autoHeal` defaults true for FE reruns; BE reruns ignore the field entirely.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testIdsArg: string[], cmdOpts: RerunFlagOpts, command: Command) => {
@@ -8709,13 +8715,13 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .command('flaky <test-id>')
     .description(
       'Repeatedly replay a test to measure stability and surface flakiness.\n' +
-        'Replays run with auto-heal OFF (strict verbatim) so healed drift cannot mask nondeterministic pass/fail.\n' +
-        '\nExit codes:\n' +
-        '  0  stable (every attempt passed)\n' +
-        '  1  flaky or failing (at least one attempt did not pass)\n' +
-        '  3  auth error\n' +
-        '  4  test not found (no replayable run — trigger `testsprite test run <id>` first)\n' +
-        '  5  validation error',
+      'Replays run with auto-heal OFF (strict verbatim) so healed drift cannot mask nondeterministic pass/fail.\n' +
+      '\nExit codes:\n' +
+      '  0  stable (every attempt passed)\n' +
+      '  1  flaky or failing (at least one attempt did not pass)\n' +
+      '  3  auth error\n' +
+      '  4  test not found (no replayable run — trigger `testsprite test run <id>` first)\n' +
+      '  5  validation error',
     )
     .option(
       '--runs <n>',
@@ -8733,11 +8739,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .addHelpText(
       'after',
       '\nNotes:\n' +
-        '  • Frontend replays are free verbatim script replays (no credit); backend replays\n' +
-        '    re-run the dependency closure and may cost credits — a one-line advisory is printed.\n' +
-        '  • Replays use auto-heal OFF so a flaky test is not silently "healed" into a pass;\n' +
-        '    this measures replay stability of the saved script against the configured URL.\n' +
-        '  • `--output json` emits a machine-readable stability report for CI gating.',
+      '  • Frontend replays are free verbatim script replays (no credit); backend replays\n' +
+      '    re-run the dependency closure and may cost credits — a one-line advisory is printed.\n' +
+      '  • Replays use auto-heal OFF so a flaky test is not silently "healed" into a pass;\n' +
+      '    this measures replay stability of the saved script against the configured URL.\n' +
+      '  • `--output json` emits a machine-readable stability report for CI gating.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(
@@ -8845,7 +8851,7 @@ export async function runFlaky(
   if (isBackend) {
     stderrFn(
       `[advisory] ${opts.testId} is a backend test — each replay re-runs its dependency closure ` +
-        `and may cost credits. Frontend replays are free verbatim script replays; backend replays are not.`,
+      `and may cost credits. Frontend replays are free verbatim script replays; backend replays are not.`,
     );
   }
 
@@ -9629,10 +9635,10 @@ function plannedBundleFiles(ctx: CliFailureContext, failedOnly: boolean): string
 
   const stepsToInclude = failedOnly
     ? ctx.steps.filter(s => {
-        if (ctx.result.failedStepIndex === null) return false;
-        const target = ctx.result.failedStepIndex;
-        return s.stepIndex >= target - 1 && s.stepIndex <= target + 1;
-      })
+      if (ctx.result.failedStepIndex === null) return false;
+      const target = ctx.result.failedStepIndex;
+      return s.stepIndex >= target - 1 && s.stepIndex <= target + 1;
+    })
     : ctx.steps;
 
   for (const step of stepsToInclude) {
@@ -9839,9 +9845,9 @@ function createTestCodeCommand(deps: TestDeps): Command {
     .addHelpText(
       'after',
       '\nDry-run note: --dry-run always returns the happy response shape.\n' +
-        'To preview the 412 retry-hint path, combine with --dry-run-simulate-error PRECONDITION_FAILED.\n' +
-        '\n' +
-        GLOBAL_OPTS_HINT,
+      'To preview the 412 retry-hint path, combine with --dry-run-simulate-error PRECONDITION_FAILED.\n' +
+      '\n' +
+      GLOBAL_OPTS_HINT,
     )
     .action(async (testId: string, cmdOpts: CodePutFlagOpts, command: Command) => {
       const simulateError = cmdOpts.dryRunSimulateError;
@@ -9896,9 +9902,9 @@ function createTestPlanCommand(deps: TestDeps): Command {
     .addHelpText(
       'after',
       '\nDry-run note: --dry-run always returns the happy response shape.\n' +
-        'To preview the 412 retry-hint path, combine with --dry-run-simulate-error PRECONDITION_FAILED.\n' +
-        '\n' +
-        GLOBAL_OPTS_HINT,
+      'To preview the 412 retry-hint path, combine with --dry-run-simulate-error PRECONDITION_FAILED.\n' +
+      '\n' +
+      GLOBAL_OPTS_HINT,
     )
     .action(async (testId: string, cmdOpts: PlanPutFlagOpts, command: Command) => {
       const simulateError = cmdOpts.dryRunSimulateError;
