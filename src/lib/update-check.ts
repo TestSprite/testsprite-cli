@@ -93,6 +93,7 @@ export interface UpdateCheckDeps {
   stderr?: (line: string) => void;
   /** Version the running binary reports. */
   currentVersion?: string;
+  argv?: string[];
 }
 
 type ResolvedUpdateCheckDeps = Required<UpdateCheckDeps>;
@@ -114,10 +115,11 @@ function resolveUpdateCheckDeps(deps: UpdateCheckDeps): ResolvedUpdateCheckDeps 
     isTTY: deps.isTTY ?? process.stderr.isTTY === true,
     stderr: deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`)),
     currentVersion: deps.currentVersion ?? VERSION,
+    argv: deps.argv ?? process.argv,
   };
 }
 
-function isDebugLoggingEnabled(argv: string[] = process.argv): boolean {
+function isDebugLoggingEnabled(argv: string[]): boolean {
   return argv.includes('--debug') || argv.includes('--verbose');
 }
 
@@ -133,7 +135,7 @@ function readUpdateCheckCache(resolved: ResolvedUpdateCheckDeps): UpdateCheckCac
     const parsed = v.safeParse(UPDATE_CHECK_CACHE_SCHEMA, body);
     return parsed.success ? parsed.output : undefined;
   } catch (err) {
-    if (isDebugLoggingEnabled()) {
+    if (isDebugLoggingEnabled(resolved.argv)) {
       resolved.stderr(`[debug] readUpdateCheckCache: ${err instanceof Error ? err.message : String(err)}`);
     }
     // Missing or unreadable cache: treat as stale.
@@ -151,7 +153,7 @@ function writeUpdateCheckCache(resolved: ResolvedUpdateCheckDeps, cache: UpdateC
     resolved.mkdir(dirname(resolved.cachePath));
     resolved.writeFile(resolved.cachePath, `${JSON.stringify(cache)}\n`);
   } catch (err) {
-    if (isDebugLoggingEnabled()) {
+    if (isDebugLoggingEnabled(resolved.argv)) {
       resolved.stderr(`[debug] writeUpdateCheckCache: ${err instanceof Error ? err.message : String(err)}`);
     }
     // Cache persistence is optional; never surface fs errors to the command.
