@@ -595,13 +595,18 @@ describe('findSample', () => {
     expect(body.summary.total).toBeGreaterThanOrEqual(1);
   });
 
-  it('only one getRun entry exists in the registry (no duplicate)', () => {
-    // Guards against re-introducing the duplicate by ensuring exactly one
-    // sample is registered for GET /runs/{runId}.
-    const matches = DRY_RUN_SAMPLE_ENTRIES.filter(
-      e => e.method === 'GET' && e.operationId === 'getRun',
+  it('keeps the failed run sentinel before the generic getRun sample', () => {
+    // findSample is first-match-wins; exact run fixtures must precede
+    // `/runs/{runId}` so `test wait --dry-run` still gets the passed sample.
+    const failedRunIndex = DRY_RUN_SAMPLE_ENTRIES.findIndex(
+      e => e.method === 'GET' && e.pathTemplate === '/runs/run_failed_sample',
     );
-    expect(matches).toHaveLength(1);
+    const genericRunIndex = DRY_RUN_SAMPLE_ENTRIES.findIndex(
+      e => e.method === 'GET' && e.pathTemplate === '/runs/{runId}',
+    );
+    expect(failedRunIndex).toBeGreaterThanOrEqual(0);
+    expect(genericRunIndex).toBeGreaterThanOrEqual(0);
+    expect(failedRunIndex).toBeLessThan(genericRunIndex);
   });
 
   // Input-derived sample tests (Fix #1 — dogfood 2026-05-15)

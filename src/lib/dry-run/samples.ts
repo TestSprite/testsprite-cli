@@ -369,9 +369,9 @@ const passedRunSample: RunResponse = {
   error: null,
   videoUrl: null,
   stepSummary: {
-    total: 8,
-    completed: 8,
-    passedCount: 8,
+    total: 2,
+    completed: 2,
+    passedCount: 2,
     failedCount: 0,
   },
   // Representative per-run steps so `test steps --run-id <id> --dry-run`
@@ -823,6 +823,7 @@ const ENTRIES: DryRunSampleEntry[] = [
   // fix(2026-05-21): a duplicate failed-shape entry that appeared before
   // this entry was removed; findSample first-match-wins was always
   // returning status: "failed" for `test wait --dry-run`.
+  entry('getRun', 'GET', `/runs/${SAMPLE_FAILED_RUN_ID}`, failedRunSample),
   entry('getRun', 'GET', '/runs/{runId}', passedRunSample),
   // DEV-331 piece 3 — POST /runs/{runId}/cancel. Method-guarded in
   // `findSample` (POST vs `getRun`'s GET), so this can't be shadowed by the
@@ -905,10 +906,7 @@ export function findSample(
   const pathOnly = extractPath(url);
   for (const e of ENTRIES) {
     if (e.method === upper && e.pattern.test(pathOnly)) {
-      const body =
-        e.operationId === 'getRun' && pathOnly === `/runs/${SAMPLE_FAILED_RUN_ID}`
-          ? failedRunSample
-          : e.body(requestBody);
+      const body = e.body(requestBody);
       // Rebind body so callers get the resolved value, not the factory.
       // We return a new object with `body` already applied so downstream
       // code can keep calling `e.body` as-before (no API break for tests
