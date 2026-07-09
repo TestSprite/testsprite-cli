@@ -906,12 +906,9 @@ export function findSample(
   const pathOnly = extractPath(url);
   for (const e of ENTRIES) {
     if (e.method === upper && e.pattern.test(pathOnly)) {
-      const body = e.body(requestBody);
-      // Rebind body so callers get the resolved value, not the factory.
-      // We return a new object with `body` already applied so downstream
-      // code can keep calling `e.body` as-before (no API break for tests
-      // that call `findSample` directly).
-      return { ...e, body: () => body };
+      // Rebind body so downstream code can call `e.body` as before while
+      // still preserving the original lazy factory semantics.
+      return { ...e, body: () => e.body(requestBody) };
     }
   }
   return undefined;
