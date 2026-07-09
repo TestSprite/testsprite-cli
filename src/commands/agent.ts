@@ -1061,7 +1061,7 @@ function collect(v: string, prev: string[]): string[] {
 
 export function createAgentCommand(deps: AgentDeps = {}): Command {
   const agent = new Command('agent').description(
-    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Windsurf, Antigravity, Codex)',
+    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Kiro, Windsurf, Copilot, Codex)',
   );
 
   agent
@@ -1071,7 +1071,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
     )
     .option(
       '--target <t>',
-      'Agent target(s): claude, cursor, cline, antigravity, kiro, windsurf, codex (comma-separated or repeated)',
+      'Agent target(s): claude, cursor, cline, antigravity, kiro, windsurf, copilot, codex (comma-separated or repeated)',
       collect,
       [],
     )

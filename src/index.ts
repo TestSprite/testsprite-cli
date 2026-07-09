@@ -3,6 +3,7 @@
 import { Command, CommanderError } from 'commander';
 import { createAgentCommand } from './commands/agent.js';
 import { createAuthCommand } from './commands/auth.js';
+import { createDoctorCommand } from './commands/doctor.js';
 import {
   createDeprecatedInitCommand,
   createSetupCommand,
@@ -12,6 +13,7 @@ import { createProjectCommand } from './commands/project.js';
 import { createTestCommand } from './commands/test.js';
 import { createUsageCommand } from './commands/usage.js';
 import { ApiError, CLIError, RequestTimeoutError } from './lib/errors.js';
+import { installBrokenPipeGuard, installSignalHandlers } from './lib/interrupt.js';
 import { Output, isOutputMode } from './lib/output.js';
 import { maybeInstallProxyAgent } from './lib/proxy.js';
 import { renderCommanderError, rephraseUnknownOption } from './lib/render-error.js';
@@ -89,6 +91,7 @@ program.addCommand(createProjectCommand({}));
 program.addCommand(createTestCommand());
 program.addCommand(createAgentCommand({}));
 program.addCommand(createUsageCommand());
+program.addCommand(createDoctorCommand());
 
 // Buffer Commander error messages instead of writing immediately. The catch
 // block re-emits in the correct format (JSON or text) once the requested
@@ -160,6 +163,14 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     void maybeNotifyUpdate();
   }
 });
+
+// Clean process lifecycle: a clear message + conventional exit code on SIGINT /
+// SIGTERM / SIGHUP (instead of Node's silent abrupt kill) so an interrupted
+// `test run --wait` explains the run continues server-side; plus an EPIPE guard
+// so piping to a reader that closes early (`| head`) exits cleanly instead of
+// dumping a raw `write EPIPE` stack.
+installSignalHandlers();
+installBrokenPipeGuard();
 
 // Corporate/CI proxies: honor HTTPS_PROXY/HTTP_PROXY/NO_PROXY (Node's fetch
 // ignores them by default). No-op when no proxy variable is set.

@@ -174,6 +174,11 @@ describe('content integrity', () => {
         expect(content.startsWith('---'), `windsurf: should start with ---`).toBe(true);
         expect(content).toContain('trigger: model_decision');
         expect(content).toContain('description:');
+      } else if (target === 'copilot') {
+        // GitHub Copilot instructions frontmatter: applyTo glob + description
+        expect(content.startsWith('---'), `copilot: should start with ---`).toBe(true);
+        expect(content).toContain("applyTo: '**'");
+        expect(content).toContain('description:');
       }
 
       // (b) branding — the renamed H1 must be present in every body variant
@@ -211,6 +216,9 @@ describe('content integrity', () => {
         expect(content.startsWith('---'), `windsurf/onboard: should start with ---`).toBe(true);
         expect(content).toContain('trigger: model_decision');
         expect(content).toContain('description:');
+      } else if (target === 'copilot') {
+        expect(content.startsWith('---'), `copilot/onboard: should start with ---`).toBe(true);
+        expect(content).toContain("applyTo: '**'");
       }
 
       // Load-bearing onboard string: the skill body must reference setup
@@ -803,7 +811,7 @@ describe('agent list', () => {
     }>;
     expect(Array.isArray(parsed)).toBe(true);
 
-    // Expected: 7 targets × 2 skills = 14 rows
+    // Expected: 8 targets × 2 skills = 16 rows
     const expectedCount = Object.keys(TARGETS).length * DEFAULT_SKILLS.length;
     expect(parsed.length).toBe(expectedCount);
 
@@ -839,6 +847,7 @@ describe('matrix coverage guard', () => {
       'cline',
       'kiro',
       'windsurf',
+      'copilot',
       'codex',
     ]);
   });

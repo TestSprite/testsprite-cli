@@ -80,19 +80,29 @@ testsprite test artifact get <run-id> --out ./out/
 // ---------------------------------------------------------------------------
 
 describe('TARGETS', () => {
-  it('has all seven required keys', () => {
+  it('has all eight required keys', () => {
     const keys = Object.keys(TARGETS).sort();
-    expect(keys).toEqual(['antigravity', 'claude', 'cline', 'codex', 'cursor', 'kiro', 'windsurf']);
+    expect(keys).toEqual([
+      'antigravity',
+      'claude',
+      'cline',
+      'codex',
+      'copilot',
+      'cursor',
+      'kiro',
+      'windsurf',
+    ]);
   });
 
   it('claude is GA', () => {
     expect(TARGETS.claude.status).toBe('ga');
   });
 
-  it('cursor, cline, windsurf, antigravity, kiro, and codex are experimental', () => {
+  it('cursor, cline, windsurf, copilot, antigravity, kiro, and codex are experimental', () => {
     expect(TARGETS.cursor.status).toBe('experimental');
     expect(TARGETS.cline.status).toBe('experimental');
     expect(TARGETS.windsurf.status).toBe('experimental');
+    expect(TARGETS.copilot.status).toBe('experimental');
     expect(TARGETS.antigravity.status).toBe('experimental');
     expect(TARGETS.kiro.status).toBe('experimental');
     expect(TARGETS.codex.status).toBe('experimental');
@@ -112,6 +122,7 @@ describe('TARGETS', () => {
     expect(TARGETS.cline.mode).toBe('own-file');
     expect(TARGETS.kiro.mode).toBe('own-file');
     expect(TARGETS.windsurf.mode).toBe('own-file');
+    expect(TARGETS.copilot.mode).toBe('own-file');
   });
 
   it('codex target has mode managed-section', () => {
@@ -341,11 +352,45 @@ describe('windsurf renders within the rules-file budget', () => {
   });
 });
 
+describe('renderForTarget("copilot")', () => {
+  const result = renderForTarget('copilot', 'testsprite-verify', STUB_BODY);
+
+  it('returns the .github/instructions path', () => {
+    expect(result.path).toBe('.github/instructions/testsprite-verify.instructions.md');
+  });
+
+  it('uses the Copilot frontmatter (applyTo + description)', () => {
+    expect(result.content.startsWith('---\n')).toBe(true);
+    expect(result.content).toContain(`description: ${SKILL_DESCRIPTION}`);
+    expect(result.content).toContain("applyTo: '**'");
+  });
+
+  it('does NOT carry the Claude/Cursor/Windsurf frontmatter keys', () => {
+    const match = /^---\n([\s\S]*?)\n---/.exec(result.content);
+    const fm = match?.[1] ?? '';
+    expect(fm).not.toContain('name:'); // claude key
+    expect(fm).not.toContain('alwaysApply:'); // cursor .mdc key
+    expect(fm).not.toContain('trigger:'); // windsurf Cascade key
+  });
+
+  it('renders the compact verify body (applyTo:** is always-on, so keep it small)', () => {
+    // Uses the REAL bodies (no stub): copilot always-injects, so like windsurf it
+    // ships the trimmed verify body while keeping the load-bearing command.
+    const copilot = renderForTarget('copilot', 'testsprite-verify');
+    const claude = renderForTarget('claude', 'testsprite-verify');
+    expect(copilot.content.length).toBeLessThan(claude.content.length);
+    expect(copilot.content).not.toContain('The verification loop that flies');
+    expect(copilot.content).toContain('testsprite test run');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Content integrity — load-bearing command strings must survive any body trim
 // ---------------------------------------------------------------------------
 
 describe('content integrity — own-file targets', () => {
+  // Full-body own-file targets. Compact-body targets (windsurf, copilot) are
+  // excluded — they render the trimmed verify body; see their dedicated tests.
   const ownFileTargets: Array<'claude' | 'cursor' | 'cline' | 'antigravity' | 'kiro'> = [
     'claude',
     'cursor',

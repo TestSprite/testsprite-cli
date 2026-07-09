@@ -229,6 +229,7 @@ describe('matrix coverage guard', () => {
       'cline',
       'kiro',
       'windsurf',
+      'copilot',
       'codex',
     ]);
   });

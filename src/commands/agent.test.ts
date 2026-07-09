@@ -769,13 +769,14 @@ describe('runList', () => {
 
     const json = JSON.parse(capture.stdout.join('\n')) as ListResult[];
     expect(Array.isArray(json)).toBe(true);
-    // 7 targets × 2 default skills = 14 rows
-    expect(json).toHaveLength(14);
+    // 8 targets × 2 default skills = 16 rows
+    expect(json).toHaveLength(16);
     const targets = json.map(r => r.target);
     expect(targets).toContain('claude');
     expect(targets).toContain('cursor');
     expect(targets).toContain('cline');
     expect(targets).toContain('windsurf');
+    expect(targets).toContain('copilot');
     expect(targets).toContain('antigravity');
     expect(targets).toContain('kiro');
     expect(targets).toContain('codex');
@@ -949,11 +950,11 @@ describe('runInstall — all own-file targets', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Dry-run for all six own-file targets
+// Dry-run for all seven own-file targets
 // ---------------------------------------------------------------------------
 
 describe('runInstall — dry-run all own-file targets', () => {
-  it('writes nothing for any of the six own-file targets (default 2 skills = 12 would-write lines)', async () => {
+  it('writes nothing for any of the seven own-file targets (default 2 skills = 14 would-write lines)', async () => {
     const { store, fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -963,7 +964,7 @@ describe('runInstall — dry-run all own-file targets', () => {
         output: 'text',
         debug: false,
         dryRun: true,
-        target: ['claude', 'cursor', 'cline', 'antigravity', 'kiro', 'windsurf'],
+        target: ['claude', 'cursor', 'cline', 'antigravity', 'kiro', 'windsurf', 'copilot'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -973,9 +974,9 @@ describe('runInstall — dry-run all own-file targets', () => {
     const stderrOut = capture.stderr.join('\n');
     // Banner appears once
     expect(stderrOut).toContain('[dry-run] no files written');
-    // 6 targets × 2 default skills = 12 would-write lines
+    // 7 targets × 2 default skills = 14 would-write lines
     const wouldWriteLines = stderrOut.split('\n').filter(l => l.includes('would write'));
-    expect(wouldWriteLines.length).toBe(12);
+    expect(wouldWriteLines.length).toBe(14);
   });
 });
 

@@ -850,6 +850,20 @@ describe('runWhoami', () => {
     expect(printed).toEqual(sampleMe);
   });
 
+  it('dry-run: whitespace-only TESTSPRITE_API_URL falls through to prod default endpoint', async () => {
+    const { capture, deps } = makeCapture();
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false, dryRun: true },
+      {
+        ...deps,
+        env: { TESTSPRITE_API_URL: '   ' },
+        credentialsPath,
+      },
+    );
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('endpoint: https://api.testsprite.com');
+  });
+
   it('L1788: text output includes the resolved endpoint URL', async () => {
     writeProfile(
       'default',

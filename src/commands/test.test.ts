@@ -35,7 +35,9 @@ import {
   runList,
   runPlanPut,
   runResult,
+  runScaffold,
   runSteps,
+  runTestWaitMany,
   runUpdate,
 } from './test.js';
 
@@ -133,6 +135,7 @@ describe('createTestCommand — surface', () => {
       'rerun',
       'result',
       'run',
+      'scaffold',
       'steps',
       'update',
       'wait',
@@ -2324,6 +2327,94 @@ describe('runCodePut', () => {
   });
 });
 
+describe('runScaffold', () => {
+  it('frontend scaffold is a valid CliPlanInput and prints as JSON on stdout', async () => {
+    const out: string[] = [];
+    const result = await runScaffold(
+      { profile: 'default', output: 'text', debug: false, scaffoldType: 'frontend', force: false },
+      { stdout: line => out.push(line), stderr: () => undefined, env: {} },
+    );
+    const plan = result as { projectId: string; type: string; planSteps: Array<{ type: string }> };
+    expect(plan.type).toBe('frontend');
+    // Placeholder project id when TESTSPRITE_PROJECT_ID is unset.
+    expect(plan.projectId).toContain('testsprite project list');
+    expect(plan.planSteps.length).toBeGreaterThanOrEqual(2);
+    // Every emitted step type must come from the real enum (no drift).
+    for (const step of plan.planSteps) expect(['action', 'assertion']).toContain(step.type);
+    // At least one assertion step so the scaffold is a meaningful test.
+    expect(plan.planSteps.some(step => step.type === 'assertion')).toBe(true);
+    // stdout body parses back to the same plan (`> plan.json` works).
+    expect(JSON.parse(out.join('\n'))).toEqual(plan);
+  });
+
+  it('pre-fills projectId from TESTSPRITE_PROJECT_ID when set', async () => {
+    const result = await runScaffold(
+      { profile: 'default', output: 'json', debug: false, scaffoldType: 'frontend', force: false },
+      {
+        stdout: () => undefined,
+        stderr: () => undefined,
+        env: { TESTSPRITE_PROJECT_ID: 'project_env' },
+      },
+    );
+    expect((result as { projectId: string }).projectId).toBe('project_env');
+  });
+
+  it('backend scaffold defines a requests test with a status assertion AND calls it', async () => {
+    const out: string[] = [];
+    const result = await runScaffold(
+      { profile: 'default', output: 'text', debug: false, scaffoldType: 'backend', force: false },
+      { stdout: line => out.push(line), stderr: () => undefined, env: {} },
+    );
+    const code = (result as { code: string }).code;
+    expect(code).toContain('import requests');
+    expect(code).toContain('assert response.status_code == 200');
+    // The onboarding rule: the function must be CALLED, not just defined.
+    expect(code).toContain('\ntest_health_endpoint()');
+    expect(out.join('\n')).toContain('import requests');
+  });
+
+  it('--out writes the file and refuses to overwrite without --force', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-scaffold-'));
+    const target = join(dir, 'plan.json');
+    const opts = {
+      profile: 'default',
+      output: 'text',
+      debug: false,
+      scaffoldType: 'frontend',
+      out: target,
+      force: false,
+    } as const;
+    const deps = { stdout: () => undefined, stderr: () => undefined, env: {} };
+    await runScaffold({ ...opts }, deps);
+    const written = JSON.parse(readFileSync(target, 'utf8')) as { type: string };
+    expect(written.type).toBe('frontend');
+    // Second run without --force must not clobber the (possibly edited) file.
+    await expect(runScaffold({ ...opts }, deps)).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+    });
+    // --force overwrites.
+    await expect(runScaffold({ ...opts, force: true }, deps)).resolves.toBeDefined();
+  });
+
+  it('--out pointing at an existing path (here a directory) rejects without --force', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-scaffold-dir-'));
+    await expect(
+      runScaffold(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          scaffoldType: 'frontend',
+          out: dir,
+          force: false,
+        },
+        { stdout: () => undefined, stderr: () => undefined, env: {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+});
+
 describe('runSteps', () => {
   it('JSON mode returns the §6.4 wire shape and forwards pageSize/cursor', async () => {
     const { credentialsPath } = makeCreds();
@@ -3039,6 +3130,160 @@ describe('runLint', () => {
     await expect(
       runLint({ profile: 'default', output: 'json', debug: false }, { stdout: () => undefined }),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+});
+
+describe('runTestWaitMany', () => {
+  const terminalRun = (runId: string, status: string) => ({
+    runId,
+    testId: `test_of_${runId}`,
+    projectId: 'project_alice',
+    userId: 'u1',
+    status,
+    source: 'cli',
+    createdAt: '2026-06-01T10:00:00.000Z',
+    startedAt: '2026-06-01T10:00:01.000Z',
+    finishedAt: '2026-06-01T10:00:30.000Z',
+    codeVersion: 'v1',
+    targetUrl: 'https://example.com',
+    createdFrom: null,
+    failedStepIndex: null,
+    failureKind: null,
+    error: null,
+    videoUrl: null,
+    stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
+  });
+
+  it('polls every run, keeps input order, and exits 1 when one finished non-passed', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => ({
+      body: url.includes('run_bad')
+        ? terminalRun('run_bad', 'failed')
+        : terminalRun('run_ok', 'passed'),
+    }));
+    const out: string[] = [];
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_ok', 'run_bad'],
+        timeoutSeconds: 30,
+        maxConcurrency: 2,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 1 });
+    const payload = JSON.parse(out.join('')) as {
+      results: Array<{ runId: string; status: string }>;
+      summary: { passed: number; failed: number };
+    };
+    expect(payload.results.map(row => row.runId)).toEqual(['run_ok', 'run_bad']);
+    expect(payload.summary).toMatchObject({ passed: 1, failed: 1 });
+  });
+
+  it('a member whose poll errors is captured as error:<CODE> and the others survive (exit 7)', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('run_gone')) {
+        return {
+          status: 404,
+          body: {
+            error: {
+              code: 'NOT_FOUND',
+              message: 'no such run',
+              nextAction: 'check the id',
+              requestId: 'req_x',
+              details: {},
+            },
+          },
+        };
+      }
+      return { body: terminalRun('run_ok', 'passed') };
+    });
+    const out: string[] = [];
+    const errs: string[] = [];
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_ok', 'run_gone'],
+        timeoutSeconds: 30,
+        maxConcurrency: 2,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => errs.push(line),
+      },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 7 });
+    const payload = JSON.parse(out.join('')) as {
+      results: Array<{ runId: string; status: string }>;
+    };
+    // The failing member did not abort the pool: the passed verdict survived.
+    expect(payload.results[0]).toMatchObject({ runId: 'run_ok', status: 'passed' });
+    expect(payload.results[1]!.status).toBe('error:NOT_FOUND');
+    // The re-attach hint names the errored member (resumable) but NOT the
+    // already-terminal passed one.
+    const hint = errs.find(line => line.includes('Re-attach with:'));
+    expect(hint).toContain('run_gone');
+    expect(hint).not.toContain('run_ok');
+  });
+
+  it('members dequeued after the shared deadline are not granted extra poll time', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetches = 0;
+    const fetchImpl = makeFetch(() => {
+      fetches += 1;
+      return { body: terminalRun('run_any', 'passed') };
+    });
+    // timeoutSeconds 0: the shared deadline is already in the past when the
+    // pool starts, so every member must resolve to timeout WITHOUT polling
+    // (previously each dequeued member was granted a fresh 1s minimum).
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_a', 'run_b', 'run_c'],
+        timeoutSeconds: 0,
+        maxConcurrency: 1,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 7 });
+    expect(fetches).toBe(0);
+  });
+
+  it('an auth error escalates the exit code to 3', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      status: 401,
+      body: {
+        error: {
+          code: 'AUTH_INVALID',
+          message: 'bad key',
+          nextAction: 'run setup',
+          requestId: 'req_y',
+          details: {},
+        },
+      },
+    }));
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_a', 'run_b'],
+        timeoutSeconds: 30,
+        maxConcurrency: 2,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 3 });
   });
 });
 

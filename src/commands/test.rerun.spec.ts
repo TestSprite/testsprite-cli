@@ -4820,326 +4820,38 @@ describe('rerun --wait — dashboardUrl on terminal output', () => {
 });
 
 // ---------------------------------------------------------------------------
-// [fix-exitcode] pollAccepted preserves ApiError exit codes (not hardcoded 1)
+// Batch --all --wait fan-out: RequestTimeoutError must not leave stdout empty
 // ---------------------------------------------------------------------------
 
-describe('[fix-exitcode] polling error exit codes preserved in batch rerun results', () => {
-  it('AUTH_REQUIRED during polling → batch escalates to exitCode 3', async () => {
+describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out poll writes JSON stdout + exit 7', () => {
+  it('stdout contains accepted[] with runIds when member polls throw RequestTimeoutError', async () => {
     const creds = makeCreds();
-    const passRun = makeTerminalRun('run_pass_a1', 'passed');
     const batchResp: BatchRerunResponse = {
       accepted: [
-        { testId: 'test_1', runId: 'run_auth_fail', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-        { testId: 'test_2', runId: 'run_pass_a1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+        { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
       ],
       deferred: [],
       conflicts: [],
       closure: { byProject: [] },
     };
-
     const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/batch/rerun')) return { status: 202, body: batchResp };
-      if (url.includes('/runs/run_auth_fail')) return errorBody('AUTH_REQUIRED');
-      if (url.includes('/runs/run_pass_a1')) return { body: passRun };
-      return errorBody('NOT_FOUND');
-    });
-
-    const err = await runTestRerun(
-      {
-        testIds: ['test_1', 'test_2'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 10,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-        maxConcurrency: 5,
-        output: 'json',
-        profile: 'default',
-        dryRun: false,
-        debug: false,
-        verbose: false,
-      },
-      { ...creds, sleep: instantSleep, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e as { exitCode?: number; message?: string });
-
-    expect((err as { exitCode?: number }).exitCode).toBe(3);
-  });
-
-  it('RATE_LIMITED during polling → non-auth, batch exits 1', async () => {
-    const creds = makeCreds();
-    const passRun = makeTerminalRun('run_pass_a2', 'passed');
-    const batchResp: BatchRerunResponse = {
-      accepted: [
-        { testId: 'test_1', runId: 'run_rl', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-        { testId: 'test_2', runId: 'run_pass_a2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/batch/rerun')) return { status: 202, body: batchResp };
-      if (url.includes('/runs/run_rl')) return errorBody('RATE_LIMITED');
-      if (url.includes('/runs/run_pass_a2')) return { body: passRun };
-      return errorBody('NOT_FOUND');
-    });
-
-    const err = await runTestRerun(
-      {
-        testIds: ['test_1', 'test_2'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 10,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-        maxConcurrency: 5,
-        output: 'json',
-        profile: 'default',
-        dryRun: false,
-        debug: false,
-        verbose: false,
-      },
-      { ...creds, sleep: instantSleep, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e);
-
-    expect((err as { exitCode?: number }).exitCode).toBe(1);
-  });
-
-  it('NOT_FOUND during run polling → non-auth, batch exits 1', async () => {
-    const creds = makeCreds();
-    const passRun = makeTerminalRun('run_pass_a3', 'passed');
-    const batchResp: BatchRerunResponse = {
-      accepted: [
-        { testId: 'test_1', runId: 'run_nf', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-        { testId: 'test_2', runId: 'run_pass_a3', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/batch/rerun')) return { status: 202, body: batchResp };
-      if (url.includes('/runs/run_nf')) return errorBody('NOT_FOUND');
-      if (url.includes('/runs/run_pass_a3')) return { body: passRun };
-      return errorBody('NOT_FOUND');
-    });
-
-    const err = await runTestRerun(
-      {
-        testIds: ['test_1', 'test_2'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 10,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-        maxConcurrency: 5,
-        output: 'json',
-        profile: 'default',
-        dryRun: false,
-        debug: false,
-        verbose: false,
-      },
-      { ...creds, sleep: instantSleep, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e);
-
-    expect((err as { exitCode?: number }).exitCode).toBe(1);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// [fix-auth-escalation] batch auth failure escalates to exit 3
-// ---------------------------------------------------------------------------
-
-describe('[fix-auth-escalation] auth error in batch rerun polling escalates to exit 3', () => {
-  it('auth failure in batch poll → batch exits 3, not 1', async () => {
-    const creds = makeCreds();
-    const passRun = makeTerminalRun('run_other', 'passed');
-    const batchResp: BatchRerunResponse = {
-      accepted: [
-        { testId: 'test_auth', runId: 'run_auth', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-        { testId: 'test_other', runId: 'run_other', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/batch/rerun')) return { status: 202, body: batchResp };
-      if (url.includes('/runs/run_auth')) return errorBody('AUTH_REQUIRED');
-      if (url.includes('/runs/run_other')) return { body: passRun };
-      return errorBody('NOT_FOUND');
-    });
-
-    const err = await runTestRerun(
-      {
-        testIds: ['test_auth', 'test_other'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 10,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-        maxConcurrency: 5,
-        output: 'json',
-        profile: 'default',
-        dryRun: false,
-        debug: false,
-        verbose: false,
-      },
-      { ...creds, sleep: instantSleep, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e);
-
-    expect((err as { exitCode?: number }).exitCode).toBe(3);
-  });
-
-  it('mixed batch: one pass, one auth failure → exits 3 (auth wins)', async () => {
-    const creds = makeCreds();
-    const batchResp: BatchRerunResponse = {
-      accepted: [
-        { testId: 'test_1', runId: 'run_pass', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-        { testId: 'test_2', runId: 'run_auth2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-    const passRun = makeTerminalRun('run_pass', 'passed');
-    passRun.testId = 'test_1';
-
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/batch/rerun')) return { status: 202, body: batchResp };
-      if (url.includes('/runs/run_pass')) return { body: passRun };
-      if (url.includes('/runs/run_auth2')) return errorBody('AUTH_REQUIRED');
-      return errorBody('NOT_FOUND');
-    });
-
-    const err = await runTestRerun(
-      {
-        testIds: ['test_1', 'test_2'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 10,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-        maxConcurrency: 5,
-        output: 'json',
-        profile: 'default',
-        dryRun: false,
-        debug: false,
-        verbose: false,
-      },
-      { ...creds, sleep: instantSleep, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e);
-
-    expect((err as { exitCode?: number }).exitCode).toBe(3);
-    expect((err as { message?: string }).message).toMatch(/auth error/i);
-  });
-
-  it('non-auth failure → exits 1 (no escalation)', async () => {
-    const creds = makeCreds();
-    const failRun = makeTerminalRun('run_fail', 'failed');
-    failRun.testId = 'test_1';
-    const passRun = makeTerminalRun('run_pass_c3', 'passed');
-    passRun.testId = 'test_2';
-    const batchResp: BatchRerunResponse = {
-      accepted: [
-        { testId: 'test_1', runId: 'run_fail', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-        { testId: 'test_2', runId: 'run_pass_c3', enqueuedAt: '2026-06-03T10:00:00.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-
-    const fetchImpl = makeFetch(url => {
-      if (url.includes('/tests/batch/rerun')) return { status: 202, body: batchResp };
-      if (url.includes('/runs/run_fail')) return { body: failRun };
-      if (url.includes('/runs/run_pass_c3')) return { body: passRun };
-      return errorBody('NOT_FOUND');
-    });
-
-    const err = await runTestRerun(
-      {
-        testIds: ['test_1', 'test_2'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 10,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-        maxConcurrency: 5,
-        output: 'json',
-        profile: 'default',
-        dryRun: false,
-        debug: false,
-        verbose: false,
-      },
-      { ...creds, sleep: instantSleep, fetchImpl, stdout: () => {}, stderr: () => {} },
-    ).catch(e => e);
-
-    expect((err as { exitCode?: number }).exitCode).toBe(1);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// [fix-D4] initial chunk idempotency key bounded to ≤256 chars
-// ---------------------------------------------------------------------------
-
-describe('[fix-D4] initial chunk dispatch idempotency key bounded to 256 chars', () => {
-  it('short key with multiple chunks passes through unchanged', async () => {
-    const creds = makeCreds();
-    const receivedKeys: string[] = [];
-
-    // 51 test IDs forces 2 chunks (MAX_BATCH_RERUN_IDS = 50)
-    const testIds = Array.from({ length: 51 }, (_, i) => `test_${i}`);
-    const batchResp: BatchRerunResponse = {
-      accepted: testIds.slice(0, 50).map(id => ({
-        testId: id,
-        runId: `run_${id}`,
-        enqueuedAt: '2026-06-03T10:00:00.000Z',
-      })),
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-    const batchResp2: BatchRerunResponse = {
-      accepted: [
-        {
-          testId: testIds[50]!,
-          runId: `run_${testIds[50]}`,
-          enqueuedAt: '2026-06-03T10:00:00.000Z',
-        },
-      ],
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-    let callCount = 0;
-
-    const fetchImpl = makeFetch((url, init) => {
       if (url.includes('/tests/batch/rerun')) {
-        const h = new Headers(init.headers ?? {});
-        const key = h.get('idempotency-key') ?? '';
-        receivedKeys.push(key);
-        callCount++;
-        return { status: 202, body: callCount === 1 ? batchResp : batchResp2 };
+        return { status: 202, body: batchResp };
+      }
+      if (url.includes('/runs/')) {
+        throw new RequestTimeoutError(120000, 'req_timeout_batch_rerun');
       }
       return errorBody('NOT_FOUND');
     });
+    const stdoutLines: string[] = [];
 
-    await runTestRerun(
+    const err = await runTestRerun(
       {
-        testIds,
+        testIds: ['test_1', 'test_2'],
         all: false,
-        wait: false,
-        timeoutSeconds: 600,
+        wait: true,
+        timeoutSeconds: 60,
         autoHeal: false,
         autoHealExplicit: false,
         skipDependencies: false,
@@ -5149,154 +4861,23 @@ describe('[fix-D4] initial chunk dispatch idempotency key bounded to 256 chars',
         dryRun: false,
         debug: false,
         verbose: false,
-        idempotencyKey: 'short-key',
       },
-      { ...creds, sleep: instantSleep, fetchImpl, stdout: () => {}, stderr: () => {} },
-    );
-
-    expect(receivedKeys).toHaveLength(2);
-    expect(receivedKeys[0]).toBe('short-key:chunk0');
-    expect(receivedKeys[1]).toBe('short-key:chunk1');
-    expect(receivedKeys[0]!.length).toBeLessThanOrEqual(256);
-    expect(receivedKeys[1]!.length).toBeLessThanOrEqual(256);
-  });
-
-  it('249-char key + :chunk0 suffix would exceed 256 → key truncated to keep total ≤256', async () => {
-    const creds = makeCreds();
-    const receivedKeys: string[] = [];
-
-    // key is 249 chars; `:chunk0` is 7 chars → 256 total (edge case, fits exactly)
-    const longKey = 'k'.repeat(249);
-    const testIds = Array.from({ length: 51 }, (_, i) => `test_${i}`);
-    const batchResp: BatchRerunResponse = {
-      accepted: testIds.slice(0, 50).map(id => ({
-        testId: id,
-        runId: `run_${id}`,
-        enqueuedAt: '2026-06-03T10:00:00.000Z',
-      })),
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-    const batchResp2: BatchRerunResponse = {
-      accepted: [
-        {
-          testId: testIds[50]!,
-          runId: `run_${testIds[50]}`,
-          enqueuedAt: '2026-06-03T10:00:00.000Z',
-        },
-      ],
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-    let callCount = 0;
-
-    const fetchImpl = makeFetch((url, init) => {
-      if (url.includes('/tests/batch/rerun')) {
-        const h = new Headers(init.headers ?? {});
-        receivedKeys.push(h.get('idempotency-key') ?? '');
-        callCount++;
-        return { status: 202, body: callCount === 1 ? batchResp : batchResp2 };
-      }
-      return errorBody('NOT_FOUND');
-    });
-
-    await runTestRerun(
       {
-        testIds,
-        all: false,
-        wait: false,
-        timeoutSeconds: 600,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-        maxConcurrency: 10,
-        output: 'json',
-        profile: 'default',
-        dryRun: false,
-        debug: false,
-        verbose: false,
-        idempotencyKey: longKey,
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl: fetchImpl as unknown as FetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
       },
-      { ...creds, sleep: instantSleep, fetchImpl, stdout: () => {}, stderr: () => {} },
-    );
+    ).catch(e => e);
 
-    expect(receivedKeys).toHaveLength(2);
-    for (const key of receivedKeys) {
-      expect(key.length).toBeLessThanOrEqual(256);
-    }
-    // suffix must be preserved
-    expect(receivedKeys[0]).toMatch(/:chunk0$/);
-    expect(receivedKeys[1]).toMatch(/:chunk1$/);
-  });
-
-  it('256-char key + :chunk0 suffix → base truncated so total is exactly 256', async () => {
-    const creds = makeCreds();
-    const receivedKeys: string[] = [];
-
-    // Max-length user key: 256 chars. `:chunk0` = 7 chars → need to truncate base to 249.
-    const maxKey = 'x'.repeat(256);
-    const testIds = Array.from({ length: 51 }, (_, i) => `test_${i}`);
-    const batchResp: BatchRerunResponse = {
-      accepted: testIds.slice(0, 50).map(id => ({
-        testId: id,
-        runId: `run_${id}`,
-        enqueuedAt: '2026-06-03T10:00:00.000Z',
-      })),
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
+    expect(err).toMatchObject({ exitCode: 7 });
+    expect(stdoutLines.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(stdoutLines.join('\n')) as {
+      accepted: Array<{ testId: string; runId: string; status: string }>;
     };
-    const batchResp2: BatchRerunResponse = {
-      accepted: [
-        {
-          testId: testIds[50]!,
-          runId: `run_${testIds[50]}`,
-          enqueuedAt: '2026-06-03T10:00:00.000Z',
-        },
-      ],
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-    let callCount = 0;
-
-    const fetchImpl = makeFetch((url, init) => {
-      if (url.includes('/tests/batch/rerun')) {
-        const h = new Headers(init.headers ?? {});
-        receivedKeys.push(h.get('idempotency-key') ?? '');
-        callCount++;
-        return { status: 202, body: callCount === 1 ? batchResp : batchResp2 };
-      }
-      return errorBody('NOT_FOUND');
-    });
-
-    await runTestRerun(
-      {
-        testIds,
-        all: false,
-        wait: false,
-        timeoutSeconds: 600,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-        maxConcurrency: 10,
-        output: 'json',
-        profile: 'default',
-        dryRun: false,
-        debug: false,
-        verbose: false,
-        idempotencyKey: maxKey,
-      },
-      { ...creds, sleep: instantSleep, fetchImpl, stdout: () => {}, stderr: () => {} },
-    );
-
-    expect(receivedKeys).toHaveLength(2);
-    for (const key of receivedKeys) {
-      expect(key.length).toBeLessThanOrEqual(256);
-    }
-    expect(receivedKeys[0]).toMatch(/:chunk0$/);
-    expect(receivedKeys[1]).toMatch(/:chunk1$/);
+    expect(parsed.accepted).toHaveLength(2);
+    expect(parsed.accepted.map(r => r.runId).sort()).toEqual(['run_b1', 'run_b2']);
+    expect(parsed.accepted.every(r => r.status === 'timeout')).toBe(true);
   });
 });

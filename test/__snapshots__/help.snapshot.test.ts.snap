@@ -4,7 +4,7 @@ exports[`--help snapshots > agent 1`] = `
 "Usage: testsprite agent [options] [command]
 
 Install TestSprite guidance into coding-agent config (Claude Code, Cursor,
-Cline, Windsurf, Antigravity, Codex)
+Cline, Antigravity, Kiro, Windsurf, Copilot, Codex)
 
 Options:
   -h, --help         display help for command
@@ -29,7 +29,8 @@ into a project for a coding agent
 
 Options:
   --target <t>    Agent target(s): claude, cursor, cline, antigravity, kiro,
-                  windsurf, codex (comma-separated or repeated) (default: [])
+                  windsurf, copilot, codex (comma-separated or repeated)
+                  (default: [])
   --skill <name>  Skill(s) to install: testsprite-verify, testsprite-onboard
                   (comma-separated or repeated; default: all) (default: [])
   --dir <path>    Project root to write into (default: cwd)
@@ -115,8 +116,8 @@ Options:
   --from-env        Read TESTSPRITE_API_KEY from the environment instead of
                     prompting (default: false)
   --agent <target>  Coding-agent target to install: claude, antigravity,
-                    cursor, cline, kiro, windsurf, codex (default: claude)
-                    (default: "claude")
+                    cursor, cline, kiro, windsurf, copilot, codex (default:
+                    claude) (default: "claude")
   --no-agent        Skip the agent skill install (configure credentials only)
   --force           Overwrite an existing skill file (a .bak backup is kept)
   --dir <path>      Project root for the skill install (default: current
@@ -200,6 +201,10 @@ Commands:
                                         (--plan-from, FE-only, M3.2 piece-5)
   create-batch [options]                Create multiple FE tests from a JSONL
                                         of plan specs (FE-only)
+  scaffold [options]                    Emit a schema-correct starter test
+                                        definition (frontend plan JSON by
+                                        default, or a backend Python skeleton).
+                                        Pure-local: no network, no credentials.
   steps [options] <test-id>             List the steps for a test (server
                                         returns the cumulative log across every
                                         run; use --run-id to scope to one run)
@@ -251,14 +256,20 @@ Commands:
    11  rate limited — honor Retry-After
   
   On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
-  wait [options] <run-id>               Wait for a run to reach a terminal status.
+  wait [options] <run-id...>            Wait for one or more runs to reach a terminal status.
+  
+  With several run-ids the runs are polled concurrently under one shared
+  --timeout and a {results, summary} envelope is printed (worst status wins
+  the exit code), so every re-attach hint the CLI prints can be pasted as
+  ONE command.
   
   Exit codes:
     0  passed
     1  failed / blocked / cancelled
     3  auth error
-    4  run not found
-    7  timeout — resume with: testsprite test wait <run-id>
+    4  run not found (single run-id; with several ids a per-member poll error
+       is recorded as error:<CODE> in its row and folded into exit 7)
+    7  timeout or per-member poll error — resume with: testsprite test wait <run-id...>
    10  transport/network failure (UNAVAILABLE) — retry the command
   
   On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
@@ -650,10 +661,12 @@ Commands:
   project                      Manage TestSprite projects
   test                         Inspect TestSprite tests
   agent                        Install TestSprite guidance into coding-agent
-                               config (Claude Code, Cursor, Cline, Windsurf,
-                               Antigravity, Codex)
+                               config (Claude Code, Cursor, Cline, Antigravity,
+                               Kiro, Windsurf, Copilot, Codex)
   usage|credits                Show credit balance and plan/entitlement info
                                (proactive pre-flight before a large test run)
+  doctor                       Diagnose CLI setup: version, Node, profile,
+                               endpoint, credentials, connectivity, skill
   help [command]               display help for command
 "
 `;

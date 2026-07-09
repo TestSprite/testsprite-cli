@@ -89,28 +89,28 @@ Prefer to configure each step by hand (or learn the surface offline with `--dry-
 
 ## Commands
 
-| Group     | Command                                             | What it does                                                                                                           |
-| --------- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| **Setup** | `setup`                                             | **Start here** — one command: configure your API key, verify it, and install the agent verification skill              |
-| **Auth**  | `auth status`                                       | Resolve the active profile to its user, key, env, and scopes                                                           |
-|           | `auth remove`                                       | Remove the active profile from the credentials file                                                                    |
-| **Read**  | `project list` / `project get`                      | List projects / fetch one by id                                                                                        |
-|           | `test list` / `test get`                            | List tests under a project / fetch one by id                                                                           |
-|           | `test code get`                                     | Print (or write) the generated test source                                                                             |
-|           | `test steps`                                        | List the latest run's steps with screenshot / DOM pointers                                                             |
-|           | `test result`                                       | Latest result; `--history` lists a test's prior runs                                                                   |
-|           | `test failure get`                                  | The agent entry point: one self-contained latest-failure bundle                                                        |
-|           | `test failure summary`                              | One-screen triage card (no media download)                                                                             |
-| **Write** | `test create` / `test create-batch`                 | Create a test (or bulk-create from a plan file); `--produces` / `--needs` / `--category` wire BE dependency metadata   |
-|           | `test update` / `test delete` / `test delete-batch` | Edit metadata / soft-delete                                                                                            |
-|           | `test code put`                                     | Replace generated code (etag-guarded)                                                                                  |
-|           | `test plan put`                                     | Replace a frontend test's plan-steps                                                                                   |
-|           | `project create` / `project update`                 | Manage projects                                                                                                        |
-| **Run**   | `test run`                                          | Trigger a fresh run; `--wait` blocks until terminal; `--all --project <id>` runs all tests in a project in wave order  |
-|           | `test rerun`                                        | Cheap replay of one/many tests (FE verbatim; BE with deps); `--all --project <id>` reruns all tests                    |
-|           | `test wait`                                         | Block on a `runId` until terminal                                                                                      |
-|           | `test artifact get`                                 | Download the failure bundle for a specific `runId`                                                                     |
-| **Agent** | `agent install` / `agent list`                      | Add or list coding-agent targets (pure-local): `claude`, `codex`, `cursor`, `cline`, `antigravity`, `kiro`, `windsurf` |
+| Group     | Command                                             | What it does                                                                                                                      |
+| --------- | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| **Setup** | `setup`                                             | **Start here** — one command: configure your API key, verify it, and install the agent verification skill                         |
+| **Auth**  | `auth status`                                       | Resolve the active profile to its user, key, env, and scopes                                                                      |
+|           | `auth remove`                                       | Remove the active profile from the credentials file                                                                               |
+| **Read**  | `project list` / `project get`                      | List projects / fetch one by id                                                                                                   |
+|           | `test list` / `test get`                            | List tests under a project / fetch one by id                                                                                      |
+|           | `test code get`                                     | Print (or write) the generated test source                                                                                        |
+|           | `test steps`                                        | List the latest run's steps with screenshot / DOM pointers                                                                        |
+|           | `test result`                                       | Latest result; `--history` lists a test's prior runs                                                                              |
+|           | `test failure get`                                  | The agent entry point: one self-contained latest-failure bundle                                                                   |
+|           | `test failure summary`                              | One-screen triage card (no media download)                                                                                        |
+| **Write** | `test create` / `test create-batch`                 | Create a test (or bulk-create from a plan file); `--produces` / `--needs` / `--category` wire BE dependency metadata              |
+|           | `test update` / `test delete` / `test delete-batch` | Edit metadata / soft-delete                                                                                                       |
+|           | `test code put`                                     | Replace generated code (etag-guarded)                                                                                             |
+|           | `test plan put`                                     | Replace a frontend test's plan-steps                                                                                              |
+|           | `project create` / `project update`                 | Manage projects                                                                                                                   |
+| **Run**   | `test run`                                          | Trigger a fresh run; `--wait` blocks until terminal; `--all --project <id>` runs all tests in a project in wave order             |
+|           | `test rerun`                                        | Cheap replay of one/many tests (FE verbatim; BE with deps); `--all --project <id>` reruns all tests                               |
+|           | `test wait`                                         | Block on a `runId` until terminal                                                                                                 |
+|           | `test artifact get`                                 | Download the failure bundle for a specific `runId`                                                                                |
+| **Agent** | `agent install` / `agent list`                      | Add or list coding-agent targets (pure-local): `claude`, `codex`, `cursor`, `cline`, `antigravity`, `kiro`, `windsurf`, `copilot` |
 
 > The earlier command names — `init`, `auth configure`, `auth whoami`, `auth logout` — still work as hidden, deprecated aliases (each prints a one-line notice pointing at the new name), so existing scripts keep running. `auth configure` now runs the full `setup` (it also installs the skill).
 

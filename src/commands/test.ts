@@ -1,4 +1,11 @@
-import { createWriteStream, readFileSync, readdirSync, statSync, type WriteStream } from 'node:fs';
+import {
+  createWriteStream,
+  existsSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  type WriteStream,
+} from 'node:fs';
 import { rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -4000,6 +4007,114 @@ export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<C
   return report;
 }
 
+/** Flag options for `test scaffold`. */
+interface ScaffoldFlagOpts {
+  type?: string;
+  out?: string;
+  force?: boolean;
+}
+
+export interface ScaffoldOptions extends CommonOptions {
+  scaffoldType: 'frontend' | 'backend';
+  out?: string;
+  force: boolean;
+}
+
+/** JSON payload `test scaffold --type backend` prints under --output json. */
+export interface CliBackendScaffold {
+  type: 'backend';
+  language: 'python';
+  code: string;
+}
+
+/**
+ * `test scaffold` — emit a schema-correct starter test definition so a first
+ * test never starts from hand-copied JSON. Pure-local: no network, no
+ * credentials, no filesystem reads. The frontend template is a `CliPlanInput`
+ * (the exact shape `--plan-from` ingests; sourceRef: CliPlanInput /
+ * PLAN_STEP_TYPES above), so `scaffold | create --plan-from -`-style flows
+ * validate out of the box. The backend template is the minimal `requests`
+ * script the onboarding skill mandates: define a test function with a
+ * concrete status assertion, then CALL it (a defined-but-never-called test
+ * would pass without asserting anything).
+ */
+export async function runScaffold(
+  opts: ScaffoldOptions,
+  deps: TestDeps = {},
+): Promise<CliPlanInput | CliBackendScaffold> {
+  const out = makeOutput(opts.output, deps);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const env = deps.env ?? process.env;
+  // Pre-fill the project id from TESTSPRITE_PROJECT_ID when the caller's
+  // environment carries one; otherwise a clearly-marked placeholder the user
+  // swaps after running `testsprite project list`.
+  const projectId =
+    typeof env.TESTSPRITE_PROJECT_ID === 'string' && env.TESTSPRITE_PROJECT_ID.length > 0
+      ? env.TESTSPRITE_PROJECT_ID
+      : '<run: testsprite project list>';
+
+  let payload: CliPlanInput | CliBackendScaffold;
+  let body: string;
+  if (opts.scaffoldType === 'frontend') {
+    const plan: CliPlanInput = {
+      projectId,
+      type: 'frontend',
+      name: 'My first frontend test',
+      description: 'Replace with one sentence describing what this test verifies.',
+      priority: 'p2',
+      planSteps: [
+        {
+          type: 'action',
+          description: 'Navigate to /login and sign in with a seeded test account',
+        },
+        { type: 'action', description: 'Open the first product page and click "Add to cart"' },
+        { type: 'assertion', description: 'Assert that the cart badge shows 1 item' },
+      ],
+    };
+    payload = plan;
+    body = `${JSON.stringify(plan, null, 2)}\n`;
+  } else {
+    const code = [
+      'import requests',
+      '',
+      '# Replace with your API base URL (must be reachable from the internet).',
+      'BASE_URL = "https://staging.example.com"',
+      '',
+      '',
+      'def test_health_endpoint() -> None:',
+      '    response = requests.get(f"{BASE_URL}/health", timeout=30)',
+      '    assert response.status_code == 200, f"expected 200, got {response.status_code}"',
+      '',
+      '',
+      '# The test function MUST be called: TestSprite executes this file top to',
+      '# bottom, so a defined-but-never-called function would pass vacuously.',
+      'test_health_endpoint()',
+      '',
+    ].join('\n');
+    payload = { type: 'backend', language: 'python', code };
+    body = code;
+  }
+
+  if (opts.out !== undefined) {
+    const resolved = isAbsolute(opts.out) ? opts.out : resolve(process.cwd(), opts.out);
+    // Never clobber silently: scaffolds are starting points the user edits, so
+    // an accidental re-run must not erase their work. --force opts in.
+    if (!opts.force && existsSync(resolved)) {
+      throw localValidationError('out', `already exists: ${resolved}. Pass --force to overwrite`);
+    }
+    const sink = openOutputFile(opts.out); // reuses the directory/parent guards
+    const fileOut = makeFileOutput(opts.output, sink);
+    await fileOut.writeChunk(body);
+    await closeOutputFile(sink, true);
+    stderrFn(`Scaffold written to ${resolved}`);
+    return payload;
+  }
+
+  // No --out: the scaffold body IS the stdout payload (`> plan.json` works).
+  out.print(payload, () => body.trimEnd());
+  return payload;
+}
+
 export async function runSteps(
   opts: StepsOptions,
   deps: TestDeps = {},
@@ -5331,6 +5446,211 @@ export async function runTestRun(
   return finalRun;
 }
 
+/** One row of the `test wait <run-id...>` multi-run payload. */
+export interface CliMultiWaitResult {
+  runId: string;
+  /** Terminal run status, or 'timeout', or 'error:<CODE>' when the poll failed. */
+  status: string;
+  /** Test the run belongs to, when the poll observed it. */
+  testId?: string;
+}
+
+export interface RunTestWaitManyOptions extends CommonOptions {
+  runIds: string[];
+  timeoutSeconds: number;
+  maxConcurrency: number;
+}
+
+/**
+ * `test wait <run-id...>` with two or more ids: attach to N already-dispatched
+ * runs in ONE invocation. This closes the loop the CLI itself opens: every
+ * batch/closure timeout prints one `testsprite test wait <runId>` hint PER
+ * member, which previously meant N sequential blocking invocations. The runs
+ * are polled concurrently under a bounded pool with ONE shared deadline
+ * (`--timeout` bounds the whole invocation, not each member), each member's
+ * poll is total (a transient error on one run never discards the others), and
+ * the exit code is the worst status across members: auth errors escalate to
+ * exit 3, any timeout or poll error exits 7, any non-passed terminal exits 1.
+ * Distinct from a run journal (issue #80): no persistence, just N known ids.
+ */
+export async function runTestWaitMany(
+  opts: RunTestWaitManyOptions,
+  deps: TestDeps = {},
+): Promise<{ results: CliMultiWaitResult[]; summary: Record<string, number> }> {
+  const out = makeOutput(opts.output, deps);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+
+  if (opts.dryRun) {
+    emitDryRunBanner(stderrFn);
+    const results: CliMultiWaitResult[] = opts.runIds.map(runId => ({
+      runId,
+      status: 'passed',
+    }));
+    const payload = {
+      results,
+      summary: { total: results.length, passed: results.length, failed: 0, timedOut: 0, errors: 0 },
+    };
+    out.print(payload, () => results.map(r => `${r.runId}  ${r.status}`).join('\n'));
+    return payload;
+  }
+
+  const client = makeClient(
+    { ...opts, requestTimeoutMs: resolveWaitRequestTimeoutMs({ ...opts, wait: true }) },
+    deps,
+  );
+  const ticker = createTicker(stderrFn, opts.output === 'json' ? false : undefined);
+
+  // One shared deadline across every member (the whole point of the shared
+  // pool: `--timeout 600` means the invocation ends within ~600s, not
+  // 600s x ceil(N/concurrency)).
+  const deadlineMs = Date.now() + opts.timeoutSeconds * 1000;
+
+  type WaitOutcome =
+    | { kind: 'result'; run: RunResponse }
+    | { kind: 'timeout' }
+    | { kind: 'error'; code: string; exitCode: number };
+
+  const pollOne = async (runId: string): Promise<WaitOutcome> => {
+    // A member dequeued AFTER the shared deadline has passed must not be
+    // granted a fresh minimum poll window (with --max-concurrency 1 that
+    // would extend the invocation by ~1s per queued run past --timeout).
+    const remainingSeconds = Math.ceil((deadlineMs - Date.now()) / 1000);
+    if (remainingSeconds <= 0) return { kind: 'timeout' };
+    const resolveAlternate = makeBackendWaitFallback({
+      client,
+      resolveTestId: run => run.testId,
+      resolveNotBefore: run => run.createdAt,
+      onResolved: () => undefined,
+    });
+    try {
+      const run = await pollRunUntilTerminal(client, runId, {
+        timeoutSeconds: remainingSeconds,
+        sleep: deps.sleep,
+        onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
+        onTick: (run, elapsedMs) => {
+          const elapsed = Math.round(elapsedMs / 1000);
+          ticker.update(`Run ${run.runId} — ${run.status} (elapsed=${elapsed}s)`);
+        },
+        resolveAlternate,
+      });
+      return { kind: 'result', run };
+    } catch (err) {
+      if (err instanceof TimeoutError) return { kind: 'timeout' };
+      if (err instanceof RequestTimeoutError) throw err;
+      if (err instanceof ApiError) return { kind: 'error', code: err.code, exitCode: err.exitCode };
+      return { kind: 'error', code: 'TRANSPORT', exitCode: 10 };
+    }
+  };
+
+  const outcomes = new Map<string, WaitOutcome>();
+  let inFlight = 0;
+  let nextIdx = 0;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const startNext = (): void => {
+        while (inFlight < opts.maxConcurrency && nextIdx < opts.runIds.length) {
+          const runId = opts.runIds[nextIdx++]!;
+          inFlight++;
+          pollOne(runId)
+            .then(outcome => {
+              outcomes.set(runId, outcome);
+              inFlight--;
+              startNext();
+              if (inFlight === 0 && nextIdx >= opts.runIds.length) resolve();
+            })
+            // pollOne is total except for RequestTimeoutError (handled below).
+            .catch(reject);
+        }
+      };
+      startNext();
+      if (opts.runIds.length === 0) resolve();
+    });
+  } catch (fanOutErr) {
+    if (fanOutErr instanceof RequestTimeoutError) {
+      // Same contract as the batch pollers: leave stdout parseable before
+      // exiting 7. Members that already settled keep their real status; only
+      // the still-unfinished ids are marked running and named in the hint
+      // (re-attaching to an already-terminal run would be a wasted command).
+      ticker.finalize('Multi-run wait — request timed out');
+      const partial = {
+        results: opts.runIds.map((runId): CliMultiWaitResult => {
+          const outcome = outcomes.get(runId);
+          if (outcome === undefined) return { runId, status: 'running' };
+          if (outcome.kind === 'timeout') return { runId, status: 'timeout' };
+          if (outcome.kind === 'error') return { runId, status: `error:${outcome.code}` };
+          return { runId, status: outcome.run.status, testId: outcome.run.testId };
+        }),
+        summary: { total: opts.runIds.length },
+      };
+      out.print(partial, () => partial.results.map(r => `${r.runId}  ${r.status}`).join('\n'));
+      const unfinished = partial.results
+        .filter(r => r.status === 'running' || r.status === 'timeout')
+        .map(r => r.runId);
+      if (unfinished.length > 0) {
+        stderrFn(`Re-attach with: testsprite test wait ${unfinished.join(' ')}`);
+      }
+    }
+    throw fanOutErr;
+  }
+  ticker.finalize();
+
+  const results: CliMultiWaitResult[] = opts.runIds.map(runId => {
+    const outcome = outcomes.get(runId);
+    if (outcome === undefined || outcome.kind === 'timeout') return { runId, status: 'timeout' };
+    if (outcome.kind === 'error') return { runId, status: `error:${outcome.code}` };
+    return { runId, status: outcome.run.status, testId: outcome.run.testId };
+  });
+  const passed = results.filter(r => r.status === 'passed').length;
+  const timedOut = results.filter(r => r.status === 'timeout').length;
+  const errors = results.filter(r => r.status.startsWith('error:')).length;
+  const failed = results.length - passed - timedOut - errors;
+  const payload = {
+    results,
+    summary: { total: results.length, passed, failed, timedOut, errors },
+  };
+  out.print(payload, () =>
+    [
+      ...results.map(r => `${r.runId}  ${r.status}`),
+      '',
+      `${passed}/${results.length} passed, ${failed} failed/blocked, ${timedOut} timed out, ${errors} poll errors`,
+    ].join('\n'),
+  );
+
+  // Every member that did not reach a terminal verdict is re-attachable:
+  // timeouts (still running server-side) and poll errors (e.g. a transient
+  // transport failure) both belong in the hint; terminal runs do not.
+  const unfinishedIds = results
+    .filter(r => r.status === 'timeout' || r.status.startsWith('error:'))
+    .map(r => r.runId);
+  if (unfinishedIds.length > 0) {
+    stderrFn(`Re-attach with: testsprite test wait ${unfinishedIds.join(' ')}`);
+  }
+
+  // Worst-status exit: auth escalates (a rejected key fails every member the
+  // same way), then timeout/poll-error (7, resumable), then plain failure (1).
+  const authError = [...outcomes.values()].find(
+    o =>
+      o.kind === 'error' &&
+      (o.code === 'AUTH_REQUIRED' || o.code === 'AUTH_INVALID' || o.code === 'AUTH_FORBIDDEN'),
+  );
+  if (authError !== undefined && authError.kind === 'error') {
+    throw new CLIError(
+      `Multi-run wait: authentication failed (${authError.code})`,
+      authError.exitCode,
+    );
+  }
+  if (timedOut > 0 || errors > 0) {
+    throw new CLIError(
+      `Multi-run wait: ${timedOut} timed out, ${errors} poll error(s) out of ${results.length} runs`,
+      7,
+    );
+  }
+  if (failed > 0) {
+    throw new CLIError(`Multi-run wait: ${failed} run(s) finished non-passed`, 1);
+  }
+  return payload;
+}
+
 /**
  * `test wait <run-id>` — M3.3 piece-3.
  *
@@ -5948,6 +6268,22 @@ export async function runTestRunAll(
             code: 'UNSUPPORTED',
             message: `Timed out after ${opts.timeoutSeconds}s`,
             exitCode: 7,
+          },
+        };
+      }
+      if (err instanceof RequestTimeoutError) {
+        // Client-side per-request timeout during polling — classify as timeout
+        // (exit 7) so the fan-out completes and stdout carries every runId.
+        // Without this, RequestTimeoutError rejects the fan-out before out.print(),
+        // leaving JSON consumers with empty stdout (mirrors create-batch --run).
+        return {
+          testId: entry.testId,
+          runId,
+          status: 'timeout',
+          error: {
+            code: 'UNSUPPORTED',
+            message: err.message,
+            exitCode: err.exitCode,
           },
         };
       }
@@ -7160,6 +7496,22 @@ export async function runTestRerun(
           },
         };
       }
+      if (err instanceof RequestTimeoutError) {
+        // Client-side per-request timeout during polling — classify as timeout
+        // (exit 7) so the fan-out completes and stdout carries every runId.
+        // Without this, RequestTimeoutError rejects the fan-out before out.print(),
+        // leaving JSON consumers with empty stdout (mirrors create-batch --run).
+        return {
+          testId: entry.testId,
+          runId: entry.runId,
+          status: 'timeout',
+          error: {
+            code: 'UNSUPPORTED',
+            message: err.message,
+            exitCode: err.exitCode,
+          },
+        };
+      }
       if (err instanceof ApiError) {
         // Preserve the real exit code (AUTH_INVALID=3, RATE_LIMITED=11, …) so the
         // batch exit-code aggregator can escalate auth failures correctly. Mirroring
@@ -7771,6 +8123,34 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     });
 
   test
+    .command('scaffold')
+    .description(
+      'Emit a schema-correct starter test definition (frontend plan JSON by default, or a backend Python skeleton). Pure-local: no network, no credentials.',
+    )
+    .option('--type <type>', 'frontend|backend (default: frontend)')
+    .option('--out <path>', 'write the scaffold to a file instead of stdout')
+    .option('--force', 'overwrite an existing --out file', false)
+    .addHelpText(
+      'after',
+      '\nExamples:\n' +
+        '  testsprite test scaffold > first-test.plan.json\n' +
+        '  testsprite test scaffold --type backend --out tests/health.py\n' +
+        '  testsprite test scaffold --out plan.json   # then edit, and create with --plan-from plan.json',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (cmdOpts: ScaffoldFlagOpts, command: Command) => {
+      await runScaffold(
+        {
+          ...resolveCommonOptions(command),
+          scaffoldType: parseEnumFlag(cmdOpts.type, 'type', TEST_TYPES) ?? 'frontend',
+          out: cmdOpts.out,
+          force: cmdOpts.force === true,
+        },
+        deps,
+      );
+    });
+
+  test
     .command('steps <test-id>')
     .description(
       'List the steps for a test (server returns the cumulative log across every run; use --run-id to scope to one run)',
@@ -8140,26 +8520,53 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     });
 
   test
-    .command('wait <run-id>')
+    .command('wait <run-id...>')
     .description(
-      'Wait for a run to reach a terminal status.\n' +
+      'Wait for one or more runs to reach a terminal status.\n' +
+        '\nWith several run-ids the runs are polled concurrently under one shared\n' +
+        '--timeout and a {results, summary} envelope is printed (worst status wins\n' +
+        'the exit code), so every re-attach hint the CLI prints can be pasted as\n' +
+        'ONE command.\n' +
         '\nExit codes:\n' +
         '  0  passed\n' +
         '  1  failed / blocked / cancelled\n' +
         '  3  auth error\n' +
-        '  4  run not found\n' +
-        '  7  timeout — resume with: testsprite test wait <run-id>\n' +
+        '  4  run not found (single run-id; with several ids a per-member poll error\n' +
+        '     is recorded as error:<CODE> in its row and folded into exit 7)\n' +
+        '  7  timeout or per-member poll error — resume with: testsprite test wait <run-id...>\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
         '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>',
     )
     .option('--timeout <s>', `max seconds to wait (1–3600, default ${DEFAULT_RUN_TIMEOUT_SECONDS})`)
+    .option(
+      '--max-concurrency <n>',
+      'with several run-ids, max concurrent polls (1-100, default: 10)',
+    )
     .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(async (runId: string, cmdOpts: WaitFlagOpts, command: Command) => {
-      await runTestWait(
+    .action(async (runIds: string[], cmdOpts: WaitFlagOpts, command: Command) => {
+      // One id keeps the historical single-run path byte-identical (same
+      // output shape, same exit codes); two or more fan out.
+      if (runIds.length === 1) {
+        await runTestWait(
+          {
+            ...resolveCommonOptions(command),
+            runId: runIds[0]!,
+            timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
+          },
+          deps,
+        );
+        return;
+      }
+      const maxConcurrency = parseNumericFlag(cmdOpts.maxConcurrency, 'max-concurrency') ?? 10;
+      if (!Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 100) {
+        throw localValidationError('max-concurrency', 'must be an integer between 1 and 100');
+      }
+      await runTestWaitMany(
         {
           ...resolveCommonOptions(command),
-          runId,
+          runIds,
           timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
+          maxConcurrency,
         },
         deps,
       );
@@ -8545,6 +8952,7 @@ interface RunFlagOpts {
 
 interface WaitFlagOpts {
   timeout?: string;
+  maxConcurrency?: string;
 }
 
 interface RerunFlagOpts {

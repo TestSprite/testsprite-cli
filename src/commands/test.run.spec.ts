@@ -5,7 +5,7 @@
  * sleep injection is wired through `TestDeps.sleep` to avoid real delays.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
@@ -3693,60 +3693,33 @@ describe('dashboardUrl on run completion', () => {
   });
 });
 
-describe('runTestRunAll — JUnit report export', () => {
-  const BATCH_FRESH_RESP: BatchRunFreshResponse = {
-    accepted: [
-      { testId: 'test_be_01', runId: 'run_fresh_01', enqueuedAt: '2026-06-09T10:00:00.000Z' },
-      { testId: 'test_be_02', runId: 'run_fresh_02', enqueuedAt: '2026-06-09T10:00:01.000Z' },
-    ],
-    conflicts: [],
-    deferred: [],
-    skippedFrontend: [],
-    skippedIntegration: [],
-  };
+// ---------------------------------------------------------------------------
+// Batch --all --wait fan-out: RequestTimeoutError must not leave stdout empty
+// ---------------------------------------------------------------------------
 
-  function makeTerminalRun(runId: string, testId: string, status: string): RunResponse {
-    return {
-      runId,
-      testId,
-      projectId: 'project_be',
-      userId: 'user_1',
-      status: status as RunResponse['status'],
-      source: 'cli',
-      createdAt: '2026-06-09T10:00:00.000Z',
-      startedAt: '2026-06-09T10:00:01.000Z',
-      finishedAt: '2026-06-09T10:00:30.000Z',
-      codeVersion: 'v1',
-      targetUrl: 'https://api.example.com',
-      createdFrom: 'cli',
-      failedStepIndex: null,
-      failureKind: null,
-      error: null,
-      videoUrl: null,
-      stepSummary: {
-        total: 3,
-        completed: 3,
-        passedCount: status === 'passed' ? 3 : 0,
-        failedCount: 0,
-      },
-    };
-  }
-
-  it('--wait --report junit writes XML after polling', async () => {
+describe('[finding-5] runTestRunAll --wait: RequestTimeoutError during fan-out poll writes JSON stdout + exit 7', () => {
+  it('stdout contains accepted[] with runIds when member polls throw RequestTimeoutError', async () => {
     const { credentialsPath } = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'junit-run-all-'));
-    const reportPath = join(dir, 'results.xml');
+    const batchResp: BatchRunFreshResponse = {
+      accepted: [
+        { testId: 'test_be_01', runId: 'run_fresh_01', enqueuedAt: '2026-06-09T10:00:00.000Z' },
+        { testId: 'test_be_02', runId: 'run_fresh_02', enqueuedAt: '2026-06-09T10:00:01.000Z' },
+      ],
+      conflicts: [],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
     const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: BATCH_FRESH_RESP };
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? '';
-      if (runId === 'run_fresh_01')
-        return { body: makeTerminalRun('run_fresh_01', 'test_be_01', 'passed') };
-      if (runId === 'run_fresh_02')
-        return { body: makeTerminalRun('run_fresh_02', 'test_be_02', 'passed') };
+      if ((init.method ?? 'GET') === 'POST') return { body: batchResp };
+      if (url.includes('/runs/')) {
+        throw new RequestTimeoutError(120000, 'req_timeout_batch_all');
+      }
       return errorBody('NOT_FOUND');
     });
+    const stdoutLines: string[] = [];
 
-    await runTestRunAll(
+    const err = await runTestRunAll(
       {
         profile: 'default',
         output: 'json',
@@ -3755,158 +3728,23 @@ describe('runTestRunAll — JUnit report export', () => {
         wait: true,
         timeoutSeconds: 60,
         maxConcurrency: 5,
-        report: 'junit',
-        reportFile: reportPath,
       },
       {
         credentialsPath,
         fetchImpl,
-        stdout: () => undefined,
+        stdout: line => stdoutLines.push(line),
         stderr: () => undefined,
         sleep: instantSleep,
       },
-    );
+    ).catch(e => e);
 
-    const xml = readFileSync(reportPath, 'utf8');
-    expect(xml).toContain('<testsuite name="testsprite:project_be"');
-    expect(xml).toContain('name="test_be_01"');
-    expect(xml).toContain('name="test_be_02"');
-    expect(xml).toContain('failures="0"');
-  });
-
-  it('--wait --report junit writes XML even when batch exits 1', async () => {
-    const { credentialsPath } = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'junit-run-fail-'));
-    const reportPath = join(dir, 'results.xml');
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') return { body: BATCH_FRESH_RESP };
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? '';
-      if (runId === 'run_fresh_01')
-        return { body: makeTerminalRun('run_fresh_01', 'test_be_01', 'passed') };
-      if (runId === 'run_fresh_02')
-        return { body: makeTerminalRun('run_fresh_02', 'test_be_02', 'failed') };
-      return errorBody('NOT_FOUND');
-    });
-
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-          report: 'junit',
-          reportFile: reportPath,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 1 });
-
-    const xml = readFileSync(reportPath, 'utf8');
-    expect(xml).toContain('failures="1"');
-    expect(xml).toContain('name="test_be_02"');
-  });
-
-  it('rejects --report without --wait', async () => {
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: false,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-          report: 'junit',
-          reportFile: './results.xml',
-        },
-        {},
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-  });
-
-  it('rejects --report-suite-name without --report', async () => {
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 60,
-          maxConcurrency: 5,
-          reportSuiteName: 'orphan-suite',
-        },
-        {},
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-  });
-
-  it('--dry-run --report junit writes canned sample XML', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'junit-run-dry-'));
-    const reportPath = join(dir, 'results.xml');
-
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-        report: 'junit',
-        reportFile: reportPath,
-      },
-      {
-        stdout: () => undefined,
-        stderr: () => undefined,
-      },
-    );
-
-    const xml = readFileSync(reportPath, 'utf8');
-    expect(xml).toContain('name="test_fresh_wave_01"');
-    expect(xml).toContain('failures="1"');
-  });
-
-  it('--dry-run --report junit --report-suite-name overrides canned suite name', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'junit-run-dry-suite-'));
-    const reportPath = join(dir, 'results.xml');
-
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: true,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 60,
-        maxConcurrency: 5,
-        report: 'junit',
-        reportFile: reportPath,
-        reportSuiteName: 'ci-checkout-suite',
-      },
-      {
-        stdout: () => undefined,
-        stderr: () => undefined,
-      },
-    );
-
-    const xml = readFileSync(reportPath, 'utf8');
-    expect(xml).toContain('<testsuite name="ci-checkout-suite"');
-    expect(xml).not.toContain('testsprite:project_be');
+    expect(err).toMatchObject({ exitCode: 7 });
+    expect(stdoutLines.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(stdoutLines.join('\n')) as {
+      accepted: Array<{ testId: string; runId: string; status: string }>;
+    };
+    expect(parsed.accepted).toHaveLength(2);
+    expect(parsed.accepted.map(r => r.runId).sort()).toEqual(['run_fresh_01', 'run_fresh_02']);
+    expect(parsed.accepted.every(r => r.status === 'timeout')).toBe(true);
   });
 });

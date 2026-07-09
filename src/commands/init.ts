@@ -15,6 +15,7 @@ import {
   parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
+import { normalizeEnvVar } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
 import { CLIError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
@@ -39,7 +40,7 @@ const DEFAULT_API_URL = 'https://api.testsprite.com';
  */
 function resolveReportedEndpoint(opts: InitOptions, deps: InitDeps): string {
   const env = deps.env ?? process.env;
-  const envApiUrl = env.TESTSPRITE_API_URL?.trim() || undefined;
+  const envApiUrl = normalizeEnvVar(env.TESTSPRITE_API_URL);
   let existing: string | undefined;
   try {
     existing = readProfile(opts.profile, { path: deps.credentialsPath })?.apiUrl;
