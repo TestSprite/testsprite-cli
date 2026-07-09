@@ -96,9 +96,6 @@ jobs:
 
       - run: npm ci
 
-      - name: Install security plugin
-        run: npm install --no-save eslint-plugin-security
-
       - name: Run security lint
         run: npx eslint src/ --config eslint.security.config.mjs --format stylish
 
