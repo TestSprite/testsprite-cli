@@ -27,11 +27,11 @@ export default tseslint.config(
       'security/detect-object-injection': 'warn',
       // Warn on timing-unsafe comparisons (token equality checks)
       'security/detect-possible-timing-attacks': 'warn',
-      // Error on non-literal RegExp (ReDoS)
+      // Warn on non-literal RegExp (ReDoS)
       'security/detect-non-literal-regexp': 'warn',
       // Error on child_process with non-literal args
       'security/detect-child-process': 'error',
-      // Disable rules that generate too much noise for a CLI codebase
+      // Disable/reduce noisy rules for a CLI codebase
       'security/detect-non-literal-require': 'off',
       'security/detect-unsafe-regex': 'warn',
     },
