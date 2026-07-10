@@ -39,13 +39,17 @@ export function defaultConfigPath(): string {
  */
 export function loadConfig(options: LoadConfigOptions = {}): Config {
   const env = options.env ?? process.env;
-  const profile = options.profile ?? env.TESTSPRITE_PROFILE ?? DEFAULT_PROFILE;
+  const profile = options.profile ?? normalizeEnvVar(env.TESTSPRITE_PROFILE) ?? DEFAULT_PROFILE;
   const credentialsPath = options.credentialsPath ?? defaultCredentialsPath();
   const fileEntry = readProfile(profile, { path: credentialsPath });
 
   // Empty / whitespace-only env vars are treated as unset so they do not
-  // short-circuit the `??` chain (e.g. `export TESTSPRITE_API_URL=` in a shell
-  // profile). Matches the normalization in auth configure and init/setup.
+  // short-circuit the `??` chain (e.g. `export TESTSPRITE_API_URL=` or
+  // `export TESTSPRITE_PROFILE=` in a shell profile). For the profile this
+  // also avoids a confusing VALIDATION_ERROR: an empty name fails the INI
+  // section-name guard, so without normalization a blank env var would break
+  // every command instead of falling back to the default profile. Matches the
+  // normalization in auth configure and init/setup.
   const envApiUrl = normalizeEnvVar(env.TESTSPRITE_API_URL);
   const envApiKey = normalizeEnvVar(env.TESTSPRITE_API_KEY);
 

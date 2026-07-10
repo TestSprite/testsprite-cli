@@ -55,6 +55,23 @@ describe('loadConfig', () => {
     ).toBe('option-profile');
   });
 
+  it('treats empty TESTSPRITE_PROFILE as unset (falls back to default)', () => {
+    expect(loadConfig({ env: { TESTSPRITE_PROFILE: '' }, credentialsPath }).profile).toBe(
+      'default',
+    );
+  });
+
+  it('treats whitespace-only TESTSPRITE_PROFILE as unset (falls back to default)', () => {
+    const config = loadConfig({ env: { TESTSPRITE_PROFILE: '   ' }, credentialsPath });
+    expect(config.profile).toBe('default');
+  });
+
+  it('reads credentials from the default profile when TESTSPRITE_PROFILE is blank', () => {
+    writeProfile('default', { apiKey: 'sk-default' }, { path: credentialsPath });
+    const config = loadConfig({ env: { TESTSPRITE_PROFILE: '  ' }, credentialsPath });
+    expect(config.apiKey).toBe('sk-default');
+  });
+
   it('option.endpointUrl overrides everything', () => {
     writeProfile('default', { apiUrl: 'https://file' }, { path: credentialsPath });
     const config = loadConfig({
