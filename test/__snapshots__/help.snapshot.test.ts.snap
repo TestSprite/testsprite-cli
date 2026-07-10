@@ -112,18 +112,22 @@ exports[`--help snapshots > init 1`] = `
 (deprecated) alias for \`setup\`
 
 Options:
-  --api-key <key>   API key to configure (skips the interactive prompt)
-  --from-env        Read TESTSPRITE_API_KEY from the environment instead of
-                    prompting (default: false)
-  --agent <target>  Coding-agent target to install: claude, antigravity,
-                    cursor, cline, kiro, windsurf, copilot, codex (default:
-                    claude) (default: "claude")
-  --no-agent        Skip the agent skill install (configure credentials only)
-  --force           Overwrite an existing skill file (a .bak backup is kept)
-  --dir <path>      Project root for the skill install (default: current
-                    directory)
-  -y, --yes         Non-interactive: accept all defaults, never prompt
-  -h, --help        display help for command
+  --api-key <key>       API key to configure (skips the interactive prompt)
+  --from-env            Read TESTSPRITE_API_KEY from the environment instead of
+                        prompting (default: false)
+  --agent <target>      Coding-agent target to install: claude, antigravity,
+                        cursor, cline, kiro, windsurf, copilot, codex (default:
+                        claude) (default: "claude")
+  --no-agent            Skip the agent skill install (configure credentials
+                        only)
+  --force               Overwrite an existing skill file (a .bak backup is
+                        kept)
+  --dir <path>          Project root for the skill install (default: current
+                        directory)
+  -y, --yes             Non-interactive: accept all defaults, never prompt
+  --skip-if-configured  Skip the API key prompt when credentials already exist
+                        for this profile (CI-safe idempotent re-run)
+  -h, --help            display help for command
 "
 `;
 

@@ -65,6 +65,17 @@ type CommonOptions = FactoryCommonOptions;
 
 interface ConfigureOptions extends CommonOptions {
   fromEnv: boolean;
+  /**
+   * When true and the active profile already has a saved API key, skip the
+   * interactive key prompt and proceed directly to the skill-install step.
+   * A CI-safe flag: lets `setup` run idempotently without prompting on
+   * machines that already have credentials (e.g. re-running setup to
+   * refresh the agent skill without re-entering the key).
+   *
+   * Ignored when an explicit `--api-key` or `--from-env` key source is
+   * provided -- those paths always overwrite, regardless of existing state.
+   */
+  skipIfConfigured?: boolean;
 }
 
 const DEFAULT_API_URL = 'https://api.testsprite.com';
@@ -125,9 +136,23 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
     apiKey = env.TESTSPRITE_API_KEY?.trim();
     if (!apiKey) throw validationError('TESTSPRITE_API_KEY', FROM_ENV_MISSING_KEY);
   } else {
+    // --skip-if-configured: when a non-empty API key is already saved for
+    // this profile, skip the interactive prompt and return early. The
+    // key is NOT re-validated via GET /me on this path -- the caller
+    // (runInit) only reaches this when no explicit key source was given,
+    // and the subsequent whoami call in runInit will surface an expired
+    // key to the user anyway.
+    if (opts.skipIfConfigured && existingProfile?.apiKey) {
+      out.print({ profile: opts.profile, apiUrl, status: 'already_configured' }, data => {
+        const d = data as { profile: string; apiUrl: string };
+        return `Profile "${d.profile}" already configured. Endpoint: ${d.apiUrl}`;
+      });
+      return;
+    }
+
     const promptApi = deps.prompt ?? { secret: (q: string) => promptSecret(q) };
     prelude(`Configuring profile "${opts.profile}".\n`);
-    // Only the API key is prompted — the endpoint defaults to prod (see above).
+    // Only the API key is prompted -- the endpoint defaults to prod (see above).
     apiKey = (await promptApi.secret('TestSprite API key: ')).trim();
     if (!apiKey) throw new CLIError('No API key provided.', 5);
   }

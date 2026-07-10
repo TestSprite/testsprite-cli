@@ -1224,3 +1224,90 @@ describe('createAuthCommand surface', () => {
     expect(err.exitCode).toBe(3);
   });
 });
+
+// ---------------------------------------------------------------------------
+// runConfigure -- skipIfConfigured
+// ---------------------------------------------------------------------------
+
+describe('runConfigure -- skipIfConfigured', () => {
+  it('skips the prompt and returns early when credentials already exist', async () => {
+    const { capture, deps } = makeCapture();
+    // Write a saved key first.
+    writeProfile('default', { apiKey: 'sk-existing' }, { path: credentialsPath });
+    const prompt = { secret: vi.fn(async () => 'sk-new') };
+    const fetchImpl = vi.fn();
+
+    await runConfigure(
+      { profile: 'default', output: 'text', debug: false, fromEnv: false, skipIfConfigured: true },
+      {
+        ...deps,
+        credentialsPath,
+        prompt,
+        fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+      },
+    );
+
+    // Prompt must never have fired.
+    expect(prompt.secret).not.toHaveBeenCalled();
+    // No network call -- we never validated or wrote a key.
+    expect(fetchImpl).not.toHaveBeenCalled();
+    // The saved key must be untouched.
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-existing');
+    // Output indicates already_configured.
+    expect(capture.stdout.join('\n')).toContain('already configured');
+  });
+
+  it('emits already_configured status in JSON mode', async () => {
+    const { capture, deps } = makeCapture();
+    writeProfile('default', { apiKey: 'sk-saved' }, { path: credentialsPath });
+    const fetchImpl = vi.fn();
+
+    await runConfigure(
+      { profile: 'default', output: 'json', debug: false, fromEnv: false, skipIfConfigured: true },
+      { ...deps, credentialsPath, fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'] },
+    );
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    const parsed = JSON.parse(capture.stdout.join(''));
+    expect(parsed).toMatchObject({ profile: 'default', status: 'already_configured' });
+  });
+
+  it('proceeds normally when no credentials exist and skipIfConfigured is true', async () => {
+    const { deps } = makeCapture();
+    // No pre-existing profile -- skip has no effect, should fall through to prompt.
+    const prompt = { secret: vi.fn(async () => 'sk-new') };
+
+    await runConfigure(
+      { profile: 'default', output: 'text', debug: false, fromEnv: false, skipIfConfigured: true },
+      { ...deps, credentialsPath, prompt, fetchImpl: meOkFetch },
+    );
+
+    expect(prompt.secret).toHaveBeenCalledTimes(1);
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-new');
+  });
+
+  it('ignores skipIfConfigured when --from-env is set', async () => {
+    const { deps } = makeCapture();
+    // Pre-existing key -- but fromEnv should override and write a new one.
+    writeProfile('default', { apiKey: 'sk-old' }, { path: credentialsPath });
+
+    await runConfigure(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        fromEnv: true,
+        skipIfConfigured: true,
+      },
+      {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: 'sk-from-env' },
+        credentialsPath,
+        fetchImpl: meOkFetch,
+      },
+    );
+
+    // The env key must overwrite the saved key.
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-from-env');
+  });
+});

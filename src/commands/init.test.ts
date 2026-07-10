@@ -9,6 +9,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, CLIError } from '../lib/errors.js';
 import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
+import { readProfile, writeProfile } from '../lib/credentials.js';
 import type { MeResponse } from './auth.js';
 import type { AgentFs } from './agent.js';
 import type { InitDeps } from './init.js';
@@ -1004,5 +1005,101 @@ describe('runInit — telemetry attribution (X-CLI-Command)', () => {
     // Exactly one carries the tag → the backend emits exactly one cli.initialized
     // (no double-count); the whoami /me stays cli.session_started.
     expect(initTagged).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runInit -- skipIfConfigured
+// ---------------------------------------------------------------------------
+
+describe('runInit -- skipIfConfigured', () => {
+  it('skips the API key prompt and reuses saved credentials when the profile exists', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    // Write a saved key before running setup.
+    writeProfile('default', { apiKey: 'sk-saved' }, { path: credentialsPath });
+    // Provide a mock fetch that accepts /me so runWhoami (identity banner) succeeds.
+    const fetchMock = makeOkFetch();
+    const prompt = { secret: vi.fn(async () => 'sk-should-never-be-asked') };
+
+    await runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
+      ...deps,
+      credentialsPath,
+      fetchImpl: fetchMock,
+      fs: agentFs,
+      isTTY: false,
+      prompt,
+    });
+
+    // The prompt must never have fired.
+    expect(prompt.secret).not.toHaveBeenCalled();
+    // The saved key must be untouched.
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-saved');
+    // The summary must still be emitted.
+    const parsed = JSON.parse(captured.stdout.join('')) as { status: string };
+    expect(parsed.status).toBe('initialized');
+  });
+
+  it('proceeds to prompt when skipIfConfigured is true but no credentials exist', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    // No pre-existing credentials -- skip has no effect.
+    const fetchMock = makeOkFetch();
+    const prompt = { secret: vi.fn(async () => 'sk-fresh') };
+
+    await runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'text' }), {
+      ...deps,
+      credentialsPath,
+      fetchImpl: fetchMock,
+      fs: agentFs,
+      isTTY: true,
+      prompt,
+    });
+
+    // With no saved key, the prompt should fire.
+    expect(prompt.secret).toHaveBeenCalledTimes(1);
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-fresh');
+    expect(captured.stdout.join('')).toContain('initialized');
+  });
+
+  it('allows non-interactive (isTTY=false) when skipIfConfigured is true and credentials exist', async () => {
+    const { deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    writeProfile('default', { apiKey: 'sk-ci' }, { path: credentialsPath });
+    const fetchMock = makeOkFetch();
+
+    // Must not throw exit 5 for "non-interactive mode, no key source".
+    await expect(
+      runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
+        ...deps,
+        credentialsPath,
+        fetchImpl: fetchMock,
+        fs: agentFs,
+        isTTY: false,
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-ci');
+  });
+
+  it('--api-key takes precedence over skipIfConfigured and overwrites the saved key', async () => {
+    const { deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    writeProfile('default', { apiKey: 'sk-old' }, { path: credentialsPath });
+    const fetchMock = makeOkFetch();
+
+    await runInit(
+      makeBaseOpts({ apiKey: 'sk-new', skipIfConfigured: true, noAgent: true, output: 'text' }),
+      {
+        ...deps,
+        credentialsPath,
+        fetchImpl: fetchMock,
+        fs: agentFs,
+        isTTY: false,
+      },
+    );
+
+    // Explicit --api-key must overwrite regardless of skipIfConfigured.
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-new');
   });
 });
