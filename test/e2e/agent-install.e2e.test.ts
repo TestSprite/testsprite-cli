@@ -179,8 +179,12 @@ describe('content integrity', () => {
         expect(content.startsWith('---'), `copilot: should start with ---`).toBe(true);
         expect(content).toContain("applyTo: '**'");
         expect(content).toContain('description:');
+      } else if (target === 'gemini') {
+        // GEMINI.md is plain Markdown -- no frontmatter expected.
+        expect(content.startsWith('---'), `gemini: must NOT start with ---`).toBe(false);
+        expect(content).not.toContain('applyTo:');
+        expect(content).not.toContain('trigger:');
       }
-
       // (b) branding — the renamed H1 must be present in every body variant
       expect(content).toContain('TestSprite Verification Loop');
       // The full-body intro line lives only in the FULL body; compact-body targets
@@ -219,6 +223,9 @@ describe('content integrity', () => {
       } else if (target === 'copilot') {
         expect(content.startsWith('---'), `copilot/onboard: should start with ---`).toBe(true);
         expect(content).toContain("applyTo: '**'");
+      } else if (target === 'gemini') {
+        // GEMINI.md is plain Markdown -- no frontmatter.
+        expect(content.startsWith('---'), `gemini/onboard: must NOT start with ---`).toBe(false);
       }
 
       // Load-bearing onboard string: the skill body must reference setup
@@ -264,8 +271,38 @@ describe('content integrity', () => {
     // (d) No frontmatter fence — AGENTS.md is plain prose
     expect(content.startsWith('---'), 'codex: must NOT start with ---').toBe(false);
   });
-});
 
+  it('gemini GEMINI.md contains ONE managed section with verify and onboard content', () => {
+    const tmpDir = freshTmpDir();
+    runCli(['agent', 'install', '--target=gemini', '--dir', tmpDir, '--output', 'json']);
+
+    const filePath = join(tmpDir, TARGETS.gemini.path);
+    const content = readFileSync(filePath, 'utf8');
+
+    // (a) Exactly ONE pair of sentinels
+    const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const beginCount = (content.match(new RegExp(escRe(MANAGED_SECTION_BEGIN), 'g')) ?? []).length;
+    const endCount = (content.match(new RegExp(escRe(MANAGED_SECTION_END), 'g')) ?? []).length;
+    expect(beginCount, 'exactly one BEGIN sentinel').toBe(1);
+    expect(endCount, 'exactly one END sentinel').toBe(1);
+
+    // BEGIN must come before END
+    expect(content.indexOf(MANAGED_SECTION_BEGIN)).toBeLessThan(
+      content.indexOf(MANAGED_SECTION_END),
+    );
+
+    // (b) Load-bearing command strings from the compact verify body
+    expect(content).toContain('testsprite test run');
+    expect(content).toContain('--wait');
+    expect(content).toContain('test artifact get');
+
+    // (c) Onboard one-liner must be present
+    expect(content).toContain('First-time setup');
+
+    // (d) No frontmatter fence -- GEMINI.md is plain prose
+    expect(content.startsWith('---'), 'gemini: must NOT start with ---').toBe(false);
+  });
+});
 // ---------------------------------------------------------------------------
 // 3. Idempotent re-run
 // ---------------------------------------------------------------------------
@@ -811,7 +848,7 @@ describe('agent list', () => {
     }>;
     expect(Array.isArray(parsed)).toBe(true);
 
-    // Expected: 8 targets × 2 skills = 16 rows
+    // Expected: targets x 2 skills per target = total rows (computed dynamically)
     const expectedCount = Object.keys(TARGETS).length * DEFAULT_SKILLS.length;
     expect(parsed.length).toBe(expectedCount);
 
@@ -848,6 +885,7 @@ describe('matrix coverage guard', () => {
       'kiro',
       'windsurf',
       'copilot',
+      'gemini',
       'codex',
     ]);
   });

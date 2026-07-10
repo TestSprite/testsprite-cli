@@ -82,7 +82,7 @@ testsprite test artifact get <run-id> --out ./out/
 // ---------------------------------------------------------------------------
 
 describe('TARGETS', () => {
-  it('has all eight required keys', () => {
+  it('has all nine required keys', () => {
     const keys = Object.keys(TARGETS).sort();
     expect(keys).toEqual([
       'antigravity',
@@ -91,6 +91,7 @@ describe('TARGETS', () => {
       'codex',
       'copilot',
       'cursor',
+      'gemini',
       'kiro',
       'windsurf',
     ]);
@@ -100,11 +101,12 @@ describe('TARGETS', () => {
     expect(TARGETS.claude.status).toBe('ga');
   });
 
-  it('cursor, cline, windsurf, copilot, antigravity, kiro, and codex are experimental', () => {
+  it('cursor, cline, windsurf, copilot, gemini, antigravity, kiro, and codex are experimental', () => {
     expect(TARGETS.cursor.status).toBe('experimental');
     expect(TARGETS.cline.status).toBe('experimental');
     expect(TARGETS.windsurf.status).toBe('experimental');
     expect(TARGETS.copilot.status).toBe('experimental');
+    expect(TARGETS.gemini.status).toBe('experimental');
     expect(TARGETS.antigravity.status).toBe('experimental');
     expect(TARGETS.kiro.status).toBe('experimental');
     expect(TARGETS.codex.status).toBe('experimental');
@@ -127,8 +129,9 @@ describe('TARGETS', () => {
     expect(TARGETS.copilot.mode).toBe('own-file');
   });
 
-  it('codex target has mode managed-section', () => {
+  it('codex and gemini targets have mode managed-section', () => {
     expect(TARGETS.codex.mode).toBe('managed-section');
+    expect(TARGETS.gemini.mode).toBe('managed-section');
   });
 
   it('codex target path is AGENTS.md', () => {
@@ -383,6 +386,31 @@ describe('renderForTarget("copilot")', () => {
     expect(copilot.content.length).toBeLessThan(claude.content.length);
     expect(copilot.content).not.toContain('The verification loop that flies');
     expect(copilot.content).toContain('testsprite test run');
+  });
+});
+
+describe('renderForTarget("gemini")', () => {
+  const result = renderForTarget('gemini', 'testsprite-verify', STUB_BODY);
+
+  it('returns GEMINI.md as the landing path', () => {
+    expect(result.path).toBe('GEMINI.md');
+  });
+
+  it('does not emit YAML frontmatter (plain Markdown, no --- fence)', () => {
+    expect(result.content.startsWith('---\n')).toBe(false);
+    expect(result.content).not.toContain('name:');
+    expect(result.content).not.toContain('applyTo:');
+    expect(result.content).not.toContain('trigger:');
+  });
+
+  it('contains the stub body verbatim', () => {
+    expect(result.content).toContain(STUB_BODY);
+  });
+
+  it('renders the verify body content (managed-section, compact codex body)', () => {
+    // Uses real bodies: gemini uses the codex contribution body (compact).
+    const gemini = renderForTarget('gemini', 'testsprite-verify');
+    expect(gemini.content).toContain('testsprite test run');
   });
 });
 

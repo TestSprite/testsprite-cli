@@ -1062,7 +1062,7 @@ function collect(v: string, prev: string[]): string[] {
 
 export function createAgentCommand(deps: AgentDeps = {}): Command {
   const agent = new Command('agent').description(
-    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Kiro, Windsurf, Copilot, Codex)',
+    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Kiro, Windsurf, Copilot, Gemini, Codex)',
   );
 
   agent
@@ -1072,7 +1072,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
     )
     .option(
       '--target <t>',
-      'Agent target(s): claude, cursor, cline, antigravity, kiro, windsurf, copilot, codex (comma-separated or repeated)',
+      'Agent target(s): claude, cursor, cline, antigravity, kiro, windsurf, copilot, gemini, codex (comma-separated or repeated)',
       collect,
       [],
     )
@@ -1086,7 +1086,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
     .option(
       '--force',
       'For own-file targets: overwrite existing file (a .bak backup is kept). ' +
-        'For codex (managed-section): replaces the section unconditionally; user content outside the section is never destroyed.',
+        'For managed-section targets (codex, gemini): replaces the section unconditionally; user content outside the section is never destroyed.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(

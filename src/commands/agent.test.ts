@@ -779,8 +779,8 @@ describe('runList', () => {
 
     const json = JSON.parse(capture.stdout.join('\n')) as ListResult[];
     expect(Array.isArray(json)).toBe(true);
-    // 8 targets × 2 default skills = 16 rows
-    expect(json).toHaveLength(16);
+    // 9 targets x 2 default skills = 18 rows
+    expect(json).toHaveLength(18);
     const targets = json.map(r => r.target);
     expect(targets).toContain('claude');
     expect(targets).toContain('cursor');
