@@ -38,9 +38,10 @@ import type { Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import { createWriteStream } from 'node:fs';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { CliFailureContext, CliTestStep } from '../commands/test.js';
-import { ApiError, TransportError } from './errors.js';
+import { ApiError, TransportError, localValidationError } from './errors.js';
+import { requireEnum } from './validate.js';
 import type { FetchImpl } from './http.js';
 
 /** Schema version stamped into `meta.json`. Bumps with the contract. */
@@ -337,9 +338,12 @@ export function pickCodeExtension(language: string, framework: string): string {
   if (language === 'python') return 'py';
   if (language === 'javascript') return 'js';
   if (language === 'typescript') return 'ts';
-  // Fallback: framework-keyed default. pytest is python, playwright TS.
+  // Fallback when the server didn't stamp a language: both TestSprite
+  // frameworks are Python — backend `pytest` and frontend Playwright
+  // (`playwright.async_api`) — so default to `.py`. (Legacy TS/JS rows
+  // carry an explicit `language` above and are honored as `.ts`/`.js`.)
   if (framework === 'pytest') return 'py';
-  return 'ts';
+  return 'py';
 }
 
 /**
@@ -351,6 +355,25 @@ export function pickCodeExtension(language: string, framework: string): string {
  */
 export function stepFilenamePrefix(stepIndex: number): string {
   return stepIndex >= 100 ? String(stepIndex).padStart(3, '0') : String(stepIndex).padStart(2, '0');
+}
+
+/**
+ * Refuse a composed artifact path that escapes `baseDir`. Step filenames are
+ * built from response-controlled fields, so this is the final containment
+ * check before any write. Returns the validated absolute path.
+ */
+export function assertNoEscape(baseDir: string, segment: string): string {
+  const composed = resolve(baseDir, segment);
+  const rel = relative(baseDir, composed);
+  if (rel.startsWith('..') || isAbsolute(rel)) {
+    throw localValidationError(
+      'out',
+      'resolved artifact path escapes the bundle directory',
+      undefined,
+      'field',
+    );
+  }
+  return composed;
 }
 
 /**
@@ -520,6 +543,30 @@ async function freshTmpDir(dir: string): Promise<string> {
  * caught reading the dir during it sees no meta and refuses to consume
  * (per §7.3). That's what we want.
  */
+/**
+ * Whether a top-level directory entry belongs to the bundle format —
+ * i.e. something a prior `writeBundle` could have produced and this
+ * commit is therefore allowed to clean up. `code.<ext>` is matched by
+ * pattern (not the current run's extension) so a stale `code.py` is
+ * still swept when the new bundle writes `code.ts`. Everything else in
+ * the directory is the user's and must never be deleted (`--out` can
+ * point at a pre-existing, populated directory).
+ */
+export function isBundleOwnedEntry(entry: string): boolean {
+  if (
+    entry === 'result.json' ||
+    entry === 'failure.json' ||
+    entry === 'video.mp4' ||
+    entry === 'meta.json' ||
+    entry === 'steps' ||
+    entry === '.tmp' ||
+    entry === '.partial'
+  ) {
+    return true;
+  }
+  return /^code\.[A-Za-z0-9]+$/.test(entry);
+}
+
 async function commitBundle(
   tmpDir: string,
   dir: string,
@@ -530,20 +577,22 @@ async function commitBundle(
 
   // (2) Sweep stale top-level files that the new bundle won't write.
   // If the prior run wrote `video.mp4` and the new run has no video,
-  // an in-place rename leaves the old video lingering. Enumerate
-  // current top-level entries and remove anything that isn't being
-  // freshly renamed in.
+  // an in-place rename leaves the old video lingering. Only entries the
+  // bundle format OWNS are candidates: `--out` may point at a directory
+  // that also holds the user's unrelated files, and those must survive
+  // the commit (deleting them would be silent data loss).
   const topLevel = files.filter(f => !f.startsWith('steps/'));
   const newTopLevelSet = new Set(topLevel);
   newTopLevelSet.add('meta.json'); // about to land last, do not delete
   const existing = await readdir(dir).catch(() => [] as string[]);
   for (const entry of existing) {
     // Preserve the writer's own scratch dir + the .partial marker
-    // (we'll re-evaluate .partial at the end of commit). Anything else
-    // not-listed in the new bundle is stale.
+    // (we'll re-evaluate .partial at the end of commit). Any other
+    // bundle-owned entry not-listed in the new bundle is stale.
     if (entry === '.tmp' || entry === '.partial') continue;
     if (newTopLevelSet.has(entry)) continue;
     if (entry === 'steps') continue; // handled below
+    if (!isBundleOwnedEntry(entry)) continue; // foreign file — never touch
     await rm(join(dir, entry), { recursive: true, force: true });
   }
 
@@ -601,17 +650,22 @@ async function writeStepArtifacts(
   fetchImpl: FetchImpl,
   filesWritten: string[],
 ): Promise<void> {
+  // stepIndex comes straight from the response and is used to build the
+  // filename — reject anything that isn't a real index before composing a path.
+  if (!Number.isInteger(step.stepIndex) || step.stepIndex < 0) {
+    throw localValidationError('stepIndex', 'must be a non-negative integer', undefined, 'field');
+  }
   const prefix = stepFilenamePrefix(step.stepIndex);
 
   if (step.screenshotUrl) {
     const file = `${prefix}-screenshot.png`;
-    await streamUrlToFile(step.screenshotUrl, join(stepsTmpDir, file), fetchImpl);
+    await streamUrlToFile(step.screenshotUrl, assertNoEscape(stepsTmpDir, file), fetchImpl);
     filesWritten.push(`steps/${file}`);
   }
 
   if (step.htmlSnapshotUrl) {
     const file = `${prefix}-snapshot.html`;
-    await streamUrlToFile(step.htmlSnapshotUrl, join(stepsTmpDir, file), fetchImpl);
+    await streamUrlToFile(step.htmlSnapshotUrl, assertNoEscape(stepsTmpDir, file), fetchImpl);
     filesWritten.push(`steps/${file}`);
   }
 
@@ -636,6 +690,8 @@ async function writeStepArtifacts(
   if (sidecar.length > 0) {
     const dereferenced = await Promise.all(
       sidecar.map(async (entry, i) => {
+        // kind comes from the response and is used in the filename — validate it.
+        requireEnum('kind', entry.kind, ['screenshot', 'snapshot', 'log', 'network', 'console']);
         // Reuse the already-downloaded step file when the evidence URL
         // matches the step's primary screenshot/snapshot URL. Cheap
         // dedupe — no extra HTTP round-trip, no duplicate bytes on disk.
@@ -661,7 +717,7 @@ async function writeStepArtifacts(
         }
         const ext = sidecarExtension(entry.kind);
         const filename = `${prefix}-${entry.kind}-${i}.${ext}`;
-        await streamUrlToFile(entry.url, join(stepsTmpDir, filename), fetchImpl);
+        await streamUrlToFile(entry.url, assertNoEscape(stepsTmpDir, filename), fetchImpl);
         filesWritten.push(`steps/${filename}`);
         return {
           kind: entry.kind,
@@ -675,7 +731,11 @@ async function writeStepArtifacts(
       }),
     );
     const file = `${prefix}-evidence.json`;
-    await writeFile(join(stepsTmpDir, file), JSON.stringify(dereferenced, null, 2) + '\n', 'utf8');
+    await writeFile(
+      assertNoEscape(stepsTmpDir, file),
+      JSON.stringify(dereferenced, null, 2) + '\n',
+      'utf8',
+    );
     filesWritten.push(`steps/${file}`);
   }
 }
@@ -712,17 +772,18 @@ export async function streamUrlToFile(
   deps?: { sleep?: (ms: number) => Promise<void> },
 ): Promise<void> {
   const sleepFn = deps?.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+  const artifactUrl = redactArtifactUrlForDetails(url);
   for (let attempt = 1; attempt <= STREAM_URL_MAX_RETRIES; attempt++) {
     let response: Response;
     try {
-      response = await fetchImpl(url);
+      response = await fetchImpl(url, { redirect: 'error' });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (attempt < STREAM_URL_MAX_RETRIES) {
         await sleepFn(STREAM_URL_RETRY_DELAY_MS);
         continue;
       }
-      throw new TransportError(`Failed to download presigned URL ${url}: ${message}`);
+      throw new TransportError(`Failed to download presigned URL ${artifactUrl}: ${message}`);
     }
     if (!response.ok) {
       // Non-2xx: the URL itself is bad (expired, unauthorized, not found).
@@ -734,7 +795,7 @@ export async function streamUrlToFile(
           nextAction:
             'Re-run `testsprite test failure get`. Presigned URLs in the bundle expire after 15 minutes.',
           requestId: 'local',
-          details: { status: response.status, url },
+          details: { status: response.status, artifactUrl },
         },
       });
     }
@@ -754,7 +815,7 @@ export async function streamUrlToFile(
           await sleepFn(STREAM_URL_RETRY_DELAY_MS);
           continue;
         }
-        throw new TransportError(`Failed to download presigned URL ${url}: ${message}`);
+        throw new TransportError(`Failed to download presigned URL ${artifactUrl}: ${message}`);
       }
     }
     await mkdir(dirname(filePath), { recursive: true });
@@ -776,8 +837,17 @@ export async function streamUrlToFile(
         await sleepFn(STREAM_URL_RETRY_DELAY_MS);
         continue;
       }
-      throw new TransportError(`Failed mid-download of ${url}: ${message}`);
+      throw new TransportError(`Failed mid-download of ${artifactUrl}: ${message}`);
     }
+  }
+}
+
+function redactArtifactUrlForDetails(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return '<invalid-url>';
   }
 }
 

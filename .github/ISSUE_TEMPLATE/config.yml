@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Questions & usage help (GitHub Discussions)
+    url: https://github.com/TestSprite/testsprite-cli/discussions
+    about: Ask questions, share ideas, and get help. Issues are for bugs and feature requests only.
+  - name: 🗨️ Discord
+    url: https://discord.gg/W4JDrZfdB
+    about: Chat with the community and the team — the fastest way to reach us.
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/TestSprite/testsprite-cli/security/advisories/new
+    about: Please report vulnerabilities privately. Do not open a public issue. See SECURITY.md.
+  - name: 📚 Documentation
+    url: https://www.testsprite.com/docs
+    about: Read the TestSprite docs and the CLI command reference.

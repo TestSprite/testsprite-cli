@@ -3,11 +3,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../lib/errors.js';
+import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import {
   type CliProject,
   type CliUpdateProjectResponse,
   createProjectCommand,
+  runAutoAuth,
   runCreate,
+  runCredential,
   runGet,
   runList,
   runUpdate,
@@ -71,10 +74,10 @@ describe('createProjectCommand', () => {
     errorSpy.mockRestore();
   });
 
-  it('exposes list, get, create and update subcommands', () => {
+  it('exposes list, get, create, update, credential and auto-auth subcommands', () => {
     const project = createProjectCommand();
     const names = project.commands.map(c => c.name()).sort();
-    expect(names).toEqual(['create', 'get', 'list', 'update']);
+    expect(names).toEqual(['auto-auth', 'create', 'credential', 'get', 'list', 'update']);
   });
 
   it('list exposes the pagination flags from the design contract', () => {
@@ -198,6 +201,47 @@ describe('runList', () => {
     });
   });
 
+  it('rejects invalid pagination before requiring credentials', async () => {
+    const credentialsPath = join(mkdtempSync(join(tmpdir(), 'cli-p2-no-creds-')), 'credentials');
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runList(
+        { profile: 'default', output: 'json', debug: false, pageSize: 1.5 },
+        { credentialsPath, fetchImpl: fetchImpl as unknown as typeof globalThis.fetch },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'page-size' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('rejects invalid dry-run pagination before emitting the dry-run banner', async () => {
+    const stderr: string[] = [];
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runList(
+        { profile: 'default', output: 'json', debug: false, dryRun: true, pageSize: 1.5 },
+        {
+          credentialsPath: join(mkdtempSync(join(tmpdir(), 'cli-p2-dryrun-')), 'credentials'),
+          fetchImpl: fetchImpl as unknown as typeof globalThis.fetch,
+          stderr: line => stderr.push(line),
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'page-size' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(stderr.join('\n')).not.toContain(DRY_RUN_BANNER);
+  });
+
   it('rejects pageSize=101 with VALIDATION_ERROR exit 5 (Fix 7 — upper-bound enforced client-side)', async () => {
     // Previously silently clamped to 100; now rejected so callers get fast feedback.
     const { credentialsPath } = makeCreds();
@@ -282,6 +326,21 @@ describe('runList', () => {
     // Format is now "[debug <ISO-TS>] {...}"
     expect(stderr.some(line => line.startsWith('[debug '))).toBe(true);
     expect(stderr.some(line => line.includes('"kind":"request"'))).toBe(true);
+  });
+});
+
+describe('DEV-244 — project update no longer accepts the dead --description flag', () => {
+  it('rejects --description on `project update` as an unknown option', async () => {
+    const project = createProjectCommand();
+    const update = project.commands.find(c => c.name() === 'update')!;
+    project.exitOverride();
+    update.exitOverride();
+
+    await expect(
+      project.parseAsync(['update', 'proj_x', '--description', 'should not exist'], {
+        from: 'user',
+      }),
+    ).rejects.toThrow(/unknown option.*--description/i);
   });
 });
 
@@ -485,11 +544,13 @@ describe('runCreate', () => {
   });
 
   it('P6 — dry-run returns canned shape without hitting the network', async () => {
+    resetDryRunBannerForTesting();
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn(async () => {
       throw new Error('should not hit network in dry-run');
     });
     const out: string[] = [];
+    const err: string[] = [];
     const result = await runCreate(
       {
         profile: 'default',
@@ -504,13 +565,15 @@ describe('runCreate', () => {
         credentialsPath,
         fetchImpl: fetchImpl as unknown as typeof fetch,
         stdout: line => out.push(line),
-        stderr: () => {},
+        stderr: line => err.push(line),
       },
     );
 
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(result.type).toBe('frontend');
     expect(result.name).toBe('DryRun Project');
+    // DEV-247: the canned sample must carry the "not from the server" banner.
+    expect(err).toContain(DRY_RUN_BANNER);
   });
 
   it('P6 — renders text mode with §6.1 field labels', async () => {
@@ -553,6 +616,60 @@ describe('runCreate', () => {
           debug: false,
           type: 'frontend',
           name: 'No URL Project',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('rejects a whitespace-only --name with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network — validation must fire client-side');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'frontend',
+          name: '   ',
+          targetUrl: 'https://example.com',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+  it('rejects a whitespace-only --password with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network - validation must fire client-side');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'frontend',
+          name: 'Password Guard Project',
+          targetUrl: 'https://example.com',
+          password: '   ',
         },
         {
           credentialsPath,
@@ -641,11 +758,62 @@ describe('runUpdate', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it('rejects a whitespace-only --name with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not be called');
+    });
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          name: '   ',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('rejects a whitespace-only --password with VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not be called');
+    });
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          password: '   ',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
   it('P7 — dry-run returns canned shape without network call', async () => {
+    resetDryRunBannerForTesting();
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn(async () => {
       throw new Error('should not hit network');
     });
+    const err: string[] = [];
     const result = await runUpdate(
       {
         profile: 'default',
@@ -659,13 +827,42 @@ describe('runUpdate', () => {
         credentialsPath,
         fetchImpl: fetchImpl as unknown as typeof fetch,
         stdout: () => {},
-        stderr: () => {},
+        stderr: line => err.push(line),
       },
     );
 
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(result.id).toBe('proj_dry');
     expect(result.updatedFields).toContain('name');
+    // DEV-247: the canned sample must carry the "not from the server" banner.
+    expect(err).toContain(DRY_RUN_BANNER);
+  });
+
+  it('P7 — dry-run with --password-file does not read the filesystem', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network');
+    });
+    const result = await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'proj_dry',
+        passwordFile: '/tmp/definitely-not-here-testsprite',
+      },
+      {
+        credentialsPath,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(result.id).toBe('proj_dry');
+    expect(result.updatedFields).toContain('password');
   });
 
   it('P7 — renders text mode with updatedFields and updatedAt', async () => {
@@ -684,7 +881,6 @@ describe('runUpdate', () => {
         debug: false,
         projectId: 'proj_text',
         name: 'New Name',
-        description: 'New desc',
       },
       { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => {} },
     );
@@ -747,5 +943,251 @@ describe('runUpdate', () => {
 
     expect(result.id).toBe('proj_json_no_fields');
     expect(result.updatedFields).toBeUndefined();
+  });
+});
+
+describe('runCredential', () => {
+  interface Captured {
+    url: string;
+    method: string;
+    body: unknown;
+    headers: Headers;
+  }
+  function captureFetch(captured: Captured[], body: unknown) {
+    return makeFetch((url, init) => {
+      captured.push({
+        url,
+        method: init.method ?? 'GET',
+        body: init.body ? JSON.parse(init.body as string) : undefined,
+        headers: new Headers(init.headers as Record<string, string>),
+      });
+      return { status: 200, body };
+    });
+  }
+
+  it('PUTs /projects/:id/credential with authType + credential + idempotency-key', async () => {
+    const { credentialsPath } = makeCreds();
+    const captured: Captured[] = [];
+    const fetchImpl = captureFetch(captured, {
+      projectId: 'p1',
+      authType: 'Bearer token',
+      rewroteCount: 2,
+    });
+    const res = await runCredential(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'p1',
+        authType: 'Bearer token',
+        credential: 'tok-123',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(res.rewroteCount).toBe(2);
+    const put = captured.find(c => c.method === 'PUT')!;
+    expect(put.url).toContain('/projects/p1/credential');
+    expect(put.body).toEqual({ authType: 'Bearer token', credential: 'tok-123' });
+    expect(put.headers.get('idempotency-key')).toMatch(/^cli-proj-cred-[0-9a-f-]{36}$/);
+  });
+
+  it('public clears the credential (no credential in body, none required)', async () => {
+    const { credentialsPath } = makeCreds();
+    const captured: Captured[] = [];
+    const fetchImpl = captureFetch(captured, {
+      projectId: 'p1',
+      authType: 'public',
+      rewroteCount: 0,
+    });
+    await runCredential(
+      { profile: 'default', output: 'json', debug: false, projectId: 'p1', authType: 'public' },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    const put = captured.find(c => c.method === 'PUT')!;
+    expect(put.body).toEqual({ authType: 'public' });
+  });
+
+  it('non-public without --credential → VALIDATION_ERROR (exit 5), no fetch', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    await expect(
+      runCredential(
+        { profile: 'default', output: 'json', debug: false, projectId: 'p1', authType: 'API key' },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetched).toBe(false);
+  });
+
+  it('rejects an unknown --type locally (no fetch)', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    await expect(
+      runCredential(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          authType: 'jwt',
+          credential: 'x',
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetched).toBe(false);
+  });
+});
+
+describe('runAutoAuth', () => {
+  interface Captured {
+    url: string;
+    method: string;
+    body: Record<string, unknown>;
+    headers: Headers;
+  }
+  function captureFetch(captured: Captured[]) {
+    return makeFetch((url, init) => {
+      captured.push({
+        url,
+        method: init.method ?? 'GET',
+        body: init.body ? JSON.parse(init.body as string) : {},
+        headers: new Headers(init.headers as Record<string, string>),
+      });
+      return {
+        status: 200,
+        body: { projectId: 'p1', enabled: true, method: 'aws_cognito_refresh', inject: 'bearer' },
+      };
+    });
+  }
+
+  it('PUTs /projects/:id/auto-auth with the config body + idempotency-key', async () => {
+    const { credentialsPath } = makeCreds();
+    const captured: Captured[] = [];
+    const fetchImpl = captureFetch(captured);
+    await runAutoAuth(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'p1',
+        method: 'aws_cognito_refresh',
+        inject: 'bearer',
+        region: 'us-east-1',
+        clientId: 'abc',
+        refreshToken: 'rt-xyz',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    const put = captured.find(c => c.method === 'PUT')!;
+    expect(put.url).toContain('/projects/p1/auto-auth');
+    expect(put.body).toEqual({
+      enabled: true,
+      method: 'aws_cognito_refresh',
+      inject: 'bearer',
+      region: 'us-east-1',
+      clientId: 'abc',
+      refreshToken: 'rt-xyz',
+    });
+    expect(put.headers.get('idempotency-key')).toMatch(/^cli-proj-autoauth-[0-9a-f-]{36}$/);
+  });
+
+  it('--disable sends enabled:false', async () => {
+    const { credentialsPath } = makeCreds();
+    const captured: Captured[] = [];
+    const fetchImpl = captureFetch(captured);
+    await runAutoAuth(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'p1',
+        disable: true,
+        method: 'password',
+        inject: 'bearer',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(captured.find(c => c.method === 'PUT')!.body.enabled).toBe(false);
+  });
+
+  it('reads a secret from --refresh-token-file', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-rt-'));
+    const rtFile = join(dir, 'rt.txt');
+    writeFileSync(rtFile, '  rt-from-file\n');
+    const captured: Captured[] = [];
+    const fetchImpl = captureFetch(captured);
+    await runAutoAuth(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'p1',
+        method: 'refresh_token',
+        inject: 'bearer',
+        tokenEndpoint: 'https://idp.example.com/token',
+        refreshTokenFile: rtFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(captured.find(c => c.method === 'PUT')!.body.refreshToken).toBe('rt-from-file');
+  });
+
+  it('rejects an unknown --method / --inject locally (no fetch)', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'magic',
+          inject: 'bearer',
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetched).toBe(false);
+  });
+});
+
+describe('dogfood 2026-06-30 — whitespace-only --name is rejected (parity with `test create`)', () => {
+  const noNetwork = () => {
+    throw new Error('network should not be hit');
+  };
+
+  it('runCreate rejects a whitespace-only --name (exit 5, no network)', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runCreate(
+        { profile: 'default', output: 'json', debug: false, type: 'backend', name: '   ' },
+        { credentialsPath, fetchImpl: makeFetch(noNetwork), stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runUpdate rejects a whitespace-only --name (exit 5, no network)', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runUpdate(
+        { profile: 'default', output: 'json', debug: false, projectId: 'p1', name: '\t \n' },
+        { credentialsPath, fetchImpl: makeFetch(noNetwork), stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 });

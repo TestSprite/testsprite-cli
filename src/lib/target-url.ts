@@ -41,7 +41,14 @@ export function assertNotLocal(rawUrl: string): void {
     throw localTargetError('target-url', 'must use http or https scheme');
   }
 
-  const host = parsed.hostname.toLowerCase();
+  // Normalize a single trailing dot in the hostname. `localhost.` is the
+  // fully-qualified form of `localhost` (RFC 6761 reserves both to resolve to
+  // loopback), so `http://localhost.` must be rejected just like
+  // `http://localhost`. Without this strip, the trailing-dot form (also
+  // reachable via `localhost%2e`) slips past the `host === 'localhost'` check.
+  // IP literals are already dot-normalized by the WHATWG URL parser, so this
+  // only affects named hosts.
+  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
 
   // Loopback / unspecified.
   if (host === 'localhost' || host === '0.0.0.0') {

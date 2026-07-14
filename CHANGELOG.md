@@ -4,6 +4,70 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-08
+
+### Added
+
+- **`testsprite doctor`** — one-command environment diagnostic that checks your Node version, credentials, endpoint reachability, and installed agent skills, and reports what's misconfigured.
+- **`test scaffold`** — emit a schema-correct starter plan (frontend) or a backend test skeleton to bootstrap a new test without hand-writing the JSON.
+- **`test lint`** — offline validator for plan / steps files; catches malformed test definitions before they are sent to the server.
+- **`test diff <run-a> <run-b>`** — compare two runs of the same test to isolate what changed between a passing and a failing run.
+- **`test flaky <test-id>`** — repeat-run flaky-test detector. Replays a test N times (`--runs`, default 5), aggregates the outcomes, and reports a stability verdict (`stable` / `flaky` / `failing`) plus the `runId` and `failureKind` of every attempt that did not pass. Replays run with auto-heal off (strict verbatim) so a nondeterministic pass/fail can't be masked. Exit code is 0 only when every attempt passed, so CI can gate a merge on flakiness. Flags: `--runs` (1–10), `--until-fail`, `--timeout`, `--output json`.
+- **JUnit XML report export for batch runs.** `test run --all` and batch `test rerun` accept `--report junit --report-file <path>` to write a CI-friendly XML sidecar after `--wait` polling completes. The report is written even when the batch exits non-zero; `--output json` is unchanged; `--dry-run` writes a canned sample without network calls.
+- **`test wait` is now variadic** — pass several run ids to attach to and poll multiple runs in a single invocation.
+- **`agent status`** — report which TestSprite skills are installed for each agent target and whether they are current; installed skills are now stamped with a version/hash marker.
+- **New `agent install` targets:** GitHub Copilot, Windsurf, and Kiro (experimental), alongside the existing Claude / Cursor / Cline / Codex / Antigravity targets.
+- **`project credential` / `project auto-auth`** — configure a project's backend credentials (static credential, free) or a recurring auto-auth token (Pro) from the CLI, with surfaced auth warnings and managed-credential guidance.
+- **Proxy support** — the CLI now honors `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` for use behind corporate and CI proxies.
+- **`NO_COLOR` support** — colored output is suppressed when `NO_COLOR` is set, per no-color.org.
+- **"New version available" notice** — a non-blocking, 24h-cached npm version check prints an upgrade hint on stderr. Opt out with the documented env var; automatically silenced in CI and under `--output json`.
+
+### Changed
+
+- **Node.js 20.19+, 22.13+, or 24+ is now the minimum supported runtime.** The CLI checks the running Node version at startup and exits with a clear message on an unsupported version; builds and CI run against Node 20 and 22.
+- **Graceful shutdown** — the CLI handles termination signals cleanly and guards against broken-pipe (`EPIPE`) errors when its output is piped to a closing consumer (e.g. `| head`).
+- **Interactive prompts and preamble now go to stderr**, keeping stdout pure for machine consumers even in interactive mode.
+- **Empty environment variables are treated as unset** when resolving config, so `TESTSPRITE_API_URL=` no longer overrides the built-in default with an empty string.
+- `agent install` defaults `--target` to `claude` in non-interactive / CI contexts (matching `setup`).
+- The `usage` command no longer implies backend test runs are free.
+- `setup`'s "Next steps" guidance no longer suggests `test list` before any project exists.
+
+### Fixed
+
+- **Timeouts & polling:** `RequestTimeoutError` is now classified as a timeout in the `--all --wait` fan-out; per-attempt timeout timers are cleared so they can't fire late; `run --all --wait` no longer polls still-queued runs past the shared deadline; a partial result is emitted on stdout when `run --wait` / `test wait` times out (so a redirected file is never zero-byte).
+- **Batch rerun:** the exit code is preserved and auth errors escalate correctly; explicit ids combined with `--all` — or `--status` / `--skip-terminal` without `--all` — are rejected with a clear validation error; auto-minted idempotency keys are surfaced under `--output json`.
+- **HTTP:** non-JSON `200` responses map to a typed error envelope instead of crashing the parser.
+- **Failure bundles / artifacts:** artifact downloads retry on transient errors and guard the default run-id path; the `--out` directory no longer sweeps unrelated pre-existing files (data-loss fix); run-scoped per-step error text and step type are surfaced.
+- **Input validation (fail fast, before any network call):** malformed API keys, invalid `--request-timeout`, directory `--code-file` / `--out` paths, blank or whitespace-only `--name` (test and project create/update), blank inline project passwords, fractional pagination flags / page sizes, and `--since` overflow are all rejected up front with `VALIDATION_ERROR` rather than crashing or failing late server-side. `--output` is validated uniformly across all command groups.
+- **Setup / auth:** the endpoint is validated before the key check; the typed API-error envelope is preserved when key verification fails; the per-request timeout is honored during `configure`.
+- **Misc:** cursor pagination no longer drops empty pages; trailing-dot hostnames are treated as loopback by the local-target guard; buffered input is preserved between interactive prompts; the Codex managed-section skill check requires a complete section; `code get` strips a leading BOM and rejects an empty `--out`.
+
+### Security
+
+- **INI injection:** CR/LF characters are stripped from credential values before they are written to `~/.testsprite/credentials`.
+- **Symlink fail-close:** the own-file `agent install` path applies its symlink containment guard under `--dry-run` as well, so a planted symlink cannot place or clobber files outside `--dir`.
+
+## [0.2.0] - 2026-06-29
+
+### Added
+
+- **Seed-suite onboarding skill.** `agent install` now installs a second skill by default — `testsprite-onboard` — which guides your coding agent to create a first test suite in a repository that doesn't have one yet (alongside the existing `testsprite-verify` skill). Use `agent install --skill <name>` to install only a specific subset.
+
+### Changed
+
+- **`test result` now reports the test verdict and execution status as separate fields.** The latest-result output gains a `verdict` field (the run's pass / fail / blocked judgement) and an `executionStatus` field (how the run terminated); `summary` is now a human-readable string.
+  - **Breaking change to `--output json`:** `summary` was previously an object (`{ passed, failed, skipped }`). Scripts that read `summary.passed` / `.failed` / `.skipped` must move to the new `verdict` / `executionStatus` fields. The legacy `status` field is unchanged.
+- `project create`, `project update`, and `test run --all` now print the `[dry-run] sample response — not from the server` banner under `--dry-run`, consistent with every other command.
+- The CLI no longer suggests TypeScript/JavaScript test code is supported — TestSprite runs all test code as Python.
+
+### Fixed
+
+- **Security (failure-bundle writer):** `test failure get` and `test artifact get` now validate the response's step index and evidence kind before composing file paths, so a malformed or hostile API response can no longer write files outside the chosen `--out` directory.
+- `test create --type backend` and `test code put` now reject a non-Python `--code-file` immediately with a clear validation error, instead of failing late server-side.
+- `test failure get --out` is validated before the network call; `test code get --out` now writes atomically (no truncation if the fetch fails); artifact downloads retry on transient transport errors.
+- Clearer validation messages for malformed `--endpoint-url` values and profile names; argument-parse errors now emit a structured JSON envelope under `--output json`.
+- Batch rerun dispatch is de-duplicated and serialized.
+
 ## [0.1.2] - 2026-06-19
 
 ### Added
@@ -123,6 +187,9 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 - Commander `help [command]` exits 0 (previously exited 5 on `test help` / `project help`).
 
-[Unreleased]: https://github.com/TestSprite/testsprite-cli/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/TestSprite/testsprite-cli/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/TestSprite/testsprite-cli/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/TestSprite/testsprite-cli/compare/v0.1.2...v0.2.0
+[0.1.2]: https://github.com/TestSprite/testsprite-cli/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/TestSprite/testsprite-cli/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/TestSprite/testsprite-cli/releases/tag/v0.1.0

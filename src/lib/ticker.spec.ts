@@ -3,7 +3,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
-import { createTicker } from './ticker.js';
+import { createTicker, isNoColor } from './ticker.js';
 
 describe('createTicker — non-TTY (CI mode)', () => {
   it('update is a no-op (no writes)', () => {
@@ -220,5 +220,68 @@ describe('createTicker — spy on process.stderr', () => {
     } finally {
       writeSpy.mockRestore();
     }
+  });
+});
+
+describe('createTicker — NO_COLOR support', () => {
+  it('suppresses ANSI escape sequences when noColor=true on TTY', () => {
+    const lines: string[] = [];
+    const raw: string[] = [];
+    const ticker = createTicker(
+      line => lines.push(line),
+      true, // isTTY = true
+      text => raw.push(text),
+      true, // noColor = true
+    );
+    ticker.update('progress');
+    // Should use stderrWrite (line-oriented) instead of rawWrite with ANSI
+    expect(raw).toHaveLength(0);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!).not.toContain('\x1b[2K');
+    expect(lines[0]!).not.toContain('\r');
+    expect(lines[0]!).toContain('progress');
+  });
+
+  it('finalize emits plain text without ANSI when noColor=true on TTY', () => {
+    const lines: string[] = [];
+    const raw: string[] = [];
+    const ticker = createTicker(
+      line => lines.push(line),
+      true,
+      text => raw.push(text),
+      true, // noColor = true
+    );
+    ticker.finalize('done');
+    expect(raw).toHaveLength(0);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!).not.toContain('\x1b[2K');
+    expect(lines[0]!).toContain('done');
+  });
+
+  it('normal ANSI output when noColor=false on TTY', () => {
+    const raw: string[] = [];
+    const ticker = createTicker(
+      () => {},
+      true,
+      text => raw.push(text),
+      false, // noColor = false
+    );
+    ticker.update('progress');
+    expect(raw).toHaveLength(1);
+    expect(raw[0]!).toContain('\x1b[2K\r');
+  });
+});
+
+describe('isNoColor', () => {
+  it('returns true when NO_COLOR is set to a non-empty value', () => {
+    expect(isNoColor({ NO_COLOR: '1' })).toBe(true);
+    expect(isNoColor({ NO_COLOR: 'true' })).toBe(true);
+  });
+
+  it('returns false when NO_COLOR is absent or empty', () => {
+    expect(isNoColor({})).toBe(false);
+    expect(isNoColor({ OTHER_VAR: '1' })).toBe(false);
+    // Per https://no-color.org/, an empty NO_COLOR does NOT disable color.
+    expect(isNoColor({ NO_COLOR: '' })).toBe(false);
   });
 });

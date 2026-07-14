@@ -1,0 +1,6 @@
+# Check out all text files with LF on every platform. Tests compare bytes
+# from checked-out files (skill templates, snapshots); a CRLF working tree
+# (core.autocrlf on Windows) broke those comparisons.
+* text=auto eol=lf
+
+*.png binary

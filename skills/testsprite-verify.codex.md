@@ -64,6 +64,8 @@ testsprite test run --all --project <id> [--filter <substr>] \
   already have the change deployed (e.g. a CI preview deploy) — the CLI tests a
   deployed URL, it doesn't host your environment. Running earlier verifies the
   previous build.
+- Backend `--code-file`: the runner executes the file top-to-bottom (not `pytest`), so **call your `test_*` function(s) at the end of the file** — a defined-but-uncalled test silently passes.
+- Backend sandbox has only stdlib + `requests` + `pytest` + `numpy` + `scipy`. Test the API over HTTP with `requests`; do **not** `import` the project's own source modules or other packages (e.g. `torch`) — they aren't installed and the test won't run.
 - `--wait` long-polls until terminal. Do not wrap it in a retry loop.
 - Exit `0` = passed; `1` = failed/blocked; `7` = timeout (resume with `test wait <run-id>`).
 - BE dependency flags (`--produces`/`--needs`/`--category`) are backend-only and

@@ -5,4 +5,4 @@ node_modules/
 package-lock.json
 .claude/worktrees/
 
-
+# Internal design docs (dropped wholesale from the public snapshot) — not Prettier-governed

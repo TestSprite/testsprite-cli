@@ -5,6 +5,12 @@ export default defineConfig({
     include: ['src/**/*.{test,spec}.ts', 'test/**/*.{test,spec}.ts'],
     exclude: ['test/dev-e2e/**', 'test/e2e/**', 'node_modules/**', 'dist/**'],
     globalSetup: ['./test/global-setup.mjs'],
+    // Strip real TESTSPRITE_* env vars and redirect the home dir so results
+    // never depend on the developer's shell or ~/.testsprite (see the file).
+    setupFiles: ['./test/helpers/hermetic-env.ts'],
+    // Subprocess/snapshot suites share dist/; keep file workers serial as a belt-
+    // and-suspenders guard even though globalSetup builds once up front.
+    fileParallelism: false,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'text-summary', 'json-summary', 'html'],

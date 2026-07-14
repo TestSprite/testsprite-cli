@@ -17,7 +17,7 @@ AI ships code in minutes — verifying it hasn't. `testsprite` opens your live a
 <p>
   <a href="https://www.npmjs.com/package/@testsprite/testsprite-cli"><img src="https://img.shields.io/npm/v/@testsprite/testsprite-cli?color=19C379&label=npm" alt="npm version"></a>
   <a href="https://www.npmjs.com/package/@testsprite/testsprite-cli"><img src="https://img.shields.io/npm/dm/@testsprite/testsprite-cli?color=19C379&label=downloads" alt="npm downloads"></a>
-  <a href="#quickstart"><img src="https://img.shields.io/badge/node-%3E%3D20-19C379" alt="Node >= 20"></a>
+  <a href="#quickstart"><img src="https://img.shields.io/badge/node-20.19%2B%20%7C%2022.13%2B%20%7C%2024%2B-19C379" alt="Node 20.19+, 22.13+, or 24+"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-0A0A0A" alt="License Apache 2.0"></a>
   <a href="https://github.com/TestSprite/testsprite-cli/actions/workflows/ci.yml"><img src="https://github.com/TestSprite/testsprite-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
@@ -54,20 +54,22 @@ If you find `testsprite` useful, a GitHub Star ⭐️ would be greatly appreciat
 
 ## Quickstart
 
-Requires **Node.js ≥ 20**. (No global install? `npx @testsprite/testsprite-cli` works too.)
+Requires **Node.js 20.19+**, **22.13+**, or **24+**. (No global install? `npx @testsprite/testsprite-cli` works too.)
 
 ```bash
 npm install -g @testsprite/testsprite-cli
 testsprite setup
 ```
 
-`testsprite setup` prompts for your [API key](https://www.testsprite.com), verifies it, and installs the verification-loop skill for your coding agent (`claude`, `cursor`, `cline`, `antigravity`, `codex`, etc.) — one command, so your agent is wired to verify its own work. Non-interactive (CI / onboarding scripts):
+`testsprite setup` prompts for your [API key](https://www.testsprite.com), verifies it, and installs the verification-loop skill for your coding agent (`claude`, `cursor`, `cline`, `windsurf`, `antigravity`, `codex`, etc.) — one command, so your agent is wired to verify its own work. Non-interactive (CI / onboarding scripts):
 
 ```bash
 TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --yes --agent claude
 ```
 
 > **Pointing a coding agent (Claude Code, Cursor, Codex, Cline, …) at TestSprite?** Have it run `testsprite setup` first — that installs the verification skill, so the agent knows how to create, run, and triage tests on its own (instead of guessing from this README). New here? Start with the **[getting-started overview](https://docs.testsprite.com/cli/getting-started/overview)**.
+
+> **Privacy note:** interactive runs check the npm registry at most once per 24 h to offer a "new version available" notice — package name only, never your key or data; `TESTSPRITE_NO_UPDATE_NOTIFIER=1` disables it. Details in [DOCUMENTATION.md → Update notice](./DOCUMENTATION.md#update-notice).
 
 From there, the loop runs on its own — an example session, typed by the coding agent:
 
@@ -89,28 +91,34 @@ Prefer to configure each step by hand (or learn the surface offline with `--dry-
 
 ## Commands
 
-| Group     | Command                                             | What it does                                                                                                          |
-| --------- | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| **Setup** | `setup`                                             | **Start here** — one command: configure your API key, verify it, and install the agent verification skill             |
-| **Auth**  | `auth status`                                       | Resolve the active profile to its user, key, env, and scopes                                                          |
-|           | `auth remove`                                       | Remove the active profile from the credentials file                                                                   |
-| **Read**  | `project list` / `project get`                      | List projects / fetch one by id                                                                                       |
-|           | `test list` / `test get`                            | List tests under a project / fetch one by id                                                                          |
-|           | `test code get`                                     | Print (or write) the generated test source                                                                            |
-|           | `test steps`                                        | List the latest run's steps with screenshot / DOM pointers                                                            |
-|           | `test result`                                       | Latest result; `--history` lists a test's prior runs                                                                  |
-|           | `test failure get`                                  | The agent entry point: one self-contained latest-failure bundle                                                       |
-|           | `test failure summary`                              | One-screen triage card (no media download)                                                                            |
-| **Write** | `test create` / `test create-batch`                 | Create a test (or bulk-create from a plan file); `--produces` / `--needs` / `--category` wire BE dependency metadata  |
-|           | `test update` / `test delete` / `test delete-batch` | Edit metadata / soft-delete                                                                                           |
-|           | `test code put`                                     | Replace generated code (etag-guarded)                                                                                 |
-|           | `test plan put`                                     | Replace a frontend test's plan-steps                                                                                  |
-|           | `project create` / `project update`                 | Manage projects                                                                                                       |
-| **Run**   | `test run`                                          | Trigger a fresh run; `--wait` blocks until terminal; `--all --project <id>` runs all tests in a project in wave order |
-|           | `test rerun`                                        | Cheap replay of one/many tests (FE verbatim; BE with deps); `--all --project <id>` reruns all tests                   |
-|           | `test wait`                                         | Block on a `runId` until terminal                                                                                     |
-|           | `test artifact get`                                 | Download the failure bundle for a specific `runId`                                                                    |
-| **Agent** | `agent install` / `agent list`                      | Add or list coding-agent targets (pure-local): `claude`, `codex`, `cursor`, `cline`, `antigravity`                    |
+| Group     | Command                                             | What it does                                                                                                                                    |
+| --------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Setup** | `setup`                                             | **Start here** — one command: configure your API key, verify it, and install the agent verification skill                                       |
+|           | `doctor`                                            | Environment diagnostic — CLI/Node versions, profile, endpoint, credentials, connectivity, agent skill; exits non-zero on failure                |
+| **Auth**  | `auth status`                                       | Resolve the active profile to its user, key, env, and scopes                                                                                    |
+|           | `auth remove`                                       | Remove the active profile from the credentials file                                                                                             |
+|           | `usage` (alias `credits`)                           | Account pre-flight: identity, plus credit balance / plan info when the backend supplies them                                                    |
+| **Read**  | `project list` / `project get`                      | List projects / fetch one by id                                                                                                                 |
+|           | `test list` / `test get`                            | List tests under a project / fetch one by id                                                                                                    |
+|           | `test code get`                                     | Print (or write) the generated test source                                                                                                      |
+|           | `test steps`                                        | List the latest run's steps with screenshot / DOM pointers                                                                                      |
+|           | `test result`                                       | Latest result; `--history` lists a test's prior runs                                                                                            |
+|           | `test failure get`                                  | The agent entry point: one self-contained latest-failure bundle                                                                                 |
+|           | `test failure summary`                              | One-screen triage card (no media download)                                                                                                      |
+|           | `test diff`                                         | Compare two runs — verdict, failure kind, per-step status flips, code-version drift                                                             |
+| **Write** | `test scaffold` / `test lint`                       | Author plans locally: emit a schema-correct starter, validate plan files offline — no network, no credentials                                   |
+|           | `test create` / `test create-batch`                 | Create a test (or bulk-create from a plan file); `--produces` / `--needs` / `--category` wire BE dependency metadata                            |
+|           | `test update` / `test delete` / `test delete-batch` | Edit metadata / permanently delete (no restore window; `--confirm` required)                                                                    |
+|           | `test code put`                                     | Replace generated code (etag-guarded)                                                                                                           |
+|           | `test plan put`                                     | Replace a frontend test's plan-steps                                                                                                            |
+|           | `project create` / `project update`                 | Manage projects                                                                                                                                 |
+|           | `project credential` / `project auto-auth`          | Configure backend-test auth: a static injected credential, or auto-refresh login (Pro)                                                          |
+| **Run**   | `test run`                                          | Trigger a fresh run; `--wait` blocks until terminal; `--all --project <id>` runs all tests in a project in wave order                           |
+|           | `test rerun`                                        | Cheap replay of one/many tests (FE verbatim; BE with deps); `--all --project <id>` reruns all tests                                             |
+|           | `test flaky`                                        | Replay a test several times (auto-heal off) and report a stability score                                                                        |
+|           | `test wait`                                         | Block on one or more `runId`s until terminal                                                                                                    |
+|           | `test artifact get`                                 | Download the failure bundle for a specific `runId`                                                                                              |
+| **Agent** | `agent install` / `agent list` / `agent status`     | Add, list, or health-check coding-agent skills (pure-local): `claude`, `codex`, `cursor`, `cline`, `antigravity`, `kiro`, `windsurf`, `copilot` |
 
 > The earlier command names — `init`, `auth configure`, `auth whoami`, `auth logout` — still work as hidden, deprecated aliases (each prints a one-line notice pointing at the new name), so existing scripts keep running. `auth configure` now runs the full `setup` (it also installs the skill).
 
@@ -173,7 +181,7 @@ That's the point of all of this: you no longer need the biggest, most expensive 
 
 ## Contributing
 
-Contributions are welcome — the CLI is plain TypeScript/Node (≥ 20), tested with Vitest, built with `tsc`. Getting a dev loop running takes a minute:
+Contributions are welcome — the CLI is plain TypeScript/Node (20.19+, 22.13+, or 24+), tested with Vitest, built with `tsc`. Getting a dev loop running takes a minute:
 
 ```bash
 git clone https://github.com/TestSprite/testsprite-cli.git

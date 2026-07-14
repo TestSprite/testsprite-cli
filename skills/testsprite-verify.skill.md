@@ -135,7 +135,10 @@ language; you don't write browser code.
 **Backend — write the Python yourself and use `--code-file`.** There is no
 server-side codegen on the CLI. Read the API surface that changed (OpenAPI, the
 route handler, request/response shapes) and write a pytest-style assertion script
-to a tempfile:
+to a tempfile. **End the file by calling your `test_*` function(s)** — the runner
+executes the file top-to-bottom and does NOT auto-discover/collect test functions
+the way `pytest` does, so a test that is only _defined_ (never called) silently
+passes regardless of its assertions:
 
 ```python
 # /tmp/login-empty-password.py — runs against the project's target URL, creds injected.
@@ -145,7 +148,55 @@ def test_login_rejects_empty_password():
     r = requests.post(f"{TARGET_URL}/login", json={"email": "a@b.c", "password": ""})
     assert r.status_code == 400
     assert r.json().get("error") == "invalid password"
+
+# Required: actually invoke the test so its assertions run.
+test_login_rejects_empty_password()
 ```
+
+**Execution environment (backend).** The code runs in a locked-down sandbox with
+only the Python **standard library + `requests` + `pytest` + `numpy` + `scipy`**
+(plus `requests`' own deps like `urllib3`). So:
+
+- **Test the API over HTTP** with `requests` against the target URL — that's what a
+  backend test verifies.
+- **Do NOT `import` the project's own source modules** (e.g. `from app.services import …`,
+  `import core`, `import model`) or other third-party/ML packages (e.g. `torch`,
+  `pandas`, `django`). They are not installed, so the test fails to even run.
+- Get values from the API's responses (and captured variables), not by importing and
+  calling the app's internals.
+
+**Authentication — read the injected credential, NEVER hardcode any credential.** This
+applies to **every** secret the API needs — Bearer/JWT tokens **and** API keys, basic-auth
+blobs, session cookies. Do not paste a literal `Bearer …`, `sk-…`, `x-api-key` value, or any
+other credential into the test. Before your script runs, TestSprite prepends a managed
+credential block built from the project's Authentication settings, and `__AUTH_HEADERS__`
+already contains the right header(s) for the configured auth type:
+
+```python
+# Auto-injected credentials — do not modify
+__AUTH_CREDENTIAL__ = "..."
+__AUTH_TYPE__       = "Bearer token"            # or "API key" / "basic token" / "public"
+__AUTH_HEADERS__    = {"Authorization": "Bearer ..."}   # API key → {"X-API-Key": "..."}; basic → {"Authorization": "Basic ..."}
+```
+
+Spread `__AUTH_HEADERS__` into every authenticated request — it adapts to whatever auth type
+the project is configured for, so the same line works for Bearer, API-key, or basic auth:
+
+```python
+r = requests.get(f"{TARGET_URL}/profile", headers={**__AUTH_HEADERS__})
+```
+
+Configure the credential **once on the project** (ask the user for the value — never invent
+or reuse a key you happened to see), and the block stays correct + refreshable:
+
+- **Bearer / API key / basic (static):**
+  `testsprite project credential <projectId> --type "Bearer token"|"API key"|"basic token" --credential <value>`
+- **Auto-refreshing login (recurring token):** `testsprite project auto-auth <projectId> …`
+
+A hardcoded token expires within hours (and a hardcoded key can't be rotated centrally), so
+the test breaks on later runs; the managed block is rewritten with a fresh value each run.
+`test create` emits a `[warn]` when it detects an inlined credential literal — treat that as
+a must-fix, not a nuisance.
 
 **Backend tests that share state declare dependencies at create time.** For a
 one-off verification, prefer a single self-contained script (log in inside the

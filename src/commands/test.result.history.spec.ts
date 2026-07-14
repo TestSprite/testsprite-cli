@@ -104,7 +104,9 @@ const CANNED_LATEST_RESULT: CliLatestResult = {
   targetUrl: 'https://example.com',
   failedStepIndex: null,
   failureKind: null,
-  summary: { passed: 5, failed: 0, skipped: 0 },
+  verdict: 'passed',
+  executionStatus: 'completed',
+  summary: 'Test passed.',
 };
 
 function errorEnvelope(code: string): unknown {
@@ -166,6 +168,24 @@ describe('parseDuration', () => {
 
   it('case-insensitive day suffix', () => {
     expect(parseDuration('7D', NOW)).toBe('2026-05-27T12:00:00.000Z');
+  });
+
+  it('overflow hours throws VALIDATION_ERROR instead of crashing', () => {
+    expect(() => parseDuration('99999999999h', NOW)).toThrow();
+    try {
+      parseDuration('99999999999h', NOW);
+    } catch (err: unknown) {
+      expect((err as { code?: string }).code).toBe('VALIDATION_ERROR');
+    }
+  });
+
+  it('overflow days throws VALIDATION_ERROR instead of crashing', () => {
+    expect(() => parseDuration('99999999999d', NOW)).toThrow();
+    try {
+      parseDuration('99999999999d', NOW);
+    } catch (err: unknown) {
+      expect((err as { code?: string }).code).toBe('VALIDATION_ERROR');
+    }
   });
 });
 
@@ -532,6 +552,32 @@ describe('runResultHistory — pagination', () => {
     );
 
     expect(capturedUrl).toContain('pageSize=5');
+  });
+
+  it('rejects fractional --page-size before making a request', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => {
+      throw new Error('should not be called');
+    });
+
+    await expect(
+      runResultHistory(
+        {
+          output: 'json',
+          testId: 'test_abc',
+          pageSize: 1.5,
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { credentialsPath, fetchImpl, stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'page-size' }),
+    });
   });
 });
 
@@ -1008,7 +1054,9 @@ describe('runResult — back-compat (M2 latest result)', () => {
     );
 
     const output = lines.join('\n');
-    expect(output).toMatch(/status:\s+passed/);
+    // text mode now leads with verdict (outcome) instead of the
+    // conflated status line.
+    expect(output).toMatch(/verdict:\s+passed/);
     expect(output).toMatch(/snapshotId:\s+snap_001/);
     // Must NOT look like a history table (no RUN ID header)
     expect(output).not.toMatch(/RUN ID\s+STATUS/);

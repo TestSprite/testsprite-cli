@@ -1,7 +1,7 @@
 import type { ChildProcess } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -91,6 +91,38 @@ describe('serializeCredentials', () => {
     expect(text).toContain('api_key = sk');
     expect(text).not.toContain('api_url');
   });
+
+  it('strips newline characters from values to prevent INI injection', () => {
+    // A malicious apiUrl with embedded newlines could inject new key-value
+    // pairs or section headers into the credentials file. The serializer
+    // must strip \n and \r so the written file has exactly one value per
+    // field and no injected content parsed as separate keys/sections.
+    const malicious = 'https://evil.com\napi_key = sk-HIJACKED\n[admin]\napi_key = sk-admin';
+    const text = serializeCredentials({ default: { apiKey: 'sk-real', apiUrl: malicious } });
+    // The output must NOT contain a standalone [admin] section header
+    // (it would be on its own line if injection succeeded)
+    const lines = text.split('\n');
+    // Only one section header exists: [default]
+    const sectionHeaders = lines.filter(l => /^\[.+\]$/.test(l.trim()));
+    expect(sectionHeaders).toEqual(['[default]']);
+    // Only one api_key line exists (the real one, not an injected duplicate)
+    const apiKeyLines = lines.filter(l => l.trim().startsWith('api_key'));
+    expect(apiKeyLines).toHaveLength(1);
+    expect(apiKeyLines[0]).toContain('sk-real');
+    // Round-trip: reading back must return only the real key, not the injected one
+    const parsed = parseCredentials(text);
+    expect(parsed['default']?.apiKey).toBe('sk-real');
+    expect(parsed['admin']).toBeUndefined();
+  });
+
+  it('strips \\r\\n (CRLF) injection from values', () => {
+    const text = serializeCredentials({ default: { apiUrl: 'https://x.com\r\napi_key = pwned' } });
+    const parsed = parseCredentials(text);
+    // The injected api_key must NOT be parsed as a real key
+    expect(parsed['default']?.apiKey).toBeUndefined();
+    // The api_url value is on one line (newlines stripped)
+    expect(parsed['default']?.apiUrl).toContain('https://x.com');
+  });
 });
 
 describe('readCredentialsFile / readProfile', () => {
@@ -110,8 +142,11 @@ describe('writeProfile', () => {
   it('creates the file with mode 0600 and writes the profile', async () => {
     await writeProfile(DEFAULT_PROFILE, { apiKey: 'sk-new' }, { path: credentialsPath });
     expect(existsSync(credentialsPath)).toBe(true);
-    const mode = statSync(credentialsPath).mode & 0o777;
-    expect(mode).toBe(0o600);
+    // POSIX file modes don't exist on Windows (stat reports 0666).
+    if (process.platform !== 'win32') {
+      const mode = statSync(credentialsPath).mode & 0o777;
+      expect(mode).toBe(0o600);
+    }
     expect(readProfile(DEFAULT_PROFILE, { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
   });
 
@@ -163,7 +198,8 @@ describe('ensureRestrictiveMode', () => {
     expect(() => ensureRestrictiveMode(credentialsPath)).not.toThrow();
   });
 
-  it('downgrades over-permissive modes', () => {
+  // POSIX-only premise: Windows has no 0644/0600 distinction to downgrade.
+  it.skipIf(process.platform === 'win32')('downgrades over-permissive modes', () => {
     mkdirSync(tmpRoot, { recursive: true });
     writeFileSync(credentialsPath, 'data', { mode: 0o644 });
     ensureRestrictiveMode(credentialsPath);
@@ -174,7 +210,7 @@ describe('ensureRestrictiveMode', () => {
 
 describe('defaultCredentialsPath', () => {
   it('points at ~/.testsprite/credentials', () => {
-    expect(defaultCredentialsPath().endsWith('/.testsprite/credentials')).toBe(true);
+    expect(defaultCredentialsPath()).toBe(join(homedir(), '.testsprite', 'credentials'));
   });
 });
 

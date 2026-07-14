@@ -17,12 +17,13 @@ import { Command } from 'commander';
 import {
   emitDryRunBanner,
   makeHttpClient,
+  parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { loadConfig } from '../lib/config.js';
 import { resolvePortalBase } from '../lib/facade.js';
 import type { FetchImpl } from '../lib/http.js';
-import { GLOBAL_OPTS_HINT, Output, type OutputMode } from '../lib/output.js';
+import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 
 /**
  * Usage/balance response from `/me` (when the backend supplies it) or a future
@@ -153,8 +154,12 @@ function renderUsage(u: UsageResponse, portalBase?: string): string {
     }
     if (u.creditsPerRun !== undefined) {
       lines.push(`cost per frontend run: ${u.creditsPerRun} credit(s)`);
+      // Backend runs DO consume credits (confirmed by design 2026-06-30 / DEV-289).
+      // The API exposes no backend-specific per-run cost field, and it differs from
+      // the frontend rate, so state that it bills without asserting a possibly-wrong
+      // number — check your balance before/after, or see the billing page.
       lines.push(
-        `cost per backend run:  0 credit(s) (backend tests bill at code-generation, not at run time)`,
+        `cost per backend run:  also consumes credits (exact amount not reported by the API)`,
       );
     }
 
@@ -199,7 +204,12 @@ export function createUsageCommand(deps: UsageDeps = {}): Command {
       '\nExamples:\n' +
         '  testsprite usage                 # show balance + plan\n' +
         '  testsprite usage --output json   # machine-readable balance\n' +
+        '  testsprite usage --debug         # trace HTTP method/path, request id, latency\n' +
         '  testsprite credits               # alias for usage\n' +
+        '\nExit codes:\n' +
+        '  0   success (or --dry-run)\n' +
+        '  3   auth error — run `testsprite setup` to configure credentials\n' +
+        '  10  transport/network failure (UNAVAILABLE) — retry the command\n' +
         '\nNote: credit balance requires a backend update to /me. Until shipped,\n' +
         "  check your portal's Billing page (/dashboard/settings/billing) for your balance.",
     )
@@ -216,20 +226,13 @@ function resolveCommonOptions(command: Command): CommonOptions {
   };
   return {
     profile: globals.profile ?? 'default',
-    output: globals.output ?? 'text',
+    output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
     verbose: globals.verbose ?? false,
     dryRun: globals.dryRun ?? false,
     requestTimeoutMs: parseRequestTimeoutFlag(globals.requestTimeout),
   };
-}
-
-function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
-  if (raw === undefined) return undefined;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0) return undefined;
-  return Math.round(n * 1000);
 }
 
 function makeOutput(mode: OutputMode, deps: UsageDeps): Output {

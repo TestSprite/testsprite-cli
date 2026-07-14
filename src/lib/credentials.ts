@@ -117,7 +117,15 @@ export function serializeCredentials(file: CredentialsFile): string {
     for (const field of fields) {
       const value = entry[field];
       if (value === undefined || value === '') continue;
-      lines.push(`${FIELD_TO_FILE_KEY[field]} = ${value}`);
+      // Guard against INI injection: a value containing newline characters
+      // would be serialized across multiple lines, allowing an attacker to
+      // inject arbitrary key-value pairs (or new section headers) into the
+      // credentials file. A valid API key or URL never contains \n or \r.
+      // Strip them so a compromised env var or MITM'd backend response
+      // cannot override the stored api_key on subsequent reads.
+      const sanitized = value.replace(/[\r\n]/g, '');
+      if (sanitized === '') continue;
+      lines.push(`${FIELD_TO_FILE_KEY[field]} = ${sanitized}`);
     }
     lines.push('');
   }
@@ -201,6 +209,11 @@ function credentialsLockPath(credentialsPath: string): string {
   return `${credentialsPath}.lock`;
 }
 
+interface CredentialsLockOwnership {
+  path: string;
+  token: string;
+}
+
 /**
  * Serialize read-modify-write on the credentials file across processes.
  * `writeCredentialsAtomic` only makes the final rename atomic; without this
@@ -208,24 +221,25 @@ function credentialsLockPath(credentialsPath: string): string {
  * same snapshot and the last rename wins — silently dropping the other update.
  */
 async function withCredentialsLock<T>(credentialsPath: string, fn: () => T): Promise<T> {
-  await acquireCredentialsLock(credentialsPath);
+  const ownership = await acquireCredentialsLock(credentialsPath);
   try {
     return fn();
   } finally {
-    releaseCredentialsLock(credentialsPath);
+    releaseCredentialsLock(ownership);
   }
 }
 
-async function acquireCredentialsLock(credentialsPath: string): Promise<void> {
+async function acquireCredentialsLock(credentialsPath: string): Promise<CredentialsLockOwnership> {
   const lockPath = credentialsLockPath(credentialsPath);
   // Ensure the credentials directory exists before creating the lock file.
   // writeCredentialsAtomic also mkdirs, but only after the lock is held.
   mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
   const deadline = Date.now() + CREDENTIALS_LOCK_MAX_WAIT_MS;
   while (Date.now() < deadline) {
+    const token = `${process.pid}\n${Date.now()}\n`;
     try {
-      writeFileSync(lockPath, `${process.pid}\n${Date.now()}\n`, { flag: 'wx', encoding: 'utf8' });
-      return;
+      writeFileSync(lockPath, token, { flag: 'wx', encoding: 'utf8' });
+      return { path: lockPath, token };
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== 'EEXIST') throw err;
@@ -243,9 +257,12 @@ async function acquireCredentialsLock(credentialsPath: string): Promise<void> {
   throw new Error(`Timed out acquiring credentials lock: ${lockPath}`);
 }
 
-function releaseCredentialsLock(credentialsPath: string): void {
+function releaseCredentialsLock(ownership: CredentialsLockOwnership): void {
   try {
-    unlinkSync(credentialsLockPath(credentialsPath));
+    const content = readFileSync(ownership.path, 'utf8');
+    // Only drop the lock we still own — a stale reclaim may have replaced us.
+    if (content !== ownership.token) return;
+    unlinkSync(ownership.path);
   } catch {
     // Lock already released or never acquired — teardown must not mask errors.
   }

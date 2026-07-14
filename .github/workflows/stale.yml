@@ -1,0 +1,64 @@
+# P1-3 — stale-bot: nudge then close inactive issues / PRs (actions/stale).
+#
+# Generous windows for an open-source repo (first-response SLA is 5 business days,
+# see CONTRIBUTING). Activity removes the `stale` label automatically, so a single
+# reply resets the clock. Newcomer- and security-relevant work is exempt from
+# closing. `good first issue` / `help wanted` stay open for whoever picks them up.
+#
+# This is a SYNCED asset (ships to the public mirror). It is scheduled, so unlike
+# the event-gated triage bot it is fenced to the PUBLIC repo with a repository
+# guard — on private atlas it is a no-op (no nagging internal issues/PRs).
+name: Stale
+
+on:
+  schedule:
+    - cron: '30 1 * * *' # daily 01:30 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  stale:
+    if: ${{ github.repository == 'TestSprite/testsprite-cli' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write # comment + (un)label + close stale issues
+      pull-requests: write # comment + (un)label + close stale PRs
+    steps:
+      - uses: actions/stale@eb5cf3af3ac0a1aa4c9c45633dd1ae542a27a899 # v10.3.0
+        with:
+          # ── issues ──────────────────────────────────────────────────────
+          days-before-issue-stale: 60
+          days-before-issue-close: 14
+          stale-issue-label: stale
+          stale-issue-message: >
+            This issue has had no activity for 60 days, so it's been marked
+            `stale`. If it's still relevant, just leave a comment (or remove the
+            `stale` label) and we'll keep it open — otherwise it will be closed
+            in 14 days. Thanks for helping us keep the tracker tidy!
+          close-issue-message: >
+            Closing as `stale` after no activity. This isn't a judgement on the
+            idea — please reopen or open a fresh issue if it's still relevant.
+
+          # ── pull requests (more grace — external contributors may be slow) ─
+          days-before-pr-stale: 45
+          days-before-pr-close: 21
+          stale-pr-label: stale
+          stale-pr-message: >
+            This PR has had no activity for 45 days, so it's been marked `stale`.
+            Push a commit or leave a comment to keep it open — otherwise it will
+            be closed in 21 days. We'd still love to merge it; ping a maintainer
+            if you're blocked on a review.
+          close-pr-message: >
+            Closing as `stale` after no activity. Reopen any time you can pick it
+            back up — your work isn't lost.
+
+          # ── shared behaviour ────────────────────────────────────────────
+          exempt-issue-labels: 'pinned,security,in-progress,good first issue,help wanted,hackathon'
+          exempt-pr-labels: 'pinned,security,in-progress,hackathon'
+          exempt-draft-pr: true
+          remove-stale-when-updated: true
+          ascending: true # oldest first — fairest under the per-run op cap
+          operations-per-run: 60
+          enable-statistics: true

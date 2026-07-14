@@ -11,13 +11,15 @@ import type { OutputMode } from './output.js';
  *
  * `boolean` flags (--dry-run, --debug, --verbose) take no value; emit
  * example without a placeholder. `value` flags (--output, --profile,
- * --endpoint-url) take a single argument; emit example with `<value>`.
+ * --endpoint-url, --request-timeout) take a single argument; emit example
+ * with `<value>`.
  */
 const GLOBAL_FLAG_ARITY: Record<string, 'boolean' | 'value'> = {
   'dry-run': 'boolean',
   output: 'value',
   profile: 'value',
   'endpoint-url': 'value',
+  'request-timeout': 'value',
   debug: 'boolean',
   verbose: 'boolean',
 };

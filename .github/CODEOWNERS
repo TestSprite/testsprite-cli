@@ -1,0 +1,9 @@
+# Code owners for testsprite-cli
+#
+# These owners are automatically requested for review on every pull request.
+# A single catch-all entry routes all PRs to the release operator; additional
+# rotating maintainers are appended here as they are named.
+#
+# Syntax: https://docs.github.com/articles/about-code-owners
+
+*       @zeshi-du @ruili-testsprite

@@ -1,5 +1,5 @@
 import type { HttpClient } from './http.js';
-import { localValidationError } from './errors.js';
+import { ApiError, localValidationError } from './errors.js';
 
 /**
  * Page shape returned by every list endpoint per
@@ -22,14 +22,15 @@ export interface PaginationFlags {
 
 const HARD_PAGE_SIZE_CAP = 100;
 const DEFAULT_PAGE_SIZE = 25;
+export const MAX_AUTO_PAGES = 1000;
 
 /**
  * Validates and normalizes pagination flags. Per the CLI OpenAPI spec
  * §components.parameters.PageSize the hard cap is 100. Values above the
  * cap are now rejected with exit 5 rather than silently clamped, giving
- * callers fast feedback that their flag value is out of range. Sub-1 /
- * NaN values also throw. `maxItems` is validated but not capped (it is a
- * client-side cursor, not a server parameter).
+ * callers fast feedback that their flag value is out of range. Fractional,
+ * sub-1, and NaN values also throw. `maxItems` is validated but not capped
+ * (it is a client-side cursor, not a server parameter).
  *
  * NOTE: `runResultHistory` previously did its own silent clamp via
  * `Math.min(Math.max(1, n), 100)` — that was unified to this path by the
@@ -38,7 +39,7 @@ const DEFAULT_PAGE_SIZE = 25;
 export function validatePaginationFlags(flags: PaginationFlags): PaginationFlags {
   const out: PaginationFlags = { ...flags };
   if (out.pageSize !== undefined) {
-    if (!Number.isFinite(out.pageSize) || out.pageSize < 1) {
+    if (!Number.isFinite(out.pageSize) || !Number.isInteger(out.pageSize) || out.pageSize < 1) {
       throw localValidationError(
         'page-size',
         `must be a positive integer between 1 and ${HARD_PAGE_SIZE_CAP}`,
@@ -52,7 +53,7 @@ export function validatePaginationFlags(flags: PaginationFlags): PaginationFlags
     }
   }
   if (out.maxItems !== undefined) {
-    if (!Number.isFinite(out.maxItems) || out.maxItems < 1) {
+    if (!Number.isFinite(out.maxItems) || !Number.isInteger(out.maxItems) || out.maxItems < 1) {
       throw localValidationError('maxItems', 'must be a positive integer');
     }
   }
@@ -91,14 +92,24 @@ export async function paginate<T>(
   const items: T[] = [];
   let cursor: string | undefined = flags.startingToken;
   let lastNextToken: string | null = null;
+  let pagesFetched = 0;
+  const seenNextTokens = new Set<string>();
+  if (cursor !== undefined) seenNextTokens.add(cursor);
 
   while (true) {
     const remaining = maxItems !== undefined ? maxItems - items.length : Infinity;
     if (remaining <= 0) break;
+    if (pagesFetched >= MAX_AUTO_PAGES) {
+      throw paginationSafetyError('max_pages_exceeded', {
+        maxPages: MAX_AUTO_PAGES,
+        lastCursor: cursor ?? null,
+      });
+    }
 
     const callPageSize = Number.isFinite(remaining) ? Math.min(pageSize, remaining) : pageSize;
 
     const page = await fetchPage({ pageSize: callPageSize, cursor });
+    pagesFetched += 1;
     lastNextToken = page.nextToken;
 
     for (const item of page.items) {
@@ -107,10 +118,28 @@ export async function paginate<T>(
     }
 
     if (page.nextToken === null) break;
+    if (seenNextTokens.has(page.nextToken)) {
+      throw paginationSafetyError('repeated_next_token', {
+        cursor: page.nextToken,
+        pagesFetched,
+      });
+    }
+    seenNextTokens.add(page.nextToken);
     cursor = page.nextToken;
   }
 
   return { items, nextToken: lastNextToken };
+}
+
+function paginationSafetyError(reason: string, details: Record<string, unknown>): ApiError {
+  return ApiError.fromEnvelope({
+    code: 'UNAVAILABLE',
+    message: 'Pagination did not make progress safely.',
+    nextAction:
+      'Retry later. If the problem continues, contact TestSprite support with the cursor details.',
+    requestId: 'local',
+    details: { reason, ...details },
+  });
 }
 
 /**

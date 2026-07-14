@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MANAGED_SECTION_BEGIN, TARGETS } from './agent-targets.js';
+import { MANAGED_SECTION_BEGIN, MANAGED_SECTION_END, TARGETS } from './agent-targets.js';
 import type { OutputMode } from './output.js';
 import {
   SKILL_NUDGE_COMMANDS,
@@ -13,31 +13,44 @@ import {
 // isVerifySkillInstalled
 // ---------------------------------------------------------------------------
 
+// The implementation joins paths with the native separator; normalize so the
+// fakes below match on Windows (backslashes) as well as POSIX.
+const toPosix = (p: string) => p.replaceAll('\\', '/');
+
 describe('isVerifySkillInstalled', () => {
   it('true when the claude own-file SKILL.md exists', () => {
-    const existsSync = (p: string) => p.endsWith('.claude/skills/testsprite-verify/SKILL.md');
+    const existsSync = (p: string) =>
+      toPosix(p).endsWith('.claude/skills/testsprite-verify/SKILL.md');
     expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
   });
 
   it('true for the cursor .mdc landing file', () => {
-    const existsSync = (p: string) => p.endsWith('.cursor/rules/testsprite-verify.mdc');
+    const existsSync = (p: string) => toPosix(p).endsWith('.cursor/rules/testsprite-verify.mdc');
     expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
   });
 
   it('true for the cline landing file', () => {
-    const existsSync = (p: string) => p.endsWith('.clinerules/testsprite-verify.md');
+    const existsSync = (p: string) => toPosix(p).endsWith('.clinerules/testsprite-verify.md');
     expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
   });
 
   it('true for the antigravity landing file', () => {
-    const existsSync = (p: string) => p.endsWith('.agents/skills/testsprite-verify/SKILL.md');
+    const existsSync = (p: string) =>
+      toPosix(p).endsWith('.agents/skills/testsprite-verify/SKILL.md');
     expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
   });
 
   it('true when AGENTS.md exists AND carries our BEGIN sentinel', () => {
     const existsSync = (p: string) => p.endsWith('AGENTS.md');
-    const readFileSync = () => `# project\n${MANAGED_SECTION_BEGIN}\n...skill...\n`;
+    const readFileSync = () =>
+      `# project\n${MANAGED_SECTION_BEGIN}\n...skill...\n${MANAGED_SECTION_END}\n`;
     expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(true);
+  });
+
+  it('false when AGENTS.md has only the BEGIN sentinel without a complete managed section', () => {
+    const existsSync = (p: string) => p.endsWith('AGENTS.md');
+    const readFileSync = () => `# project\n${MANAGED_SECTION_BEGIN}\n...partial skill...\n`;
+    expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(false);
   });
 
   it('false when only a bare AGENTS.md (no sentinel) exists', () => {
@@ -66,7 +79,7 @@ describe('isVerifySkillInstalled', () => {
         return false;
       },
     });
-    expect(seen.every(p => p.startsWith('/some/proj'))).toBe(true);
+    expect(seen.every(p => toPosix(p).startsWith('/some/proj'))).toBe(true);
     // One probe per target landing path.
     expect(seen).toHaveLength(Object.keys(TARGETS).length);
   });
@@ -191,6 +204,6 @@ describe('maybeEmitSkillNudge', () => {
     });
     maybeEmitSkillNudge(ctx);
     expect(probed.length).toBeGreaterThan(0);
-    expect(probed.every(p => p.startsWith('/work/here'))).toBe(true);
+    expect(probed.every(p => toPosix(p).startsWith('/work/here'))).toBe(true);
   });
 });

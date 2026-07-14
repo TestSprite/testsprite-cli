@@ -7,8 +7,8 @@
  * and runs `auth whoami` against the mock."
  */
 
-import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, statSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -190,7 +190,9 @@ beforeAll(async () => {
             targetUrl: 'https://staging.example.com/checkout',
             failedStepIndex: 2,
             failureKind: 'assertion',
-            summary: { passed: 1, failed: 1, skipped: 0 },
+            verdict: 'failed',
+            executionStatus: 'completed',
+            summary: 'Failed (assertion) on step 2: assertion error.',
           }),
         );
         return;
@@ -358,7 +360,10 @@ function runCli(args: string[], envOverrides: Record<string, string> = {}): Prom
       cwd: REPO_ROOT,
       env: {
         ...process.env,
+        // os.homedir() reads HOME on POSIX but USERPROFILE on Windows —
+        // set both so the child never sees the real ~/.testsprite.
         HOME: tmpHome,
+        USERPROFILE: tmpHome,
         TESTSPRITE_API_KEY: undefined,
         TESTSPRITE_API_URL: undefined,
         ...envOverrides,
@@ -493,22 +498,23 @@ describe('project list subprocess', () => {
     const parsed = JSON.parse(result.stderr) as { error: { code: string } };
     expect(parsed.error.code).toBe('VALIDATION_ERROR');
   }, 30_000);
-});
 
-describe('a malformed --profile is rejected (exit 5), not silently corrupting credentials', () => {
-  // A profile name becomes an INI section header (`[name]`). `prod]` would
-  // serialise to `[prod]]`, which the parser cannot read back — `setup` would
-  // report success while the key silently fails to persist. The guard fires on
-  // any credential read/write path.
-  it('exits 5 with a VALIDATION_ERROR naming the profile flag', async () => {
-    const result = await runCli(['--output', 'json', '--profile', 'prod]', 'project', 'list'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
-      TESTSPRITE_API_URL: baseUrl,
-    });
+  it('--request-timeout 30s exits 5 (VALIDATION_ERROR), not a silent fallback to 120s', async () => {
+    // Previously an invalid flag value resolved to `undefined` and the command
+    // silently ran with the default 120s deadline — the operator believed they
+    // had set a timeout but had not. Now the explicit flag is validated like
+    // every other flag.
+    const result = await runCli(
+      ['--output', 'json', '--request-timeout', '30s', 'project', 'list'],
+      {
+        TESTSPRITE_API_KEY: 'sk-subproc',
+        TESTSPRITE_API_URL: baseUrl,
+      },
+    );
     expect(result.exitCode).toBe(5);
     const parsed = JSON.parse(result.stderr) as { error: { code: string; nextAction: string } };
     expect(parsed.error.code).toBe('VALIDATION_ERROR');
-    expect(parsed.error.nextAction).toContain('profile');
+    expect(parsed.error.nextAction).toContain('request-timeout');
   }, 30_000);
 });
 
@@ -538,6 +544,50 @@ describe('malformed --endpoint-url is rejected (exit 5), not retried as a networ
     expect(result.exitCode).toBe(5);
     const parsed = JSON.parse(result.stderr) as { error: { code: string } };
     expect(parsed.error.code).toBe('VALIDATION_ERROR');
+  }, 30_000);
+});
+
+describe('invalid --output is rejected uniformly (exit 5)', () => {
+  // Regression: previously only `test` and `project` validated `--output`;
+  // `auth`, `usage`, `agent`, and `init` silently coerced an unknown value to
+  // text mode. An agent that asked for `--output json` but mistyped it then
+  // received a text payload it could not parse, with no signal as to why. Every
+  // command group now routes through resolveOutputMode (exit 5 on bad input).
+
+  // Note: when `--output` itself is the invalid value, the requested mode is
+  // unusable for the error envelope, so it is rendered in text mode (the catch
+  // block in index.ts falls back to text for an unrecognised --output).
+
+  it('agent list --output josn exits 5 with an actionable message (offline command)', async () => {
+    const result = await runCli(['--output', 'josn', 'agent', 'list'], {});
+    expect(result.exitCode).toBe(5);
+    expect(result.stderr).toContain('must be one of: json, text');
+  }, 30_000);
+
+  it('auth status --output yaml exits 5 before any network call', async () => {
+    const result = await runCli(['--output', 'yaml', 'auth', 'status'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    expect(result.stderr).toContain('must be one of: json, text');
+  }, 30_000);
+});
+
+describe('a malformed --profile is rejected (exit 5), not silently corrupting credentials', () => {
+  // A profile name becomes an INI section header (`[name]`). `prod]` would
+  // serialise to `[prod]]`, which the parser cannot read back — `setup` would
+  // report success while the key silently fails to persist. The guard fires on
+  // any credential read/write path.
+  it('exits 5 with a VALIDATION_ERROR naming the profile flag', async () => {
+    const result = await runCli(['--output', 'json', '--profile', 'prod]', 'project', 'list'], {
+      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    const parsed = JSON.parse(result.stderr) as { error: { code: string; nextAction: string } };
+    expect(parsed.error.code).toBe('VALIDATION_ERROR');
+    expect(parsed.error.nextAction).toContain('profile');
   }, 30_000);
 });
 
@@ -817,7 +867,8 @@ describe('test result subprocess', () => {
     expect(kindLine).toBeLessThan(startedLine);
     expect(result.stdout).toContain('failureKind:        assertion');
     expect(result.stdout).toContain('failedStepIndex:    2');
-    expect(result.stdout).toContain('summary:            passed=1 failed=1 skipped=0');
+    expect(result.stdout).toContain('verdict:            failed');
+    expect(result.stdout).toContain('summary:            Failed (assertion) on step 2');
   }, 30_000);
 });
 
@@ -845,7 +896,10 @@ describe('setup --from-env subprocess', () => {
     expect(result.exitCode).toBe(0);
     const credentialsPath = join(tmpHome, '.testsprite', 'credentials');
     expect(existsSync(credentialsPath)).toBe(true);
-    expect(statSync(credentialsPath).mode & 0o777).toBe(0o600);
+    // POSIX file modes don't exist on Windows (stat reports 0666).
+    if (process.platform !== 'win32') {
+      expect(statSync(credentialsPath).mode & 0o777).toBe(0o600);
+    }
   }, 30_000);
 
   it('exits 5 with VALIDATION_ERROR when --from-env is set without TESTSPRITE_API_KEY', async () => {
@@ -887,6 +941,22 @@ describe('--dry-run subprocess smoke', () => {
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(result.stdout) as { id: string };
     expect(parsed.id).toBeTruthy();
+  }, 30_000);
+
+  it('project update --dry-run does not read a missing --password-file', async () => {
+    const result = await runCli([
+      'project',
+      'update',
+      'proj_anything',
+      '--password-file',
+      '/tmp/definitely-not-here-testsprite',
+      '--dry-run',
+      '--output',
+      'json',
+    ]);
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as { updatedFields: string[] };
+    expect(parsed.updatedFields).toContain('password');
   }, 30_000);
 
   it('test list --dry-run returns canned TestList', async () => {
@@ -976,7 +1046,7 @@ describe('--dry-run subprocess smoke', () => {
     // skipped the prompt.
     const credPath = join(tmpHome, '.testsprite', 'credentials');
     // Make sure any previous test didn't leave one behind.
-    if (existsSync(credPath)) execFileSync('rm', [credPath]);
+    rmSync(credPath, { force: true });
     const result = await runCli(['setup', '--dry-run', '--no-agent', '--output', 'json']);
     expect(result.exitCode).toBe(0);
     expect(existsSync(credPath)).toBe(false);

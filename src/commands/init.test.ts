@@ -13,7 +13,7 @@ import type { MeResponse } from './auth.js';
 import type { AgentFs } from './agent.js';
 import type { InitDeps } from './init.js';
 import { runInit } from './init.js';
-import { TARGETS, type AgentTarget } from '../lib/agent-targets.js';
+import { TARGETS, DEFAULT_SKILLS, pathFor, type AgentTarget } from '../lib/agent-targets.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -199,8 +199,14 @@ describe('runInit — happy path (interactive)', () => {
     const stdout = captured.stdout.join('\n');
     expect(stdout).toContain('TestSprite initialized.');
     expect(stdout).toContain('profile:');
+    // Next steps leads with creating a project; no command that fails without --project.
     expect(stdout).toContain('Next steps:');
-    expect(stdout).toContain('testsprite test list');
+    expect(stdout).toContain('testsprite project create --type frontend');
+    expect(stdout).toContain('testsprite test run --all --project <projectId>');
+    expect(stdout).toContain('the testsprite-onboard skill is installed');
+    // No "current project" wording, no bare test list.
+    expect(stdout).not.toContain('current project');
+    expect(stdout).not.toContain('testsprite test list');
   });
 
   it('json mode: emits structured InitSummary object', async () => {
@@ -225,6 +231,11 @@ describe('runInit — happy path (interactive)', () => {
     expect(typeof parsed.apiUrl).toBe('string');
     expect(Array.isArray(parsed.scopes)).toBe(true);
     expect(parsed.agent).not.toBeNull();
+    // setup installs DEFAULT_SKILLS (both skills); aggregate action is 'installed'
+    const agent = parsed.agent as { target: string; action: string; skills?: string[] };
+    expect(agent.action).toBe('installed');
+    expect(agent.skills).toContain('testsprite-verify');
+    expect(agent.skills).toContain('testsprite-onboard');
   });
 });
 
@@ -301,6 +312,65 @@ describe('runInit — --no-agent', () => {
 
     const stdout = captured.stdout.join('\n');
     expect(stdout).toContain('skipped (--no-agent)');
+    // --no-agent points at manual test creation; must not claim the skill is installed.
+    expect(stdout).toContain('Next steps:');
+    expect(stdout).toContain('testsprite project create --type frontend');
+    expect(stdout).toContain('testsprite test create --project <projectId>');
+    expect(stdout).toContain('testsprite test run --all --project <projectId>');
+    expect(stdout).not.toContain('skill is installed');
+    // No "current project" wording, no bare test list.
+    expect(stdout).not.toContain('current project');
+    expect(stdout).not.toContain('testsprite test list');
+  });
+
+  it('text mode with agent: summary contains skills line with both default skills', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    const fetchMock = makeOkFetch();
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-test' }), {
+      ...deps,
+      fetchImpl: fetchMock,
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    const stdout = captured.stdout.join('\n');
+    // renderInitText emits a 'skills:' line when skills are present
+    expect(stdout).toContain('skills:');
+    expect(stdout).toContain('testsprite-verify');
+    expect(stdout).toContain('testsprite-onboard');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3b. Default claude target: installs both DEFAULT_SKILLS (2 own-file writes)
+// ---------------------------------------------------------------------------
+
+describe('runInit — default claude target installs 2 skill files', () => {
+  it('writes both testsprite-verify and testsprite-onboard for claude', async () => {
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+    const fetchMock = makeOkFetch();
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-test' }), {
+      ...deps,
+      fetchImpl: fetchMock,
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    const verifyPath = path.resolve(CWD, pathFor('claude', 'testsprite-verify'));
+    const onboardPath = path.resolve(CWD, pathFor('claude', 'testsprite-onboard'));
+    expect(writeCalls).toContain(verifyPath);
+    expect(writeCalls).toContain(onboardPath);
+    // Exactly 2 skill-file writes (claude is own-file, one file per skill)
+    const skillWrites = writeCalls.filter(p => p === verifyPath || p === onboardPath);
+    expect(skillWrites).toHaveLength(2);
   });
 });
 
@@ -323,6 +393,12 @@ describe('runInit — --agent cursor', () => {
       fs: agentFs,
     });
 
+    // cursor is own-file; DEFAULT_SKILLS installs 2 files (testsprite-verify + testsprite-onboard)
+    const cursorVerifyPath = path.resolve(CWD, pathFor('cursor', 'testsprite-verify'));
+    const cursorOnboardPath = path.resolve(CWD, pathFor('cursor', 'testsprite-onboard'));
+    expect(writeCalls).toContain(cursorVerifyPath);
+    expect(writeCalls).toContain(cursorOnboardPath);
+    // TARGETS[target].path is the verify skill path (back-compat); still written
     const cursorAbsPath = path.resolve(CWD, TARGETS.cursor.path);
     expect(writeCalls).toContain(cursorAbsPath);
 
@@ -375,6 +451,28 @@ describe('runInit — --dry-run', () => {
     const stderr = captured.stderr.join('\n');
     expect(stderr).toContain('[dry-run]');
     expect(stderr).toContain('preview only');
+  });
+
+  it('dry-run with agent: summary action is dry-run and skills lists DEFAULT_SKILLS', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+
+    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-dry', output: 'json' }), {
+      ...deps,
+      fetchImpl: vi.fn(async () => new Response('{}')) as unknown as InitDeps['fetchImpl'],
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as {
+      agent: { target: string; action: string; skills?: string[] } | null;
+    };
+    expect(parsed.agent).not.toBeNull();
+    expect(parsed.agent?.action).toBe('dry-run');
+    expect(parsed.agent?.skills).toContain('testsprite-verify');
+    expect(parsed.agent?.skills).toContain('testsprite-onboard');
   });
 
   it('dry-run --no-agent: still no fetch, no writes, summary shows agent: null', async () => {
@@ -457,6 +555,36 @@ describe('runInit — codex-review hardening', () => {
       isTTY: false,
     });
     expect(fetchImpl).toHaveBeenCalled();
+  });
+
+  it('rejects malformed --endpoint-url before setup key verification', async () => {
+    const { captured, deps } = makeCapture();
+    const fetchImpl = makeOkFetch();
+
+    await expect(
+      runInit(
+        makeBaseOpts({
+          fromEnv: true,
+          endpointUrl: 'not-a-url',
+          noAgent: true,
+          output: 'json',
+        }),
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          fetchImpl,
+          credentialsPath,
+          isTTY: false,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(captured.stderr.join('\n')).not.toContain('API key rejected');
   });
 
   it('whoami banner uses --api-key, not a stale TESTSPRITE_API_KEY in env (E2E 2026-06-09)', async () => {
@@ -593,7 +721,7 @@ describe('runInit — summary JSON shape', () => {
     expect(parsed).toHaveProperty('status', 'initialized');
   });
 
-  it('JSON summary agent field has target and action', async () => {
+  it('JSON summary agent field has target, action (installed), and skills (both defaults)', async () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs } = makeMemFs();
     const fetchMock = makeOkFetch();
@@ -608,11 +736,17 @@ describe('runInit — summary JSON shape', () => {
     });
 
     const parsed = JSON.parse(captured.stdout.join('\n')) as {
-      agent: { target: string; action: string } | null;
+      agent: { target: string; action: string; skills?: string[] } | null;
     };
     expect(parsed.agent).not.toBeNull();
     expect(parsed.agent?.target).toBe('claude');
+    // aggregateInstallAction maps 'written' → 'installed'; fresh install is 'installed'
+    expect(parsed.agent?.action).toBe('installed');
     expect(typeof parsed.agent?.action).toBe('string');
+    // Both DEFAULT_SKILLS must appear in the skills list
+    expect(parsed.agent?.skills).toContain('testsprite-verify');
+    expect(parsed.agent?.skills).toContain('testsprite-onboard');
+    expect(parsed.agent?.skills).toHaveLength(DEFAULT_SKILLS.length);
   });
 });
 
@@ -675,8 +809,20 @@ describe('runInit — all agent targets', () => {
         fs: agentFs,
       });
 
+      // TARGETS[target].path is the testsprite-verify path (back-compat); always written
       const expectedPath = path.resolve(CWD, TARGETS[target].path);
       expect(writeCalls).toContain(expectedPath);
+
+      if (TARGETS[target].mode === 'own-file') {
+        // own-file targets: DEFAULT_SKILLS installs 2 separate files (one per skill)
+        const verifyPath = path.resolve(CWD, pathFor(target, 'testsprite-verify'));
+        const onboardPath = path.resolve(CWD, pathFor(target, 'testsprite-onboard'));
+        expect(writeCalls).toContain(verifyPath);
+        expect(writeCalls).toContain(onboardPath);
+      } else {
+        // managed-section (codex): ONE write to AGENTS.md aggregating all skills
+        expect(writeCalls.filter(p => p === expectedPath).length).toBe(1);
+      }
     });
   }
 });
