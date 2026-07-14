@@ -86,8 +86,8 @@ describe('loadConfig', () => {
     expect(config.apiKey).toBe('sk-dev');
   });
 
-  it('treats empty / whitespace TESTSPRITE_API_URL as unset (falls through to profile)', () => {
-    writeProfile(
+  it('treats empty / whitespace TESTSPRITE_API_URL as unset (falls through to profile)', async () => {
+    await writeProfile(
       'default',
       { apiKey: 'sk-file', apiUrl: 'https://api.example.com:8443' },
       { path: credentialsPath },
@@ -99,8 +99,8 @@ describe('loadConfig', () => {
     expect(config.apiUrl).toBe('https://api.example.com:8443');
   });
 
-  it('treats empty / whitespace TESTSPRITE_API_KEY as unset (falls through to profile)', () => {
-    writeProfile('default', { apiKey: 'sk-file' }, { path: credentialsPath });
+  it('treats empty / whitespace TESTSPRITE_API_KEY as unset (falls through to profile)', async () => {
+    await writeProfile('default', { apiKey: 'sk-file' }, { path: credentialsPath });
     const config = loadConfig({
       env: { TESTSPRITE_API_KEY: '' },
       credentialsPath,

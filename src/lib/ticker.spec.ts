@@ -3,7 +3,15 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
-import { createTicker, isNoColor } from './ticker.js';
+import { createTicker, isNoColor, type Ticker } from './ticker.js';
+
+/** TTY tests that expect ANSI in-place updates. CI sets NO_COLOR=1, so opt out explicitly. */
+function createTtyTicker(
+  stderrWrite: (line: string) => void = () => {},
+  stderrRaw?: (text: string) => void,
+): Ticker {
+  return createTicker(stderrWrite, true, stderrRaw, false);
+}
 
 describe('createTicker — non-TTY (CI mode)', () => {
   it('update is a no-op (no writes)', () => {
@@ -58,11 +66,7 @@ function stripTickerTimestamp(raw: string): string {
 describe('createTicker — TTY mode', () => {
   it('update writes ANSI clear-line + carriage-return + content via rawWrite', () => {
     const raw: string[] = [];
-    const ticker = createTicker(
-      () => {},
-      true, // isTTY = true
-      text => raw.push(text),
-    );
+    const ticker = createTtyTicker(() => {}, text => raw.push(text));
     ticker.update('Run run_abc — running (3/8 steps elapsed=12s)');
     expect(raw).toHaveLength(1);
     expect(stripTickerTimestamp(raw[0]!)).toBe(
@@ -72,11 +76,7 @@ describe('createTicker — TTY mode', () => {
 
   it('update rewrites the line on each call (in-place update)', () => {
     const raw: string[] = [];
-    const ticker = createTicker(
-      () => {},
-      true,
-      text => raw.push(text),
-    );
+    const ticker = createTtyTicker(() => {}, text => raw.push(text));
     ticker.update('first tick');
     ticker.update('second tick');
     ticker.update('third tick');
@@ -88,11 +88,7 @@ describe('createTicker — TTY mode', () => {
 
   it('finalize with a final line emits the line then a newline', () => {
     const raw: string[] = [];
-    const ticker = createTicker(
-      () => {},
-      true,
-      text => raw.push(text),
-    );
+    const ticker = createTtyTicker(() => {}, text => raw.push(text));
     ticker.update('working');
     ticker.finalize('done — passed');
     // Expect: clear+carriage-return+line, then \n
@@ -103,11 +99,7 @@ describe('createTicker — TTY mode', () => {
 
   it('finalize without args emits just a newline when something was written', () => {
     const raw: string[] = [];
-    const ticker = createTicker(
-      () => {},
-      true,
-      text => raw.push(text),
-    );
+    const ticker = createTtyTicker(() => {}, text => raw.push(text));
     ticker.update('progress');
     ticker.finalize();
     // Last call should be '\n' to flush the line
@@ -116,11 +108,7 @@ describe('createTicker — TTY mode', () => {
 
   it('finalize without args emits nothing when nothing was written', () => {
     const raw: string[] = [];
-    const ticker = createTicker(
-      () => {},
-      true,
-      text => raw.push(text),
-    );
+    const ticker = createTtyTicker(() => {}, text => raw.push(text));
     // No update calls
     ticker.finalize();
     // Nothing should have been written (lastLength is 0)
@@ -129,11 +117,7 @@ describe('createTicker — TTY mode', () => {
 
   it('finalize without args but with prior update — emits newline only', () => {
     const raw: string[] = [];
-    const ticker = createTicker(
-      () => {},
-      true,
-      text => raw.push(text),
-    );
+    const ticker = createTtyTicker(() => {}, text => raw.push(text));
     ticker.update('x');
     const lengthAfterUpdate = raw.length;
     ticker.finalize();
@@ -144,11 +128,7 @@ describe('createTicker — TTY mode', () => {
 
   it('multiple finalize calls only move to fresh line once (idempotent-ish)', () => {
     const raw: string[] = [];
-    const ticker = createTicker(
-      () => {},
-      true,
-      text => raw.push(text),
-    );
+    const ticker = createTtyTicker(() => {}, text => raw.push(text));
     ticker.update('something');
     ticker.finalize();
     const lenAfterFirst = raw.length;
@@ -178,11 +158,7 @@ describe('createTicker — stderrWrite dependency injection', () => {
   it('does not call stderrWrite during update on TTY (rawWrite used instead)', () => {
     const stderrLines: string[] = [];
     const raw: string[] = [];
-    const ticker = createTicker(
-      line => stderrLines.push(line),
-      true,
-      text => raw.push(text),
-    );
+    const ticker = createTtyTicker(line => stderrLines.push(line), text => raw.push(text));
     ticker.update('progress');
     // stderrWrite should not be called (rawWrite handles TTY in-place updates)
     expect(stderrLines).toHaveLength(0);
@@ -192,11 +168,7 @@ describe('createTicker — stderrWrite dependency injection', () => {
   it('stderrWrite is referenced in finalize (no unused-var warning)', () => {
     // This is purely a compilation concern but we verify no throws.
     const stderrLines: string[] = [];
-    const ticker = createTicker(
-      line => stderrLines.push(line),
-      true,
-      () => {},
-    );
+    const ticker = createTtyTicker(line => stderrLines.push(line), () => {});
     expect(() => ticker.finalize('line')).not.toThrow();
   });
 });
@@ -209,7 +181,8 @@ describe('createTicker — spy on process.stderr', () => {
       const ticker = createTicker(
         () => {},
         true, // force TTY
-        // No stderrRaw — should default to process.stderr.write
+        undefined, // stderrRaw — should default to process.stderr.write
+        false, // CI sets NO_COLOR=1; this test asserts ANSI rawWrite path
       );
       ticker.update('test line');
       // The ticker prepends an ISO timestamp; verify the call happened and

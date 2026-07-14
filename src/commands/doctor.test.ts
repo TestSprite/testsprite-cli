@@ -64,7 +64,7 @@ beforeEach(() => {
 
 describe('runDoctor — healthy environment', () => {
   it('returns an all-passing report and does not throw', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const report = await runDoctor(
       { profile: 'default', output: 'text', debug: false },
@@ -79,7 +79,7 @@ describe('runDoctor — healthy environment', () => {
   });
 
   it('never prints the API key anywhere in the report', async () => {
-    writeProfile('default', { apiKey: 'sk-super-secret-value' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-super-secret-value' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runDoctor(
       { profile: 'default', output: 'text', debug: false },
@@ -90,7 +90,7 @@ describe('runDoctor — healthy environment', () => {
   });
 
   it('emits a machine-readable report under --output json without leaking the API key', async () => {
-    writeProfile('default', { apiKey: 'sk-json-secret-value' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-json-secret-value' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runDoctor(
       { profile: 'default', output: 'json', debug: false },
@@ -124,7 +124,7 @@ describe('runDoctor — failing checks exit non-zero', () => {
   });
 
   it('invalid endpoint URL fails the API endpoint check', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const rejection = await runDoctor(
       { profile: 'default', output: 'text', debug: false, endpointUrl: 'not-a-url' },
@@ -137,7 +137,7 @@ describe('runDoctor — failing checks exit non-zero', () => {
   });
 
   it('rejected API key surfaces as a Connectivity failure', async () => {
-    writeProfile('default', { apiKey: 'sk-bad' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-bad' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const authError = {
       error: { code: 'AUTH_INVALID', message: 'Bad key.', requestId: 'req_x', details: {} },
@@ -153,7 +153,7 @@ describe('runDoctor — failing checks exit non-zero', () => {
   });
 
   it('a non-auth /me error is reported as a Connectivity failure with its code', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const notFound = {
       error: { code: 'NOT_FOUND', message: 'nope', requestId: 'req_y', details: {} },
@@ -167,7 +167,7 @@ describe('runDoctor — failing checks exit non-zero', () => {
   });
 
   it('an outdated Node runtime fails the Node.js check', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const rejection = await runDoctor(
       { profile: 'default', output: 'text', debug: false },
@@ -182,7 +182,7 @@ describe('runDoctor — failing checks exit non-zero', () => {
 
 describe('runDoctor — warnings do not fail', () => {
   it('missing verify skill is a warning, not a failure', async () => {
-    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    await writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const report = await runDoctor(
       { profile: 'default', output: 'text', debug: false },
