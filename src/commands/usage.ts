@@ -154,8 +154,12 @@ function renderUsage(u: UsageResponse, portalBase?: string): string {
     }
     if (u.creditsPerRun !== undefined) {
       lines.push(`cost per frontend run: ${u.creditsPerRun} credit(s)`);
+      // Backend runs DO consume credits (confirmed by design 2026-06-30 / DEV-289).
+      // The API exposes no backend-specific per-run cost field, and it differs from
+      // the frontend rate, so state that it bills without asserting a possibly-wrong
+      // number — check your balance before/after, or see the billing page.
       lines.push(
-        `cost per backend run:  0 credit(s) (backend tests bill at code-generation, not at run time)`,
+        `cost per backend run:  also consumes credits (exact amount not reported by the API)`,
       );
     }
 

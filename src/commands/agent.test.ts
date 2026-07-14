@@ -661,29 +661,39 @@ describe('runInstall — multi-target', () => {
 // ---------------------------------------------------------------------------
 
 describe('runInstall — empty target', () => {
-  it('non-TTY with no target throws exit 5', async () => {
-    const { fs: agentFs } = makeMemFs();
+  it('non-TTY with no target defaults to claude and installs the skill file', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        target: [],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
+    );
+
+    const claudeAbs = path.resolve(CWD, TARGETS.claude.path);
+    expect(store.has(claudeAbs)).toBe(true);
+    expect(capture.stderr.join('\n')).toContain('defaulting to claude');
+  });
+
+  it('non-TTY default writes the canonical claude content', async () => {
+    const { store, fs: agentFs } = makeMemFs();
     const { deps } = makeCapture();
 
-    let thrown: unknown;
-    try {
-      await runInstall(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          dryRun: false,
-          target: [],
-          force: false,
-        },
-        { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
-      );
-    } catch (err) {
-      thrown = err;
-    }
+    await runInstall(
+      { profile: 'default', output: 'text', debug: false, dryRun: false, target: [], force: false },
+      { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
+    );
 
-    expect(thrown).toBeInstanceOf(ApiError);
-    expect((thrown as ApiError).exitCode).toBe(5);
+    const { path: relPath, content } = renderForTarget('claude', 'testsprite-verify');
+    const abs = path.resolve(CWD, relPath);
+    expect(store.get(abs)).toBe(content);
   });
 
   it('TTY with injected prompt returning "claude" installs claude', async () => {

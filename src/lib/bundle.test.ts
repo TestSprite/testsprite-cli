@@ -10,7 +10,7 @@
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   applyFailedOnly,
@@ -593,7 +593,8 @@ describe('resolveBundleDir', () => {
 
   it('resolves a relative path against cwd', () => {
     const out = resolveBundleDir('./tmp/x');
-    expect(out).toBe(resolve('./tmp/x'));
+    expect(out).toBe(resolve(process.cwd(), 'tmp', 'x'));
+    expect(isAbsolute(out)).toBe(true);
   });
 
   it('strips a trailing slash', () => {

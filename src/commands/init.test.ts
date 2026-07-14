@@ -199,8 +199,14 @@ describe('runInit — happy path (interactive)', () => {
     const stdout = captured.stdout.join('\n');
     expect(stdout).toContain('TestSprite initialized.');
     expect(stdout).toContain('profile:');
+    // Next steps leads with creating a project; no command that fails without --project.
     expect(stdout).toContain('Next steps:');
-    expect(stdout).toContain('testsprite test list');
+    expect(stdout).toContain('testsprite project create --type frontend');
+    expect(stdout).toContain('testsprite test run --all --project <projectId>');
+    expect(stdout).toContain('the testsprite-onboard skill is installed');
+    // No "current project" wording, no bare test list.
+    expect(stdout).not.toContain('current project');
+    expect(stdout).not.toContain('testsprite test list');
   });
 
   it('json mode: emits structured InitSummary object', async () => {
@@ -306,6 +312,15 @@ describe('runInit — --no-agent', () => {
 
     const stdout = captured.stdout.join('\n');
     expect(stdout).toContain('skipped (--no-agent)');
+    // --no-agent points at manual test creation; must not claim the skill is installed.
+    expect(stdout).toContain('Next steps:');
+    expect(stdout).toContain('testsprite project create --type frontend');
+    expect(stdout).toContain('testsprite test create --project <projectId>');
+    expect(stdout).toContain('testsprite test run --all --project <projectId>');
+    expect(stdout).not.toContain('skill is installed');
+    // No "current project" wording, no bare test list.
+    expect(stdout).not.toContain('current project');
+    expect(stdout).not.toContain('testsprite test list');
   });
 
   it('text mode with agent: summary contains skills line with both default skills', async () => {

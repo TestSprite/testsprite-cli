@@ -1,13 +1,15 @@
 # P1-2 issue auto-assign + 3-slot-cap bot (InsForge `agent-zhang-beihai` pattern).
-# Posts as the `alfheim-agent` GitHub App ⇒ `alfheim-agent[bot]`.
+# Posts as the `testsprite-hob` GitHub App ⇒ `testsprite-hob[bot]`.
 #
 # Setup (one-time, by an org admin):
-#   1. Create a GitHub App named `alfheim-agent` (org Settings → Developer settings →
+#   1. Create a GitHub App named `testsprite-hob` (org Settings → Developer settings →
 #      GitHub Apps → New). Permissions: Issues = Read & write, Metadata = Read. No webhook.
 #      Generate a private key; install the App on the public testsprite-cli repo.
 #   2. Add two repo (or org) secrets:
-#        ALFHEIM_AGENT_APP_ID         = the App's numeric App ID
-#        ALFHEIM_AGENT_PRIVATE_KEY    = the App's .pem private key (full contents)
+#        TESTSPRITE_HOB_APP_ID        = the App's numeric App ID
+#        TESTSPRITE_HOB_PRIVATE_KEY   = the App's .pem private key (full contents)
+#      (The ALFHEIM_AGENT_* fallbacks are this App's original secret names from
+#      before it was renamed — same App ID + key; either naming works.)
 #   Until those exist, the bot gracefully falls back to github-actions[bot] (still works).
 #
 # Fires on each new issue comment; assigns the commenter when they claim an issue
@@ -30,23 +32,26 @@ env:
 jobs:
   triage:
     # issues only (issue_comment also fires on PRs), and never react to a bot's own
-    # comment — incl. our own alfheim-agent[bot], which (unlike GITHUB_TOKEN) would
+    # comment — incl. our own testsprite-hob[bot], which (unlike GITHUB_TOKEN) would
     # otherwise re-trigger this workflow. `type == 'Bot'` covers both bot identities.
     if: ${{ !github.event.issue.pull_request && github.event.comment.user.type != 'Bot' }}
     runs-on: ubuntu-latest
     steps:
-      # Mint a token for the alfheim-agent App so comments post as alfheim-agent[bot].
+      # Mint a token for the testsprite-hob App so comments post as testsprite-hob[bot].
       # continue-on-error: until the App + secrets exist this no-ops and we fall back below.
       - id: app-token
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.ALFHEIM_AGENT_APP_ID }}
-          private-key: ${{ secrets.ALFHEIM_AGENT_PRIVATE_KEY }}
+          app-id: ${{ secrets.TESTSPRITE_HOB_APP_ID || secrets.ALFHEIM_AGENT_APP_ID }}
+          private-key: ${{ secrets.TESTSPRITE_HOB_PRIVATE_KEY || secrets.ALFHEIM_AGENT_PRIVATE_KEY }}
+          # Scope the minted token to what this job uses (issues API only) instead
+          # of inheriting the App's full installation permissions.
+          permission-issues: write
 
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.0.1
         with:
-          # App token when available (→ alfheim-agent[bot]); else the default
+          # App token when available (→ testsprite-hob[bot]); else the default
           # GITHUB_TOKEN (→ github-actions[bot]). Either way the logic is identical.
           github-token: ${{ steps.app-token.outputs.token || github.token }}
           script: |

@@ -371,18 +371,19 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
   if (rawTargets.length === 0) {
     const isTTY = deps.isTTY ?? Boolean(process.stdin.isTTY);
     if (!isTTY) {
-      throw localValidationError(
-        'target',
-        `required; pass --target=claude (comma-separated or repeated for several). Supported: ${Object.keys(TARGETS).join(', ')}`,
+      stderrFn(
+        '[info] --target not specified; defaulting to claude. Pass --target=<target> to select a different agent.',
       );
+      resolvedTargetStrings = ['claude'];
+    } else {
+      const promptFn = deps.prompt ?? ((q: string) => promptText(q));
+      const answer = (await promptFn('Targets to install (comma-separated) [claude]: ')).trim();
+      const defaulted = answer || 'claude';
+      resolvedTargetStrings = defaulted
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
     }
-    const promptFn = deps.prompt ?? ((q: string) => promptText(q));
-    const answer = (await promptFn('Targets to install (comma-separated) [claude]: ')).trim();
-    const defaulted = answer || 'claude';
-    resolvedTargetStrings = defaulted
-      .split(',')
-      .map(s => s.trim())
-      .filter(Boolean);
   } else {
     resolvedTargetStrings = rawTargets;
   }

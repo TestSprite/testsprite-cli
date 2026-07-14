@@ -528,9 +528,9 @@ export class HttpClient {
         }
 
         // Edge proxies / load balancers return 408/502/504 without our error
-        // envelope on transient outages. Per the CLI error spec §7 these are
-        // transport-level retries, not facade errors — fold them in here so
-        // we get the bounded backoff budget instead of a single INTERNAL bail.
+        // envelope on transient outages. These are transport-level retries,
+        // not facade errors — fold them in here so we get the bounded backoff
+        // budget instead of a single INTERNAL bail.
         if (rawBody === null && isTransportEdgeStatus(response.status)) {
           this.debug({
             kind: 'error',

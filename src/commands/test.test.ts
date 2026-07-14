@@ -4631,6 +4631,48 @@ describe('runCreate', () => {
     expect(sent.headers.get('x-api-key')).toBe('sk-user-test');
   });
 
+  it('emits backend warnings[] to stderr without polluting stdout JSON', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('BEARER = "eyJhbGciOi.eyJzdWIiOiJ4In0.sig"\n');
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          ...SAMPLE_RESPONSE,
+          type: 'backend',
+          warnings: [
+            'This test appears to hardcode an auth credential — read auth from __AUTH_HEADERS__.',
+          ],
+        },
+      };
+    });
+    const out: string[] = [];
+    const err: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'backend',
+        name: 'hardcoded be',
+        codeFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => err.push(line),
+      },
+    );
+    // Warning lands on stderr, prefixed `[warn]`.
+    expect(err.some(l => l.includes('[warn]') && l.includes('__AUTH_HEADERS__'))).toBe(true);
+    // stdout stays the parseable wire object — no warning noise.
+    expect(out.join('\n')).not.toContain('[warn]');
+  });
+
   it('respects a caller-supplied --idempotency-key (for safe retries)', async () => {
     const { credentialsPath } = makeCreds();
     const codeFile = writeCodeFile('code body');
@@ -5672,6 +5714,36 @@ describe('runCreate — M4 BE dependency authoring flags', () => {
         },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('[FE guard] --produces rejection is well-formed: bare field, no ----produces, singular verb (dogfood 2026-06-30)', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('// fe code');
+    const err = (await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_fe',
+        type: 'frontend',
+        name: 'fe test',
+        codeFile,
+        produces: ['some_var'],
+      },
+      {
+        credentialsPath,
+        fetchImpl: () => Promise.resolve(new Response('{}')),
+        stdout: () => undefined,
+        stderr: () => undefined,
+      },
+    ).catch((e: unknown) => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    // details.field is the BARE flag name (was '--produces' → double-dashed subject).
+    expect(err.details).toMatchObject({ field: 'produces' });
+    expect(err.nextAction).toContain('--produces');
+    expect(err.nextAction).not.toContain('----'); // regression: '----produces'
+    expect(err.nextAction).toContain('is a backend-only flag'); // singular for one flag
+    expect(err.nextAction).not.toContain('backend..'); // regression: double period
   });
 
   it('[FE guard] throws VALIDATION_ERROR exit 5 when --type frontend + --needs', async () => {

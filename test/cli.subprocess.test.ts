@@ -8,7 +8,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, renameSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -31,11 +31,6 @@ const ME_BODY = {
 let server: Server;
 let baseUrl: string;
 let tmpHome: string;
-
-function expectPosixMode(path: string, expected: number): void {
-  if (process.platform === 'win32') return;
-  expect(statSync(path).mode & 0o777).toBe(expected);
-}
 
 beforeAll(async () => {
   // Always rebuild — `npm run build` is fast and a stale `dist/index.js`
@@ -355,7 +350,7 @@ beforeAll(async () => {
 }, 60_000);
 
 afterAll(async () => {
-  if (server) await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+  await new Promise<void>(resolveClose => server.close(() => resolveClose()));
 });
 
 interface SpawnResult {
@@ -368,7 +363,16 @@ function runCli(args: string[], envOverrides: Record<string, string> = {}): Prom
   return new Promise((resolveResult, rejectResult) => {
     const child = spawn('node', [BIN_PATH, ...args], {
       cwd: REPO_ROOT,
-      env: childEnv(envOverrides),
+      env: {
+        ...process.env,
+        // os.homedir() reads HOME on POSIX but USERPROFILE on Windows —
+        // set both so the child never sees the real ~/.testsprite.
+        HOME: tmpHome,
+        USERPROFILE: tmpHome,
+        TESTSPRITE_API_KEY: undefined,
+        TESTSPRITE_API_URL: undefined,
+        ...envOverrides,
+      } as NodeJS.ProcessEnv,
     });
     let stdout = '';
     let stderr = '';
@@ -377,21 +381,6 @@ function runCli(args: string[], envOverrides: Record<string, string> = {}): Prom
     child.on('error', rejectResult);
     child.on('close', code => resolveResult({ exitCode: code ?? -1, stdout, stderr }));
   });
-}
-
-function childEnv(envOverrides: Record<string, string>): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  for (const key of Object.keys(env)) {
-    if (key.toUpperCase() === 'TESTSPRITE_API_KEY' || key.toUpperCase() === 'TESTSPRITE_API_URL') {
-      delete env[key];
-    }
-  }
-  return {
-    ...env,
-    HOME: tmpHome,
-    USERPROFILE: tmpHome,
-    ...envOverrides,
-  };
 }
 
 describe('auth status subprocess (+ deprecated whoami alias)', () => {
@@ -912,7 +901,10 @@ describe('setup --from-env subprocess', () => {
     expect(result.exitCode).toBe(0);
     const credentialsPath = join(tmpHome, '.testsprite', 'credentials');
     expect(existsSync(credentialsPath)).toBe(true);
-    expectPosixMode(credentialsPath, 0o600);
+    // POSIX file modes don't exist on Windows (stat reports 0666).
+    if (process.platform !== 'win32') {
+      expect(statSync(credentialsPath).mode & 0o777).toBe(0o600);
+    }
   }, 30_000);
 
   it('exits 5 with VALIDATION_ERROR when --from-env is set without TESTSPRITE_API_KEY', async () => {
@@ -1059,7 +1051,7 @@ describe('--dry-run subprocess smoke', () => {
     // skipped the prompt.
     const credPath = join(tmpHome, '.testsprite', 'credentials');
     // Make sure any previous test didn't leave one behind.
-    if (existsSync(credPath)) renameSync(credPath, `${credPath}.bak-${process.pid}-${Date.now()}`);
+    rmSync(credPath, { force: true });
     const result = await runCli(['setup', '--dry-run', '--no-agent', '--output', 'json']);
     expect(result.exitCode).toBe(0);
     expect(existsSync(credPath)).toBe(false);

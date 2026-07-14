@@ -91,6 +91,27 @@ Each file is a COMPLETE plan and must include `projectId` (from step 2), `type: 
 **Backend** — one `.py` file per endpoint, using `requests` with concrete assertions on
 status code and response body.
 
+**Backend auth — read the injected `__AUTH_HEADERS__`, NEVER hardcode any credential.** This
+covers **every** secret the API needs — Bearer/JWT tokens **and** API keys (`sk-…`,
+`x-api-key`), basic-auth blobs, cookies. TestSprite prepends a managed credential block
+(`__AUTH_CREDENTIAL__` / `__AUTH_TYPE__` / `__AUTH_HEADERS__`) to every backend test from the
+project's Authentication settings, and `__AUTH_HEADERS__` already holds the right header(s) for
+the configured type (Bearer → `{"Authorization": "Bearer …"}`; API key → `{"X-API-Key": "…"}`;
+basic → `{"Authorization": "Basic …"}`). Spread it into your request headers — never paste a
+literal `Bearer …` / `sk-…` / key value into the script:
+
+```python
+r = requests.get(f"{TARGET_URL}/orders", headers={**__AUTH_HEADERS__})
+```
+
+Configure the credential once on the project (ask the user for the value — never invent it or
+reuse a key you happened to see): a static credential with
+`testsprite project credential <projectId> --type "Bearer token"|"API key"|"basic token" --credential <value>`,
+or an auto-refreshing login with `testsprite project auto-auth <projectId> …` so scheduled/repeat
+runs keep working after the token expires. A hardcoded token expires within hours and a hardcoded
+key can't be rotated centrally — `test create` emits a `[warn]` on an inlined credential; treat it
+as a must-fix.
+
 **Assertion rule (this is the whole game for FE):** every `assertion` step must name a
 **concrete, observable** outcome — an element, text, URL, count, or status. Never write
 `"verify it works"`, `"check the page loads"`, or other narrative that an AI judge can

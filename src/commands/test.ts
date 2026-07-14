@@ -543,6 +543,12 @@ export interface CliCreateTestResponse {
   type: 'frontend' | 'backend';
   codeVersion: string;
   createdAt: string;
+  /**
+   * Non-fatal advisories from the backend (e.g. the BE auth guardrail
+   * flagging a hardcoded credential). Rendered on stderr; the create
+   * still succeeded.
+   */
+  warnings?: string[];
 }
 
 export const CLI_CREATE_PRIORITIES = ['p0', 'p1', 'p2', 'p3'] as const;
@@ -752,14 +758,19 @@ export async function runCreate(
   // save a round-trip.
   if (opts.type === 'frontend') {
     const depFlags: string[] = [];
-    if (opts.produces !== undefined && opts.produces.length > 0) depFlags.push('--produces');
-    if (opts.needs !== undefined && opts.needs.length > 0) depFlags.push('--needs');
-    if (opts.category !== undefined) depFlags.push('--category');
+    if (opts.produces !== undefined && opts.produces.length > 0) depFlags.push('produces');
+    if (opts.needs !== undefined && opts.needs.length > 0) depFlags.push('needs');
+    if (opts.category !== undefined) depFlags.push('category');
     if (depFlags.length > 0) {
+      // Pass the BARE flag name to localValidationError — its kind:'flag' branch
+      // adds the `--` prefix, so '--produces' would render as '----produces'.
+      const flagList = depFlags.map(f => `--${f}`);
+      const verb = depFlags.length === 1 ? 'is a backend-only flag' : 'are backend-only flags';
+      // No trailing period: localValidationError appends one after the reason.
       throw localValidationError(
         depFlags[0]!,
-        `${depFlags.join(', ')} are backend-only flags; frontend plans have no wave model. ` +
-          `Remove ${depFlags.join('/')} or use --type backend.`,
+        `${flagList.join(', ')} ${verb}; frontend plans have no wave model. ` +
+          `Remove ${flagList.join('/')} or use --type backend`,
       );
     }
   }
@@ -835,6 +846,11 @@ export async function runCreate(
     body,
     headers: { 'idempotency-key': idempotencyKey },
   });
+
+  // Surface backend advisories (e.g. a hardcoded-credential warning for BE
+  // tests) on stderr so they reach the agent without polluting stdout JSON.
+  // Emitted before the --run early return so they always show.
+  emitResponseWarnings(response.warnings, deps);
 
   // --run chain (M3.3 piece-3). Per codex round-1 P1: suppress the
   // create's own print when chaining; `runTestRun` emits a single
@@ -996,6 +1012,16 @@ function renderCreateText(response: CliCreateTestResponse): string {
     `codeVersion ${response.codeVersion}`,
     `createdAt   ${response.createdAt}`,
   ].join('\n');
+}
+
+/**
+ * Emit backend `warnings[]` advisories to stderr (one `[warn]` line each),
+ * keeping stdout — JSON or text — uncluttered. No-op when absent/empty.
+ */
+function emitResponseWarnings(warnings: string[] | undefined, deps: TestDeps): void {
+  if (!warnings || warnings.length === 0) return;
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  for (const w of warnings) stderrFn(`[warn] ${w}`);
 }
 
 /**
@@ -3400,6 +3426,12 @@ export interface CliPutTestCodeResponse {
   testId: string;
   codeVersion: string;
   updatedAt: string;
+  /**
+   * Non-fatal advisories (e.g. the BE auth guardrail flagging a hardcoded
+   * credential in the replaced code). Rendered on stderr; the update still
+   * succeeded.
+   */
+  warnings?: string[];
 }
 
 type CodePutLanguage = CliTestCode['language'];
@@ -3577,6 +3609,7 @@ export async function runCodePut(
         },
       },
     );
+    emitResponseWarnings(response.warnings, deps);
     out.print(response, data => renderCodePutText(data as CliPutTestCodeResponse));
     return response;
   } catch (err) {
@@ -5803,7 +5836,7 @@ export async function runTestWait(
 // ---------------------------------------------------------------------------
 
 interface RunTestRunAllOptions extends CommonOptions {
-  /** projectId to run all BE tests in. */
+  /** projectId to run all tests in. */
   projectId: string;
   /** --filter <substr>: only run tests whose name contains this substring (case-insensitive). */
   nameFilter?: string;
@@ -5940,7 +5973,7 @@ export async function runTestRunAll(
     stderrFn(`idempotency-key: ${idempotencyKey}`);
   }
 
-  // Resolve testIds: fetch all BE tests in the project, apply --filter.
+  // Resolve testIds: fetch all tests in the project, apply --filter.
   let testIds: string[] | undefined;
   if (opts.nameFilter !== undefined && opts.nameFilter !== '') {
     // We need to resolve the full test set to apply the name filter.
@@ -5978,7 +6011,8 @@ export async function runTestRunAll(
       `Resolved ${testIds.length} test${testIds.length !== 1 ? 's' : ''} in project ${opts.projectId} for batch run.`,
     );
   }
-  // When no --filter, omit testIds → server runs ALL BE tests in the project.
+  // When no --filter, omit testIds → server runs ALL tests in the project
+  // (BE tests on the legacy V2 wave engine; FE + BE on the V3 unified engine).
 
   const batchResp = await client.triggerBatchRunFresh(
     {
@@ -8369,7 +8403,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .command('run [test-id]')
     .description(
       'Trigger a test run. With --wait, polls until terminal status.\n' +
-        'Use --all --project <id> for a wave-ordered batch run of all BE tests (M4).\n' +
+        'Use --all --project <id> for a wave-ordered batch run of all tests in a project (M4).\n' +
         '\nExit codes:\n' +
         '  0  passed (or queued without --wait)\n' +
         '  1  failed / blocked / cancelled\n' +
@@ -8397,7 +8431,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--all',
-      'run all BE tests in the project (wave-ordered fresh run; requires --project). Mutually exclusive with <test-id>.',
+      'run all tests in the project (wave-ordered fresh run; requires --project). Mutually exclusive with <test-id>.',
       false,
     )
     .option(
@@ -8424,11 +8458,14 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .addHelpText(
       'after',
       '\nDependency-aware fresh run (M4):\n' +
-        '  testsprite test run --all --project <id>           run all BE tests in wave order\n' +
+        '  testsprite test run --all --project <id>           run all project tests in wave order\n' +
         '  testsprite test run --all --project <id> --filter <substr>  name-glob subset\n' +
         '  testsprite test run --all --project <id> --wait --report junit --report-file ./results.xml\n' +
         '\nBE tests can declare --produces/--needs at create time to drive wave ordering\n' +
-        '(see `testsprite test create --help` for details).',
+        '(see `testsprite test create --help` for details).\n' +
+        '\nFrontend tests: the current unified engine runs FE tests too (they are billed\n' +
+        'like any run). On the legacy backend-only engine FE tests cannot run — they are\n' +
+        "reported under skippedFrontend with an advisory; run those with 'test run <id>'.",
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testIdArg: string | undefined, cmdOpts: RunFlagOpts, command: Command) => {
@@ -8444,7 +8481,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       if (testIdArg === undefined && !isAll) {
         throw localValidationError(
           'test-id',
-          'provide a <test-id>, or use --all --project <id> to run all BE tests in a project',
+          'provide a <test-id>, or use --all --project <id> to run all tests in a project',
         );
       }
       // --filter is an --all-only narrowing flag (mirrors `test rerun --filter`).
@@ -8473,14 +8510,16 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             '--all requires a project id — pass --project <id>',
           );
         }
-        // --target-url has no effect on the --all batch path: it is BE-only
-        // (FE tests are skipped server-side) and a BE test's base URL is baked
-        // into its code. Silently dropping it could run the suite against an
-        // unintended environment in the caller's mind — reject loudly instead.
+        // --target-url has no effect on the --all batch path: a BE test's base
+        // URL is baked into its code, and the unified engine resolves each
+        // project's configured environment server-side (per-run URL overrides
+        // are not applied to batch FE runs either). Silently dropping it could
+        // run the suite against an unintended environment in the caller's mind
+        // — reject loudly instead.
         if (cmdOpts.targetUrl !== undefined && cmdOpts.targetUrl !== '') {
           throw localValidationError(
             'target-url',
-            '--target-url has no effect with --all (the batch path is the BE-only wave engine; a BE test’s URL is baked into its code). Remove --target-url.',
+            '--target-url has no effect with --all (the batch path does not apply a per-run URL override — BE test URLs are baked into their code and the unified engine resolves the project environment server-side). Remove --target-url.',
           );
         }
         await runTestRunAll(
@@ -9973,7 +10012,11 @@ export function createTestArtifactCommand(deps: TestDeps): Command {
         'Parent must exist. The bundle dir itself is created if absent.',
       ].join(' '),
     )
-    .option('--failed-only', 'Keep only the failed step plus its immediate neighbors (±1)')
+    .option(
+      '--failed-only',
+      'Trim to the failed step ±1. The bundle is already failure-focused server-side, ' +
+        'so this is usually a no-op; use `test steps <id>` for the full run trail.',
+    )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(
       async (runId: string, cmdOpts: { out?: string; failedOnly?: boolean }, command: Command) => {
@@ -10003,7 +10046,11 @@ function createTestFailureCommand(deps: TestDeps): Command {
       '--out <dir>',
       'Directory to write the §7 disk layout into (default: print wire envelope to stdout)',
     )
-    .option('--failed-only', 'Keep only the failed step plus its immediate neighbors (±1)')
+    .option(
+      '--failed-only',
+      'Trim to the failed step ±1. The bundle is already failure-focused server-side, ' +
+        'so this is usually a no-op; use `test steps <id>` for the full run trail.',
+    )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(
       async (testId: string, cmdOpts: { out?: string; failedOnly?: boolean }, command: Command) => {

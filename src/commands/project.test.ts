@@ -8,7 +8,9 @@ import {
   type CliProject,
   type CliUpdateProjectResponse,
   createProjectCommand,
+  runAutoAuth,
   runCreate,
+  runCredential,
   runGet,
   runList,
   runUpdate,
@@ -72,10 +74,10 @@ describe('createProjectCommand', () => {
     errorSpy.mockRestore();
   });
 
-  it('exposes list, get, create and update subcommands', () => {
+  it('exposes list, get, create, update, credential and auto-auth subcommands', () => {
     const project = createProjectCommand();
     const names = project.commands.map(c => c.name()).sort();
-    expect(names).toEqual(['create', 'get', 'list', 'update']);
+    expect(names).toEqual(['auto-auth', 'create', 'credential', 'get', 'list', 'update']);
   });
 
   it('list exposes the pagination flags from the design contract', () => {
@@ -324,6 +326,21 @@ describe('runList', () => {
     // Format is now "[debug <ISO-TS>] {...}"
     expect(stderr.some(line => line.startsWith('[debug '))).toBe(true);
     expect(stderr.some(line => line.includes('"kind":"request"'))).toBe(true);
+  });
+});
+
+describe('DEV-244 — project update no longer accepts the dead --description flag', () => {
+  it('rejects --description on `project update` as an unknown option', async () => {
+    const project = createProjectCommand();
+    const update = project.commands.find(c => c.name() === 'update')!;
+    project.exitOverride();
+    update.exitOverride();
+
+    await expect(
+      project.parseAsync(['update', 'proj_x', '--description', 'should not exist'], {
+        from: 'user',
+      }),
+    ).rejects.toThrow(/unknown option.*--description/i);
   });
 });
 
@@ -864,7 +881,6 @@ describe('runUpdate', () => {
         debug: false,
         projectId: 'proj_text',
         name: 'New Name',
-        description: 'New desc',
       },
       { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => {} },
     );
@@ -927,5 +943,251 @@ describe('runUpdate', () => {
 
     expect(result.id).toBe('proj_json_no_fields');
     expect(result.updatedFields).toBeUndefined();
+  });
+});
+
+describe('runCredential', () => {
+  interface Captured {
+    url: string;
+    method: string;
+    body: unknown;
+    headers: Headers;
+  }
+  function captureFetch(captured: Captured[], body: unknown) {
+    return makeFetch((url, init) => {
+      captured.push({
+        url,
+        method: init.method ?? 'GET',
+        body: init.body ? JSON.parse(init.body as string) : undefined,
+        headers: new Headers(init.headers as Record<string, string>),
+      });
+      return { status: 200, body };
+    });
+  }
+
+  it('PUTs /projects/:id/credential with authType + credential + idempotency-key', async () => {
+    const { credentialsPath } = makeCreds();
+    const captured: Captured[] = [];
+    const fetchImpl = captureFetch(captured, {
+      projectId: 'p1',
+      authType: 'Bearer token',
+      rewroteCount: 2,
+    });
+    const res = await runCredential(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'p1',
+        authType: 'Bearer token',
+        credential: 'tok-123',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(res.rewroteCount).toBe(2);
+    const put = captured.find(c => c.method === 'PUT')!;
+    expect(put.url).toContain('/projects/p1/credential');
+    expect(put.body).toEqual({ authType: 'Bearer token', credential: 'tok-123' });
+    expect(put.headers.get('idempotency-key')).toMatch(/^cli-proj-cred-[0-9a-f-]{36}$/);
+  });
+
+  it('public clears the credential (no credential in body, none required)', async () => {
+    const { credentialsPath } = makeCreds();
+    const captured: Captured[] = [];
+    const fetchImpl = captureFetch(captured, {
+      projectId: 'p1',
+      authType: 'public',
+      rewroteCount: 0,
+    });
+    await runCredential(
+      { profile: 'default', output: 'json', debug: false, projectId: 'p1', authType: 'public' },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    const put = captured.find(c => c.method === 'PUT')!;
+    expect(put.body).toEqual({ authType: 'public' });
+  });
+
+  it('non-public without --credential → VALIDATION_ERROR (exit 5), no fetch', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    await expect(
+      runCredential(
+        { profile: 'default', output: 'json', debug: false, projectId: 'p1', authType: 'API key' },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetched).toBe(false);
+  });
+
+  it('rejects an unknown --type locally (no fetch)', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    await expect(
+      runCredential(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          authType: 'jwt',
+          credential: 'x',
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetched).toBe(false);
+  });
+});
+
+describe('runAutoAuth', () => {
+  interface Captured {
+    url: string;
+    method: string;
+    body: Record<string, unknown>;
+    headers: Headers;
+  }
+  function captureFetch(captured: Captured[]) {
+    return makeFetch((url, init) => {
+      captured.push({
+        url,
+        method: init.method ?? 'GET',
+        body: init.body ? JSON.parse(init.body as string) : {},
+        headers: new Headers(init.headers as Record<string, string>),
+      });
+      return {
+        status: 200,
+        body: { projectId: 'p1', enabled: true, method: 'aws_cognito_refresh', inject: 'bearer' },
+      };
+    });
+  }
+
+  it('PUTs /projects/:id/auto-auth with the config body + idempotency-key', async () => {
+    const { credentialsPath } = makeCreds();
+    const captured: Captured[] = [];
+    const fetchImpl = captureFetch(captured);
+    await runAutoAuth(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'p1',
+        method: 'aws_cognito_refresh',
+        inject: 'bearer',
+        region: 'us-east-1',
+        clientId: 'abc',
+        refreshToken: 'rt-xyz',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    const put = captured.find(c => c.method === 'PUT')!;
+    expect(put.url).toContain('/projects/p1/auto-auth');
+    expect(put.body).toEqual({
+      enabled: true,
+      method: 'aws_cognito_refresh',
+      inject: 'bearer',
+      region: 'us-east-1',
+      clientId: 'abc',
+      refreshToken: 'rt-xyz',
+    });
+    expect(put.headers.get('idempotency-key')).toMatch(/^cli-proj-autoauth-[0-9a-f-]{36}$/);
+  });
+
+  it('--disable sends enabled:false', async () => {
+    const { credentialsPath } = makeCreds();
+    const captured: Captured[] = [];
+    const fetchImpl = captureFetch(captured);
+    await runAutoAuth(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'p1',
+        disable: true,
+        method: 'password',
+        inject: 'bearer',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(captured.find(c => c.method === 'PUT')!.body.enabled).toBe(false);
+  });
+
+  it('reads a secret from --refresh-token-file', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-rt-'));
+    const rtFile = join(dir, 'rt.txt');
+    writeFileSync(rtFile, '  rt-from-file\n');
+    const captured: Captured[] = [];
+    const fetchImpl = captureFetch(captured);
+    await runAutoAuth(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'p1',
+        method: 'refresh_token',
+        inject: 'bearer',
+        tokenEndpoint: 'https://idp.example.com/token',
+        refreshTokenFile: rtFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(captured.find(c => c.method === 'PUT')!.body.refreshToken).toBe('rt-from-file');
+  });
+
+  it('rejects an unknown --method / --inject locally (no fetch)', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'magic',
+          inject: 'bearer',
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetched).toBe(false);
+  });
+});
+
+describe('dogfood 2026-06-30 — whitespace-only --name is rejected (parity with `test create`)', () => {
+  const noNetwork = () => {
+    throw new Error('network should not be hit');
+  };
+
+  it('runCreate rejects a whitespace-only --name (exit 5, no network)', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runCreate(
+        { profile: 'default', output: 'json', debug: false, type: 'backend', name: '   ' },
+        { credentialsPath, fetchImpl: makeFetch(noNetwork), stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runUpdate rejects a whitespace-only --name (exit 5, no network)', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runUpdate(
+        { profile: 'default', output: 'json', debug: false, projectId: 'p1', name: '\t \n' },
+        { credentialsPath, fetchImpl: makeFetch(noNetwork), stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 });

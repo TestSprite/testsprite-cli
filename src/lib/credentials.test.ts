@@ -19,11 +19,6 @@ import { ApiError } from './errors.js';
 let tmpRoot: string;
 let credentialsPath: string;
 
-function expectPosixMode(path: string, expected: number): void {
-  if (process.platform === 'win32') return;
-  expect(statSync(path).mode & 0o777).toBe(expected);
-}
-
 beforeEach(() => {
   tmpRoot = mkdtempSync(join(tmpdir(), 'testsprite-creds-'));
   credentialsPath = join(tmpRoot, 'credentials');
@@ -144,7 +139,11 @@ describe('writeProfile', () => {
   it('creates the file with mode 0600 and writes the profile', () => {
     writeProfile(DEFAULT_PROFILE, { apiKey: 'sk-new' }, { path: credentialsPath });
     expect(existsSync(credentialsPath)).toBe(true);
-    expectPosixMode(credentialsPath, 0o600);
+    // POSIX file modes don't exist on Windows (stat reports 0666).
+    if (process.platform !== 'win32') {
+      const mode = statSync(credentialsPath).mode & 0o777;
+      expect(mode).toBe(0o600);
+    }
     expect(readProfile(DEFAULT_PROFILE, { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
   });
 
@@ -192,11 +191,13 @@ describe('ensureRestrictiveMode', () => {
     expect(() => ensureRestrictiveMode(credentialsPath)).not.toThrow();
   });
 
-  it('downgrades over-permissive modes', () => {
+  // POSIX-only premise: Windows has no 0644/0600 distinction to downgrade.
+  it.skipIf(process.platform === 'win32')('downgrades over-permissive modes', () => {
     mkdirSync(tmpRoot, { recursive: true });
     writeFileSync(credentialsPath, 'data', { mode: 0o644 });
     ensureRestrictiveMode(credentialsPath);
-    expectPosixMode(credentialsPath, 0o600);
+    const mode = statSync(credentialsPath).mode & 0o777;
+    expect(mode).toBe(0o600);
   });
 });
 

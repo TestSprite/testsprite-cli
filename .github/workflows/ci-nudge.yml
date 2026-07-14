@@ -1,0 +1,129 @@
+# "Fix this and we merge" nudge (InsForge `agent-zhang-beihai` pattern, part 3).
+# When a PR's CI finishes red, posts ONE sticky comment listing exactly which
+# jobs failed and the local one-liner that reproduces/fixes each (the automated
+# version of the hand-written "run `npm run format` and you're green" review
+# comments). The comment flips to a green confirmation once all checks pass.
+#
+# Runs in base-repo context via workflow_run — no PR code is checked out, so
+# fork PRs are safe. State is recomputed from check-runs each time, so the two
+# CI workflows (CI + Test Coverage) can complete in any order.
+#
+# Bot identity: same App-token-first / GITHUB_TOKEN-fallback pattern as
+# pr-triage.yml (the App needs the "Pull requests: Read & write" permission to
+# post as testsprite-hob[bot]; until then comments come from github-actions[bot]).
+name: CI failure nudge
+
+on:
+  workflow_run:
+    workflows: ['CI', 'Test Coverage']
+    types: [completed]
+
+permissions:
+  checks: read # read the head SHA's check-run state
+  pull-requests: write
+  issues: write # PR comments ride the issues API
+
+env:
+  MARKER: '<!-- hob:ci-nudge -->'
+
+jobs:
+  nudge:
+    # Public repo only; PR-triggered runs only (pushes to main have no PR to nudge).
+    if: >-
+      github.repository == 'TestSprite/testsprite-cli' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.TESTSPRITE_HOB_APP_ID || secrets.ALFHEIM_AGENT_APP_ID }}
+          private-key: ${{ secrets.TESTSPRITE_HOB_PRIVATE_KEY || secrets.ALFHEIM_AGENT_PRIVATE_KEY }}
+
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.0.1
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const run = context.payload.workflow_run;
+            const marker = process.env.MARKER;
+
+            const appClient = process.env.APP_TOKEN
+              ? require('@actions/github').getOctokit(process.env.APP_TOKEN)
+              : null;
+            async function write(fn) {
+              if (appClient) {
+                try { return await fn(appClient.rest); }
+                catch (e) { if (e.status !== 403 && e.status !== 404) throw e; }
+              }
+              return await fn(github.rest);
+            }
+
+            // Resolve the PR for this run. `workflow_run.pull_requests` is empty
+            // for fork PRs, so fall back to the commit→PRs lookup.
+            let pr = (run.pull_requests || [])[0];
+            if (!pr) {
+              const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit(
+                { owner, repo, commit_sha: run.head_sha });
+              pr = data.find(p => p.state === 'open');
+            } else {
+              pr = (await github.rest.pulls.get({ owner, repo, pull_number: pr.number })).data;
+            }
+            if (!pr || pr.state !== 'open' || pr.user.type === 'Bot') return;
+
+            // Job name → the local command that reproduces/fixes it. Also the
+            // allowlist of CI jobs this nudge watches — keep in sync with ci.yml.
+            const FIX = {
+              'Lint & Format': 'run `npm run lint:fix && npm run format`, then commit',
+              'Typecheck': 'run `npm run typecheck` and fix the reported type errors',
+              'Unit Tests': 'run `npm test` and fix the failing tests',
+              'Build': 'run `npm run build` and fix the compile errors',
+              'Local E2E Tests': 'run `npm run test:e2e` (it builds first)',
+              'Coverage (>= 80%)': 'run `npm run test:coverage` — new code needs tests until every metric is back at 80%',
+            };
+
+            // Recompute full CI state from this SHA's check runs, narrowed to the
+            // CI jobs above — other workflows (e.g. pr-triage) also attach
+            // github-actions check runs to the PR head and must not count here.
+            const checks = await github.paginate(github.rest.checks.listForRef,
+              { owner, repo, ref: run.head_sha, per_page: 100 });
+            const ours = checks.filter(c => c.app && c.app.slug === 'github-actions' && FIX[c.name]);
+            const failing = ours.filter(c => ['failure', 'timed_out'].includes(c.conclusion));
+            const pending = ours.filter(c => c.status !== 'completed');
+
+            const comments = await github.paginate(github.rest.issues.listComments,
+              { owner, repo, issue_number: pr.number, per_page: 100 });
+            const sticky = comments.find(c => (c.body || '').includes(marker));
+
+            if (failing.length === 0) {
+              // Only speak up on success if we previously flagged a failure, and
+              // only once everything has actually finished.
+              if (sticky && pending.length === 0 && !sticky.body.includes('all green')) {
+                await write(rest => rest.issues.updateComment({ owner, repo, comment_id: sticky.id,
+                  body: `${marker}\n✅ CI is **all green** now — thanks, @${pr.user.login}!` }));
+              }
+              return;
+            }
+
+            const lines = failing
+              .sort((a, b) => a.name.localeCompare(b.name))
+              .map(c => {
+                const fix = FIX[c.name] || 'see the logs for details';
+                return `- **${c.name}** — ${fix} ([logs](${c.html_url}))`;
+              });
+            const body = `${marker}\nThanks, @${pr.user.login}! CI is red on this PR — `
+              + `here's what failed and how to reproduce it locally:\n\n${lines.join('\n')}\n\n`
+              + `Everything runs on Node 22 after \`npm ci\`. Push a fix and this comment `
+              + `flips green automatically once all checks pass.`;
+
+            if (sticky) {
+              if (sticky.body !== body) {
+                await write(rest => rest.issues.updateComment(
+                  { owner, repo, comment_id: sticky.id, body }));
+              }
+            } else {
+              await write(rest => rest.issues.createComment(
+                { owner, repo, issue_number: pr.number, body }));
+            }

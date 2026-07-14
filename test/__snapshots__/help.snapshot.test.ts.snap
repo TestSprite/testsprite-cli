@@ -133,20 +133,29 @@ exports[`--help snapshots > project 1`] = `
 Manage TestSprite projects
 
 Options:
-  -h, --help                     display help for command
+  -h, --help                         display help for command
 
 Commands:
-  list [options]                 List projects visible to the API key
+  list [options]                     List projects visible to the API key
   
   Exit codes:
     0  success
     3  auth error
     5  validation error (e.g., bad --page-size)
    10  transport/network failure (UNAVAILABLE) — retry the command
-  get <project-id>               Get a project by id
-  create [options]               Create a new project
-  update [options] <project-id>  Update project metadata
-  help [command]                 display help for command
+  get <project-id>                   Get a project by id
+  create [options]                   Create a new project
+  update [options] <project-id>      Update project metadata
+  credential [options] <project-id>  Set the static backend credential injected
+                                     into every backend test
+                                     (Bearer token / API key / Basic token /
+                                     public). Free tier.
+  auto-auth [options] <project-id>   Configure the recurring-token
+                                     (auto-refresh login) for backend tests
+                                     (Pro).
+                                     A fresh token is fetched on each run and
+                                     injected into every backend test.
+  help [command]                     display help for command
 "
 `;
 
@@ -242,7 +251,7 @@ Commands:
   
   Note: a 404 "not found" response is counted as skipped in the summary, not an error.
   run [options] [test-id]               Trigger a test run. With --wait, polls until terminal status.
-  Use --all --project <id> for a wave-ordered batch run of all BE tests (M4).
+  Use --all --project <id> for a wave-ordered batch run of all tests in a project (M4).
   
   Exit codes:
     0  passed (or queued without --wait)
@@ -362,7 +371,9 @@ Write a self-contained failure-context bundle for a test's latest failing run
 Options:
   --out <dir>    Directory to write the §7 disk layout into (default: print
                  wire envelope to stdout)
-  --failed-only  Keep only the failed step plus its immediate neighbors (±1)
+  --failed-only  Trim to the failed step ±1. The bundle is already
+                 failure-focused server-side, so this is usually a no-op; use
+                 \`test steps <id>\` for the full run trail.
   -h, --help     display help for command
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
@@ -548,7 +559,7 @@ exports[`--help snapshots > test run 1`] = `
 "Usage: testsprite test run [options] [test-id]
 
 Trigger a test run. With --wait, polls until terminal status.
-Use --all --project <id> for a wave-ordered batch run of all BE tests (M4).
+Use --all --project <id> for a wave-ordered batch run of all tests in a project (M4).
 
 Exit codes:
   0  passed (or queued without --wait)
@@ -572,9 +583,9 @@ Options:
                               600)
   --idempotency-key <key>     opaque key for safe retries (1–256 chars).
                               Printed to stderr at --debug if auto-generated.
-  --all                       run all BE tests in the project (wave-ordered
-                              fresh run; requires --project). Mutually
-                              exclusive with <test-id>. (default: false)
+  --all                       run all tests in the project (wave-ordered fresh
+                              run; requires --project). Mutually exclusive with
+                              <test-id>. (default: false)
   --project <id>              project id (required with --all; returned by
                               \`testsprite project list\`)
   --filter <substr>           with --all: only run tests whose name contains
@@ -589,12 +600,16 @@ Options:
   -h, --help                  display help for command
 
 Dependency-aware fresh run (M4):
-  testsprite test run --all --project <id>           run all BE tests in wave order
+  testsprite test run --all --project <id>           run all project tests in wave order
   testsprite test run --all --project <id> --filter <substr>  name-glob subset
   testsprite test run --all --project <id> --wait --report junit --report-file ./results.xml
 
 BE tests can declare --produces/--needs at create time to drive wave ordering
 (see \`testsprite test create --help\` for details).
+
+Frontend tests: the current unified engine runs FE tests too (they are billed
+like any run). On the legacy backend-only engine FE tests cannot run — they are
+reported under skippedFrontend with an advisory; run those with 'test run <id>'.
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
@@ -640,10 +655,13 @@ Options:
                                without the full trace.
   --debug                      Print HTTP method/path, request id, latency,
                                retry decisions to stderr
-  --dry-run                    Skip the network, credentials, and filesystem;
-                               emit a canned sample matching the OpenAPI
-                               contract. Useful for learning the CLI surface
-                               without an API key.
+  --dry-run                    Skip the network and credentials; emit a canned
+                               sample matching the OpenAPI contract. Useful for
+                               learning the CLI surface without an API key.
+                               Note: file inputs you pass
+                               (--plan-from/--plans/--steps) are still read and
+                               validated locally; only --code-file uses a
+                               placeholder.
   --request-timeout <seconds>  Client-side per-request timeout in seconds
                                (default: 120). Aborts any single fetch that
                                does not complete within this deadline. Override
