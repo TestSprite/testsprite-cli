@@ -395,9 +395,15 @@ export class HttpClient {
     timeoutSignal: AbortSignal,
     callerSignal: AbortSignal | undefined,
     requestId: string,
+    effectiveSignal: AbortSignal = timeoutSignal,
   ): void {
     if (isAbortError(err) || isTimeoutError(err)) {
-      if (timeoutSignal.aborted && (callerSignal == null || !callerSignal.aborted)) {
+      const timeoutWon =
+        timeoutSignal.aborted &&
+        (callerSignal == null ||
+          !callerSignal.aborted ||
+          effectiveSignal.reason === timeoutSignal.reason);
+      if (timeoutWon) {
         throw new RequestTimeoutError(this.requestTimeoutMs, requestId);
       }
       throw err;
@@ -428,184 +434,200 @@ export class HttpClient {
       // signal. The polling path supplies its own deadline-aware signal per
       // iteration — this timeout (120s default) is safely larger than any single
       // long-poll window (<=25s via ?waitSeconds), so it never bites polling.
-      const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
+      const requestTimeout = createRequestTimeout(this.requestTimeoutMs);
+      const timeoutSignal = requestTimeout.signal;
       const effectiveSignal =
         options.signal != null ? AbortSignal.any([timeoutSignal, options.signal]) : timeoutSignal;
 
       try {
-        response = await this.fetchImpl(url, {
-          method,
-          headers: this.buildHeaders(requestId, options),
-          body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
-          signal: effectiveSignal,
-        });
-      } catch (err) {
-        // Distinguish a client-side request timeout from a caller-supplied abort.
-        //
-        // Node 22 `AbortSignal.timeout()` throws a `DOMException` with
-        // `name === 'TimeoutError'` (not 'AbortError') when the signal fires.
-        // A caller-supplied abort sets `name === 'AbortError'`.
-        // We treat both abort variants together: if the timeout signal fired and
-        // the caller hadn't already aborted, surface a clear RequestTimeoutError.
-        // A timeout/abort during the fetch itself: classify it (RequestTimeoutError
-        // when our deadline fired; otherwise rethrow the caller's abort unmodified).
-        this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId);
-        // If a RequestTimeoutError already propagated from somewhere (e.g. from a
-        // nested call or from a test-injected fetchImpl), pass it through unchanged
-        // rather than re-wrapping it as a TransportError.
-        if (err instanceof RequestTimeoutError) throw err;
-        const message = err instanceof Error ? err.message : String(err);
-        this.debug({
-          kind: 'error',
-          method,
-          url,
-          attempt,
-          requestId,
-          errorCode: 'TRANSPORT',
-          durationMs: Date.now() - startedAt,
-        });
-        const decision = transportRetryDecision(attempt, this.random);
-        if (!decision.retry) throw new TransportError(message, requestId);
-        this.transition(
-          `Network error on ${shortPath(path)} — retrying in ${Math.round(decision.delayMs / 1000)}s (attempt ${attempt})`,
-        );
-        this.debug({
-          kind: 'retry',
-          method,
-          url,
-          attempt,
-          requestId,
-          errorCode: 'TRANSPORT',
-          delayMs: decision.delayMs,
-        });
-        await this.sleep(decision.delayMs);
-        continue;
-      }
-
-      const durationMs = Date.now() - startedAt;
-      if (response.ok) {
-        this.debug({
-          kind: 'response',
-          method,
-          url,
-          attempt,
-          status: response.status,
-          requestId,
-          durationMs,
-        });
         try {
-          return { body: (await response.json()) as T, requestId, status: response.status };
+          response = await this.fetchImpl(url, {
+            method,
+            headers: this.buildHeaders(requestId, options),
+            body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+            signal: effectiveSignal,
+          });
         } catch (err) {
-          // A timeout/abort can fire mid-body-read (headers received, stream stalls).
-          this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId);
+          // Distinguish a client-side request timeout from a caller-supplied abort.
+          //
+          // The request-timeout controller aborts with an Error/DOMException whose
+          // `name === 'TimeoutError'` (not 'AbortError') when the signal fires.
+          // A caller-supplied abort sets `name === 'AbortError'`.
+          // We treat both abort variants together: if the timeout signal fired and
+          // the caller hadn't already aborted, surface a clear RequestTimeoutError.
+          // A timeout/abort during the fetch itself: classify it (RequestTimeoutError
+          // when our deadline fired; otherwise rethrow the caller's abort unmodified).
+          this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
+          // If a RequestTimeoutError already propagated from somewhere (e.g. from a
+          // nested call or from a test-injected fetchImpl), pass it through unchanged
+          // rather than re-wrapping it as a TransportError.
+          if (err instanceof RequestTimeoutError) throw err;
+          const message = err instanceof Error ? err.message : String(err);
+          this.debug({
+            kind: 'error',
+            method,
+            url,
+            attempt,
+            requestId,
+            errorCode: 'TRANSPORT',
+            durationMs: Date.now() - startedAt,
+          });
+          const decision = transportRetryDecision(attempt, this.random);
+          if (!decision.retry) throw new TransportError(message, requestId);
+          this.transition(
+            `Network error on ${shortPath(path)} — retrying in ${Math.round(decision.delayMs / 1000)}s (attempt ${attempt})`,
+          );
+          this.debug({
+            kind: 'retry',
+            method,
+            url,
+            attempt,
+            requestId,
+            errorCode: 'TRANSPORT',
+            delayMs: decision.delayMs,
+          });
+          requestTimeout.clear();
+          await this.sleep(decision.delayMs);
+          continue;
+        }
+
+        const durationMs = Date.now() - startedAt;
+        if (response.ok) {
+          this.debug({
+            kind: 'response',
+            method,
+            url,
+            attempt,
+            status: response.status,
+            requestId,
+            durationMs,
+          });
+          try {
+            return { body: (await response.json()) as T, requestId, status: response.status };
+          } catch (err) {
+            // A timeout/abort can fire mid-body-read (headers received, stream stalls).
+            this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
+            // Otherwise the successful response body was not valid JSON — a
+            // misconfigured endpoint, a proxy / captive-portal / login page that
+            // returns HTML with a 200 status, or an empty body. Surface a typed
+            // error carrying the requestId instead of letting the raw SyntaxError
+            // escape to index.ts, where it would print a bare `{"error":"..."}`
+            // and break the --output json envelope contract.
+            throw malformedResponseError(response, requestId, err);
+          }
+        }
+
+        let rawBody: unknown;
+        try {
+          rawBody = await safeReadJson(response);
+        } catch (err) {
+          // safeReadJson rethrows aborts/timeouts (it swallows only non-abort parse
+          // errors), so a timeout fired mid-body-read on a non-OK response lands here.
+          this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
           throw err;
         }
-      }
 
-      let rawBody: unknown;
-      try {
-        rawBody = await safeReadJson(response);
-      } catch (err) {
-        // safeReadJson rethrows aborts/timeouts (it swallows only non-abort parse
-        // errors), so a timeout fired mid-body-read on a non-OK response lands here.
-        this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId);
-        throw err;
-      }
+        // Edge proxies / load balancers return 408/502/504 without our error
+        // envelope on transient outages. These are transport-level retries,
+        // not facade errors — fold them in here so we get the bounded backoff
+        // budget instead of a single INTERNAL bail.
+        if (rawBody === null && isTransportEdgeStatus(response.status)) {
+          this.debug({
+            kind: 'error',
+            method,
+            url,
+            attempt,
+            status: response.status,
+            requestId,
+            errorCode: 'TRANSPORT',
+            durationMs,
+          });
+          const decision = transportRetryDecision(attempt, this.random);
+          if (!decision.retry) {
+            throw new TransportError(`HTTP ${response.status} from ${url}`, requestId);
+          }
+          this.transition(
+            `HTTP ${response.status} from ${shortPath(path)} — transport error, retrying in ${Math.round(decision.delayMs / 1000)}s (attempt ${attempt})`,
+          );
+          this.debug({
+            kind: 'retry',
+            method,
+            url,
+            attempt,
+            requestId,
+            errorCode: 'TRANSPORT',
+            delayMs: decision.delayMs,
+          });
+          requestTimeout.clear();
+          await this.sleep(decision.delayMs);
+          continue;
+        }
 
-      // Edge proxies / load balancers return 408/502/504 without our error
-      // envelope on transient outages. Per the CLI error spec §7 these are
-      // transport-level retries, not facade errors — fold them in here so
-      // we get the bounded backoff budget instead of a single INTERNAL bail.
-      if (rawBody === null && isTransportEdgeStatus(response.status)) {
+        const retryAfterSec = parseRetryAfter(response.headers.get('retry-after'));
+        // Clamp server-directed Retry-After to [1s, 300s] and surface on the
+        // thrown error so outer callers (e.g. runBatchRun outer retry loop)
+        // can honor it without re-reading the now-consumed HTTP response.
+        const retryAfterMsForError =
+          retryAfterSec !== undefined
+            ? Math.min(Math.max(retryAfterSec, 1), 300) * 1000
+            : undefined;
+        const apiError = ApiError.fromEnvelope(
+          rawBody,
+          response.status,
+          retryAfterMsForError,
+          // Lets synthesized nextAction text (e.g. INSUFFICIENT_CREDITS billing
+          // links) resolve the environment-correct portal domain.
+          this.baseUrl,
+        );
         this.debug({
           kind: 'error',
           method,
           url,
           attempt,
           status: response.status,
+          errorCode: apiError.code,
           requestId,
-          errorCode: 'TRANSPORT',
           durationMs,
         });
-        const decision = transportRetryDecision(attempt, this.random);
-        if (!decision.retry) {
-          throw new TransportError(`HTTP ${response.status} from ${url}`, requestId);
-        }
-        this.transition(
-          `HTTP ${response.status} from ${shortPath(path)} — transport error, retrying in ${Math.round(decision.delayMs / 1000)}s (attempt ${attempt})`,
+        const retryOnConflict = options.retryOnConflict !== false;
+        const retryOnRateLimit = options.retryOnRateLimit !== false;
+        const decision = apiRetryDecision(
+          apiError.code,
+          attempt,
+          retryAfterSec,
+          this.random,
+          retryOnConflict,
+          retryOnRateLimit,
         );
+        if (!decision.retry) throw apiError;
+        const delaySec = Math.round(decision.delayMs / 1000);
+        if (apiError.code === 'RATE_LIMITED') {
+          this.transition(
+            `Rate limited (HTTP 429) — waiting ${delaySec}s before retry (attempt ${attempt})`,
+          );
+        } else if (apiError.code === 'INTERNAL') {
+          this.transition(
+            `Server error (HTTP 5xx, requestId: ${requestId}) — retrying in ${delaySec}s (attempt ${attempt})`,
+          );
+        } else if (apiError.code === 'UNAVAILABLE') {
+          this.transition(
+            `Service unavailable (HTTP 503) — retrying in ${delaySec}s (attempt ${attempt})`,
+          );
+        }
         this.debug({
           kind: 'retry',
           method,
           url,
           attempt,
           requestId,
-          errorCode: 'TRANSPORT',
+          errorCode: apiError.code,
           delayMs: decision.delayMs,
         });
+        requestTimeout.clear();
         await this.sleep(decision.delayMs);
-        continue;
+      } finally {
+        requestTimeout.clear();
       }
-
-      const retryAfterSec = parseRetryAfter(response.headers.get('retry-after'));
-      // Clamp server-directed Retry-After to [1s, 300s] and surface on the
-      // thrown error so outer callers (e.g. runBatchRun outer retry loop)
-      // can honor it without re-reading the now-consumed HTTP response.
-      const retryAfterMsForError =
-        retryAfterSec !== undefined ? Math.min(Math.max(retryAfterSec, 1), 300) * 1000 : undefined;
-      const apiError = ApiError.fromEnvelope(
-        rawBody,
-        response.status,
-        retryAfterMsForError,
-        // Lets synthesized nextAction text (e.g. INSUFFICIENT_CREDITS billing
-        // links) resolve the environment-correct portal domain.
-        this.baseUrl,
-      );
-      this.debug({
-        kind: 'error',
-        method,
-        url,
-        attempt,
-        status: response.status,
-        errorCode: apiError.code,
-        requestId,
-        durationMs,
-      });
-      const retryOnConflict = options.retryOnConflict !== false;
-      const retryOnRateLimit = options.retryOnRateLimit !== false;
-      const decision = apiRetryDecision(
-        apiError.code,
-        attempt,
-        retryAfterSec,
-        this.random,
-        retryOnConflict,
-        retryOnRateLimit,
-      );
-      if (!decision.retry) throw apiError;
-      const delaySec = Math.round(decision.delayMs / 1000);
-      if (apiError.code === 'RATE_LIMITED') {
-        this.transition(
-          `Rate limited (HTTP 429) — waiting ${delaySec}s before retry (attempt ${attempt})`,
-        );
-      } else if (apiError.code === 'INTERNAL') {
-        this.transition(
-          `Server error (HTTP 5xx, requestId: ${requestId}) — retrying in ${delaySec}s (attempt ${attempt})`,
-        );
-      } else if (apiError.code === 'UNAVAILABLE') {
-        this.transition(
-          `Service unavailable (HTTP 503) — retrying in ${delaySec}s (attempt ${attempt})`,
-        );
-      }
-      this.debug({
-        kind: 'retry',
-        method,
-        url,
-        attempt,
-        requestId,
-        errorCode: apiError.code,
-        delayMs: decision.delayMs,
-      });
-      await this.sleep(decision.delayMs);
     }
   }
 
@@ -681,6 +703,39 @@ function newRequestId(): string {
   return `cli_${randomUUID()}`;
 }
 
+interface RequestTimeoutHandle {
+  signal: AbortSignal;
+  clear: () => void;
+}
+
+function createRequestTimeout(timeoutMs: number): RequestTimeoutHandle {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(makeTimeoutReason());
+  }, timeoutMs);
+  unrefTimer(timer);
+
+  return {
+    signal: controller.signal,
+    clear: () => clearTimeout(timer),
+  };
+}
+
+function makeTimeoutReason(): Error {
+  if (typeof DOMException !== 'undefined') {
+    return new DOMException('The operation timed out.', 'TimeoutError');
+  }
+  const err = new Error('The operation timed out.');
+  err.name = 'TimeoutError';
+  return err;
+}
+
+function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+  if (typeof timer !== 'object' || timer === null || !('unref' in timer)) return;
+  const unref = (timer as { unref?: () => void }).unref;
+  if (typeof unref === 'function') unref.call(timer);
+}
+
 async function safeReadJson(response: Response): Promise<unknown> {
   try {
     return await response.json();
@@ -690,6 +745,53 @@ async function safeReadJson(response: Response): Promise<unknown> {
     if (isAbortError(err) || isTimeoutError(err)) throw err;
     return null;
   }
+}
+
+/**
+ * Build a typed error for a successful response whose body could not be parsed
+ * as JSON.
+ *
+ * The CLI expects every API response to be a JSON envelope. When a `200 OK`
+ * carries a non-JSON body — a misconfigured endpoint, a proxy / captive-portal
+ * / SSO login page returning HTML with a success status, or an empty body —
+ * `response.json()` throws a raw `SyntaxError`. Left unhandled it escapes to
+ * the top-level handler in `index.ts`, which prints a bare
+ * `{"error":"<parse message>"}` under `--output json` (breaking the
+ * typed-envelope contract every other error honors) and gives the operator no
+ * actionable context.
+ *
+ * This wraps it in a typed `INTERNAL` `ApiError` (exit 1, unchanged) that
+ * carries the `requestId`, names the likely cause, and points the operator at
+ * their endpoint configuration. `details` includes the HTTP status, the
+ * response `content-type` (when present), and the underlying parse message.
+ */
+export function malformedResponseError(
+  response: Response,
+  requestId: string,
+  cause: unknown,
+): ApiError {
+  const contentType = response.headers.get('content-type') ?? undefined;
+  const parseError = cause instanceof Error ? cause.message : String(cause);
+  const contentTypeNote = contentType ? ` (content-type: ${contentType})` : '';
+  return new ApiError(
+    {
+      code: 'INTERNAL',
+      message:
+        `The server returned a non-JSON response${contentTypeNote} for an HTTP ${response.status}. ` +
+        `This usually means the endpoint is not the TestSprite API — a proxy, captive portal, or ` +
+        `login page can return HTML with a success status.`,
+      nextAction:
+        'Check that --endpoint-url / TESTSPRITE_API_URL points at the TestSprite API ' +
+        '(default https://api.testsprite.com), then retry.',
+      requestId,
+      details: {
+        httpStatus: response.status,
+        ...(contentType ? { contentType } : {}),
+        parseError,
+      },
+    },
+    response.status,
+  );
 }
 
 export function parseRetryAfter(headerValue: string | null): number | undefined {

@@ -169,11 +169,25 @@ describe('content integrity', () => {
           content.trimStart().startsWith('#'),
           `cline: should start with a markdown heading`,
         ).toBe(true);
+      } else if (target === 'windsurf') {
+        // Windsurf Cascade frontmatter: trigger + description (no name/alwaysApply)
+        expect(content.startsWith('---'), `windsurf: should start with ---`).toBe(true);
+        expect(content).toContain('trigger: model_decision');
+        expect(content).toContain('description:');
+      } else if (target === 'copilot') {
+        // GitHub Copilot instructions frontmatter: applyTo glob + description
+        expect(content.startsWith('---'), `copilot: should start with ---`).toBe(true);
+        expect(content).toContain("applyTo: '**'");
+        expect(content).toContain('description:');
       }
 
-      // (b) branding — the renamed H1 must be present
+      // (b) branding — the renamed H1 must be present in every body variant
       expect(content).toContain('TestSprite Verification Loop');
-      expect(content).toContain('The verification loop that flies');
+      // The full-body intro line lives only in the FULL body; compact-body targets
+      // (e.g. windsurf, budget-capped) ship the trimmed verify body and omit it.
+      if (!TARGETS[target].compactBody) {
+        expect(content).toContain('The verification loop that flies');
+      }
 
       // (c) Load-bearing command strings
       expect(content, `${target}: missing 'testsprite test run'`).toContain('testsprite test run');
@@ -198,6 +212,13 @@ describe('content integrity', () => {
         expect(content).toContain('alwaysApply: false');
       } else if (target === 'cline') {
         expect(content.startsWith('---'), `cline/onboard: must NOT start with ---`).toBe(false);
+      } else if (target === 'windsurf') {
+        expect(content.startsWith('---'), `windsurf/onboard: should start with ---`).toBe(true);
+        expect(content).toContain('trigger: model_decision');
+        expect(content).toContain('description:');
+      } else if (target === 'copilot') {
+        expect(content.startsWith('---'), `copilot/onboard: should start with ---`).toBe(true);
+        expect(content).toContain("applyTo: '**'");
       }
 
       // Load-bearing onboard string: the skill body must reference setup
@@ -430,13 +451,13 @@ describe('dry-run', () => {
 // ---------------------------------------------------------------------------
 
 describe('multi-target install', () => {
-  it('--target=claude,cursor,cline,antigravity,codex writes all targets + skills, exit 0', () => {
+  it('--target=claude,cursor,cline,antigravity,kiro,codex writes all targets + skills, exit 0', () => {
     const tmpDir = freshTmpDir();
 
     const result = runCli([
       'agent',
       'install',
-      '--target=claude,cursor,cline,antigravity,codex',
+      '--target=claude,cursor,cline,antigravity,kiro,codex',
       '--dir',
       tmpDir,
       '--output',
@@ -449,7 +470,7 @@ describe('multi-target install', () => {
       action: string;
       path: string;
     }>;
-    const allTargets: AgentTarget[] = ['claude', 'cursor', 'cline', 'antigravity', 'codex'];
+    const allTargets: AgentTarget[] = ['claude', 'cursor', 'cline', 'antigravity', 'kiro', 'codex'];
 
     for (const target of allTargets) {
       if (TARGETS[target].mode === 'managed-section') {
@@ -790,7 +811,7 @@ describe('agent list', () => {
     }>;
     expect(Array.isArray(parsed)).toBe(true);
 
-    // Expected: 5 targets × 2 skills = 10 rows
+    // Expected: 8 targets × 2 skills = 16 rows
     const expectedCount = Object.keys(TARGETS).length * DEFAULT_SKILLS.length;
     expect(parsed.length).toBe(expectedCount);
 
@@ -819,7 +840,16 @@ describe('agent list', () => {
 // ---------------------------------------------------------------------------
 describe('matrix coverage guard', () => {
   it('TARGETS matches the documented, e2e-covered set (update this list when adding a target)', () => {
-    expect(Object.keys(TARGETS)).toEqual(['claude', 'antigravity', 'cursor', 'cline', 'codex']);
+    expect(Object.keys(TARGETS)).toEqual([
+      'claude',
+      'antigravity',
+      'cursor',
+      'cline',
+      'kiro',
+      'windsurf',
+      'copilot',
+      'codex',
+    ]);
   });
 
   it('SKILLS matches the documented, e2e-covered set (update this list when adding a skill)', () => {

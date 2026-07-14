@@ -69,6 +69,33 @@ describe('promptText', () => {
     const output = new CaptureStream();
     expect(await promptText('? ', { input, output })).toBe('eof-no-newline');
   });
+
+  it('writes the question to stderr by default — keeps stdout pure for --output json', async () => {
+    // Regression: prompts used to default to stdout, which polluted the JSON
+    // result on the interactive setup/configure path. Interactive UI belongs
+    // on stderr. Manually swap the global stream writers (prompt reads
+    // process.stderr/stdout at call time, so this is reliably intercepted).
+    const errChunks: string[] = [];
+    const outChunks: string[] = [];
+    const origErr = process.stderr.write.bind(process.stderr);
+    const origOut = process.stdout.write.bind(process.stdout);
+    (process.stderr as unknown as { write: (c: string) => boolean }).write = c => {
+      errChunks.push(String(c));
+      return true;
+    };
+    (process.stdout as unknown as { write: (c: string) => boolean }).write = c => {
+      outChunks.push(String(c));
+      return true;
+    };
+    try {
+      await promptText('Q: ', { input: Readable.from(['x\n']) }); // no output → default
+    } finally {
+      (process.stderr as unknown as { write: typeof origErr }).write = origErr;
+      (process.stdout as unknown as { write: typeof origOut }).write = origOut;
+    }
+    expect(errChunks.join('')).toContain('Q: ');
+    expect(outChunks.join('')).not.toContain('Q: ');
+  });
 });
 
 describe('promptSecret (non-TTY behavior)', () => {
@@ -86,6 +113,35 @@ describe('promptSecret (non-TTY behavior)', () => {
     const written = output.text();
     expect(written).toContain('Key: ');
     expect(written).not.toContain('sk-hidden-12345');
+  });
+
+  it('writes the prompt to stderr by default — keeps stdout pure for --output json', async () => {
+    // Same regression as promptText: the secret prompt is interactive UI and
+    // must default to stderr so stdout carries only the command result. Manual
+    // stream swap (vi.spyOn does not intercept process.stderr.write here).
+    const errChunks: string[] = [];
+    const outChunks: string[] = [];
+    const origErr = process.stderr.write.bind(process.stderr);
+    const origOut = process.stdout.write.bind(process.stdout);
+    (process.stderr as unknown as { write: (c: string) => boolean }).write = c => {
+      errChunks.push(String(c));
+      return true;
+    };
+    (process.stdout as unknown as { write: (c: string) => boolean }).write = c => {
+      outChunks.push(String(c));
+      return true;
+    };
+    try {
+      await promptSecret('Key: ', { input: Readable.from(['sk-x\n']) }); // no output → default
+    } finally {
+      (process.stderr as unknown as { write: typeof origErr }).write = origErr;
+      (process.stdout as unknown as { write: typeof origOut }).write = origOut;
+    }
+    expect(errChunks.join('')).toContain('Key: ');
+    expect(outChunks.join('')).not.toContain('Key: ');
+    // The typed secret is never echoed to either real stream.
+    expect(errChunks.join('')).not.toContain('sk-x');
+    expect(outChunks.join('')).not.toContain('sk-x');
   });
 
   it('honors DEL/backspace before submission', async () => {

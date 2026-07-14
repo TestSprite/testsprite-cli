@@ -1,6 +1,16 @@
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { VERSION } from '../version.js';
 
-export type AgentTarget = 'claude' | 'cursor' | 'cline' | 'antigravity' | 'codex';
+export type AgentTarget =
+  | 'claude'
+  | 'cursor'
+  | 'cline'
+  | 'antigravity'
+  | 'codex'
+  | 'kiro'
+  | 'windsurf'
+  | 'copilot';
 
 export interface TargetSpec {
   status: 'ga' | 'experimental';
@@ -12,11 +22,19 @@ export interface TargetSpec {
    */
   path: string;
   /**
-   * 'own-file': the CLI owns the whole file (claude/cursor/cline/antigravity).
+   * 'own-file': the CLI owns the whole file (claude/cursor/cline/antigravity/windsurf).
    * 'managed-section': the CLI writes only a sentinel-delimited section inside
    * a potentially user-authored file (codex target, AGENTS.md).
    */
   mode: 'own-file' | 'managed-section';
+  /**
+   * When true, render the budget-friendly body (see {@link compactBodyFor})
+   * instead of the full own-file skill body. Used for own-file targets whose
+   * rule files are size-capped — currently `windsurf` (`.windsurf/rules/*.md`
+   * files cap at ~12 K characters and Cascade silently truncates beyond that,
+   * which would cut the full ~22 KB verify skill in half).
+   */
+  compactBody?: boolean;
   /**
    * Wrap a skill body in this target's frontmatter/header. Takes the skill's
    * `name`+`description` (own-file targets emit them as frontmatter) and the body.
@@ -120,6 +138,31 @@ function wrapMdc(_name: string, description: string, body: string): string {
   return `---\ndescription: ${description}\nalwaysApply: false\n---\n\n${body}\n`;
 }
 
+/**
+ * Windsurf (Cascade) reads workspace rules from `.windsurf/rules/*.md` with YAML
+ * frontmatter. `trigger: model_decision` is the Cascade equivalent of the Cursor
+ * `.mdc` `alwaysApply: false` mode: only the `description` is surfaced up front,
+ * and Cascade pulls in the full rule body when the description shows it is
+ * relevant — exactly the on-demand activation these skills want. (The other
+ * triggers are `always_on`, `manual`, and `glob`.)
+ */
+function wrapWindsurf(_name: string, description: string, body: string): string {
+  return `---\ntrigger: model_decision\ndescription: ${description}\n---\n\n${body}\n`;
+}
+
+/**
+ * GitHub Copilot reads path-specific custom instructions from
+ * `.github/instructions/*.instructions.md` (VS Code / Visual Studio / GitHub
+ * Copilot Chat). Each file carries YAML frontmatter with `applyTo` — a glob that
+ * scopes when the instructions attach. `applyTo: '**'` attaches the guidance to
+ * every request in the repo, which is what a persistent verification skill wants
+ * (there is no on-demand "model decides" mode for Copilot instruction files, so
+ * always-apply is the correct idiom). `description` is surfaced in Copilot's UI.
+ */
+function wrapCopilot(_name: string, description: string, body: string): string {
+  return `---\ndescription: ${description}\napplyTo: '**'\n---\n\n${body}\n`;
+}
+
 // ---------------------------------------------------------------------------
 // Landing paths
 // ---------------------------------------------------------------------------
@@ -140,6 +183,12 @@ export function pathFor(target: AgentTarget, skill: string): string {
       return `.cursor/rules/${skill}.mdc`;
     case 'cline':
       return `.clinerules/${skill}.md`;
+    case 'kiro':
+      return `.kiro/skills/${skill}/SKILL.md`;
+    case 'windsurf':
+      return `.windsurf/rules/${skill}.md`;
+    case 'copilot':
+      return `.github/instructions/${skill}.instructions.md`;
     case 'codex':
       return 'AGENTS.md';
   }
@@ -169,6 +218,35 @@ export const TARGETS: Record<AgentTarget, TargetSpec> = {
     path: pathFor('cline', SKILL_NAME),
     mode: 'own-file',
     wrap: (_name, _description, body) => body,
+  },
+  kiro: {
+    status: 'experimental',
+    path: pathFor('kiro', SKILL_NAME),
+    mode: 'own-file',
+    // kiro reads SKILL.md files with name/description frontmatter, same as
+    // claude/antigravity, so it shares the wrapSkill wrapper.
+    wrap: wrapSkill,
+  },
+  windsurf: {
+    status: 'experimental',
+    path: pathFor('windsurf', SKILL_NAME),
+    mode: 'own-file',
+    // Windsurf rules files are budget-capped (~12 K chars per `.windsurf/rules/*.md`),
+    // so render the compact body per skill (see compactBodyFor).
+    compactBody: true,
+    wrap: wrapWindsurf,
+  },
+  copilot: {
+    status: 'experimental',
+    path: pathFor('copilot', SKILL_NAME),
+    mode: 'own-file',
+    // GitHub Copilot path-specific instructions: frontmatter carries `applyTo`.
+    // `applyTo: '**'` means the file is ALWAYS injected into Copilot requests
+    // (there is no on-demand "model decides" mode like Cursor/Windsurf), so
+    // render the compact body to keep the always-on context cost small — the
+    // same reasoning that drives windsurf's compact render.
+    compactBody: true,
+    wrap: wrapCopilot,
   },
   /**
    * codex target — managed-section mode.
@@ -201,6 +279,85 @@ export const MANAGED_SECTION_BEGIN =
   '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install codex) -->';
 export const MANAGED_SECTION_END = '<!-- END TESTSPRITE AGENT SECTION -->';
 
+// ---------------------------------------------------------------------------
+// Install marker (stale-skill detection, issue #123)
+// ---------------------------------------------------------------------------
+
+/**
+ * Hex characters of the canonical body's SHA-256 kept in the install marker.
+ * 12 hex chars (48 bits) is ample for drift DETECTION (equality against bodies
+ * this CLI ships); the marker is provenance metadata, not a security boundary.
+ */
+const MARKER_HASH_HEX_LENGTH = 12;
+
+/**
+ * When one marker covers several skills (the codex managed section aggregates
+ * every installed skill), their names are joined with this separator in the
+ * marker's skill field. Skill names never contain '+' (see {@link SKILLS} keys).
+ */
+export const MARKER_SKILL_SEPARATOR = '+';
+
+/**
+ * Marker line shape: `<!-- testsprite-skill: <name> v<version> sha256:<hash> -->`.
+ * An HTML comment is inert in every target format (SKILL.md, .mdc, .clinerules
+ * markdown, AGENTS.md). Built via `new RegExp` so the hash length stays bound
+ * to {@link MARKER_HASH_HEX_LENGTH}.
+ */
+const SKILL_MARKER_LINE_RE = new RegExp(
+  `^<!-- testsprite-skill: (\\S+) v(\\S+) sha256:([0-9a-f]{${MARKER_HASH_HEX_LENGTH}}) -->$`,
+);
+
+/**
+ * First {@link MARKER_HASH_HEX_LENGTH} hex chars of the SHA-256 of a canonical
+ * skill body. The hash covers the CANONICAL BODY ONLY (pre-wrap, pre-marker),
+ * so writing the marker into the rendered artifact never changes the hash the
+ * marker itself carries.
+ */
+export function bodyHash12(canonicalBody: string): string {
+  return createHash('sha256')
+    .update(canonicalBody, 'utf8')
+    .digest('hex')
+    .slice(0, MARKER_HASH_HEX_LENGTH);
+}
+
+/**
+ * Build the provenance marker line for a skill (or a
+ * {@link MARKER_SKILL_SEPARATOR}-joined skill set) and its canonical body.
+ * `agent status` compares this fingerprint against the bodies the running CLI
+ * ships to detect silently stale installs.
+ */
+export function buildSkillMarker(skillName: string, canonicalBody: string): string {
+  return `<!-- testsprite-skill: ${skillName} v${VERSION} sha256:${bodyHash12(canonicalBody)} -->`;
+}
+
+/** A marker line parsed back into its fields. */
+export interface ParsedSkillMarker {
+  /** Skill name, or several names joined with {@link MARKER_SKILL_SEPARATOR}. */
+  skill: string;
+  /** CLI version that wrote the artifact. */
+  version: string;
+  /** First 12 hex chars of the canonical body's SHA-256 at install time. */
+  hash12: string;
+  /** The exact marker line (trailing CR/whitespace stripped) as found. */
+  line: string;
+}
+
+/**
+ * Find the first testsprite-skill marker line in `content`, or null when the
+ * content carries none (a pre-marker install). Lines are matched whole with
+ * trailing CR/whitespace stripped, so CRLF checkouts parse identically.
+ */
+export function parseSkillMarker(content: string): ParsedSkillMarker | null {
+  for (const rawLine of content.split('\n')) {
+    const line = rawLine.trimEnd();
+    const matched = SKILL_MARKER_LINE_RE.exec(line);
+    if (matched) {
+      return { skill: matched[1]!, version: matched[2]!, hash12: matched[3]!, line };
+    }
+  }
+  return null;
+}
+
 type ReadFn = (url: URL) => string;
 
 const defaultRead: ReadFn = (url: URL) => readFileSync(url, 'utf8');
@@ -225,6 +382,24 @@ export function loadSkillBodyFor(skill: string, read: ReadFn = defaultRead): str
   const spec = SKILLS[skill];
   if (!spec) throw new Error(`unknown skill: ${skill}`);
   return readSkillAsset(spec.bodyFile, read);
+}
+
+/**
+ * Budget-friendly body for an own-file target whose rule files are size-capped
+ * (e.g. windsurf). For a skill that ships a trimmed codex asset (`codex.kind ===
+ * 'full'`, e.g. `testsprite-verify` — full body ~22 KB, codex ~5 KB) we render
+ * that compact asset so the wrapped file stays under the cap. For skills whose
+ * codex contribution is only a one-liner (`'line'`/`'none'`, e.g.
+ * `testsprite-onboard`), the one-liner is useless as a standalone rule and the
+ * full own-file body (~6.5 KB) already fits the budget — so the full body is
+ * used.
+ */
+export function compactBodyFor(skill: string, read: ReadFn = defaultRead): string {
+  const spec = SKILLS[skill];
+  if (!spec) throw new Error(`unknown skill: ${skill}`);
+  return spec.codex.kind === 'full'
+    ? readSkillAsset(spec.codex.file, read)
+    : loadSkillBodyFor(skill, read);
 }
 
 /**
@@ -276,14 +451,66 @@ export function loadCodexSkillBody(read: ReadFn = defaultRead): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * Place the marker line inside a wrapped own-file render.
+ *
+ * - Wraps that emit YAML frontmatter (claude/antigravity/cursor): the marker
+ *   lands on the line right after the closing `---` fence, before the body.
+ * - Wrapless targets (cline, body verbatim): the marker is appended as the
+ *   LAST line instead. Cline surfaces the file's first heading as the rule
+ *   title, so a leading comment would displace the body's H1.
+ */
+function injectMarkerLine(wrapped: string, markerLine: string): string {
+  if (wrapped.startsWith('---\n')) {
+    // The name/description frontmatter values are single-line, so the first
+    // `\n---\n` after the opening fence is always the closing fence.
+    const closingFence = '\n---\n';
+    const fenceIdx = wrapped.indexOf(closingFence);
+    if (fenceIdx !== -1) {
+      const insertAt = fenceIdx + closingFence.length;
+      return `${wrapped.slice(0, insertAt)}${markerLine}\n${wrapped.slice(insertAt)}`;
+    }
+  }
+  const separator = wrapped.endsWith('\n') ? '' : '\n';
+  return `${wrapped}${separator}${markerLine}\n`;
+}
+
+/**
+ * Exact own-file bytes for a skill on a target, carrying the GIVEN marker line.
+ * `agent status` uses this to re-render the current canonical body with a
+ * file's own (possibly older-versioned) marker: when only the marker's version
+ * string lags but the body is unchanged, the artifact still compares pristine.
+ */
+export function renderOwnFileWithMarker(
+  target: AgentTarget,
+  skill: string,
+  markerLine: string,
+  body?: string,
+): string {
+  const spec = TARGETS[target];
+  if (spec.mode !== 'own-file') {
+    throw new Error(`renderOwnFileWithMarker: ${target} is not an own-file target`);
+  }
+  const skillSpec = SKILLS[skill];
+  if (!skillSpec) throw new Error(`unknown skill: ${skill}`);
+  const resolvedBody = body !== undefined ? body : loadSkillBodyFor(skill);
+  return injectMarkerLine(
+    spec.wrap(skillSpec.name, skillSpec.description, resolvedBody),
+    markerLine,
+  );
+}
+
+/**
  * The exact bytes to write for one skill on one target.
  *
  * - own-file targets: `body` defaults to the skill's own-file asset, wrapped in
- *   the target's frontmatter/header.
+ *   the target's frontmatter/header, and carrying a provenance marker line so
+ *   `agent status` can tell fresh, stale, and hand-edited installs apart.
  * - codex (managed-section): returns the skill's codex contribution unwrapped
- *   (plain Markdown, no frontmatter). The real install does NOT call this for
- *   codex — it aggregates all skills via {@link buildCodexAggregate} — but it is
- *   kept single-skill here for tests and parity. Pass an explicit `body` to override.
+ *   and marker-free (plain Markdown, no frontmatter). The real install does NOT
+ *   call this for codex: it aggregates all skills via
+ *   {@link buildCodexAggregate} and writes ONE marker just inside the BEGIN
+ *   sentinel. It is kept single-skill here for tests and parity. Pass an
+ *   explicit `body` to override.
  */
 export function renderForTarget(
   t: AgentTarget,
@@ -298,6 +525,10 @@ export function renderForTarget(
     const resolvedBody = body !== undefined ? body : codexContentFor(skill);
     return { path, content: spec.wrap(skillSpec.name, skillSpec.description, resolvedBody) };
   }
-  const resolvedBody = body !== undefined ? body : loadSkillBodyFor(skill);
-  return { path, content: spec.wrap(skillSpec.name, skillSpec.description, resolvedBody) };
+  const resolvedBody =
+    body !== undefined ? body : spec.compactBody ? compactBodyFor(skill) : loadSkillBodyFor(skill);
+  return {
+    path,
+    content: renderOwnFileWithMarker(t, skill, buildSkillMarker(skill, resolvedBody), resolvedBody),
+  };
 }

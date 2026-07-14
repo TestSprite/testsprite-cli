@@ -15,14 +15,20 @@ const pendingPromptInput = new WeakMap<NodeJS.ReadableStream, string>();
 
 export async function promptText(question: string, streams: PromptStreams = {}): Promise<string> {
   const input = streams.input ?? process.stdin;
-  const output = streams.output ?? process.stdout;
+  // Prompts are interactive UI, not data — write the question (and any echo)
+  // to stderr so stdout carries only the command's result. This keeps
+  // `--output json` stdout a single pure JSON document even on the interactive
+  // setup / configure path (§8.1 stdout purity). stderr is still the user's
+  // TTY, so the prompt remains visible.
+  const output = streams.output ?? process.stderr;
   output.write(question);
   return readLine(input, output, false);
 }
 
 export async function promptSecret(question: string, streams: PromptStreams = {}): Promise<string> {
   const input = streams.input ?? process.stdin;
-  const output = streams.output ?? process.stdout;
+  // See promptText: interactive prompt + masking go to stderr, not stdout.
+  const output = streams.output ?? process.stderr;
   output.write(question);
 
   const inputAsTTY = input as Readable & RawModeCapable;

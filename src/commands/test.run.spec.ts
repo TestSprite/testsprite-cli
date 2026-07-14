@@ -1936,6 +1936,74 @@ describe('runTestRun --wait: Fix 3 — RequestTimeoutError writes partial JSON t
 });
 
 // ---------------------------------------------------------------------------
+// TimeoutError on --wait: partial stdout + exit 7
+// ---------------------------------------------------------------------------
+
+describe('runTestRun --wait: TimeoutError writes partial JSON to stdout', () => {
+  it('exit 7 AND stdout contains {runId, status:"running"} when --timeout polling deadline is exceeded', async () => {
+    const { credentialsPath } = makeCreds();
+    let dateCallCount = 0;
+    let fetchCallCount = 0;
+    const base = Date.now();
+    const realDateNow = Date.now;
+    Date.now = () => (++dateCallCount > 6 ? base + 2000 : base);
+
+    try {
+      const fetchImpl: typeof globalThis.fetch = async () => {
+        ++fetchCallCount;
+        if (fetchCallCount === 1) {
+          return new Response(JSON.stringify(TRIGGER_RESP), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        const runningRun: RunResponse = { ...makePassedRun(), status: 'running' };
+        return new Response(JSON.stringify(runningRun), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      };
+
+      const stdoutLines: string[] = [];
+      const stderrLines: string[] = [];
+
+      await expect(
+        runTestRun(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            verbose: false,
+            dryRun: false,
+            testId: 'test_xyz',
+            wait: true,
+            timeoutSeconds: 1,
+          },
+          {
+            credentialsPath,
+            fetchImpl: fetchImpl as unknown as FetchImpl,
+            stdout: line => stdoutLines.push(line),
+            stderr: line => stderrLines.push(line),
+            sleep: instantSleep,
+          },
+        ),
+      ).rejects.toMatchObject({ exitCode: 7 });
+
+      const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
+        runId: string;
+        status: string;
+        targetUrl: string;
+      };
+      expect(stdoutJson.runId).toBe(TRIGGER_RESP.runId);
+      expect(stdoutJson.status).toBe('running');
+      expect(stdoutJson.targetUrl).toBe(TRIGGER_RESP.targetUrl);
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Fix 5 — B2(c): --timeout hint fires on default, not on explicit timeout
 // ---------------------------------------------------------------------------
 
@@ -3622,5 +3690,61 @@ describe('dashboardUrl on run completion', () => {
         l.includes('Dashboard: https://www.testsprite.com/dashboard/tests/project_be'),
       ),
     ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Batch --all --wait fan-out: RequestTimeoutError must not leave stdout empty
+// ---------------------------------------------------------------------------
+
+describe('[finding-5] runTestRunAll --wait: RequestTimeoutError during fan-out poll writes JSON stdout + exit 7', () => {
+  it('stdout contains accepted[] with runIds when member polls throw RequestTimeoutError', async () => {
+    const { credentialsPath } = makeCreds();
+    const batchResp: BatchRunFreshResponse = {
+      accepted: [
+        { testId: 'test_be_01', runId: 'run_fresh_01', enqueuedAt: '2026-06-09T10:00:00.000Z' },
+        { testId: 'test_be_02', runId: 'run_fresh_02', enqueuedAt: '2026-06-09T10:00:01.000Z' },
+      ],
+      conflicts: [],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: batchResp };
+      if (url.includes('/runs/')) {
+        throw new RequestTimeoutError(120000, 'req_timeout_batch_all');
+      }
+      return errorBody('NOT_FOUND');
+    });
+    const stdoutLines: string[] = [];
+
+    const err = await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+
+    expect(err).toMatchObject({ exitCode: 7 });
+    expect(stdoutLines.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(stdoutLines.join('\n')) as {
+      accepted: Array<{ testId: string; runId: string; status: string }>;
+    };
+    expect(parsed.accepted).toHaveLength(2);
+    expect(parsed.accepted.map(r => r.runId).sort()).toEqual(['run_fresh_01', 'run_fresh_02']);
+    expect(parsed.accepted.every(r => r.status === 'timeout')).toBe(true);
   });
 });

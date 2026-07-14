@@ -154,8 +154,12 @@ function renderUsage(u: UsageResponse, portalBase?: string): string {
     }
     if (u.creditsPerRun !== undefined) {
       lines.push(`cost per frontend run: ${u.creditsPerRun} credit(s)`);
+      // Backend runs DO consume credits (confirmed by design 2026-06-30 / DEV-289).
+      // The API exposes no backend-specific per-run cost field, and it differs from
+      // the frontend rate, so state that it bills without asserting a possibly-wrong
+      // number — check your balance before/after, or see the billing page.
       lines.push(
-        `cost per backend run:  0 credit(s) (backend tests bill at code-generation, not at run time)`,
+        `cost per backend run:  also consumes credits (exact amount not reported by the API)`,
       );
     }
 
@@ -200,7 +204,12 @@ export function createUsageCommand(deps: UsageDeps = {}): Command {
       '\nExamples:\n' +
         '  testsprite usage                 # show balance + plan\n' +
         '  testsprite usage --output json   # machine-readable balance\n' +
+        '  testsprite usage --debug         # trace HTTP method/path, request id, latency\n' +
         '  testsprite credits               # alias for usage\n' +
+        '\nExit codes:\n' +
+        '  0   success (or --dry-run)\n' +
+        '  3   auth error — run `testsprite setup` to configure credentials\n' +
+        '  10  transport/network failure (UNAVAILABLE) — retry the command\n' +
         '\nNote: credit balance requires a backend update to /me. Until shipped,\n' +
         "  check your portal's Billing page (/dashboard/settings/billing) for your balance.",
     )

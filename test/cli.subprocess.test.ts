@@ -8,8 +8,8 @@
  */
 
 import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { execNpm } from './helpers/execNpm.js';
-import { existsSync, mkdtempSync, statSync, unlinkSync } from 'node:fs';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -903,6 +903,7 @@ describe('setup --from-env subprocess', () => {
     expect(result.exitCode).toBe(0);
     const credentialsPath = join(tmpHome, '.testsprite', 'credentials');
     expect(existsSync(credentialsPath)).toBe(true);
+    // POSIX file modes don't exist on Windows (stat reports 0666).
     if (process.platform !== 'win32') {
       expect(statSync(credentialsPath).mode & 0o777).toBe(0o600);
     }
@@ -1052,7 +1053,7 @@ describe('--dry-run subprocess smoke', () => {
     // skipped the prompt.
     const credPath = join(tmpHome, '.testsprite', 'credentials');
     // Make sure any previous test didn't leave one behind.
-    if (existsSync(credPath)) unlinkSync(credPath);
+    rmSync(credPath, { force: true });
     const result = await runCli(['setup', '--dry-run', '--no-agent', '--output', 'json']);
     expect(result.exitCode).toBe(0);
     expect(existsSync(credPath)).toBe(false);

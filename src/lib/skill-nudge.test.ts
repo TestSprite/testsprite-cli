@@ -14,6 +14,12 @@ import {
 // isVerifySkillInstalled
 // ---------------------------------------------------------------------------
 
+/** True when `observed` resolves under `root` (boundary-safe, cross-platform). */
+function isUnderRoot(root: string, observed: string): boolean {
+  const rel = path.relative(path.resolve(root), path.resolve(observed));
+  return !path.isAbsolute(rel) && !rel.startsWith('..');
+}
+
 describe('isVerifySkillInstalled', () => {
   const projDir = path.resolve('proj');
 
@@ -85,8 +91,7 @@ describe('isVerifySkillInstalled', () => {
         return false;
       },
     });
-    const resolvedRoot = path.resolve(root);
-    expect(seen.every(p => path.resolve(p).startsWith(resolvedRoot))).toBe(true);
+    expect(seen.every(p => isUnderRoot(root, p))).toBe(true);
     // One probe per target landing path.
     expect(seen).toHaveLength(Object.keys(TARGETS).length);
   });
@@ -212,7 +217,6 @@ describe('maybeEmitSkillNudge', () => {
     });
     maybeEmitSkillNudge(ctx);
     expect(probed.length).toBeGreaterThan(0);
-    const resolvedCwd = path.resolve(cwd);
-    expect(probed.every(p => path.resolve(p).startsWith(resolvedCwd))).toBe(true);
+    expect(probed.every(p => isUnderRoot(cwd, p))).toBe(true);
   });
 });

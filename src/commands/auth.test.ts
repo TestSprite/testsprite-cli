@@ -164,6 +164,100 @@ describe('runConfigure', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 
+  it('rejects a malformed endpoint before key validation fetch', async () => {
+    const { capture, deps } = makeCapture();
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          fromEnv: true,
+          endpointUrl: 'not-a-url',
+        },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(capture.stderr.join('\n')).not.toContain('API key rejected');
+  });
+
+  it('rejects a non-http endpoint before key validation fetch', async () => {
+    const { deps } = makeCapture();
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          fromEnv: true,
+          endpointUrl: 'ftp://example.com',
+        },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+  });
+
+  it('rejects a malformed dry-run endpoint before emitting dry-run output', async () => {
+    const { capture, deps } = makeCapture();
+    const fetchImpl = vi.fn();
+
+    await expect(
+      runConfigure(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          fromEnv: false,
+          dryRun: true,
+          endpointUrl: 'not-a-url',
+        },
+        {
+          ...deps,
+          env: {},
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(capture.stderr.join('\n')).not.toContain('[dry-run]');
+    expect(capture.stdout).toEqual([]);
+  });
+
   it('prompts only for the API key (never the endpoint) and defaults to prod', async () => {
     const { capture, deps } = makeCapture();
     // Prompt object exposes ONLY `secret`. If runConfigure tried to prompt for
@@ -182,6 +276,35 @@ describe('runConfigure', () => {
       apiUrl: 'https://api.testsprite.com',
     });
     expect(capture.prelude.join('')).toContain('Configuring profile "default"');
+  });
+
+  it('routes the interactive prelude to stderr by default, keeping stdout for the result', async () => {
+    // Regression: the prelude used to default to process.stdout, polluting the
+    // result stream (and the JSON document under --output json). With no
+    // injected preludeWrite/stderr, the default must land on stderr, not stdout.
+    const stdout: string[] = [];
+    const errChunks: string[] = [];
+    const origErr = process.stderr.write.bind(process.stderr);
+    (process.stderr as unknown as { write: (c: string) => boolean }).write = c => {
+      errChunks.push(String(c));
+      return true;
+    };
+    try {
+      await runConfigure(
+        { profile: 'default', output: 'text', debug: false, fromEnv: false },
+        {
+          stdout: line => stdout.push(line),
+          prompt: { secret: vi.fn(async () => 'sk-typed') },
+          fetchImpl: meOkFetch,
+          credentialsPath,
+          env: {},
+        },
+      );
+    } finally {
+      (process.stderr as unknown as { write: typeof origErr }).write = origErr;
+    }
+    expect(errChunks.join('')).toContain('Configuring profile "default"');
+    expect(stdout.join('\n')).not.toContain('Configuring profile');
   });
 
   it('interactive path resolves the endpoint from TESTSPRITE_API_URL without prompting', async () => {
@@ -725,6 +848,20 @@ describe('runWhoami', () => {
     );
     const printed = JSON.parse(capture.stdout.join(''));
     expect(printed).toEqual(sampleMe);
+  });
+
+  it('dry-run: whitespace-only TESTSPRITE_API_URL falls through to prod default endpoint', async () => {
+    const { capture, deps } = makeCapture();
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false, dryRun: true },
+      {
+        ...deps,
+        env: { TESTSPRITE_API_URL: '   ' },
+        credentialsPath,
+      },
+    );
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('endpoint: https://api.testsprite.com');
   });
 
   it('L1788: text output includes the resolved endpoint URL', async () => {

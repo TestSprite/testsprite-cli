@@ -12,7 +12,9 @@ agree on the approach before you invest time — see CONTRIBUTING.md.
 
 ## Related issue
 
-<!-- e.g. "Fixes #123" or "Refs #123". Link an issue for non-trivial changes. -->
+<!-- e.g. "Closes #123". Required for features and behavior changes — open an
+     issue first and get it assigned (comment `/assign` there); see
+     CONTRIBUTING.md → Contribution model. Docs and small fixes don't need one. -->
 
 ## Type of change
 

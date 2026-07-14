@@ -4,6 +4,9 @@ export default defineConfig({
   test: {
     include: ['src/**/*.{test,spec}.ts', 'test/**/*.{test,spec}.ts'],
     exclude: ['test/dev-e2e/**', 'test/e2e/**', 'node_modules/**', 'dist/**'],
+    // Strip real TESTSPRITE_* env vars and redirect the home dir so results
+    // never depend on the developer's shell or ~/.testsprite (see the file).
+    setupFiles: ['./test/helpers/hermetic-env.ts'],
     // Subprocess/snapshot suites each run `npm run build` in beforeAll; parallel
     // file workers can race on dist/ and produce a stale binary (exit 1 vs 5 flakes).
     fileParallelism: false,

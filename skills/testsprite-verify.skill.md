@@ -165,6 +165,39 @@ only the Python **standard library + `requests` + `pytest` + `numpy` + `scipy`**
 - Get values from the API's responses (and captured variables), not by importing and
   calling the app's internals.
 
+**Authentication — read the injected credential, NEVER hardcode any credential.** This
+applies to **every** secret the API needs — Bearer/JWT tokens **and** API keys, basic-auth
+blobs, session cookies. Do not paste a literal `Bearer …`, `sk-…`, `x-api-key` value, or any
+other credential into the test. Before your script runs, TestSprite prepends a managed
+credential block built from the project's Authentication settings, and `__AUTH_HEADERS__`
+already contains the right header(s) for the configured auth type:
+
+```python
+# Auto-injected credentials — do not modify
+__AUTH_CREDENTIAL__ = "..."
+__AUTH_TYPE__       = "Bearer token"            # or "API key" / "basic token" / "public"
+__AUTH_HEADERS__    = {"Authorization": "Bearer ..."}   # API key → {"X-API-Key": "..."}; basic → {"Authorization": "Basic ..."}
+```
+
+Spread `__AUTH_HEADERS__` into every authenticated request — it adapts to whatever auth type
+the project is configured for, so the same line works for Bearer, API-key, or basic auth:
+
+```python
+r = requests.get(f"{TARGET_URL}/profile", headers={**__AUTH_HEADERS__})
+```
+
+Configure the credential **once on the project** (ask the user for the value — never invent
+or reuse a key you happened to see), and the block stays correct + refreshable:
+
+- **Bearer / API key / basic (static):**
+  `testsprite project credential <projectId> --type "Bearer token"|"API key"|"basic token" --credential <value>`
+- **Auto-refreshing login (recurring token):** `testsprite project auto-auth <projectId> …`
+
+A hardcoded token expires within hours (and a hardcoded key can't be rotated centrally), so
+the test breaks on later runs; the managed block is rewritten with a fresh value each run.
+`test create` emits a `[warn]` when it detects an inlined credential literal — treat that as
+a must-fix, not a nuisance.
+
 **Backend tests that share state declare dependencies at create time.** For a
 one-off verification, prefer a single self-contained script (log in inside the
 same file). But when the coverage set splits naturally into producer → consumer

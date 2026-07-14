@@ -199,8 +199,14 @@ describe('runInit — happy path (interactive)', () => {
     const stdout = captured.stdout.join('\n');
     expect(stdout).toContain('TestSprite initialized.');
     expect(stdout).toContain('profile:');
+    // Next steps leads with creating a project; no command that fails without --project.
     expect(stdout).toContain('Next steps:');
-    expect(stdout).toContain('testsprite test list');
+    expect(stdout).toContain('testsprite project create --type frontend');
+    expect(stdout).toContain('testsprite test run --all --project <projectId>');
+    expect(stdout).toContain('the testsprite-onboard skill is installed');
+    // No "current project" wording, no bare test list.
+    expect(stdout).not.toContain('current project');
+    expect(stdout).not.toContain('testsprite test list');
   });
 
   it('json mode: emits structured InitSummary object', async () => {
@@ -306,6 +312,15 @@ describe('runInit — --no-agent', () => {
 
     const stdout = captured.stdout.join('\n');
     expect(stdout).toContain('skipped (--no-agent)');
+    // --no-agent points at manual test creation; must not claim the skill is installed.
+    expect(stdout).toContain('Next steps:');
+    expect(stdout).toContain('testsprite project create --type frontend');
+    expect(stdout).toContain('testsprite test create --project <projectId>');
+    expect(stdout).toContain('testsprite test run --all --project <projectId>');
+    expect(stdout).not.toContain('skill is installed');
+    // No "current project" wording, no bare test list.
+    expect(stdout).not.toContain('current project');
+    expect(stdout).not.toContain('testsprite test list');
   });
 
   it('text mode with agent: summary contains skills line with both default skills', async () => {
@@ -540,6 +555,36 @@ describe('runInit — codex-review hardening', () => {
       isTTY: false,
     });
     expect(fetchImpl).toHaveBeenCalled();
+  });
+
+  it('rejects malformed --endpoint-url before setup key verification', async () => {
+    const { captured, deps } = makeCapture();
+    const fetchImpl = makeOkFetch();
+
+    await expect(
+      runInit(
+        makeBaseOpts({
+          fromEnv: true,
+          endpointUrl: 'not-a-url',
+          noAgent: true,
+          output: 'json',
+        }),
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk' },
+          fetchImpl,
+          credentialsPath,
+          isTTY: false,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'endpoint-url' },
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(captured.stderr.join('\n')).not.toContain('API key rejected');
   });
 
   it('whoami banner uses --api-key, not a stale TESTSPRITE_API_KEY in env (E2E 2026-06-09)', async () => {

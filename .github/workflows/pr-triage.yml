@@ -1,0 +1,189 @@
+# PR-side twin of issue-triage.yml (InsForge `agent-zhang-beihai` pattern, part 2).
+# Enforces the issue-first workflow on community PRs: every non-docs PR must
+# carry a closing link ("Closes #123") to an issue that is ASSIGNED to the PR
+# author (claimed via `/assign`, which issue-triage.yml handles). Violations
+# get a `needs-issue` label + a sticky comment, and — for PRs opened after
+# GATE_SINCE — a failing check, so unclaimed work is visibly not review-ready.
+# PRs opened before GATE_SINCE are grandfathered: nudge only, never a red check.
+#
+# Assignment happens on the ISSUE, so it cannot re-trigger this PR workflow;
+# the comment tells the contributor to edit the PR description or push a
+# commit (`edited` / `synchronize`) to re-run the gate.
+#
+# Runs with NO checkout — metadata-only, so it is safe under pull_request_target
+# (which is required for fork PRs to get a write-capable token).
+#
+# Bot identity: posts as `testsprite-hob[bot]` when the App token works. The
+# App currently has Issues R/W + Metadata only — commenting/labeling a PULL
+# REQUEST needs the "Pull requests: Read & write" App permission (issues-API
+# endpoints are permission-checked by target type). Until an org admin adds
+# that permission and re-approves the installation, every call gracefully falls
+# back to the default GITHUB_TOKEN and posts as github-actions[bot].
+# Secrets: TESTSPRITE_HOB_* preferred; the ALFHEIM_AGENT_* fallbacks are the
+# original names from before the App was renamed (same App ID + key).
+name: PR triage (issue-link gate)
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  pull-requests: write # add/remove the needs-issue label
+  issues: write # create/update the nudge comment (PR comments ride the issues API)
+
+env:
+  LABEL: 'needs-issue'
+  MARKER: '<!-- hob:needs-issue -->'
+  # PRs created before this instant are grandfathered (nudge, no failing check).
+  GATE_SINCE: '2026-07-04T00:00:00Z'
+
+jobs:
+  gate:
+    # Public repo only — this file also lives in the private mirror, where PRs
+    # are internal work that never links public issues. Skip bot authors
+    # (dependabot etc.), maintainers, and docs-only changes (CONTRIBUTING
+    # exempts docs/small fixes from the issue-first ask).
+    if: >-
+      github.repository == 'TestSprite/testsprite-cli' &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.user.type != 'Bot' &&
+      !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      !startsWith(github.event.pull_request.title, 'docs')
+    runs-on: ubuntu-latest
+    steps:
+      # Mint an App token so actions post as testsprite-hob[bot]. Until the App +
+      # secrets + Pull-requests permission exist this no-ops / gets 403 and the
+      # script below falls back to the default token per-call.
+      - id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.TESTSPRITE_HOB_APP_ID || secrets.ALFHEIM_AGENT_APP_ID }}
+          private-key: ${{ secrets.TESTSPRITE_HOB_PRIVATE_KEY || secrets.ALFHEIM_AGENT_PRIVATE_KEY }}
+
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.0.1
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        with:
+          # `github` client = default GITHUB_TOKEN: used for all reads (the App
+          # can't read PRs without the Pull-requests permission) and as the
+          # write fallback. App client (when mintable) is preferred for writes.
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const label = process.env.LABEL;
+            const marker = process.env.MARKER;
+            const author = pr.user.login;
+
+            const appClient = process.env.APP_TOKEN
+              ? require('@actions/github').getOctokit(process.env.APP_TOKEN)
+              : null;
+            // Prefer the App identity; fall back to github-actions[bot] when the
+            // App is absent or lacks the Pull-requests permission (403/404).
+            async function write(fn) {
+              if (appClient) {
+                try { return await fn(appClient.rest); }
+                catch (e) { if (e.status !== 403 && e.status !== 404) throw e; }
+              }
+              return await fn(github.rest);
+            }
+
+            // Linked issues: GitHub-computed closing references carry number +
+            // assignees in one query.
+            const gql = await github.graphql(
+              `query($owner:String!,$repo:String!,$num:Int!){
+                repository(owner:$owner,name:$repo){
+                  pullRequest(number:$num){
+                    closingIssuesReferences(first:10){
+                      nodes{ number assignees(first:10){ nodes{ login } } }
+                    }
+                  }
+                }
+              }`, { owner, repo, num: pr.number });
+            const linkedIssues = gql.repository.pullRequest.closingIssuesReferences.nodes
+              .map(n => ({ number: n.number, assignees: n.assignees.nodes.map(a => a.login) }));
+
+            // Body-text fallback for the brief window before GitHub computes the
+            // link (same-repo bare "#N" references only).
+            const bodyRefs = [...(pr.body || '')
+              .matchAll(/(close[sd]?|fix(e[sd])?|resolve[sd]?)\s*:?\s+#(\d+)/gi)]
+              .map(m => Number(m[3]))
+              .filter(n => !linkedIssues.some(i => i.number === n))
+              .slice(0, 5);
+            for (const num of bodyRefs) {
+              try {
+                const { data } = await github.rest.issues.get({ owner, repo, issue_number: num });
+                if (data.pull_request) continue; // "#N" pointed at a PR, not an issue
+                linkedIssues.push({ number: num, assignees: (data.assignees || []).map(a => a.login) });
+              } catch (e) { /* unknown number — ignore */ }
+            }
+
+            const linked = linkedIssues.length > 0;
+            const assignedToAuthor = linkedIssues.some(i => i.assignees.includes(author));
+            const state = assignedToAuthor ? 'ok' : (linked ? 'unassigned' : 'unlinked');
+
+            const hasLabel = (pr.labels || []).some(l => l.name === label);
+            const comments = await github.paginate(github.rest.issues.listComments,
+              { owner, repo, issue_number: pr.number, per_page: 100 });
+            const nudge = comments.find(c => (c.body || '').includes(marker));
+            const stateLine = `<!-- hob:state:${state} -->`;
+
+            const contributingUrl =
+              `https://github.com/${owner}/${repo}/blob/main/CONTRIBUTING.md#contribution-model`;
+            const rerunHint = 'After fixing it, edit the PR description or push a commit to re-run this check.';
+
+            let body;
+            if (state === 'ok') {
+              body = `${marker}\n${stateLine}\n`
+                + `✅ This PR is linked to an issue assigned to @${author} — thanks! `
+                + `The \`${label}\` label has been removed.`;
+            } else if (state === 'unassigned') {
+              const list = linkedIssues.map(i => {
+                const holders = i.assignees.filter(a => a !== author);
+                return `#${i.number}` + (holders.length ? ` (currently assigned to @${holders.join(', @')})` : ' (unassigned)');
+              }).join(', ');
+              body = `${marker}\n${stateLine}\n`
+                + `Thanks for the PR, @${author}! It links an issue, but that issue isn't assigned to you yet: ${list}. `
+                + `Per our workflow, **claim the issue first by commenting \`/assign\` on it** (the triage bot assigns you automatically). `
+                + `If it's already assigned to someone else, please coordinate with them or pick another issue — `
+                + `unclaimed-issue PRs are not reviewed. ${rerunHint} `
+                + `See [CONTRIBUTING → Contribution model](${contributingUrl}).`;
+            } else {
+              body = `${marker}\n${stateLine}\n`
+                + `Thanks for the PR, @${author}! A quick note on our workflow: for **features and behavior changes** `
+                + `we require contributors to **open an issue first, claim it by commenting \`/assign\` on the issue, `
+                + `then submit a PR that links it** (e.g. \`Closes #123\`). This PR isn't linked to any issue yet, `
+                + `so it is not review-ready. ${rerunHint} `
+                + `See [CONTRIBUTING → Contribution model](${contributingUrl}).`;
+            }
+
+            // Sticky comment: create once, update when the state changes.
+            if (!nudge) {
+              if (state !== 'ok') {
+                await write(rest => rest.issues.createComment(
+                  { owner, repo, issue_number: pr.number, body }));
+              }
+            } else if (!nudge.body.includes(stateLine)) {
+              await write(rest => rest.issues.updateComment(
+                { owner, repo, comment_id: nudge.id, body }));
+            }
+
+            // Label tracks the gate state.
+            if (state === 'ok' && hasLabel) {
+              await write(rest => rest.issues.removeLabel(
+                { owner, repo, issue_number: pr.number, name: label })).catch(() => {});
+            }
+            if (state !== 'ok' && !hasLabel) {
+              await write(rest => rest.issues.addLabels(
+                { owner, repo, issue_number: pr.number, labels: [label] }));
+            }
+
+            // Hard gate for PRs opened after the cutoff; older PRs are nudged only.
+            const gated = new Date(pr.created_at) >= new Date(process.env.GATE_SINCE);
+            if (state !== 'ok' && gated) {
+              core.setFailed(state === 'unlinked'
+                ? 'No closing-linked issue. Open/claim an issue, add "Closes #<n>" to the PR description, then re-run.'
+                : 'Linked issue is not assigned to the PR author. Comment /assign on the issue, then re-run.');
+            } else if (state !== 'ok') {
+              core.notice(`Grandfathered PR (opened before ${process.env.GATE_SINCE}): gate not enforced, nudge only.`);
+            }

@@ -20,13 +20,53 @@ Discussions**, so the issue tracker stays a clean, actionable list.
 
 ## Contribution model
 
-- **Small fixes and improvements:** just open a pull request. No issue required.
-- **Large or breaking changes** (new commands, changed flags/output, new
-  dependencies, refactors): **open an issue first** to discuss the design. This
-  avoids wasted work on something we'd ask you to rework or that's out of scope.
+- **Docs and small fixes** (typos, doc corrections, comment-only changes):
+  just open a pull request. No issue required (linking one is still
+  appreciated).
+- **Features and behavior changes** (new commands or flags, changed output,
+  new dependencies, refactors) follow **issue-first**:
+  1. Find an existing issue, or open a new one describing the change.
+  2. Claim it by commenting `/assign` on the issue — the literal slash
+     command on its own line. The triage bot assigns you automatically;
+     free-text requests ("can I take this?") are **not** detected.
+  3. If the issue is new, wait for triage — we check proposals against
+     [VISION.md](./VISION.md) and the [standing policies](#standing-scope-policies)
+     below before any code is written, so you don't invest in something
+     we'd ask you to rework or decline.
+  4. Open your PR with a closing link (e.g. `Closes #123`) in the
+     description.
+- **PR gate:** a bot checks every non-docs community PR for a closing-linked
+  issue that is **assigned to the PR author**. PRs that don't meet this get
+  the `needs-issue` label and a failing `PR triage` check, and **are not
+  reviewed** until it's fixed — file or claim the issue, add the closing
+  link, then edit the PR description (or push a commit) to re-run the check.
+- Suspected **security vulnerabilities** are the exception to "file an
+  issue": report them privately per [SECURITY.md](./SECURITY.md) instead.
 - We **do** accept community code contributions — this is an actively maintained
   open-source CLI, not a read-only distribution mirror.
 - See [VISION.md](./VISION.md) for what is in and out of scope.
+
+### Standing scope policies
+
+Pre-decided policies, so proposals don't have to relitigate them:
+
+- **Runtime dependencies are budgeted.** The CLI ships with a deliberately
+  tiny runtime dependency set (`commander`, `valibot`, plus `undici` —
+  approved for `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` support). Any new
+  runtime dependency needs explicit maintainer sign-off **in the issue,
+  before the PR**. Utility modules land only together with the consumer
+  that uses them — standalone libraries are declined.
+- **`agent install` targets.** Shipped: `claude`, `antigravity`, `cursor`,
+  `cline`, `codex`, `kiro`, `windsurf`, `copilot`. Accepted and in progress:
+  `gemini`.
+  A proposal for a new target needs (1) the editor's official rules/skill
+  file mechanism, documented, and (2) the proposer prepared to maintain the
+  target going forward.
+- **Outbound network calls.** The CLI talks only to the configured
+  TestSprite API endpoint. The one approved exception is an opt-out-able
+  npm registry version check (at most once per 24h, carrying nothing but
+  the package name, fully silenced by its env opt-out and in CI/JSON/dry-run
+  modes or when stderr is not a TTY). Any other outbound call is out of scope.
 
 We aim to give every issue and PR a **first response within 5 business days**
 (best-effort). If something has gone quiet longer than that, a polite nudge on

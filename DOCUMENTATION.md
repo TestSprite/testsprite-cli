@@ -15,6 +15,7 @@ The full reference for the TestSprite CLI: install verification, manual setup, e
   - [Read commands](#read-commands)
   - [Write commands](#write-commands)
   - [Run commands](#run-commands)
+  - [Account & diagnostics](#account--diagnostics)
 - [Configuration](#configuration)
 - [Output & scripting](#output--scripting)
 - [Exit codes](#exit-codes)
@@ -112,15 +113,23 @@ testsprite agent install claude     # install the skill for Claude Code
 testsprite agent install codex      # install into AGENTS.md for Codex (managed-section)
 testsprite agent install cursor     # .cursor/rules/testsprite-verify.mdc
 testsprite agent install cline      # .clinerules/testsprite-verify.md
+testsprite agent install windsurf   # .windsurf/rules/testsprite-verify.md
 testsprite agent install antigravity  # .agents/skills/testsprite-verify/SKILL.md
-testsprite agent list               # list all 5 targets with status + mode + path
+testsprite agent install kiro       # .kiro/skills/testsprite-verify/SKILL.md
+testsprite agent install copilot    # .github/instructions/testsprite-verify.instructions.md
+testsprite agent list               # list all 8 targets with status + mode + path
+testsprite agent status             # check installed skills against this CLI version
 ```
 
-Supported targets: `claude` (GA), `codex` (experimental), `cursor` (experimental), `cline` (experimental), `antigravity` (experimental).
+Supported targets: `claude` (GA), `codex` (experimental), `cursor` (experimental), `cline` (experimental), `antigravity` (experimental), `kiro` (experimental), `windsurf` (experimental), `copilot` (experimental).
+
+Omitting `--target` in a non-interactive shell (CI, agent subprocess) defaults to `claude` with an `[info]` note on stderr; in a terminal the CLI prompts (empty answer = `claude`).
+
+`agent status` checks every installed skill file against the current CLI version and reports one of `ok`, `stale`, `modified`, `unmarked`, `absent`, or `corrupt` per target. It exits `1` when anything needs attention, so `testsprite agent status && …` can gate a CI step; `--dir <path>` inspects a different project root.
 
 The `codex` target uses **managed-section mode** — it writes only a sentinel-delimited section inside your existing `AGENTS.md`, so your project instructions are never clobbered. Re-running without `--force` replaces the section in-place; user content outside the sentinels is always preserved.
 
-Re-running with `--force` on **own-file targets** (claude, cursor, cline, antigravity) backs up the existing file to `<path>.bak` first.
+Re-running with `--force` on **own-file targets** (claude, cursor, cline, antigravity, kiro, windsurf, copilot) backs up the existing file to `<path>.bak` first.
 
 ## Command reference
 
@@ -217,6 +226,15 @@ testsprite test result test_xxxxxxxx --history --source cli --since 7d --output 
 testsprite test result test_xxxxxxxx --history --dry-run --output json
 ```
 
+#### `testsprite test diff <run-a> <run-b>`
+
+Compare two runs of a test and print what regressed: verdict, `failureKind`, `failedStepIndex`, per-step status flips, and `codeVersion` drift. Exit `0` when the verdicts match, `1` when they differ — so a script can assert "this rerun behaves like the last known-good run" in one call.
+
+```bash
+testsprite test diff run_aaaa run_bbbb --output json
+testsprite test diff run_aaaa run_bbbb --dry-run --output json
+```
+
 #### `testsprite test failure get <test-id>`
 
 The latest-failure agent entry point. Returns one consistent snapshot of the latest failing run as a self-contained bundle: the result, the failed step plus its immediate neighbors with screenshots and DOM snapshots, the test source, a video pointer, a root-cause hypothesis, a recommended fix target, and correlation metadata. For the bundle of a _specific_ run an agent just triggered, prefer `test artifact get <run-id>` — it is keyed by `runId` and cannot be raced by another run that lands afterward.
@@ -250,7 +268,28 @@ testsprite test failure summary test_xxxxxxxx --dry-run --output json
 
 ### Write commands
 
-Require the `write:tests` scope.
+Require the `write:tests` scope (project commands require `write:projects`), except `test scaffold` and `test lint`, which are pure-local authoring helpers — no network, no credentials, no scope.
+
+#### `testsprite test scaffold`
+
+Emit a schema-correct starter test definition — a frontend plan JSON by default, or a backend Python skeleton with `--type backend`. Pure-local: no network, no credentials. Edit the scaffold, then create the test with `--plan-from` / `--code-file`.
+
+```bash
+testsprite test scaffold > first-test.plan.json
+testsprite test scaffold --type backend --out tests/health.py
+testsprite test scaffold --out plan.json --force     # overwrite an existing file
+```
+
+#### `testsprite test lint`
+
+Validate plan/steps files offline with the same validators `test create` runs, collecting **every** problem instead of stopping at the first. No network, no credentials. Exit `0` when all inputs are valid, `5` otherwise.
+
+```bash
+testsprite test lint --plan-from ./checkout.plan.json
+testsprite test lint --plan-from-dir ./plans/          # every *.json checked, all errors reported
+testsprite test lint --plans ./plans.jsonl             # one plan spec per line
+testsprite test lint --steps ./refined.plan.json       # the shape `test plan put` ingests
+```
 
 #### `testsprite test create`
 
@@ -289,7 +328,7 @@ testsprite test update test_xxxxxxxx --dry-run --output json
 
 #### `testsprite test delete <test-id>` / `test delete-batch`
 
-Soft-delete one test (or many). `--confirm` is required; absent it, the CLI exits 5 with a local validation error.
+Permanently delete one test (or many) — there is **no restore window**. `--confirm` is required; absent it, the CLI exits 5 with a local validation error.
 
 ```bash
 testsprite test delete test_xxxxxxxx --confirm
@@ -319,12 +358,56 @@ testsprite test plan put test_xxxxxxxx --steps ./refined.plan.json --dry-run --o
 
 #### `testsprite project create` / `project update`
 
-Manage projects from the CLI. Both pre-flight `--url` against local addresses for fast feedback.
+Manage projects from the CLI. Both pre-flight `--url` against local addresses for fast feedback. Note the asymmetry: `--description` is **create-only** — `project update` accepts `--name`, `--url`, `--username`, `--password`, `--password-file`, and `--instruction`, but not `--description`.
 
 ```bash
 testsprite project create --type frontend --name "Checkout" --url https://staging.example.com
 testsprite project update proj_xxxxxxxx --name "Checkout v2"
 ```
+
+#### `testsprite project credential <project-id>`
+
+Set the **static backend credential** injected into every backend test in the project (free tier). Supported types: `public` (no credential), `"Bearer token"`, `"API key"`, `"basic token"`.
+
+```bash
+testsprite project credential proj_xxxxxxxx --type "Bearer token" --credential-file ./token.txt
+testsprite project credential proj_xxxxxxxx --type public
+testsprite project credential proj_xxxxxxxx --type "API key" --credential sk-live-... --dry-run --output json
+```
+
+`--credential <value>` or `--credential-file <path>` supplies the value (required unless `--type public`). Prefer `--credential-file` in scripts so the secret never lands in shell history.
+
+#### `testsprite project auto-auth <project-id>`
+
+Configure the **recurring-token (auto-refresh) login** for backend tests (Pro): a fresh token is fetched on each run and injected into every backend test, so long-lived suites survive token expiry.
+
+```bash
+# Password login: POST the login endpoint, extract the token, inject as a Bearer header
+testsprite project auto-auth proj_xxxxxxxx \
+  --method password --inject bearer \
+  --login-url https://api.example.com/login --login-method POST \
+  --login-content-type application/json \
+  --login-body-template '{"user":"{{username}}","pass":"{{password}}"}' \
+  --username ci@example.com --password-file ./pw.txt \
+  --token-path '$.data.accessToken'
+
+# OAuth refresh-token flow
+testsprite project auto-auth proj_xxxxxxxx \
+  --method refresh_token --inject header --inject-key X-Auth-Token \
+  --token-endpoint https://auth.example.com/oauth/token \
+  --client-id my-client --client-secret-file ./secret.txt \
+  --refresh-token-file ./refresh.txt --scope api.read
+
+# AWS Cognito refresh
+testsprite project auto-auth proj_xxxxxxxx \
+  --method aws_cognito_refresh --inject bearer \
+  --client-id my-app-client --refresh-token-file ./refresh.txt --region us-east-1
+
+# Turn it off (stored config is kept)
+testsprite project auto-auth proj_xxxxxxxx --disable
+```
+
+Required flags: `--method <password|refresh_token|aws_cognito_refresh>` and `--inject <bearer|header|cookie>` (`--inject-key <name>` names the header/cookie when not `bearer`). Method-specific flags: password login uses `--login-url/--login-method/--login-content-type/--login-body-template/--username/--password[-file]/--token-path`; OAuth uses `--token-endpoint/--client-id/--client-secret[-file]/--refresh-token[-file]/--scope`; Cognito adds `--region`. File variants (`--password-file`, `--client-secret-file`, `--refresh-token-file`) keep secrets out of shell history.
 
 ### Run commands
 
@@ -332,7 +415,9 @@ Require the `run:tests` scope.
 
 #### `testsprite test run <test-id>`
 
-Trigger a run for a test. Without `--wait`, prints `{ runId, status: "queued", enqueuedAt, codeVersion, targetUrl }` and exits 0. With `--wait`, polls until terminal — exit 0 on `passed`, exit 1 on `failed | blocked | cancelled`, exit 7 on `--timeout` (with a `nextAction` pointing at `test wait <run-id>` so an agent can resume).
+Trigger a run for a test. Without `--wait`, prints `{ runId, status: "queued", enqueuedAt, codeVersion, targetUrl }` and exits 0. With `--wait`, polls until terminal — exit 0 on `passed`, exit 1 on `failed | blocked | cancelled`, exit 7 on `--timeout`. On a timeout the CLI still prints the partial run object (with `runId`) to stdout **before** exiting 7, plus a `nextAction` pointing at `test wait <run-id>` — so a script always has the id to resume with, and stdout is never empty.
+
+`--all --project <id>` runs every test in the project in wave order. On the current unified engine that means **all tests, frontend and backend**; on the legacy backend-only engine, frontend tests can't run — they are skipped and enumerated in `skippedFrontend` with a stderr advisory.
 
 ```bash
 # Trigger and return immediately
@@ -344,7 +429,17 @@ testsprite test run test_xxxxxxxx --target-url https://staging.example.com \
 
 # Dry-run prints a canned queued response (no network, no credentials)
 testsprite test run test_xxxxxxxx --dry-run --output json
+
+# Batch run with JUnit XML for CI (sidecar; --output json unchanged)
+testsprite test run --all --project proj_xxxxxxxx --wait \
+  --report junit --report-file ./results.xml --output json
+
+# Optional custom suite name (default: testsprite:<projectId>)
+testsprite test run --all --project proj_xxxxxxxx --wait \
+  --report junit --report-file ./results.xml --report-suite-name my-ci-suite --output json
 ```
+
+Batch `--report` flags apply only to `test run --all --wait` (and batch `test rerun --wait`). `--report junit --report-file <path>` writes a JUnit XML sidecar after polling completes (atomic write); `--output json` is unchanged. Optional `--report-suite-name <name>` overrides the default `testsprite:<projectId>` suite name.
 
 `--target-url` must be a publicly reachable URL — the CLI pre-flights it against local addresses (`localhost`, `127.x`, `::1`, `0.0.0.0`, `169.254.x`, RFC1918) and the backend resolves it via DNS. For testing against localhost, use the [TestSprite MCP plugin](https://www.testsprite.com/docs), which handles the local tunnel. The CLI auto-mints an idempotency key (printed to stderr under `--output json`, `--verbose`, or `--debug`); pass `--idempotency-key <uuid>` to control it explicitly.
 
@@ -365,9 +460,19 @@ testsprite test rerun test_be_xxxx --skip-dependencies --output json
 # Rerun every test in a project (batch)
 testsprite test rerun --all --project proj_xxxxxxxx --wait --max-concurrency 4 --output json
 
+# Batch rerun with JUnit XML for CI
+testsprite test rerun --all --project proj_xxxxxxxx --wait \
+  --report junit --report-file ./results.xml --output json
+
+# Optional custom suite name (default: testsprite:<projectId>)
+testsprite test rerun --all --project proj_xxxxxxxx --wait \
+  --report junit --report-file ./results.xml --report-suite-name my-ci-suite --output json
+
 # Several specific tests
 testsprite test rerun test_aaaa test_bbbb --wait --output json
 ```
+
+Batch `--report` flags apply only to batch `--wait` reruns (`--all` or multiple test ids). `--report junit --report-file <path>` writes a JUnit XML sidecar after polling completes (atomic write); `--output json` is unchanged. When `--project` is omitted, the CLI infers `projectId` from polled run rows for classname / default suite naming; if inference fails, pass `--project <id>` explicitly (required under `--dry-run`).
 
 Flags:
 
@@ -377,19 +482,44 @@ Flags:
 - `--skip-dependencies` — backend only: rerun just the named test without expanding the producer/teardown closure.
 - `--max-concurrency <n>` — with `--wait`, cap on in-flight polls during a batch rerun.
 - `--idempotency-key <key>` — auto-minted when omitted (the minted key is printed to stderr under `--output json`, `--verbose`, or `--debug`).
+- `--report junit --report-file <path>` — with batch `--wait`, write a JUnit XML sidecar after polling (atomic write). Optional `--report-suite-name <name>` overrides the default `testsprite:<projectId>` suite name. Requires `--wait`; not available on single-test reruns.
 
 A batch rerun returns `accepted[]` (one `runId` per dispatched test) plus `deferred[]` for any test shed by the per-key run-rate limit; under `--wait`, a non-empty `deferred[]` exits 7 with a `nextAction` you can retry with a fresh idempotency key.
 
-#### `testsprite test wait <run-id>`
+#### `testsprite test flaky <test-id>`
 
-Block until a run reaches a terminal status. Same exit-code matrix as `test run --wait`. Used to resume polling after a timed-out `test run --wait`, or when an agent already has a `runId` from a previous invocation.
+Detect a **flaky** test by replaying it several times and reporting how often it passes. Each attempt is a rerun with auto-heal **off** (a strict verbatim replay), so healed drift can't disguise a nondeterministic pass/fail — this measures the replay stability of the saved script against the configured URL. Frontend replays are free verbatim script replays; backend tests re-run their dependency closure and may cost credits (a one-line stderr advisory is printed before the run).
+
+```bash
+# Replay 10 times and print a stability score
+testsprite test flaky test_xxxxxxxx --runs 10
+
+# Fast "is it flaky at all?" — stop at the first non-passing attempt
+testsprite test flaky test_xxxxxxxx --runs 10 --until-fail
+
+# Machine-readable stability report for CI
+testsprite test flaky test_xxxxxxxx --runs 10 --output json
+```
+
+Flags:
+
+- `--runs <n>` — number of replays (1–10, default 5).
+- `--until-fail` — stop at the first attempt that does not pass.
+- `--timeout <s>` — per-attempt polling deadline (same semantics as `test wait`).
+
+`--output json` emits `{ testId, runs, passed, failed, stableRatio, verdict, failures: [{ attempt, runId, outcome, failureKind }] }`. Exit codes: **0** when every observed attempt passed (`stable`); **1** when any attempt did not pass (`flaky` or `failing`); **4** when the test has no replayable run (trigger `testsprite test run <id>` first); **5** on a validation error.
+
+#### `testsprite test wait <run-id...>`
+
+Block until one **or more** runs reach a terminal status. With a single `run-id` the behavior is unchanged: same exit-code matrix as `test run --wait`. With several ids, the runs are polled concurrently under one shared `--timeout` and the CLI prints a `{ results, summary }` envelope — the worst status wins the exit code — so every re-attach hint the CLI prints can be pasted back as one command. `--max-concurrency <n>` (1–100, default 10) caps concurrent polls. Used to resume polling after a timed-out `--wait`, or when an agent already holds `runId`s from previous invocations.
 
 ```bash
 testsprite test wait run_01hx3z9p8q4k2y7a --timeout 600 --output json
+testsprite test wait run_aaaa run_bbbb run_cccc --timeout 900 --output json
 testsprite test wait run_01hx3z9p8q4k2y7a --dry-run --output json
 ```
 
-Polling is handled automatically — the CLI uses server-driven long-poll where supported and exponential backoff with jitter otherwise, honoring `Retry-After`.
+With several ids, a per-member poll error (e.g. one id not found) is recorded as `error:<CODE>` in that run's row and folded into exit 7, rather than aborting the whole batch. Polling is handled automatically — the CLI uses server-driven long-poll where supported and exponential backoff with jitter otherwise, honoring `Retry-After`.
 
 #### `testsprite test artifact get <run-id>`
 
@@ -403,6 +533,30 @@ testsprite test artifact get run_01hx3z9p8q4k2y7a --dry-run --output json
 ```
 
 Returns 404 (CLI exit 4) when the run passed (`details.reason: "no_failing_run"`), is still in flight (`run_not_ready`), was cancelled (`cancelled_no_artifacts`), or its test was deleted (`no_code`).
+
+### Account & diagnostics
+
+#### `testsprite usage` (alias: `testsprite credits`)
+
+Account pre-flight before a large batch: resolves the active key to its identity (`userId`, `keyId`, `env`) and surfaces the credit balance / plan fields when the backend supplies them. Useful right before a `test run --all` fan-out.
+
+```bash
+testsprite usage --output json
+testsprite credits
+testsprite usage --dry-run --output json
+```
+
+#### `testsprite doctor`
+
+One-shot environment diagnostic. Runs a fixed checklist — CLI version, Node.js runtime, active profile, API endpoint, credentials, live connectivity + key validity (`GET /me`), and whether the verify skill is installed in the current project — and prints an OK/WARN/FAIL report. Exits non-zero only when a check **fails** (warnings, e.g. skill not installed, don't fail the process), so it can gate a CI step or an agent preflight:
+
+```bash
+testsprite doctor
+testsprite doctor --output json
+testsprite doctor && testsprite test run test_xxxxxxxx --wait
+```
+
+Every check reuses the same helpers the real commands use, so the report reflects exactly what a subsequent command would resolve.
 
 ## Configuration
 
@@ -426,24 +580,41 @@ These apply to every command:
 
 ### Environment variables
 
-| Variable                        | Purpose                                                                           |
-| ------------------------------- | --------------------------------------------------------------------------------- |
-| `TESTSPRITE_API_KEY`            | API key — overrides the credentials file                                          |
-| `TESTSPRITE_API_URL`            | API endpoint — overrides the credentials file                                     |
-| `TESTSPRITE_PROFILE`            | Active profile (below `--profile`, above `default`)                               |
-| `TESTSPRITE_REQUEST_TIMEOUT_MS` | Per-request timeout in **milliseconds** (default `120000`, range `1000`–`600000`) |
+| Variable                                  | Purpose                                                                                  |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `TESTSPRITE_API_KEY`                      | API key — overrides the credentials file                                                 |
+| `TESTSPRITE_API_URL`                      | API endpoint — overrides the credentials file                                            |
+| `TESTSPRITE_PROFILE`                      | Active profile (below `--profile`, above `default`)                                      |
+| `TESTSPRITE_REQUEST_TIMEOUT_MS`           | Per-request timeout in **milliseconds** (default `120000`, range `1000`–`600000`)        |
+| `TESTSPRITE_NO_UPDATE_NOTIFIER`           | Any non-empty value disables the once-per-24h "new version available" notice             |
+| `NO_COLOR`                                | Suppress ANSI escape sequences in ticker output ([no-color.org](https://no-color.org/))  |
+| `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` | Standard proxy support — API traffic is routed through the configured proxy              |
+| `TESTSPRITE_NO_SKILL_WARNING`             | Any non-empty value silences the "verify skill not installed" reminder (CI / manual use) |
+| `TESTSPRITE_PORTAL_URL`                   | Override the Portal origin used for `dashboardUrl` links (non-prod environments)         |
+
+### Update notice
+
+Interactive runs print a one-line "new version available" notice on stderr when
+a newer release exists. To learn this, the CLI contacts the public npm registry
+(`registry.npmjs.org`) at most once per 24 hours; the request carries the
+package name only — never your API key, project data, or command line. The
+check is skipped in CI, when stderr is not a TTY, under `--output json` /
+`--dry-run`, and entirely when `TESTSPRITE_NO_UPDATE_NOTIFIER` is set. Any
+failure is silent: the notice can never break or delay a command. This is the
+only outbound call the CLI makes besides your configured API endpoint.
 
 ### Scopes
 
 API-key scopes gate the write and run surfaces:
 
-| Scope           | Required by                                                          |
-| --------------- | -------------------------------------------------------------------- |
-| `read:me`       | `auth whoami`                                                        |
-| `read:projects` | `project list / get`                                                 |
-| `read:tests`    | every `test *` read command                                          |
-| `write:tests`   | `test create / create-batch / update / delete / code put / plan put` |
-| `run:tests`     | `test run / rerun / wait / artifact get`                             |
+| Scope            | Required by                                                          |
+| ---------------- | -------------------------------------------------------------------- |
+| `read:me`        | `auth status`, `usage`, `doctor` (connectivity check)                |
+| `read:projects`  | `project list / get`                                                 |
+| `read:tests`     | every `test *` read command                                          |
+| `write:tests`    | `test create / create-batch / update / delete / code put / plan put` |
+| `write:projects` | `project create / update / credential / auto-auth`                   |
+| `run:tests`      | `test run / rerun / flaky / wait / artifact get`                     |
 
 New API keys include the full scope set. If a command returns `AUTH_FORBIDDEN`, the missing scope is named in `details.requiredScope` — regenerate your key from the dashboard to pick up new scopes.
 
@@ -461,20 +632,25 @@ testsprite test wait "$RUN_ID" --timeout 600 --output json || echo "run did not 
 
 ## Exit codes
 
-| Code | Meaning                                 |
-| ---- | --------------------------------------- |
-| `0`  | Success                                 |
-| `1`  | Generic failure / non-passed run status |
-| `2`  | Not yet implemented                     |
-| `3`  | Auth error                              |
-| `4`  | Not found                               |
-| `5`  | Validation error / payload too large    |
-| `6`  | Conflict / precondition failed          |
-| `7`  | Timeout / unsupported                   |
-| `10` | Service unavailable                     |
-| `11` | Rate limited (retriable)                |
-| `12` | Insufficient credits (non-retriable)    |
-| `13` | Feature gated (paid plan required)      |
+| Code                  | Meaning                                                                     |
+| --------------------- | --------------------------------------------------------------------------- |
+| `0`                   | Success                                                                     |
+| `1`                   | Generic failure / non-passed run status                                     |
+| `2`                   | Not yet implemented                                                         |
+| `3`                   | Auth error                                                                  |
+| `4`                   | Not found                                                                   |
+| `5`                   | Validation error / payload too large                                        |
+| `6`                   | Conflict / precondition failed                                              |
+| `7`                   | Timeout / unsupported                                                       |
+| `10`                  | Service unavailable                                                         |
+| `11`                  | Rate limited (retriable)                                                    |
+| `12`                  | Insufficient credits (non-retriable)                                        |
+| `13`                  | Feature gated (paid plan required)                                          |
+| `129` / `130` / `143` | Interrupted by a signal (SIGHUP / SIGINT / SIGTERM) — `128 + signal number` |
+
+### Signals & pipes
+
+On SIGINT (Ctrl-C), SIGTERM, or SIGHUP the CLI prints `Interrupted (<signal>). Any run already started keeps executing on the server; check it with 'testsprite test list' or 'testsprite test wait <run-id>'.` and exits `128 + signal`. **Ctrl-C does not cancel the server-side run** — execution (and any credit spend) continues; there is no cancel command today, so re-attach with `test wait <run-id>` instead of re-triggering. A closed stdout pipe (`EPIPE`, e.g. `testsprite test list | head`) exits `0` silently rather than crashing.
 
 ## Design principles
 

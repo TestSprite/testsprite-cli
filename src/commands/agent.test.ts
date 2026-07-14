@@ -9,13 +9,21 @@ import {
   MANAGED_SECTION_END,
   ONBOARD_CODEX_LINE,
   SKILLS,
+  buildSkillMarker,
   pathFor,
   renderForTarget,
+  renderOwnFileWithMarker,
   TARGETS,
   type AgentTarget,
 } from '../lib/agent-targets.js';
-import type { AgentDeps, AgentFs, InstallResult, ListResult } from './agent.js';
-import { AGENTS_MD_CODEX_BUDGET_BYTES, createAgentCommand, runInstall, runList } from './agent.js';
+import type { AgentDeps, AgentFs, InstallResult, ListResult, StatusResult } from './agent.js';
+import {
+  AGENTS_MD_CODEX_BUDGET_BYTES,
+  createAgentCommand,
+  runInstall,
+  runList,
+  runStatus,
+} from './agent.js';
 
 /** Windows requires Developer Mode or elevation to create symlinks. */
 function canCreateSymlinks(): boolean {
@@ -668,29 +676,39 @@ describe('runInstall — multi-target', () => {
 // ---------------------------------------------------------------------------
 
 describe('runInstall — empty target', () => {
-  it('non-TTY with no target throws exit 5', async () => {
-    const { fs: agentFs } = makeMemFs();
+  it('non-TTY with no target defaults to claude and installs the skill file', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        target: [],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
+    );
+
+    const claudeAbs = path.resolve(CWD, TARGETS.claude.path);
+    expect(store.has(claudeAbs)).toBe(true);
+    expect(capture.stderr.join('\n')).toContain('defaulting to claude');
+  });
+
+  it('non-TTY default writes the canonical claude content', async () => {
+    const { store, fs: agentFs } = makeMemFs();
     const { deps } = makeCapture();
 
-    let thrown: unknown;
-    try {
-      await runInstall(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          dryRun: false,
-          target: [],
-          force: false,
-        },
-        { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
-      );
-    } catch (err) {
-      thrown = err;
-    }
+    await runInstall(
+      { profile: 'default', output: 'text', debug: false, dryRun: false, target: [], force: false },
+      { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
+    );
 
-    expect(thrown).toBeInstanceOf(ApiError);
-    expect((thrown as ApiError).exitCode).toBe(5);
+    const { path: relPath, content } = renderForTarget('claude', 'testsprite-verify');
+    const abs = path.resolve(CWD, relPath);
+    expect(store.get(abs)).toBe(content);
   });
 
   it('TTY with injected prompt returning "claude" installs claude', async () => {
@@ -756,6 +774,7 @@ describe('runList', () => {
     expect(out).toContain('cursor');
     expect(out).toContain('cline');
     expect(out).toContain('antigravity');
+    expect(out).toContain('kiro');
     expect(out).toContain('codex');
     expect(out).toContain('ga');
     expect(out).toContain('experimental');
@@ -764,6 +783,7 @@ describe('runList', () => {
     expect(out).toContain(TARGETS.cursor.path);
     expect(out).toContain(TARGETS.cline.path);
     expect(out).toContain(TARGETS.antigravity.path);
+    expect(out).toContain(TARGETS.kiro.path);
     expect(out).toContain(TARGETS.codex.path);
   });
 
@@ -774,13 +794,16 @@ describe('runList', () => {
 
     const json = JSON.parse(capture.stdout.join('\n')) as ListResult[];
     expect(Array.isArray(json)).toBe(true);
-    // 5 targets × 2 default skills = 10 rows
-    expect(json).toHaveLength(10);
+    // 8 targets × 2 default skills = 16 rows
+    expect(json).toHaveLength(16);
     const targets = json.map(r => r.target);
     expect(targets).toContain('claude');
     expect(targets).toContain('cursor');
     expect(targets).toContain('cline');
+    expect(targets).toContain('windsurf');
+    expect(targets).toContain('copilot');
     expect(targets).toContain('antigravity');
+    expect(targets).toContain('kiro');
     expect(targets).toContain('codex');
     // skill field present on each row
     const skills = json.map(r => r.skill);
@@ -920,11 +943,11 @@ describe('createAgentCommand wiring', () => {
 });
 
 // ---------------------------------------------------------------------------
-// All four own-file targets installed at once
+// All own-file targets installed at once
 // ---------------------------------------------------------------------------
 
-describe('runInstall — all four own-file targets', () => {
-  it('installs all four own-file targets in one invocation', async () => {
+describe('runInstall — all own-file targets', () => {
+  it('installs every own-file target in one invocation', async () => {
     const { store, fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -934,7 +957,7 @@ describe('runInstall — all four own-file targets', () => {
         output: 'text',
         debug: false,
         dryRun: false,
-        target: ['claude', 'cursor', 'cline', 'antigravity'],
+        target: [...OWN_FILE_TARGETS],
         skills: ['testsprite-verify'],
         force: false,
       },
@@ -952,11 +975,11 @@ describe('runInstall — all four own-file targets', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Dry-run for all four own-file targets
+// Dry-run for all seven own-file targets
 // ---------------------------------------------------------------------------
 
 describe('runInstall — dry-run all own-file targets', () => {
-  it('writes nothing for any of the four own-file targets (default 2 skills = 8 would-write lines)', async () => {
+  it('writes nothing for any of the seven own-file targets (default 2 skills = 14 would-write lines)', async () => {
     const { store, fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -966,7 +989,7 @@ describe('runInstall — dry-run all own-file targets', () => {
         output: 'text',
         debug: false,
         dryRun: true,
-        target: ['claude', 'cursor', 'cline', 'antigravity'],
+        target: ['claude', 'cursor', 'cline', 'antigravity', 'kiro', 'windsurf', 'copilot'],
         force: false,
       },
       { cwd: CWD, fs: agentFs, ...deps },
@@ -976,9 +999,9 @@ describe('runInstall — dry-run all own-file targets', () => {
     const stderrOut = capture.stderr.join('\n');
     // Banner appears once
     expect(stderrOut).toContain('[dry-run] no files written');
-    // 4 targets × 2 default skills = 8 would-write lines
+    // 7 targets × 2 default skills = 14 would-write lines
     const wouldWriteLines = stderrOut.split('\n').filter(l => l.includes('would write'));
-    expect(wouldWriteLines.length).toBe(8);
+    expect(wouldWriteLines.length).toBe(14);
   });
 });
 
@@ -2446,5 +2469,122 @@ describe('runInstall — SKILLS registry / DEFAULT_SKILLS contract', () => {
   it('ONBOARD_CODEX_LINE is the one-liner used in the codex section', () => {
     expect(typeof ONBOARD_CODEX_LINE).toBe('string');
     expect(ONBOARD_CODEX_LINE).toContain('**First-time setup:**');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runStatus — `agent status` (issue #123)
+// ---------------------------------------------------------------------------
+
+describe('runStatus — agent status (issue #123)', () => {
+  const statusOpts = {
+    profile: 'default' as const,
+    output: 'json' as const,
+    debug: false,
+    dryRun: false,
+  };
+
+  /** Run status against the given fs and return the printed rows. */
+  async function statusRows(agentFs: AgentFs): Promise<{ rows: StatusResult[]; thrown: unknown }> {
+    const { capture, deps } = makeCapture();
+    let thrown: unknown;
+    try {
+      await runStatus(statusOpts, { cwd: CWD, fs: agentFs, ...deps });
+    } catch (err) {
+      thrown = err;
+    }
+    return { rows: JSON.parse(capture.stdout.join('')) as StatusResult[], thrown };
+  }
+
+  it('nothing installed: every row is absent and the command exits 0', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(thrown).toBeUndefined();
+    expect(rows).toHaveLength(Object.keys(TARGETS).length * DEFAULT_SKILLS.length);
+    expect(rows.every(row => row.state === 'absent')).toBe(true);
+  });
+
+  it('fresh installs read ok (own-file and codex managed section), exit 0', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+    await runInstall(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        target: ['claude', 'codex'],
+        skills: [...DEFAULT_SKILLS],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(thrown).toBeUndefined();
+    for (const skill of DEFAULT_SKILLS) {
+      expect(rows.find(r => r.target === 'claude' && r.skill === skill)?.state).toBe('ok');
+      expect(rows.find(r => r.target === 'codex' && r.skill === skill)?.state).toBe('ok');
+      expect(rows.find(r => r.target === 'cursor' && r.skill === skill)?.state).toBe('absent');
+    }
+  });
+
+  it('stale: a marker whose hash matches an OLDER body reads stale and exits 1', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const oldBody = '# TestSprite Verification Loop\n\nold body from a previous CLI release\n';
+    seedFile(
+      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
+      renderOwnFileWithMarker(
+        'claude',
+        'testsprite-verify',
+        buildSkillMarker('testsprite-verify', oldBody),
+        oldBody,
+      ),
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(rows.find(r => r.target === 'claude' && r.skill === 'testsprite-verify')?.state).toBe(
+      'stale',
+    );
+    expect(thrown).toBeInstanceOf(CLIError);
+    expect((thrown as CLIError).exitCode).toBe(1);
+    expect((thrown as CLIError).message).toContain('need attention');
+  });
+
+  it('modified: current hash but edited bytes reads modified and exits 1', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const canonical = renderForTarget('claude', 'testsprite-verify').content;
+    seedFile(
+      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
+      `${canonical}\n<!-- my local tweak -->\n`,
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(rows.find(r => r.target === 'claude' && r.skill === 'testsprite-verify')?.state).toBe(
+      'modified',
+    );
+    expect((thrown as CLIError).exitCode).toBe(1);
+  });
+
+  it('unmarked: an artifact without a marker line reads unmarked and exits 1', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    seedFile(
+      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
+      '# hand-rolled skill file with no marker\n',
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(rows.find(r => r.target === 'claude' && r.skill === 'testsprite-verify')?.state).toBe(
+      'unmarked',
+    );
+    expect((thrown as CLIError).exitCode).toBe(1);
+  });
+
+  it('rejects an explicit empty --dir (exit 5), matching the resolve-to-cwd hazard', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+    await expect(
+      runStatus({ ...statusOpts, dir: '   ' }, { cwd: CWD, fs: agentFs, ...deps }),
+    ).rejects.toMatchObject({ exitCode: 5 });
   });
 });

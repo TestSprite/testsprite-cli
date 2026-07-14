@@ -1,5 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import { DRY_RUN_SAMPLE_ENTRIES, findSample } from './samples.js';
+import { DRY_RUN_SAMPLE_ENTRIES, findSample, sampleJUnitReportXml } from './samples.js';
+
+describe('sampleJUnitReportXml', () => {
+  it('returns well-formed JUnit XML with canned batch ids', () => {
+    const xml = sampleJUnitReportXml('proj_dry');
+    expect(xml).toContain('<?xml version="1.0" encoding="UTF-8"?>');
+    expect(xml).toContain('<testsuite name="testsprite:proj_dry"');
+    expect(xml).toContain('classname="proj_dry"');
+    expect(xml).toContain('name="test_fresh_wave_01"');
+    expect(xml).toContain('name="test_fresh_wave_02"');
+    expect(xml).toContain('failures="1"');
+  });
+
+  it('honors reportSuiteName override', () => {
+    const xml = sampleJUnitReportXml('proj_dry', 'custom-ci-suite');
+    expect(xml).toContain('<testsuite name="custom-ci-suite"');
+    expect(xml).not.toContain('testsprite:proj_dry');
+  });
+});
 
 describe('findSample', () => {
   it('resolves /me', () => {

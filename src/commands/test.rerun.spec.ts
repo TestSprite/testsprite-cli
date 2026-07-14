@@ -280,6 +280,126 @@ describe('runTestRerun — validation', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   });
 
+  it('exit 5 (VALIDATION_ERROR) when explicit test IDs are combined with --all', async () => {
+    // The --all branch resolves the FULL project test set and overwrites the
+    // listed ids, so 'rerun test_abc --all' would silently rerun the ENTIRE
+    // project instead of test_abc — burning rerun/auto-heal credits. The
+    // guard throws BEFORE any network/dispatch. (Mirrors `test run`'s
+    // positional+--all guard and delete-batch's ids+--all guard.)
+    const creds = makeCreds();
+    await expect(
+      runTestRerun(
+        {
+          testIds: ['test_abc'],
+          all: true,
+          projectId: 'proj_1',
+          wait: false,
+          timeoutSeconds: 600,
+          autoHeal: false,
+          autoHealExplicit: false,
+          skipDependencies: false,
+          maxConcurrency: 10,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, sleep: instantSleep },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'test-ids' }),
+    });
+  });
+
+  it('exit 5 (VALIDATION_ERROR) when --status is passed WITHOUT --all', async () => {
+    // --status is an --all-only narrowing filter. With explicit ids it was
+    // silently ignored (both tests dispatched, filter dropped) — same
+    // failure mode as the --filter guard above.
+    const creds = makeCreds();
+    await expect(
+      runTestRerun(
+        {
+          testIds: ['test_a', 'test_b'],
+          all: false,
+          statusFilter: 'failed',
+          wait: false,
+          timeoutSeconds: 600,
+          autoHeal: false,
+          autoHealExplicit: false,
+          skipDependencies: false,
+          maxConcurrency: 10,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, sleep: instantSleep },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'status' }),
+    });
+  });
+
+  it('exit 5 (VALIDATION_ERROR) for an INVALID --status value without --all (was silently accepted)', async () => {
+    // Before the guard, an invalid --status token without --all was never
+    // even validated: 'rerun test_a --status notastatus' exited 0 while the
+    // same flag on delete-batch exits 5.
+    const creds = makeCreds();
+    await expect(
+      runTestRerun(
+        {
+          testIds: ['test_a'],
+          all: false,
+          statusFilter: 'notastatus',
+          wait: false,
+          timeoutSeconds: 600,
+          autoHeal: false,
+          autoHealExplicit: false,
+          skipDependencies: false,
+          maxConcurrency: 10,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, sleep: instantSleep },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
+  it('exit 5 (VALIDATION_ERROR) when --skip-terminal is passed WITHOUT --all', async () => {
+    const creds = makeCreds();
+    await expect(
+      runTestRerun(
+        {
+          testIds: ['test_a'],
+          all: false,
+          skipTerminal: true,
+          wait: false,
+          timeoutSeconds: 600,
+          autoHeal: false,
+          autoHealExplicit: false,
+          skipDependencies: false,
+          maxConcurrency: 10,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, sleep: instantSleep },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'skip-terminal' }),
+    });
+  });
+
   it('exit 5 when --all without --project', async () => {
     const creds = makeCreds();
     try {
@@ -4696,5 +4816,68 @@ describe('rerun --wait — dashboardUrl on terminal output', () => {
     expect(result.dashboardUrl).toBe(
       'https://www.testsprite.com/dashboard/tests/project_abc/test/test_fe_01',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Batch --all --wait fan-out: RequestTimeoutError must not leave stdout empty
+// ---------------------------------------------------------------------------
+
+describe('[finding-5] batch rerun --wait: RequestTimeoutError during fan-out poll writes JSON stdout + exit 7', () => {
+  it('stdout contains accepted[] with runIds when member polls throw RequestTimeoutError', async () => {
+    const creds = makeCreds();
+    const batchResp: BatchRerunResponse = {
+      accepted: [
+        { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+      ],
+      deferred: [],
+      conflicts: [],
+      closure: { byProject: [] },
+    };
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/rerun')) {
+        return { status: 202, body: batchResp };
+      }
+      if (url.includes('/runs/')) {
+        throw new RequestTimeoutError(120000, 'req_timeout_batch_rerun');
+      }
+      return errorBody('NOT_FOUND');
+    });
+    const stdoutLines: string[] = [];
+
+    const err = await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 60,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl: fetchImpl as unknown as FetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
+      },
+    ).catch(e => e);
+
+    expect(err).toMatchObject({ exitCode: 7 });
+    expect(stdoutLines.length).toBeGreaterThan(0);
+    const parsed = JSON.parse(stdoutLines.join('\n')) as {
+      accepted: Array<{ testId: string; runId: string; status: string }>;
+    };
+    expect(parsed.accepted).toHaveLength(2);
+    expect(parsed.accepted.map(r => r.runId).sort()).toEqual(['run_b1', 'run_b2']);
+    expect(parsed.accepted.every(r => r.status === 'timeout')).toBe(true);
   });
 });

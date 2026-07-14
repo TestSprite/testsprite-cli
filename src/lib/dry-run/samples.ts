@@ -27,6 +27,7 @@ import type {
   CliTestStep,
 } from '../../commands/test.js';
 import type { MeResponse } from '../../commands/auth.js';
+import { buildJUnitReport } from '../junit-report.js';
 import type { Page } from '../pagination.js';
 import type {
   TriggerRunResponse,
@@ -66,6 +67,37 @@ const SAMPLE_TARGET_URL = 'https://staging.example.com/checkout';
 const SAMPLE_REQUEST_ID = 'req_dry-run';
 
 export const SAMPLE_DRY_RUN_REQUEST_ID = SAMPLE_REQUEST_ID;
+
+/**
+ * Canned JUnit XML for batch `--wait --report junit --dry-run`. Mirrors the
+ * fresh batch-run sample ids so agents can learn the sidecar shape offline.
+ */
+export function sampleJUnitReportXml(
+  projectId: string = SAMPLE_PROJECT_ID,
+  reportSuiteName?: string,
+): string {
+  return buildJUnitReport({
+    suiteName: reportSuiteName ?? `testsprite:${projectId}`,
+    classname: projectId,
+    results: [
+      {
+        testId: SAMPLE_TEST_ID_FRESH_1,
+        runId: SAMPLE_BATCH_FRESH_RUN_ID_1,
+        status: 'passed',
+      },
+      {
+        testId: SAMPLE_TEST_ID_FRESH_2,
+        runId: SAMPLE_BATCH_FRESH_RUN_ID_2,
+        status: 'failed',
+        error: {
+          code: 'ASSERTION',
+          message: 'Expected checkout heading to be visible',
+          exitCode: 1,
+        },
+      },
+    ],
+  });
+}
 
 const me: MeResponse = {
   userId: SAMPLE_USER_ID,

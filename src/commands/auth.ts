@@ -1,5 +1,6 @@
 import { Command } from 'commander';
 import {
+  assertValidEndpointUrl,
   emitDryRunBanner,
   makeHttpClient,
   parseRequestTimeoutFlag,
@@ -16,7 +17,7 @@ import {
   readProfile,
   writeProfile,
 } from '../lib/credentials.js';
-import { loadConfig } from '../lib/config.js';
+import { loadConfig, normalizeEnvVar } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
 import type { OutputMode } from '../lib/output.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
@@ -74,21 +75,25 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   const env = deps.env ?? process.env;
   const credentialsPath = deps.credentialsPath ?? defaultCredentialsPath();
   const out = makeOutput(opts.output, deps);
-  const prelude = deps.preludeWrite ?? ((chunk: string) => process.stdout.write(chunk));
+  // The "Configuring profile …" prelude is informational, not result data, so
+  // it defaults to stderr — stdout stays a pure result stream (the configured
+  // JSON/text), which matters under `--output json` (§8.1 stdout purity).
+  const prelude = deps.preludeWrite ?? ((chunk: string) => process.stderr.write(chunk));
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   // Normalize the env endpoint: an empty / whitespace-only TESTSPRITE_API_URL is
   // treated as unset. Without this, `''` (e.g. `export TESTSPRITE_API_URL=` in a
   // shell profile) is non-nullish and would short-circuit the `??` chains below to
   // an empty endpoint instead of falling through to the profile / prod default.
-  const envApiUrl = env.TESTSPRITE_API_URL?.trim() || undefined;
+  const envApiUrl = normalizeEnvVar(env.TESTSPRITE_API_URL);
 
   // Dry-run: do not prompt, do not read env, do not write credentials.
   // Print the canned success shape so an agent sees exactly the JSON it
   // would get on a real configure (modulo the endpoint string).
   if (opts.dryRun) {
-    emitDryRunBanner(stderr);
     const apiUrl = opts.endpointUrl ?? envApiUrl ?? DEFAULT_API_URL;
+    assertValidEndpointUrl(apiUrl);
+    emitDryRunBanner(stderr);
     stderr(`[dry-run] would write credentials for profile="${opts.profile}" to ${credentialsPath}`);
     out.print({ profile: opts.profile, apiUrl, status: 'configured' }, data => {
       const d = data as { profile: string; apiUrl: string };
@@ -114,6 +119,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   // api_url doesn't silently validate a new key against the default endpoint.
   const resolvedFromProfile = existingProfile?.apiUrl;
   const apiUrl = opts.endpointUrl ?? envApiUrl ?? resolvedFromProfile ?? DEFAULT_API_URL;
+  assertValidEndpointUrl(apiUrl);
 
   if (opts.fromEnv) {
     apiKey = env.TESTSPRITE_API_KEY?.trim();
@@ -202,7 +208,8 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
   // displayed URL always matches where requests actually go (dogfood L1788).
   let resolvedEndpoint: string;
   if (opts.dryRun) {
-    resolvedEndpoint = opts.endpointUrl ?? env.TESTSPRITE_API_URL ?? 'https://api.testsprite.com';
+    resolvedEndpoint =
+      opts.endpointUrl ?? normalizeEnvVar(env.TESTSPRITE_API_URL) ?? 'https://api.testsprite.com';
   } else {
     const credentialsPath = deps.credentialsPath ?? defaultCredentialsPath();
     const config = loadConfig({

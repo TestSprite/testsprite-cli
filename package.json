@@ -1,6 +1,6 @@
 {
   "name": "@testsprite/testsprite-cli",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Official TestSprite command-line interface",
   "type": "module",
   "main": "dist/index.js",
@@ -50,6 +50,7 @@
   "license": "Apache-2.0",
   "dependencies": {
     "commander": "^12.1.0",
+    "undici": "^7.16.0",
     "valibot": "^1.4.1"
   },
   "devDependencies": {

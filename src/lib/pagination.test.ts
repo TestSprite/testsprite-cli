@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from './errors.js';
-import { paginate, validatePaginationFlags, type FetchPage, type Page } from './pagination.js';
+import {
+  MAX_AUTO_PAGES,
+  paginate,
+  validatePaginationFlags,
+  type FetchPage,
+  type Page,
+} from './pagination.js';
 
 function makePages<T>(pages: Page<T>[]): {
   fetchPage: FetchPage<T>;
@@ -120,5 +126,56 @@ describe('paginate', () => {
     const { fetchPage, calls } = makePages([{ items: [1], nextToken: null }]);
     await expect(paginate(fetchPage, { pageSize: 0 })).rejects.toBeInstanceOf(ApiError);
     expect(calls).toHaveLength(0);
+  });
+
+  it('continues through empty cursor pages until later data', async () => {
+    const { fetchPage, calls } = makePages([
+      { items: [], nextToken: 'cursor-1' },
+      { items: [1], nextToken: null },
+    ]);
+
+    const page = await paginate(fetchPage);
+
+    expect(page.items).toEqual([1]);
+    expect(page.nextToken).toBeNull();
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.cursor).toBe('cursor-1');
+  });
+
+  it('rejects when API repeats a non-null cursor without making progress', async () => {
+    const { fetchPage, calls } = makePages([{ items: [], nextToken: 'cursor-1' }]);
+
+    await expect(paginate(fetchPage)).rejects.toMatchObject({
+      code: 'UNAVAILABLE',
+      details: expect.objectContaining({ reason: 'repeated_next_token' }),
+    });
+
+    expect(calls).toHaveLength(2);
+  });
+
+  it('rejects when auto-pagination exceeds the page safety cap', async () => {
+    const calls: Array<{ pageSize: number; cursor: string | undefined }> = [];
+    const fetchPage: FetchPage<number> = async args => {
+      calls.push(args);
+      return {
+        items: [],
+        nextToken:
+          args.cursor === undefined ? 'cursor-1' : `cursor-${Number(args.cursor.slice(7)) + 1}`,
+      };
+    };
+
+    let thrown: unknown;
+    try {
+      await paginate(fetchPage);
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(ApiError);
+    expect(thrown).toMatchObject({
+      code: 'UNAVAILABLE',
+      details: expect.objectContaining({ reason: 'max_pages_exceeded' }),
+    });
+    expect(calls).toHaveLength(MAX_AUTO_PAGES);
   });
 });

@@ -15,6 +15,7 @@ import {
   parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
+import { normalizeEnvVar } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
 import { CLIError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
@@ -39,7 +40,7 @@ const DEFAULT_API_URL = 'https://api.testsprite.com';
  */
 function resolveReportedEndpoint(opts: InitOptions, deps: InitDeps): string {
   const env = deps.env ?? process.env;
-  const envApiUrl = env.TESTSPRITE_API_URL?.trim() || undefined;
+  const envApiUrl = normalizeEnvVar(env.TESTSPRITE_API_URL);
   let existing: string | undefined;
   try {
     existing = readProfile(opts.profile, { path: deps.credentialsPath })?.apiUrl;
@@ -406,12 +407,33 @@ function renderInitText(data: unknown): string {
   }
   lines.push('');
   lines.push('Next steps:');
-  lines.push('  testsprite test list            # list tests in the current project');
-  lines.push('  testsprite agent list           # check installed agent targets');
+  lines.push('  # 1. Create your first project (frontend example) — prints a projectId');
+  lines.push(
+    '  testsprite project create --type frontend --name "My App" --url https://your-app.com',
+  );
+  lines.push('');
   if (s.agent) {
     lines.push(
-      '  testsprite agent install --target=<t>  # re-install or install additional targets',
+      '  # 2. Generate tests: ask your coding agent (the testsprite-onboard skill is installed),',
     );
+    lines.push('  #    or create one yourself, then run them (use the projectId from step 1):');
+    lines.push('  testsprite test run --all --project <projectId>');
+    lines.push('');
+    lines.push('  # Manage installed agent skills');
+    lines.push('  testsprite agent list');
+    lines.push(
+      '  testsprite agent install --target=<t>   # re-install or install additional targets',
+    );
+  } else {
+    lines.push('  # 2. Create a test, then run it (use the projectId from step 1):');
+    lines.push('  testsprite test create --project <projectId> ...');
+    lines.push('  testsprite test run --all --project <projectId>');
+    lines.push(
+      '  # Tip: `testsprite agent install` sets up the onboarding skill for your coding agent',
+    );
+    lines.push('');
+    lines.push('  # Manage installed agent skills');
+    lines.push('  testsprite agent list');
   }
 
   return lines.join('\n');
