@@ -7,6 +7,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { localValidationError } from './errors.js';
@@ -59,6 +60,17 @@ export type CredentialsFile = Record<string, ProfileEntry>;
 
 export interface CredentialsOptions {
   path?: string;
+}
+
+interface RestrictiveModeOptions {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  spawnSync?: (
+    command: string,
+    args: readonly string[],
+    options: { shell: false; stdio: 'ignore'; windowsHide: true },
+  ) => SpawnSyncReturns<Buffer>;
+  warn?: (line: string) => void;
 }
 
 const FILE_KEY_TO_FIELD: Record<string, keyof ProfileEntry> = {
@@ -172,10 +184,51 @@ export function deleteProfile(profile: string, options: CredentialsOptions = {})
   return true;
 }
 
-export function ensureRestrictiveMode(path: string): void {
+export function ensureRestrictiveMode(path: string, options: RestrictiveModeOptions = {}): void {
   if (!existsSync(path)) return;
+  if ((options.platform ?? process.platform) === 'win32') {
+    ensureWindowsRestrictiveAcl(path, options);
+    return;
+  }
   const overpermissive = (statSync(path).mode & 0o077) !== 0;
   if (overpermissive) chmodSync(path, 0o600);
+}
+
+function ensureWindowsRestrictiveAcl(path: string, options: RestrictiveModeOptions): void {
+  const username = (options.env ?? process.env).USERNAME?.trim();
+  if (!username) {
+    warnWindowsAcl(
+      'could not determine the Windows username; credentials file permissions were not tightened',
+      options,
+    );
+    return;
+  }
+
+  const run = options.spawnSync ?? spawnSync;
+  const result = run('icacls', [path, '/inheritance:r', '/grant:r', `${username}:F`], {
+    shell: false,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+
+  if (result.error) {
+    warnWindowsAcl(
+      `icacls failed while tightening credentials file permissions: ${result.error.message}`,
+      options,
+    );
+    return;
+  }
+  if (result.status !== 0) {
+    warnWindowsAcl(
+      `icacls exited with status ${result.status ?? 'unknown'}; credentials file permissions may be too broad`,
+      options,
+    );
+  }
+}
+
+function warnWindowsAcl(message: string, options: RestrictiveModeOptions): void {
+  const warn = options.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
+  warn(`[warning] ${message}`);
 }
 
 function resolvePath(options: CredentialsOptions): string {

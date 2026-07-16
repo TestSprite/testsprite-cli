@@ -1,7 +1,7 @@
 import { mkdtempSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_PROFILE,
   assertValidProfileName,
@@ -189,6 +189,45 @@ describe('deleteProfile', () => {
 describe('ensureRestrictiveMode', () => {
   it('is a no-op when the file is missing', () => {
     expect(() => ensureRestrictiveMode(credentialsPath)).not.toThrow();
+  });
+
+  it('tightens the Windows ACL with icacls instead of POSIX chmod', () => {
+    mkdirSync(tmpRoot, { recursive: true });
+    writeFileSync(credentialsPath, 'data', { mode: 0o666 });
+    const spawn = vi.fn(() => ({ status: 0, signal: null, output: [], pid: 123 })) as never;
+
+    ensureRestrictiveMode(credentialsPath, {
+      platform: 'win32',
+      env: { USERNAME: 'alice' } as NodeJS.ProcessEnv,
+      spawnSync: spawn,
+    });
+
+    expect(spawn).toHaveBeenCalledWith(
+      'icacls',
+      [credentialsPath, '/inheritance:r', '/grant:r', 'alice:F'],
+      {
+        shell: false,
+        stdio: 'ignore',
+        windowsHide: true,
+      },
+    );
+  });
+
+  it('warns on Windows when credentials ACL tightening cannot run', () => {
+    mkdirSync(tmpRoot, { recursive: true });
+    writeFileSync(credentialsPath, 'data');
+    const warnings: string[] = [];
+    const spawn = vi.fn(() => ({ status: 0, signal: null, output: [], pid: 123 })) as never;
+
+    ensureRestrictiveMode(credentialsPath, {
+      platform: 'win32',
+      env: {} as NodeJS.ProcessEnv,
+      spawnSync: spawn,
+      warn: line => warnings.push(line),
+    });
+
+    expect(spawn).not.toHaveBeenCalled();
+    expect(warnings.join('\n')).toContain('credentials file permissions were not tightened');
   });
 
   // POSIX-only premise: Windows has no 0644/0600 distinction to downgrade.
