@@ -184,6 +184,10 @@ export function deleteProfile(profile: string, options: CredentialsOptions = {})
   return true;
 }
 
+/**
+ * Enforce restrictive access on the credentials file after atomic writes.
+ * POSIX hosts use chmod(0600); Windows hosts use ACL tightening via icacls.
+ */
 export function ensureRestrictiveMode(path: string, options: RestrictiveModeOptions = {}): void {
   if (!existsSync(path)) return;
   if ((options.platform ?? process.platform) === 'win32') {
@@ -194,6 +198,10 @@ export function ensureRestrictiveMode(path: string, options: RestrictiveModeOpti
   if (overpermissive) chmodSync(path, 0o600);
 }
 
+/**
+ * Restrict a Windows credentials file to the current user using icacls.
+ * The command is invoked with an args array so credential paths are never shell-interpreted.
+ */
 function ensureWindowsRestrictiveAcl(path: string, options: RestrictiveModeOptions): void {
   const username = (options.env ?? process.env).USERNAME?.trim();
   if (!username) {
@@ -226,6 +234,7 @@ function ensureWindowsRestrictiveAcl(path: string, options: RestrictiveModeOptio
   }
 }
 
+/** Emit an explicit warning when Windows ACL tightening cannot be completed. */
 function warnWindowsAcl(message: string, options: RestrictiveModeOptions): void {
   const warn = options.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
   warn(`[warning] ${message}`);
