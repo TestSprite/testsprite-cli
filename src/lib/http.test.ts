@@ -260,6 +260,31 @@ describe('HttpClient error mapping', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(4);
   });
 
+  it('does not retry transport errors for keyless writes', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('ECONNRESET');
+    });
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.post('/projects', { body: { name: 'Checkout' } })).rejects.toBeInstanceOf(
+      TransportError,
+    );
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries transport errors for writes with an idempotency key', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('ECONNRESET');
+    });
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(
+      client.post('/projects', {
+        body: { name: 'Checkout' },
+        headers: { 'Idempotency-Key': 'op_123' },
+      }),
+    ).rejects.toBeInstanceOf(TransportError);
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+
   it('does not retry AbortError', async () => {
     const fetchImpl = vi.fn(async () => {
       const err = new Error('aborted');
@@ -330,6 +355,27 @@ describe('HttpClient transport-edge statuses', () => {
       expect(fetchImpl).toHaveBeenCalledTimes(4);
     },
   );
+
+  it('does not retry bare transport-edge responses for keyless writes', async () => {
+    const fetchImpl = vi.fn(async () => new Response('proxy gateway html', { status: 502 }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.post('/projects', { body: { name: 'Checkout' } })).rejects.toBeInstanceOf(
+      TransportError,
+    );
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries bare transport-edge responses for writes with an idempotency key', async () => {
+    const fetchImpl = vi.fn(async () => new Response('proxy gateway html', { status: 502 }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(
+      client.post('/projects', {
+        body: { name: 'Checkout' },
+        headers: { 'idempotency-key': 'op_123' },
+      }),
+    ).rejects.toBeInstanceOf(TransportError);
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
 
   it('502 carrying our envelope still maps to its catalog code', async () => {
     const body = {
