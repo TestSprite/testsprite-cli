@@ -50,7 +50,11 @@ function healthyDeps(credentialsPath: string, extra: Partial<DoctorDeps> = {}): 
     credentialsPath,
     cwd: '/project',
     nodeVersion: '22.9.0',
-    existsSync: () => true, // skill landing file present
+    existsSync: () => true, // skill landing file present, and git/gitignore present
+    readFileSync: (p: string) => {
+      if (p.endsWith('.gitignore')) return '.testsprite/';
+      return '';
+    },
     fetchImpl: makeFetch(OK_ME),
     ...extra,
   };
@@ -195,6 +199,30 @@ describe('runDoctor — warnings do not fail', () => {
     expect(out).toContain('Verify skill');
   });
 
+  it('missing Git repository is a warning, not a failure', async () => {
+    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const report = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      { ...healthyDeps(credentialsPath, { existsSync: (p) => !p.endsWith('.git') }), ...deps },
+    );
+    expect(report.failures).toBe(0);
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('[WARN] Git repository');
+  });
+
+  it('missing .gitignore or .testsprite/ not ignored is a warning, not a failure', async () => {
+    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const report = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      { ...healthyDeps(credentialsPath, { readFileSync: () => 'node_modules/' }), ...deps },
+    );
+    expect(report.failures).toBe(0);
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('[WARN] Gitignore safety');
+  });
+
   it('--dry-run skips connectivity and never calls fetch, missing key is a warning', async () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error('fetch must not be called under --dry-run');
@@ -208,6 +236,10 @@ describe('runDoctor — warnings do not fail', () => {
         cwd: '/project',
         nodeVersion: '22.9.0',
         existsSync: () => true,
+        readFileSync: (p: string) => {
+          if (p.endsWith('.gitignore')) return '.testsprite/';
+          return '';
+        },
         fetchImpl,
         ...deps,
       },

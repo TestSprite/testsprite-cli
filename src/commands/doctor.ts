@@ -28,6 +28,7 @@ import { GLOBAL_OPTS_HINT, Output, type OutputMode } from '../lib/output.js';
 import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
 import { VERSION } from '../version.js';
 import { MIN_SUPPORTED_NODE_MAJOR, shouldRejectNodeVersion } from '../version-guard.js';
+import { isInsideGitRepo, checkTestspriteIgnored } from '../lib/git-utils.js';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -85,6 +86,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   const checks: DoctorCheck[] = [
     { name: 'CLI version', status: 'ok', detail: VERSION },
     checkNodeVersion(nodeVersion),
+    checkGitRepo(cwd, deps),
     { name: 'Profile', status: 'ok', detail: config.profile },
     endpointCheck,
     checkCredentials(hasKey, config.profile, opts.dryRun ?? false),
@@ -93,6 +95,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
       endpointOk: endpointCheck.status === 'ok',
     }),
     checkSkill(cwd, deps),
+    await checkGitignoreSafety(cwd, deps),
   ];
 
   const failures = checks.filter(check => check.status === 'fail').length;
@@ -168,6 +171,33 @@ function checkSkill(cwd: string, deps: DoctorDeps): DoctorCheck {
     detail: installed
       ? 'installed in this project'
       : 'not installed here; run `testsprite setup` so your agent verifies its changes',
+  };
+}
+
+function checkGitRepo(cwd: string, deps: DoctorDeps): DoctorCheck {
+  const isGit = isInsideGitRepo(cwd, {
+    existsSync: deps.existsSync,
+  });
+  return {
+    name: 'Git repository',
+    status: isGit ? 'ok' : 'warn',
+    detail: isGit
+      ? 'initialized repository'
+      : 'not a Git repository; agent skills require Git tracking',
+  };
+}
+
+async function checkGitignoreSafety(cwd: string, deps: DoctorDeps): Promise<DoctorCheck> {
+  const isIgnored = await checkTestspriteIgnored(cwd, {
+    existsSync: deps.existsSync,
+    readFile: deps.readFileSync ? async (p) => deps.readFileSync!(p) : undefined,
+  });
+  return {
+    name: 'Gitignore safety',
+    status: isIgnored ? 'ok' : 'warn',
+    detail: isIgnored
+      ? '.testsprite/ is ignored'
+      : '.testsprite/ is not ignored; run setup or add to .gitignore to avoid committing artifacts',
   };
 }
 
