@@ -36,6 +36,11 @@ import {
 import { promptText } from '../lib/prompt.js';
 import type { FetchImpl } from '../lib/http.js';
 import { readProfile } from '../lib/credentials.js';
+import {
+  ensureTestspriteIgnored,
+  checkTestspriteIgnored,
+  isInsideGitRepoAsync,
+} from '../lib/git-utils.js';
 
 /** Mirrors auth.ts's DEFAULT_API_URL (kept in sync; auth.ts owns the canonical value). */
 const DEFAULT_API_URL = 'https://api.testsprite.com';
@@ -105,6 +110,7 @@ interface InitOptions extends CommonOptions {
    */
   agent?: AgentTarget;
   noAgent: boolean;
+  noGitignore?: boolean;
   force: boolean;
   dir?: string;
   yes: boolean;
@@ -497,6 +503,20 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
       );
     }
 
+    if (!opts.noGitignore) {
+      const projectDir = opts.dir ?? deps.cwd ?? process.cwd();
+      const gitignoreDeps = {
+        exists: deps.fs ? async (p: string) => (await deps.fs!.lstat(p)) !== null : undefined,
+        readFile: deps.fs ? (p: string) => deps.fs!.readFile(p) : undefined,
+      };
+      if (await isInsideGitRepoAsync(projectDir, gitignoreDeps)) {
+        const isIgnored = await checkTestspriteIgnored(projectDir, gitignoreDeps);
+        if (!isIgnored) {
+          stderrFn('[dry-run] would ignore .testsprite/ in .gitignore');
+        }
+      }
+    }
+
     const summary: InitSummary = {
       profile: opts.profile,
       apiUrl: resolveReportedEndpoint(opts, deps),
@@ -622,6 +642,31 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
           `re-run 'testsprite agent install --target ${resolution.targets.join(',')}' after fixing the path`,
       );
       throw installErr;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Step 3.5: Ensure .testsprite/ is ignored in .gitignore
+  // -------------------------------------------------------------------------
+  if (!opts.noGitignore) {
+    const projectDir = opts.dir ?? deps.cwd ?? process.cwd();
+    const gitignoreDeps = {
+      exists: deps.fs ? async (p: string) => (await deps.fs!.lstat(p)) !== null : undefined,
+      readFile: deps.fs ? (p: string) => deps.fs!.readFile(p) : undefined,
+      writeFile: deps.fs
+        ? (p: string, content: string) => deps.fs!.writeFile(p, content)
+        : undefined,
+    };
+    try {
+      const appended = await ensureTestspriteIgnored(projectDir, gitignoreDeps);
+      if (appended) {
+        stderrFn('[info] Added .testsprite/ to .gitignore to avoid committing artifacts');
+      }
+    } catch (err) {
+      // Non-blocking warning on gitignore setup error
+      stderrFn(
+        `[warn] Failed to update .gitignore: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
@@ -768,6 +813,8 @@ export interface SetupCmdOpts {
    */
   agent: string | false;
   noAgent?: boolean;
+  gitignore?: boolean;
+  noGitignore?: boolean;
   force?: boolean;
   dir?: string;
   yes?: boolean;
@@ -798,6 +845,7 @@ export function addSetupOptions(
         `(default: every agent detected in this project, or ${defaultAgent} if none)`,
     )
     .option('--no-agent', 'Skip the agent skill install (configure credentials only)')
+    .option('--no-gitignore', 'Skip adding .testsprite/ to .gitignore')
     .option('--force', 'Overwrite an existing skill file (a .bak backup is kept)')
     .option('--dir <path>', 'Project root for the skill install (default: current directory)')
     .option('-y, --yes', 'Non-interactive: accept all defaults, never prompt')
@@ -818,6 +866,7 @@ function buildSetupOptions(
   // Commander sets `agent: false` (boolean) when `--no-agent` is passed,
   // because `--no-agent` is the negation of `--agent <target>`.
   const isNoAgent = cmdOpts.noAgent === true || cmdOpts.agent === false;
+  const isNoGitignore = cmdOpts.noGitignore === true || cmdOpts.gitignore === false;
 
   // Detect conflict when both --no-agent and --agent <target> appear in the raw
   // args. Commander only populates `rawArgs` on the ROOT command passed to
@@ -843,6 +892,7 @@ function buildSetupOptions(
     fromEnv: Boolean(cmdOpts.fromEnv),
     agent: chosenAgent,
     noAgent: isNoAgent,
+    noGitignore: isNoGitignore,
     force: Boolean(cmdOpts.force),
     dir: cmdOpts.dir,
     yes: Boolean(cmdOpts.yes),
