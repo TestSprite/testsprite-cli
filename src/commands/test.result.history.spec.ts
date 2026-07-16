@@ -225,6 +225,102 @@ describe('runResultHistory — text mode', () => {
     expect(output).toMatch(/DURATION/);
   });
 
+  it('selects/reorders columns and suppresses header/separator/detail sub-lines', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_abc/runs')) {
+        return {
+          body: makeHistoryResp([
+            makeHistoryItem({
+              runId: 'run_url_001',
+              targetUrl: 'https://staging.example.com/checkout',
+              targetUrlSource: 'run',
+            }),
+          ]),
+        };
+      }
+      return { status: 404, body: errorEnvelope('NOT_FOUND') };
+    });
+
+    await runResultHistory(
+      {
+        output: 'text',
+        testId: 'test_abc',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        columns: 'status,runid',
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => lines.push(line) },
+    );
+
+    const output = lines.join('\n');
+    expect(output.split('\n')[0]).toMatch(/^passed\s+run_url_001$/);
+    expect(output).not.toMatch(/^RUN ID/m);
+    expect(output).not.toMatch(/^-+$/m);
+    expect(output).not.toContain('targetUrl:');
+  });
+
+  it('rejects unknown history columns with VALIDATION_ERROR', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_abc/runs')) {
+        return { body: makeHistoryResp() };
+      }
+      return { status: 404, body: errorEnvelope('NOT_FOUND') };
+    });
+
+    await expect(
+      runResultHistory(
+        {
+          output: 'text',
+          testId: 'test_abc',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+          columns: 'bogus',
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'columns' },
+    });
+  });
+
+  it('json mode ignores text-only history column flags', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_abc/runs')) {
+        return { body: makeHistoryResp() };
+      }
+      return { status: 404, body: errorEnvelope('NOT_FOUND') };
+    });
+
+    await runResultHistory(
+      {
+        output: 'json',
+        testId: 'test_abc',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        columns: 'bogus',
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => lines.push(line) },
+    );
+
+    const parsed = JSON.parse(lines.join('')) as { runs: Array<{ runId: string }> };
+    expect(parsed.runs[0]?.runId).toBe('run_hist_001');
+  });
+
   it('renders run_hist_001 row with status passed and source cli', async () => {
     const { credentialsPath } = makeCreds();
     const lines: string[] = [];

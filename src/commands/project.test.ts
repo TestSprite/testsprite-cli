@@ -87,6 +87,8 @@ describe('createProjectCommand', () => {
     expect(flagNames).toContain('--page-size');
     expect(flagNames).toContain('--starting-token');
     expect(flagNames).toContain('--max-items');
+    expect(flagNames).toContain('--columns');
+    expect(flagNames).toContain('--no-header');
   });
 });
 
@@ -281,6 +283,77 @@ describe('runList', () => {
     expect(block).toContain('CREATED');
     expect(block).toContain('Checkout');
     expect(block).toContain('nextToken: next-please');
+  });
+
+  it('text output selects/reorders columns and suppresses the header', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [PROJECT_FIXTURE], nextToken: null },
+    }));
+
+    const out: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        pageSize: 25,
+        columns: 'name,id',
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    const block = out.join('\n');
+    expect(block).toMatch(/^Checkout\s+project_b3c91efa$/);
+    expect(block).not.toContain('NAME');
+    expect(block).not.toContain('CREATED');
+  });
+
+  it('text output rejects unknown columns with VALIDATION_ERROR', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [PROJECT_FIXTURE], nextToken: null },
+    }));
+
+    await expect(
+      runList(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          pageSize: 25,
+          columns: 'bogus',
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'columns' },
+    });
+  });
+
+  it('json output ignores text-only column flags', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [PROJECT_FIXTURE], nextToken: null },
+    }));
+
+    const out: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        pageSize: 25,
+        columns: 'bogus',
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    expect(JSON.parse(out.join('\n')).items[0].id).toBe('project_b3c91efa');
   });
 
   it('text output reads "No projects." when items is empty and nextToken is null', async () => {

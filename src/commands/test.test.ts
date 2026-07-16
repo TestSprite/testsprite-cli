@@ -199,6 +199,7 @@ describe('createTestCommand — surface', () => {
   it('result exposes --include-analysis (M2.1) + M3.4 piece-5 --history flags', () => {
     // M2.1 piece 3 adds `--include-analysis` to `test result`.
     // M3.4 piece 5 adds `--history`, `--source`, `--since`, `--page-size`, `--cursor`.
+    // Issue #165 adds text-table shaping via `--columns` and `--no-header`.
     // Pinning the surface so a future flag-consolidation sweep keeps every
     // option intentional. Back-compat: bare `test result <id>` (no --history)
     // still calls runResult and returns the M2 CliLatestResult shape.
@@ -212,6 +213,8 @@ describe('createTestCommand — surface', () => {
       '--since',
       '--page-size',
       '--cursor',
+      '--columns',
+      '--no-header',
     ]);
   });
 
@@ -572,6 +575,79 @@ describe('runList', () => {
     // accidentally hardcode a value.
     expect(block).toContain('portal');
     expect(block).toContain('mcp');
+  });
+
+  it('text mode selects/reorders columns and suppresses the header', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [FE_TEST, BE_TEST], nextToken: null },
+    }));
+    const out: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_alice',
+        pageSize: 25,
+        columns: 'status,id',
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    const lines = out.join('\n').split('\n');
+    expect(lines[0]).toMatch(/^failed\s+test_fe$/);
+    expect(lines[1]).toMatch(/^passed\s+test_be$/);
+    expect(out.join('\n')).not.toContain('STATUS');
+    expect(out.join('\n')).not.toContain('UPDATED');
+  });
+
+  it('text mode rejects unknown columns with VALIDATION_ERROR', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [FE_TEST], nextToken: null },
+    }));
+
+    await expect(
+      runList(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          projectId: 'project_alice',
+          pageSize: 25,
+          columns: 'bogus',
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'columns' },
+    });
+  });
+
+  it('json mode ignores text-only column flags', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [FE_TEST], nextToken: null },
+    }));
+    const out: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        pageSize: 25,
+        columns: 'bogus',
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    expect(JSON.parse(out.join('\n')).items[0].id).toBe('test_fe');
   });
 
   it('text mode reads "No tests." when items is empty and nextToken is null', async () => {

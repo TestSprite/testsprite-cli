@@ -187,6 +187,9 @@ Options:
   --page-size <n>           service page-size hint (1-100, default 25)
   --starting-token <token>  opaque cursor from a previous list response
   --max-items <n>           stop after this many items across auto-paged pages
+  --columns <list>          select/reorder text table columns (comma-separated
+                            keys)
+  --no-header               suppress the text table header row
   -h, --help                display help for command
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
@@ -444,6 +447,9 @@ Options:
   --cursor <token>          alias for --starting-token; accepted for parity
                             with \`test result --history\`
   --max-items <n>           stop after this many items across auto-paged pages
+  --columns <list>          select/reorder text table columns (comma-separated
+                            keys)
+  --no-header               suppress the text table header row
   -h, --help                display help for command
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
@@ -548,6 +554,8 @@ Options:
   --page-size <n>     with --history: number of runs per page (1–100, default
                       20)
   --cursor <token>    with --history: opaque cursor from a prior page
+  --columns <list>    with --history: select/reorder text table columns
+  --no-header         with --history: suppress the text table header row
   -h, --help          display help for command
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):

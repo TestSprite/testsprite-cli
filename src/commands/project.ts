@@ -12,6 +12,7 @@ import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { assertNotLocal } from '../lib/target-url.js';
+import { renderTextTable, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
 import {
   fetchSinglePage,
@@ -44,6 +45,8 @@ interface ListOptions extends CommonOptions {
   pageSize?: number;
   startingToken?: string;
   maxItems?: number;
+  columns?: string;
+  noHeader?: boolean;
 }
 
 export async function runList(
@@ -84,7 +87,7 @@ export async function runList(
 
   out.print(page, data => {
     const p = data as Page<CliProject>;
-    return renderProjectListText(p);
+    return renderProjectListText(p, { columns: opts.columns, noHeader: opts.noHeader });
   });
   return page;
 }
@@ -584,6 +587,8 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .option('--page-size <n>', 'service page-size hint (1-100, default 25)')
     .option('--starting-token <token>', 'opaque cursor from a previous list response')
     .option('--max-items <n>', 'stop after this many items across auto-paged pages')
+    .option('--columns <list>', 'select/reorder text table columns (comma-separated keys)')
+    .option('--no-header', 'suppress the text table header row')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts: ListFlagOpts, command: Command) => {
       // Don't parse numeric flags via Commander — its parser throws a
@@ -597,6 +602,8 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
           pageSize: parseFlag(cmdOpts.pageSize, 'page-size'),
           startingToken: cmdOpts.startingToken,
           maxItems: parseFlag(cmdOpts.maxItems, 'max-items'),
+          columns: cmdOpts.columns,
+          noHeader: cmdOpts.header === false,
         },
         deps,
       );
@@ -784,6 +791,8 @@ interface ListFlagOpts {
   pageSize?: string;
   startingToken?: string;
   maxItems?: string;
+  columns?: string;
+  header?: boolean;
 }
 
 interface CreateFlagOpts {
@@ -885,45 +894,37 @@ function makeOutput(mode: OutputMode, deps: ProjectDeps): Output {
   return new Output(mode, { stdout: deps.stdout, stderr: deps.stderr });
 }
 
-function renderProjectListText(page: Page<CliProject>): string {
+const PROJECT_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliProject>> = [
+  {
+    header: 'ID',
+    width: rows => Math.max(2, ...rows.map(project => project.id.length)),
+    render: project => project.id,
+  },
+  {
+    header: 'NAME',
+    width: rows => Math.max(4, ...rows.map(project => project.name.length)),
+    render: project => project.name,
+  },
+  { header: 'TYPE', width: 8, render: project => project.type },
+  { header: 'FROM', width: 6, render: project => project.createdFrom },
+  { header: 'CREATED', width: 0, render: project => project.createdAt },
+];
+
+function renderProjectListText(
+  page: Page<CliProject>,
+  options: { columns?: string; noHeader?: boolean } = {},
+): string {
   if (page.items.length === 0) {
     return page.nextToken
       ? `No projects on this page.\nnextToken: ${page.nextToken}`
       : 'No projects.';
   }
-  // Compact, AWS-CLI-grade columnar output. Column widths are computed
-  // per-call so a single absurdly long project name doesn't push the
-  // whole table off-screen.
-  const idWidth = Math.max(2, ...page.items.map(p => p.id.length));
-  const nameWidth = Math.max(4, ...page.items.map(p => p.name.length));
-  const typeWidth = 8;
-  const fromWidth = 6;
-
-  const header =
-    pad('ID', idWidth) +
-    '  ' +
-    pad('NAME', nameWidth) +
-    '  ' +
-    pad('TYPE', typeWidth) +
-    '  ' +
-    pad('FROM', fromWidth) +
-    '  ' +
-    'CREATED';
-
-  const rows = page.items.map(
-    p =>
-      pad(p.id, idWidth) +
-      '  ' +
-      pad(p.name, nameWidth) +
-      '  ' +
-      pad(p.type, typeWidth) +
-      '  ' +
-      pad(p.createdFrom, fromWidth) +
-      '  ' +
-      p.createdAt,
-  );
-
-  const lines = [header, ...rows];
+  const lines = [
+    renderTextTable(page.items, PROJECT_LIST_COLUMNS, {
+      columns: options.columns,
+      noHeader: options.noHeader,
+    }),
+  ];
   if (page.nextToken) lines.push('', `nextToken: ${page.nextToken}`);
   return lines.join('\n');
 }
@@ -937,11 +938,6 @@ function renderProjectText(p: CliProject): string {
     `createdAt:   ${p.createdAt}`,
     `updatedAt:   ${p.updatedAt}`,
   ].join('\n');
-}
-
-function pad(s: string, width: number): string {
-  if (s.length >= width) return s;
-  return s + ' '.repeat(width - s.length);
 }
 
 function renderUpdateText(r: CliUpdateProjectResponse): string {

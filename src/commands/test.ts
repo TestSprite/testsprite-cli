@@ -78,6 +78,13 @@ import type {
 } from '../lib/runs.types.js';
 import { RUN_SOURCES } from '../lib/runs.types.js';
 import { assertNotLocal } from '../lib/target-url.js';
+import {
+  formatTextTableRow,
+  measureTextColumns,
+  renderTextTable,
+  resolveTextColumns,
+  type TextTableColumn,
+} from '../lib/text-table.js';
 import { createTicker } from '../lib/ticker.js';
 import { RateThrottle } from '../lib/rate-throttle.js';
 import { resolvePortalBase, resolvePortalUrl } from '../lib/facade.js';
@@ -431,6 +438,8 @@ interface ListOptions extends CommonOptions {
   pageSize?: number;
   startingToken?: string;
   maxItems?: number;
+  columns?: string;
+  noHeader?: boolean;
 }
 
 const TEST_TYPES: ReadonlyArray<'frontend' | 'backend'> = ['frontend', 'backend'];
@@ -529,7 +538,9 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
     );
   }
 
-  out.print(page, data => renderTestListText(data as Page<CliTest>));
+  out.print(page, data =>
+    renderTestListText(data as Page<CliTest>, { columns: opts.columns, noHeader: opts.noHeader }),
+  );
   return page;
 }
 
@@ -4353,6 +4364,8 @@ interface ResultHistoryOptions extends CommonOptions {
   pageSize?: number;
   /** Opaque cursor from a prior page's `nextCursor`. */
   cursor?: string;
+  columns?: string;
+  noHeader?: boolean;
 }
 
 /**
@@ -4430,7 +4443,7 @@ export async function runResultHistory(
   }
 
   const lines: string[] = [];
-  lines.push(renderRunHistoryTable(resp.runs));
+  lines.push(renderRunHistoryTable(resp.runs, { columns: opts.columns, noHeader: opts.noHeader }));
 
   // Footer: pointer to per-run detail commands.
   lines.push('');
@@ -4457,13 +4470,18 @@ export async function runResultHistory(
   return resp;
 }
 
-const RUN_HISTORY_TABLE_COL_WIDTHS = {
-  runId: 36,
-  status: 10,
-  source: 18,
-  rerun: 6,
-  when: 25,
-};
+const RUN_HISTORY_TABLE_COLUMNS: ReadonlyArray<TextTableColumn<RunHistoryItem>> = [
+  { header: 'RUN ID', width: 36, render: run => run.runId },
+  { header: 'STATUS', width: 10, render: run => run.status },
+  { header: 'SOURCE', width: 18, render: run => run.source },
+  { header: 'RERUN?', width: 6, render: run => (run.isRerun ? 'yes' : 'no') },
+  { header: 'WHEN', width: 25, render: run => run.createdAt },
+  {
+    header: 'DURATION',
+    width: 0,
+    render: run => formatDurationMs(run.startedAt ?? run.createdAt, run.finishedAt),
+  },
+];
 
 /**
  * Max width of the `test steps` DESCRIPTION column in text mode. Long /
@@ -4499,60 +4517,41 @@ const HISTORY_TARGET_URL_MAX = 80;
  * run row (truncated to `HISTORY_TARGET_URL_MAX` chars). The table columns
  * are left intact to avoid width blow-out on terminals.
  */
-function renderRunHistoryTable(runs: RunHistoryItem[]): string {
-  const cols = RUN_HISTORY_TABLE_COL_WIDTHS;
-  const header = [
-    padEnd('RUN ID', cols.runId),
-    padEnd('STATUS', cols.status),
-    padEnd('SOURCE', cols.source),
-    padEnd('RERUN?', cols.rerun),
-    padEnd('WHEN', cols.when),
-    'DURATION',
-  ].join('  ');
-  const sep = '-'.repeat(header.length);
+function renderRunHistoryTable(
+  runs: RunHistoryItem[],
+  options: { columns?: string; noHeader?: boolean } = {},
+): string {
+  const selectedColumns = resolveTextColumns(options.columns, RUN_HISTORY_TABLE_COLUMNS);
+  const widths = measureTextColumns(runs, selectedColumns);
+  const customColumns = options.columns !== undefined && options.columns.trim() !== '';
+  const includeDetailLines = !customColumns && options.noHeader !== true;
+  const header = formatTextTableRow(
+    selectedColumns.map(column => column.header),
+    widths,
+  );
 
-  const rows = runs.flatMap(r => {
-    // FE runs never populate `startedAt` today — the RUNNING heartbeat
-    // that would set it doesn't fire on the legacy/sync execution path
-    // (dogfood 2026-06-04), so without a fallback DURATION was always
-    // "—" for every FE run. Fall back to `createdAt` so the column shows
-    // wall-clock from trigger to finish; on sync dev the queue gap is
-    // ~0, and `--output json` still exposes raw startedAt/finishedAt for
-    // consumers that need to exclude queue time.
-    const duration = formatDurationMs(r.startedAt ?? r.createdAt, r.finishedAt);
-    const mainRow = [
-      padEnd(r.runId, cols.runId),
-      padEnd(r.status, cols.status),
-      padEnd(r.source, cols.source),
-      padEnd(r.isRerun ? 'yes' : 'no', cols.rerun),
-      padEnd(r.createdAt, cols.when),
-      duration,
-    ].join('  ');
+  const rows = runs.flatMap(run => {
+    const mainRow = formatTextTableRow(
+      selectedColumns.map(column => column.render(run)),
+      widths,
+    );
 
-    // G1b: surface per-run targetUrl as an indented sub-line.
-    // Render only when truthy (skip null, undefined, empty) and when the
-    // source is not 'unresolved' (that would mean "backend couldn't resolve
-    // a URL" — printing "—" is less informative than omitting the line).
     const lines: string[] = [mainRow];
-    if (r.targetUrl && r.targetUrlSource !== 'unresolved') {
+    if (includeDetailLines && run.targetUrl && run.targetUrlSource !== 'unresolved') {
       const url =
-        r.targetUrl.length > HISTORY_TARGET_URL_MAX
-          ? `${r.targetUrl.slice(0, HISTORY_TARGET_URL_MAX - 1)}…`
-          : r.targetUrl;
+        run.targetUrl.length > HISTORY_TARGET_URL_MAX
+          ? `${run.targetUrl.slice(0, HISTORY_TARGET_URL_MAX - 1)}…`
+          : run.targetUrl;
       lines.push(`  targetUrl: ${url}`);
-    } else if (r.targetUrlSource === 'unresolved') {
+    } else if (includeDetailLines && run.targetUrlSource === 'unresolved') {
       lines.push(`  targetUrl: —`);
     }
 
     return lines;
   });
 
-  return [header, sep, ...rows].join('\n');
-}
-
-function padEnd(s: string, width: number): string {
-  if (s.length >= width) return s;
-  return s + ' '.repeat(width - s.length);
+  if (options.noHeader === true) return rows.join('\n');
+  return [header, '-'.repeat(header.length), ...rows].join('\n');
 }
 
 function formatDurationMs(startedAt: string | null, finishedAt: string | null): string {
@@ -7945,6 +7944,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       'alias for --starting-token; accepted for parity with `test result --history`',
     )
     .option('--max-items <n>', 'stop after this many items across auto-paged pages')
+    .option('--columns <list>', 'select/reorder text table columns (comma-separated keys)')
+    .option('--no-header', 'suppress the text table header row')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts: ListFlagOpts, command: Command) => {
       // Same parser strategy as `project list`: skip Commander's number
@@ -7965,6 +7966,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           pageSize: parseNumericFlag(cmdOpts.pageSize, 'page-size'),
           startingToken: cmdOpts.startingToken ?? cmdOpts.cursor,
           maxItems: parseNumericFlag(cmdOpts.maxItems, 'max-items'),
+          columns: cmdOpts.columns,
+          noHeader: cmdOpts.header === false,
         },
         deps,
       );
@@ -8275,6 +8278,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option('--page-size <n>', 'with --history: number of runs per page (1–100, default 20)')
     .option('--cursor <token>', 'with --history: opaque cursor from a prior page')
+    .option('--columns <list>', 'with --history: select/reorder text table columns')
+    .option('--no-header', 'with --history: suppress the text table header row')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testId: string, cmdOpts: ResultFlagOpts, command: Command) => {
       if (cmdOpts.history) {
@@ -8290,6 +8295,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
                 ? parseNumericFlag(cmdOpts.pageSize, 'page-size')
                 : undefined,
             cursor: cmdOpts.cursor,
+            columns: cmdOpts.columns,
+            noHeader: cmdOpts.header === false,
           },
           deps,
         );
@@ -9042,6 +9049,8 @@ interface ResultFlagOpts {
   pageSize?: string;
   /** Opaque pagination cursor from a prior page's nextCursor. */
   cursor?: string;
+  columns?: string;
+  header?: boolean;
 }
 
 interface CreateFlagOpts {
@@ -9089,6 +9098,8 @@ interface ListFlagOpts {
    */
   cursor?: string;
   maxItems?: string;
+  columns?: string;
+  header?: boolean;
 }
 
 interface StepsFlagOpts {
@@ -9435,45 +9446,36 @@ async function streamPresignedBody(url: string, out: Output, deps: TestDeps): Pr
   }
 }
 
-function renderTestListText(page: Page<CliTest>): string {
+const TEST_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliTest>> = [
+  {
+    header: 'ID',
+    width: rows => Math.max(2, ...rows.map(test => test.id.length)),
+    render: test => test.id,
+  },
+  {
+    header: 'NAME',
+    width: rows => Math.max(4, ...rows.map(test => test.name.length)),
+    render: test => test.name,
+  },
+  { header: 'TYPE', width: 8, render: test => test.type },
+  { header: 'FROM', width: 6, render: test => test.createdFrom },
+  { header: 'STATUS', width: 9, render: test => test.status },
+  { header: 'UPDATED', width: 0, render: test => test.updatedAt },
+];
+
+function renderTestListText(
+  page: Page<CliTest>,
+  options: { columns?: string; noHeader?: boolean } = {},
+): string {
   if (page.items.length === 0) {
     return page.nextToken ? `No tests on this page.\nnextToken: ${page.nextToken}` : 'No tests.';
   }
-  const idWidth = Math.max(2, ...page.items.map(t => t.id.length));
-  const nameWidth = Math.max(4, ...page.items.map(t => t.name.length));
-  const typeWidth = 8;
-  const fromWidth = 6;
-  const statusWidth = 9;
-
-  const header =
-    pad('ID', idWidth) +
-    '  ' +
-    pad('NAME', nameWidth) +
-    '  ' +
-    pad('TYPE', typeWidth) +
-    '  ' +
-    pad('FROM', fromWidth) +
-    '  ' +
-    pad('STATUS', statusWidth) +
-    '  ' +
-    'UPDATED';
-
-  const rows = page.items.map(
-    t =>
-      pad(t.id, idWidth) +
-      '  ' +
-      pad(t.name, nameWidth) +
-      '  ' +
-      pad(t.type, typeWidth) +
-      '  ' +
-      pad(t.createdFrom, fromWidth) +
-      '  ' +
-      pad(t.status, statusWidth) +
-      '  ' +
-      t.updatedAt,
-  );
-
-  const lines = [header, ...rows];
+  const lines = [
+    renderTextTable(page.items, TEST_LIST_COLUMNS, {
+      columns: options.columns,
+      noHeader: options.noHeader,
+    }),
+  ];
   if (page.nextToken) lines.push('', `nextToken: ${page.nextToken}`);
   return lines.join('\n');
 }
