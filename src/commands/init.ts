@@ -26,6 +26,7 @@ import { runInstall } from './agent.js';
 import { TARGETS, DEFAULT_SKILLS, type AgentTarget } from '../lib/agent-targets.js';
 import type { FetchImpl } from '../lib/http.js';
 import { readProfile } from '../lib/credentials.js';
+import { ensureTestspriteIgnored, checkTestspriteIgnored } from '../lib/git-utils.js';
 
 /** Mirrors auth.ts's DEFAULT_API_URL (kept in sync; auth.ts owns the canonical value). */
 const DEFAULT_API_URL = 'https://api.testsprite.com';
@@ -243,6 +244,18 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
       );
     }
 
+    if (!opts.noAgent) {
+      const projectDir = opts.dir ?? deps.cwd ?? process.cwd();
+      const gitignoreDeps = {
+        exists: deps.fs ? async (p: string) => (await deps.fs!.lstat(p)) !== null : undefined,
+        readFile: deps.fs ? (p: string) => deps.fs!.readFile(p) : undefined,
+      };
+      const isIgnored = await checkTestspriteIgnored(projectDir, gitignoreDeps);
+      if (!isIgnored) {
+        stderrFn('[dry-run] would ignore .testsprite/ in .gitignore');
+      }
+    }
+
     const summary: InitSummary = {
       profile: opts.profile,
       apiUrl: resolveReportedEndpoint(opts, deps),
@@ -351,6 +364,27 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
           `re-run 'testsprite agent install --target ${opts.agent}' after fixing the path`,
       );
       throw installErr;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Step 3.5: Ensure .testsprite/ is ignored in .gitignore
+  // -------------------------------------------------------------------------
+  if (!opts.noAgent) {
+    const projectDir = opts.dir ?? deps.cwd ?? process.cwd();
+    const gitignoreDeps = {
+      exists: deps.fs ? async (p: string) => (await deps.fs!.lstat(p)) !== null : undefined,
+      readFile: deps.fs ? (p: string) => deps.fs!.readFile(p) : undefined,
+      writeFile: deps.fs ? (p: string, content: string) => deps.fs!.writeFile(p, content) : undefined,
+    };
+    try {
+      const appended = await ensureTestspriteIgnored(projectDir, gitignoreDeps);
+      if (appended) {
+        stderrFn('[info] Added .testsprite/ to .gitignore to avoid committing artifacts');
+      }
+    } catch (err) {
+      // Non-blocking warning on gitignore setup error
+      stderrFn(`[warn] Failed to update .gitignore: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
