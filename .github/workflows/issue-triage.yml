@@ -49,7 +49,7 @@ jobs:
           # of inheriting the App's full installation permissions.
           permission-issues: write
 
-      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.0.1
+      - uses: actions/github-script@v8
         with:
           # App token when available (→ testsprite-hob[bot]); else the default
           # GITHUB_TOKEN (→ github-actions[bot]). Either way the logic is identical.

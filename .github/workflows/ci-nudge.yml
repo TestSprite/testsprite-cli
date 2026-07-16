@@ -41,7 +41,7 @@ jobs:
           app-id: ${{ secrets.TESTSPRITE_HOB_APP_ID || secrets.ALFHEIM_AGENT_APP_ID }}
           private-key: ${{ secrets.TESTSPRITE_HOB_PRIVATE_KEY || secrets.ALFHEIM_AGENT_PRIVATE_KEY }}
 
-      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.0.1
+      - uses: actions/github-script@v8
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
         with:
@@ -51,7 +51,7 @@ jobs:
             const marker = process.env.MARKER;
 
             const appClient = process.env.APP_TOKEN
-              ? require('@actions/github').getOctokit(process.env.APP_TOKEN)
+              ? getOctokit(process.env.APP_TOKEN)
               : null;
             async function write(fn) {
               if (appClient) {
