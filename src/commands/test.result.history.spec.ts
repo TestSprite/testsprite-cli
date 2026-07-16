@@ -264,15 +264,45 @@ describe('runResultHistory — text mode', () => {
     expect(output).not.toContain('targetUrl:');
   });
 
-  it('rejects unknown history columns with VALIDATION_ERROR', async () => {
+  it('no-header suppresses only the history header and separator', async () => {
     const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
     const fetchImpl = makeFetch(url => {
       if (url.includes('/tests/test_abc/runs')) {
-        return { body: makeHistoryResp() };
+        return {
+          body: makeHistoryResp([
+            makeHistoryItem({
+              runId: 'run_url_001',
+              targetUrl: 'https://staging.example.com/checkout',
+              targetUrlSource: 'run',
+            }),
+          ]),
+        };
       }
       return { status: 404, body: errorEnvelope('NOT_FOUND') };
     });
 
+    await runResultHistory(
+      {
+        output: 'text',
+        testId: 'test_abc',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => lines.push(line) },
+    );
+
+    const output = lines.join('\n');
+    expect(output).not.toMatch(/^RUN ID/m);
+    expect(output).not.toMatch(/^-+$/m);
+    expect(output).toContain('run_url_001');
+    expect(output).toContain('targetUrl: https://staging.example.com/checkout');
+  });
+
+  it('rejects unknown history columns with VALIDATION_ERROR before auth/network access', async () => {
     await expect(
       runResultHistory(
         {
@@ -284,7 +314,7 @@ describe('runResultHistory — text mode', () => {
           verbose: false,
           columns: 'bogus',
         },
-        { credentialsPath, fetchImpl, stdout: () => undefined },
+        { stdout: () => undefined },
       ),
     ).rejects.toMatchObject({
       code: 'VALIDATION_ERROR',

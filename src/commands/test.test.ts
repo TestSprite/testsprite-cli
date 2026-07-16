@@ -603,12 +603,7 @@ describe('runList', () => {
     expect(out.join('\n')).not.toContain('UPDATED');
   });
 
-  it('text mode rejects unknown columns with VALIDATION_ERROR', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({
-      body: { items: [FE_TEST], nextToken: null },
-    }));
-
+  it('text mode rejects unknown columns with VALIDATION_ERROR before auth/network access', async () => {
     await expect(
       runList(
         {
@@ -619,7 +614,7 @@ describe('runList', () => {
           pageSize: 25,
           columns: 'bogus',
         },
-        { credentialsPath, fetchImpl, stdout: () => undefined },
+        { stdout: () => undefined },
       ),
     ).rejects.toMatchObject({
       code: 'VALIDATION_ERROR',

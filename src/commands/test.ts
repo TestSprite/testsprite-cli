@@ -505,6 +505,9 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
   validateStatusFilter(opts.status);
 
   const out = makeOutput(opts.output, deps);
+  if (opts.output === 'text') {
+    resolveTextColumns(opts.columns, TEST_LIST_COLUMNS);
+  }
   const client = makeClient(opts, deps);
 
   // Match P2's "explicit pageSize ⇒ single-page" convention so an
@@ -4394,6 +4397,9 @@ export async function runResultHistory(
       throw localValidationError('page-size', 'must be between 1 and 100');
     }
   }
+  if (opts.output === 'text') {
+    resolveTextColumns(opts.columns, RUN_HISTORY_TABLE_COLUMNS);
+  }
 
   const client = makeClient(opts, deps);
   const pageSize = opts.pageSize ?? 20;
@@ -4406,7 +4412,7 @@ export async function runResultHistory(
     since: sinceIso,
   });
 
-  if (opts.output === 'json') {
+  if (opts.output !== 'text') {
     out.print({ runs: resp.runs, nextCursor: resp.nextCursor }, data => JSON.stringify(data));
     return resp;
   }
@@ -4524,7 +4530,7 @@ function renderRunHistoryTable(
   const selectedColumns = resolveTextColumns(options.columns, RUN_HISTORY_TABLE_COLUMNS);
   const widths = measureTextColumns(runs, selectedColumns);
   const customColumns = options.columns !== undefined && options.columns.trim() !== '';
-  const includeDetailLines = !customColumns && options.noHeader !== true;
+  const includeDetailLines = !customColumns;
   const header = formatTextTableRow(
     selectedColumns.map(column => column.header),
     widths,

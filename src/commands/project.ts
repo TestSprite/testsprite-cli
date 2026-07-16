@@ -12,7 +12,7 @@ import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { assertNotLocal } from '../lib/target-url.js';
-import { renderTextTable, type TextTableColumn } from '../lib/text-table.js';
+import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
 import {
   fetchSinglePage,
@@ -60,6 +60,9 @@ export async function runList(
     startingToken: opts.startingToken,
     maxItems: opts.maxItems,
   });
+  if (opts.output === 'text') {
+    resolveTextColumns(opts.columns, PROJECT_LIST_COLUMNS);
+  }
   const client = makeClient(opts, deps);
 
   // When the user explicitly passed a page-size flag and did NOT ask

@@ -310,12 +310,7 @@ describe('runList', () => {
     expect(block).not.toContain('CREATED');
   });
 
-  it('text output rejects unknown columns with VALIDATION_ERROR', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({
-      body: { items: [PROJECT_FIXTURE], nextToken: null },
-    }));
-
+  it('text output rejects unknown columns with VALIDATION_ERROR before auth/network access', async () => {
     await expect(
       runList(
         {
@@ -325,7 +320,7 @@ describe('runList', () => {
           pageSize: 25,
           columns: 'bogus',
         },
-        { credentialsPath, fetchImpl, stdout: () => undefined },
+        { stdout: () => undefined },
       ),
     ).rejects.toMatchObject({
       code: 'VALIDATION_ERROR',
