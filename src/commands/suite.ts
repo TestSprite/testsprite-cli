@@ -13,10 +13,16 @@ import { Command } from 'commander';
 import {
   makeHttpClient,
   parseRequestTimeoutFlag,
+  resolveRequestTimeoutMs,
   type CommonOptions,
 } from '../lib/client-factory.js';
-import { localValidationError } from '../lib/errors.js';
-import type { FetchImpl, HttpClient } from '../lib/http.js';
+import {
+  ApiError,
+  RequestTimeoutError,
+  TransportError,
+  localValidationError,
+} from '../lib/errors.js';
+import { createRequestTimeout, type FetchImpl, type HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { paginate, type Page } from '../lib/pagination.js';
 import type {
@@ -430,12 +436,19 @@ export async function runSuiteApply(
     if (item.action === 'noop') {
       unchanged.push(item.key);
       if (item.testId) {
-        lock.entries[item.key] = makeCompletedLockEntry(
-          item.testId,
-          item.remoteCode?.codeVersion,
-          item.desiredHash,
-          deps,
-        );
+        const existing = lock.entries[item.key];
+        const meaningfulFieldsMatch =
+          existing?.testId === item.testId &&
+          existing.codeVersion === item.remoteCode?.codeVersion &&
+          existing.desiredHash === item.desiredHash;
+        if (!meaningfulFieldsMatch) {
+          lock.entries[item.key] = makeCompletedLockEntry(
+            item.testId,
+            item.remoteCode?.codeVersion,
+            item.desiredHash,
+            deps,
+          );
+        }
       }
       continue;
     }
@@ -631,6 +644,7 @@ async function calculateSuitePlan(
 
   const claimedRemoteIds = new Set<string>();
   const items: ResolvedPlanItem[] = [];
+  const requestTimeoutMs = resolveRequestTimeoutMs(opts, deps.env ?? process.env);
   for (const spec of context.manifest.tests) {
     const desiredCode = context.codeByKey.get(spec.key)!;
     const desiredHashValue = context.desiredHashByKey.get(spec.key)!;
@@ -729,7 +743,11 @@ async function calculateSuitePlan(
       continue;
     }
     const remoteCode = await client.get<CliTestCode>(`/tests/${encodeURIComponent(testId)}/code`);
-    const remoteCodeBody = await resolveRemoteCode(remoteCode.code, deps.fetchImpl);
+    const remoteCodeBody = await resolveRemoteCode(
+      remoteCode.code,
+      deps.fetchImpl,
+      requestTimeoutMs,
+    );
     const changes = diffSuiteTest(spec, desiredCode, remote, remoteCodeBody);
     items.push({
       key: spec.key,
@@ -828,16 +846,34 @@ function createBody(
   };
 }
 
-async function resolveRemoteCode(code: string, fetchImpl?: FetchImpl): Promise<string> {
+async function resolveRemoteCode(
+  code: string,
+  fetchImpl: FetchImpl | undefined,
+  requestTimeoutMs: number,
+): Promise<string> {
   if (!code.startsWith('https://')) return code;
-  const response = await (fetchImpl ?? globalThis.fetch)(code);
-  if (!response.ok) {
-    throw localValidationError(
-      'suite',
-      `failed to download remote test code (HTTP ${response.status})`,
-    );
+  const requestTimeout = createRequestTimeout(requestTimeoutMs);
+  try {
+    const response = await (fetchImpl ?? globalThis.fetch)(code, {
+      signal: requestTimeout.signal,
+    });
+    if (!response.ok) {
+      throw localValidationError(
+        'suite',
+        `failed to download remote test code (HTTP ${response.status})`,
+      );
+    }
+    return await response.text();
+  } catch (error) {
+    if (error instanceof ApiError || error instanceof RequestTimeoutError) throw error;
+    if (requestTimeout.signal.aborted) {
+      throw new RequestTimeoutError(requestTimeoutMs);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new TransportError(`Failed to download remote test code: ${message}`);
+  } finally {
+    requestTimeout.clear();
   }
-  return response.text();
 }
 
 function loadSuiteLock(path: string, projectId: string): SuiteLock {
@@ -878,13 +914,13 @@ function loadSuiteLock(path: string, projectId: string): SuiteLock {
       throw localValidationError('lock-file', `entry ${key} is malformed`);
     }
     entries[key] = {
-      desiredHash: value.desiredHash,
-      updatedAt: value.updatedAt,
       ...(typeof value.testId === 'string' ? { testId: value.testId } : {}),
       ...(typeof value.codeVersion === 'string' || value.codeVersion === null
         ? { codeVersion: value.codeVersion }
         : {}),
+      desiredHash: value.desiredHash,
       ...(typeof value.createKey === 'string' ? { createKey: value.createKey } : {}),
+      updatedAt: value.updatedAt,
     };
   }
   return { schemaVersion: LOCK_SCHEMA_VERSION, projectId, entries };

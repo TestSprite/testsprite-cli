@@ -289,6 +289,60 @@ describe('suite plan', () => {
     expect(plan.items[0]).toMatchObject({ action: 'conflict' });
     expect(plan.items[0]?.reason).toContain('add testId');
   });
+
+  it('times out stalled presigned code downloads using the configured request deadline', async () => {
+    const { manifestPath } = writeSuite([
+      { key: 'slow', testId: 'test_slow', name: 'Slow', codeFile: 'slow.py' },
+    ]);
+    const fetchImpl: FetchImpl = async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/tests')) {
+        return json({
+          items: [
+            {
+              id: 'test_slow',
+              projectId: 'proj_suite_1',
+              name: 'Slow',
+              type: 'backend',
+              createdFrom: 'cli',
+              status: 'ready',
+              produces: [],
+              consumes: [],
+              createdAt: '2026-01-01T00:00:00.000Z',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+            },
+          ],
+          nextToken: null,
+        });
+      }
+      if (url.pathname.endsWith('/tests/test_slow/code')) {
+        return json({
+          testId: 'test_slow',
+          language: 'python',
+          framework: 'pytest',
+          code: 'https://storage.example.test/slow.py',
+          codeVersion: 'v1',
+        });
+      }
+      if (url.hostname === 'storage.example.test') {
+        return new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (!signal) {
+            reject(new Error('expected a request timeout signal'));
+            return;
+          }
+          const rejectFromAbort = () => reject(signal.reason);
+          if (signal.aborted) rejectFromAbort();
+          else signal.addEventListener('abort', rejectFromAbort, { once: true });
+        });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    };
+
+    await expect(
+      runSuitePlan({ ...common(fetchImpl), manifestPath, requestTimeoutMs: 1 }, common(fetchImpl)),
+    ).rejects.toMatchObject({ name: 'RequestTimeoutError', timeoutMs: 1_000 });
+  });
 });
 
 describe('suite apply', () => {
@@ -398,6 +452,108 @@ describe('suite apply', () => {
       code: 'VALIDATION_ERROR',
       nextAction: expect.stringContaining('required to apply 1 suite mutation'),
     });
+  });
+
+  it('refuses to apply a plan containing conflicts without sending mutations', async () => {
+    const { manifestPath } = writeSuite([{ key: 'health', name: 'Health', codeFile: 'health.py' }]);
+    let mutations = 0;
+    const fetchImpl: FetchImpl = async (_input, init) => {
+      if ((init?.method ?? 'GET') !== 'GET') mutations += 1;
+      return json({
+        items: [
+          {
+            id: 'test_existing',
+            projectId: 'proj_suite_1',
+            name: 'Health',
+            type: 'backend',
+            createdFrom: 'portal',
+            status: 'ready',
+            createdAt: '2026-01-01T00:00:00.000Z',
+            updatedAt: '2026-01-01T00:00:00.000Z',
+          },
+        ],
+        nextToken: null,
+      });
+    };
+
+    await expect(
+      runSuiteApply({ ...common(fetchImpl), manifestPath, confirm: true }, common(fetchImpl)),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      nextAction: expect.stringContaining('plan contains 1 conflict'),
+    });
+    expect(mutations).toBe(0);
+  });
+
+  it('does not churn an unchanged lock entry timestamp on repeated apply', async () => {
+    const { manifestPath, lockPath } = writeSuite([
+      { key: 'health', name: 'Health', codeFile: 'health.py' },
+    ]);
+    const createFetch: FetchImpl = async (input, init) => {
+      const url = new URL(String(input));
+      if ((init?.method ?? 'GET') === 'GET' && url.pathname.endsWith('/tests')) {
+        return json({ items: [], nextToken: null });
+      }
+      if ((init?.method ?? 'GET') === 'POST' && url.pathname.endsWith('/tests')) {
+        return json({
+          testId: 'test_health',
+          type: 'backend',
+          codeVersion: 'v1',
+          createdAt: 'now',
+        });
+      }
+      throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url.pathname}`);
+    };
+    await runSuiteApply(
+      { ...common(createFetch), manifestPath, confirm: true },
+      common(createFetch),
+    );
+    const before = readFileSync(lockPath, 'utf8');
+
+    const noopFetch: FetchImpl = async input => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/tests')) {
+        return json({
+          items: [
+            {
+              id: 'test_health',
+              projectId: 'proj_suite_1',
+              name: 'Health',
+              type: 'backend',
+              createdFrom: 'cli',
+              status: 'ready',
+              produces: [],
+              consumes: [],
+              createdAt: '2026-01-01T00:00:00.000Z',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+            },
+          ],
+          nextToken: null,
+        });
+      }
+      if (url.pathname.endsWith('/tests/test_health/code')) {
+        return json({
+          testId: 'test_health',
+          language: 'python',
+          framework: 'pytest',
+          code: 'def test_health():\n    assert True\n',
+          codeVersion: 'v1',
+        });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    };
+    const later = {
+      ...common(noopFetch),
+      now: () => new Date('2026-07-22T12:00:00.000Z'),
+    };
+    const result = await runSuiteApply({ ...later, manifestPath, confirm: true }, later);
+
+    expect('summary' in result && result.summary).toEqual({
+      created: 0,
+      updated: 0,
+      unchanged: 1,
+    });
+    expect(readFileSync(lockPath, 'utf8')).toBe(before);
   });
 
   it('resumes an unchanged pending create and conflicts if its definition drifted', async () => {

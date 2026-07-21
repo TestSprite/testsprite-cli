@@ -828,12 +828,12 @@ function newRequestId(): string {
   return `cli_${randomUUID()}`;
 }
 
-interface RequestTimeoutHandle {
+export interface RequestTimeoutHandle {
   signal: AbortSignal;
   clear: () => void;
 }
 
-function createRequestTimeout(timeoutMs: number): RequestTimeoutHandle {
+export function createRequestTimeout(timeoutMs: number): RequestTimeoutHandle {
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort(makeTimeoutReason());
