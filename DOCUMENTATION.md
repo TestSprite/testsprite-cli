@@ -11,6 +11,7 @@ The full reference for the TestSprite CLI: install verification, manual setup, e
 - [Manual setup](#manual-setup)
 - [The complete agent loop](#the-complete-agent-loop)
 - [Agent onboarding (`agent install`)](#agent-onboarding-agent-install)
+- [Declarative backend suites (`suite`)](#declarative-backend-suites-suite)
 - [Command reference](#command-reference)
   - [Read commands](#read-commands)
   - [Write commands](#write-commands)
@@ -45,7 +46,7 @@ testsprite --version
 testsprite project list --dry-run --output json
 ```
 
-`--dry-run` is a global flag that skips the network, credentials, and the local filesystem and emits a canned sample matching the API contract. It's the right way to confirm an install or learn the surface before configuring auth — the response _shapes_ match the wire contract, but the data is fake.
+`--dry-run` is a global flag that skips the network, credentials, and filesystem writes and emits a canned sample matching the API contract. File-backed plan inputs and Suitefile manifests/code are still read and validated locally. It's the right way to confirm an install or learn the surface before configuring auth — the response _shapes_ match the wire contract, but the remote data is fake.
 
 ## Manual setup
 
@@ -130,6 +131,67 @@ Omitting `--target` in a non-interactive shell (CI, agent subprocess) defaults t
 The `codex` target uses **managed-section mode** — it writes only a sentinel-delimited section inside your existing `AGENTS.md`, so your project instructions are never clobbered. Re-running without `--force` replaces the section in-place; user content outside the sentinels is always preserved.
 
 Re-running with `--force` on **own-file targets** (claude, cursor, cline, antigravity, kiro, windsurf, copilot) backs up the existing file to `<path>.bak` first.
+
+## Declarative backend suites (`suite`)
+
+A Suitefile keeps a backend test suite in source control: test identity, metadata, Python source paths, and data dependencies. The CLI validates the complete local definition, compiles `produces`/`consumes` into deterministic execution waves, compares it with the remote project, then performs only the reviewed creates and updates.
+
+```json
+{
+  "schemaVersion": 1,
+  "projectId": "proj_xxxxxxxx",
+  "tests": [
+    {
+      "key": "auth/session",
+      "name": "Create API session",
+      "codeFile": "tests/auth_session.py",
+      "priority": "p0",
+      "produces": ["session_token"],
+      "category": "setup"
+    },
+    {
+      "key": "orders/create",
+      "name": "Create order",
+      "codeFile": "tests/create_order.py",
+      "consumes": ["session_token"]
+    },
+    {
+      "key": "orders/cleanup",
+      "name": "Clean up order data",
+      "codeFile": "tests/cleanup.py",
+      "category": "teardown"
+    }
+  ]
+}
+```
+
+Paths are relative to the Suitefile and must resolve to contained `.py` files. Unknown fields, duplicate keys/test ids, missing or ambiguous producers, self-dependencies, cycles, lexical or symlink path escapes, and oversized code files fail locally before credentials or network are touched. `teardown` and `cleanup` tests are forced behind non-teardown tests.
+
+```bash
+# Pure-local checks
+testsprite suite validate ./testsprite.suite.json
+testsprite suite graph ./testsprite.suite.json --output json
+
+# Live comparison; makes no changes
+testsprite suite plan ./testsprite.suite.json
+
+# Fully validate locally without credentials/network
+testsprite suite plan ./testsprite.suite.json --dry-run --output json
+
+# Apply exactly the create/update plan
+testsprite suite apply ./testsprite.suite.json --confirm
+```
+
+The adjacent `testsprite.suite.lock.json` records stable suite-key → remote-test identity, code version, and desired-state hash. Check it into source control with the manifest. You can override its location with `--lock-file <path>`.
+
+Safety rules are deliberately strict:
+
+- Existing tests are adopted only through an explicit manifest `testId` or the lockfile. A same-name remote test is a conflict, not an implicit match.
+- Unmanaged remote tests are reported by `plan` and are **never deleted** by `apply`.
+- Backend tests only are supported in schema version 1; an adopted frontend test is a conflict.
+- Creates and updates use deterministic idempotency keys. The lockfile is written atomically, and interrupted creates retain their request identity for safe replay; changing the definition while a create is pending produces a conflict.
+- `name`, Python code, `produces`, and `consumes` are authoritative. Omitted `produces`/`consumes` mean empty lists. `priority` and `category` are changed only when declared.
+- `apply` requires `--confirm` whenever the plan contains a mutation. It refuses any plan containing conflicts.
 
 ## Command reference
 

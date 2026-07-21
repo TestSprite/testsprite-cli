@@ -209,6 +209,87 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 "
 `;
 
+exports[`--help snapshots > suite 1`] = `
+"Usage: testsprite suite [options] [command]
+
+Validate, plan, and apply a declarative backend test suite from a versioned
+Suitefile
+
+Options:
+  -h, --help                     display help for command
+
+Commands:
+  validate [options] <manifest>  Validate Suitefile structure, code paths,
+                                 dependencies, and execution waves locally
+  graph [options] <manifest>     Compile produces/consumes declarations into
+                                 deterministic execution waves
+  plan [options] <manifest>      Compare the Suitefile with the remote project
+                                 without changing either side
+  apply [options] <manifest>     Create and update backend tests from a
+                                 previously reviewed Suitefile plan
+  help [command]                 display help for command
+"
+`;
+
+exports[`--help snapshots > suite apply 1`] = `
+"Usage: testsprite suite apply [options] <manifest>
+
+Create and update backend tests from a previously reviewed Suitefile plan
+
+Options:
+  --lock-file <path>  override the adjacent *.lock.json path
+  --confirm           required before remote mutations; deletions are never
+                      performed (default: false)
+  -h, --help          display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > suite graph 1`] = `
+"Usage: testsprite suite graph [options] <manifest>
+
+Compile produces/consumes declarations into deterministic execution waves
+
+Options:
+  --lock-file <path>  override the adjacent *.lock.json path
+  -h, --help          display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > suite plan 1`] = `
+"Usage: testsprite suite plan [options] <manifest>
+
+Compare the Suitefile with the remote project without changing either side
+
+Options:
+  --lock-file <path>  override the adjacent *.lock.json path
+  -h, --help          display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > suite validate 1`] = `
+"Usage: testsprite suite validate [options] <manifest>
+
+Validate Suitefile structure, code paths, dependencies, and execution waves
+locally
+
+Options:
+  --lock-file <path>  override the adjacent *.lock.json path
+  -h, --help          display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
 exports[`--help snapshots > test 1`] = `
 "Usage: testsprite test [options] [command]
 
@@ -738,9 +819,9 @@ Options:
   --dry-run                    Skip the network and credentials; emit a canned
                                sample matching the OpenAPI contract. Useful for
                                learning the CLI surface without an API key.
-                               Note: file inputs you pass
-                               (--plan-from/--plans/--steps) are still read and
-                               validated locally; only --code-file uses a
+                               Note: plan/step inputs and Suitefile
+                               manifests/code are still read and validated
+                               locally; only standalone test --code-file uses a
                                placeholder.
   --request-timeout <seconds>  Client-side per-request timeout in seconds
                                (default: 120). Aborts any single fetch that
@@ -758,6 +839,8 @@ Commands:
   auth                         Manage TestSprite credentials
   project                      Manage TestSprite projects
   test                         Inspect TestSprite tests
+  suite                        Validate, plan, and apply a declarative backend
+                               test suite from a versioned Suitefile
   agent                        Install TestSprite guidance into coding-agent
                                config (Claude Code, Cursor, Cline, Antigravity,
                                Kiro, Windsurf, Copilot, Codex)

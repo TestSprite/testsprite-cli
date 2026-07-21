@@ -11,6 +11,7 @@ import {
   runConfigureViaSetup,
 } from './commands/init.js';
 import { createProjectCommand } from './commands/project.js';
+import { createSuiteCommand } from './commands/suite.js';
 import { createTestCommand } from './commands/test.js';
 import { createUsageCommand } from './commands/usage.js';
 import { ApiError, CLIError, InterruptError, RequestTimeoutError } from './lib/errors.js';
@@ -53,7 +54,7 @@ program
   .option('--debug', 'Print HTTP method/path, request id, latency, retry decisions to stderr')
   .option(
     '--dry-run',
-    'Skip the network and credentials; emit a canned sample matching the OpenAPI contract. Useful for learning the CLI surface without an API key. Note: file inputs you pass (--plan-from/--plans/--steps) are still read and validated locally; only --code-file uses a placeholder.',
+    'Skip the network and credentials; emit a canned sample matching the OpenAPI contract. Useful for learning the CLI surface without an API key. Note: plan/step inputs and Suitefile manifests/code are still read and validated locally; only standalone test --code-file uses a placeholder.',
   )
   .option(
     '--request-timeout <seconds>',
@@ -90,6 +91,7 @@ program.addCommand(authCommand);
 
 program.addCommand(createProjectCommand({}));
 program.addCommand(createTestCommand());
+program.addCommand(createSuiteCommand());
 program.addCommand(createAgentCommand({}));
 program.addCommand(createUsageCommand());
 program.addCommand(createDoctorCommand());
