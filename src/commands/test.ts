@@ -4065,6 +4065,244 @@ export interface CliLintReport {
 }
 
 /**
+ * Deterministic on-disk test DEFINITION (issue #125): the round-trippable
+ * subset of a test (metadata + code) with provenance, so definitions can be
+ * version-controlled, reviewed, backed up, and migrated. DISTINCT from the
+ * JUnit RESULTS export: this is what the test IS, not what a run produced.
+ * Stable key order comes from constructing the object literal in one place.
+ */
+export interface CliTestDefinition {
+  schemaVersion: 1;
+  /** Present on exports; on import, its presence selects update-vs-create. */
+  testId?: string;
+  projectId: string;
+  type: 'frontend' | 'backend';
+  name: string;
+  description?: string;
+  code?: {
+    language: string;
+    framework: string;
+    body: string;
+    /** Optimistic-concurrency provenance; import replays it as If-Match. */
+    codeVersion: string | null;
+  };
+  /**
+   * Honest-limitation marker: a frontend test's authored planSteps[] is
+   * write-only on the wire (PUT exists, no GET), so an FE export carries
+   * metadata + generated code only.
+   */
+  planUnavailable?: true;
+}
+
+export interface ExportOptions extends CommonOptions {
+  testId: string;
+  out?: string;
+  force: boolean;
+}
+
+/** `test export <test-id>` (issue #125): write the definition file. */
+export async function runExport(
+  opts: ExportOptions,
+  deps: TestDeps = {},
+): Promise<CliTestDefinition> {
+  const out = makeOutput(opts.output, deps);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+
+  if (opts.dryRun) {
+    emitDryRunBanner(stderrFn);
+    const sample: CliTestDefinition = {
+      schemaVersion: 1,
+      testId: opts.testId,
+      projectId: 'p_dryrun_2026',
+      type: 'backend',
+      name: 'Sample exported test',
+      code: { language: 'python', framework: 'pytest', body: '# dry-run', codeVersion: 'v1' },
+    };
+    out.print(sample, () => JSON.stringify(sample, null, 2));
+    return sample;
+  }
+
+  const client = makeClient(opts, deps);
+  const test = await client.get<CliTest>(`/tests/${encodeURIComponent(opts.testId)}`);
+  // The generated code may not exist yet (fresh FE test): NOT_FOUND means
+  // "no code portion", every other error propagates unchanged.
+  let code: CliTestCode | undefined;
+  try {
+    code = await client.get<CliTestCode>(`/tests/${encodeURIComponent(opts.testId)}/code`);
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'NOT_FOUND') code = undefined;
+    else throw err;
+  }
+
+  const description = (test as { description?: string }).description;
+  const definition: CliTestDefinition = {
+    schemaVersion: 1,
+    testId: opts.testId,
+    projectId: test.projectId,
+    type: test.type === 'backend' ? 'backend' : 'frontend',
+    name: test.name,
+    ...(typeof description === 'string' && description.length > 0 ? { description } : {}),
+    ...(code !== undefined
+      ? {
+          code: {
+            language: code.language,
+            framework: code.framework,
+            body: code.code,
+            codeVersion: code.codeVersion,
+          },
+        }
+      : {}),
+    ...(test.type === 'frontend' ? { planUnavailable: true as const } : {}),
+  };
+  if (definition.planUnavailable === true) {
+    stderrFn(
+      'note: frontend planSteps[] are write-only on the API; this export carries metadata + generated code only (planUnavailable: true)',
+    );
+  }
+
+  const fileBody = `${JSON.stringify(definition, null, 2)}\n`;
+  if (opts.out !== undefined) {
+    const resolved = isAbsolute(opts.out) ? opts.out : resolve(process.cwd(), opts.out);
+    if (!opts.force && existsSync(resolved)) {
+      throw localValidationError('out', `already exists: ${resolved}. Pass --force to overwrite`);
+    }
+    const sink = openOutputFile(opts.out);
+    const fileOut = makeFileOutput(opts.output, sink);
+    await fileOut.writeChunk(fileBody);
+    await closeOutputFile(sink, true);
+    stderrFn(`Definition written to ${resolved}`);
+    return definition;
+  }
+  out.print(definition, () => fileBody.trimEnd());
+  return definition;
+}
+
+export interface ImportOptions extends CommonOptions {
+  file: string;
+}
+
+/**
+ * `test import <file>` (issue #125): create or update a test from a
+ * definition file. A `testId` in the file selects update (metadata PUT +
+ * code PUT with the recorded codeVersion as If-Match, so a drifted server
+ * copy fails loudly with the existing 412 contract); no `testId` creates
+ * (`POST /tests` with the same body shape `test create` sends).
+ */
+export async function runImport(
+  opts: ImportOptions,
+  deps: TestDeps = {},
+): Promise<{ testId: string; action: 'created' | 'updated' }> {
+  const out = makeOutput(opts.output, deps);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+
+  const absolute = resolveAbsolute(opts.file);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(absolute, 'utf8'));
+  } catch {
+    throw localValidationError(
+      'file',
+      `is not readable valid JSON: ${absolute}`,
+      undefined,
+      'field',
+    );
+  }
+  const def = parsed as Partial<CliTestDefinition>;
+  if (def.schemaVersion !== 1) {
+    throw localValidationError('schemaVersion', 'must be 1', [1], 'field');
+  }
+  if (typeof def.projectId !== 'string' || def.projectId.length === 0) {
+    throw localValidationError('projectId', 'is required', undefined, 'field');
+  }
+  if (def.type !== 'frontend' && def.type !== 'backend') {
+    throw localValidationError(
+      'type',
+      "must be 'frontend' or 'backend'",
+      ['frontend', 'backend'],
+      'field',
+    );
+  }
+  if (typeof def.name !== 'string' || def.name.trim().length === 0) {
+    throw localValidationError('name', 'is required', undefined, 'field');
+  }
+
+  if (opts.dryRun) {
+    emitDryRunBanner(stderrFn);
+    const sample = {
+      testId: def.testId ?? 'test_dryrun_imported',
+      action: (def.testId !== undefined ? 'updated' : 'created') as 'created' | 'updated',
+    };
+    out.print(
+      sample,
+      data => `${(data as { action: string }).action}: ${(data as { testId: string }).testId}`,
+    );
+    return sample;
+  }
+
+  const client = makeClient(opts, deps);
+  if (typeof def.testId === 'string' && def.testId.length > 0) {
+    const testId = def.testId;
+    await client.put(`/tests/${encodeURIComponent(testId)}`, {
+      body: {
+        name: def.name.trim(),
+        ...(def.description !== undefined ? { description: def.description } : {}),
+      },
+      headers: { 'idempotency-key': `cli-import-meta-${randomUUID()}` },
+    });
+    if (def.code !== undefined && typeof def.code.body === 'string') {
+      await client.put(`/tests/${encodeURIComponent(testId)}/code`, {
+        body: { code: def.code.body },
+        headers: {
+          'idempotency-key': `cli-import-code-${randomUUID()}`,
+          // Replay the recorded provenance so a server copy that moved on
+          // fails with the existing 412 PRECONDITION_FAILED contract instead
+          // of being silently clobbered.
+          ...(def.code.codeVersion !== null && def.code.codeVersion !== undefined
+            ? { 'if-match': def.code.codeVersion }
+            : {}),
+        },
+      });
+    }
+    const result = { testId, action: 'updated' as const };
+    out.print(result, () => `updated: ${testId}`);
+    return result;
+  }
+
+  const created = await client.post<{ testId: string }>('/tests', {
+    body: {
+      projectId: def.projectId,
+      type: def.type,
+      name: def.name.trim(),
+      ...(def.description !== undefined ? { description: def.description } : {}),
+      ...(def.code !== undefined ? { code: def.code.body } : {}),
+    },
+    headers: { 'idempotency-key': `cli-import-create-${randomUUID()}` },
+  });
+  const result = { testId: created.testId, action: 'created' as const };
+  out.print(result, () => `created: ${created.testId}`);
+  return result;
+}
+
+export interface LintOptions extends CommonOptions {
+  planFrom?: string;
+  planFromDir?: string;
+  plans?: string;
+  steps?: string;
+}
+
+export interface CliLintIssue {
+  file: string;
+  field: string;
+  reason: string;
+}
+
+export interface CliLintReport {
+  checked: number;
+  valid: number;
+  issues: CliLintIssue[];
+}
+
+/**
  * `test lint` (issue #98): validate plan/steps files fully OFFLINE with the
  * SAME validators the create paths run, but collecting EVERY problem instead
  * of dying on the first one, and without any network write. The create-batch
@@ -8844,6 +9082,38 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (runA: string, runB: string, _cmdOpts: unknown, command: Command) => {
       await runDiff({ ...resolveCommonOptions(command), runA, runB }, deps);
+    });
+
+  test
+    .command('export <test-id>')
+    .description(
+      'Export the test DEFINITION (metadata + code, with codeVersion provenance) to a versionable JSON file. Frontend plans are write-only on the API, so FE exports carry planUnavailable: true.',
+    )
+    .option('--out <file>', 'write to a file instead of stdout')
+    .option('--force', 'overwrite an existing --out file', false)
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(
+      async (testId: string, cmdOpts: { out?: string; force?: boolean }, command: Command) => {
+        await runExport(
+          {
+            ...resolveCommonOptions(command),
+            testId,
+            out: cmdOpts.out,
+            force: cmdOpts.force === true,
+          },
+          deps,
+        );
+      },
+    );
+
+  test
+    .command('import <file>')
+    .description(
+      'Create or update a test from a definition file produced by `test export`: a testId in the file updates (code PUT replays the recorded codeVersion as If-Match), no testId creates.',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (file: string, _cmdOpts: unknown, command: Command) => {
+      await runImport({ ...resolveCommonOptions(command), file }, deps);
     });
 
   test

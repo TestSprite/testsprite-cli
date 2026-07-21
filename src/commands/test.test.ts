@@ -31,6 +31,8 @@ import {
   runFailureGet,
   runFailureSummary,
   runGet,
+  runExport,
+  runImport,
   runLint,
   runList,
   runOpen,
@@ -128,9 +130,11 @@ describe('createTestCommand — surface', () => {
       'delete',
       'delete-batch',
       'diff',
+      'export',
       'failure',
       'flaky',
       'get',
+      'import',
       'lint',
       'list',
       'open',
@@ -3255,6 +3259,153 @@ describe('runDiff', () => {
       statusA: 'passed',
       statusB: 'failed',
     });
+  });
+});
+
+describe('runExport / runImport', () => {
+  const TEST_ROW = {
+    id: 'test_be',
+    projectId: 'project_alice',
+    projectName: 'Alice',
+    name: 'Health check',
+    type: 'backend',
+    createdFrom: 'cli',
+    status: 'ready',
+    createdAt: '2026-06-01T10:00:00.000Z',
+    updatedAt: '2026-06-01T10:00:00.000Z',
+  };
+  const CODE_ROW = {
+    testId: 'test_be',
+    language: 'python',
+    framework: 'pytest',
+    code: 'import requests\n',
+    codeVersion: 'v3',
+  };
+
+  it('export composes metadata + code with codeVersion provenance (backend: lossless)', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => ({ body: url.includes('/code') ? CODE_ROW : TEST_ROW }));
+    const out: string[] = [];
+    const definition = await runExport(
+      { profile: 'default', output: 'json', debug: false, testId: 'test_be', force: false },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    expect(definition).toMatchObject({
+      schemaVersion: 1,
+      testId: 'test_be',
+      projectId: 'project_alice',
+      type: 'backend',
+      code: { language: 'python', body: 'import requests\n', codeVersion: 'v3' },
+    });
+    expect(definition.planUnavailable).toBeUndefined();
+    expect(JSON.parse(out.join('')) as unknown).toEqual(definition);
+  });
+
+  it('a frontend export declares planUnavailable and warns on stderr', async () => {
+    const { credentialsPath } = makeCreds();
+    const feRow = { ...TEST_ROW, id: 'test_fe2', type: 'frontend' };
+    const fetchImpl = makeFetch(url => ({ body: url.includes('/code') ? CODE_ROW : feRow }));
+    const errs: string[] = [];
+    const definition = await runExport(
+      { profile: 'default', output: 'json', debug: false, testId: 'test_fe2', force: false },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: line => errs.push(line) },
+    );
+    expect(definition.planUnavailable).toBe(true);
+    expect(errs.join('\n')).toContain('write-only');
+  });
+
+  it('import without testId creates via POST /tests with the definition body', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-import-'));
+    const file = join(dir, 'def.testsprite.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 1,
+        projectId: 'project_alice',
+        type: 'backend',
+        name: 'Imported test',
+        code: { language: 'python', framework: 'pytest', body: 'print(1)\n', codeVersion: null },
+      }),
+      'utf8',
+    );
+    const seen: Array<{ url: string; method: string; body: unknown }> = [];
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      seen.push({
+        url: String(input),
+        method: init.method ?? 'GET',
+        body: init.body === undefined ? undefined : JSON.parse(init.body as string),
+      });
+      return new Response(JSON.stringify({ testId: 'test_new' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const result = await runImport(
+      { profile: 'default', output: 'json', debug: false, file },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(result).toEqual({ testId: 'test_new', action: 'created' });
+    expect(seen[0]!.method).toBe('POST');
+    expect(seen[0]!.body).toMatchObject({
+      projectId: 'project_alice',
+      type: 'backend',
+      name: 'Imported test',
+      code: 'print(1)\n',
+    });
+  });
+
+  it('import with testId updates metadata then PUTs the code with If-Match provenance', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-import-upd-'));
+    const file = join(dir, 'def.testsprite.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 1,
+        testId: 'test_be',
+        projectId: 'project_alice',
+        type: 'backend',
+        name: 'Renamed test',
+        code: { language: 'python', framework: 'pytest', body: 'print(2)\n', codeVersion: 'v3' },
+      }),
+      'utf8',
+    );
+    const seen: Array<{ url: string; method: string; ifMatch: string | null }> = [];
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      const headers = new Headers(init.headers);
+      seen.push({
+        url: String(input),
+        method: init.method ?? 'GET',
+        ifMatch: headers.get('if-match'),
+      });
+      return new Response(JSON.stringify({ testId: 'test_be' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const result = await runImport(
+      { profile: 'default', output: 'json', debug: false, file },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(result).toEqual({ testId: 'test_be', action: 'updated' });
+    expect(seen).toHaveLength(2);
+    expect(seen[0]!.method).toBe('PUT');
+    expect(seen[0]!.url).toContain('/tests/test_be');
+    expect(seen[1]!.url).toContain('/tests/test_be/code');
+    expect(seen[1]!.ifMatch).toBe('v3');
+  });
+
+  it('import rejects a wrong schemaVersion with a field-level VALIDATION_ERROR', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-import-bad-'));
+    const file = join(dir, 'def.json');
+    writeFileSync(file, JSON.stringify({ schemaVersion: 2 }), 'utf8');
+    await expect(
+      runImport(
+        { profile: 'default', output: 'json', debug: false, file },
+        { stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 });
 
