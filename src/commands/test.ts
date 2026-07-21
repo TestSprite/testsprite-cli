@@ -2888,6 +2888,17 @@ async function runBatchRun(
           })
         : batchRunResults;
     out.print({ results: enrichedResults });
+  } else if (!opts.wait) {
+    // Text mode, no --wait: statuses are non-terminal by design ('queued'),
+    // so a pass/fail summary would misread a successful dispatch as
+    // "0/N passed". Report what actually happened: triggers.
+    const total = batchRunResults.length;
+    const erroredCount = batchRunResults.filter(r => r.error !== undefined).length;
+    const parts = [`${total - erroredCount}/${total} triggered`];
+    if (erroredCount > 0) {
+      parts.push(`${erroredCount} trigger error${erroredCount !== 1 ? 's' : ''}`);
+    }
+    stderrFn(`batch-run summary: ${parts.join(', ')}`);
   } else {
     // Text mode: print summary line.
     const passed = batchRunResults.filter(r => r.status === 'passed').length;
@@ -2906,20 +2917,23 @@ async function runBatchRun(
     stderrFn(`batch-run summary: ${parts.join(', ')}`);
   }
 
-  // Determine exit code.
-  const allPassed = batchRunResults.every(r => r.status === 'passed');
-  if (allPassed) return; // exit 0
+  // Determine exit code. With --wait, success means every run reached the
+  // terminal status 'passed'. Without --wait, statuses are non-terminal by
+  // design ('queued' per CliBatchRunResult), so success means every trigger
+  // dispatched without error — mirroring single `test run` (no --wait),
+  // which exits 0 on a successful queued dispatch.
+  const failing = opts.wait
+    ? batchRunResults.filter(r => r.status !== 'passed')
+    : batchRunResults.filter(r => r.error !== undefined);
+  if (failing.length === 0) return; // exit 0
 
-  // Check for a uniform non-pass exit code across all non-passed results.
-  const errorExitCodes = batchRunResults
-    .filter(r => r.error !== undefined)
-    .map(r => r.error!.exitCode);
-  const nonPassedStatuses = batchRunResults.filter(r => r.status !== 'passed');
+  // Check for a uniform non-pass exit code across all failing results.
+  const errorExitCodes = failing.filter(r => r.error !== undefined).map(r => r.error!.exitCode);
   // Exit 7 only when EVERY run timed out — a mix of pass + timeout is "mixed
-  // outcomes" (exit 1), not "all timed out". `nonPassedStatuses.every(...)`
+  // outcomes" (exit 1), not "all timed out". `failing.every(...)` alone
   // would incorrectly fire exit 7 when 1 of N passed and the rest timed out.
   const allTimeout =
-    batchRunResults.length > 0 &&
+    failing.length === batchRunResults.length &&
     batchRunResults.every(r => r.status === 'timeout' || r.error?.exitCode === 7);
   if (allTimeout) {
     throw new CLIError(
@@ -2927,8 +2941,8 @@ async function runBatchRun(
       7,
     );
   }
-  // If all non-passed results share the same specific exit code (6 or 11), use it.
-  if (errorExitCodes.length > 0 && errorExitCodes.length === nonPassedStatuses.length) {
+  // If all failing results share the same specific exit code (6 or 11), use it.
+  if (errorExitCodes.length > 0 && errorExitCodes.length === failing.length) {
     const uniformCode = errorExitCodes[0];
     if (
       uniformCode !== undefined &&
@@ -2937,14 +2951,16 @@ async function runBatchRun(
       uniformCode !== 7
     ) {
       throw new CLIError(
-        `Batch run finished: ${nonPassedStatuses.length} run(s) failed with exit code ${uniformCode}.`,
+        `Batch run finished: ${failing.length} run(s) failed with exit code ${uniformCode}.`,
         uniformCode,
       );
     }
   }
   // Default: mixed outcomes or generic failure → exit 1.
   throw new CLIError(
-    `Batch run finished: ${batchRunResults.filter(r => r.status !== 'passed').length} of ${batchRunResults.length} run(s) did not pass.`,
+    opts.wait
+      ? `Batch run finished: ${failing.length} of ${batchRunResults.length} run(s) did not pass.`
+      : `Batch run trigger finished: ${failing.length} of ${batchRunResults.length} trigger(s) failed.`,
     1,
   );
 }
