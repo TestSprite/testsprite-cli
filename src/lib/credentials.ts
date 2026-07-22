@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { localValidationError } from './errors.js';
@@ -67,6 +68,11 @@ interface CredentialsLockInfo {
   pid?: number;
   createdAt?: number;
   token?: string;
+}
+
+interface CredentialsLock {
+  assertHeld: () => void;
+  release: () => void;
 }
 
 interface RestrictiveModeOptions {
@@ -261,29 +267,29 @@ function mutateCredentialsFile(
   mutate: (file: CredentialsFile) => CredentialsFile | undefined,
 ): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const releaseLock = acquireCredentialsLock(path);
+  const lock = acquireCredentialsLock(path);
   try {
     const file = readCredentialsFile({ path });
     const nextFile = mutate(file);
     if (nextFile === undefined) return;
+    lock.assertHeld();
     writeCredentialsAtomic(path, nextFile);
   } finally {
-    releaseLock();
+    lock.release();
   }
 }
 
 function writeCredentialsAtomic(path: string, file: CredentialsFile): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = `${path}.tmp.${process.pid}`;
   writeFileSync(tmp, serializeCredentials(file), { mode: 0o600, encoding: 'utf8' });
   renameSync(tmp, path);
   ensureRestrictiveMode(path);
 }
 
-function acquireCredentialsLock(path: string): () => void {
+function acquireCredentialsLock(path: string): CredentialsLock {
   const lockPath = `${path}.lock`;
   const deadline = Date.now() + CREDENTIALS_LOCK_WAIT_MS;
-  const token = `${process.pid}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+  const token = `${process.pid}:${Date.now()}:${randomUUID()}`;
   const lockInfo: Required<CredentialsLockInfo> = {
     pid: process.pid,
     createdAt: Date.now(),
@@ -297,7 +303,10 @@ function acquireCredentialsLock(path: string): () => void {
         flag: 'wx',
         mode: 0o600,
       });
-      return () => releaseCredentialsLock(lockPath, token);
+      return {
+        assertHeld: () => assertCredentialsLockHeld(lockPath, token),
+        release: () => releaseCredentialsLock(lockPath, token),
+      };
     } catch (error) {
       if (!isErrnoException(error) || error.code !== 'EEXIST') {
         throw error;
@@ -341,20 +350,34 @@ function reclaimStaleCredentialsLock(lockPath: string): void {
   }
 }
 
+function assertCredentialsLockHeld(lockPath: string, token: string): void {
+  const lockInfo = readCredentialsLockInfo(lockPath);
+  if (lockInfo?.token === token) return;
+  throw localValidationError(
+    'credentialsLock',
+    'lost ownership of the credential update lock; retry the command',
+    undefined,
+    'field',
+  );
+}
+
 function releaseCredentialsLock(lockPath: string, token: string): void {
-  let lockInfo: CredentialsLockInfo | undefined;
-  try {
-    lockInfo = JSON.parse(readFileSync(lockPath, 'utf-8')) as CredentialsLockInfo;
-  } catch {
-    return;
-  }
-  if (lockInfo.token !== token) return;
+  const lockInfo = readCredentialsLockInfo(lockPath);
+  if (lockInfo?.token !== token) return;
   try {
     unlinkSync(lockPath);
   } catch (error) {
     if (!isErrnoException(error) || error.code !== 'ENOENT') {
       throw error;
     }
+  }
+}
+
+function readCredentialsLockInfo(lockPath: string): CredentialsLockInfo | undefined {
+  try {
+    return JSON.parse(readFileSync(lockPath, 'utf-8')) as CredentialsLockInfo;
+  } catch {
+    return undefined;
   }
 }
 
