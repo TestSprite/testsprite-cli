@@ -20,7 +20,7 @@ import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { TARGETS } from '../../src/lib/agent-targets.js';
+import { canonicalSkillFile } from '../../src/lib/agent-targets.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '../..');
@@ -124,8 +124,8 @@ describe('skill nudge — suppression gates', () => {
     () => {
       const proj = freshDir('ts-nudge-proj-');
       const home = homeWithCreds();
-      // Drop a claude own-file skill so detection finds it.
-      const skillPath = join(proj, TARGETS.claude.path);
+      // Drop a canonical skill so detection finds it.
+      const skillPath = join(proj, canonicalSkillFile('testsprite-verify'));
       mkdirSync(dirname(skillPath), { recursive: true });
       writeFileSync(skillPath, '---\nname: testsprite-verify\n---\nbody\n', 'utf8');
 

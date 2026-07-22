@@ -94,7 +94,7 @@ const authConfigureValidTargets = Object.keys(TARGETS) as AgentTarget[];
 addSetupOptions(
   authCommand.command('configure', { hidden: true }),
   authConfigureValidTargets,
-  'claude',
+  'claude-code',
 ).action(async (cmdOpts: SetupCmdOpts, command: Command) => {
   process.stderr.write(
     '[deprecated] `testsprite auth configure` now runs full setup (configure + skill install) — ' +

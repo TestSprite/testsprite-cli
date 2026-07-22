@@ -109,30 +109,27 @@ Every artifact in the bundle shares one `snapshotId`; the CLI will not mix a fai
 
 ## Agent onboarding (`agent install`)
 
-`testsprite agent install` writes a ready-made skill/instruction file into your project so your coding agent knows the commands, the exit codes, and the failure-bundle layout — no prompt engineering required. It's a pure-local command: no network, no credentials.
+`testsprite agent install` writes the TestSprite skills into your project so your coding agent knows the commands, the exit codes, and the failure-bundle layout — no prompt engineering required. It's a pure-local command: no network, no credentials.
 
 ```bash
-testsprite agent install claude     # install the skill for Claude Code
-testsprite agent install codex      # install into AGENTS.md for Codex (managed-section)
-testsprite agent install cursor     # .cursor/rules/testsprite-verify.mdc
-testsprite agent install cline      # .clinerules/testsprite-verify.md
-testsprite agent install windsurf   # .windsurf/rules/testsprite-verify.md
-testsprite agent install antigravity  # .agents/skills/testsprite-verify/SKILL.md
-testsprite agent install kiro       # .kiro/skills/testsprite-verify/SKILL.md
-testsprite agent install copilot    # .github/instructions/testsprite-verify.instructions.md
-testsprite agent list               # list all 8 targets with status + mode + path
-testsprite agent status             # check installed skills against this CLI version
+testsprite agent install claude-code    # .agents/skills/<skill>/SKILL.md + .claude/skills/<skill> symlink
+testsprite agent install codex          # writes the canonical copy (Codex reads .agents/skills directly)
+testsprite agent install cursor         # universal — reads the canonical copy
+testsprite agent install gemini-cli     # universal
+testsprite agent install github-copilot # universal
+testsprite agent install kiro-cli       # .kiro/skills/<skill> symlink → canonical
+testsprite agent install windsurf       # .windsurf/skills/<skill> symlink → canonical
+testsprite agent list                   # every supported agent, its skills folder, and universal vs symlink
+testsprite agent status                 # check installed skills against this CLI version
 ```
 
-Supported targets: `claude` (GA), `codex` (experimental), `cursor` (experimental), `cline` (experimental), `antigravity` (experimental), `kiro` (experimental), `windsurf` (experimental), `copilot` (experimental).
+`--target` accepts any agent id from the standard registry (70+), plus the legacy short aliases (`claude`, `codex`, `cursor`, `cline`, `antigravity`, `kiro`, `windsurf`, `copilot`). Omitting `--target` in a non-interactive shell defaults to `claude-code`; in a terminal the CLI prompts.
 
-Omitting `--target` in a non-interactive shell (CI, agent subprocess) defaults to `claude` with an `[info]` note on stderr; in a terminal the CLI prompts (empty answer = `claude`).
+Because every universal agent reads the same `.agents/skills/` folder, **installing for one universal agent makes the skill available to all of them** — `agent install --target codex` also serves Cursor, Cline, Gemini CLI, Copilot, etc.
 
-`agent status` checks every installed skill file against the current CLI version and reports one of `ok`, `stale`, `modified`, `unmarked`, `absent`, or `corrupt` per target. It exits `1` when anything needs attention, so `testsprite agent status && …` can gate a CI step; `--dir <path>` inspects a different project root.
+`agent status` checks the canonical skill file (and each symlinked landing) against the current CLI version and reports `ok`, `stale`, `modified`, or `unmarked` for every agent that has an install (absent agents are omitted to keep output focused). It exits `1` when anything needs attention, so `testsprite agent status && …` can gate a CI step; `--dir <path>` inspects a different project root.
 
-The `codex` target uses **managed-section mode** — it writes only a sentinel-delimited section inside your existing `AGENTS.md`, so your project instructions are never clobbered. Re-running without `--force` replaces the section in-place; user content outside the sentinels is always preserved.
-
-Re-running with `--force` on **own-file targets** (claude, cursor, cline, antigravity, kiro, windsurf, copilot) backs up the existing file to `<path>.bak` first.
+Re-running with `--force` overwrites a canonical file that has drifted, backing up the existing bytes to `<path>.bak` first; for symlinked landings it replaces a link that points elsewhere.
 
 ## Plan file format
 

@@ -3,8 +3,8 @@
 exports[`--help snapshots > agent 1`] = `
 "Usage: testsprite agent [options] [command]
 
-Install TestSprite guidance into coding-agent config (Claude Code, Cursor,
-Cline, Antigravity, Kiro, Windsurf, Copilot, Codex)
+Install TestSprite skills into each coding agent (Claude Code, Codex, Cursor,
+Cline, Gemini CLI, Copilot, and 60+ more)
 
 Options:
   -h, --help                      display help for command
@@ -16,13 +16,14 @@ Commands:
                                   may be given positionally (e.g. \`agent
                                   install cursor codex\`) and/or via --target;
                                   the two are merged.
-  list                            List supported agent targets and skills,
-                                  their status, and landing paths
-  status [options]                Check installed TestSprite skill files
-                                  against this CLI version: ok, stale,
-                                  modified, unmarked, absent, or corrupt (exits
-                                  1 when anything needs attention, so it can
-                                  gate CI)
+  list                            List supported agent targets, their skill
+                                  folder, and whether they read .agents/skills
+                                  directly (universal) or via symlink
+  status [options]                Check installed TestSprite skills against
+                                  this CLI version
+                                  (ok/stale/modified/unmarked). Reports only
+                                  agents that have an install; exits 1 when any
+                                  need attention, so it can gate CI
   help [command]                  display help for command
 "
 `;
@@ -35,16 +36,15 @@ into a project for a coding agent. Target(s) may be given positionally (e.g.
 \`agent install cursor codex\`) and/or via --target; the two are merged.
 
 Options:
-  --target <t>    Agent target(s): claude, cursor, cline, antigravity, kiro,
-                  windsurf, copilot, codex (comma-separated or repeated).
-                  Merged with any positional target(s). (default: [])
+  --target <t>    Agent target(s): claude-code, codex, cursor, gemini-cli,
+                  github-copilot, kiro-cli, windsurf, cline, antigravity
+                  (comma-separated or repeated). Merged with any positional
+                  target(s). (default: [])
   --skill <name>  Skill(s) to install: testsprite-verify, testsprite-onboard
                   (comma-separated or repeated; default: all) (default: [])
   --dir <path>    Project root to write into (default: cwd)
-  --force         For own-file targets: overwrite existing file (a .bak backup
-                  is kept). For codex (managed-section): replaces the section
-                  unconditionally; user content outside the section is never
-                  destroyed.
+  --force         Overwrite an existing canonical file or landing (a .bak
+                  backup is kept for files).
   -h, --help      display help for command
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
@@ -55,7 +55,8 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > agent list 1`] = `
 "Usage: testsprite agent list [options]
 
-List supported agent targets and skills, their status, and landing paths
+List supported agent targets, their skill folder, and whether they read
+.agents/skills directly (universal) or via symlink
 
 Options:
   -h, --help  display help for command
@@ -88,9 +89,11 @@ Options:
   --api-key <key>       API key to configure (skips the interactive prompt)
   --from-env            Read TESTSPRITE_API_KEY from the environment instead of
                         prompting (default: false)
-  --agent <target>      Coding-agent target to install: claude, antigravity,
-                        cursor, cline, kiro, windsurf, copilot, codex (default:
-                        claude) (default: "claude")
+  --agent <target>      Coding-agent target to install — any of the 72 Agent
+                        Skills standard (agentskills.io) agent ids (e.g.
+                        claude-code, codex, cursor, cline, gemini-cli,
+                        github-copilot, kiro-cli, windsurf, antigravity).
+                        Default: claude-code (default: "claude-code")
   --no-agent            Skip the agent skill install (configure credentials
                         only)
   --force               Overwrite an existing skill file (a .bak backup is
@@ -135,9 +138,11 @@ Options:
   --api-key <key>       API key to configure (skips the interactive prompt)
   --from-env            Read TESTSPRITE_API_KEY from the environment instead of
                         prompting (default: false)
-  --agent <target>      Coding-agent target to install: claude, antigravity,
-                        cursor, cline, kiro, windsurf, copilot, codex (default:
-                        claude) (default: "claude")
+  --agent <target>      Coding-agent target to install — any of the 72 Agent
+                        Skills standard (agentskills.io) agent ids (e.g.
+                        claude-code, codex, cursor, cline, gemini-cli,
+                        github-copilot, kiro-cli, windsurf, antigravity).
+                        Default: claude-code (default: "claude-code")
   --no-agent            Skip the agent skill install (configure credentials
                         only)
   --force               Overwrite an existing skill file (a .bak backup is
@@ -889,9 +894,9 @@ Commands:
   auth                         Manage TestSprite credentials
   project                      Manage TestSprite projects
   test                         Inspect TestSprite tests
-  agent                        Install TestSprite guidance into coding-agent
-                               config (Claude Code, Cursor, Cline, Antigravity,
-                               Kiro, Windsurf, Copilot, Codex)
+  agent                        Install TestSprite skills into each coding agent
+                               (Claude Code, Codex, Cursor, Cline, Gemini CLI,
+                               Copilot, and 60+ more)
   usage|credits                Show credit balance and plan/entitlement info
                                (proactive pre-flight before a large test run)
   doctor                       Diagnose CLI setup: version, Node, profile,

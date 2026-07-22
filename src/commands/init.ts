@@ -23,7 +23,7 @@ import type { AuthDeps, MeResponse } from './auth.js';
 import { runConfigure, runWhoami } from './auth.js';
 import type { AgentDeps, AgentFs, InstallResult } from './agent.js';
 import { runInstall } from './agent.js';
-import { TARGETS, DEFAULT_SKILLS, type AgentTarget } from '../lib/agent-targets.js';
+import { DEFAULT_SKILLS, TARGETS, type AgentTarget } from '../lib/agent-targets.js';
 import type { FetchImpl } from '../lib/http.js';
 import { readProfile } from '../lib/credentials.js';
 
@@ -521,7 +521,9 @@ export function addSetupOptions(
     )
     .option(
       '--agent <target>',
-      `Coding-agent target to install: ${validTargets.join(', ')} (default: ${defaultAgent})`,
+      `Coding-agent target to install — any of the ${validTargets.length} Agent Skills standard ` +
+        '(agentskills.io) agent ids (e.g. claude-code, codex, cursor, cline, gemini-cli, ' +
+        `github-copilot, kiro-cli, windsurf, antigravity). Default: ${defaultAgent}`,
       defaultAgent,
     )
     .option('--no-agent', 'Skip the agent skill install (configure credentials only)')
@@ -598,8 +600,8 @@ async function runSetupAction(
 }
 
 export function createSetupCommand(deps: InitDeps = {}): Command {
+  const defaultAgent: AgentTarget = 'claude-code';
   const validTargets = Object.keys(TARGETS) as AgentTarget[];
-  const defaultAgent: AgentTarget = 'claude';
 
   return addSetupOptions(new Command('setup'), validTargets, defaultAgent)
     .description(SETUP_DESCRIPTION)
@@ -616,8 +618,8 @@ export function createSetupCommand(deps: InitDeps = {}): Command {
  * deprecation notice. (Setup consolidation.)
  */
 export function createDeprecatedInitCommand(deps: InitDeps = {}): Command {
+  const defaultAgent: AgentTarget = 'claude-code';
   const validTargets = Object.keys(TARGETS) as AgentTarget[];
-  const defaultAgent: AgentTarget = 'claude';
 
   return addSetupOptions(new Command('init'), validTargets, defaultAgent)
     .description('(deprecated) alias for `setup`')
@@ -644,5 +646,5 @@ export async function runConfigureViaSetup(
   deps: InitDeps,
   cmdOpts: SetupCmdOpts,
 ): Promise<void> {
-  await runSetupAction(cmdOpts, command, deps, 'claude');
+  await runSetupAction(cmdOpts, command, deps, 'claude-code');
 }

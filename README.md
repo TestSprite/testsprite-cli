@@ -61,13 +61,13 @@ npm install -g @testsprite/testsprite-cli
 testsprite setup
 ```
 
-`testsprite setup` prompts for your [API key](https://www.testsprite.com), verifies it, and installs the verification-loop skill for your coding agent (`claude`, `cursor`, `cline`, `windsurf`, `antigravity`, `codex`, etc.) — one command, so your agent is wired to verify its own work. Non-interactive (CI / onboarding scripts):
+`testsprite setup` prompts for your [API key](https://www.testsprite.com), verifies it, and installs the verification-loop skill for your coding agent (Claude Code, Codex, Cursor, Cline, Gemini CLI, GitHub Copilot, Windsurf, Kiro, Antigravity, and [60+ more](#supported-agents)) — one command, so your agent is wired to verify its own work. Non-interactive (CI / onboarding scripts):
 
 ```bash
-TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --yes --agent claude
+TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --yes --agent claude-code
 ```
 
-> **Pointing a coding agent (Claude Code, Cursor, Codex, Cline, …) at TestSprite?** Have it run `testsprite setup` first — that installs the verification skill, so the agent knows how to create, run, and triage tests on its own (instead of guessing from this README). New here? Start with the **[getting-started overview](https://docs.testsprite.com/cli/getting-started/overview)**.
+> **Pointing a [coding agent](#supported-agents) (Claude Code, Cursor, Codex, Cline, …) at TestSprite?** Have it run `testsprite setup` first — that installs the verification skill, so the agent knows how to create, run, and triage tests on its own (instead of guessing from this README). New here? Start with the **[getting-started overview](https://docs.testsprite.com/cli/getting-started/overview)**.
 
 > **Privacy note:** interactive runs check the npm registry at most once per 24 h to offer a "new version available" notice — package name only, never your key or data; `TESTSPRITE_NO_UPDATE_NOTIFIER=1` disables it. The backend also advertises its minimum supported CLI version — a below-floor CLI prints a one-line upgrade advisory on stderr, and a too-old client may be rejected with exit 14 (`CLIENT_TOO_OLD`). Details in [DOCUMENTATION.md → Update notice](./DOCUMENTATION.md#update-notice).
 
@@ -144,7 +144,8 @@ Prefer to configure each step by hand (or learn the surface offline with `--dry-
 |           | `test wait`                                            | Block on one or more `runId`s until terminal                                                                                                          |
 |           | `test cancel`                                          | Cancel one or more in-flight runs (Ctrl-C during `--wait` only detaches — `cancel` is the real stop)                                                  |
 |           | `test artifact get`                                    | Download the failure bundle for a specific `runId`                                                                                                    |
-| **Agent** | `agent install` / `agent list` / `agent status`        | Add, list, or health-check coding-agent skills (pure-local): `claude`, `codex`, `cursor`, `cline`, `antigravity`, `kiro`, `windsurf`, `copilot`       |
+| **Agent** | `agent install` / `agent list` / `agent status`        | Add, list, or health-check [coding-agent skills](#supported-agents) (pure-local): `claude`, `codex`, `cursor`, `cline`, `antigravity`, `kiro`, `windsurf`, `copilot`       |
+
 
 > The earlier command names — `init`, `auth configure`, `auth whoami`, `auth logout` — still work as hidden, deprecated aliases (each prints a one-line notice pointing at the new name), so existing scripts keep running. `auth configure` now runs the full `setup` (it also installs the skill).
 
@@ -226,3 +227,82 @@ Pull requests target the `dev` branch. The full guide — build from source, tes
 ## License
 
 [Apache-2.0](./LICENSE) © TestSprite
+
+## Supported agents
+
+`agent install --target <id>` (and `setup --agent <id>`) wires the verification skill into any of the agents below. Those marked _(shared)_ read the single `.agents/skills/` directory directly; every other agent gets a symlink from its own skills folder back to it — one source of truth, no drift between agents. A few agents also accept a **legacy short alias** (shown in parentheses) for backwards compatibility with older scripts — prefer the canonical id.
+
+| `--target` id                | Agent              | Skills folder               |
+| ---------------------------- | ------------------ | --------------------------- |
+| `aider-desk`                 | AiderDesk          | `.aider-desk/skills`        |
+| `amp`                        | Amp                | `.agents/skills` _(shared)_ |
+| `antigravity`                | Antigravity        | `.agents/skills` _(shared)_ |
+| `antigravity-cli`            | Antigravity CLI    | `.agents/skills` _(shared)_ |
+| `astrbot`                    | AstrBot            | `data/skills`               |
+| `autohand-code`              | Autohand Code CLI  | `.autohand/skills`          |
+| `augment`                    | Augment            | `.augment/skills`           |
+| `bob`                        | IBM Bob            | `.bob/skills`               |
+| `claude-code` (`claude`)     | Claude Code        | `.claude/skills`            |
+| `openclaw`                   | OpenClaw           | `skills`                    |
+| `cline`                      | Cline              | `.agents/skills` _(shared)_ |
+| `codearts-agent`             | CodeArts Agent     | `.codeartsdoer/skills`      |
+| `codebuddy`                  | CodeBuddy          | `.codebuddy/skills`         |
+| `codemaker`                  | Codemaker          | `.codemaker/skills`         |
+| `codestudio`                 | Code Studio        | `.codestudio/skills`        |
+| `codex`                      | Codex              | `.agents/skills` _(shared)_ |
+| `command-code`               | Command Code       | `.commandcode/skills`       |
+| `continue`                   | Continue           | `.continue/skills`          |
+| `cortex`                     | Cortex Code        | `.cortex/skills`            |
+| `crush`                      | Crush              | `.crush/skills`             |
+| `cursor`                     | Cursor             | `.agents/skills` _(shared)_ |
+| `deepagents`                 | Deep Agents        | `.agents/skills` _(shared)_ |
+| `devin`                      | Devin for Terminal | `.devin/skills`             |
+| `dexto`                      | Dexto              | `.agents/skills` _(shared)_ |
+| `droid`                      | Droid              | `.factory/skills`           |
+| `eve`                        | Eve                | `agent/skills`              |
+| `firebender`                 | Firebender         | `.agents/skills` _(shared)_ |
+| `forgecode`                  | ForgeCode          | `.forge/skills`             |
+| `gemini-cli`                 | Gemini CLI         | `.agents/skills` _(shared)_ |
+| `github-copilot` (`copilot`) | GitHub Copilot     | `.agents/skills` _(shared)_ |
+| `goose`                      | Goose              | `.goose/skills`             |
+| `hermes-agent`               | Hermes Agent       | `.hermes/skills`            |
+| `inference-sh`               | inference.sh       | `.inferencesh/skills`       |
+| `jazz`                       | Jazz               | `.jazz/skills`              |
+| `junie`                      | Junie              | `.junie/skills`             |
+| `iflow-cli`                  | iFlow CLI          | `.iflow/skills`             |
+| `kilo`                       | Kilo Code          | `.kilocode/skills`          |
+| `kimi-code-cli`              | Kimi Code CLI      | `.agents/skills` _(shared)_ |
+| `kiro-cli` (`kiro`)          | Kiro CLI           | `.kiro/skills`              |
+| `kode`                       | Kode               | `.kode/skills`              |
+| `lingma`                     | Lingma             | `.lingma/skills`            |
+| `loaf`                       | Loaf               | `.agents/skills` _(shared)_ |
+| `mcpjam`                     | MCPJam             | `.mcpjam/skills`            |
+| `mistral-vibe`               | Mistral Vibe       | `.vibe/skills`              |
+| `moxby`                      | Moxby              | `.moxby/skills`             |
+| `mux`                        | Mux                | `.mux/skills`               |
+| `opencode`                   | OpenCode           | `.agents/skills` _(shared)_ |
+| `openhands`                  | OpenHands          | `.openhands/skills`         |
+| `ona`                        | Ona                | `.ona/skills`               |
+| `pi`                         | Pi                 | `.pi/skills`                |
+| `qoder`                      | Qoder              | `.qoder/skills`             |
+| `qoder-cn`                   | Qoder CN           | `.qoder/skills`             |
+| `qwen-code`                  | Qwen Code          | `.qwen/skills`              |
+| `replit`                     | Replit             | `.agents/skills` _(shared)_ |
+| `reasonix`                   | Reasonix           | `.reasonix/skills`          |
+| `roo`                        | Roo Code           | `.roo/skills`               |
+| `rovodev`                    | Rovo Dev           | `.rovodev/skills`           |
+| `tabnine-cli`                | Tabnine CLI        | `.tabnine/agent/skills`     |
+| `terramind`                  | Terramind          | `.terramind/skills`         |
+| `tinycloud`                  | Tinycloud          | `.tinycloud/skills`         |
+| `trae`                       | Trae               | `.trae/skills`              |
+| `trae-cn`                    | Trae CN            | `.trae/skills`              |
+| `warp`                       | Warp               | `.agents/skills` _(shared)_ |
+| `windsurf`                   | Windsurf           | `.windsurf/skills`          |
+| `zed`                        | Zed                | `.agents/skills` _(shared)_ |
+| `zcode`                      | ZCode              | `.zcode/skills`             |
+| `zencoder`                   | Zencoder           | `.zencoder/skills`          |
+| `zenflow`                    | Zenflow            | `.zencoder/skills`          |
+| `neovate`                    | Neovate            | `.neovate/skills`           |
+| `pochi`                      | Pochi              | `.pochi/skills`             |
+| `promptscript`               | PromptScript       | `.agents/skills` _(shared)_ |
+| `adal`                       | AdaL               | `.adal/skills`              |
