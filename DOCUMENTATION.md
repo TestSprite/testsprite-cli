@@ -310,7 +310,7 @@ testsprite test create --plan-from ./checkout.plan.json --dry-run --output json
 
 #### `testsprite test create-batch`
 
-Bulk-create frontend tests from a JSONL plan-steps file (or a directory of plan files with `--plan-from-dir`). Optional `--run --max-concurrency <N>` fans out triggers.
+Bulk-create frontend tests from a JSONL plan-steps file (or a directory of plan files with `--plan-from-dir`). Optional `--run --max-concurrency <N>` fans out triggers. Without `--wait`, each run is dispatched (`status: "queued"`) and the command exits 0 when every trigger is accepted — mirroring single `test run` without `--wait`; a trigger error still exits non-zero. With `--wait`, it polls every run to terminal and exits non-zero if any run does not pass.
 
 ```bash
 testsprite test create-batch --plans ./plans.jsonl --run --max-concurrency 4 --output json
