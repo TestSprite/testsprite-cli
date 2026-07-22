@@ -5,6 +5,7 @@ import {
   readFileSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
@@ -62,6 +63,12 @@ export interface CredentialsOptions {
   path?: string;
 }
 
+interface CredentialsLockInfo {
+  pid?: number;
+  createdAt?: number;
+  token?: string;
+}
+
 interface RestrictiveModeOptions {
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
@@ -82,6 +89,10 @@ const FIELD_TO_FILE_KEY: Record<keyof ProfileEntry, string> = {
   apiKey: 'api_key',
   apiUrl: 'api_url',
 };
+
+const CREDENTIALS_LOCK_RETRY_MS = 25;
+const CREDENTIALS_LOCK_WAIT_MS = 5_000;
+const CREDENTIALS_LOCK_STALE_MS = 30_000;
 
 export function parseCredentials(content: string): CredentialsFile {
   const result: CredentialsFile = {};
@@ -165,23 +176,24 @@ export function writeProfile(
 ): void {
   assertValidProfileName(profile);
   const path = resolvePath(options);
-  const file = readCredentialsFile(options);
-  file[profile] = { ...file[profile], ...entry };
-  writeCredentialsAtomic(path, file);
+  mutateCredentialsFile(path, file => {
+    file[profile] = { ...file[profile], ...entry };
+    return file;
+  });
 }
 
 export function deleteProfile(profile: string, options: CredentialsOptions = {}): boolean {
   assertValidProfileName(profile);
   const path = resolvePath(options);
-  const file = readCredentialsFile(options);
-  if (!(profile in file)) return false;
-  delete file[profile];
-  if (Object.keys(file).length === 0) {
-    writeCredentialsAtomic(path, {});
-  } else {
-    writeCredentialsAtomic(path, file);
-  }
-  return true;
+  if (!existsSync(path)) return false;
+  let removed = false;
+  mutateCredentialsFile(path, file => {
+    if (!(profile in file)) return undefined;
+    removed = true;
+    delete file[profile];
+    return file;
+  });
+  return removed;
 }
 
 /**
@@ -244,10 +256,123 @@ function resolvePath(options: CredentialsOptions): string {
   return options.path ?? defaultCredentialsPath();
 }
 
+function mutateCredentialsFile(
+  path: string,
+  mutate: (file: CredentialsFile) => CredentialsFile | undefined,
+): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const releaseLock = acquireCredentialsLock(path);
+  try {
+    const file = readCredentialsFile({ path });
+    const nextFile = mutate(file);
+    if (nextFile === undefined) return;
+    writeCredentialsAtomic(path, nextFile);
+  } finally {
+    releaseLock();
+  }
+}
+
 function writeCredentialsAtomic(path: string, file: CredentialsFile): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = `${path}.tmp.${process.pid}`;
   writeFileSync(tmp, serializeCredentials(file), { mode: 0o600, encoding: 'utf8' });
   renameSync(tmp, path);
   ensureRestrictiveMode(path);
+}
+
+function acquireCredentialsLock(path: string): () => void {
+  const lockPath = `${path}.lock`;
+  const deadline = Date.now() + CREDENTIALS_LOCK_WAIT_MS;
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+  const lockInfo: Required<CredentialsLockInfo> = {
+    pid: process.pid,
+    createdAt: Date.now(),
+    token,
+  };
+
+  while (true) {
+    try {
+      writeFileSync(lockPath, `${JSON.stringify(lockInfo)}\n`, {
+        encoding: 'utf8',
+        flag: 'wx',
+        mode: 0o600,
+      });
+      return () => releaseCredentialsLock(lockPath, token);
+    } catch (error) {
+      if (!isErrnoException(error) || error.code !== 'EEXIST') {
+        throw error;
+      }
+
+      reclaimStaleCredentialsLock(lockPath);
+      if (Date.now() >= deadline) {
+        throw localValidationError(
+          'credentialsLock',
+          'timed out waiting for another credential update to finish; retry the command',
+          undefined,
+          'field',
+        );
+      }
+      sleepSync(CREDENTIALS_LOCK_RETRY_MS);
+    }
+  }
+}
+
+function reclaimStaleCredentialsLock(lockPath: string): void {
+  let lockInfo: CredentialsLockInfo | undefined;
+  try {
+    lockInfo = JSON.parse(readFileSync(lockPath, 'utf-8')) as CredentialsLockInfo;
+  } catch {
+    lockInfo = undefined;
+  }
+
+  const createdAt = typeof lockInfo?.createdAt === 'number' ? lockInfo.createdAt : undefined;
+  const ageMs = createdAt === undefined ? Number.POSITIVE_INFINITY : Date.now() - createdAt;
+  const pid = typeof lockInfo?.pid === 'number' ? lockInfo.pid : undefined;
+  if (ageMs <= CREDENTIALS_LOCK_STALE_MS && (pid === undefined || isProcessAlive(pid))) {
+    return;
+  }
+
+  try {
+    unlinkSync(lockPath);
+  } catch (error) {
+    if (!isErrnoException(error) || error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+}
+
+function releaseCredentialsLock(lockPath: string, token: string): void {
+  let lockInfo: CredentialsLockInfo | undefined;
+  try {
+    lockInfo = JSON.parse(readFileSync(lockPath, 'utf-8')) as CredentialsLockInfo;
+  } catch {
+    return;
+  }
+  if (lockInfo.token !== token) return;
+  try {
+    unlinkSync(lockPath);
+  } catch (error) {
+    if (!isErrnoException(error) || error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (isErrnoException(error) && error.code === 'ESRCH') return false;
+    return true;
+  }
+}
+
+function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && 'code' in error;
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
