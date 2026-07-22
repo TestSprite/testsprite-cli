@@ -42,7 +42,8 @@ export function isShell(value: string): value is Shell {
 /** Best-effort shell detection from `$SHELL` (e.g. "/bin/zsh" -> "zsh"). */
 export function detectShell(env: NodeJS.ProcessEnv): Shell | undefined {
   const shellPath = env.SHELL ?? '';
-  const base = shellPath.slice(shellPath.lastIndexOf('/') + 1);
+  const rawBase = shellPath.split(/[/\\]/).pop() ?? '';
+  const base = rawBase.toLowerCase().replace(/\.exe$/, '');
   return isShell(base) ? base : undefined;
 }
 
