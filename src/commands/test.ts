@@ -1,9 +1,11 @@
 import {
+  appendFileSync,
   createWriteStream,
   existsSync,
   readFileSync,
   readdirSync,
   statSync,
+  writeFileSync,
   type WriteStream,
 } from 'node:fs';
 import { rename, stat, unlink } from 'node:fs/promises';
@@ -92,6 +94,7 @@ import {
 import { createTicker } from '../lib/ticker.js';
 import { RateThrottle } from '../lib/rate-throttle.js';
 import { resolvePortalBase, resolvePortalUrl } from '../lib/facade.js';
+import { emitGithubOutputs, summarizeAcceptedPayload } from '../lib/gh-output.js';
 import { loadConfig } from '../lib/config.js';
 import {
   flakyExitCode,
@@ -6363,6 +6366,10 @@ interface RunTestRunAllOptions extends CommonOptions {
   reportFile?: string;
   /** --report-suite-name: optional override for the JUnit <testsuite name=...>. */
   reportSuiteName?: string;
+  /** --gh-output: force the GitHub-native output layer even off-Actions (issue #99). */
+  ghOutput?: boolean;
+  /** --summary-file: also write the reduced machine summary JSON to this path. */
+  summaryFile?: string;
 }
 
 async function writeBatchJUnitReportIfRequested(
@@ -6927,6 +6934,41 @@ export async function runTestRunAll(
   };
   await writeBatchJUnitReportIfRequested(opts, freshRunResults);
   out.print(jsonPayload);
+  // CI-native output layer (issue #99): emitted before the gate throws below so
+  // the artifacts land even when the batch exits non-zero. The summary file is a
+  // machine artifact written regardless of --output mode; stdout stays owned by
+  // the envelope above (plus Actions workflow commands, which Actions parses).
+  {
+    const env = deps.env ?? process.env;
+    const ghEnabled = opts.ghOutput === true || env.GITHUB_ACTIONS === 'true';
+    if (ghEnabled || opts.summaryFile !== undefined) {
+      const ciSummary = summarizeAcceptedPayload(JSON.stringify(jsonPayload));
+      if (opts.summaryFile !== undefined) {
+        try {
+          writeFileSync(opts.summaryFile, `${JSON.stringify(ciSummary, null, 2)}\n`, 'utf8');
+        } catch {
+          stderrFn(`[run] could not write --summary-file ${opts.summaryFile}; continuing`);
+        }
+      }
+      if (ghEnabled) {
+        const stdoutFn = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
+        emitGithubOutputs(
+          ciSummary,
+          env,
+          {
+            stdout: stdoutFn,
+            stderr: stderrFn,
+            appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf8'),
+            // Under --output json the envelope above owns stdout; workflow
+            // commands go to stderr instead (the Actions runner parses both
+            // streams), keeping the documented machine output parseable.
+            annotations: opts.output === 'json' ? stderrFn : stdoutFn,
+          },
+          { force: opts.ghOutput === true },
+        );
+      }
+    }
+  }
 
   // Rate-deferred tests were never dispatched → the batch is incomplete (exit 7),
   // mirroring `test rerun --all`. Checked before the failed-run throw so the
@@ -9125,6 +9167,14 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       '--report-suite-name <name>',
       'optional JUnit <testsuite name=...> override (default: testsprite:<projectId>)',
     )
+    .option(
+      '--gh-output',
+      'with --all --wait: emit GitHub-native output (::error:: annotations per non-passed run; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
+    )
+    .option(
+      '--summary-file <path>',
+      'with --all --wait: also write the reduced machine summary JSON {total, passed, failed, timedOut, runs[]} to this file',
+    )
     .addHelpText(
       'after',
       '\nDependency-aware fresh run (M4):\n' +
@@ -9173,6 +9223,22 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         wait: cmdOpts.wait === true,
         batchPath: isAll,
       });
+      // --gh-output / --summary-file reduce the terminal batch envelope, which
+      // only exists on the --all --wait path (without --wait the command returns
+      // after enqueueing). Anywhere else they would silently no-op — reject
+      // loudly (same rule as --filter and the JUnit report flags).
+      if (cmdOpts.ghOutput === true && (!isAll || cmdOpts.wait !== true)) {
+        throw localValidationError(
+          'gh-output',
+          '--gh-output only applies with --all --wait (it reduces the terminal batch envelope). Remove --gh-output, or add --all --wait.',
+        );
+      }
+      if (cmdOpts.summaryFile !== undefined && (!isAll || cmdOpts.wait !== true)) {
+        throw localValidationError(
+          'summary-file',
+          '--summary-file only applies with --all --wait (it reduces the terminal batch envelope). Remove --summary-file, or add --all --wait.',
+        );
+      }
 
       if (isAll) {
         // --all path: wave-ordered fresh batch run.
@@ -9207,6 +9273,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             report,
             reportFile: cmdOpts.reportFile,
             reportSuiteName: cmdOpts.reportSuiteName,
+            ghOutput: cmdOpts.ghOutput === true,
+            summaryFile: cmdOpts.summaryFile,
           },
           deps,
         );
@@ -9687,6 +9755,8 @@ interface RunFlagOpts {
   report?: string;
   reportFile?: string;
   reportSuiteName?: string;
+  ghOutput?: boolean;
+  summaryFile?: string;
 }
 
 interface WaitFlagOpts {
