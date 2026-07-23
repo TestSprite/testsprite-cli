@@ -6951,13 +6951,18 @@ export async function runTestRunAll(
         }
       }
       if (ghEnabled) {
+        const stdoutFn = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
         emitGithubOutputs(
           ciSummary,
           env,
           {
-            stdout: deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`)),
+            stdout: stdoutFn,
             stderr: stderrFn,
             appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf8'),
+            // Under --output json the envelope above owns stdout; workflow
+            // commands go to stderr instead (the Actions runner parses both
+            // streams), keeping the documented machine output parseable.
+            annotations: opts.output === 'json' ? stderrFn : stdoutFn,
           },
           { force: opts.ghOutput === true },
         );
@@ -9164,11 +9169,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--gh-output',
-      'with --all: emit GitHub-native output (::error:: annotations per non-passed run; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
+      'with --all --wait: emit GitHub-native output (::error:: annotations per non-passed run; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
     )
     .option(
       '--summary-file <path>',
-      'with --all: also write the reduced machine summary JSON {total, passed, failed, timedOut, runs[]} to this file',
+      'with --all --wait: also write the reduced machine summary JSON {total, passed, failed, timedOut, runs[]} to this file',
     )
     .addHelpText(
       'after',
@@ -9218,18 +9223,20 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         wait: cmdOpts.wait === true,
         batchPath: isAll,
       });
-      // --gh-output / --summary-file reduce the batch envelope; on the single-id
-      // path they would be silently ignored — reject loudly (same rule as --filter).
-      if (cmdOpts.ghOutput === true && !isAll) {
+      // --gh-output / --summary-file reduce the terminal batch envelope, which
+      // only exists on the --all --wait path (without --wait the command returns
+      // after enqueueing). Anywhere else they would silently no-op — reject
+      // loudly (same rule as --filter and the JUnit report flags).
+      if (cmdOpts.ghOutput === true && (!isAll || cmdOpts.wait !== true)) {
         throw localValidationError(
           'gh-output',
-          '--gh-output only applies with --all (it reduces the batch envelope). Remove --gh-output, or add --all.',
+          '--gh-output only applies with --all --wait (it reduces the terminal batch envelope). Remove --gh-output, or add --all --wait.',
         );
       }
-      if (cmdOpts.summaryFile !== undefined && !isAll) {
+      if (cmdOpts.summaryFile !== undefined && (!isAll || cmdOpts.wait !== true)) {
         throw localValidationError(
           'summary-file',
-          '--summary-file only applies with --all (it reduces the batch envelope). Remove --summary-file, or add --all.',
+          '--summary-file only applies with --all --wait (it reduces the terminal batch envelope). Remove --summary-file, or add --all --wait.',
         );
       }
 

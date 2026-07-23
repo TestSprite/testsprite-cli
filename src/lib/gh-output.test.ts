@@ -46,6 +46,17 @@ describe('summarizeAcceptedPayload', () => {
     expect(summarizeAcceptedPayload('{"method":"POST"}')).toMatchObject({ total: 0 });
     expect(summarizeAcceptedPayload('not json')).toMatchObject({ total: 0 });
   });
+
+  it('valid-JSON non-record payloads and null rows are skipped, not crashes', () => {
+    expect(summarizeAcceptedPayload('null')).toMatchObject({ total: 0 });
+    expect(summarizeAcceptedPayload('"a string"')).toMatchObject({ total: 0 });
+    expect(summarizeAcceptedPayload('[1,2]')).toMatchObject({ total: 0 });
+    const mixed = summarizeAcceptedPayload(
+      JSON.stringify({ accepted: [null, 42, { testId: 'test_ok', status: 'passed' }] }),
+    );
+    expect(mixed.total).toBe(1);
+    expect(mixed.runs[0]).toMatchObject({ testId: 'test_ok', status: 'passed' });
+  });
 });
 
 describe('renderJobSummaryMarkdown', () => {
@@ -119,5 +130,17 @@ describe('emitGithubOutputs', () => {
     const annotations = forced.stdout.filter(line => line.startsWith('::error'));
     expect(annotations).toHaveLength(2);
     expect(forced.appended).toHaveLength(0);
+  });
+
+  it('a dedicated annotations sink diverts workflow commands off the primary stdout', () => {
+    const { stdout, sinks } = makeSinks();
+    const diverted: string[] = [];
+    emitGithubOutputs(
+      summary,
+      { GITHUB_ACTIONS: 'true' },
+      { ...sinks, annotations: line => diverted.push(line) },
+    );
+    expect(stdout).toHaveLength(0);
+    expect(diverted.filter(line => line.startsWith('::error'))).toHaveLength(2);
   });
 });

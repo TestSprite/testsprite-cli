@@ -38,26 +38,35 @@ export interface CiSummary {
  * after a timeout) reduces to an empty run list rather than a crash.
  */
 export function summarizeAcceptedPayload(capturedJson: string): CiSummary {
-  let payload: { accepted?: unknown } = {};
+  let parsed: unknown;
   try {
-    payload = JSON.parse(capturedJson) as { accepted?: unknown };
+    parsed = JSON.parse(capturedJson);
   } catch {
-    // Not a JSON object (dry-run banner path or truncated output): no rows.
+    // Not JSON at all (dry-run banner path or truncated output): no rows.
+    parsed = undefined;
   }
+  // `JSON.parse('null')` and non-object payloads are valid JSON but carry no
+  // batch envelope — treat them like unparseable input instead of crashing.
+  const payload: { accepted?: unknown } =
+    parsed !== null && typeof parsed === 'object' ? (parsed as { accepted?: unknown }) : {};
   const rows: CiRunRow[] = Array.isArray(payload.accepted)
-    ? (payload.accepted as Array<Record<string, unknown>>).map(row => {
-        const errorMessage =
-          row.error !== null && typeof row.error === 'object'
-            ? (row.error as { message?: unknown }).message
-            : undefined;
-        return {
-          testId: String(row.testId ?? ''),
-          ...(typeof row.runId === 'string' ? { runId: row.runId } : {}),
-          status: String(row.status ?? 'unknown'),
-          ...(typeof row.dashboardUrl === 'string' ? { dashboardUrl: row.dashboardUrl } : {}),
-          ...(typeof errorMessage === 'string' ? { error: errorMessage } : {}),
-        };
-      })
+    ? payload.accepted
+        .filter(
+          (entry): entry is Record<string, unknown> => entry !== null && typeof entry === 'object',
+        )
+        .map(row => {
+          const errorMessage =
+            row.error !== null && typeof row.error === 'object'
+              ? (row.error as { message?: unknown }).message
+              : undefined;
+          return {
+            testId: String(row.testId ?? ''),
+            ...(typeof row.runId === 'string' ? { runId: row.runId } : {}),
+            status: String(row.status ?? 'unknown'),
+            ...(typeof row.dashboardUrl === 'string' ? { dashboardUrl: row.dashboardUrl } : {}),
+            ...(typeof errorMessage === 'string' ? { error: errorMessage } : {}),
+          };
+        })
     : [];
   const passed = rows.filter(row => row.status === 'passed').length;
   const timedOut = rows.filter(row => row.status === 'timeout').length;
@@ -100,6 +109,13 @@ export function emitGithubOutputs(
     stdout: (line: string) => void;
     stderr: (line: string) => void;
     appendFile: (path: string, content: string) => void;
+    /**
+     * Where `::error::` workflow-command lines go. Defaults to `stdout`; the
+     * caller passes stderr under `--output json` so the machine envelope on
+     * stdout stays parseable (the Actions runner processes workflow commands
+     * on both streams).
+     */
+    annotations?: (line: string) => void;
   },
   opts: { force?: boolean } = {},
 ): void {
@@ -112,11 +128,12 @@ export function emitGithubOutputs(
     }
   }
   if (env.GITHUB_ACTIONS === 'true' || opts.force === true) {
+    const annotate = sinks.annotations ?? sinks.stdout;
     for (const row of summary.runs) {
       if (row.status === 'passed') continue;
       const detail = row.error !== undefined ? ` ${row.error}` : '';
       const link = row.dashboardUrl !== undefined ? ` ${row.dashboardUrl}` : '';
-      sinks.stdout(`::error title=TestSprite ${row.testId}::status=${row.status}${detail}${link}`);
+      annotate(`::error title=TestSprite ${row.testId}::status=${row.status}${detail}${link}`);
     }
   }
 }

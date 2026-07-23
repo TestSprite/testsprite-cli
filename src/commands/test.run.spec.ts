@@ -5,7 +5,7 @@
  * sleep injection is wired through `TestDeps.sleep` to avoid real delays.
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
@@ -3958,5 +3958,127 @@ describe('runTestRun --wait — InterruptError graceful detach (DEV-331)', () =>
     expect(stderrBlock).toContain('Interrupted (SIGINT)');
     expect(stderrBlock).toContain('billing');
     expect(stderrBlock).toContain('testsprite test wait run_abc');
+  });
+});
+
+describe('gh-output integration on run --all --wait (issue #99 reshape)', () => {
+  function makeTerminalRun(runId: string, testId: string, status: string): RunResponse {
+    return {
+      runId,
+      testId,
+      projectId: 'project_be',
+      userId: 'user_1',
+      status: status as RunResponse['status'],
+      source: 'cli',
+      createdAt: '2026-06-09T11:00:00.000Z',
+      startedAt: '2026-06-09T11:00:01.000Z',
+      finishedAt: '2026-06-09T11:00:30.000Z',
+      codeVersion: 'v1',
+      targetUrl: 'https://api.example.com',
+      createdFrom: 'cli',
+      failedStepIndex: null,
+      failureKind: null,
+      error: null,
+      videoUrl: null,
+      stepSummary: {
+        total: 3,
+        completed: 3,
+        passedCount: status === 'passed' ? 3 : 0,
+        failedCount: 0,
+      },
+    };
+  }
+
+  function mixedHarness() {
+    const { credentialsPath } = makeCreds();
+    const mixedBatch: BatchRunFreshResponse = {
+      accepted: [
+        { testId: 'test_p', runId: 'run_p', enqueuedAt: '2026-06-09T11:00:00.000Z' },
+        { testId: 'test_f', runId: 'run_f', enqueuedAt: '2026-06-09T11:00:02.000Z' },
+      ],
+      conflicts: [],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: mixedBatch };
+      const runId = url.split('/runs/')[1]?.split('?')[0] ?? '';
+      if (runId === 'run_p') return { body: makeTerminalRun('run_p', 'test_p', 'passed') };
+      if (runId === 'run_f') return { body: makeTerminalRun('run_f', 'test_f', 'failed') };
+      return errorBody('NOT_FOUND');
+    });
+    return { credentialsPath, fetchImpl };
+  }
+
+  it('under Actions with --output json: stdout stays parseable JSON, ::error:: goes to stderr', async () => {
+    const { credentialsPath, fetchImpl } = mixedHarness();
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    const err = await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        env: { GITHUB_ACTIONS: 'true' } as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ exitCode: 1 });
+    // The documented machine envelope must remain parseable as-is.
+    const payload = JSON.parse(stdoutLines.join('\n')) as { accepted?: unknown[] };
+    expect(Array.isArray(payload.accepted)).toBe(true);
+    expect(stdoutLines.some(line => line.startsWith('::error'))).toBe(false);
+    const annotations = stderrLines.filter(line => line.startsWith('::error'));
+    expect(annotations).toHaveLength(1);
+    expect(annotations[0]).toContain('test_f');
+  });
+
+  it('--gh-output --summary-file writes the reduced artifact even though the gate exits 1', async () => {
+    const { credentialsPath, fetchImpl } = mixedHarness();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-gh-output-'));
+    const summaryFile = join(dir, 'summary.json');
+    const stdoutLines: string[] = [];
+    const err = await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+        ghOutput: true,
+        summaryFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
+        env: {} as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ exitCode: 1 });
+    const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
+      total: number;
+      passed: number;
+      failed: number;
+      runs: unknown[];
+    };
+    expect(artifact).toMatchObject({ total: 2, passed: 1, failed: 1 });
+    // Forced annotations (off-Actions) land on the text stdout, not the file.
+    expect(stdoutLines.some(line => line.startsWith('::error'))).toBe(true);
   });
 });
