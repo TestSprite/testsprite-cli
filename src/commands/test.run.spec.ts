@@ -2725,6 +2725,7 @@ describe('runTestRunAll — batch fresh run', () => {
           fetchImpl,
           stdout: line => stdoutLines.push(line),
           stderr: () => undefined,
+          env: {} as NodeJS.ProcessEnv,
           sleep: instantSleep,
         },
       );
@@ -3458,6 +3459,7 @@ describe('[B-E2E-01] runTestRunAll --wait: non-passed runs must exit 1 (regressi
           fetchImpl,
           stdout: line => stdoutLines.push(line),
           stderr: () => undefined,
+          env: {} as NodeJS.ProcessEnv,
           sleep: instantSleep,
         },
       );
@@ -3866,6 +3868,7 @@ describe('[finding-5] runTestRunAll --wait: RequestTimeoutError during fan-out p
         fetchImpl,
         stdout: line => stdoutLines.push(line),
         stderr: () => undefined,
+        env: {} as NodeJS.ProcessEnv,
         sleep: instantSleep,
       },
     ).catch(e => e);
