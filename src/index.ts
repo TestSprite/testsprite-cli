@@ -43,7 +43,12 @@ program
   .name('testsprite')
   .description('Official TestSprite command-line interface')
   .version(VERSION)
-  .option('--output <mode>', 'Output format (json|text)', 'text')
+  .option(
+    '--output <mode>',
+    'Output format (json|text|csv|ndjson). csv/ndjson are only supported by list commands ' +
+      '(project list, test list, test result --history).',
+    'text',
+  )
   .option('--profile <name>', 'Configuration profile to use')
   .option('--endpoint-url <url>', 'Override the API endpoint host')
   .option(

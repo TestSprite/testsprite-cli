@@ -289,7 +289,7 @@ describe('createDoctorCommand wiring', () => {
     expect(rejection).toMatchObject({
       code: 'VALIDATION_ERROR',
       exitCode: 5,
-      nextAction: 'Flag `--output` is invalid: must be one of: json, text.',
+      nextAction: 'Flag `--output` is invalid: must be one of: json, text, csv, ndjson.',
     });
   });
 

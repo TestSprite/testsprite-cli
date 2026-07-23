@@ -10,7 +10,13 @@ import {
 import { ApiError } from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
-import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
+import {
+  GLOBAL_OPTS_HINT,
+  Output,
+  resolveOutputMode,
+  type ListColumn,
+  type OutputMode,
+} from '../lib/output.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
@@ -86,6 +92,27 @@ export async function runList(
         }),
       paginationFlags,
     );
+  }
+
+  // csv/ndjson: routed here (before `out.print`, which rejects both modes
+  // for every non-list command) so the row data goes to stdout and the
+  // pagination cursor goes to stderr — keeping stdout a pure, parseable
+  // table/stream per M-hackathon-164.
+  if (opts.output === 'csv' || opts.output === 'ndjson') {
+    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    if (opts.output === 'csv') {
+      out.printCsv(page.items, PROJECT_CSV_COLUMNS);
+    } else {
+      out.printNdjson(page.items);
+    }
+    if (page.nextToken) {
+      stderr(
+        opts.output === 'csv'
+          ? `nextToken: ${page.nextToken}`
+          : JSON.stringify({ nextToken: page.nextToken }),
+      );
+    }
+    return page;
   }
 
   out.print(page, data => {
@@ -1027,6 +1054,20 @@ const PROJECT_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliProject>> = [
   { header: 'TYPE', width: 8, render: project => project.type },
   { header: 'FROM', width: 6, render: project => project.createdFrom },
   { header: 'CREATED', width: 0, render: project => project.createdAt },
+];
+
+/**
+ * `--output csv`/`--output ndjson` columns for `project list`, derived
+ * straight from the `CliProject` source-of-truth shape (not the
+ * possibly-reordered/subset `PROJECT_LIST_COLUMNS` used for `--output text`).
+ */
+const PROJECT_CSV_COLUMNS: ReadonlyArray<ListColumn<CliProject>> = [
+  { header: 'id', value: p => p.id },
+  { header: 'name', value: p => p.name },
+  { header: 'type', value: p => p.type },
+  { header: 'createdFrom', value: p => p.createdFrom },
+  { header: 'createdAt', value: p => p.createdAt },
+  { header: 'updatedAt', value: p => p.updatedAt },
 ];
 
 function renderProjectListText(

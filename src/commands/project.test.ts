@@ -1423,3 +1423,171 @@ describe('dogfood 2026-06-30 — whitespace-only --name is rejected (parity with
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 });
+
+// ---------------------------------------------------------------------------
+// issue #164 — `project list --output csv|ndjson`
+// ---------------------------------------------------------------------------
+
+describe('project list --output csv', () => {
+  it('renders an RFC 4180 header + one row per project, quoting fields with commas/quotes/newlines', async () => {
+    const { credentialsPath } = makeCreds();
+    const quirky: CliProject = {
+      ...PROJECT_FIXTURE,
+      id: 'project_quirky',
+      name: 'Say "hi", then\nnewline',
+    };
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [PROJECT_FIXTURE, quirky], nextToken: null },
+    }));
+
+    const out: string[] = [];
+    const err: string[] = [];
+    await runList(
+      { profile: 'default', output: 'csv', debug: false },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: line => err.push(line) },
+    );
+
+    expect(out).toHaveLength(1);
+    const lines = out[0]!.split('\r\n');
+    expect(lines[0]).toBe('id,name,type,createdFrom,createdAt,updatedAt');
+    expect(lines[1]).toBe(
+      `${PROJECT_FIXTURE.id},${PROJECT_FIXTURE.name},${PROJECT_FIXTURE.type},${PROJECT_FIXTURE.createdFrom},${PROJECT_FIXTURE.createdAt},${PROJECT_FIXTURE.updatedAt}`,
+    );
+    // Embedded comma, double quote, and (raw) newline all force RFC 4180
+    // quoting; the embedded `"` is doubled per §2 rule 7. The record is one
+    // CSV row even though it contains a literal `\n` — only `\r\n` is a row
+    // separator, so `.split('\r\n')` does not break it apart.
+    expect(lines).toHaveLength(3);
+    expect(lines[2]).toBe(
+      'project_quirky,"Say ""hi"", then\nnewline",frontend,portal,2026-04-15T10:23:00.000Z,2026-05-05T08:12:00.000Z',
+    );
+    expect(err).toEqual([]);
+  });
+
+  it('emits the header row only (no data rows) for an empty page', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { items: [], nextToken: null } }));
+
+    const out: string[] = [];
+    await runList(
+      { profile: 'default', output: 'csv', debug: false },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    expect(out).toEqual(['id,name,type,createdFrom,createdAt,updatedAt']);
+  });
+
+  it('routes the pagination cursor to stderr, keeping stdout pure CSV', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [PROJECT_FIXTURE], nextToken: 'opaque-cursor-1' },
+    }));
+
+    const out: string[] = [];
+    const err: string[] = [];
+    await runList(
+      { profile: 'default', output: 'csv', debug: false, pageSize: 1 },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: line => err.push(line) },
+    );
+
+    expect(out).toHaveLength(1);
+    expect(out[0]).not.toContain('nextToken');
+    expect(err).toEqual(['nextToken: opaque-cursor-1']);
+  });
+});
+
+describe('project list --output ndjson', () => {
+  it('emits one compact JSON object per line, no wrapping array', async () => {
+    const { credentialsPath } = makeCreds();
+    const second = { ...PROJECT_FIXTURE, id: 'project_2' };
+    const fetchImpl = makeFetch(() => ({ body: { items: [PROJECT_FIXTURE, second], nextToken: null } }));
+
+    const out: string[] = [];
+    await runList(
+      { profile: 'default', output: 'ndjson', debug: false },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    expect(out).toHaveLength(1);
+    const lines = out[0]!.split('\n');
+    expect(lines).toHaveLength(2);
+    expect(JSON.parse(lines[0]!)).toEqual(PROJECT_FIXTURE);
+    expect(JSON.parse(lines[1]!)).toEqual(second);
+    // Compact — no pretty-printed indentation.
+    expect(lines[0]).not.toContain('\n  ');
+  });
+
+  it('writes nothing to stdout for an empty page (no stray blank line)', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { items: [], nextToken: null } }));
+
+    const out: string[] = [];
+    await runList(
+      { profile: 'default', output: 'ndjson', debug: false },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    expect(out).toEqual([]);
+  });
+
+  it('routes the pagination cursor to stderr as JSON, keeping stdout pure NDJSON', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [PROJECT_FIXTURE], nextToken: 'opaque-cursor-1' },
+    }));
+
+    const out: string[] = [];
+    const err: string[] = [];
+    await runList(
+      { profile: 'default', output: 'ndjson', debug: false, pageSize: 1 },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: line => err.push(line) },
+    );
+
+    expect(out).toHaveLength(1);
+    expect(err).toEqual([JSON.stringify({ nextToken: 'opaque-cursor-1' })]);
+  });
+});
+
+describe('issue #164 — single-object commands reject --output csv|ndjson', () => {
+  it('runGet exits 5 (VALIDATION_ERROR) for --output csv', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: PROJECT_FIXTURE }));
+
+    await expect(
+      runGet(
+        { profile: 'default', output: 'csv', debug: false, projectId: 'p1' },
+        { credentialsPath, fetchImpl, stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runGet exits 5 (VALIDATION_ERROR) for --output ndjson', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: PROJECT_FIXTURE }));
+
+    await expect(
+      runGet(
+        { profile: 'default', output: 'ndjson', debug: false, projectId: 'p1' },
+        { credentialsPath, fetchImpl, stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runCreate exits 5 (VALIDATION_ERROR) for --output csv', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: PROJECT_FIXTURE }));
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'csv',
+          debug: false,
+          type: 'backend',
+          name: 'Checkout',
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+});

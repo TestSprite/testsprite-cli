@@ -1,6 +1,14 @@
 import { localValidationError } from './errors.js';
 
-export type OutputMode = 'json' | 'text';
+export type OutputMode = 'json' | 'text' | 'csv' | 'ndjson';
+
+/**
+ * Output modes accepted by the `--output` flag. `csv` and `ndjson` are only
+ * meaningful for list-style commands (`project list`, `test list`,
+ * `test result --history`) — every other command rejects them via
+ * {@link Output.print} (see that method's doc comment).
+ */
+const OUTPUT_MODES: readonly OutputMode[] = ['json', 'text', 'csv', 'ndjson'];
 
 /**
  * Help-text footer pointing at the global options surface so users
@@ -12,15 +20,15 @@ export const GLOBAL_OPTS_HINT =
   '\n  testsprite --help';
 
 export function isOutputMode(value: unknown): value is OutputMode {
-  return value === 'json' || value === 'text';
+  return (OUTPUT_MODES as readonly unknown[]).includes(value);
 }
 
 /**
  * Resolve a raw `--output` flag value to a concrete {@link OutputMode}.
  *
  * `undefined` (flag omitted) resolves to the default `'text'`. Any other
- * value that is not `'json'` or `'text'` throws a typed VALIDATION_ERROR
- * (exit 5) with an actionable message.
+ * value that is not one of `'json' | 'text' | 'csv' | 'ndjson'` throws a
+ * typed VALIDATION_ERROR (exit 5) with an actionable message.
  *
  * The alternative — silently falling back to `'text'` — is a footgun for the
  * CLI's primary consumer (coding agents): a caller that asks for
@@ -28,11 +36,64 @@ export function isOutputMode(value: unknown): value is OutputMode {
  * human-readable text payload and fail to parse it as JSON, with no signal as
  * to why. Every command group routes its global-option resolution through this
  * helper so the validation is uniform.
+ *
+ * `csv` and `ndjson` are accepted here (so `--output csv` on any command
+ * parses) but are only actually rendered by list commands; every other
+ * command rejects them at print time via {@link Output.print}.
  */
 export function resolveOutputMode(raw: unknown): OutputMode {
   if (raw === undefined) return 'text';
   if (isOutputMode(raw)) return raw;
-  throw localValidationError('output', 'must be one of: json, text', ['json', 'text']);
+  throw localValidationError('output', 'must be one of: json, text, csv, ndjson', OUTPUT_MODES);
+}
+
+/**
+ * One column of a CSV/NDJSON list rendering, derived straight from a
+ * source-of-truth wire type (e.g. `CliProject`, `CliTest`,
+ * `RunHistoryItem`) rather than the (possibly reordered/truncated) text
+ * table columns used for `--output text`.
+ */
+export interface ListColumn<T> {
+  /** CSV header cell / JSON-ish field name for this column. */
+  header: string;
+  /** Extract the raw value for this column from one row. */
+  value: (row: T) => unknown;
+}
+
+/**
+ * Escape one CSV field per RFC 4180 §2:
+ *   - `null`/`undefined` render as the empty string.
+ *   - Fields containing a comma, double quote, or CR/LF are wrapped in
+ *     double quotes, with embedded double quotes doubled (`"` → `""`).
+ */
+export function csvEscapeField(raw: unknown): string {
+  if (raw === null || raw === undefined) return '';
+  const s = String(raw);
+  if (/[",\r\n]/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+/**
+ * Render rows as an RFC 4180 CSV table: a header row followed by one row
+ * per item, fields joined with `,` and records joined with the RFC-mandated
+ * `\r\n` line terminator (no trailing terminator on the final record).
+ */
+export function renderCsv<T>(rows: readonly T[], columns: readonly ListColumn<T>[]): string {
+  const header = columns.map(column => csvEscapeField(column.header)).join(',');
+  const body = rows.map(row => columns.map(column => csvEscapeField(column.value(row))).join(','));
+  return [header, ...body].join('\r\n');
+}
+
+/**
+ * Render rows as newline-delimited JSON: one compact `JSON.stringify`'d
+ * object per line, no wrapping array. Returns `''` (no lines) for an empty
+ * `rows` array — callers should skip the stdout write entirely in that case
+ * so no stray blank line is emitted.
+ */
+export function renderNdjson<T>(rows: readonly T[]): string {
+  return rows.map(row => JSON.stringify(row)).join('\n');
 }
 
 export interface OutputStreams {
@@ -87,12 +148,50 @@ export class Output {
     this.rawStdoutWrite = streams.rawStdout ?? defaultRawStdout;
   }
 
+  /**
+   * Print a single JSON/text envelope. `csv`/`ndjson` are rejected here with
+   * a VALIDATION_ERROR (exit 5): those two modes only make sense for a table
+   * of rows, and every non-list command (get/create/update/delete/...)
+   * renders its single-object result through this method — centralizing the
+   * rejection here means every such command rejects `--output csv|ndjson`
+   * without each of them needing its own guard. List commands (`project
+   * list`, `test list`, `test result --history`) branch on `csv`/`ndjson`
+   * *before* reaching this method and call {@link Output.printCsv} /
+   * {@link Output.printNdjson} instead.
+   */
   print(data: unknown, textRenderer?: (data: unknown) => string): void {
+    if (this.mode === 'csv' || this.mode === 'ndjson') {
+      throw localValidationError(
+        'output',
+        `'${this.mode}' is only supported by list commands (project list, test list, ` +
+          'test result --history); use --output json or --output text here',
+      );
+    }
     if (this.mode === 'json' || !textRenderer) {
       this.stdoutWrite(JSON.stringify(data, null, 2));
       return;
     }
     this.stdoutWrite(textRenderer(data));
+  }
+
+  /**
+   * Render `rows` as an RFC 4180 CSV table (header + one row per item) and
+   * write it to stdout as a single chunk. No-op guard against being called
+   * with a non-`csv` mode is intentionally omitted — callers already branch
+   * on `opts.output === 'csv'` before reaching here.
+   */
+  printCsv<T>(rows: readonly T[], columns: readonly ListColumn<T>[]): void {
+    this.stdoutWrite(renderCsv(rows, columns));
+  }
+
+  /**
+   * Render `rows` as newline-delimited JSON and write it to stdout as a
+   * single chunk. Writes nothing when `rows` is empty, so an empty list
+   * never emits a stray blank line on stdout.
+   */
+  printNdjson<T>(rows: readonly T[]): void {
+    const body = renderNdjson(rows);
+    if (body.length > 0) this.stdoutWrite(body);
   }
 
   /**
