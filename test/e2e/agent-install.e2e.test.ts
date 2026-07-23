@@ -274,7 +274,23 @@ describe('content integrity', () => {
 
   it('gemini GEMINI.md contains ONE managed section with verify and onboard content', () => {
     const tmpDir = freshTmpDir();
-    runCli(['agent', 'install', '--target=gemini', '--dir', tmpDir, '--output', 'json']);
+    const result = runCli(['agent', 'install', '--target=gemini', '--dir', tmpDir, '--output', 'json']);
+
+    // Exit code must be 0
+    expect(result.status, 'gemini install: exit code').toBe(0);
+
+    // stdout must be valid JSON with the expected entry
+    const parsed = JSON.parse(result.stdout) as Array<{
+      target: string;
+      path: string;
+      action: string;
+      skills: string[];
+    }>;
+    expect(Array.isArray(parsed), 'output should be a JSON array').toBe(true);
+    const entry = parsed.find(r => r.target === 'gemini');
+    expect(entry, 'gemini entry in JSON output').toBeDefined();
+    expect(entry!.action, 'gemini action').toBe('section-installed');
+    expect(entry!.path).toBe(TARGETS.gemini.path);
 
     const filePath = join(tmpDir, TARGETS.gemini.path);
     const content = readFileSync(filePath, 'utf8');
@@ -301,6 +317,57 @@ describe('content integrity', () => {
 
     // (d) No frontmatter fence -- GEMINI.md is plain prose
     expect(content.startsWith('---'), 'gemini: must NOT start with ---').toBe(false);
+  });
+
+  it('gemini managed-section preserves user content outside sentinels across re-runs', () => {
+    const tmpDir = freshTmpDir();
+    const filePath = join(tmpDir, TARGETS.gemini.path);
+
+    // Pre-populate GEMINI.md with user content above and below where the
+    // managed section will land.
+    const userPrefix = '# My Project\n\nSome hand-written instructions.\n\n';
+    const userSuffix = '\n## Extra notes\n\nMore user content here.\n';
+    writeFileSync(filePath, userPrefix + userSuffix, 'utf8');
+
+    // First install: merges managed section into the file
+    const first = runCli(['agent', 'install', '--target=gemini', '--dir', tmpDir, '--output', 'json']);
+    expect(first.status, 'first install: exit code').toBe(0);
+
+    const afterFirst = readFileSync(filePath, 'utf8');
+    expect(afterFirst).toContain(userPrefix.trimEnd());
+    expect(afterFirst).toContain(userSuffix.trim());
+    expect(afterFirst).toContain(MANAGED_SECTION_BEGIN);
+    expect(afterFirst).toContain(MANAGED_SECTION_END);
+
+    // Capture the managed section content for comparison across runs
+    const sectionAfterFirst = afterFirst.slice(
+      afterFirst.indexOf(MANAGED_SECTION_BEGIN),
+      afterFirst.indexOf(MANAGED_SECTION_END) + MANAGED_SECTION_END.length,
+    );
+
+    // Second install (re-run): must be idempotent and preserve user content
+    const second = runCli(['agent', 'install', '--target=gemini', '--dir', tmpDir, '--output', 'json']);
+    expect(second.status, 'second install: exit code').toBe(0);
+
+    const afterSecond = readFileSync(filePath, 'utf8');
+
+    // User content outside sentinels must be intact
+    expect(afterSecond).toContain(userPrefix.trimEnd());
+    expect(afterSecond).toContain(userSuffix.trim());
+
+    // Exactly one pair of sentinels after re-run
+    const escRe2 = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const beginCount2 = (afterSecond.match(new RegExp(escRe2(MANAGED_SECTION_BEGIN), 'g')) ?? []).length;
+    const endCount2 = (afterSecond.match(new RegExp(escRe2(MANAGED_SECTION_END), 'g')) ?? []).length;
+    expect(beginCount2, 'exactly one BEGIN sentinel after re-run').toBe(1);
+    expect(endCount2, 'exactly one END sentinel after re-run').toBe(1);
+
+    // Managed section content must be byte-identical between runs
+    const sectionAfterSecond = afterSecond.slice(
+      afterSecond.indexOf(MANAGED_SECTION_BEGIN),
+      afterSecond.indexOf(MANAGED_SECTION_END) + MANAGED_SECTION_END.length,
+    );
+    expect(sectionAfterSecond).toBe(sectionAfterFirst);
   });
 });
 // ---------------------------------------------------------------------------

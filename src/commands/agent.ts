@@ -22,6 +22,7 @@ import {
   renderForTarget,
   renderOwnFileWithMarker,
   MANAGED_SECTION_BEGIN,
+  MANAGED_SECTION_BEGIN_LEGACY,
   MANAGED_SECTION_END,
 } from '../lib/agent-targets.js';
 
@@ -206,7 +207,8 @@ function classifySection(existing: string, section: string): SectionState {
 
   for (let i = 0; i < lines.length; i++) {
     const stripped = (lines[i] ?? '').trimEnd();
-    if (stripped === MANAGED_SECTION_BEGIN) beginLines.push(i);
+    if (stripped === MANAGED_SECTION_BEGIN || stripped === MANAGED_SECTION_BEGIN_LEGACY)
+      beginLines.push(i);
     else if (stripped === MANAGED_SECTION_END) endLines.push(i);
   }
 

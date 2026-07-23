@@ -409,8 +409,13 @@ describe('renderForTarget("gemini")', () => {
 
   it('renders the verify body content (managed-section, compact codex body)', () => {
     // Uses real bodies: gemini uses the codex contribution body (compact).
+    // renderForTarget for managed-section returns the unwrapped body (no
+    // sentinels) — sentinel wrapping happens at install time via buildSection.
     const gemini = renderForTarget('gemini', 'testsprite-verify');
     expect(gemini.content).toContain('testsprite test run');
+    // Body must NOT be wrapped in sentinels at this layer
+    expect(gemini.content).not.toContain(MANAGED_SECTION_BEGIN);
+    expect(gemini.content).not.toContain(MANAGED_SECTION_END);
   });
 });
 

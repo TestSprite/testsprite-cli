@@ -300,10 +300,19 @@ export const TARGETS: Record<AgentTarget, TargetSpec> = {
   },
 };
 
-/** Sentinel pair that bounds our managed section in AGENTS.md. */
+/** Sentinel pair that bounds our managed section in AGENTS.md / GEMINI.md. */
 export const MANAGED_SECTION_BEGIN =
-  '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install codex) -->';
+  '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install) -->';
 export const MANAGED_SECTION_END = '<!-- END TESTSPRITE AGENT SECTION -->';
+
+/**
+ * Legacy sentinel written by versions prior to this change.
+ * Kept for backward-compatibility: existing AGENTS.md files that contain
+ * the old Codex-labelled marker are still recognised as a valid managed
+ * section during classify / replace operations.
+ */
+export const MANAGED_SECTION_BEGIN_LEGACY =
+  '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install codex) -->';
 
 // ---------------------------------------------------------------------------
 // Install marker (stale-skill detection, issue #123)
