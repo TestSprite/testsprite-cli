@@ -23,7 +23,12 @@ export interface OpenInBrowserDeps {
 }
 
 export function openInBrowser(url: string, deps: OpenInBrowserDeps = {}): void {
-  const parsed = new URL(url);
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw localValidationError('url', 'must be a valid http(s) URL', undefined, 'field');
+  }
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
     // User-input error, not an internal failure: classify as VALIDATION_ERROR
     // so it maps to exit 5 (like every other bad-argument path), not exit 1.

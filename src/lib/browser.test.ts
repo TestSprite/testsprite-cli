@@ -54,9 +54,16 @@ describe('openInBrowser', () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it('throws on a malformed URL', () => {
+  it('refuses a malformed URL with exit 5 before spawning', () => {
     const exec = vi.fn();
-    expect(() => openInBrowser('not a url', { exec })).toThrow();
+    let error: unknown;
+    try {
+      openInBrowser('not a url', { exec });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).exitCode).toBe(5);
     expect(exec).not.toHaveBeenCalled();
   });
 
