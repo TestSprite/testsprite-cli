@@ -3407,6 +3407,185 @@ describe('runExport / runImport', () => {
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
+
+  it('import accepts a BOM-prefixed definition file (PowerShell utf8 writes one)', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-import-bom-'));
+    const file = join(dir, 'def.testsprite.json');
+    writeFileSync(
+      file,
+      `﻿${JSON.stringify({
+        schemaVersion: 1,
+        projectId: 'project_alice',
+        type: 'backend',
+        name: 'BOM test',
+      })}`,
+      'utf8',
+    );
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ testId: 'test_bom' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })) as typeof fetch;
+    const result = await runImport(
+      { profile: 'default', output: 'json', debug: false, file },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    );
+    expect(result).toEqual({ testId: 'test_bom', action: 'created' });
+  });
+
+  it('import splits missing-file from malformed-JSON errors', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-import-err-'));
+    await expect(
+      runImport(
+        { profile: 'default', output: 'json', debug: false, file: join(dir, 'nope.json') },
+        { stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      nextAction: expect.stringContaining('file not found'),
+    });
+    const bad = join(dir, 'bad.json');
+    writeFileSync(bad, '{not json', 'utf8');
+    await expect(
+      runImport(
+        { profile: 'default', output: 'json', debug: false, file: bad },
+        { stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      nextAction: expect.stringContaining('is not valid JSON'),
+    });
+  });
+
+  it('import with codeVersion null sends If-Match: * and warns about the unconditional overwrite', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-import-null-'));
+    const file = join(dir, 'def.testsprite.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 1,
+        testId: 'test_be',
+        projectId: 'project_alice',
+        type: 'backend',
+        name: 'Legacy row',
+        code: { language: 'python', framework: 'pytest', body: 'print(3)\n', codeVersion: null },
+      }),
+      'utf8',
+    );
+    const seen: Array<{ url: string; ifMatch: string | null }> = [];
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      const headers = new Headers(init.headers);
+      seen.push({ url: String(input), ifMatch: headers.get('if-match') });
+      return new Response(JSON.stringify({ testId: 'test_be' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const errs: string[] = [];
+    await runImport(
+      { profile: 'default', output: 'json', debug: false, file },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: line => errs.push(line) },
+    );
+    expect(seen[1]!.url).toContain('/code');
+    expect(seen[1]!.ifMatch).toBe('*');
+    expect(errs.join('\n')).toContain('If-Match: *');
+  });
+
+  it('import mints one echoed idempotency key and derives :meta/:code from a supplied one', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-import-idem-'));
+    const file = join(dir, 'def.testsprite.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        schemaVersion: 1,
+        testId: 'test_be',
+        projectId: 'project_alice',
+        type: 'backend',
+        name: 'Idem test',
+        code: { language: 'python', framework: 'pytest', body: 'print(4)\n', codeVersion: 'v3' },
+      }),
+      'utf8',
+    );
+    const keys: Array<string | null> = [];
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      keys.push(new Headers(init.headers).get('idempotency-key'));
+      return new Response(JSON.stringify({ testId: 'test_be' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const errs: string[] = [];
+    await runImport(
+      { profile: 'default', output: 'json', debug: false, file, idempotencyKey: 'ci-key-1' },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: line => errs.push(line) },
+    );
+    expect(keys).toEqual(['ci-key-1:meta', 'ci-key-1:code']);
+    expect(errs.join('\n')).not.toContain('idempotency-key:');
+
+    keys.length = 0;
+    await runImport(
+      { profile: 'default', output: 'json', debug: false, file },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: line => errs.push(line) },
+    );
+    expect(keys[0]).toMatch(/^cli-import-.+:meta$/);
+    expect(keys[1]).toMatch(/^cli-import-.+:code$/);
+    expect(errs.join('\n')).toContain('idempotency-key: cli-import-');
+  });
+
+  it('export --out writes the file, refuses to overwrite without --force, overwrites with it', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => ({ body: url.includes('/code') ? CODE_ROW : TEST_ROW }));
+    const dir = mkdtempSync(join(tmpdir(), 'cli-export-out-'));
+    const outFile = join(dir, 'def.testsprite.json');
+    const errs: string[] = [];
+    await runExport(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_be',
+        out: outFile,
+        force: false,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: line => errs.push(line) },
+    );
+    const written = JSON.parse(readFileSync(outFile, 'utf8')) as { testId?: string };
+    expect(written).toMatchObject({ schemaVersion: 1, testId: 'test_be' });
+    expect(errs.join('\n')).toContain('Definition written to');
+
+    await expect(
+      runExport(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_be',
+          out: outFile,
+          force: false,
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      nextAction: expect.stringContaining('already exists'),
+    });
+
+    await runExport(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_be',
+        out: outFile,
+        force: true,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    );
+    expect(JSON.parse(readFileSync(outFile, 'utf8'))).toMatchObject({ testId: 'test_be' });
+  });
 });
 
 describe('runLint', () => {

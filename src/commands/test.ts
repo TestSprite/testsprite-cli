@@ -4179,6 +4179,8 @@ export async function runExport(
 
 export interface ImportOptions extends CommonOptions {
   file: string;
+  /** --idempotency-key: caller-supplied; auto-minted UUID when absent. */
+  idempotencyKey?: string;
 }
 
 /**
@@ -4194,18 +4196,24 @@ export async function runImport(
 ): Promise<{ testId: string; action: 'created' | 'updated' }> {
   const out = makeOutput(opts.output, deps);
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  assertIdempotencyKey(opts.idempotencyKey);
 
   const absolute = resolveAbsolute(opts.file);
+  // Read and parse are split so a typo'd path and malformed JSON stop being
+  // the same message. stripBom mirrors every other JSON file-read in this
+  // file: PowerShell 5.1's `Set-Content -Encoding utf8` writes a BOM, and
+  // bare JSON.parse rejects it.
+  let raw: string;
+  try {
+    raw = stripBom(readFileSync(absolute, 'utf8'));
+  } catch {
+    throw localValidationError('file', `file not found: ${absolute}`, undefined, 'field');
+  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(absolute, 'utf8'));
+    parsed = JSON.parse(raw);
   } catch {
-    throw localValidationError(
-      'file',
-      `is not readable valid JSON: ${absolute}`,
-      undefined,
-      'field',
-    );
+    throw localValidationError('file', `is not valid JSON: ${absolute}`, undefined, 'field');
   }
   const def = parsed as Partial<CliTestDefinition>;
   if (def.schemaVersion !== 1) {
@@ -4239,6 +4247,17 @@ export async function runImport(
     return sample;
   }
 
+  // One base key covers the whole import; per-mutation keys derive from it
+  // deterministically (`:meta`, `:code`, `:create`) so a caller-supplied key
+  // replayed after an ambiguous transport failure reuses the SAME wire keys
+  // instead of minting fresh ones and duplicating the mutation (same contract
+  // as `test create` / `test update` / `code put`). Echoed on stderr below
+  // for the auto-minted case, mirroring the `test create` site.
+  const idempotencyKey = opts.idempotencyKey ?? `cli-import-${randomUUID()}`;
+  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
+    stderrFn(`idempotency-key: ${idempotencyKey}`);
+  }
+
   const client = makeClient(opts, deps);
   if (typeof def.testId === 'string' && def.testId.length > 0) {
     const testId = def.testId;
@@ -4247,19 +4266,28 @@ export async function runImport(
         name: def.name.trim(),
         ...(def.description !== undefined ? { description: def.description } : {}),
       },
-      headers: { 'idempotency-key': `cli-import-meta-${randomUUID()}` },
+      headers: { 'idempotency-key': `${idempotencyKey}:meta` },
     });
     if (def.code !== undefined && typeof def.code.body === 'string') {
+      const recordedVersion = def.code.codeVersion;
+      if (recordedVersion === null || recordedVersion === undefined) {
+        // Legacy export with no stamped codeVersion: `If-Match: *` applies the
+        // backend's force path (audit-logged) instead of silently omitting the
+        // precondition — same handling as `code put`'s auto-fetch on a legacy
+        // row, and the notice makes the unconditional overwrite visible.
+        stderrFn(
+          `note: definition has codeVersion: null (legacy export) — sending If-Match: * (unconditional overwrite of the server copy)`,
+        );
+      }
       await client.put(`/tests/${encodeURIComponent(testId)}/code`, {
         body: { code: def.code.body },
         headers: {
-          'idempotency-key': `cli-import-code-${randomUUID()}`,
+          'idempotency-key': `${idempotencyKey}:code`,
           // Replay the recorded provenance so a server copy that moved on
           // fails with the existing 412 PRECONDITION_FAILED contract instead
           // of being silently clobbered.
-          ...(def.code.codeVersion !== null && def.code.codeVersion !== undefined
-            ? { 'if-match': def.code.codeVersion }
-            : {}),
+          'if-match':
+            recordedVersion !== null && recordedVersion !== undefined ? recordedVersion : '*',
         },
       });
     }
@@ -4276,7 +4304,7 @@ export async function runImport(
       ...(def.description !== undefined ? { description: def.description } : {}),
       ...(def.code !== undefined ? { code: def.code.body } : {}),
     },
-    headers: { 'idempotency-key': `cli-import-create-${randomUUID()}` },
+    headers: { 'idempotency-key': `${idempotencyKey}:create` },
   });
   const result = { testId: created.testId, action: 'created' as const };
   out.print(result, () => `created: ${created.testId}`);
@@ -9111,9 +9139,16 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .description(
       'Create or update a test from a definition file produced by `test export`: a testId in the file updates (code PUT replays the recorded codeVersion as If-Match), no testId creates.',
     )
+    .option(
+      '--idempotency-key <key>',
+      'opaque key for safe retries (1–256 chars). Printed to stderr at --debug if auto-generated.',
+    )
     .addHelpText('after', GLOBAL_OPTS_HINT)
-    .action(async (file: string, _cmdOpts: unknown, command: Command) => {
-      await runImport({ ...resolveCommonOptions(command), file }, deps);
+    .action(async (file: string, cmdOpts: { idempotencyKey?: string }, command: Command) => {
+      await runImport(
+        { ...resolveCommonOptions(command), file, idempotencyKey: cmdOpts.idempotencyKey },
+        deps,
+      );
     });
 
   test

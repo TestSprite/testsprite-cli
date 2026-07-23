@@ -246,7 +246,7 @@ Commands:
                                         versionable JSON file. Frontend plans
                                         are write-only on the API, so FE
                                         exports carry planUnavailable: true.
-  import <file>                         Create or update a test from a
+  import [options] <file>               Create or update a test from a
                                         definition file produced by \`test
                                         export\`: a testId in the file updates
                                         (code PUT replays the recorded
