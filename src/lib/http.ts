@@ -1,7 +1,16 @@
 import { randomUUID } from 'node:crypto';
+import * as v from 'valibot';
 import type { ErrorCode } from './errors.js';
 import { ApiError, InterruptError, RequestTimeoutError, TransportError } from './errors.js';
 import { VERSION } from '../version.js';
+import {
+  BATCH_RERUN_RESPONSE_SCHEMA,
+  BATCH_RUN_FRESH_RESPONSE_SCHEMA,
+  LIST_RUNS_RESPONSE_SCHEMA,
+  RERUN_RESPONSE_SCHEMA,
+  RUN_RESPONSE_SCHEMA,
+  TRIGGER_RUN_RESPONSE_SCHEMA,
+} from './response-schemas.js';
 import type {
   TriggerRunBody,
   TriggerRunResponse,
@@ -108,10 +117,26 @@ export interface HttpClientOptions {
   shutdownSignal?: AbortSignal;
 }
 
-export interface RequestOptions {
+export interface RequestOptions<T = unknown> {
   query?: Record<string, string | number | boolean | undefined>;
   signal?: AbortSignal;
   requestId?: string;
+  /**
+   * Optional valibot schema for the parsed 2xx response body (issue #102).
+   *
+   * When present, `requestWithMeta` runs `v.safeParse` on the OK-path JSON:
+   * success returns the parsed output (unknown extra keys preserved via
+   * `looseObject`); failure throws an INTERNAL `ApiError` envelope naming the
+   * request path and the first {@link MAX_SCHEMA_ISSUES_IN_DETAILS} mismatched
+   * field paths (never the body itself). When absent, behavior is unchanged:
+   * the body is returned via the historical blind `as T` cast.
+   *
+   * Wired by the typed run helpers only (`triggerRun`, `triggerRunWithMeta`,
+   * `triggerRerun`, `triggerBatchRerun`, `triggerBatchRunFresh`, `getRun`,
+   * `listTestRuns`); generic `get`/`post`/... callers stay opt-in.
+   * sourceRef: response-schemas.ts.
+   */
+  schema?: v.GenericSchema<unknown, T>;
   /**
    * Optional JSON body for non-GET requests. Serialized with
    * `JSON.stringify`; `Content-Type: application/json` is auto-attached
@@ -168,6 +193,11 @@ const MAX_RATE_LIMITED_DELAY_MS = 60_000;
 const CONFLICT_DELAY_MS = 1000;
 const INTERNAL_DELAY_MS = 500;
 
+// Cap on how many valibot issues a shape-mismatch INTERNAL envelope carries in
+// `details.issues` (path + message each). Keeps the envelope readable and
+// guarantees the response body itself is never echoed back to the operator.
+const MAX_SCHEMA_ISSUES_IN_DETAILS = 3;
+
 /**
  * Result of a successful HTTP request, including the parsed body and the
  * `x-request-id` that was sent (useful for surfacing in happy-path output).
@@ -222,23 +252,23 @@ export class HttpClient {
     }
   }
 
-  async get<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  async get<T>(path: string, options: RequestOptions<T> = {}): Promise<T> {
     return this.requestWithMeta<T>('GET', path, options).then(r => r.body);
   }
 
-  async post<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  async post<T>(path: string, options: RequestOptions<T> = {}): Promise<T> {
     return this.requestWithMeta<T>('POST', path, options).then(r => r.body);
   }
 
-  async put<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  async put<T>(path: string, options: RequestOptions<T> = {}): Promise<T> {
     return this.requestWithMeta<T>('PUT', path, options).then(r => r.body);
   }
 
-  async patch<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  async patch<T>(path: string, options: RequestOptions<T> = {}): Promise<T> {
     return this.requestWithMeta<T>('PATCH', path, options).then(r => r.body);
   }
 
-  async delete<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  async delete<T>(path: string, options: RequestOptions<T> = {}): Promise<T> {
     return this.requestWithMeta<T>('DELETE', path, options).then(r => r.body);
   }
 
@@ -247,23 +277,26 @@ export class HttpClient {
    * `requestId` and `status`, so callers can surface the requestId in
    * happy-path output (dogfood item 1).
    */
-  async getWithMeta<T>(path: string, options: RequestOptions = {}): Promise<RequestResult<T>> {
+  async getWithMeta<T>(path: string, options: RequestOptions<T> = {}): Promise<RequestResult<T>> {
     return this.requestWithMeta<T>('GET', path, options);
   }
 
-  async postWithMeta<T>(path: string, options: RequestOptions = {}): Promise<RequestResult<T>> {
+  async postWithMeta<T>(path: string, options: RequestOptions<T> = {}): Promise<RequestResult<T>> {
     return this.requestWithMeta<T>('POST', path, options);
   }
 
-  async putWithMeta<T>(path: string, options: RequestOptions = {}): Promise<RequestResult<T>> {
+  async putWithMeta<T>(path: string, options: RequestOptions<T> = {}): Promise<RequestResult<T>> {
     return this.requestWithMeta<T>('PUT', path, options);
   }
 
-  async patchWithMeta<T>(path: string, options: RequestOptions = {}): Promise<RequestResult<T>> {
+  async patchWithMeta<T>(path: string, options: RequestOptions<T> = {}): Promise<RequestResult<T>> {
     return this.requestWithMeta<T>('PATCH', path, options);
   }
 
-  async deleteWithMeta<T>(path: string, options: RequestOptions = {}): Promise<RequestResult<T>> {
+  async deleteWithMeta<T>(
+    path: string,
+    options: RequestOptions<T> = {},
+  ): Promise<RequestResult<T>> {
     return this.requestWithMeta<T>('DELETE', path, options);
   }
 
@@ -282,6 +315,7 @@ export class HttpClient {
       body,
       headers: { 'idempotency-key': options.idempotencyKey },
       signal: options.signal,
+      schema: TRIGGER_RUN_RESPONSE_SCHEMA,
       // 409 on POST /runs means "another run is already in flight" — a
       // persistent condition, not a transient snapshot conflict. Retrying
       // would enqueue a second run once the first finishes.
@@ -310,6 +344,7 @@ export class HttpClient {
       body,
       headers: { 'idempotency-key': options.idempotencyKey },
       signal: options.signal,
+      schema: TRIGGER_RUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
       // Default true: single `test run` / `test create --run` retain 429 retry.
       // Batch call site passes false to keep outer-loop as sole rate-limit owner.
@@ -334,6 +369,7 @@ export class HttpClient {
       body,
       headers: { 'idempotency-key': options.idempotencyKey },
       signal: options.signal,
+      schema: RERUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
     }).then(r => r.body);
   }
@@ -353,6 +389,7 @@ export class HttpClient {
       body,
       headers: { 'idempotency-key': options.idempotencyKey },
       signal: options.signal,
+      schema: BATCH_RERUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
     }).then(r => r.body);
   }
@@ -373,6 +410,7 @@ export class HttpClient {
       body,
       headers: { 'idempotency-key': options.idempotencyKey },
       signal: options.signal,
+      schema: BATCH_RUN_FRESH_RESPONSE_SCHEMA,
       retryOnConflict: false,
     }).then(r => r.body);
   }
@@ -391,7 +429,10 @@ export class HttpClient {
     if (query.pageSize !== undefined) q.pageSize = query.pageSize;
     if (query.source !== undefined) q.source = query.source;
     if (query.since !== undefined) q.since = query.since;
-    return this.get<ListRunsResponse>(`/tests/${encodeURIComponent(testId)}/runs`, { query: q });
+    return this.get<ListRunsResponse>(`/tests/${encodeURIComponent(testId)}/runs`, {
+      query: q,
+      schema: LIST_RUNS_RESPONSE_SCHEMA,
+    });
   }
 
   /**
@@ -421,6 +462,7 @@ export class HttpClient {
     return this.get<RunResponse>(`/runs/${encodeURIComponent(runId)}`, {
       query: Object.keys(query).length > 0 ? query : undefined,
       signal: options?.signal,
+      schema: RUN_RESPONSE_SCHEMA,
     });
   }
 
@@ -481,7 +523,7 @@ export class HttpClient {
   async requestWithMeta<T>(
     method: string,
     path: string,
-    options: RequestOptions = {},
+    options: RequestOptions<T> = {},
   ): Promise<RequestResult<T>> {
     if (!this.apiKey) throw ApiError.authRequired();
 
@@ -594,8 +636,9 @@ export class HttpClient {
             requestId,
             durationMs,
           });
+          let raw: unknown;
           try {
-            return { body: (await response.json()) as T, requestId, status: response.status };
+            raw = await response.json();
           } catch (err) {
             // Interrupt passthrough (see the fetch catch above).
             if (err instanceof InterruptError) throw err;
@@ -609,6 +652,34 @@ export class HttpClient {
             // and break the --output json envelope contract.
             throw malformedResponseError(response, requestId, err);
           }
+          if (options.schema !== undefined) {
+            const parsed = v.safeParse(options.schema, raw);
+            if (!parsed.success) {
+              const issues = parsed.issues.slice(0, MAX_SCHEMA_ISSUES_IN_DETAILS).map(issue => ({
+                path: v.getDotPath(issue) ?? '(root)',
+                message: issue.message,
+              }));
+              // Shape drift is a server-side contract break: surface a typed
+              // INTERNAL envelope (requestId + the first mismatched paths,
+              // never the body) instead of letting a blind cast poison
+              // downstream output with undefined fields or a raw TypeError.
+              throw ApiError.fromEnvelope(
+                {
+                  error: {
+                    code: 'INTERNAL',
+                    message: `Response shape mismatch from ${shortPath(path)}.`,
+                    nextAction:
+                      'Retry; if it persists, report this requestId (the server returned an unexpected shape).',
+                    requestId,
+                    details: { issues },
+                  },
+                },
+                response.status,
+              );
+            }
+            return { body: parsed.output as T, requestId, status: response.status };
+          }
+          return { body: raw as T, requestId, status: response.status };
         }
 
         let rawBody: unknown;
@@ -790,7 +861,7 @@ export class HttpClient {
    * `client.request(...)` directly. New callers should use
    * `requestWithMeta` or the typed helpers (`get`, `post`, etc.).
    */
-  async request<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
+  async request<T>(method: string, path: string, options: RequestOptions<T> = {}): Promise<T> {
     return this.requestWithMeta<T>(method, path, options).then(r => r.body);
   }
 }
