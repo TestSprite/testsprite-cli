@@ -274,7 +274,15 @@ describe('content integrity', () => {
 
   it('gemini GEMINI.md contains ONE managed section with verify and onboard content', () => {
     const tmpDir = freshTmpDir();
-    const result = runCli(['agent', 'install', '--target=gemini', '--dir', tmpDir, '--output', 'json']);
+    const result = runCli([
+      'agent',
+      'install',
+      '--target=gemini',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
 
     // Exit code must be 0
     expect(result.status, 'gemini install: exit code').toBe(0);
@@ -330,7 +338,15 @@ describe('content integrity', () => {
     writeFileSync(filePath, userPrefix + userSuffix, 'utf8');
 
     // First install: merges managed section into the file
-    const first = runCli(['agent', 'install', '--target=gemini', '--dir', tmpDir, '--output', 'json']);
+    const first = runCli([
+      'agent',
+      'install',
+      '--target=gemini',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
     expect(first.status, 'first install: exit code').toBe(0);
 
     const afterFirst = readFileSync(filePath, 'utf8');
@@ -346,7 +362,15 @@ describe('content integrity', () => {
     );
 
     // Second install (re-run): must be idempotent and preserve user content
-    const second = runCli(['agent', 'install', '--target=gemini', '--dir', tmpDir, '--output', 'json']);
+    const second = runCli([
+      'agent',
+      'install',
+      '--target=gemini',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
     expect(second.status, 'second install: exit code').toBe(0);
 
     const afterSecond = readFileSync(filePath, 'utf8');
@@ -357,8 +381,10 @@ describe('content integrity', () => {
 
     // Exactly one pair of sentinels after re-run
     const escRe2 = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const beginCount2 = (afterSecond.match(new RegExp(escRe2(MANAGED_SECTION_BEGIN), 'g')) ?? []).length;
-    const endCount2 = (afterSecond.match(new RegExp(escRe2(MANAGED_SECTION_END), 'g')) ?? []).length;
+    const beginCount2 = (afterSecond.match(new RegExp(escRe2(MANAGED_SECTION_BEGIN), 'g')) ?? [])
+      .length;
+    const endCount2 = (afterSecond.match(new RegExp(escRe2(MANAGED_SECTION_END), 'g')) ?? [])
+      .length;
     expect(beginCount2, 'exactly one BEGIN sentinel after re-run').toBe(1);
     expect(endCount2, 'exactly one END sentinel after re-run').toBe(1);
 
