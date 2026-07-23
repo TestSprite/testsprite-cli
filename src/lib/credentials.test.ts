@@ -157,6 +157,19 @@ describe('writeProfile', () => {
     expect(file.dev).toEqual({ apiKey: 'sk-dev', apiUrl: 'https://dev' });
   });
 
+  it('reclaims stale mutation locks and removes the lock after writing', () => {
+    const lockPath = `${credentialsPath}.lock`;
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({ pid: process.pid, createdAt: Date.now() - 60_000, token: 'stale' })}\n`,
+    );
+
+    writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath });
+
+    expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
   it('does not leak the api key into the on-disk file format aside from the value itself', () => {
     writeProfile('default', { apiKey: 'sk-secret-12345' }, { path: credentialsPath });
     const onDisk = readFileSync(credentialsPath, 'utf-8');
@@ -168,6 +181,7 @@ describe('writeProfile', () => {
 describe('deleteProfile', () => {
   it('returns false when the profile is missing', () => {
     expect(deleteProfile('nope', { path: credentialsPath })).toBe(false);
+    expect(existsSync(credentialsPath)).toBe(false);
   });
 
   it('removes the named profile and leaves others intact', () => {
