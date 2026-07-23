@@ -3414,13 +3414,12 @@ describe('runExport / runImport', () => {
     const file = join(dir, 'def.testsprite.json');
     writeFileSync(
       file,
-      '﻿' +
-        JSON.stringify({
-          schemaVersion: 1,
-          projectId: 'project_alice',
-          type: 'backend',
-          name: 'BOM test',
-        }),
+      `\uFEFF${JSON.stringify({
+        schemaVersion: 1,
+        projectId: 'project_alice',
+        type: 'backend',
+        name: 'BOM test',
+      })}`,
       'utf8',
     );
     const fetchImpl = (async () =>
