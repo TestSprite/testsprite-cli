@@ -367,6 +367,9 @@ describe('content integrity', () => {
       afterSecond.indexOf(MANAGED_SECTION_BEGIN),
       afterSecond.indexOf(MANAGED_SECTION_END) + MANAGED_SECTION_END.length,
     );
+    // User content must be OUTSIDE the managed section, not absorbed into it
+    expect(sectionAfterSecond).not.toContain(userPrefix.trimEnd());
+    expect(sectionAfterSecond).not.toContain(userSuffix.trim());
     expect(sectionAfterSecond).toBe(sectionAfterFirst);
   });
 });
