@@ -100,6 +100,8 @@ const CREDENTIALS_LOCK_RETRY_MS = 25;
 const CREDENTIALS_LOCK_WAIT_MS = 5_000;
 const CREDENTIALS_LOCK_STALE_MS = 30_000;
 
+const DANGEROUS_INI_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 /**
  * Generic hardened INI walk shared by the credentials file and the settings
  * config file (`~/.testsprite/config`). Returns every `[section]`'s raw
@@ -120,11 +122,7 @@ export function parseIniFile(content: string): Record<string, Record<string, str
       const sectionName = sectionMatch[1]!.trim();
       // Defense in depth alongside the null-prototype accumulator: never treat a
       // prototype-polluting key as a profile section. Skip its key=value lines.
-      if (
-        sectionName === '__proto__' ||
-        sectionName === 'constructor' ||
-        sectionName === 'prototype'
-      ) {
+      if (DANGEROUS_INI_KEYS.has(sectionName)) {
         currentEntry = null;
         continue;
       }
@@ -145,7 +143,7 @@ export function parseIniFile(content: string): Record<string, Record<string, str
     const rawValue = line.slice(eqIndex + 1).trim();
     // Same guard for keys: `__proto__ = x` must never become a property write
     // on a shared prototype when a caller copies the section into a plain map.
-    if (rawKey === '__proto__' || rawKey === 'constructor' || rawKey === 'prototype') continue;
+    if (DANGEROUS_INI_KEYS.has(rawKey)) continue;
     currentEntry[rawKey] = rawValue;
   }
   // Return plain objects so callers (and test matchers) see normal prototypes.

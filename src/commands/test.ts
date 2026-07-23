@@ -9176,10 +9176,14 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
       if (isAll) {
         // --all path: wave-ordered fresh batch run.
-        const projectId = resolveProjectId(cmdOpts.project, deps, resolveCommonOptions(command).profile);
+        const projectId = resolveProjectId(
+          cmdOpts.project,
+          deps,
+          resolveCommonOptions(command).profile,
+        );
         requireProjectId(
           projectId,
-          '--all requires a project id - pass --project <id> or set TESTSPRITE_PROJECT_ID',
+          '--all requires a project id - pass --project <id>, set TESTSPRITE_PROJECT_ID, or set project_id in ~/.testsprite/config (or TESTSPRITE_CONFIG_FILE)',
         );
         // --target-url has no effect on the --all batch path: a BE test's base
         // URL is baked into its code, and the unified engine resolves each
@@ -9826,7 +9830,7 @@ function resolveProjectId(
 }
 function requireProjectId(
   projectId: string | undefined,
-  message = 'is required; pass --project <id>, set TESTSPRITE_PROJECT_ID, or set project_id in ~/.testsprite/config',
+  message = 'is required; pass --project <id>, set TESTSPRITE_PROJECT_ID, or set project_id in the config file (~/.testsprite/config or TESTSPRITE_CONFIG_FILE)',
 ): asserts projectId is string {
   if (typeof projectId !== 'string' || projectId.length === 0) {
     throw localValidationError('project', message);
