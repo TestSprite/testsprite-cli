@@ -730,7 +730,10 @@ Official TestSprite command-line interface
 
 Options:
   -V, --version                output the version number
-  --output <mode>              Output format (json|text) (default: "text")
+  --output <mode>              Output format (json|text|csv|ndjson). csv/ndjson
+                               are only supported by list commands (project
+                               list, test list, test result --history).
+                               (default: "text")
   --profile <name>             Configuration profile to use
   --endpoint-url <url>         Override the API endpoint host
   --verbose                    Emit human-readable HTTP retry / backoff /

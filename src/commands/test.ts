@@ -54,7 +54,13 @@ import {
 import { REQUEST_TIMEOUT_DEFAULT_MS, REQUEST_TIMEOUT_MAX_MS } from '../lib/http.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
-import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
+import {
+  GLOBAL_OPTS_HINT,
+  Output,
+  resolveOutputMode,
+  type ListColumn,
+  type OutputMode,
+} from '../lib/output.js';
 import {
   fetchSinglePage,
   paginate,
@@ -602,6 +608,26 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
         }),
       paginationFlags,
     );
+  }
+
+  // csv/ndjson: handled before `out.print` (which rejects both modes for
+  // every non-list command) — row data to stdout, pagination cursor to
+  // stderr so stdout stays a pure, parseable table/stream (M-hackathon-164).
+  if (opts.output === 'csv' || opts.output === 'ndjson') {
+    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    if (opts.output === 'csv') {
+      out.printCsv(page.items, TEST_CSV_COLUMNS);
+    } else {
+      out.printNdjson(page.items);
+    }
+    if (page.nextToken) {
+      stderr(
+        opts.output === 'csv'
+          ? `nextToken: ${page.nextToken}`
+          : JSON.stringify({ nextToken: page.nextToken }),
+      );
+    }
+    return page;
   }
 
   out.print(page, data =>
@@ -4620,8 +4646,31 @@ export async function runResultHistory(
     since: sinceIso,
   });
 
-  if (opts.output !== 'text') {
+  if (opts.output === 'json') {
     out.print({ runs: resp.runs, nextCursor: resp.nextCursor }, data => JSON.stringify(data));
+    return resp;
+  }
+
+  // csv/ndjson: handled before `out.print` (which rejects both modes for
+  // every non-list command) — run rows go to stdout, `nextCursor` and the
+  // `meta` block go to stderr so stdout stays a pure, parseable table/stream
+  // (M-hackathon-164).
+  if (opts.output === 'csv' || opts.output === 'ndjson') {
+    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    if (opts.output === 'csv') {
+      out.printCsv(resp.runs, RUN_HISTORY_CSV_COLUMNS);
+    } else {
+      out.printNdjson(resp.runs);
+    }
+    if (resp.nextCursor !== null) {
+      stderr(
+        opts.output === 'csv'
+          ? `nextCursor: ${resp.nextCursor}`
+          : JSON.stringify({ nextCursor: resp.nextCursor }),
+      );
+    }
+    if (resp.meta.note) stderr(`note: ${resp.meta.note}`);
+    if (resp.meta.portalUrl) stderr(`portal: ${resp.meta.portalUrl}`);
     return resp;
   }
 
@@ -4695,6 +4744,27 @@ const RUN_HISTORY_TABLE_COLUMNS: ReadonlyArray<TextTableColumn<RunHistoryItem>> 
     width: 0,
     render: run => formatDurationMs(run.startedAt ?? run.createdAt, run.finishedAt),
   },
+];
+
+/**
+ * `--output csv`/`--output ndjson` columns for `test result --history`,
+ * derived straight from the `RunHistoryItem` source-of-truth shape (not the
+ * text-table-only `RUN_HISTORY_TABLE_COLUMNS`, which drops several fields
+ * and derives `RERUN?`/`DURATION` for display).
+ */
+const RUN_HISTORY_CSV_COLUMNS: ReadonlyArray<ListColumn<RunHistoryItem>> = [
+  { header: 'runId', value: run => run.runId },
+  { header: 'status', value: run => run.status },
+  { header: 'source', value: run => run.source },
+  { header: 'isRerun', value: run => run.isRerun },
+  { header: 'createdFrom', value: run => run.createdFrom },
+  { header: 'createdAt', value: run => run.createdAt },
+  { header: 'startedAt', value: run => run.startedAt },
+  { header: 'finishedAt', value: run => run.finishedAt },
+  { header: 'codeVersion', value: run => run.codeVersion },
+  { header: 'failureKind', value: run => run.failureKind },
+  { header: 'targetUrl', value: run => run.targetUrl },
+  { header: 'targetUrlSource', value: run => run.targetUrlSource },
 ];
 
 /**
@@ -10168,6 +10238,30 @@ const TEST_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliTest>> = [
   { header: 'FROM', width: 6, render: test => test.createdFrom },
   { header: 'STATUS', width: 9, render: test => test.status },
   { header: 'UPDATED', width: 0, render: test => test.updatedAt },
+];
+
+/**
+ * `--output csv`/`--output ndjson` columns for `test list`, derived straight
+ * from the `CliTest` source-of-truth shape (not the possibly-reordered/subset
+ * `TEST_LIST_COLUMNS` used for `--output text`). `produces`/`consumes` are
+ * comma-joined; `renderCsv`'s escaping quotes the cell automatically since a
+ * joined list contains commas.
+ */
+const TEST_CSV_COLUMNS: ReadonlyArray<ListColumn<CliTest>> = [
+  { header: 'id', value: t => t.id },
+  { header: 'projectId', value: t => t.projectId },
+  { header: 'projectName', value: t => t.projectName },
+  { header: 'name', value: t => t.name },
+  { header: 'type', value: t => t.type },
+  { header: 'createdFrom', value: t => t.createdFrom },
+  { header: 'status', value: t => t.status },
+  { header: 'createdAt', value: t => t.createdAt },
+  { header: 'updatedAt', value: t => t.updatedAt },
+  { header: 'planStepCount', value: t => t.planStepCount },
+  { header: 'priority', value: t => t.priority },
+  { header: 'produces', value: t => t.produces?.join(',') },
+  { header: 'consumes', value: t => t.consumes?.join(',') },
+  { header: 'category', value: t => t.category },
 ];
 
 function renderTestListText(
