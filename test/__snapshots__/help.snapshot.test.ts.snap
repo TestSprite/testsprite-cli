@@ -679,6 +679,13 @@ Options:
   --report-file <path>        output path for --report (atomic write)
   --report-suite-name <name>  optional JUnit <testsuite name=...> override
                               (default: testsprite:<projectId>)
+  --gh-output                 with --all: emit GitHub-native output (::error::
+                              annotations per non-passed run; job-summary table
+                              when $GITHUB_STEP_SUMMARY is set). Auto-enabled
+                              when GITHUB_ACTIONS=true
+  --summary-file <path>       with --all: also write the reduced machine
+                              summary JSON {total, passed, failed, timedOut,
+                              runs[]} to this file
   -h, --help                  display help for command
 
 Dependency-aware fresh run (M4):
