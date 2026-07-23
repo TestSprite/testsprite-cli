@@ -230,6 +230,7 @@ describe('matrix coverage guard', () => {
       'kiro',
       'windsurf',
       'copilot',
+      'gemini',
       'codex',
     ]);
   });

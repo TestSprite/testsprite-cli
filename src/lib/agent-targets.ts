@@ -10,7 +10,8 @@ export type AgentTarget =
   | 'codex'
   | 'kiro'
   | 'windsurf'
-  | 'copilot';
+  | 'copilot'
+  | 'gemini';
 
 export interface TargetSpec {
   status: 'ga' | 'experimental';
@@ -189,6 +190,8 @@ export function pathFor(target: AgentTarget, skill: string): string {
       return `.windsurf/rules/${skill}.md`;
     case 'copilot':
       return `.github/instructions/${skill}.instructions.md`;
+    case 'gemini':
+      return 'GEMINI.md';
     case 'codex':
       return 'AGENTS.md';
   }
@@ -243,10 +246,33 @@ export const TARGETS: Record<AgentTarget, TargetSpec> = {
     // GitHub Copilot path-specific instructions: frontmatter carries `applyTo`.
     // `applyTo: '**'` means the file is ALWAYS injected into Copilot requests
     // (there is no on-demand "model decides" mode like Cursor/Windsurf), so
-    // render the compact body to keep the always-on context cost small — the
+    // render the compact body to keep the always-on context cost small -- the
     // same reasoning that drives windsurf's compact render.
     compactBody: true,
     wrap: wrapCopilot,
+  },
+  /**
+   * gemini target -- managed-section mode (GEMINI.md).
+   *
+   * Gemini CLI reads project-level instructions from a `GEMINI.md` file in
+   * the repo root. The file is plain Markdown, loaded at the start of every
+   * session (always-on). Because all installed skills share this single file
+   * we use managed-section mode -- the same approach as codex/AGENTS.md --
+   * writing only a sentinel-delimited section so any existing user content
+   * in GEMINI.md is never clobbered.
+   *
+   * The compact body is used (same reasoning as windsurf/copilot): GEMINI.md
+   * is always-injected, so keeping it small reduces context cost.
+   *
+   * --force replaces the managed section unconditionally but never touches
+   * content outside the sentinels.
+   */
+  gemini: {
+    status: 'experimental',
+    path: pathFor('gemini', SKILL_NAME),
+    mode: 'managed-section',
+    // GEMINI.md is plain Markdown; wrap is a no-op (no frontmatter).
+    wrap: (_name, _description, body) => body,
   },
   /**
    * codex target — managed-section mode.
@@ -274,10 +300,19 @@ export const TARGETS: Record<AgentTarget, TargetSpec> = {
   },
 };
 
-/** Sentinel pair that bounds our managed section in AGENTS.md. */
+/** Sentinel pair that bounds our managed section in AGENTS.md / GEMINI.md. */
 export const MANAGED_SECTION_BEGIN =
-  '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install codex) -->';
+  '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install) -->';
 export const MANAGED_SECTION_END = '<!-- END TESTSPRITE AGENT SECTION -->';
+
+/**
+ * Legacy sentinel written by versions prior to this change.
+ * Kept for backward-compatibility: existing AGENTS.md files that contain
+ * the old Codex-labelled marker are still recognised as a valid managed
+ * section during classify / replace operations.
+ */
+export const MANAGED_SECTION_BEGIN_LEGACY =
+  '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install codex) -->';
 
 // ---------------------------------------------------------------------------
 // Install marker (stale-skill detection, issue #123)
