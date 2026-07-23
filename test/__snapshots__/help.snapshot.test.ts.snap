@@ -241,6 +241,17 @@ Commands:
                                         failedStepIndex, per-step status flips,
                                         codeVersion drift. Exit 0 when verdicts
                                         match, 1 when they differ.
+  export [options] <test-id>            Export the test DEFINITION (metadata +
+                                        code, with codeVersion provenance) to a
+                                        versionable JSON file. Frontend plans
+                                        are write-only on the API, so FE
+                                        exports carry planUnavailable: true.
+  import [options] <file>               Create or update a test from a
+                                        definition file produced by \`test
+                                        export\`: a testId in the file updates
+                                        (code PUT replays the recorded
+                                        codeVersion as If-Match), no testId
+                                        creates.
   lint [options]                        Validate plan/steps files offline with
                                         the same validators \`create\` runs,
                                         collecting EVERY problem. No network,
