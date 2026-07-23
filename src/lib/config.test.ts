@@ -1,8 +1,8 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { defaultConfigPath, loadConfig } from './config.js';
+import { defaultConfigPath, loadConfig, readConfigFileSettings } from './config.js';
 import { writeProfile } from './credentials.js';
 
 let tmpRoot: string;
@@ -125,5 +125,55 @@ describe('loadConfig', () => {
 describe('defaultConfigPath', () => {
   it('points to ~/.testsprite/config', () => {
     expect(defaultConfigPath()).toBe(join(homedir(), '.testsprite', 'config'));
+  });
+});
+
+describe('readConfigFileSettings + the config-file layer of loadConfig', () => {
+  function writeConfigFile(content: string): string {
+    const path = join(mkdtempSync(join(tmpdir(), 'testsprite-config-')), 'config');
+    writeFileSync(path, content, 'utf8');
+    return path;
+  }
+
+  it('reads endpoint_url/output/project_id from the profile section', () => {
+    const path = writeConfigFile(
+      '[default]\nendpoint_url = https://selfhosted.example.com\noutput = json\nproject_id = project_cfg\n',
+    );
+    expect(readConfigFileSettings('default', { path })).toEqual({
+      endpointUrl: 'https://selfhosted.example.com',
+      output: 'json',
+      projectId: 'project_cfg',
+    });
+    // A different profile section is not leaked into.
+    expect(readConfigFileSettings('other', { path })).toEqual({});
+  });
+
+  it('missing file and unknown keys are non-fatal', () => {
+    expect(readConfigFileSettings('default', { path: '/nope/definitely/missing' })).toEqual({});
+    const path = writeConfigFile('[default]\nmystery_key = x\n');
+    expect(readConfigFileSettings('default', { path })).toEqual({});
+  });
+
+  it('resolves the path from TESTSPRITE_CONFIG_FILE when no explicit path is given', () => {
+    const path = writeConfigFile('[default]\nproject_id = project_from_env_path\n');
+    const settings = readConfigFileSettings('default', {
+      env: { TESTSPRITE_CONFIG_FILE: path },
+    });
+    expect(settings.projectId).toBe('project_from_env_path');
+  });
+
+  it('loadConfig: config-file endpoint_url sits above the built-in default and below env', () => {
+    const path = writeConfigFile('[default]\nendpoint_url = https://cfg.example.com\n');
+    const missingCreds = join(mkdtempSync(join(tmpdir(), 'testsprite-creds-')), 'credentials');
+    // Only the config file supplies a URL -> it wins over the built-in default.
+    const fromConfig = loadConfig({ env: {}, credentialsPath: missingCreds, configPath: path });
+    expect(fromConfig.apiUrl).toBe('https://cfg.example.com');
+    // Env still outranks the config file.
+    const fromEnv = loadConfig({
+      env: { TESTSPRITE_API_URL: 'https://env.example.com' },
+      credentialsPath: missingCreds,
+      configPath: path,
+    });
+    expect(fromEnv.apiUrl).toBe('https://env.example.com');
   });
 });
