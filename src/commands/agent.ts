@@ -8,7 +8,9 @@ import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptText } from '../lib/prompt.js';
 import {
   type AgentTarget,
+  type LegacyOwnFileSpec,
   DEFAULT_SKILLS,
+  LEGACY_OWN_FILE_TARGETS,
   SKILLS,
   TARGETS,
   acceptedTargetTokens,
@@ -16,6 +18,8 @@ import {
   buildSkillMarker,
   canonicalSkillDir,
   canonicalSkillFile,
+  findManagedSectionBounds,
+  legacyOwnFilePath,
   loadSkillFull,
   parseSkillMarker,
   pathFor,
@@ -41,6 +45,8 @@ export interface AgentFs {
   unlink(p: string): Promise<void>;
   /** Remove a file, symlink, or (recursively) a directory. */
   rm(p: string): Promise<void>;
+  /** List the direct children of a directory (entry names only). Throws on ENOENT. */
+  readdir(p: string): Promise<string[]>;
 }
 
 const defaultAgentFs: AgentFs = {
@@ -86,6 +92,9 @@ const defaultAgentFs: AgentFs = {
   },
   async rm(p) {
     await fs.rm(p, { recursive: true, force: true });
+  },
+  async readdir(p) {
+    return fs.readdir(p);
   },
 };
 
@@ -194,6 +203,7 @@ export type InstallAction =
   | 'skipped'
   | 'blocked'
   | 'updated'
+  | 'migrated'
   | 'dry-run'
   | 'copy-fallback';
 
@@ -367,6 +377,16 @@ async function ensureAgentLink(
   if (!mdStat.isFile) return 'blocked';
   const existing = await agentFs.readFile(skillMdAbs);
   if (existing === content) return 'skipped';
+  // A real folder with a provenance marker is a legacy skill.
+  // Under --force migration already handled it; refuse without --force.
+  if (parseSkillMarker(existing) !== null && !force) {
+    throw new CLIError(
+      `${landingRel} is a legacy TestSprite skill folder that must be ` +
+        `replaced by a symlink to ${canonicalSkillDir(skill)}. Re-run with --force to back it up ` +
+        `to ${landingRel}.bak and link to the canonical skill.`,
+      6,
+    );
+  }
   if (!force) return 'blocked';
   const backupPath = await writeBackup(agentFs, skillMdAbs, existing);
   stderr(`backed up ${path.relative(root, skillMdAbs)} to ${path.relative(root, backupPath)}`);
@@ -455,6 +475,31 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
       renderCanonicalWithMarker(skill, buildSkillMarker(skill, rawContent(skill))),
     );
 
+  // Under --force, retire legacy artifacts FIRST so the canonical/symlink
+  // phases land on a clean tree.
+  const migrated = new Set<string>();
+  if (opts.force) {
+    const migration = await migrateLegacyArtifacts(
+      agentFs,
+      root,
+      dedupedTargets,
+      skills,
+      Boolean(opts.dryRun),
+    );
+    if (migration.length > 0) {
+      printMigrationSummary(migration, stderrFn);
+      // Report each migrated (target, skill) as 'migrated' rather than 'skipped'.
+      for (const r of migration) {
+        if (r.skill !== null) {
+          migrated.add(`${r.targetId}\0${r.skill}`);
+        } else {
+          // codex managed section covers every skill.
+          for (const s of skills) migrated.add(`${r.targetId}\0${s}`);
+        }
+      }
+    }
+  }
+
   const results: InstallResult[] = [];
   const dryRunLines: { rel: string; bytes: number; note: string }[] = [];
 
@@ -529,10 +574,13 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
       }
 
       if (spec.universal) {
+        // canonical already correct → 'skipped'; migration upgrades it.
+        let action: InstallAction = cAction;
+        if (action === 'skipped' && migrated.has(`${t}\0${skill}`)) action = 'migrated';
         results.push({
           target: t,
           path: pathFor(t, skill),
-          action: cAction,
+          action,
           skills: [skill],
           mode,
         });
@@ -551,6 +599,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
         // run is a content change for this target even when the link was already correct.
         if (action === 'skipped' && (cAction === 'written' || cAction === 'updated'))
           action = 'updated';
+        if (action === 'skipped' && migrated.has(`${t}\0${skill}`)) action = 'migrated';
         results.push({ target: t, path: pathFor(t, skill), action, skills: [skill], mode });
       }
     }
@@ -699,6 +748,7 @@ async function classifySymlinked(
 
 export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Promise<void> {
   const agentFs = deps.fs ?? defaultAgentFs;
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const out = makeOutput(opts.output, deps);
 
   if (opts.dir !== undefined && opts.dir.trim() === '') {
@@ -727,6 +777,17 @@ export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Prom
     }
   }
 
+  // Advisory: surface a scoped --force hint for any legacy artifacts (stderr
+  // only, never changes exit code).
+  const legacyTargets = await detectLegacyTargets(agentFs, root);
+  if (legacyTargets.length > 0) {
+    const list = legacyTargets.join(',');
+    stderrFn(
+      `[info] found legacy installs for: ${legacyTargets.join(', ')}. ` +
+        `Run \`testsprite agent install --force --target ${list}\` to back them up and migrate them (*.bak kept).`,
+    );
+  }
+
   out.print(results, data => {
     const items = data as StatusResult[];
     if (items.length === 0) return 'No TestSprite skill artifacts installed in this project.';
@@ -744,6 +805,232 @@ export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Prom
       1,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy migration
+// ---------------------------------------------------------------------------
+
+/** One legacy artifact retired by `agent install --force` (stderr summary only). */
+interface MigrationRow {
+  /** 'own-file' = a legacy per-target skill file/folder; 'managed-section' = the codex AGENTS.md block. */
+  kind: 'own-file' | 'managed-section';
+  targetId: AgentTarget;
+  /** Legacy target id (own-file) or 'codex' (managed-section) — messaging only. */
+  legacyTarget: string;
+  /** null for the codex managed section (it aggregated skills). */
+  skill: string | null;
+  from: string;
+  backup: string;
+  to: string;
+}
+
+/**
+ * Read a legacy own-file artifact, or null when none is present. Requires a
+ * file at the legacy path AND a provenance marker inside it (so user-authored
+ * files are never touched). A 'dir'-kind symlink landing is the new format, not
+ * a legacy artifact, and is skipped.
+ */
+async function readLegacyOwnFile(
+  agentFs: AgentFs,
+  root: string,
+  spec: LegacyOwnFileSpec,
+  skill: string,
+): Promise<{ path: string; content: string } | null> {
+  const rel = legacyOwnFilePath(spec, skill);
+  if (spec.kind === 'dir') {
+    const skillDirRel = rel.slice(0, rel.length - '/SKILL.md'.length);
+    const skillDirStat = await agentFs.lstat(path.resolve(root, skillDirRel));
+    if (skillDirStat === null) return null;
+    if (skillDirStat.isSymbolicLink) return null;
+    const fileStat = await agentFs.lstat(path.resolve(root, rel));
+    if (fileStat === null || !fileStat.isFile) return null;
+    const content = await agentFs.readFile(path.resolve(root, rel));
+    return parseSkillMarker(content) === null ? null : { path: rel, content };
+  }
+  const abs = path.resolve(root, rel);
+  const st = await agentFs.lstat(abs);
+  if (st === null || !st.isFile) return null;
+  const content = await agentFs.readFile(abs);
+  return parseSkillMarker(content) === null ? null : { path: rel, content };
+}
+
+/** Targets that have a legacy artifact under `root` (for the status nudge). */
+async function detectLegacyTargets(agentFs: AgentFs, root: string): Promise<AgentTarget[]> {
+  const found = new Set<AgentTarget>();
+  for (const spec of LEGACY_OWN_FILE_TARGETS) {
+    for (const skill of Object.keys(SKILLS)) {
+      if ((await readLegacyOwnFile(agentFs, root, spec, skill)) !== null) {
+        found.add(spec.newTarget);
+        break; // one artifact is enough to know this target has legacy
+      }
+    }
+  }
+  const agentsStat = await agentFs.lstat(path.resolve(root, 'AGENTS.md'));
+  if (agentsStat !== null && agentsStat.isFile) {
+    const existing = await agentFs.readFile(path.resolve(root, 'AGENTS.md'));
+    if (findManagedSectionBounds(existing).state === 'present') found.add('codex');
+  }
+  return [...found];
+}
+
+/**
+ * Retire legacy artifacts for the REQUESTED targets (scoped). Idempotent.
+ *
+ * 'file'-kind → backed up to `<path>.bak` and unlinked.
+ * 'dir'-kind  → folder backed up to `<folder>.bak/` and removed (install phase
+ *               plants the symlink in its place).
+ * codex       → the AGENTS.md managed section is removed in place.
+ *
+ * Malformed sentinels or non-file entries in a 'dir'-kind folder throw (exit 5).
+ */
+async function migrateLegacyArtifacts(
+  agentFs: AgentFs,
+  root: string,
+  targets: readonly AgentTarget[],
+  skills: readonly string[],
+  dryRun: boolean,
+): Promise<MigrationRow[]> {
+  const rows: MigrationRow[] = [];
+
+  // codex: the AGENTS.md managed section (one section, aggregates skills) — retire once.
+  if (targets.includes('codex')) {
+    const agentsMdRel = 'AGENTS.md';
+    const agentsMdAbs = path.resolve(root, agentsMdRel);
+    const agentsStat = await agentFs.lstat(agentsMdAbs);
+    if (agentsStat !== null && agentsStat.isFile) {
+      const existing = await agentFs.readFile(agentsMdAbs);
+      const bounds = findManagedSectionBounds(existing);
+      if (bounds.state === 'corrupt') {
+        throw new CLIError(
+          `${agentsMdRel} contains a malformed TestSprite sentinel block (${bounds.reason}). ` +
+            `Manually remove the partial sentinel lines and re-run.`,
+          5,
+        );
+      }
+      if (bounds.state === 'present') {
+        let backupRel: string;
+        if (dryRun) {
+          backupRel = path.relative(root, `${agentsMdAbs}.bak`);
+        } else {
+          const backupAbs = await writeBackup(agentFs, agentsMdAbs, existing);
+          backupRel = path.relative(root, backupAbs);
+          const next = existing.slice(0, bounds.start) + existing.slice(bounds.end);
+          await agentFs.writeFile(agentsMdAbs, next);
+        }
+        rows.push({
+          kind: 'managed-section',
+          targetId: 'codex',
+          legacyTarget: 'codex',
+          skill: null,
+          from: agentsMdRel,
+          backup: backupRel,
+          to: canonicalSkillFile('testsprite-verify'),
+        });
+      }
+    }
+  }
+
+  for (const target of targets) {
+    const spec = LEGACY_OWN_FILE_TARGETS.find(s => s.newTarget === target);
+    if (spec === undefined) continue; // target has no legacy format (e.g. amp, antigravity)
+    for (const skill of skills) {
+      const hit = await readLegacyOwnFile(agentFs, root, spec, skill);
+      if (hit === null) continue;
+      const legacyAbs = path.resolve(root, hit.path);
+      let backupRel: string;
+      if (spec.kind === 'dir') {
+        const dirRel = hit.path.slice(0, -'/SKILL.md'.length);
+        backupRel = await backupLegacyDir(agentFs, root, dirRel, dryRun);
+        if (!dryRun) await agentFs.rm(path.resolve(root, dirRel));
+      } else {
+        if (dryRun) {
+          backupRel = path.relative(root, `${legacyAbs}.bak`);
+        } else {
+          const backupAbs = await writeBackup(agentFs, legacyAbs, hit.content);
+          backupRel = path.relative(root, backupAbs);
+          await agentFs.unlink(legacyAbs);
+        }
+      }
+      rows.push({
+        kind: 'own-file',
+        targetId: spec.newTarget,
+        legacyTarget: spec.legacyTarget,
+        skill,
+        from: hit.path,
+        backup: backupRel,
+        to: pathFor(spec.newTarget, skill),
+      });
+    }
+  }
+
+  return rows;
+}
+
+/**
+ * Back up a legacy 'dir'-kind folder to a non-clobbering sibling `<folder>.bak[.N]/`.
+ * Refuses (exit 5) on nested dirs/symlinks — only `SKILL.md` is expected.
+ */
+async function backupLegacyDir(
+  agentFs: AgentFs,
+  root: string,
+  dirRel: string,
+  dryRun: boolean,
+): Promise<string> {
+  if (dryRun) return `${dirRel}.bak`;
+  const dirAbs = path.resolve(root, dirRel);
+  const baseRel = `${dirRel}.bak`;
+  const baseAbs = path.resolve(root, baseRel);
+  let backupAbs = baseAbs;
+  let n = 0;
+  while ((await agentFs.lstat(backupAbs)) !== null) {
+    n += 1;
+    backupAbs = `${baseAbs}.${n}`;
+  }
+  const entries = await agentFs.readdir(dirAbs);
+  await agentFs.mkdir(backupAbs);
+  for (const name of entries) {
+    const childAbs = path.join(dirAbs, name);
+    const cst = await agentFs.lstat(childAbs);
+    if (cst === null) continue;
+    if (!cst.isFile) {
+      throw new CLIError(
+        `${dirRel} contains a non-file entry "${name}" (old installs only wrote SKILL.md). ` +
+          `Remove it manually and re-run.`,
+        5,
+      );
+    }
+    await agentFs.writeFile(path.join(backupAbs, name), await agentFs.readFile(childAbs), {
+      exclusive: true,
+    });
+  }
+  return n === 0 ? baseRel : `${baseRel}.${n}`;
+}
+
+/**
+ * Emit the per-row summary and the *.bak cleanup tip (stderr only).
+ * 'dir'-kind (claude/kiro): "converted" (folder → symlink, from === to).
+ * 'file'-kind: "migrated" (obsolete file → canonical/symlink path).
+ * codex managed section: "migrated" (removed from AGENTS.md).
+ */
+function printMigrationSummary(rows: MigrationRow[], stderr: (line: string) => void): void {
+  for (const r of rows) {
+    if (r.kind === 'managed-section') {
+      stderr(`migrated codex managed section in ${r.from} → ${r.to} (backup: ${r.backup})`);
+    } else if (r.from === r.to) {
+      // In-place: the folder at the agent's own skills path became a symlink.
+      stderr(
+        `converted ${r.legacyTarget} skill at ${r.from} (folder → symlink; backup: ${r.backup})`,
+      );
+    } else {
+      stderr(`migrated ${r.legacyTarget} skill at ${r.from} → ${r.to} (backup: ${r.backup})`);
+    }
+  }
+  stderr(
+    'tip: a backup of each converted legacy artifact was kept as *.bak. Once you have confirmed ' +
+      'everything looks correct, you can delete them — for example: ' +
+      'find . -name "*.bak" -prune -exec rm -rf {} +.',
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +1067,8 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
     .option('--dir <path>', 'Project root to write into (default: cwd)')
     .option(
       '--force',
-      'Overwrite an existing canonical file or landing (a .bak backup is kept for files).',
+      'Overwrite an existing canonical file or landing, and migrate any legacy ' +
+        'artifacts found in the repo (originals kept as *.bak).',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(

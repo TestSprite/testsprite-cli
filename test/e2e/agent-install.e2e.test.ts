@@ -14,7 +14,15 @@
  * Do NOT run via `npm test` — the main vitest.config.ts excludes `test/e2e/**`.
  */
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, lstatSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  lstatSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -24,6 +32,8 @@ import {
   TARGETS,
   SKILLS,
   DEFAULT_SKILLS,
+  LEGACY_MANAGED_SECTION_BEGIN,
+  LEGACY_MANAGED_SECTION_END,
   canonicalSkillFile,
   pathFor,
   renderCanonical,
@@ -517,15 +527,214 @@ describe('full-registry smoke', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 13. Positional target argument
+// 13. `agent install --force` — legacy migration (issue #270 gate #2).
+//     Pre-standard artifacts are detected, backed up to *.bak, and retired as
+//     part of a forced install; the codex AGENTS.md section is removed in place.
+//     A plain (no --force) install refuses a dir collision rather than half-migrate.
+// ---------------------------------------------------------------------------
+
+/** A minimal old-format own-file artifact carrying a valid provenance marker. */
+const MARKER_LINE = '<!-- testsprite-skill: testsprite-verify v0.3.0 sha256:000000000000 -->';
+
+function seedLegacyClaude(tmpDir: string): string {
+  // Pre-standard: `.claude/skills/<skill>/SKILL.md` as a real file (not a symlink).
+  const rel = join(tmpDir, '.claude/skills/testsprite-verify/SKILL.md');
+  mkdirSync(join(tmpDir, '.claude/skills/testsprite-verify'), { recursive: true });
+  writeFileSync(rel, `---\nname: testsprite-verify\n---\n${MARKER_LINE}\n# legacy\nold body\n`);
+  return rel;
+}
+
+function seedLegacyCodexSection(
+  tmpDir: string,
+  opts: { before?: string; after?: string } = {},
+): string {
+  const before = opts.before ?? '# Project\n\nIntro paragraph.\n';
+  const after = opts.after ?? '\n## Footer\n\nKeep me.\n';
+  const content = `${before}${LEGACY_MANAGED_SECTION_BEGIN}\n${MARKER_LINE}\nRun tests.\n${LEGACY_MANAGED_SECTION_END}\n${after}`;
+  writeFileSync(join(tmpDir, 'AGENTS.md'), content);
+  return content;
+}
+
+describe('agent install --force (legacy migration)', () => {
+  it('claude: --target=claude-code backs up the legacy folder to a sibling .bak/ and REPLACES it with a symlink', () => {
+    const tmpDir = freshTmpDir();
+    seedLegacyClaude(tmpDir);
+
+    const result = runCli([
+      'agent',
+      'install',
+      '--target=claude-code',
+      '--force',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
+    expect(result.status, `stderr: ${result.stderr}`).toBe(0);
+
+    // The legacy real folder is gone, REPLACED by a symlink at the same path.
+    expect(lstatSync(join(tmpDir, '.claude/skills/testsprite-verify')).isSymbolicLink()).toBe(true);
+    // The old bytes survive only in the sibling <folder>.bak/.
+    expect(
+      readFileSync(join(tmpDir, '.claude/skills/testsprite-verify.bak/SKILL.md'), 'utf8'),
+    ).toContain('old body');
+    // The SKILL.md reachable through the symlink is the CANONICAL content (not the old body).
+    expect(
+      readFileSync(join(tmpDir, '.claude/skills/testsprite-verify/SKILL.md'), 'utf8'),
+    ).not.toContain('old body');
+    // Canonical destination now exists.
+    expect(existsSync(join(tmpDir, canonicalSkillFile('testsprite-verify')))).toBe(true);
+    expect(result.stderr).toMatch(
+      /converted claude skill at .*\.claude\/skills\/testsprite-verify/,
+    );
+    expect(result.stderr).toMatch(/find . -name "\*\.bak" -prune -exec rm -rf/);
+  });
+
+  it('SCOPED: --target=codex does NOT migrate a legacy claude folder', () => {
+    const tmpDir = freshTmpDir();
+    seedLegacyClaude(tmpDir);
+
+    const result = runCli([
+      'agent',
+      'install',
+      '--target=codex',
+      '--force',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
+    expect(result.status, `stderr: ${result.stderr}`).toBe(0);
+    // claude's legacy folder is untouched (codex wasn't asked to migrate it).
+    expect(existsSync(join(tmpDir, '.claude/skills/testsprite-verify/SKILL.md'))).toBe(true);
+    expect(existsSync(join(tmpDir, '.claude/skills/testsprite-verify.bak'))).toBe(false);
+    expect(result.stderr).not.toMatch(/migrated claude/);
+  });
+
+  it('removes only the codex managed section, preserving surrounding AGENTS.md content', () => {
+    const tmpDir = freshTmpDir();
+    const original = seedLegacyCodexSection(tmpDir);
+
+    const result = runCli([
+      'agent',
+      'install',
+      '--target=codex',
+      '--force',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
+    expect(result.status, `stderr: ${result.stderr}`).toBe(0);
+
+    // Whole-file backup preserves the original.
+    expect(readFileSync(join(tmpDir, 'AGENTS.md.bak'), 'utf8')).toBe(original);
+    // The new AGENTS.md keeps user content, drops the sentinel block.
+    const next = readFileSync(join(tmpDir, 'AGENTS.md'), 'utf8');
+    expect(next).not.toContain(LEGACY_MANAGED_SECTION_BEGIN);
+    expect(next).not.toContain(LEGACY_MANAGED_SECTION_END);
+    expect(next).toContain('Intro paragraph.');
+    expect(next).toContain('Keep me.');
+    // Canonical is written so universal agents keep working.
+    expect(existsSync(join(tmpDir, canonicalSkillFile('testsprite-verify')))).toBe(true);
+  });
+
+  it('is idempotent: a second --force install reports no migration', () => {
+    const tmpDir = freshTmpDir();
+    seedLegacyCodexSection(tmpDir);
+    runCli(['agent', 'install', '--target=codex', '--force', '--dir', tmpDir, '--output', 'json']);
+
+    const second = runCli([
+      'agent',
+      'install',
+      '--target=codex',
+      '--force',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
+    expect(second.status, `stderr: ${second.stderr}`).toBe(0);
+    expect(second.stderr).not.toMatch(/migrated /);
+  });
+
+  it('refuses a corrupt sentinel block with exit 5 and writes nothing', () => {
+    const tmpDir = freshTmpDir();
+    const malformed = `# head\n\n${LEGACY_MANAGED_SECTION_BEGIN}\nbody with no end sentinel\n`;
+    writeFileSync(join(tmpDir, 'AGENTS.md'), malformed);
+    const result = runCli([
+      'agent',
+      'install',
+      '--target=codex',
+      '--force',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
+    expect(result.status).toBe(5);
+    // File untouched, no backup created.
+    expect(readFileSync(join(tmpDir, 'AGENTS.md'), 'utf8')).toBe(malformed);
+    expect(existsSync(join(tmpDir, 'AGENTS.md.bak'))).toBe(false);
+  });
+
+  it('--dry-run plans the migration but changes nothing on disk', () => {
+    const tmpDir = freshTmpDir();
+    seedLegacyClaude(tmpDir);
+    const result = runCli([
+      'agent',
+      'install',
+      '--target=claude-code',
+      '--force',
+      '--dry-run',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
+    expect(result.status, `stderr: ${result.stderr}`).toBe(0);
+    expect(result.stderr).toMatch(/converted claude skill/);
+    // Nothing written or removed.
+    expect(existsSync(join(tmpDir, '.claude/skills/testsprite-verify/SKILL.md'))).toBe(true);
+    expect(existsSync(join(tmpDir, '.claude/skills/testsprite-verify.bak'))).toBe(false);
+    expect(existsSync(join(tmpDir, canonicalSkillFile('testsprite-verify')))).toBe(false);
+  });
+
+  it('plain install (no --force) refuses a legacy dir collision with exit 6', () => {
+    const tmpDir = freshTmpDir();
+    seedLegacyClaude(tmpDir);
+    const result = runCli([
+      'agent',
+      'install',
+      '--target=claude-code',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
+    expect(result.status).toBe(6);
+    expect(result.stderr).toMatch(/legacy installs|--force/);
+    // Plain install never migrates: the legacy folder is untouched, no .bak.
+    expect(existsSync(join(tmpDir, '.claude/skills/testsprite-verify/SKILL.md'))).toBe(true);
+    expect(existsSync(join(tmpDir, '.claude/skills/testsprite-verify.bak'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 14. Positional target argument
 //
 // Repro: `agent install <target>` (the exact one-liner form documented in
-// DOCUMENTATION.md / README for all 8 targets) previously installed the
-// claude skill regardless of the target named, because `install` declared
-// only `--target <t>` with no positional `.argument()` — Commander silently
-// dropped the excess positional and the non-TTY default-to-claude path won.
-// These tests drive the real built binary (not just the command wiring) to
-// pin the documented one-liner behavior for good.
+// DOCUMENTATION.md / README) previously installed the claude skill regardless
+// of the target named, because `install` declared only `--target <t>` with no
+// positional `.argument()` — Commander silently dropped the excess positional
+// and the non-TTY default-to-claude path won. These tests drive the real built
+// binary (not just the command wiring) to pin the documented one-liner behavior
+// for good.
+//
+// Adapted to the canonical/symlink model: `cursor` is universal (reads
+// `.agents/skills` directly), `claude-code` lands a symlink at
+// `.claude/skills/<skill>` — so "the named target, not the default" is proven
+// by the claude landing existing ONLY when claude-code was actually requested.
 // ---------------------------------------------------------------------------
 describe('positional target argument', () => {
   it('installs the named target, not the claude default (repro: agent install cursor)', () => {
@@ -533,18 +742,20 @@ describe('positional target argument', () => {
     const result = runCli(['agent', 'install', 'cursor', '--dir', tmpDir, '--output', 'json']);
     expect(result.status).toBe(0);
 
-    expect(existsSync(join(tmpDir, pathFor('cursor', 'testsprite-verify')))).toBe(true);
-    expect(existsSync(join(tmpDir, pathFor('claude', 'testsprite-verify')))).toBe(false);
+    // cursor is universal: the canonical file exists ...
+    expect(existsSync(join(tmpDir, canonicalSkillFile('testsprite-verify')))).toBe(true);
+    // ... and the claude landing was NOT created (cursor ≠ claude-code).
+    expect(existsSync(join(tmpDir, '.claude/skills/testsprite-verify'))).toBe(false);
   });
 
-  it('accepts every documented one-liner form (agent install <target>) for all 8 targets', () => {
+  it('accepts every documented one-liner form (agent install <target>) for all targets', () => {
     for (const target of Object.keys(TARGETS) as AgentTarget[]) {
       const tmpDir = freshTmpDir();
       const result = runCli(['agent', 'install', target, '--dir', tmpDir, '--output', 'json']);
       expect(result.status, `exit code for positional '${target}'`).toBe(0);
       expect(
         existsSync(join(tmpDir, pathFor(target, 'testsprite-verify'))),
-        `landing file for positional '${target}'`,
+        `landing for positional '${target}'`,
       ).toBe(true);
     }
   });
@@ -554,16 +765,18 @@ describe('positional target argument', () => {
     const result = runCli([
       'agent',
       'install',
-      'cline',
-      'kiro',
+      'codex',
+      'kiro-cli',
       '--dir',
       tmpDir,
       '--output',
       'json',
     ]);
     expect(result.status).toBe(0);
-    expect(existsSync(join(tmpDir, pathFor('cline', 'testsprite-verify')))).toBe(true);
-    expect(existsSync(join(tmpDir, pathFor('kiro', 'testsprite-verify')))).toBe(true);
+    // codex is universal: canonical exists.
+    expect(existsSync(join(tmpDir, canonicalSkillFile('testsprite-verify')))).toBe(true);
+    // kiro-cli is symlinked: the landing is reachable.
+    expect(existsSync(join(tmpDir, pathFor('kiro-cli', 'testsprite-verify')))).toBe(true);
   });
 
   it('merges a positional target with --target', () => {
@@ -579,8 +792,10 @@ describe('positional target argument', () => {
       'json',
     ]);
     expect(result.status).toBe(0);
-    expect(existsSync(join(tmpDir, pathFor('antigravity', 'testsprite-verify')))).toBe(true);
-    expect(existsSync(join(tmpDir, pathFor('windsurf', 'testsprite-verify')))).toBe(true);
+    // antigravity (positional) is universal: canonical exists.
+    expect(existsSync(join(tmpDir, canonicalSkillFile('testsprite-verify')))).toBe(true);
+    // windsurf (--target, alias for devin-desktop) is symlinked under .windsurf/skills.
+    expect(existsSync(join(tmpDir, pathFor('devin-desktop', 'testsprite-verify')))).toBe(true);
   });
 
   it('rejects an unknown positional target with exit 5 instead of silently defaulting', () => {
@@ -588,6 +803,6 @@ describe('positional target argument', () => {
     const result = runCli(['agent', 'install', 'banana', '--dir', tmpDir]);
     expect(result.status).toBe(5);
     expect(result.stderr).toContain('unknown target "banana"');
-    expect(existsSync(join(tmpDir, pathFor('claude', 'testsprite-verify')))).toBe(false);
+    expect(existsSync(join(tmpDir, '.claude/skills/testsprite-verify'))).toBe(false);
   });
 });

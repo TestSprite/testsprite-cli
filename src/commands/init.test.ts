@@ -144,6 +144,19 @@ function makeMemFs(): {
         if (d === p || d.startsWith(p + path.sep)) dirs.delete(d);
       }
     },
+    async readdir(p: string) {
+      const names = new Set<string>();
+      const prefix = p + path.sep;
+      const direct = (k: string) => {
+        if (!k.startsWith(prefix)) return;
+        const rest = k.slice(prefix.length);
+        if (!rest.includes(path.sep)) names.add(rest);
+      };
+      for (const k of store.keys()) direct(k);
+      for (const s of symlinks.keys()) direct(s);
+      for (const d of dirs) direct(d);
+      return [...names];
+    },
   };
 
   return { store, fs: agentFs, writeCalls, mkdirCalls, symlinkCalls };
@@ -1031,6 +1044,9 @@ describe('[B-E2E-06] runInit: install failure → info message on stderr + re-th
       },
       async rm() {
         throw new Error('ENOENT');
+      },
+      async readdir() {
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
       },
     };
 

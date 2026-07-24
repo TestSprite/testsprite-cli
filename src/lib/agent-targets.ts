@@ -337,3 +337,129 @@ export function renderCanonical(skill: string, read: ReadFn = defaultRead): stri
     read,
   );
 }
+
+// ---------------------------------------------------------------------------
+// Legacy format detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Legacy `AGENTS.md` sentinel pair for the codex target. The BEGIN line matches
+ * the exact string the old CLI emitted.
+ */
+export const LEGACY_MANAGED_SECTION_BEGIN =
+  '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install codex) -->';
+export const LEGACY_MANAGED_SECTION_END = '<!-- END TESTSPRITE AGENT SECTION -->';
+
+/**
+ * Legacy own-file format for one old target (e.g. `.cursor/rules/*.mdc`,
+ * `.claude/skills/<skill>/SKILL.md`). `antigravity` is omitted — it already
+ * lands at `.agents/skills/`.
+ */
+export interface LegacyOwnFileSpec {
+  /** Old target id — for messaging only (not resolved against the new registry). */
+  legacyTarget: string;
+  /** POSIX path template with a `{skill}` placeholder. */
+  pathTemplate: string;
+  /** 'dir' = the artifact is `<dir>/<skill>/SKILL.md` (skill lives in a folder);
+   *  'file' = the artifact is a bare file (e.g. `<dir>/<skill>.mdc`). */
+  kind: 'dir' | 'file';
+  /** New-format target id (e.g. 'claude-code', 'github-copilot'). */
+  newTarget: AgentTarget;
+}
+
+export const LEGACY_OWN_FILE_TARGETS: readonly LegacyOwnFileSpec[] = [
+  {
+    legacyTarget: 'claude',
+    pathTemplate: '.claude/skills/{skill}/SKILL.md',
+    kind: 'dir',
+    newTarget: 'claude-code',
+  },
+  {
+    legacyTarget: 'cursor',
+    pathTemplate: '.cursor/rules/{skill}.mdc',
+    kind: 'file',
+    newTarget: 'cursor',
+  },
+  {
+    legacyTarget: 'cline',
+    pathTemplate: '.clinerules/{skill}.md',
+    kind: 'file',
+    newTarget: 'cline',
+  },
+  {
+    legacyTarget: 'kiro',
+    pathTemplate: '.kiro/skills/{skill}/SKILL.md',
+    kind: 'dir',
+    newTarget: 'kiro',
+  },
+  {
+    legacyTarget: 'windsurf',
+    pathTemplate: '.windsurf/rules/{skill}.md',
+    kind: 'file',
+    newTarget: 'devin-desktop',
+  },
+  {
+    legacyTarget: 'copilot',
+    pathTemplate: '.github/instructions/{skill}.instructions.md',
+    kind: 'file',
+    newTarget: 'github-copilot',
+  },
+];
+
+/** Render a legacy path template for a concrete skill (POSIX, repo-relative). */
+export function legacyOwnFilePath(spec: LegacyOwnFileSpec, skill: string): string {
+  return spec.pathTemplate.replace('{skill}', skill);
+}
+
+/** Outcome of locating the legacy managed section inside an `AGENTS.md`. */
+export type ManagedSectionBounds =
+  | { state: 'absent' }
+  | { state: 'present'; start: number; end: number }
+  | { state: 'corrupt'; reason: string };
+
+/**
+ * Find the byte range `[start, end)` of the legacy managed section in
+ * `AGENTS.md`.  Only standalone BEGIN/END sentinel lines count (exact match
+ * after trim).
+ *
+ * Returns `absent` (no sentinels), `present` (one balanced BEGIN…END pair),
+ * or `corrupt` (unbalanced, duplicate, or misordered).
+ */
+export function findManagedSectionBounds(content: string): ManagedSectionBounds {
+  const lines = content.split('\n');
+  // lineStart[i] = byte offset where lines[i] begins (lines[0] = 0).
+  const lineStart: number[] = [0];
+  for (let i = 0; i < lines.length; i++) {
+    lineStart.push(lineStart[i]! + lines[i]!.length + 1); // +1 for the '\n'
+  }
+
+  const beginLines: number[] = [];
+  const endLines: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const stripped = lines[i]!.trim();
+    if (stripped === LEGACY_MANAGED_SECTION_BEGIN) beginLines.push(i);
+    else if (stripped === LEGACY_MANAGED_SECTION_END) endLines.push(i);
+  }
+
+  if (beginLines.length === 0 && endLines.length === 0) return { state: 'absent' };
+  if (beginLines.length > 1 || endLines.length > 1) {
+    return { state: 'corrupt', reason: 'found multiple standalone TestSprite sentinel lines' };
+  }
+  if (beginLines.length === 1 && endLines.length === 0) {
+    return { state: 'corrupt', reason: 'BEGIN sentinel without a matching END' };
+  }
+  if (endLines.length === 1 && beginLines.length === 0) {
+    return { state: 'corrupt', reason: 'END sentinel without a matching BEGIN' };
+  }
+
+  const beginLine = beginLines[0]!;
+  const endLine = endLines[0]!;
+  if (endLine < beginLine) {
+    return { state: 'corrupt', reason: 'END sentinel appears before BEGIN' };
+  }
+
+  const start = lineStart[beginLine]!;
+  let end = lineStart[endLine]! + lines[endLine]!.length;
+  if (end < content.length && content[end] === '\n') end += 1;
+  return { state: 'present', start, end };
+}

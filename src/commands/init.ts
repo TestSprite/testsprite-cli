@@ -121,7 +121,8 @@ export interface InitSummary {
  * which outranks a no-op. `blocked` never reaches here — runInstall throws first.
  */
 function aggregateInstallAction(actions: string[]): string {
-  if (actions.some(a => a === 'updated' || a === 'section-updated')) return 'updated';
+  if (actions.some(a => a === 'updated' || a === 'migrated' || a === 'section-updated'))
+    return 'updated';
   if (actions.some(a => a === 'written' || a === 'section-installed')) return 'installed';
   if (actions.some(a => a === 'dry-run')) return 'dry-run';
   return 'skipped'; // all skipped / section-unchanged

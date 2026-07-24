@@ -43,8 +43,9 @@ Options:
   --skill <name>  Skill(s) to install: testsprite-verify, testsprite-onboard
                   (comma-separated or repeated; default: all) (default: [])
   --dir <path>    Project root to write into (default: cwd)
-  --force         Overwrite an existing canonical file or landing (a .bak
-                  backup is kept for files).
+  --force         Overwrite an existing canonical file or landing, and migrate
+                  any legacy artifacts found in the repo (originals kept as
+                  *.bak).
   -h, --help      display help for command
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
@@ -89,7 +90,7 @@ Options:
   --api-key <key>       API key to configure (skips the interactive prompt)
   --from-env            Read TESTSPRITE_API_KEY from the environment instead of
                         prompting (default: false)
-  --agent <target>      Coding-agent target to install — any of the 72 Agent
+  --agent <target>      Coding-agent target to install — any of the 66 Agent
                         Skills standard (agentskills.io) agent ids (e.g.
                         claude-code, codex, cursor, cline, gemini-cli,
                         github-copilot, kiro-cli, windsurf, antigravity).
@@ -138,7 +139,7 @@ Options:
   --api-key <key>       API key to configure (skips the interactive prompt)
   --from-env            Read TESTSPRITE_API_KEY from the environment instead of
                         prompting (default: false)
-  --agent <target>      Coding-agent target to install — any of the 72 Agent
+  --agent <target>      Coding-agent target to install — any of the 66 Agent
                         Skills standard (agentskills.io) agent ids (e.g.
                         claude-code, codex, cursor, cline, gemini-cli,
                         github-copilot, kiro-cli, windsurf, antigravity).

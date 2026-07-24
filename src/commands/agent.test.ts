@@ -2,11 +2,18 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_SKILLS,
+  LEGACY_MANAGED_SECTION_BEGIN,
+  LEGACY_MANAGED_SECTION_END,
+  LEGACY_OWN_FILE_TARGETS,
   SKILLS,
   TARGETS,
   type AgentTarget,
+  type LegacyOwnFileSpec,
   buildSkillMarker,
+  canonicalSkillDir,
   canonicalSkillFile,
+  findManagedSectionBounds,
+  legacyOwnFilePath,
   loadSkillFull,
   pathFor,
   renderCanonicalWithMarker,
@@ -94,6 +101,18 @@ function makeMemFs() {
       for (const d of [...dirs]) {
         if (d === p || d.startsWith(p + path.sep)) dirs.delete(d);
       }
+    },
+    async readdir(p) {
+      const names = new Set<string>();
+      const prefix = p + path.sep;
+      const direct = (k: string) => {
+        if (!k.startsWith(prefix)) return;
+        const rest = k.slice(prefix.length);
+        if (!rest.includes(path.sep)) names.add(rest);
+      };
+      for (const k of files.keys()) direct(k);
+      for (const d of dirs) direct(d);
+      return [...names];
     },
   };
 
@@ -876,6 +895,54 @@ describe('createAgentCommand wiring', () => {
     await program.parseAsync(['status'], { from: 'user' });
     expect(stdout.join('')).toContain('No TestSprite skill artifacts');
   });
+
+  // -------------------------------------------------------------------------
+  // `agent install <target>` positional argument (real Commander wiring).
+  //
+  // Before the positional fix, Commander silently dropped an excess
+  // positional and `agent install cursor` fell through to the non-TTY
+  // default-to-claude path regardless of what was typed — the WRONG agent's
+  // skill with zero signal. These tests exercise the `.command('install
+  // [targets...]')` declaration itself so a regression in the wiring (not
+  // just the downstream parsing) is caught.
+  // -------------------------------------------------------------------------
+
+  it('agent install <target> (positional) installs the named target, not the claude-code default', async () => {
+    const memFs = makeMemFs();
+    const program = createAgentCommand(deps(memFs));
+
+    await program.parseAsync(['install', 'cursor', '--skill', 'testsprite-verify'], {
+      from: 'user',
+    });
+
+    // cursor is universal: the canonical file exists …
+    expect(memFs.files.get(canonicalPath('testsprite-verify'))?.content).toBe(
+      canonicalContent('testsprite-verify'),
+    );
+    // … and the claude landing was NOT planted (cursor ≠ claude-code).
+    expect(memFs.files.has(landingPath('claude-code', 'testsprite-verify'))).toBe(false);
+  });
+
+  it('agent install <t1> <t2> --target <t3> merges positional and flag targets', async () => {
+    const memFs = makeMemFs();
+    const program = createAgentCommand(deps(memFs));
+
+    await program.parseAsync(
+      ['install', 'claude-code', 'kiro-cli', '--target=windsurf', '--skill', 'testsprite-verify'],
+      { from: 'user' },
+    );
+
+    for (const t of ['claude-code', 'kiro-cli', 'devin-desktop'] as const) {
+      expect(memFs.files.has(landingPath(t, 'testsprite-verify')), `landing for ${t}`).toBe(true);
+    }
+  });
+
+  it('agent install <unknown> (positional) rejects with exit 5', async () => {
+    const program = createAgentCommand(deps(makeMemFs()));
+    await expect(
+      program.parseAsync(['install', 'banana'], { from: 'user' }),
+    ).rejects.toMatchObject({ exitCode: 5 });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -885,5 +952,271 @@ describe('createAgentCommand wiring', () => {
 describe('shipped skills', () => {
   it('SKILLS has testsprite-verify and testsprite-onboard', () => {
     expect(Object.keys(SKILLS).sort()).toEqual(['testsprite-onboard', 'testsprite-verify']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runInstall --force — legacy migration (issue #270 gate #2)
+// ---------------------------------------------------------------------------
+
+const legacyMarker = (skill: string) => buildSkillMarker(skill, loadSkillFull(skill));
+const claudeSpec = LEGACY_OWN_FILE_TARGETS.find(s => s.legacyTarget === 'claude')!;
+const cursorSpec = LEGACY_OWN_FILE_TARGETS.find(s => s.legacyTarget === 'cursor')!;
+
+function seedLegacyOwnFile(
+  fs: ReturnType<typeof makeMemFs>,
+  spec: LegacyOwnFileSpec,
+  skill: string,
+): string {
+  // Mimic the old wrap: frontmatter + provenance marker + body. Only the marker
+  // matters for detection; the body/shape is irrelevant to migration.
+  const content = `---\nname: ${skill}\ndescription: legacy\n---\n${legacyMarker(skill)}\n# ${skill}\nlegacy body\n`;
+  const rel = legacyOwnFilePath(spec, skill);
+  fs.seedFile(path.resolve(ROOT, rel), content);
+  return rel;
+}
+
+function seedLegacyCodexSection(
+  fs: ReturnType<typeof makeMemFs>,
+  opts: { before?: string; body?: string; after?: string } = {},
+): string {
+  const before = opts.before ?? '# My project\n\nWelcome.\n';
+  const after = opts.after ?? '\n## Notes\n\nHand-written notes.\n';
+  const body =
+    opts.body ?? `${legacyMarker('testsprite-verify')}\nRun testsprite tests after changes.`;
+  const content = `${before}${LEGACY_MANAGED_SECTION_BEGIN}\n${body}\n${LEGACY_MANAGED_SECTION_END}\n${after}`;
+  fs.seedFile(path.resolve(ROOT, 'AGENTS.md'), content);
+  return content;
+}
+
+/** Run `agent install --force` (default target: codex) capturing stdout/stderr. */
+async function runInstallForceCapture(
+  fs: ReturnType<typeof makeMemFs>,
+  opts: { dryRun?: boolean; target?: string[]; output?: 'json' | 'text' } = {},
+) {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  await runInstall(
+    {
+      ...COMMON,
+      output: opts.output ?? 'json',
+      target: opts.target ?? ['codex'],
+      force: true,
+      dryRun: opts.dryRun ?? false,
+    },
+    { ...deps(fs), stdout: (l: string) => stdout.push(l), stderr: (l: string) => stderr.push(l) },
+  );
+  return { stdout: stdout.join(''), stderr: stderr.join('\n') };
+}
+
+describe('runInstall --force — migrates legacy own-file artifacts (scoped to --target)', () => {
+  it('claude: backs up the legacy folder to a sibling .bak/ and REPLACES it with a symlink', async () => {
+    const fs = makeMemFs();
+    const rel = seedLegacyOwnFile(fs, claudeSpec, 'testsprite-verify');
+
+    const { stderr } = await runInstallForceCapture(fs, { target: ['claude-code'] });
+
+    // The legacy folder is gone; a sibling <folder>.bak/ preserves the old SKILL.md.
+    expect(fs.files.has(path.resolve(ROOT, rel))).toBe(false);
+    expect(
+      fs.files.get(path.resolve(ROOT, '.claude/skills/testsprite-verify.bak/SKILL.md'))?.content,
+    ).toContain('legacy body');
+    // The agent's read path is now a SYMLINK → canonical (created by the install phase).
+    const link = fs.files.get(landingPath('claude-code', 'testsprite-verify'))!;
+    expect(link?.kind).toBe('symlink');
+    expect(link?.target).toBe(
+      path.relative(
+        path.dirname(landingPath('claude-code', 'testsprite-verify')),
+        path.resolve(ROOT, canonicalSkillDir('testsprite-verify')),
+      ),
+    );
+    // The SKILL.md reachable through the link is canonical, not the old body.
+    expect(fs.files.get(canonicalPath('testsprite-verify'))?.content).not.toContain('legacy body');
+    expect(stderr).toMatch(
+      /converted claude skill at .claude\/skills\/testsprite-verify\/SKILL.md/,
+    );
+    expect(stderr).toMatch(/find . -name "\*\.bak" -prune -exec rm -rf/);
+  });
+
+  it('cursor (universal): backs up the obsolete file and removes it; no symlink (reads canonical)', async () => {
+    const fs = makeMemFs();
+    const rel = seedLegacyOwnFile(fs, cursorSpec, 'testsprite-verify');
+    await runInstallForceCapture(fs, { target: ['cursor'] });
+    expect(fs.files.has(path.resolve(ROOT, rel))).toBe(false);
+    expect(fs.files.get(path.resolve(ROOT, `${rel}.bak`))?.content).toContain('legacy body');
+    // cursor is universal — canonical is the destination, no symlink landing.
+    expect(fs.files.has(canonicalPath('testsprite-verify'))).toBe(true);
+  });
+
+  it('does not touch a user-authored file at a legacy path (no provenance marker)', async () => {
+    const fs = makeMemFs();
+    const rel = '.cursor/rules/testsprite-verify.mdc';
+    fs.seedFile(path.resolve(ROOT, rel), '---\ndescription: mine\n---\n# my own rule\n');
+    await runInstallForceCapture(fs, { target: ['cursor'] });
+    expect(fs.files.has(path.resolve(ROOT, rel))).toBe(true);
+  });
+
+  it('SCOPED: --target codex does NOT migrate a legacy claude folder', async () => {
+    const fs = makeMemFs();
+    seedLegacyOwnFile(fs, claudeSpec, 'testsprite-verify');
+    const { stderr } = await runInstallForceCapture(fs, { target: ['codex'] });
+    // claude's legacy folder is untouched (codex wasn't asked to migrate it).
+    expect(fs.files.has(path.resolve(ROOT, '.claude/skills/testsprite-verify/SKILL.md'))).toBe(
+      true,
+    );
+    expect(fs.dirs.has(path.resolve(ROOT, '.claude/skills/testsprite-verify.bak'))).toBe(false);
+    expect(stderr).not.toMatch(/migrated claude/);
+  });
+
+  it('does not migrate a new-format symlink landing (claude-code)', async () => {
+    const fs = makeMemFs();
+    await runInstallJson(fs, { target: ['claude-code'] });
+    await runInstallForceCapture(fs, { target: ['claude-code'] });
+    // The symlink is intact; no .bak folder was created next to it.
+    expect(fs.files.get(landingPath('claude-code', 'testsprite-verify'))?.kind).toBe('symlink');
+    expect(fs.dirs.has(path.resolve(ROOT, '.claude/skills/testsprite-verify.bak'))).toBe(false);
+  });
+
+  it('refuses (exit 5) a legacy folder with unknown nested content', async () => {
+    const fs = makeMemFs();
+    seedLegacyOwnFile(fs, claudeSpec, 'testsprite-verify');
+    // Plant a nested subdirectory the old install never wrote → refuse rather than destroy.
+    fs.seedFile(path.resolve(ROOT, '.claude/skills/testsprite-verify/notes/x.md'), 'user data');
+    await expect(runInstallForceCapture(fs, { target: ['claude-code'] })).rejects.toMatchObject({
+      exitCode: 5,
+    });
+    expect(
+      fs.files.get(path.resolve(ROOT, '.claude/skills/testsprite-verify/notes/x.md'))?.content,
+    ).toBe('user data');
+  });
+});
+
+describe('runInstall --force — codex AGENTS.md managed section', () => {
+  it('backs up AGENTS.md, removes only the section, preserves surrounding content', async () => {
+    const fs = makeMemFs();
+    const original = seedLegacyCodexSection(fs, {
+      before: '# Project Alpha\n\nIntro paragraph.\n',
+      after: '\n## Footer\n\nKeep me.\n',
+    });
+
+    await runInstallForceCapture(fs);
+
+    // Backup holds the entire original file.
+    expect(fs.files.get(path.resolve(ROOT, 'AGENTS.md.bak'))?.content).toBe(original);
+    // The sentinel block is gone; user content survives.
+    const next = fs.files.get(path.resolve(ROOT, 'AGENTS.md'))?.content ?? '';
+    expect(next).not.toContain(LEGACY_MANAGED_SECTION_BEGIN);
+    expect(next).not.toContain(LEGACY_MANAGED_SECTION_END);
+    expect(next).toContain('# Project Alpha');
+    expect(next).toContain('Intro paragraph.');
+    expect(next).toContain('## Footer');
+    expect(next).toContain('Keep me.');
+  });
+
+  it('refuses (exit 5) a corrupt sentinel block without writing anything', async () => {
+    const fs = makeMemFs();
+    const malformed = `# head\n\n${LEGACY_MANAGED_SECTION_BEGIN}\nbody with no end sentinel\n`;
+    fs.seedFile(path.resolve(ROOT, 'AGENTS.md'), malformed);
+    await expect(runInstallForceCapture(fs)).rejects.toMatchObject({ exitCode: 5 });
+    expect(fs.files.get(path.resolve(ROOT, 'AGENTS.md'))?.content).toBe(malformed);
+    expect(fs.files.has(path.resolve(ROOT, 'AGENTS.md.bak'))).toBe(false);
+  });
+});
+
+describe('runInstall --force — idempotency, dry-run, and the cleanup tip', () => {
+  it('is idempotent: a second --force install reports no migration', async () => {
+    const fs = makeMemFs();
+    seedLegacyCodexSection(fs);
+    await runInstallForceCapture(fs);
+    const second = await runInstallForceCapture(fs);
+    expect(second.stderr).not.toMatch(/migrated /);
+  });
+
+  it('--dry-run --force plans the migration but writes/removes nothing', async () => {
+    const fs = makeMemFs();
+    const rel = seedLegacyOwnFile(fs, cursorSpec, 'testsprite-verify');
+    const { stderr } = await runInstallForceCapture(fs, { target: ['cursor'], dryRun: true });
+    expect(stderr).toMatch(/migrated cursor skill/);
+    expect(fs.files.has(path.resolve(ROOT, rel))).toBe(true);
+    expect(fs.files.has(path.resolve(ROOT, `${rel}.bak`))).toBe(false);
+    expect(fs.files.has(canonicalPath('testsprite-verify'))).toBe(false);
+  });
+
+  it('a clean repo: --force install does no migration and prints no tip', async () => {
+    const fs = makeMemFs();
+    const { stderr } = await runInstallForceCapture(fs);
+    expect(stderr).not.toMatch(/migrated /);
+    expect(stderr).not.toMatch(/prune -exec rm -rf/);
+  });
+});
+
+describe('runInstall (plain, no --force) — refuses a legacy dir collision', () => {
+  it('exit 6 with a migration hint when a legacy claude folder blocks the symlink', async () => {
+    const fs = makeMemFs();
+    seedLegacyOwnFile(fs, claudeSpec, 'testsprite-verify');
+    await expect(
+      runInstall({ ...COMMON, target: ['claude-code'], force: false }, deps(fs)),
+    ).rejects.toMatchObject({ exitCode: 6 });
+    // Plain install never migrates: the legacy folder is untouched.
+    expect(fs.files.has(path.resolve(ROOT, '.claude/skills/testsprite-verify/SKILL.md'))).toBe(
+      true,
+    );
+    expect(fs.dirs.has(path.resolve(ROOT, '.claude/skills/testsprite-verify.bak'))).toBe(false);
+  });
+});
+
+describe('runStatus — legacy-artifact nudge', () => {
+  it('names the scoped targets and the exact --force --target command to migrate', async () => {
+    const fs = makeMemFs();
+    seedLegacyOwnFile(fs, claudeSpec, 'testsprite-verify');
+    seedLegacyCodexSection(fs);
+    const stderr: string[] = [];
+    await expect(
+      runStatus(
+        { ...COMMON, output: 'json' },
+        { ...deps(fs), stderr: (l: string) => stderr.push(l) },
+      ),
+    ).rejects.toMatchObject({ exitCode: 1 });
+    const out = stderr.join('\n');
+    expect(out).toMatch(/legacy installs for:.*claude-code/);
+    expect(out).toMatch(/codex/);
+    expect(out).toMatch(/testsprite agent install --force --target \S+/);
+  });
+
+  it('does not emit the nudge on a clean project', async () => {
+    const fs = makeMemFs();
+    const stderr: string[] = [];
+    await runStatus(
+      { ...COMMON, output: 'json' },
+      { ...deps(fs), stderr: (l: string) => stderr.push(l) },
+    );
+    expect(stderr.join('\n')).not.toMatch(/legacy installs for:/);
+  });
+});
+
+// Pure bounds-finder (data-only; no filesystem).
+describe('findManagedSectionBounds', () => {
+  it('absent when no sentinels', () => {
+    expect(findManagedSectionBounds('no sentinels here\n')).toEqual({ state: 'absent' });
+  });
+  it('present with a balanced pair', () => {
+    const c = `a\n${LEGACY_MANAGED_SECTION_BEGIN}\nx\n${LEGACY_MANAGED_SECTION_END}\nb\n`;
+    const b = findManagedSectionBounds(c);
+    expect(b.state).toBe('present');
+    if (b.state === 'present') {
+      expect(c.slice(b.start, b.end)).toBe(
+        `${LEGACY_MANAGED_SECTION_BEGIN}\nx\n${LEGACY_MANAGED_SECTION_END}\n`,
+      );
+      // Removing the range leaves the surrounding content intact.
+      expect(c.slice(0, b.start) + c.slice(b.end)).toBe('a\nb\n');
+    }
+  });
+  it('corrupt when BEGIN has no END', () => {
+    const b = findManagedSectionBounds(`a\n${LEGACY_MANAGED_SECTION_BEGIN}\nx\n`);
+    expect(b.state).toBe('corrupt');
+  });
+  it('corrupt when END appears before BEGIN', () => {
+    const c = `${LEGACY_MANAGED_SECTION_END}\nx\n${LEGACY_MANAGED_SECTION_BEGIN}\n`;
+    expect(findManagedSectionBounds(c).state).toBe('corrupt');
   });
 });
