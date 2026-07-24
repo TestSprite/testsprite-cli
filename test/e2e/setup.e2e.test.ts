@@ -234,10 +234,10 @@ describe('matrix coverage guard', () => {
         'codex',
         'cursor',
         'cline',
-        'gemini-cli',
+        'antigravity-cli',
         'github-copilot',
         'kiro-cli',
-        'windsurf',
+        'devin-desktop',
         'antigravity',
       ]),
     );

@@ -88,10 +88,10 @@ const representative: AgentTarget[] = [
   'claude-code', // symlinked
   'codex', // universal
   'cursor', // universal
-  'gemini-cli', // universal
+  'antigravity-cli', // universal
   'github-copilot', // universal
   'kiro-cli', // symlinked
-  'windsurf', // symlinked
+  'devin-desktop', // symlinked
 ];
 
 describe('fresh install (representative targets)', () => {
@@ -448,10 +448,10 @@ describe('registry coverage guard', () => {
         'codex',
         'cursor',
         'cline',
-        'gemini-cli',
+        'antigravity-cli',
         'github-copilot',
         'kiro-cli',
-        'windsurf',
+        'devin-desktop',
         'antigravity',
       ]),
     );

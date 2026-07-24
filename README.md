@@ -199,6 +199,90 @@ On [**CoderCup**](https://codercup.ai) — an open leaderboard where frontier co
 
 That's the point of all of this: you no longer need the biggest, most expensive model to ship software you can trust — top-tier quality, without paying top-tier prices, within reach of every team.
 
+## Supported agents
+
+`agent install --target <id>` wires the verification skill into any of the agents below. Names in parentheses are **aliases** — legacy short names or product variants that resolve to the canonical id; always prefer the canonical id.
+
+### Universal agents
+
+`.agents/skills` → **Universal agent**: reads the skill directly from the shared folder, meaning that installing for **one** universal agent makes it available to **all** of them (e.g., `agent install --target codex` also serves Cursor, Copilot, Amp, etc.).
+
+| `--target` id                    | Agent                                                                                          | Skills folder    |
+| -------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------- |
+| `amp`                            | [Amp](https://ampcode.com/manual#agent-skills)                                                 | `.agents/skills` |
+| `antigravity`                    | [Antigravity](https://antigravity.google/docs/skills)                                          | `.agents/skills` |
+| `antigravity-cli` (`gemini-cli`) | [Antigravity CLI](https://antigravity.google/docs/cli/plugins)                                 | `.agents/skills` |
+| `augment`                        | [Augment](https://docs.augmentcode.com/cli/skills)                                             | `.agents/skills` |
+| `codestudio`                     | [Code Studio](https://help.syncfusion.com/code-studio/reference/configure-properties/skills)   | `.agents/skills` |
+| `codex`                          | [Codex](https://developers.openai.com/codex/skills/)                                           | `.agents/skills` |
+| `command-code`                   | [Command Code](https://commandcode.ai/docs/skills)                                             | `.agents/skills` |
+| `crush`                          | [Crush](https://github.com/charmbracelet/crush#agent-skills)                                   | `.agents/skills` |
+| `cursor`                         | [Cursor](https://cursor.com/docs/context/skills)                                               | `.agents/skills` |
+| `devin-cloud`                    | [Devin Cloud](https://docs.devin.ai/product-guides/skills)                                     | `.agents/skills` |
+| `firebender`                     | [Firebender](https://docs.firebender.com/multi-agent/skills)                                   | `.agents/skills` |
+| `github-copilot` (`copilot`)     | [GitHub Copilot](https://docs.github.com/en/copilot/concepts/agents/about-agent-skills)        | `.agents/skills` |
+| `goose`                          | [Goose](https://goose-docs.ai/docs/guides/context-engineering/using-skills/)                   | `.agents/skills` |
+| `kilo`                           | [Kilo Code](https://kilo.ai/docs/customize/skills)                                             | `.agents/skills` |
+| `kimi-code-cli`                  | [Kimi Code CLI](https://www.kimi.com/code/docs/en/kimi-code-cli/customization/skills.html)     | `.agents/skills` |
+| `mcpjam`                         | [MCPJam](https://docs.mcpjam.com/inspector/skills)                                             | `.agents/skills` |
+| `mistral-vibe`                   | [Mistral Vibe](https://docs.mistral.ai/vibe/code/cli/skills)                                   | `.agents/skills` |
+| `mux`                            | [Mux](https://mux.coder.com/agents/agent-skills)                                               | `.agents/skills` |
+| `ona`                            | [Ona](https://ona.com/docs/ona/agents/skills)                                                  | `.agents/skills` |
+| `openclaw`                       | [OpenClaw](https://docs.openclaw.ai/tools/skills)                                              | `.agents/skills` |
+| `opencode`                       | [OpenCode](https://opencode.ai/docs/skills/)                                                   | `.agents/skills` |
+| `openhands`                      | [OpenHands](https://docs.openhands.dev/overview/skills)                                        | `.agents/skills` |
+| `pi`                             | [Pi](https://pi.dev/docs/latest/skills)                                                        | `.agents/skills` |
+| `pochi`                          | [Pochi](https://docs.getpochi.com/skills/)                                                     | `.agents/skills` |
+| `promptscript`                   | [PromptScript](https://getpromptscript.dev)                                                    | `.agents/skills` |
+| `replit`                         | [Replit](https://docs.replit.com/features/agent/skills)                                        | `.agents/skills` |
+| `rovodev`                        | [Rovo Dev](https://support.atlassian.com/rovo/docs/extend-rovo-dev-cli-with-agent-skills/)     | `.agents/skills` |
+| `tabnine-cli`                    | [Tabnine CLI](https://docs.tabnine.com/main/getting-started/tabnine-cli/features/agent-skills) | `.agents/skills` |
+| `vtcode`                         | [VT Code](https://github.com/vinhnx/VTCode/blob/main/docs/skills/SKILLS_GUIDE.md)              | `.agents/skills` |
+| `warp`                           | [Warp](https://docs.warp.dev/agent-platform/capabilities/skills/)                              | `.agents/skills` |
+| `zed`                            | [Zed](https://zed.dev/docs/ai/skills)                                                          | `.agents/skills` |
+| `zencoder` (`zenflow`)           | [Zencoder](https://docs.zencoder.ai/features/skills)                                           | `.agents/skills` |
+
+### Symlinked agents
+
+Any other folder → **Symlinked agent**: installing a skill for a symlinked agent first installs it into `.agents/skills/`, then creates a symlink in that agent's own folder (for example, `agent install --target claude-code` installs to `.agents/skills/` and symlinks into `.claude/skills/`). Because `.agents/skills/` is the shared source for all symlinked agents, installing a skill for any one of them also makes it available to every universal agent above. On systems without symlink support (such as Windows without Developer Mode), a plain copy is used instead and will not auto-update.
+
+| `--target` id                | Agent                                                                                          | Skills folder          |
+| ---------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------- |
+| `adal`                       | [AdaL](https://docs.sylph.ai/features/plugins-and-skills)                                      | `.adal/skills`         |
+| `aider-desk`                 | [AiderDesk](https://aiderdesk.hotovo.com/docs/features/skills)                                 | `.aider-desk/skills`   |
+| `astrbot`                    | [AstrBot](https://docs.astrbot.app/en/use/skills.html)                                         | `data/skills`          |
+| `autohand-code`              | [Autohand Code CLI](https://docs.autohand.ai/working-with-autohand-code/skills)                | `.autohand/skills`     |
+| `bob`                        | [IBM Bob](https://bob.ibm.com/docs/ide/features/skills)                                        | `.bob/skills`          |
+| `claude-code` (`claude`)     | [Claude Code](https://code.claude.com/docs/en/skills)                                          | `.claude/skills`       |
+| `cline`                      | [Cline](https://docs.cline.bot/customization/skills)                                           | `.cline/skills`        |
+| `codearts-agent`             | [CodeArts Agent](https://support.huaweicloud.com/usermanual-cli/codeartsagent_cli_0019.html)   | `.codeartsdoer/skills` |
+| `codebuddy`                  | [CodeBuddy](https://www.codebuddy.ai/docs/ide/Features/Skills)                                 | `.codebuddy/skills`    |
+| `codebuddy-cli`              | [CodeBuddy CLI](https://www.codebuddy.ai/docs/cli/skills)                                      | `.codebuddy/skills`    |
+| `codebuddy-cn`               | [CodeBuddy CN](https://www.codebuddy.cn/docs/ide/Features/Skills)                              | `.codebuddy/skills`    |
+| `codebuddy-cn-cli`           | [CodeBuddy CN CLI](https://www.codebuddy.cn/docs/cli/skills)                                   | `.codebuddy/skills`    |
+| `continue`                   | [Continue](https://github.com/continuedev/continue/pull/9696)                                  | `.continue/skills`     |
+| `cortex`                     | [Cortex Code](https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code-desktop/skills) | `.cortex/skills`       |
+| `devin`                      | [Devin for Terminal](https://docs.devin.ai/cli/extensibility/skills/overview)                  | `.devin/skills`        |
+| `devin-desktop` (`windsurf`) | [Devin Desktop](https://docs.devin.ai/desktop/cascade/skills)                                  | `.windsurf/skills`     |
+| `droid`                      | [Droid](https://docs.factory.ai/cli/configuration/skills)                                      | `.factory/skills`      |
+| `eve`                        | [Eve](https://eve.dev/docs/skills)                                                             | `agent/skills`         |
+| `forgecode`                  | [ForgeCode](https://forgecode.dev/docs/skills/)                                                | `.forge/skills`        |
+| `hermes-agent`               | [Hermes Agent](https://github.com/nicepkg/hermes)                                              | `.hermes/skills`       |
+| `junie`                      | [Junie](https://junie.jetbrains.com/docs/agent-skills.html)                                    | `.junie/skills`        |
+| `kiro`                       | [Kiro IDE](https://kiro.dev/docs/skills/)                                                      | `.kiro/skills`         |
+| `kiro-cli`                   | [Kiro CLI](https://kiro.dev/docs/cli/skills/)                                                  | `.kiro/skills`         |
+| `kode`                       | [Kode](https://github.com/shareAI-lab/kode/blob/main/docs/skills.md)                           | `.kode/skills`         |
+| `neovate`                    | [Neovate](https://github.com/neovateai/neovateai.dev/blob/master/content/en/docs/skills.mdx)   | `.neovate/skills`      |
+| `qoder`                      | [Qoder](https://docs.qoder.com/extensions/skills)                                              | `.qoder/skills`        |
+| `qoder-cli` (`iflow-cli`)    | [Qoder CLI](https://docs.qoder.com/en/cli/Skills)                                              | `.qoder/skills`        |
+| `qoder-cn` (`lingma`)        | [Qoder CN](https://docs.qoder.cn/user-guide/skills)                                            | `.lingma/skills`       |
+| `qoder-cn-cli`               | [Qoder CN CLI](https://docs.qoder.cn/cli/skills)                                               | `.qoder/skills`        |
+| `qwen-code`                  | [Qwen Code](https://qwenlm.github.io/qwen-code-docs/en/users/features/skills/)                 | `.qwen/skills`         |
+| `reasonix`                   | [Reasonix](https://github.com/esengine/DeepSeek-Reasonix/blob/main-v2/docs/GUIDE.md)           | `.reasonix/skills`     |
+| `trae`                       | [Trae](https://docs.trae.ai/ide/skills)                                                        | `.trae/skills`         |
+| `trae-cn`                    | [Trae CN](https://docs.trae.cn/ide_skills)                                                     | `.trae/skills`         |
+| `trae-cn-cli`                | [Trae CN CLI](https://docs.trae.cn/cli_skills)                                                 | `.traecli/skills`      |
+
 ## Getting help
 
 - 📚 **CLI reference** — [DOCUMENTATION.md](./DOCUMENTATION.md)
@@ -227,82 +311,3 @@ Pull requests target the `dev` branch. The full guide — build from source, tes
 ## License
 
 [Apache-2.0](./LICENSE) © TestSprite
-
-## Supported agents
-
-`agent install --target <id>` (and `setup --agent <id>`) wires the verification skill into any of the agents below. Those marked _(shared)_ read the single `.agents/skills/` directory directly; every other agent gets a symlink from its own skills folder back to it — one source of truth, no drift between agents. A few agents also accept a **legacy short alias** (shown in parentheses) for backwards compatibility with older scripts — prefer the canonical id.
-
-| `--target` id                | Agent              | Skills folder               |
-| ---------------------------- | ------------------ | --------------------------- |
-| `aider-desk`                 | AiderDesk          | `.aider-desk/skills`        |
-| `amp`                        | Amp                | `.agents/skills` _(shared)_ |
-| `antigravity`                | Antigravity        | `.agents/skills` _(shared)_ |
-| `antigravity-cli`            | Antigravity CLI    | `.agents/skills` _(shared)_ |
-| `astrbot`                    | AstrBot            | `data/skills`               |
-| `autohand-code`              | Autohand Code CLI  | `.autohand/skills`          |
-| `augment`                    | Augment            | `.augment/skills`           |
-| `bob`                        | IBM Bob            | `.bob/skills`               |
-| `claude-code` (`claude`)     | Claude Code        | `.claude/skills`            |
-| `openclaw`                   | OpenClaw           | `skills`                    |
-| `cline`                      | Cline              | `.agents/skills` _(shared)_ |
-| `codearts-agent`             | CodeArts Agent     | `.codeartsdoer/skills`      |
-| `codebuddy`                  | CodeBuddy          | `.codebuddy/skills`         |
-| `codemaker`                  | Codemaker          | `.codemaker/skills`         |
-| `codestudio`                 | Code Studio        | `.codestudio/skills`        |
-| `codex`                      | Codex              | `.agents/skills` _(shared)_ |
-| `command-code`               | Command Code       | `.commandcode/skills`       |
-| `continue`                   | Continue           | `.continue/skills`          |
-| `cortex`                     | Cortex Code        | `.cortex/skills`            |
-| `crush`                      | Crush              | `.crush/skills`             |
-| `cursor`                     | Cursor             | `.agents/skills` _(shared)_ |
-| `deepagents`                 | Deep Agents        | `.agents/skills` _(shared)_ |
-| `devin`                      | Devin for Terminal | `.devin/skills`             |
-| `dexto`                      | Dexto              | `.agents/skills` _(shared)_ |
-| `droid`                      | Droid              | `.factory/skills`           |
-| `eve`                        | Eve                | `agent/skills`              |
-| `firebender`                 | Firebender         | `.agents/skills` _(shared)_ |
-| `forgecode`                  | ForgeCode          | `.forge/skills`             |
-| `gemini-cli`                 | Gemini CLI         | `.agents/skills` _(shared)_ |
-| `github-copilot` (`copilot`) | GitHub Copilot     | `.agents/skills` _(shared)_ |
-| `goose`                      | Goose              | `.goose/skills`             |
-| `hermes-agent`               | Hermes Agent       | `.hermes/skills`            |
-| `inference-sh`               | inference.sh       | `.inferencesh/skills`       |
-| `jazz`                       | Jazz               | `.jazz/skills`              |
-| `junie`                      | Junie              | `.junie/skills`             |
-| `iflow-cli`                  | iFlow CLI          | `.iflow/skills`             |
-| `kilo`                       | Kilo Code          | `.kilocode/skills`          |
-| `kimi-code-cli`              | Kimi Code CLI      | `.agents/skills` _(shared)_ |
-| `kiro-cli` (`kiro`)          | Kiro CLI           | `.kiro/skills`              |
-| `kode`                       | Kode               | `.kode/skills`              |
-| `lingma`                     | Lingma             | `.lingma/skills`            |
-| `loaf`                       | Loaf               | `.agents/skills` _(shared)_ |
-| `mcpjam`                     | MCPJam             | `.mcpjam/skills`            |
-| `mistral-vibe`               | Mistral Vibe       | `.vibe/skills`              |
-| `moxby`                      | Moxby              | `.moxby/skills`             |
-| `mux`                        | Mux                | `.mux/skills`               |
-| `opencode`                   | OpenCode           | `.agents/skills` _(shared)_ |
-| `openhands`                  | OpenHands          | `.openhands/skills`         |
-| `ona`                        | Ona                | `.ona/skills`               |
-| `pi`                         | Pi                 | `.pi/skills`                |
-| `qoder`                      | Qoder              | `.qoder/skills`             |
-| `qoder-cn`                   | Qoder CN           | `.qoder/skills`             |
-| `qwen-code`                  | Qwen Code          | `.qwen/skills`              |
-| `replit`                     | Replit             | `.agents/skills` _(shared)_ |
-| `reasonix`                   | Reasonix           | `.reasonix/skills`          |
-| `roo`                        | Roo Code           | `.roo/skills`               |
-| `rovodev`                    | Rovo Dev           | `.rovodev/skills`           |
-| `tabnine-cli`                | Tabnine CLI        | `.tabnine/agent/skills`     |
-| `terramind`                  | Terramind          | `.terramind/skills`         |
-| `tinycloud`                  | Tinycloud          | `.tinycloud/skills`         |
-| `trae`                       | Trae               | `.trae/skills`              |
-| `trae-cn`                    | Trae CN            | `.trae/skills`              |
-| `warp`                       | Warp               | `.agents/skills` _(shared)_ |
-| `windsurf`                   | Windsurf           | `.windsurf/skills`          |
-| `zed`                        | Zed                | `.agents/skills` _(shared)_ |
-| `zcode`                      | ZCode              | `.zcode/skills`             |
-| `zencoder`                   | Zencoder           | `.zencoder/skills`          |
-| `zenflow`                    | Zenflow            | `.zencoder/skills`          |
-| `neovate`                    | Neovate            | `.neovate/skills`           |
-| `pochi`                      | Pochi              | `.pochi/skills`             |
-| `promptscript`               | PromptScript       | `.agents/skills` _(shared)_ |
-| `adal`                       | AdaL               | `.adal/skills`              |

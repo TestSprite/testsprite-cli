@@ -112,20 +112,22 @@ Every artifact in the bundle shares one `snapshotId`; the CLI will not mix a fai
 `testsprite agent install` writes the TestSprite skills into your project so your coding agent knows the commands, the exit codes, and the failure-bundle layout — no prompt engineering required. It's a pure-local command: no network, no credentials.
 
 ```bash
-testsprite agent install claude-code    # .agents/skills/<skill>/SKILL.md + .claude/skills/<skill> symlink
-testsprite agent install codex          # writes the canonical copy (Codex reads .agents/skills directly)
-testsprite agent install cursor         # universal — reads the canonical copy
-testsprite agent install gemini-cli     # universal
-testsprite agent install github-copilot # universal
-testsprite agent install kiro-cli       # .kiro/skills/<skill> symlink → canonical
-testsprite agent install windsurf       # .windsurf/skills/<skill> symlink → canonical
-testsprite agent list                   # every supported agent, its skills folder, and universal vs symlink
-testsprite agent status                 # check installed skills against this CLI version
+testsprite agent install claude-code
+testsprite agent install codex
+testsprite agent install cursor
+testsprite agent install kiro-cli
+testsprite agent list
+testsprite agent status
 ```
 
-`--target` accepts any agent id from the standard registry (70+), plus the legacy short aliases (`claude`, `codex`, `cursor`, `cline`, `antigravity`, `kiro`, `windsurf`, `copilot`). Omitting `--target` in a non-interactive shell defaults to `claude-code`; in a terminal the CLI prompts.
+`--target` accepts any agent id from the registry — see [Supported agents](./README.md#supported-agents) in the README for the full list. Omitting `--target` in a non-interactive shell defaults to `claude-code`; in a terminal the CLI prompts.
 
-Because every universal agent reads the same `.agents/skills/` folder, **installing for one universal agent makes the skill available to all of them** — `agent install --target codex` also serves Cursor, Cline, Gemini CLI, Copilot, etc.
+There are two kinds of agent:
+
+- **Universal agents** (Skills folder `.agents/skills`) read the skill directly from the shared folder. Installing for **one** of them makes the skill available to **all** of them — `agent install --target codex` also serves Cursor, Copilot, Amp, and every other universal agent.
+- **Symlinked agents** (every other folder) get a per-skill symlink from their own skills folder back to `.agents/skills/`, so they read the same bytes as the universal ones.
+
+`.agents/skills/` is the **single source of truth**: it is written on every install, even when you target a symlinked agent — `agent install --target claude-code` lands the skill in `.agents/skills/` (covering every universal agent) **and** links it into `.claude/skills/`. Because each symlink points _into_ `.agents/skills/`, you only ever edit a skill there and every symlinked agent reflects the change automatically (on systems where symlinks are unavailable — e.g. Windows without Developer Mode — a plain copy is written instead, which won't auto-update).
 
 `agent status` checks the canonical skill file (and each symlinked landing) against the current CLI version and reports `ok`, `stale`, `modified`, or `unmarked` for every agent that has an install (absent agents are omitted to keep output focused). It exits `1` when anything needs attention, so `testsprite agent status && …` can gate a CI step; `--dir <path>` inspects a different project root.
 
