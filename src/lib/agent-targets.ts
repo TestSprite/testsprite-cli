@@ -169,9 +169,7 @@ export const TARGET_ALIASES: Record<string, AgentTarget> = {
 export function resolveTarget(raw: string): AgentTarget | null {
   if (Object.prototype.hasOwnProperty.call(TARGETS, raw)) return raw as AgentTarget;
   // hasOwnProperty avoids inherited keys (constructor, __proto__).
-  return Object.prototype.hasOwnProperty.call(TARGET_ALIASES, raw)
-    ? TARGET_ALIASES[raw]!
-    : null;
+  return Object.prototype.hasOwnProperty.call(TARGET_ALIASES, raw) ? TARGET_ALIASES[raw]! : null;
 }
 
 /** Every accepted `--target` token (ids + aliases), for help/error text. */
