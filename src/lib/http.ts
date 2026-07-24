@@ -106,6 +106,14 @@ export interface HttpClientOptions {
    * `globalShutdown.signal` via the client factory.
    */
   shutdownSignal?: AbortSignal;
+  /**
+   * Upper bound (bytes) on a successful JSON response body the client will
+   * buffer before parsing. A response whose declared `Content-Length` — or
+   * actual streamed size — exceeds this fails fast with a typed
+   * `PAYLOAD_TOO_LARGE` error instead of growing the heap without limit.
+   * Defaults to {@link MAX_RESPONSE_BYTES_DEFAULT} (64 MiB).
+   */
+  maxResponseBytes?: number;
 }
 
 export interface RequestOptions {
@@ -168,6 +176,15 @@ const MAX_RATE_LIMITED_DELAY_MS = 60_000;
 const CONFLICT_DELAY_MS = 1000;
 const INTERNAL_DELAY_MS = 500;
 
+// Upper bound on the size of a successful JSON response body the client will
+// buffer into memory. `response.json()` reads the ENTIRE body before parsing,
+// with no limit, so a large `test result --history` page or a run with a long
+// `steps[]` array (getRun `includeSteps`) would grow the heap in proportion to
+// the payload. 64 MiB sits far above any legitimate metadata/history/steps
+// response yet still bounds a pathological — or hostile — one. Override per
+// client via `HttpClientOptions.maxResponseBytes`.
+const MAX_RESPONSE_BYTES_DEFAULT = 64 * 1024 * 1024;
+
 /**
  * Result of a successful HTTP request, including the parsed body and the
  * `x-request-id` that was sent (useful for surfacing in happy-path output).
@@ -189,6 +206,7 @@ export class HttpClient {
   private readonly onServerVersion?: (info: { minVersion?: string }) => void;
   private readonly requestTimeoutMs: number;
   private readonly shutdownSignal?: AbortSignal;
+  private readonly maxResponseBytes: number;
 
   constructor(options: HttpClientOptions) {
     this.baseUrl = trimTrailingSlash(options.baseUrl);
@@ -201,6 +219,7 @@ export class HttpClient {
     this.onTransition = options.onTransition;
     this.onServerVersion = options.onServerVersion;
     this.requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_DEFAULT_MS;
+    this.maxResponseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES_DEFAULT;
   }
 
   /**
@@ -595,10 +614,15 @@ export class HttpClient {
             durationMs,
           });
           try {
-            return { body: (await response.json()) as T, requestId, status: response.status };
+            const text = await readBoundedText(response, this.maxResponseBytes, requestId);
+            return { body: JSON.parse(text) as T, requestId, status: response.status };
           } catch (err) {
             // Interrupt passthrough (see the fetch catch above).
             if (err instanceof InterruptError) throw err;
+            // A bounded-read rejection (PAYLOAD_TOO_LARGE) — or any typed ApiError —
+            // is a real, actionable outcome; surface it unchanged rather than
+            // masking it as a malformed-body error below.
+            if (err instanceof ApiError) throw err;
             // A timeout/abort can fire mid-body-read (headers received, stream stalls).
             this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
             // Otherwise the successful response body was not valid JSON — a
@@ -917,6 +941,105 @@ export function malformedResponseError(
     },
     response.status,
   );
+}
+
+/**
+ * Read a successful response body as text, bounded to `maxBytes`.
+ *
+ * `response.json()` buffers the ENTIRE body into memory before parsing, with no
+ * upper limit — a large `test result --history` page, or a run with a long
+ * `steps[]` array (getRun `includeSteps`), grows the heap in proportion to the
+ * payload. This reads the body incrementally and stops once the accumulated
+ * size crosses `maxBytes`, so a pathological (or hostile) response fails fast
+ * with a typed PAYLOAD_TOO_LARGE error instead of exhausting memory.
+ *
+ * A declared `Content-Length` over the cap is rejected before any body is read.
+ * Chunked bodies (no `Content-Length`) are bounded by counting bytes as they
+ * stream. Decoding happens once, at the end, so multi-byte UTF-8 sequences that
+ * straddle a chunk boundary still decode correctly.
+ */
+async function readBoundedText(
+  response: Response,
+  maxBytes: number,
+  requestId: string,
+): Promise<string> {
+  const declared = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw responseTooLargeError(requestId, maxBytes, declared);
+  }
+  const stream = response.body;
+  if (stream === null) {
+    // No readable stream exposed (some runtimes / test doubles): fall back to a
+    // buffered read, then enforce the cap on the materialized text.
+    const text = await response.text();
+    if (new TextEncoder().encode(text).length > maxBytes) {
+      throw responseTooLargeError(requestId, maxBytes);
+    }
+    return text;
+  }
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw responseTooLargeError(requestId, maxBytes, total);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // The reader may already be released after cancel(); releasing twice is a
+      // no-op we don't want surfacing over the original error.
+    }
+  }
+  return new TextDecoder('utf-8').decode(concatChunks(chunks, total));
+}
+
+/** Concatenate byte chunks into a single `Uint8Array` of known total length. */
+function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Typed error for a response body that exceeds the client-side buffering cap.
+ * Reuses PAYLOAD_TOO_LARGE (exit 5, validation family) — the same code the
+ * backend returns for oversized request bodies — so machine consumers route on
+ * it uniformly. `nextAction` names the knobs that shrink the result set.
+ */
+function responseTooLargeError(
+  requestId: string,
+  maxBytes: number,
+  observedBytes?: number,
+): ApiError {
+  const limitMiB = Math.round(maxBytes / (1024 * 1024));
+  return new ApiError({
+    code: 'PAYLOAD_TOO_LARGE',
+    message:
+      `The server response exceeded the client-side ${limitMiB} MiB limit and was not ` +
+      `buffered, to avoid unbounded memory use.`,
+    nextAction:
+      'Narrow the result set and retry — e.g. a smaller --page-size, a tighter --since ' +
+      'window, or scope --history to a single run.',
+    requestId,
+    details: {
+      maxBytes,
+      ...(observedBytes !== undefined ? { observedBytes } : {}),
+    },
+  });
 }
 
 export function parseRetryAfter(headerValue: string | null): number | undefined {
