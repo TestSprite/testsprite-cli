@@ -89,7 +89,7 @@ This is the loop a coding agent runs on its own once you've onboarded it with `t
 
 ```bash
 # (one-time, per project) teach your agent the CLI
-testsprite agent install claude
+testsprite agent install --target claude
 
 # 1 — describe the behavior you want to guarantee, run it, wait
 testsprite test create --project proj_8f0f6 --type frontend \
@@ -112,10 +112,10 @@ Every artifact in the bundle shares one `snapshotId`; the CLI will not mix a fai
 `testsprite agent install` writes the TestSprite skills into your project so your coding agent knows the commands, the exit codes, and the failure-bundle layout — no prompt engineering required. It's a pure-local command: no network, no credentials.
 
 ```bash
-testsprite agent install claude-code
-testsprite agent install codex
-testsprite agent install cursor
-testsprite agent install kiro-cli
+testsprite agent install --target claude-code
+testsprite agent install --target codex
+testsprite agent install --target cursor
+testsprite agent install --target kiro-cli
 testsprite agent list
 testsprite agent status
 ```

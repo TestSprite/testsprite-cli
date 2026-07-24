@@ -158,7 +158,7 @@ Prefer to configure each step by hand (or learn the surface offline with `--dry-
 - ♻️ **A loop, not a one-shot.** `create → run → failure get → fix → rerun` — every pass is banked, not thrown away.
 - 📐 **Scriptable & deterministic.** Stable `--output json` contract, predictable [exit codes](./DOCUMENTATION.md#exit-codes), and a `--dry-run` that exercises the full code path offline with canned data.
 - 🚦 **CI-native.** On GitHub Actions, `--wait` runs annotate the PR checks tab with one `::error::` per failure and append a results table to the job summary — automatically. Add `--report junit` for a JUnit XML sidecar, `--summary-file` for a machine summary, or `--gh-output` to preview the annotations locally. [Details →](./DOCUMENTATION.md#run-commands)
-- 🔌 **One command to onboard your agent.** `testsprite agent install claude` drops a ready-made skill file into your repo so your coding agent knows how to drive the loop on its own.
+- 🔌 **One command to onboard your agent.** `testsprite agent install --target claude` drops a ready-made skill file into your repo so your coding agent knows how to drive the loop on its own.
 
 ## How it works
 
