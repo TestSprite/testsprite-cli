@@ -129,7 +129,7 @@ There are two kinds of agent:
 
 `.agents/skills/` is the **single source of truth**: it is written on every install, even when you target a symlinked agent — `agent install --target claude-code` lands the skill in `.agents/skills/` (covering every universal agent) **and** links it into `.claude/skills/`. Because each symlink points _into_ `.agents/skills/`, you only ever edit a skill there and every symlinked agent reflects the change automatically (on systems where symlinks are unavailable — e.g. Windows without Developer Mode — a plain copy is written instead, which won't auto-update).
 
-`agent status` checks the canonical skill file (and each symlinked landing) against the current CLI version and reports `ok`, `stale`, `modified`, or `unmarked` for every agent that has an install (absent agents are omitted to keep output focused). It exits `1` when anything needs attention, so `testsprite agent status && …` can gate a CI step; `--dir <path>` inspects a different project root.
+`agent status` checks each installed skill against this CLI version and reports `ok`, `stale`, `modified`, or `unmarked`. Symlinked agents appear only when their own landing exists; universal agents share one canonical skill file (`.agents/skills/`), so installing for any one of them serves every universal agent and they all report together. Agents with nothing installed are omitted. It exits `1` when anything needs attention, so `testsprite agent status && …` can gate a CI step; `--dir <path>` inspects a different project root.
 
 Re-running with `--force` overwrites a canonical file that has drifted, backing up the existing bytes to `<path>.bak` first; for symlinked landings it replaces a link that points elsewhere.
 

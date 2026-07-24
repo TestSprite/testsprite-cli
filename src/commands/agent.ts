@@ -1112,7 +1112,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
   agent
     .command('status')
     .description(
-      'Check installed TestSprite skills against this CLI version (ok/stale/modified/unmarked). Reports only agents that have an install; exits 1 when any need attention, so it can gate CI',
+      'Check installed TestSprite skills against this CLI version (ok/stale/modified/unmarked). Universal agents share one canonical skill file (installing for any one serves all); symlinked agents appear only when their own landing exists. Exits 1 when any need attention, so it can gate CI',
     )
     .option('--dir <path>', 'Project root to inspect (default: cwd)')
     .addHelpText('after', GLOBAL_OPTS_HINT)
