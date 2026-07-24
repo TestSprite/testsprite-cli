@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import { Command } from 'commander';
 import {
   emitDryRunBanner,
@@ -615,7 +614,7 @@ export async function runCredential(
   // except `public` (which clears it).
   let credential = opts.credential;
   if (credential === undefined && opts.credentialFile !== undefined) {
-    credential = readFileSync(opts.credentialFile, 'utf8').trim();
+    credential = readSecretFileGuarded('credential-file', opts.credentialFile);
   }
   if (opts.authType !== 'public' && (credential === undefined || credential === '')) {
     throw localValidationError(
@@ -724,16 +723,18 @@ export async function runAutoAuth(
   // Resolve secrets from --*-file variants so they stay out of shell history.
   const password =
     opts.password ??
-    (opts.passwordFile !== undefined ? readFileSync(opts.passwordFile, 'utf8').trim() : undefined);
+    (opts.passwordFile !== undefined
+      ? readSecretFileGuarded('password-file', opts.passwordFile)
+      : undefined);
   const clientSecret =
     opts.clientSecret ??
     (opts.clientSecretFile !== undefined
-      ? readFileSync(opts.clientSecretFile, 'utf8').trim()
+      ? readSecretFileGuarded('client-secret-file', opts.clientSecretFile)
       : undefined);
   const refreshToken =
     opts.refreshToken ??
     (opts.refreshTokenFile !== undefined
-      ? readFileSync(opts.refreshTokenFile, 'utf8').trim()
+      ? readSecretFileGuarded('refresh-token-file', opts.refreshTokenFile)
       : undefined);
 
   const enabled = opts.disable !== true;
@@ -1302,3 +1303,5 @@ function localValidationError(message: string): ApiError {
     },
   });
 }
+
+

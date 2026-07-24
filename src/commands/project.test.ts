@@ -2079,3 +2079,165 @@ describe('dogfood 2026-06-30 — whitespace-only --name is rejected (parity with
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 });
+
+describe('#282 — secret --*-file flags are guarded (structured error, exit 5, no raw ENOENT)', () => {
+  const noNetwork = () => {
+    throw new Error('network should not be hit');
+  };
+  const deps = (credentialsPath: string) => ({
+    credentialsPath,
+    fetchImpl: makeFetch(noNetwork),
+    stdout: () => {},
+    stderr: () => {},
+  });
+  const missingPath = () => join(mkdtempSync(join(tmpdir(), 'cli-missing-')), 'no-such-secret.txt');
+
+  it('runCredential --credential-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runCredential(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          authType: 'API key',
+          credentialFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runCredential --credential-file pointing at a directory → VALIDATION_ERROR (exit 5)', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-cred-dir-'));
+    await expect(
+      runCredential(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          authType: 'API key',
+          credentialFile: dir,
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runCredential reads a valid --credential-file (trimmed) and sends it', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-cred-ok-'));
+    const credFile = join(dir, 'cred.txt');
+    writeFileSync(credFile, '  tok-from-file\n');
+    let sentBody: { credential?: string } | undefined;
+    const fetchImpl = makeFetch((_url, init) => {
+      sentBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { status: 200, body: { projectId: 'p1', authType: 'API key', rewroteCount: 1 } };
+    });
+    await runCredential(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'p1',
+        authType: 'API key',
+        credentialFile: credFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    // The on-disk fixture is "  tok-from-file\n"; the shared guard trims it.
+    expect(sentBody?.credential).toBe('tok-from-file');
+  });
+
+  it('runAutoAuth --password-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'password',
+          inject: 'bearer',
+          passwordFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runAutoAuth --client-secret-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'refresh_token',
+          inject: 'bearer',
+          clientSecretFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runAutoAuth --refresh-token-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'refresh_token',
+          inject: 'bearer',
+          refreshTokenFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runCreate --password-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'frontend',
+          name: 'FE',
+          targetUrl: 'https://example.com',
+          username: 'u',
+          passwordFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runUpdate --password-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          passwordFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+});
