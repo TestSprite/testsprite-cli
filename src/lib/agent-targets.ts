@@ -168,7 +168,10 @@ export const TARGET_ALIASES: Record<string, AgentTarget> = {
 /** Resolve a `--target` token (id or alias) to a canonical id, or null if unknown. */
 export function resolveTarget(raw: string): AgentTarget | null {
   if (Object.prototype.hasOwnProperty.call(TARGETS, raw)) return raw as AgentTarget;
-  return TARGET_ALIASES[raw] ?? null;
+  // hasOwnProperty avoids inherited keys (constructor, __proto__).
+  return Object.prototype.hasOwnProperty.call(TARGET_ALIASES, raw)
+    ? TARGET_ALIASES[raw]!
+    : null;
 }
 
 /** Every accepted `--target` token (ids + aliases), for help/error text. */

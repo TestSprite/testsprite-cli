@@ -157,6 +157,13 @@ describe('TARGET_ALIASES + resolveTarget', () => {
     expect(resolveTarget('definitely-not-an-agent')).toBeNull();
   });
 
+  it('resolveTarget rejects inherited prototype-chain keys as unknown', () => {
+    // Inherited keys (constructor, __proto__, ...) are truthy on a plain object.
+    for (const token of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+      expect(resolveTarget(token), token).toBeNull();
+    }
+  });
+
   it('acceptedTargetTokens is exactly the ids plus the aliases', () => {
     expect(new Set(acceptedTargetTokens())).toEqual(
       new Set([...Object.keys(TARGETS), ...Object.keys(TARGET_ALIASES)]),
