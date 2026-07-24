@@ -9,7 +9,8 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ApiError, RequestTimeoutError } from '../lib/errors.js';
+import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
+import { ShutdownController } from '../lib/interrupt.js';
 import type { RunResponse, RerunResponse, BatchRerunResponse } from '../lib/runs.types.js';
 import type { FetchImpl } from '../lib/http.js';
 import { runTestRerun, resolveWaitRequestTimeoutMs } from './test.js';
@@ -4950,5 +4951,100 @@ describe('[finding-4] single FE rerun --wait: TimeoutError writes partial JSON t
     expect(parsed.status).toBe('running');
 
     void fetchCallCount;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEV-331 piece 1 — graceful detach during batch rerun --wait (SIG-6)
+// ---------------------------------------------------------------------------
+
+describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatched runIds (DEV-331)', () => {
+  it('interrupt mid fan-out → stdout partial covers every accepted runId, honest stderr, exit 130', async () => {
+    const creds = makeCreds();
+    const shutdown = new ShutdownController();
+    const batchResp: BatchRerunResponse = {
+      accepted: [
+        { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+      ],
+      deferred: [],
+      conflicts: [],
+      closure: { byProject: [] },
+    };
+
+    // Batch trigger resolves; every run poll hangs until the composed signal aborts.
+    const fetchImpl: FetchImpl = (async (input: unknown, init: RequestInit = {}) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      if (url.includes('/tests/batch/rerun')) {
+        return new Response(JSON.stringify(batchResp), {
+          status: 202,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init.signal;
+        const rejectWithReason = (): void => {
+          const reason: unknown = signal?.reason;
+          reject(reason instanceof Error ? reason : new Error('aborted'));
+        };
+        if (signal?.aborted) {
+          rejectWithReason();
+          return;
+        }
+        signal?.addEventListener('abort', rejectWithReason, { once: true });
+      });
+    }) as FetchImpl;
+
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    const pending = runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        shutdown,
+      },
+    );
+    setTimeout(() => shutdown.interrupt('SIGINT'), 10);
+
+    const err = await pending.catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    expect((err as InterruptError).exitCode).toBe(130);
+
+    // SIG-6: the partial lists ALL dispatched runIds, marked running.
+    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
+      accepted: Array<{ runId: string; status: string }>;
+    };
+    const byRunId = new Map(stdoutJson.accepted.map(r => [r.runId, r.status]));
+    expect(byRunId.get('run_b1')).toBe('running');
+    expect(byRunId.get('run_b2')).toBe('running');
+
+    const stderrBlock = stderrLines.join('\n');
+    expect(stderrBlock).toContain('Interrupted (SIGINT)');
+    expect(stderrBlock).toContain('billing');
+    expect(stderrBlock).toContain('run_b1');
+    expect(stderrBlock).toContain('run_b2');
   });
 });
