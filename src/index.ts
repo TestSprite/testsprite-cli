@@ -166,6 +166,7 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     output?: string;
     profile?: string;
     dryRun?: boolean;
+    debug?: boolean;
   };
   const commandPath = commandPathOf(actionCommand);
   maybeEmitSkillNudge({
@@ -175,6 +176,7 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     profile: globals.profile ?? 'default',
     cwd: process.cwd(),
     env: process.env,
+    debug: globals.debug ?? false,
   });
 
   // Best-effort update notice (see lib/update-check.ts): self-gates on the

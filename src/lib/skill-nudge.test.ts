@@ -193,6 +193,51 @@ describe('maybeEmitSkillNudge', () => {
     expect(lines).toHaveLength(0);
   });
 
+  it('reports a swallowed profile lookup error only in debug mode', () => {
+    const { ctx, lines } = makeCtx({
+      debug: true,
+      readProfileImpl: () => {
+        throw new Error('credentials unavailable');
+      },
+    });
+
+    maybeEmitSkillNudge(ctx);
+
+    expect(lines).toEqual(['[debug] skill nudge skipped: credentials unavailable']);
+  });
+
+  it('keeps an unreadable managed target byte-identical without debug', () => {
+    const normal = makeCtx();
+    maybeEmitSkillNudge(normal.ctx);
+
+    const unreadable = makeCtx({
+      existsSync: p => p.endsWith('AGENTS.md'),
+      readFileSync: () => {
+        throw new Error('EACCES');
+      },
+    });
+    maybeEmitSkillNudge(unreadable.ctx);
+
+    expect(unreadable.lines).toEqual(normal.lines);
+  });
+
+  it('reports an unreadable managed target only in debug mode, then preserves the warning', () => {
+    const { ctx, lines } = makeCtx({
+      debug: true,
+      existsSync: p => p.endsWith('AGENTS.md'),
+      readFileSync: () => {
+        throw new Error('EACCES');
+      },
+    });
+
+    maybeEmitSkillNudge(ctx);
+
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('[debug] skill nudge could not read /proj/AGENTS.md');
+    expect(lines[0]).toContain('EACCES');
+    expect(lines[1]).toContain('[warn] No TestSprite verification skill is installed');
+  });
+
   it('passes the cwd through to the presence check', () => {
     const probed: string[] = [];
     const { ctx } = makeCtx({
