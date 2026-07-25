@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -2239,5 +2239,56 @@ describe('#282 — secret --*-file flags are guarded (structured error, exit 5, 
         deps(credentialsPath),
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runAutoAuth --dry-run with missing --password-file skips filesystem (returns sample)', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    const result = await runAutoAuth(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'p1',
+        method: 'password',
+        inject: 'bearer',
+        passwordFile: missingPath(),
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(fetched).toBe(false);
+    // blindfold: manual — dry-run skips file reads; returns sample with the projectId we passed in
+    expect(result.projectId).toBe('p1');
+  });
+
+  it('runCredential --credential-file unreadable after stat → VALIDATION_ERROR (exit 5)', async () => {
+    if (process.getuid?.() === 0) return; // root bypasses permission checks
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-cred-mode-'));
+    const f = join(dir, 'secret.txt');
+    writeFileSync(f, 'tok');
+    chmodSync(f, 0o000);
+    try {
+      await expect(
+        runCredential(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            projectId: 'p1',
+            authType: 'API key',
+            credentialFile: f,
+          },
+          deps(credentialsPath),
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    } finally {
+      chmodSync(f, 0o644);
+    }
   });
 });

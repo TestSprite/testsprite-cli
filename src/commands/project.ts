@@ -720,7 +720,26 @@ export async function runAutoAuth(
     throw localValidationError(`--inject must be one of: ${AUTO_AUTH_INJECTS.join(', ')}`);
   }
 
+  const enabled = opts.disable !== true;
+
+  const idempotencyKey = opts.idempotencyKey ?? `cli-proj-autoauth-${randomUUID()}`;
+  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
+    stderr(`idempotency-key: ${idempotencyKey}`);
+  }
+
+  if (opts.dryRun) {
+    const sample: CliProjectAutoAuthResponse = {
+      projectId: opts.projectId,
+      enabled,
+      method: opts.method,
+      inject: opts.inject,
+    };
+    out.print(sample, data => renderAutoAuthText(data as CliProjectAutoAuthResponse));
+    return sample;
+  }
+
   // Resolve secrets from --*-file variants so they stay out of shell history.
+  // Placed after the dry-run early return so --dry-run never touches the filesystem.
   const password =
     opts.password ??
     (opts.passwordFile !== undefined
@@ -737,7 +756,6 @@ export async function runAutoAuth(
       ? readSecretFileGuarded('refresh-token-file', opts.refreshTokenFile)
       : undefined);
 
-  const enabled = opts.disable !== true;
   const body: Record<string, unknown> = { enabled, method: opts.method, inject: opts.inject };
   const maybe = (k: string, v: string | undefined): void => {
     if (v !== undefined) body[k] = v;
@@ -756,22 +774,6 @@ export async function runAutoAuth(
   maybe('refreshToken', refreshToken);
   maybe('scope', opts.scope);
   maybe('region', opts.region);
-
-  const idempotencyKey = opts.idempotencyKey ?? `cli-proj-autoauth-${randomUUID()}`;
-  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
-    stderr(`idempotency-key: ${idempotencyKey}`);
-  }
-
-  if (opts.dryRun) {
-    const sample: CliProjectAutoAuthResponse = {
-      projectId: opts.projectId,
-      enabled,
-      method: opts.method,
-      inject: opts.inject,
-    };
-    out.print(sample, data => renderAutoAuthText(data as CliProjectAutoAuthResponse));
-    return sample;
-  }
 
   const client = makeClient(opts, deps);
   const res = await client.put<CliProjectAutoAuthResponse>(
@@ -1303,5 +1305,3 @@ function localValidationError(message: string): ApiError {
     },
   });
 }
-
-
