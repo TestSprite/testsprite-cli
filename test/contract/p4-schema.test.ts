@@ -83,6 +83,8 @@ const LATEST_RESULT_REQUIRED = [
   'targetUrl',
   'failedStepIndex',
   'failureKind',
+  'verdict',
+  'executionStatus',
   'summary',
 ] as const;
 // `targetUrlSource` (D1) is OPTIONAL — present on backends that shipped the D1
@@ -108,6 +110,15 @@ const FAILURE_KINDS = new Set<unknown>([
   'infra',
   'unknown',
   null,
+]);
+const VERDICTS = new Set<unknown>(['passed', 'failed', 'blocked', 'cancelled', 'unknown', null]);
+const EXECUTION_STATUSES = new Set<unknown>([
+  'queued',
+  'running',
+  'completed',
+  'cancelled',
+  'error',
+  'unknown',
 ]);
 
 function expectKeysMatch(value: Record<string, unknown>, allowed: Set<string>, label: string) {
@@ -178,17 +189,6 @@ function validateTestStepList(value: unknown, label = 'TestStepList'): void {
   }
 }
 
-function validateResultSummary(value: unknown, label: string): void {
-  expect(value, label).toBeTypeOf('object');
-  expect(value, label).not.toBeNull();
-  const obj = value as Record<string, unknown>;
-  expectKeysMatch(obj, new Set(['passed', 'failed', 'skipped']), label);
-  for (const k of ['passed', 'failed', 'skipped']) {
-    expect(typeof obj[k], `${label}.${k}`).toBe('number');
-    expect((obj[k] as number) >= 0, `${label}.${k} >= 0`).toBe(true);
-  }
-}
-
 function validateLatestResult(value: unknown, label = 'LatestResult'): void {
   expect(value, `${label}: must be an object`).toBeTypeOf('object');
   expect(value, `${label}: must not be null`).not.toBeNull();
@@ -215,7 +215,9 @@ function validateLatestResult(value: unknown, label = 'LatestResult'): void {
     expect((obj.failedStepIndex as number) >= 1, `${label}.failedStepIndex >= 1`).toBe(true);
   }
   expect(FAILURE_KINDS.has(obj.failureKind), `${label}.failureKind`).toBe(true);
-  validateResultSummary(obj.summary, `${label}.summary`);
+  expect(VERDICTS.has(obj.verdict), `${label}.verdict`).toBe(true);
+  expect(EXECUTION_STATUSES.has(obj.executionStatus), `${label}.executionStatus`).toBe(true);
+  expect(typeof obj.summary, `${label}.summary`).toBe('string');
 }
 
 describe('P4 schema contract — fixtures match the OpenAPI shapes', () => {
