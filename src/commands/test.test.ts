@@ -3295,10 +3295,12 @@ describe('runDiff', () => {
     expect(errs.join('\n')).toContain('different tests');
   });
 
-  it('--dry-run returns the canned sample fully offline (no credentials, no fetch)', async () => {
-    // Dry-run must not require credentials or hit the network — it returns a
-    // canned CliRunDiff so `--dry-run` shows the shape offline.
-    const diff = await runDiff(
+  it('--dry-run prints the canned sample fully offline and exits 1 when verdicts differ', async () => {
+    // Dry-run must not require credentials or hit the network. It still emits a
+    // canned CliRunDiff so `--dry-run` shows the shape offline, then follows the
+    // same verdict-change exit contract as the real path.
+    const out: string[] = [];
+    const rejection = await runDiff(
       {
         profile: 'default',
         output: 'json',
@@ -3307,8 +3309,15 @@ describe('runDiff', () => {
         runA: 'run_aaa',
         runB: 'run_bbb',
       },
-      { stdout: () => undefined, stderr: () => undefined },
-    );
+      { stdout: line => out.push(line), stderr: () => undefined },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 1 });
+    const diff = JSON.parse(out.join('')) as {
+      runA: { runId: string };
+      runB: { runId: string };
+      verdictChanged: boolean;
+      changedSteps: Array<{ stepIndex: number; statusA: string; statusB: string }>;
+    };
     expect(diff.runA.runId).toBe('run_aaa');
     expect(diff.runB.runId).toBe('run_bbb');
     expect(diff.verdictChanged).toBe(true);

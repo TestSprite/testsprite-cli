@@ -3956,6 +3956,12 @@ export async function runDiff(opts: DiffOptions, deps: TestDeps = {}): Promise<C
       changedSteps: [{ stepIndex: 2, statusA: 'passed', statusB: 'failed' }],
     };
     out.print(sample, () => renderRunDiffText(sample));
+    if (sample.verdictChanged) {
+      throw new CLIError(
+        `verdicts differ: ${sample.runA.runId}=${sample.runA.status} vs ${sample.runB.runId}=${sample.runB.status}`,
+        1,
+      );
+    }
     return sample;
   }
 
