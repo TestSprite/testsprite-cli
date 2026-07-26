@@ -23,8 +23,16 @@ describe('isShell / detectShell', () => {
     expect(detectShell({ SHELL: '/usr/local/bin/fish' })).toBe('fish');
   });
 
+  it('detects shells with Windows backslashes, .exe suffixes, and uppercase paths', () => {
+    expect(detectShell({ SHELL: 'C:\\Program Files\\Git\\bin\\bash.exe' })).toBe('bash');
+    expect(detectShell({ SHELL: 'C:\\tools\\zsh.exe' })).toBe('zsh');
+    expect(detectShell({ SHELL: '/usr/bin/FISH.EXE' })).toBe('fish');
+    expect(detectShell({ SHELL: 'C:/Program Files\\Git\\bin/bash.exe' })).toBe('bash');
+  });
+
   it('returns undefined for an unknown or missing shell', () => {
     expect(detectShell({ SHELL: '/bin/sh' })).toBeUndefined();
+    expect(detectShell({ SHELL: 'C:\\Windows\\System32\\cmd.exe' })).toBeUndefined();
     expect(detectShell({})).toBeUndefined();
   });
 });

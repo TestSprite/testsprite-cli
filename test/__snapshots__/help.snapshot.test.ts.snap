@@ -664,10 +664,12 @@ Options:
   --idempotency-key <key>     opaque key for safe retries (1–256 chars).
                               Printed to stderr at --debug if auto-generated.
   --all                       run all tests in the project (wave-ordered fresh
-                              run; requires --project). Mutually exclusive with
-                              <test-id>. (default: false)
-  --project <id>              project id (required with --all; returned by
-                              \`testsprite project list\`)
+                              run; uses --project or TESTSPRITE_PROJECT_ID).
+                              Mutually exclusive with <test-id>. (default:
+                              false)
+  --project <id>              project id (with --all, overrides
+                              TESTSPRITE_PROJECT_ID; returned by \`testsprite
+                              project list\`)
   --filter <substr>           with --all: only run tests whose name contains
                               this substring (case-insensitive)
   --max-concurrency <n>       with --all --wait, max in-flight polls at once
@@ -677,12 +679,21 @@ Options:
   --report-file <path>        output path for --report (atomic write)
   --report-suite-name <name>  optional JUnit <testsuite name=...> override
                               (default: testsprite:<projectId>)
+  --gh-output                 with --all --wait: emit GitHub-native output
+                              (::error:: annotations per non-passed run;
+                              job-summary table when $GITHUB_STEP_SUMMARY is
+                              set). Auto-enabled when GITHUB_ACTIONS=true
+  --summary-file <path>       with --all --wait: also write the reduced machine
+                              summary JSON {total, passed, failed, timedOut,
+                              runs[]} to this file
   -h, --help                  display help for command
 
 Dependency-aware fresh run (M4):
-  testsprite test run --all --project <id>           run all project tests in wave order
-  testsprite test run --all --project <id> --filter <substr>  name-glob subset
-  testsprite test run --all --project <id> --wait --report junit --report-file ./results.xml
+  testsprite test run --all --project <id>                run all project tests in wave order
+  TESTSPRITE_PROJECT_ID=<id> testsprite test run --all    use env default project
+  testsprite test run --all --filter <substr>             name-glob subset (uses --project/env)
+  testsprite test run --all --wait --report junit --report-file ./results.xml
+  project id precedence: --project wins over TESTSPRITE_PROJECT_ID
 
 BE tests can declare --produces/--needs at create time to drive wave ordering
 (see \`testsprite test create --help\` for details).

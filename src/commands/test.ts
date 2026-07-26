@@ -1,9 +1,11 @@
 import {
+  appendFileSync,
   createWriteStream,
   existsSync,
   readFileSync,
   readdirSync,
   statSync,
+  writeFileSync,
   type WriteStream,
 } from 'node:fs';
 import { rename, stat, unlink } from 'node:fs/promises';
@@ -92,6 +94,7 @@ import {
 import { createTicker } from '../lib/ticker.js';
 import { RateThrottle } from '../lib/rate-throttle.js';
 import { resolvePortalBase, resolvePortalUrl } from '../lib/facade.js';
+import { emitGithubOutputs, summarizeAcceptedPayload } from '../lib/gh-output.js';
 import { loadConfig } from '../lib/config.js';
 import {
   flakyExitCode,
@@ -487,7 +490,7 @@ function interruptDetachMessage(err: InterruptError, runIds: string[]): string {
 type CommonOptions = FactoryCommonOptions;
 
 interface ListOptions extends CommonOptions {
-  projectId: string;
+  projectId?: string;
   type?: 'frontend' | 'backend';
   createdFrom?: 'portal' | 'mcp' | 'cli';
   /**
@@ -552,7 +555,8 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
   // (exit 3) when the caller also lacks a configured key. Order matters
   // for the CLI error spec §2 — bad input is a caller bug, not an auth
   // gate.
-  requireProjectId(opts.projectId);
+  const projectId = resolveProjectId(opts.projectId, deps);
+  requireProjectId(projectId);
 
   const paginationFlags: PaginationFlags = validatePaginationFlags({
     pageSize: opts.pageSize,
@@ -578,7 +582,7 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
   const useSinglePage = opts.pageSize !== undefined && opts.maxItems === undefined;
 
   const baseQuery: Record<string, string | number | boolean | undefined> = {
-    projectId: opts.projectId,
+    projectId,
     type: opts.type,
     createdFrom: opts.createdFrom,
     status: opts.status,
@@ -642,7 +646,7 @@ export type CliCreatePriority = (typeof CLI_CREATE_PRIORITIES)[number];
 const MAX_INLINE_CODE_BYTES = 350 * 1024;
 
 interface CreateOptions extends CommonOptions {
-  projectId: string;
+  projectId?: string;
   type: 'frontend' | 'backend';
   name: string;
   description?: string;
@@ -790,7 +794,8 @@ export async function runCreate(
   assertChainedRunKeyFits(opts.run, opts.idempotencyKey);
   // Validate inputs before touching credentials or fs — matches the
   // M2 read commands' "input gates first, then auth, then I/O" ordering.
-  requireProjectId(opts.projectId);
+  const projectId = resolveProjectId(opts.projectId, deps);
+  requireProjectId(projectId);
   requireNonEmpty('name', opts.name);
   // P1-3: client-side length checks matching server limits (name ≤200,
   // description ≤2000) so the user gets instant, actionable errors instead
@@ -871,7 +876,7 @@ export async function runCreate(
   }
 
   const body: Record<string, unknown> = {
-    projectId: opts.projectId,
+    projectId,
     type: opts.type,
     name: opts.name,
     description: opts.description,
@@ -915,7 +920,7 @@ export async function runCreate(
   // B3: best-effort duplicate-name advisory. Skip under --dry-run.
   if (!opts.dryRun) {
     const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-    await emitDupNameAdvisoryIfNeeded(client, opts.projectId, opts.name, stderrFn);
+    await emitDupNameAdvisoryIfNeeded(client, projectId, opts.name, stderrFn);
   }
 
   const response = await client.post<CliCreateTestResponse>('/tests', {
@@ -940,7 +945,7 @@ export async function runCreate(
     // R1: suppress under --dry-run (fake canned test id).
     const chainDashboardUrl = opts.dryRun
       ? undefined
-      : resolvePortalUrl(resolveApiUrl(opts, deps), opts.projectId, response.testId);
+      : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId);
     const createContextWithUrl =
       chainDashboardUrl !== undefined ? { ...response, dashboardUrl: chainDashboardUrl } : response;
     await runTestRun(
@@ -970,7 +975,7 @@ export async function runCreate(
   // (e.g. "test_dryrun_create_2026") and a live-looking URL would mislead.
   const dashboardUrl = opts.dryRun
     ? undefined
-    : resolvePortalUrl(resolveApiUrl(opts, deps), opts.projectId, response.testId);
+    : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId);
   if (opts.output === 'json') {
     out.print(dashboardUrl !== undefined ? { ...response, dashboardUrl } : response, data =>
       renderCreateText(data as CliCreateTestResponse),
@@ -6343,8 +6348,8 @@ export async function runTestWait(
 // ---------------------------------------------------------------------------
 
 interface RunTestRunAllOptions extends CommonOptions {
-  /** projectId to run all tests in. */
-  projectId: string;
+  /** projectId to run all tests in; may be resolved from --project or TESTSPRITE_PROJECT_ID. */
+  projectId?: string;
   /** --filter <substr>: only run tests whose name contains this substring (case-insensitive). */
   nameFilter?: string;
   /** --wait: block until terminal or --timeout. */
@@ -6361,6 +6366,10 @@ interface RunTestRunAllOptions extends CommonOptions {
   reportFile?: string;
   /** --report-suite-name: optional override for the JUnit <testsuite name=...>. */
   reportSuiteName?: string;
+  /** --gh-output: force the GitHub-native output layer even off-Actions (issue #99). */
+  ghOutput?: boolean;
+  /** --summary-file: also write the reduced machine summary JSON to this path. */
+  summaryFile?: string;
 }
 
 async function writeBatchJUnitReportIfRequested(
@@ -6409,7 +6418,8 @@ export async function runTestRunAll(
   deps: TestDeps = {},
 ): Promise<BatchRunFreshResponse | undefined> {
   assertIdempotencyKey(opts.idempotencyKey);
-  requireProjectId(opts.projectId);
+  const projectId = resolveProjectId(opts.projectId, deps);
+  requireProjectId(projectId);
   if (
     !Number.isInteger(opts.maxConcurrency) ||
     opts.maxConcurrency < 1 ||
@@ -6440,7 +6450,7 @@ export async function runTestRunAll(
       method: 'POST',
       path: '/api/cli/v1/tests/batch/run',
       body: {
-        projectId: opts.projectId,
+        projectId,
         testIds: opts.nameFilter ? ['<filtered by --filter>'] : undefined,
         source: 'cli' as const,
       },
@@ -6469,9 +6479,9 @@ export async function runTestRunAll(
   const projectDashboardUrl =
     batchPortalBase === undefined
       ? undefined
-      : `${batchPortalBase}/dashboard/tests/${encodeURIComponent(opts.projectId)}`;
+      : `${batchPortalBase}/dashboard/tests/${encodeURIComponent(projectId)}`;
   const withBatchDashboardUrl = <T extends { testId: string }>(item: T): T => {
-    const dashboardUrl = resolvePortalUrl(batchApiUrl, opts.projectId, item.testId);
+    const dashboardUrl = resolvePortalUrl(batchApiUrl, projectId, item.testId);
     return dashboardUrl !== undefined ? { ...item, dashboardUrl } : item;
   };
 
@@ -6487,7 +6497,7 @@ export async function runTestRunAll(
     const allPage = await paginate<CliTest>(
       async ({ pageSize, cursor }) =>
         client.get<Page<CliTest>>('/tests', {
-          query: { projectId: opts.projectId, pageSize, cursor },
+          query: { projectId, pageSize, cursor },
         }),
       {},
     );
@@ -6503,7 +6513,7 @@ export async function runTestRunAll(
     testIds = filtered.map(t => t.id);
     if (testIds.length === 0) {
       stderrFn(
-        `No tests found in project ${opts.projectId} matching --filter "${opts.nameFilter}" — nothing to run.`,
+        `No tests found in project ${projectId} matching --filter "${opts.nameFilter}" — nothing to run.`,
       );
       out.print({
         accepted: [],
@@ -6515,7 +6525,7 @@ export async function runTestRunAll(
       return undefined;
     }
     stderrFn(
-      `Resolved ${testIds.length} test${testIds.length !== 1 ? 's' : ''} in project ${opts.projectId} for batch run.`,
+      `Resolved ${testIds.length} test${testIds.length !== 1 ? 's' : ''} in project ${projectId} for batch run.`,
     );
   }
   // When no --filter, omit testIds → server runs ALL tests in the project
@@ -6523,7 +6533,7 @@ export async function runTestRunAll(
 
   const batchResp = await client.triggerBatchRunFresh(
     {
-      projectId: opts.projectId,
+      projectId,
       ...(testIds !== undefined ? { testIds } : {}),
       source: 'cli',
     },
@@ -6667,7 +6677,7 @@ export async function runTestRunAll(
     try {
       retryResp = await client.triggerBatchRunFresh(
         {
-          projectId: opts.projectId,
+          projectId,
           testIds: retryIds,
           source: 'cli',
         },
@@ -6924,6 +6934,41 @@ export async function runTestRunAll(
   };
   await writeBatchJUnitReportIfRequested(opts, freshRunResults);
   out.print(jsonPayload);
+  // CI-native output layer (issue #99): emitted before the gate throws below so
+  // the artifacts land even when the batch exits non-zero. The summary file is a
+  // machine artifact written regardless of --output mode; stdout stays owned by
+  // the envelope above (plus Actions workflow commands, which Actions parses).
+  {
+    const env = deps.env ?? process.env;
+    const ghEnabled = opts.ghOutput === true || env.GITHUB_ACTIONS === 'true';
+    if (ghEnabled || opts.summaryFile !== undefined) {
+      const ciSummary = summarizeAcceptedPayload(JSON.stringify(jsonPayload));
+      if (opts.summaryFile !== undefined) {
+        try {
+          writeFileSync(opts.summaryFile, `${JSON.stringify(ciSummary, null, 2)}\n`, 'utf8');
+        } catch {
+          stderrFn(`[run] could not write --summary-file ${opts.summaryFile}; continuing`);
+        }
+      }
+      if (ghEnabled) {
+        const stdoutFn = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
+        emitGithubOutputs(
+          ciSummary,
+          env,
+          {
+            stdout: stdoutFn,
+            stderr: stderrFn,
+            appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf8'),
+            // Under --output json the envelope above owns stdout; workflow
+            // commands go to stderr instead (the Actions runner parses both
+            // streams), keeping the documented machine output parseable.
+            annotations: opts.output === 'json' ? stderrFn : stdoutFn,
+          },
+          { force: opts.ghOutput === true },
+        );
+      }
+    }
+  }
 
   // Rate-deferred tests were never dispatched → the batch is incomplete (exit 7),
   // mirroring `test rerun --all`. Checked before the failed-run throw so the
@@ -9098,12 +9143,12 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--all',
-      'run all tests in the project (wave-ordered fresh run; requires --project). Mutually exclusive with <test-id>.',
+      'run all tests in the project (wave-ordered fresh run; uses --project or TESTSPRITE_PROJECT_ID). Mutually exclusive with <test-id>.',
       false,
     )
     .option(
       '--project <id>',
-      'project id (required with --all; returned by `testsprite project list`)',
+      'project id (with --all, overrides TESTSPRITE_PROJECT_ID; returned by `testsprite project list`)',
     )
     .option(
       '--filter <substr>',
@@ -9122,12 +9167,22 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       '--report-suite-name <name>',
       'optional JUnit <testsuite name=...> override (default: testsprite:<projectId>)',
     )
+    .option(
+      '--gh-output',
+      'with --all --wait: emit GitHub-native output (::error:: annotations per non-passed run; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
+    )
+    .option(
+      '--summary-file <path>',
+      'with --all --wait: also write the reduced machine summary JSON {total, passed, failed, timedOut, runs[]} to this file',
+    )
     .addHelpText(
       'after',
       '\nDependency-aware fresh run (M4):\n' +
-        '  testsprite test run --all --project <id>           run all project tests in wave order\n' +
-        '  testsprite test run --all --project <id> --filter <substr>  name-glob subset\n' +
-        '  testsprite test run --all --project <id> --wait --report junit --report-file ./results.xml\n' +
+        '  testsprite test run --all --project <id>                run all project tests in wave order\n' +
+        '  TESTSPRITE_PROJECT_ID=<id> testsprite test run --all    use env default project\n' +
+        '  testsprite test run --all --filter <substr>             name-glob subset (uses --project/env)\n' +
+        '  testsprite test run --all --wait --report junit --report-file ./results.xml\n' +
+        '  project id precedence: --project wins over TESTSPRITE_PROJECT_ID\n' +
         '\nBE tests can declare --produces/--needs at create time to drive wave ordering\n' +
         '(see `testsprite test create --help` for details).\n' +
         '\nFrontend tests: the current unified engine runs FE tests too (they are billed\n' +
@@ -9148,7 +9203,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       if (testIdArg === undefined && !isAll) {
         throw localValidationError(
           'test-id',
-          'provide a <test-id>, or use --all --project <id> to run all tests in a project',
+          'provide a <test-id>, or use --all with --project <id> or TESTSPRITE_PROJECT_ID',
         );
       }
       // --filter is an --all-only narrowing flag (mirrors `test rerun --filter`).
@@ -9157,7 +9212,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       if (cmdOpts.filter !== undefined && cmdOpts.filter !== '' && !isAll) {
         throw localValidationError(
           'filter',
-          '--filter only applies with --all (it narrows which project tests run). Remove --filter, or add --all --project <id>.',
+          '--filter only applies with --all (it narrows which project tests run). Remove --filter, or add --all with --project <id> or TESTSPRITE_PROJECT_ID.',
         );
       }
       const report = parseJUnitReportFormat(cmdOpts.report);
@@ -9168,21 +9223,36 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         wait: cmdOpts.wait === true,
         batchPath: isAll,
       });
+      // --gh-output / --summary-file reduce the terminal batch envelope, which
+      // only exists on the --all --wait path (without --wait the command returns
+      // after enqueueing). Anywhere else they would silently no-op — reject
+      // loudly (same rule as --filter and the JUnit report flags).
+      if (cmdOpts.ghOutput === true && (!isAll || cmdOpts.wait !== true)) {
+        throw localValidationError(
+          'gh-output',
+          '--gh-output only applies with --all --wait (it reduces the terminal batch envelope). Remove --gh-output, or add --all --wait.',
+        );
+      }
+      if (cmdOpts.summaryFile !== undefined && (!isAll || cmdOpts.wait !== true)) {
+        throw localValidationError(
+          'summary-file',
+          '--summary-file only applies with --all --wait (it reduces the terminal batch envelope). Remove --summary-file, or add --all --wait.',
+        );
+      }
 
       if (isAll) {
         // --all path: wave-ordered fresh batch run.
-        if (!cmdOpts.project) {
-          throw localValidationError(
-            'project',
-            '--all requires a project id — pass --project <id>',
-          );
-        }
+        const projectId = resolveProjectId(cmdOpts.project, deps);
+        requireProjectId(
+          projectId,
+          '--all requires a project id - pass --project <id> or set TESTSPRITE_PROJECT_ID',
+        );
         // --target-url has no effect on the --all batch path: a BE test's base
         // URL is baked into its code, and the unified engine resolves each
         // project's configured environment server-side (per-run URL overrides
         // are not applied to batch FE runs either). Silently dropping it could
-        // run the suite against an unintended environment in the caller's mind
-        // — reject loudly instead.
+        // run the suite against an unintended environment in the caller's mind,
+        // so reject loudly.
         if (cmdOpts.targetUrl !== undefined && cmdOpts.targetUrl !== '') {
           throw localValidationError(
             'target-url',
@@ -9192,7 +9262,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         await runTestRunAll(
           {
             ...resolveCommonOptions(command),
-            projectId: cmdOpts.project,
+            projectId,
             nameFilter: cmdOpts.filter,
             wait: cmdOpts.wait === true,
             timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
@@ -9203,6 +9273,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             report,
             reportFile: cmdOpts.reportFile,
             reportSuiteName: cmdOpts.reportSuiteName,
+            ghOutput: cmdOpts.ghOutput === true,
+            summaryFile: cmdOpts.summaryFile,
           },
           deps,
         );
@@ -9683,6 +9755,8 @@ interface RunFlagOpts {
   report?: string;
   reportFile?: string;
   reportSuiteName?: string;
+  ghOutput?: boolean;
+  summaryFile?: string;
 }
 
 interface WaitFlagOpts {
@@ -9801,9 +9875,19 @@ interface StepsFlagOpts {
   runId?: string;
 }
 
-function requireProjectId(projectId: string): void {
+function resolveProjectId(projectId: string | undefined, deps: TestDeps): string | undefined {
+  const explicit = projectId?.trim();
+  if (explicit && explicit.length > 0) return explicit;
+  const envValue = (deps.env ?? process.env).TESTSPRITE_PROJECT_ID;
+  const trimmed = envValue?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+function requireProjectId(
+  projectId: string | undefined,
+  message = 'is required; pass --project <id> or set TESTSPRITE_PROJECT_ID',
+): asserts projectId is string {
   if (typeof projectId !== 'string' || projectId.length === 0) {
-    throw localValidationError('project', 'is required');
+    throw localValidationError('project', message);
   }
 }
 

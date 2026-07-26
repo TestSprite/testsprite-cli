@@ -365,6 +365,64 @@ describe('runList', () => {
     expect(seen[0]).toContain('createdFrom=portal');
   });
 
+  it('uses TESTSPRITE_PROJECT_ID when --project is omitted', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      seen.push(url);
+      return { body: { items: [FE_TEST], nextToken: null } };
+    });
+    await runList(
+      { profile: 'default', output: 'json', debug: false },
+      {
+        credentialsPath,
+        env: { TESTSPRITE_PROJECT_ID: 'project_env' } as NodeJS.ProcessEnv,
+        fetchImpl,
+        stdout: () => undefined,
+      },
+    );
+    expect(seen[0]).toContain('projectId=project_env');
+  });
+
+  it('uses TESTSPRITE_PROJECT_ID when --project is blank', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      seen.push(url);
+      return { body: { items: [FE_TEST], nextToken: null } };
+    });
+    await runList(
+      { profile: 'default', output: 'json', debug: false, projectId: '   ' },
+      {
+        credentialsPath,
+        env: { TESTSPRITE_PROJECT_ID: 'project_env' } as NodeJS.ProcessEnv,
+        fetchImpl,
+        stdout: () => undefined,
+      },
+    );
+    expect(seen[0]).toContain('projectId=project_env');
+  });
+
+  it('prefers explicit --project over TESTSPRITE_PROJECT_ID', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      seen.push(url);
+      return { body: { items: [FE_TEST], nextToken: null } };
+    });
+    await runList(
+      { profile: 'default', output: 'json', debug: false, projectId: 'project_flag' },
+      {
+        credentialsPath,
+        env: { TESTSPRITE_PROJECT_ID: 'project_env' } as NodeJS.ProcessEnv,
+        fetchImpl,
+        stdout: () => undefined,
+      },
+    );
+    expect(seen[0]).toContain('projectId=project_flag');
+    expect(seen[0]).not.toContain('projectId=project_env');
+  });
+
   it('accepts --created-from cli and passes createdFrom=cli to the wire (dogfood 2026-06-04)', async () => {
     // End-to-end through parseEnumFlag: backend now stamps createFrom='cli'
     // on `testsprite test create` rows, so the filter must accept 'cli'.
@@ -783,10 +841,15 @@ describe('createTestCommand list — required flag', () => {
       await test.parseAsync(['list'], { from: 'user' });
       expect.unreachable('expected ApiError');
     } catch (err) {
-      const apiErr = err as { code?: string; exitCode?: number; details?: { field?: string } };
+      const apiErr = err as {
+        code?: string;
+        exitCode?: number;
+        details?: { field?: string; reason?: string };
+      };
       expect(apiErr.code).toBe('VALIDATION_ERROR');
       expect(apiErr.exitCode).toBe(5);
       expect(apiErr.details?.field).toBe('project');
+      expect(apiErr.details?.reason).toContain('TESTSPRITE_PROJECT_ID');
     }
   });
 
@@ -4847,7 +4910,7 @@ describe('runCreate', () => {
           ...SAMPLE_RESPONSE,
           type: 'backend',
           warnings: [
-            'This test appears to hardcode an auth credential — read auth from __AUTH_HEADERS__.',
+            'This test appears to hardcode an auth credential - read auth from __AUTH_HEADERS__.',
           ],
         },
       };
@@ -4873,10 +4936,43 @@ describe('runCreate', () => {
     );
     // Warning lands on stderr, prefixed `[warn]`.
     expect(err.some(l => l.includes('[warn]') && l.includes('__AUTH_HEADERS__'))).toBe(true);
-    // stdout stays the parseable wire object — no warning noise.
+    // stdout stays the parseable wire object - no warning noise.
     expect(out.join('\n')).not.toContain('[warn]');
   });
 
+  it('uses TESTSPRITE_PROJECT_ID for create when --project is omitted', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('code body');
+    type Captured = { method: string; body: unknown; url: string };
+    const captured: Captured[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      captured.push({ url, method, body: init.body ? JSON.parse(init.body as string) : undefined });
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      return { status: 200, body: SAMPLE_RESPONSE };
+    });
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        type: 'frontend',
+        name: 'n',
+        codeFile,
+      },
+      {
+        credentialsPath,
+        env: { TESTSPRITE_PROJECT_ID: 'project_env' } as NodeJS.ProcessEnv,
+        fetchImpl,
+        stdout: () => undefined,
+      },
+    );
+    expect(captured.some(c => c.method === 'GET' && c.url.includes('projectId=project_env'))).toBe(
+      true,
+    );
+    const post = captured.find(c => c.method === 'POST')!;
+    expect(post.body).toMatchObject({ projectId: 'project_env' });
+  });
   it('respects a caller-supplied --idempotency-key (for safe retries)', async () => {
     const { credentialsPath } = makeCreds();
     const codeFile = writeCodeFile('code body');
@@ -5030,7 +5126,6 @@ describe('runCreate', () => {
           profile: 'default',
           output: 'json',
           debug: false,
-          // @ts-expect-error — exercising the runtime gate
           projectId: undefined,
           type: 'frontend',
           name: 'n',
