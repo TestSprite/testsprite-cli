@@ -115,6 +115,23 @@ describe('runUsage — real path without credits (current backend)', () => {
     expect(stderr).toContain('testsprite.com');
   });
 
+  // Issue #277: the usage projection is validated at the client boundary, so a
+  // string balance surfaces as a typed envelope instead of silently reaching
+  // the `Math.floor(credits / creditsPerRun)` pre-flight arithmetic.
+  it('rejects a non-numeric credit balance with a typed INTERNAL envelope', async () => {
+    writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
+    const { deps } = makeCapture();
+    const rejection = await runUsage(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...deps,
+        credentialsPath,
+        fetchImpl: makeFetch({ ...meWithoutCredits, credits: '100', creditsPerRun: 2 }),
+      },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ code: 'INTERNAL' });
+  });
+
   it('text output includes identity fields even without credits', async () => {
     writeProfile('default', { apiKey: 'sk-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();

@@ -1,13 +1,15 @@
 /**
- * Valibot schemas for the run-path wire shapes (issue #102).
+ * Valibot schemas for the API wire shapes (issue #102, extended by #277).
  *
  * `requestWithMeta` used to return `(await response.json()) as T` with zero
  * runtime validation, so a drifted or partial server response surfaced as
  * `undefined` output or an opaque TypeError deep inside a command. These
  * schemas are wired (opt-in, via `RequestOptions.schema`) into the typed
- * HttpClient helpers only: `triggerRun`, `triggerRunWithMeta`, `triggerRerun`,
- * `triggerBatchRerun`, `triggerBatchRunFresh`, `getRun`, `listTestRuns`.
- * The generic `get`/`post`/`put`/`patch`/`delete` paths stay schema-free.
+ * HttpClient helpers `triggerRun`, `triggerRunWithMeta`, `triggerRerun`,
+ * `triggerBatchRerun`, `triggerBatchRunFresh`, `getRun`, `listTestRuns`, and
+ * — for the account surfaces below — at the `client.get` call sites that own
+ * a `/me` or usage read. Every other generic `get`/`post`/`put`/`patch`/
+ * `delete` caller stays schema-free and opt-in.
  *
  * Resilience rules (additive server changes must never hard-fail the CLI):
  *
@@ -32,6 +34,11 @@
  * interface it mirrors, so schema/interface drift fails `tsc` in this file.
  */
 import * as v from 'valibot';
+// Type-only imports: erased at compile time, so pulling a command's wire
+// interface into `lib/` adds no runtime edge (same pattern as `bundle.ts`,
+// which type-imports `CliTestStep` from `commands/test.ts`).
+import type { MeResponse } from '../commands/auth.js';
+import type { UsageResponse } from '../commands/usage.js';
 import type {
   BatchRerunResponse,
   BatchRunFreshResponse,
@@ -43,6 +50,9 @@ import type {
   RunStatus,
   TriggerRunResponse,
 } from './runs.types.js';
+
+/** Deployment environment the bound key belongs to; open on the wire (rule 2). */
+type AccountEnv = 'development' | 'staging' | 'production';
 
 /**
  * Compile-time literal union, runtime open string.
@@ -251,21 +261,80 @@ export const LIST_RUNS_RESPONSE_SCHEMA: v.GenericSchema<unknown, ListRunsRespons
 // ---------------------------------------------------------------------------
 
 /**
- * Minimal `/me` identity core shared by its consumers. `doctor` reads a
- * two-field optional projection (`MeIdentity` in commands/doctor.ts) while
- * `auth whoami` reads the full `MeResponse` (commands/auth.ts); this schema
- * validates the common identity core so it can guard either caller, and
- * `looseObject` lets the full projection (scopes, env, email, ...) pass
- * through untouched. Not wired into any typed helper yet: `/me` callers use
- * the generic `get`, which stays schema-free in this change.
+ * Minimal `/me` identity core, as read by `doctor`'s connectivity check.
+ *
+ * `doctor` deliberately treats every field as optional: the check only needs
+ * "the key was accepted", and it decorates the detail line with the userId
+ * *when present* (`me.userId ? ...`). Fixture evidence for keeping it fully
+ * optional rather than reusing {@link ME_RESPONSE_SCHEMA}: `OK_ME` in
+ * `commands/doctor.test.ts` is `{ userId, keyId }` with no `scopes`/`env`, and
+ * a connectivity probe must not fail on a partial identity projection.
+ *
+ * `commands/doctor.ts` aliases its `MeIdentity` to this type so the two cannot
+ * drift (they already had: `v3Enabled` existed on the command side only).
  */
 export interface MeIdentityWire {
   userId?: string;
   keyId?: string;
+  /** Authoritative per-user V3 routing bit; older backends omit it. */
+  v3Enabled?: boolean;
 }
 
 /** Mirrors `MeIdentity` (commands/doctor.ts): `GET /api/cli/v1/me` core. */
 export const ME_IDENTITY_SCHEMA: v.GenericSchema<unknown, MeIdentityWire> = v.looseObject({
   userId: v.optional(v.string()),
   keyId: v.optional(v.string()),
+  v3Enabled: v.optional(v.boolean()),
+});
+
+/**
+ * Mirrors `MeResponse` (commands/auth.ts): the full `GET /me` projection read
+ * by `auth whoami` (and, through it, `init`).
+ *
+ * `scopes` is required and array-typed on purpose — this is the shape drift
+ * that actually bites today. `runWhoami` renders `m.scopes.join(', ')` and
+ * computes `missingScopes` via `m.scopes.includes(...)` with no guard, so a
+ * `/me` body without `scopes` crashes with a raw `TypeError` (exit 1) instead
+ * of a typed envelope. Every `/me` fixture in the suite supplies it
+ * (`auth.test.ts`, `init.test.ts`, `usage.test.ts`, `cli.subprocess.test.ts`,
+ * `test/mock-backend/fixtures.ts`), so requiring it matches observed wire
+ * reality; `email` / `displayName` / `v3Enabled` are the genuinely absent-safe
+ * ones and stay `v.optional` with no default (rule 3, optional branch).
+ *
+ * `init` calls this through `runWhoami` inside a try/catch that falls back to
+ * a placeholder identity, so a drifted `/me` degrades the setup summary
+ * instead of failing the whole `init`.
+ */
+export const ME_RESPONSE_SCHEMA: v.GenericSchema<unknown, MeResponse> = v.looseObject({
+  userId: v.string(),
+  keyId: v.string(),
+  scopes: v.array(v.string()),
+  env: openWireLiteral<AccountEnv>(),
+  email: v.optional(v.string()),
+  displayName: v.optional(v.string()),
+  v3Enabled: v.optional(v.boolean()),
+});
+
+// ---------------------------------------------------------------------------
+// GET /me (usage projection)
+// ---------------------------------------------------------------------------
+
+/**
+ * Mirrors `UsageResponse` (commands/usage.ts): the credits/plan projection the
+ * `usage` command reads off the same `GET /me` body.
+ *
+ * `renderUsage` prints `userId`/`keyId`/`env` unconditionally as its "identity
+ * block", so those three are required; `credits`, `subPlan` and
+ * `creditsPerRun` are forward-compat fields the backend does not send today
+ * (see the BACKEND FOLLOW-UP note in usage.ts) and every renderer branch is
+ * gated on `!== undefined`, so they stay optional with no default. `scopes`
+ * rides along as an unknown extra key and is preserved by `looseObject`.
+ */
+export const USAGE_RESPONSE_SCHEMA: v.GenericSchema<unknown, UsageResponse> = v.looseObject({
+  userId: v.string(),
+  keyId: v.string(),
+  env: openWireLiteral<AccountEnv>(),
+  credits: v.optional(v.number()),
+  subPlan: v.optional(v.string()),
+  creditsPerRun: v.optional(v.number()),
 });

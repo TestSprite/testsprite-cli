@@ -24,6 +24,7 @@ import { loadConfig } from '../lib/config.js';
 import { resolvePortalBase } from '../lib/facade.js';
 import type { FetchImpl } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
+import { USAGE_RESPONSE_SCHEMA } from '../lib/response-schemas.js';
 
 /**
  * Usage/balance response from `/me` (when the backend supplies it) or a future
@@ -117,7 +118,7 @@ export async function runUsage(opts: CommonOptions, deps: UsageDeps = {}): Promi
   // /me is the only available source of credits/plan today.
   // When the backend adds credits/subPlan to MeResponse (or adds /usage),
   // this single get call is sufficient — no code change needed in the CLI.
-  const me = await client.get<UsageResponse>('/me');
+  const me = await client.get<UsageResponse>('/me', { schema: USAGE_RESPONSE_SCHEMA });
 
   out.print(me, data => renderUsage(data as UsageResponse, portalBase));
 

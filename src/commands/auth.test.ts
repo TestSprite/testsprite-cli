@@ -850,6 +850,41 @@ describe('runWhoami', () => {
     expect(printed).toEqual(sampleMe);
   });
 
+  // Issue #277: `/me` is validated against ME_RESPONSE_SCHEMA at the client
+  // boundary, so wire drift becomes a typed envelope instead of a crash.
+  it('turns a /me body without scopes into a typed INTERNAL envelope, not a raw TypeError', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { deps } = makeCapture();
+    const withoutScopes: Record<string, unknown> = { ...sampleMe };
+    delete withoutScopes.scopes;
+    const drifted = new Response(JSON.stringify(withoutScopes), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    const rejection = await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(drifted) },
+    ).catch((error: unknown) => error);
+    // Before: `m.scopes.join(', ')` threw `TypeError: ... not a function`.
+    expect(rejection).toBeInstanceOf(ApiError);
+    expect(rejection).toMatchObject({ code: 'INTERNAL' });
+    expect(JSON.stringify((rejection as ApiError).getDetail('issues'))).toContain('scopes');
+  });
+
+  it('passes an additive /me field straight through to --output json', async () => {
+    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const additive = new Response(JSON.stringify({ ...sampleMe, orgName: 'Acme' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    await runWhoami(
+      { profile: 'default', output: 'json', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(additive) },
+    );
+    expect(JSON.parse(capture.stdout.join('')).orgName).toBe('Acme');
+  });
+
   it('renders routing: v3 and the gap advisory when v3Enabled is true', async () => {
     writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
