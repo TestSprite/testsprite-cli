@@ -22,6 +22,7 @@ import { emitDeprecationNotice } from '../lib/deprecate.js';
 import type { OutputMode } from '../lib/output.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptSecret } from '../lib/prompt.js';
+import { ME_RESPONSE_SCHEMA } from '../lib/response-schemas.js';
 import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 
 export interface MeResponse {
@@ -261,7 +262,7 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
     stderr: deps.stderr,
   });
 
-  const me = await client.get<MeResponse>('/me');
+  const me = await client.get<MeResponse>('/me', { schema: ME_RESPONSE_SCHEMA });
   out.print(me, data => {
     const m = data as MeResponse;
     const lines = [

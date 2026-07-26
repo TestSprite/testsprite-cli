@@ -7,7 +7,13 @@
 import { describe, expect, it } from 'vitest';
 import * as v from 'valibot';
 import { HttpClient } from './http.js';
-import { RUN_RESPONSE_SCHEMA, TRIGGER_RUN_RESPONSE_SCHEMA } from './response-schemas.js';
+import {
+  ME_IDENTITY_SCHEMA,
+  ME_RESPONSE_SCHEMA,
+  RUN_RESPONSE_SCHEMA,
+  TRIGGER_RUN_RESPONSE_SCHEMA,
+  USAGE_RESPONSE_SCHEMA,
+} from './response-schemas.js';
 
 const VALID_RUN = {
   runId: 'run_1',
@@ -100,5 +106,99 @@ describe('TRIGGER_RUN_RESPONSE_SCHEMA', () => {
       targetUrl: 'https://example.com',
     });
     expect(parsed.success).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Account surfaces (issue #277): GET /me and its usage projection.
+// ---------------------------------------------------------------------------
+
+const VALID_ME = {
+  userId: 'u_1',
+  keyId: 'k_1',
+  scopes: ['read:projects', 'read:tests'],
+  env: 'development',
+};
+
+describe('ME_RESPONSE_SCHEMA', () => {
+  it('accepts the minimal /me body and preserves unknown extra keys', () => {
+    const parsed = v.safeParse(ME_RESPONSE_SCHEMA, { ...VALID_ME, plan: 'Pro' });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect((parsed.output as { plan?: string }).plan).toBe('Pro');
+    }
+  });
+
+  it('accepts an unknown env value (a new deployment tier must not hard-fail)', () => {
+    expect(v.safeParse(ME_RESPONSE_SCHEMA, { ...VALID_ME, env: 'sandbox' }).success).toBe(true);
+  });
+
+  it('leaves the absent-safe identity fields absent rather than defaulting them', () => {
+    const parsed = v.safeParse(ME_RESPONSE_SCHEMA, VALID_ME);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect('email' in parsed.output).toBe(false);
+      expect('displayName' in parsed.output).toBe(false);
+      expect('v3Enabled' in parsed.output).toBe(false);
+    }
+  });
+
+  it('rejects a /me body without scopes, naming the path', () => {
+    const withoutScopes: Record<string, unknown> = { ...VALID_ME };
+    delete withoutScopes.scopes;
+    const parsed = v.safeParse(ME_RESPONSE_SCHEMA, withoutScopes);
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(parsed.issues.some(issue => v.getDotPath(issue) === 'scopes')).toBe(true);
+    }
+  });
+});
+
+describe('ME_IDENTITY_SCHEMA', () => {
+  it("accepts doctor's partial identity projection (connectivity must not fail on it)", () => {
+    expect(v.safeParse(ME_IDENTITY_SCHEMA, { userId: 'u-doc', keyId: 'k-doc' }).success).toBe(true);
+  });
+
+  it('carries v3Enabled through so the routing advisory still fires', () => {
+    const parsed = v.safeParse(ME_IDENTITY_SCHEMA, { ...VALID_ME, v3Enabled: true });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.output.v3Enabled).toBe(true);
+    }
+  });
+
+  it('rejects a wrongly-typed identity field', () => {
+    expect(v.safeParse(ME_IDENTITY_SCHEMA, { userId: 42 }).success).toBe(false);
+  });
+});
+
+describe('USAGE_RESPONSE_SCHEMA', () => {
+  it("accepts today's /me body, which carries no credits fields at all", () => {
+    const parsed = v.safeParse(USAGE_RESPONSE_SCHEMA, VALID_ME);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.output.credits).toBeUndefined();
+      // `scopes` is not part of the usage projection but must survive as an
+      // unknown extra key so `--output json` stays byte-faithful.
+      expect((parsed.output as { scopes?: string[] }).scopes).toEqual(VALID_ME.scopes);
+    }
+  });
+
+  it('accepts the future body with credits, plan and per-run cost', () => {
+    const parsed = v.safeParse(USAGE_RESPONSE_SCHEMA, {
+      ...VALID_ME,
+      credits: 100,
+      subPlan: 'Standard',
+      creditsPerRun: 2,
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('rejects a non-numeric credit balance instead of rendering NaN math', () => {
+    const parsed = v.safeParse(USAGE_RESPONSE_SCHEMA, { ...VALID_ME, credits: '100' });
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(parsed.issues.some(issue => v.getDotPath(issue) === 'credits')).toBe(true);
+    }
   });
 });
