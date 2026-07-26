@@ -595,17 +595,22 @@ describe('findSample', () => {
     expect(body.summary.total).toBeGreaterThanOrEqual(1);
   });
 
-  it('keeps the failed run sentinel before the generic getRun sample', () => {
+  it('keeps the failed run sentinel before generic getRun while retaining cancelRun', () => {
     // findSample is first-match-wins; exact run fixtures must precede
     // `/runs/{runId}` so `test wait --dry-run` still gets the passed sample.
+    // The adjacent POST cancel fixture was added on main after this branch forked.
     const failedRunIndex = DRY_RUN_SAMPLE_ENTRIES.findIndex(
       e => e.method === 'GET' && e.pathTemplate === '/runs/run_failed_sample',
     );
     const genericRunIndex = DRY_RUN_SAMPLE_ENTRIES.findIndex(
       e => e.method === 'GET' && e.pathTemplate === '/runs/{runId}',
     );
+    const cancelRunIndex = DRY_RUN_SAMPLE_ENTRIES.findIndex(
+      e => e.method === 'POST' && e.pathTemplate === '/runs/{runId}/cancel',
+    );
     expect(failedRunIndex).toBeGreaterThanOrEqual(0);
     expect(genericRunIndex).toBeGreaterThanOrEqual(0);
+    expect(cancelRunIndex).toBeGreaterThanOrEqual(0);
     expect(failedRunIndex).toBeLessThan(genericRunIndex);
   });
 
