@@ -59,7 +59,7 @@
     "@vitest/coverage-v8": "^2.1.4",
     "eslint": "^9.14.0",
     "eslint-config-prettier": "^9.1.0",
-    "globals": "^15.12.0",
+    "globals": "^16.5.0",
     "msw": "^2.14.3",
     "prettier": "^3.3.3",
     "typescript": "^5.6.3",
