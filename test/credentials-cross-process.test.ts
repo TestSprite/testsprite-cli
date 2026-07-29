@@ -52,6 +52,72 @@ function runCredentialWriter(env: Record<string, string>): Promise<ChildResult> 
 describe('credentials cross-process writes', () => {
   beforeAll(() => {
     execNpm(['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
+  }, 60_000);
+
+  it('reports missing required child-process environment variables', async () => {
+    const result = await runCredentialWriter({
+      CRED_API_KEY: '',
+      CRED_PATH: '',
+      CRED_PROFILE: '',
+      CRED_START_PATH: '',
+    });
+
+    expect(result).toMatchObject({
+      code: 1,
+      signal: null,
+      stdout: '',
+    });
+    expect(result.stderr).toContain(
+      'CRED_PROFILE, CRED_PATH, CRED_API_KEY, and CRED_START_PATH are required',
+    );
+  });
+
+  it('reports a timed out child-process start marker', async () => {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'testsprite-creds-timeout-'));
+
+    try {
+      const startPath = join(tmpRoot, 'missing-start');
+      const result = await runCredentialWriter({
+        CRED_API_KEY: 'sk-child-timeout',
+        CRED_PATH: join(tmpRoot, 'credentials'),
+        CRED_PROFILE: 'child-timeout',
+        CRED_START_PATH: startPath,
+      });
+
+      expect(result).toMatchObject({
+        code: 2,
+        signal: null,
+        stdout: '',
+      });
+      expect(result.stderr).toContain(`Timed out waiting for start marker: ${startPath}`);
+    } finally {
+      rmSync(tmpRoot, { force: true, recursive: true });
+    }
+  }, 15_000);
+
+  it('reports writeProfile failures from the child process', async () => {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'testsprite-creds-write-error-'));
+
+    try {
+      const startPath = join(tmpRoot, 'start');
+      writeFileSync(startPath, 'go');
+
+      const result = await runCredentialWriter({
+        CRED_API_KEY: 'sk-child-invalid-profile',
+        CRED_PATH: join(tmpRoot, 'credentials'),
+        CRED_PROFILE: 'bad]',
+        CRED_START_PATH: startPath,
+      });
+
+      expect(result).toMatchObject({
+        code: 3,
+        signal: null,
+        stdout: '',
+      });
+      expect(result.stderr).toContain('Invalid request.');
+    } finally {
+      rmSync(tmpRoot, { force: true, recursive: true });
+    }
   });
 
   it('preserves every profile written by concurrent child processes', async () => {
