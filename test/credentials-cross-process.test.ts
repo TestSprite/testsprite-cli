@@ -49,6 +49,19 @@ function runCredentialWriter(env: Record<string, string>): Promise<ChildResult> 
   });
 }
 
+async function waitForFiles(paths: string[], timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (true) {
+    const missing = paths.filter(path => !existsSync(path));
+    if (missing.length === 0) return;
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for files: ${missing.join(', ')}`);
+    }
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 5));
+  }
+}
+
 describe('credentials cross-process writes', () => {
   beforeAll(() => {
     execNpm(['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
@@ -81,7 +94,9 @@ describe('credentials cross-process writes', () => {
         CRED_API_KEY: 'sk-child-timeout',
         CRED_PATH: join(tmpRoot, 'credentials'),
         CRED_PROFILE: 'child-timeout',
+        CRED_POLL_MS: '1',
         CRED_START_PATH: startPath,
+        CRED_START_TIMEOUT_MS: '100',
       });
 
       expect(result).toMatchObject({
@@ -130,16 +145,18 @@ describe('credentials cross-process writes', () => {
         apiKey: `sk-child-${index}`,
         profile: `child-${index}`,
       }));
-      const children = profiles.map(({ apiKey, profile }) =>
+      const readyPaths = profiles.map(({ profile }) => join(tmpRoot, `${profile}.ready`));
+      const children = profiles.map(({ apiKey, profile }, index) =>
         runCredentialWriter({
           CRED_API_KEY: apiKey,
           CRED_PATH: credentialsPath,
           CRED_PROFILE: profile,
+          CRED_READY_PATH: readyPaths[index]!,
           CRED_START_PATH: startPath,
         }),
       );
 
-      await new Promise(resolveDelay => setTimeout(resolveDelay, 50));
+      await waitForFiles(readyPaths);
       writeFileSync(startPath, 'go');
 
       const results = await Promise.all(children);
