@@ -231,7 +231,21 @@ function ensureWindowsRestrictiveAcl(path: string, options: RestrictiveModeOptio
   }
 
   const run = options.spawnSync ?? spawnSync;
-  const result = run('icacls', [path, '/inheritance:r', '/grant:r', `${username}:F`], {
+
+  // Reset to re-enable inheritance from the parent directory first.
+  // Using /inheritance:r (the previous approach) strips all inherited ACEs and
+  // relies solely on the USERNAME-based grant — on Windows the env USERNAME may
+  // not resolve to the same SID that owns the file (e.g. Microsoft Account /
+  // domain account mismatches), which leaves the file unreadable by anyone.
+  // /reset restores inherited ACEs so the owner can always access the file, then
+  // the explicit /grant:r adds a belt-and-suspenders Full-Control entry.
+  run('icacls', [path, '/reset'], {
+    shell: false,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+
+  const result = run('icacls', [path, '/grant:r', `${username}:F`], {
     shell: false,
     stdio: 'ignore',
     windowsHide: true,
