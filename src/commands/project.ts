@@ -11,6 +11,7 @@ import { ApiError } from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
+import { readSecretFileGuarded } from '../lib/secret-file.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
@@ -210,7 +211,7 @@ export async function runCreate(
   // Resolve password: flag > file > none
   let password = opts.password;
   if (password === undefined && opts.passwordFile !== undefined) {
-    password = readFileSync(opts.passwordFile, 'utf8').trim();
+    password = readSecretFileGuarded('password-file', opts.passwordFile);
   }
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-create-${randomUUID()}`;
@@ -326,7 +327,7 @@ export async function runUpdate(
   // filesystem, even when --password-file is present.
   let password = opts.password;
   if (password === undefined && opts.passwordFile !== undefined) {
-    password = readFileSync(opts.passwordFile, 'utf8').trim();
+    password = readSecretFileGuarded('password-file', opts.passwordFile);
   }
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-update-${randomUUID()}`;

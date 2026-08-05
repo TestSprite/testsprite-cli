@@ -1044,6 +1044,122 @@ describe('runUpdate', () => {
   });
 });
 
+describe('#79 — an unreadable --password-file is a validation error, not a crash', () => {
+  const missing = join(tmpdir(), 'testsprite-issue-79-absent-password-file');
+
+  it('runCreate rejects a missing file with VALIDATION_ERROR (exit 5) before the network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'backend',
+          name: 'Guarded',
+          passwordFile: missing,
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('runUpdate rejects a missing file with VALIDATION_ERROR (exit 5) before the network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network');
+    });
+
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_guarded',
+          passwordFile: missing,
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('names the flag in nextAction instead of leaking a raw ENOENT', async () => {
+    const { credentialsPath } = makeCreds();
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'backend',
+          name: 'Guarded',
+          passwordFile: missing,
+        },
+        {
+          credentialsPath,
+          fetchImpl: (async () => {
+            throw new Error('should not hit network');
+          }) as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({
+      nextAction: expect.stringContaining('--password-file') as unknown as string,
+    });
+  });
+
+  it('still reads a password file that exists', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-p79-'));
+    const passwordFile = join(dir, 'pw.txt');
+    writeFileSync(passwordFile, 'from-file\n');
+
+    const sentBodies: unknown[] = [];
+    const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      if (init.body) sentBodies.push(JSON.parse(init.body as string) as unknown);
+      return new Response(JSON.stringify({ ...PROJECT_FIXTURE, id: 'proj_pw' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        type: 'backend',
+        name: 'Guarded',
+        passwordFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+
+    expect((sentBodies[0] as Record<string, unknown>).password).toBe('from-file');
+  });
+});
+
 describe('runDelete', () => {
   it('refuses without --confirm and never hits the network (exit 5)', async () => {
     const { credentialsPath } = makeCreds();
