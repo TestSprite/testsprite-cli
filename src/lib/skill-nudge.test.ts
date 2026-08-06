@@ -4,6 +4,7 @@ import type { OutputMode } from './output.js';
 import {
   SKILL_NUDGE_COMMANDS,
   SKILL_NUDGE_OPT_OUT_ENV,
+  isPlanTemplateInvocation,
   isVerifySkillInstalled,
   maybeEmitSkillNudge,
   type SkillNudgeContext,
@@ -205,5 +206,34 @@ describe('maybeEmitSkillNudge', () => {
     maybeEmitSkillNudge(ctx);
     expect(probed.length).toBeGreaterThan(0);
     expect(probed.every(p => toPosix(p).startsWith('/work/here'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isPlanTemplateInvocation — src/index.ts's preAction hook uses
+// this to exempt `test create --plan-template` from BOTH the skill nudge
+// above and the update-registry check in update-check.ts. Extracted here
+// (rather than left inline in src/index.ts, which executes `program.parse()`
+// at import time and so cannot safely be imported by a unit test) purely so
+// the boolean logic is directly unit-testable.
+// ---------------------------------------------------------------------------
+
+describe('isPlanTemplateInvocation', () => {
+  it('true for `test create` with planTemplate: true', () => {
+    expect(isPlanTemplateInvocation('test create', true)).toBe(true);
+  });
+
+  it('false for `test create` without planTemplate (undefined)', () => {
+    expect(isPlanTemplateInvocation('test create', undefined)).toBe(false);
+  });
+
+  it('false for `test create` with planTemplate: false', () => {
+    expect(isPlanTemplateInvocation('test create', false)).toBe(false);
+  });
+
+  it('false for any other command path even with planTemplate: true (Commander would never actually set this, but the check must not false-positive)', () => {
+    expect(isPlanTemplateInvocation('test create-batch', true)).toBe(false);
+    expect(isPlanTemplateInvocation('test run', true)).toBe(false);
+    expect(isPlanTemplateInvocation('auth status', true)).toBe(false);
   });
 });

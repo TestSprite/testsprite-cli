@@ -11,6 +11,7 @@ The full reference for the TestSprite CLI: install verification, manual setup, e
 - [Manual setup](#manual-setup)
 - [The complete agent loop](#the-complete-agent-loop)
 - [Agent onboarding (`agent install`)](#agent-onboarding-agent-install)
+- [Plan file format](#plan-file-format)
 - [Command reference](#command-reference)
   - [Read commands](#read-commands)
   - [Write commands](#write-commands)
@@ -67,6 +68,8 @@ testsprite auth whoami
 ```
 
 Credentials are stored at `~/.testsprite/credentials` (INI-style, mode `0600`). See [Configuration](#configuration) for profiles, environment overrides, and scopes.
+
+For an org-scoped API key, `auth status` additionally prints an `orgs:` line (every organization your account belongs to) and an `org binding:` line (the specific organization this key is bound to). Both are omitted for a personal key or an older backend that doesn't report them.
 
 ### 2. Run your first test
 
@@ -131,6 +134,52 @@ The `codex` target uses **managed-section mode** — it writes only a sentinel-d
 
 Re-running with `--force` on **own-file targets** (claude, cursor, cline, antigravity, kiro, windsurf, copilot) backs up the existing file to `<path>.bak` first.
 
+## Plan file format
+
+A **plan file** is the JSON document `test create --plan-from <file>` ingests to author one **frontend** test (bulk-create takes the same shape, one spec per line/file — see [`test create-batch`](#testsprite-test-create-batch)). It holds exactly **ONE** test as a single JSON object — a top-level array is rejected (use `create-batch` for many).
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.4.0/schemas/plan.schema.json",
+  "projectId": "prj_abc123",
+  "type": "frontend",
+  "name": "Login rejects an empty password",
+  "planSteps": [
+    {
+      "type": "action",
+      "description": "Navigate to /login and submit the form with an empty password"
+    },
+    {
+      "type": "assertion",
+      "description": "Verify an inline error says the password is required"
+    }
+  ]
+}
+```
+
+Get this exact skeleton without hand-copying it from this file: `testsprite test create --plan-template` (pure-local, prints to stdout — see [`test create`](#testsprite-test-create)). The same example is embedded in `test create --help`. **The `$schema` value above is pinned to the CLI version that generated this page (`v0.4.0`)** — `--plan-template`'s live output always pins to your actually-installed version instead, so on a later release the two will differ; run the command yourself rather than trusting this snippet's `$schema` value verbatim.
+
+| Field         | Required | Type                                                            | Notes                                                                                                                                                                                                                            |
+| ------------- | -------- | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `projectId`   | yes      | string                                                          | Returned by `testsprite project list`. Non-empty, not whitespace-only.                                                                                                                                                           |
+| `type`        | yes      | `"frontend"`                                                    | `--plan-from` only accepts `frontend` — a `backend`-typed plan is rejected pre-flight with a `nextAction` pointing at `test create --type backend --code-file <path>` (backend tests are authored from a code file, not a plan). |
+| `name`        | yes      | string                                                          | An assertable behavior statement (subject + verb + outcome), not a noun fragment.                                                                                                                                                |
+| `description` | no       | string                                                          | One-sentence elaboration of `name` — the condition plus the expected outcome.                                                                                                                                                    |
+| `priority`    | no       | `"p0"` \| `"p1"` \| `"p2"` \| `"p3"`                            | p0 = must-pass, p1 = important paths, p2 = edge cases, p3 = cosmetic.                                                                                                                                                            |
+| `planSteps`   | yes      | `Array<{ type: "action" \| "assertion", description: string }>` | **1–200 steps**, describing user intent in plain language, not selectors.                                                                                                                                                        |
+
+**Size cap:** the whole file must be **≤ 256 KB** (`test create-batch` caps the aggregate batch at 5 MB / 50 specs). Both caps are enforced client-side before any network call.
+
+**`{{...}}`-style placeholders are NOT substituted.** The CLI does no variable substitution — a step like `"description": "log in as {{LOGIN_USER}}"` is structurally valid (it validates and creates fine) but the browser agent types the literal braces into the field. `test create --plan-from` prints a non-fatal `[advisory]` when it detects one; store login credentials on the project instead: `testsprite project update <project-id> --username <user> --password <pw>`, or Portal → Project Settings.
+
+**`$schema` for live editor validation:** the optional `"$schema"` key above (an ordinary extra property — the CLI does not restrict a plan file to a fixed property set, so a non-string value there is exactly as valid as a string one) points VS Code's JSON language service — and by extension Copilot's inline completions — at [`schemas/plan.schema.json`](./schemas/plan.schema.json), shipped in both this repo and the npm package. Point it at a local copy instead (`node_modules/@testsprite/testsprite-cli/schemas/plan.schema.json`) if you'd rather not depend on the network URL resolving in your editor. This value is **version-pinned** (`v<CLI version>`, not `main`) — a plan authored against one CLI version keeps resolving the SAME schema later, even after `main` gains new required fields.
+
+**Machine-readable ground truth**, for tooling that wants to fetch the contract instead of parsing this page: [`schemas/plan.schema.json`](./schemas/plan.schema.json) — this schema is the ground truth for the `--plan-from` **command** end-to-end (e.g. it restricts `type` to `"frontend"` only, matching what actually succeeds, not `assertPlanShape`'s looser raw structural check in isolation); if the schema and the validator ever disagree, the validator's real acceptance behavior is authoritative and the schema is out of date. The schema file's own internal `$id` intentionally stays pinned to the canonical `main` URL — `$id` is the schema's IDENTITY (what it calls itself for cross-referencing), not a fetch instruction, so it does not need version-pinning the way the `$schema` fetch hint above does.
+
+**Multiple tests?** Draft a `plans.jsonl` (one plan object per line) or a directory of `*.json` plan files, then `test create-batch --plans <file.jsonl>` / `--plan-from-dir <dir>`. Max 50 specs / 5 MB per batch.
+
+**Zero-cost iteration loop:** `test create --plan-from <file> --dry-run` runs the exact same local validation as a real create — no network call, no auth, no credits spent — so an agent (or you) can iterate on a plan file until it validates before ever hitting the API. `test lint` runs the same validators across a whole batch, collecting every problem instead of stopping at the first.
+
 ## Command reference
 
 Every command supports the [global flags](#global-flags), and every example below pairs a real call with a `--dry-run` companion that works on a fresh install with no auth.
@@ -151,6 +200,8 @@ Common flags:
 - `--page-size <n>` — server hint for items per page; the cursor token comes back in `nextToken`. Passing `--page-size` without `--max-items` returns a single page.
 - `--starting-token <token>` — opaque cursor from a previous response.
 - `--max-items <n>` — client-side cap on total items across auto-paged pages.
+
+For an org-scoped API key, the text table gains an `ORG` column (project owning organization) whenever at least one row carries org attribution; a personal key or a page with no org data keeps the legacy column set unchanged. `--output json` always includes `orgId`/`orgName` when the backend supplies them.
 
 #### `testsprite project get <project-id>`
 
@@ -268,7 +319,7 @@ testsprite test failure summary test_xxxxxxxx --dry-run --output json
 
 ### Write commands
 
-Require the `write:tests` scope (project commands require `write:projects`), except `test scaffold` and `test lint`, which are pure-local authoring helpers — no network, no credentials, no scope.
+Require the `write:tests` scope (project commands require `write:projects`), except `test scaffold`, `test lint`, and `test create --plan-template`, which are pure-local authoring helpers — no network, no credentials, no scope.
 
 #### `testsprite test scaffold`
 
@@ -293,7 +344,9 @@ testsprite test lint --steps ./refined.plan.json       # the shape `test plan pu
 
 #### `testsprite test create`
 
-Create a new test. Backend tests use `--code-file` (agents supply backend code directly); frontend tests use either `--code-file` or `--plan-from`. With `--run --wait`, the CLI chains create → trigger → poll in a single invocation. Backend tests can declare wave-ordering dependencies at create time — `--produces <var>` / `--needs <var>` (repeatable) and `--category <setup|main|teardown>` — and amend them later via `test update`.
+Create a new test. Backend tests use `--code-file` (agents supply backend code directly); frontend tests use either `--code-file` or `--plan-from` (see [Plan file format](#plan-file-format)). With `--run --wait`, the CLI chains create → trigger → poll in a single invocation. Backend tests can declare wave-ordering dependencies at create time — `--produces <var>` / `--needs <var>` (repeatable) and `--category <setup|main|teardown>` — and amend them later via `test update`.
+
+`--plan-template` prints the canonical minimal plan-file skeleton to stdout and exits — pure-local, no network/credentials, ignores every other flag. The exact same example is embedded in `test create --help`.
 
 ```bash
 # Backend test from a code file
@@ -303,6 +356,9 @@ testsprite test create --project proj_xxxxxxxx --type backend --name "Login API"
 # Frontend test from an agent-supplied plan-steps document; trigger + wait inline
 testsprite test create --plan-from ./checkout.plan.json --type frontend \
   --run --wait --timeout 600 --output json
+
+# Print the plan-file skeleton, edit it, then create from it
+testsprite test create --plan-template > plan.json
 
 # Dry-run prints the canned wire envelope
 testsprite test create --plan-from ./checkout.plan.json --dry-run --output json
@@ -356,6 +412,8 @@ Replace a frontend test's plan-steps with a refined plan. `--expected-step-count
 testsprite test plan put test_xxxxxxxx --steps ./refined.plan.json --expected-step-count 8
 testsprite test plan put test_xxxxxxxx --steps ./refined.plan.json --dry-run --output json
 ```
+
+**V3-migrated accounts:** the backend returns `UNSUPPORTED` (exit 7, with an actionable `nextAction`) for this endpoint on accounts that have been migrated to V3 — plan-steps replacement isn't wired up for the V3 test-case schema yet. This is a clean, expected denial (not a bug); there is currently no CLI-side workaround.
 
 #### `testsprite project create` / `project update`
 
@@ -455,7 +513,7 @@ Batch `--report` flags apply only to `test run --all --wait` (and batch `test re
 
 #### `testsprite test rerun [test-id...]`
 
-Re-execute one or more tests as a cheap **replay** — distinct from `test run`, which triggers a fresh agent run that may regenerate code and spend credits. A frontend rerun replays the saved script (verbatim unless AI heal-on-drift engages — see `--auto-heal`); a backend rerun re-runs the named test together with its producer/teardown dependency closure. Without `--wait`, prints the queued run(s) and exits 0; with `--wait`, polls to terminal with the same exit-code matrix as `test run --wait`.
+Re-execute one or more tests as a **replay** — distinct from `test run`, which triggers a fresh agent run that may regenerate code. A frontend rerun replays the saved script (verbatim unless AI heal-on-drift engages — see `--auto-heal`); a backend rerun re-runs the named test together with its producer/teardown dependency closure. A rerun is billed the same as a fresh run — 0.5 credits per FE rerun, 0.2 credits per BE rerun (legacy V2 accounts: FE rerun remains free). Without `--wait`, prints the queued run(s) and exits 0; with `--wait`, polls to terminal with the same exit-code matrix as `test run --wait`.
 
 ```bash
 # Frontend test — verbatim replay
@@ -488,7 +546,7 @@ Flags:
 
 - `--all` — rerun every test in the resolved project; requires `--project <id>`.
 - `--wait`, `--timeout <s>` — block until terminal; same exit matrix as `test run --wait`.
-- `--auto-heal` / `--no-auto-heal` — frontend AI heal-on-drift, **on by default** for FE reruns; opt out with `--no-auto-heal`. Verbatim-replay passes are free; a heal engage costs a small amount of credit. Ignored for backend tests.
+- `--auto-heal` / `--no-auto-heal` — frontend AI heal-on-drift, **on by default** for FE reruns; opt out with `--no-auto-heal`. The rerun itself is billed at 0.5 credits regardless of whether heal engages; a heal engage costs a small amount of credit on top of that (legacy V2 accounts: a verbatim-replay pass is free, and only a heal engage costs credit). Ignored for backend tests. On V3-routed accounts the `--no-auto-heal` opt-out is still rolling out and may not yet be honored server-side.
 - `--skip-dependencies` — backend only: rerun just the named test without expanding the producer/teardown closure.
 - `--max-concurrency <n>` — with `--wait`, cap on in-flight polls during a batch rerun.
 - `--idempotency-key <key>` — auto-minted when omitted (the minted key is printed to stderr under `--output json`, `--verbose`, or `--debug`).
@@ -498,7 +556,7 @@ A batch rerun returns `accepted[]` (one `runId` per dispatched test) plus `defer
 
 #### `testsprite test flaky <test-id>`
 
-Detect a **flaky** test by replaying it several times and reporting how often it passes. Each attempt is a rerun with auto-heal **off** (a strict verbatim replay), so healed drift can't disguise a nondeterministic pass/fail — this measures the replay stability of the saved script against the configured URL. Frontend replays are free verbatim script replays; backend tests re-run their dependency closure and may cost credits (a one-line stderr advisory is printed before the run).
+Detect a **flaky** test by replaying it several times and reporting how often it passes. Each attempt is a rerun with auto-heal **off** (a strict verbatim replay), so healed drift can't disguise a nondeterministic pass/fail — this measures the replay stability of the saved script against the configured URL. Each replay is billed as a rerun, same as a fresh run: 0.5 credits for a frontend replay, 0.2 credits for a backend replay (legacy V2 accounts: FE rerun remains free) — so `--runs N` costs roughly N×0.5 credits for a frontend test. A one-line stderr advisory is printed before a backend replay.
 
 ```bash
 # Replay 10 times and print a stability score
@@ -531,6 +589,12 @@ testsprite test wait run_01hx3z9p8q4k2y7a --dry-run --output json
 
 With several ids, a per-member poll error (e.g. one id not found) is recorded as `error:<CODE>` in that run's row and folded into exit 7, rather than aborting the whole batch. Polling is handled automatically — the CLI uses server-driven long-poll where supported and exponential backoff with jitter otherwise, honoring `Retry-After`.
 
+A `RATE_LIMITED` (429) poll is the one per-member error that is retried before it becomes an outcome: each member re-polls up to 3 times, sleeping the server's `Retry-After`. Each backoff is clamped to the shared `--timeout` deadline, and a backoff interrupted by Ctrl-C detaches normally; if the deadline is reached during one, that member reports a **timeout** (exit 7), not a rate limit.
+
+If the throttle outlasts the retry budget **and** nothing else went wrong — no timeouts, no failed runs, no other error codes, and no repeated run id in the argument list — the exit code is **11** (rate limited) rather than 7, because the correct next action is to back off before re-attaching, not to retry immediately. Any timeout or non-passed run in the same invocation keeps the usual 7 / 1.
+
+One caveat this does not fix: the HTTP layer's own 429 retries (up to 3, honoring `Retry-After`) are bounded by their own budget, not by `--timeout`, so a sustained throttle can still overshoot the deadline by roughly one retry chain before the command gives up. That is pre-existing behavior on every polling command, not something this retry loop introduced — the outer loop re-checks the deadline before each of its own attempts.
+
 #### `testsprite test cancel <run-id...>`
 
 Cancel one or more in-flight runs — the counterpart to Ctrl-C, which only **detaches** (the server-side run keeps executing and billing). Cancelling is idempotent: an already-cancelled run reports `alreadyCancelled` as an advisory, not an error; a run that already reached a terminal verdict is a conflict — the verdict is never overwritten, and no credits are refunded. With one id, prints the run card; with several, prints a `{ cancelled, alreadyCancelled, conflicts, notFound }` summary. Exit codes: any unknown id → 4; else any conflict → 6; else 0.
@@ -558,7 +622,7 @@ Returns 404 (CLI exit 4) when the run passed (`details.reason: "no_failing_run"`
 
 #### `testsprite usage` (alias: `testsprite credits`)
 
-Account pre-flight before a large batch: resolves the active key to its identity (`userId`, `keyId`, `env`) and surfaces the credit balance / plan fields when the backend supplies them. Useful right before a `test run --all` fan-out.
+Account pre-flight before a large batch: resolves the active key to its identity (`userId`, `keyId`, `env`) and surfaces the credit balance / plan fields when the backend supplies them. Useful right before a `test run --all` fan-out. For an org-scoped key, also prints the `orgs:` / `org binding:` lines described under [Authenticate](#1-authenticate).
 
 ```bash
 testsprite usage --output json
@@ -576,7 +640,7 @@ testsprite doctor --output json
 testsprite doctor && testsprite test run test_xxxxxxxx --wait
 ```
 
-Every check reuses the same helpers the real commands use, so the report reflects exactly what a subsequent command would resolve.
+Every check reuses the same helpers the real commands use, so the report reflects exactly what a subsequent command would resolve. For an org-scoped key, the report also lists `Organizations` (account-wide membership list) and `Org binding` (this key's bound organization) checks.
 
 ## Configuration
 
@@ -600,18 +664,37 @@ These apply to every command:
 
 ### Environment variables
 
-| Variable                                  | Purpose                                                                                          |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `TESTSPRITE_API_KEY`                      | API key - overrides the credentials file                                                         |
-| `TESTSPRITE_API_URL`                      | API endpoint - overrides the credentials file                                                    |
-| `TESTSPRITE_PROFILE`                      | Active profile (below `--profile`, above `default`)                                              |
-| `TESTSPRITE_PROJECT_ID`                   | Default project for `test list`, `test create`, and `test run --all` when `--project` is omitted |
-| `TESTSPRITE_REQUEST_TIMEOUT_MS`           | Per-request timeout in **milliseconds** (default `120000`, range `1000`-`600000`)                |
-| `TESTSPRITE_NO_UPDATE_NOTIFIER`           | Any non-empty value disables the once-per-24h "new version available" notice                     |
-| `NO_COLOR`                                | Suppress ANSI escape sequences in ticker output ([no-color.org](https://no-color.org/))          |
-| `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` | Standard proxy support - API traffic is routed through the configured proxy                      |
-| `TESTSPRITE_NO_SKILL_WARNING`             | Any non-empty value silences the "verify skill not installed" reminder (CI / manual use)         |
-| `TESTSPRITE_PORTAL_URL`                   | Override the Portal origin used for `dashboardUrl` links (non-prod environments)                 |
+| Variable                                   | Purpose                                                                                          |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `TESTSPRITE_API_KEY`                       | API key - overrides the credentials file                                                         |
+| `TESTSPRITE_API_URL`                       | API endpoint - overrides the credentials file                                                    |
+| `TESTSPRITE_PROFILE`                       | Active profile (below `--profile`, above `default`)                                              |
+| `TESTSPRITE_PROJECT_ID`                    | Default project for `test list`, `test create`, and `test run --all` when `--project` is omitted |
+| `TESTSPRITE_REQUEST_TIMEOUT_MS`            | Per-request timeout in **milliseconds** (default `120000`, range `1000`-`600000`)                |
+| `TESTSPRITE_NO_UPDATE_NOTIFIER`            | Any non-empty value disables the once-per-24h "new version available" notice                     |
+| `NO_COLOR`                                 | Suppress ANSI escape sequences in ticker output ([no-color.org](https://no-color.org/))          |
+| `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`  | Standard proxy support - API traffic is routed through the configured proxy                      |
+| `TESTSPRITE_NO_SKILL_WARNING`              | Any non-empty value silences the "verify skill not installed" reminder (CI / manual use)         |
+| `TESTSPRITE_NO_TELEMETRY` / `DO_NOT_TRACK` | Any truthy value (not `0`/`false`/empty) disables usage telemetry (see Telemetry below)          |
+| `TESTSPRITE_PORTAL_URL`                    | Override the Portal origin used for `dashboardUrl` links (non-prod environments)                 |
+
+### Telemetry
+
+Authenticated runs send one best-effort "command outcome" event per invocation
+to TestSprite (`POST /api/cli/v1/telemetry`) so we can measure which commands
+run and diagnose failures. Each event carries only: the command name (e.g.
+`test run`), the outcome (`success`/`error`/`abort`), the exit code, a machine
+error **code** (e.g. `VALIDATION_ERROR`), the duration, and context (CLI
+version, OS, Node version, output mode, CI-vs-interactive).
+
+It **never** sends: your API key, target URLs, flag or argument values, or error
+**messages**. The event is a fixed allowlist, bounded to ~1s, and fully
+best-effort — it never delays beyond that, never changes a command's behavior or
+exit code, and is skipped entirely when no API key is configured or under
+`--dry-run`.
+
+Opt out with `TESTSPRITE_NO_TELEMETRY=1` or the cross-tool
+`DO_NOT_TRACK=1` (any truthy value; `0`/`false`/empty do not opt out).
 
 ### Update notice
 
@@ -668,7 +751,7 @@ testsprite test wait "$RUN_ID" --timeout 600 --output json || echo "run did not 
 | `3`                   | Auth error                                                                                        |
 | `4`                   | Not found                                                                                         |
 | `5`                   | Validation error / payload too large                                                              |
-| `6`                   | Conflict / precondition failed                                                                    |
+| `6`                   | Conflict / precondition failed / ambiguous org (see below)                                        |
 | `7`                   | Timeout / unsupported                                                                             |
 | `10`                  | Service unavailable                                                                               |
 | `11`                  | Rate limited (retriable)                                                                          |
@@ -676,6 +759,15 @@ testsprite test wait "$RUN_ID" --timeout 600 --output json || echo "run did not 
 | `13`                  | Feature gated (paid plan required)                                                                |
 | `14`                  | Client too old — the backend requires a newer CLI (HTTP 426 `CLIENT_TOO_OLD`); upgrade to proceed |
 | `129` / `130` / `143` | Interrupted by a signal (SIGHUP / SIGINT / SIGTERM) — `128 + signal number`                       |
+
+### Ambiguous org id (exit 6)
+
+For a membership-scoped API key, a testId can — pathologically — resolve to
+projects in more than one of your organizations. The CLI prints one
+`candidate: project <id> (org <id>)` line per colliding project plus a hint
+to re-run with `--project <id>`, and exits `6` (same family as a generic
+conflict; retrying does not resolve it). `--output json` carries the same
+information in `error.details.candidates`.
 
 ### Signals & pipes
 

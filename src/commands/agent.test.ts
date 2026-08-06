@@ -925,6 +925,117 @@ describe('createAgentCommand wiring', () => {
     expect(out).toContain('claude');
     expect(out).toContain('antigravity');
   });
+
+  // -------------------------------------------------------------------------
+  // `agent install <target>` positional argument
+  // -------------------------------------------------------------------------
+  //
+  // Before the fix, `install` declared only `--target <t>` with no
+  // `.argument()`, so Commander silently dropped an excess positional and
+  // `install` fell through to the non-TTY default-to-claude path regardless
+  // of what was typed — `agent install cursor` installed claude's skill with
+  // exit 0 and zero signal. These tests exercise the real Commander wiring
+  // (not just `runInstall` directly) so a regression in the `.argument()`
+  // declaration itself would be caught, not just a regression in the
+  // downstream parsing logic.
+
+  it('agent install <target> (positional) via parseAsync installs the named target, not the claude default', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    const command = createAgentCommand({ cwd: CWD, fs: agentFs, ...deps });
+    const parent = new (await import('commander')).Command('testsprite');
+    parent.option('--output <mode>', 'output', 'text');
+    parent.option('--profile <name>', 'profile', 'default');
+    parent.option('--endpoint-url <url>');
+    parent.option('--debug', 'debug', false);
+    parent.option('--verbose', 'verbose', false);
+    parent.option('--dry-run', 'dry-run', false);
+    parent.addCommand(command);
+
+    await parent.parseAsync(['node', 'ts', 'agent', 'install', 'cursor', `--dir=${CWD}`]);
+
+    const cursorAbs = path.resolve(CWD, pathFor('cursor', 'testsprite-verify'));
+    const claudeAbs = path.resolve(CWD, pathFor('claude', 'testsprite-verify'));
+    expect(store.get(cursorAbs)).toBe(renderForTarget('cursor', 'testsprite-verify').content);
+    expect(store.has(claudeAbs)).toBe(false);
+  });
+
+  it('agent install <target1> <target2> (multiple positionals) via parseAsync installs both', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    const command = createAgentCommand({ cwd: CWD, fs: agentFs, ...deps });
+    const parent = new (await import('commander')).Command('testsprite');
+    parent.option('--output <mode>', 'output', 'text');
+    parent.option('--profile <name>', 'profile', 'default');
+    parent.option('--endpoint-url <url>');
+    parent.option('--debug', 'debug', false);
+    parent.option('--verbose', 'verbose', false);
+    parent.option('--dry-run', 'dry-run', false);
+    parent.addCommand(command);
+
+    await parent.parseAsync(['node', 'ts', 'agent', 'install', 'cline', 'kiro', `--dir=${CWD}`]);
+
+    expect(store.has(path.resolve(CWD, pathFor('cline', 'testsprite-verify')))).toBe(true);
+    expect(store.has(path.resolve(CWD, pathFor('kiro', 'testsprite-verify')))).toBe(true);
+  });
+
+  it('agent install <target> --target <other> via parseAsync merges positional and flag targets', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    const command = createAgentCommand({ cwd: CWD, fs: agentFs, ...deps });
+    const parent = new (await import('commander')).Command('testsprite');
+    parent.option('--output <mode>', 'output', 'text');
+    parent.option('--profile <name>', 'profile', 'default');
+    parent.option('--endpoint-url <url>');
+    parent.option('--debug', 'debug', false);
+    parent.option('--verbose', 'verbose', false);
+    parent.option('--dry-run', 'dry-run', false);
+    parent.addCommand(command);
+
+    await parent.parseAsync([
+      'node',
+      'ts',
+      'agent',
+      'install',
+      'antigravity',
+      '--target=windsurf',
+      `--dir=${CWD}`,
+    ]);
+
+    expect(store.has(path.resolve(CWD, pathFor('antigravity', 'testsprite-verify')))).toBe(true);
+    expect(store.has(path.resolve(CWD, pathFor('windsurf', 'testsprite-verify')))).toBe(true);
+  });
+
+  it('agent install <unknown-target> (positional) via parseAsync throws CLIError exit 5', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    const command = createAgentCommand({ cwd: CWD, fs: agentFs, ...deps });
+    const parent = new (await import('commander')).Command('testsprite');
+    parent.option('--output <mode>', 'output', 'text');
+    parent.option('--profile <name>', 'profile', 'default');
+    parent.option('--endpoint-url <url>');
+    parent.option('--debug', 'debug', false);
+    parent.option('--verbose', 'verbose', false);
+    parent.option('--dry-run', 'dry-run', false);
+    parent.addCommand(command);
+
+    let thrown: unknown;
+    try {
+      await parent.parseAsync(['node', 'ts', 'agent', 'install', 'banana', `--dir=${CWD}`]);
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeDefined();
+    const isValidationErr =
+      (thrown instanceof ApiError && thrown.exitCode === 5) ||
+      (thrown instanceof CLIError && thrown.exitCode === 5);
+    expect(isValidationErr).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

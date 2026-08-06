@@ -3,14 +3,7 @@ import { readFileSync } from 'node:fs';
 import { VERSION } from '../version.js';
 
 export type AgentTarget =
-  | 'claude'
-  | 'cursor'
-  | 'cline'
-  | 'antigravity'
-  | 'codex'
-  | 'kiro'
-  | 'windsurf'
-  | 'copilot';
+  'claude' | 'cursor' | 'cline' | 'antigravity' | 'codex' | 'kiro' | 'windsurf' | 'copilot';
 
 export interface TargetSpec {
   status: 'ga' | 'experimental';
@@ -59,9 +52,7 @@ export interface TargetSpec {
  * - 'none': skill is not represented in AGENTS.md at all (reserved).
  */
 export type CodexContribution =
-  | { kind: 'full'; file: string }
-  | { kind: 'line'; text: string }
-  | { kind: 'none' };
+  { kind: 'full'; file: string } | { kind: 'line'; text: string } | { kind: 'none' };
 
 export interface SkillSpec {
   /** Skill name — appears in own-file frontmatter and the landing path. */

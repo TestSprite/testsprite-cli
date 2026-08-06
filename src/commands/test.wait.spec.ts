@@ -796,6 +796,44 @@ describe('runTestWait — backend testId fallback (L1888)', () => {
     expect(stderr.join(' ')).toContain('test record');
   });
 
+  it('backend fallback with no URL on either side keeps targetUrl null and omits the text line', async () => {
+    const { credentialsPath } = makeCreds();
+    // Both the run row and the test record report no target URL — the shape a
+    // backend run has (no browser URL to record).
+    const router = beWaitRouter({
+      runStatus: 'running',
+      result: () => makeBeResult({ status: 'passed', targetUrl: null, codeVersion: null }),
+    });
+    const stdoutLines: string[] = [];
+    const result = await runTestWait(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch((url: string) =>
+          url.includes('/runs/run_abc')
+            ? { body: { ...makeRun('running'), targetUrl: null, codeVersion: null } }
+            : router.handler(url),
+        ),
+        stdout: line => stdoutLines.push(line),
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    expect(result.status).toBe('passed');
+    expect(result.targetUrl).toBeNull();
+    const stdoutBlock = stdoutLines.join('\n');
+    // No dangling "targetUrl" label with an empty value, and no literal "null".
+    expect(stdoutBlock).not.toMatch(/^targetUrl/m);
+    expect(stdoutBlock).not.toContain('null');
+  });
+
   it('failing backend test resolves via fallback (CLIError exit 1) + testId artifact hint', async () => {
     const { credentialsPath } = makeCreds();
     const router = beWaitRouter({
@@ -1023,6 +1061,108 @@ describe('runTestWait: Fix 3 — RequestTimeoutError writes partial JSON to stdo
 });
 
 // ---------------------------------------------------------------------------
+// RATE_LIMITED during test wait polling — partial stdout + honest hint, exit
+// 11 kept (never reclassified to 7). The 429 must be a real HTTP response
+// (not thrown directly) so it exercises http.ts's own RATE_LIMITED
+// retry-then-throw path (MAX_ATTEMPTS_RATE_LIMITED = 3).
+// ---------------------------------------------------------------------------
+
+function rateLimitedResponse(retryAfterSeconds?: number): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        code: 'RATE_LIMITED',
+        message: 'Run trigger rate limit exceeded: too many requests from this IP.',
+        nextAction: '',
+        requestId: 'req_rl_wait_test',
+        details: {},
+      },
+    }),
+    {
+      status: 429,
+      headers: {
+        'content-type': 'application/json',
+        ...(retryAfterSeconds !== undefined ? { 'retry-after': String(retryAfterSeconds) } : {}),
+      },
+    },
+  );
+}
+
+describe('runTestWait: RATE_LIMITED writes partial JSON to stdout, keeps exit 11', () => {
+  it('exit 11 (NOT reclassified to 7) AND stdout contains {runId, status:"running"} when poll exhausts RATE_LIMITED retries', async () => {
+    const { credentialsPath } = makeCreds();
+    // retry-after: 0 keeps http.ts's internal retry-then-throw budget fast.
+    const fetchImpl: typeof globalThis.fetch = async () => rateLimitedResponse(0);
+
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+
+    const err = await runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 600,
+      },
+      {
+        credentialsPath,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('RATE_LIMITED');
+    expect((err as ApiError).exitCode).toBe(11);
+
+    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as { runId: string; status: string };
+    expect(stdoutJson.runId).toBe('run_abc');
+    expect(stdoutJson.status).toBe('running');
+
+    const stderrBlock = stderrLines.join('\n');
+    expect(stderrBlock).toContain('run_abc');
+    expect(stderrBlock).toContain('test wait');
+    expect(stderrBlock).toContain('test cancel');
+    expect(stderrBlock).toContain('Rate limited');
+  });
+
+  it('text mode: renders human-readable partial (not raw JSON), still exit 11', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl: typeof globalThis.fetch = async () => rateLimitedResponse(0);
+
+    const stdoutLines: string[] = [];
+
+    const err = await runTestWait(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 600,
+      },
+      {
+        credentialsPath,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+
+    expect((err as ApiError).exitCode).toBe(11);
+    const stdoutBlock = stdoutLines.join('\n');
+    expect(stdoutBlock).toContain('runId');
+    expect(stdoutBlock).toContain('running');
+    expect(stdoutBlock).not.toMatch(/^\{/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // TimeoutError on test wait: partial stdout + exit 7
 // ---------------------------------------------------------------------------
 
@@ -1197,6 +1337,76 @@ describe('[fix-4-ux] runTestWait — text mode shows error string for failed/blo
     expect(stdoutBlock).not.toMatch(/^error\s+/m);
   });
 
+  it('run with targetUrl: null completes normally and omits the targetUrl line in text mode', async () => {
+    const { credentialsPath } = makeCreds();
+    // A backend run (and every V3-executed run) reports no target URL; those
+    // rows also report no codeVersion when the test has no stored code body.
+    const run: RunResponse = { ...makeRun('passed'), targetUrl: null, codeVersion: null };
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+
+    const fetchImpl = makeFetch(() => ({ body: run }));
+
+    const result = await runTestWait(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+
+    // Resolves (exit 0) instead of raising a response-validation INTERNAL.
+    expect(result.status).toBe('passed');
+    const stdoutBlock = stdoutLines.join('\n');
+    expect(stdoutBlock).toMatch(/^status\s+passed$/m);
+    // Absent fields are omitted, never printed as the literal "null".
+    expect(stdoutBlock).not.toMatch(/^targetUrl/m);
+    expect(stdoutBlock).not.toMatch(/^codeVersion/m);
+    expect(stdoutBlock).not.toContain('null');
+    expect(stderrLines.join('\n')).not.toContain('INTERNAL');
+  });
+
+  it('run with targetUrl: null passes the null through the JSON envelope', async () => {
+    const { credentialsPath } = makeCreds();
+    const run: RunResponse = { ...makeRun('passed'), targetUrl: null, codeVersion: null };
+    const stdoutLines: string[] = [];
+
+    const fetchImpl = makeFetch(() => ({ body: run }));
+
+    await runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+
+    const parsed = JSON.parse(stdoutLines.join('')) as RunResponse;
+    expect(parsed.status).toBe('passed');
+    expect(parsed.targetUrl).toBeNull();
+    expect(parsed.codeVersion).toBeNull();
+  });
+
   it('JSON mode does NOT change: error field passes through wire envelope unchanged', async () => {
     const { credentialsPath } = makeCreds();
     const run: RunResponse = {
@@ -1304,6 +1514,81 @@ describe('runTestWait — dashboardUrl on terminal output', () => {
     );
     const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
     expect(printed.dashboardUrl).toBeUndefined();
+  });
+
+  // A server-sent link supersedes the client computation, because the server
+  // knows which STORE answered the read and the client does not: a V3-served
+  // run's page is a different route family, and the `/dashboard/tests/…` route
+  // the client templates reads DynamoDB only — for a V3-native project there is
+  // no row there at all, so the client's link cannot render.
+  it('server-sent dashboardUrl wins over the client computation', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const serverUrl =
+      'https://www.testsprite.com/dashboard-v3/o/org-1/projects/project_1/test-cases/test_xyz';
+    const fetchImpl = makeFetch(() => ({
+      body: { ...makeRun('passed'), dashboardUrl: serverUrl },
+    }));
+    const stdout: string[] = [];
+    await runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      { credentialsPath, fetchImpl, stdout: line => stdout.push(line), sleep: instantSleep },
+    );
+    const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
+    expect(printed.dashboardUrl).toBe(serverUrl);
+  });
+
+  // An explicit `null` is the server saying "no correct link exists for this
+  // run" (e.g. the workspace-scoped page isn't served by this environment's
+  // portal build yet). Falling back to the client guess there would put back
+  // exactly the broken link the server declined to send.
+  it('server dashboardUrl:null suppresses the link — the client guess is NOT substituted', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const fetchImpl = makeFetch(() => ({ body: { ...makeRun('passed'), dashboardUrl: null } }));
+    const stdout: string[] = [];
+    await runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      { credentialsPath, fetchImpl, stdout: line => stdout.push(line), sleep: instantSleep },
+    );
+    const printed = JSON.parse(stdout.join('')) as Record<string, unknown>;
+    expect(printed.dashboardUrl).toBeUndefined();
+  });
+
+  it('text mode: a server link renders on the card in place of the client shape', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const serverUrl =
+      'https://www.testsprite.com/dashboard-v3/o/org-1/projects/project_1/test-cases/test_xyz';
+    const fetchImpl = makeFetch(() => ({
+      body: { ...makeRun('passed'), dashboardUrl: serverUrl },
+    }));
+    const stdout: string[] = [];
+    await runTestWait(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      { credentialsPath, fetchImpl, stdout: line => stdout.push(line), sleep: instantSleep },
+    );
+    const out = stdout.join('\n');
+    expect(out).toContain(`dashboard   ${serverUrl}`);
+    expect(out).not.toContain('/dashboard/tests/');
   });
 });
 

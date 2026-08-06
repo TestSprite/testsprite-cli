@@ -865,3 +865,79 @@ describe('matrix coverage guard', () => {
 it.skip('bootstrap tip after auth configure — see auth.test.ts for tip coverage', () => {
   // No-op: piece-3 unit tests in src/commands/auth.test.ts cover the tip.
 });
+
+// ---------------------------------------------------------------------------
+// 13. Positional target argument
+//
+// Repro: `agent install <target>` (the exact one-liner form documented in
+// DOCUMENTATION.md / README for all 8 targets) previously installed the
+// claude skill regardless of the target named, because `install` declared
+// only `--target <t>` with no positional `.argument()` — Commander silently
+// dropped the excess positional and the non-TTY default-to-claude path won.
+// These tests drive the real built binary (not just the command wiring) to
+// pin the documented one-liner behavior for good.
+// ---------------------------------------------------------------------------
+describe('positional target argument', () => {
+  it('installs the named target, not the claude default (repro: agent install cursor)', () => {
+    const tmpDir = freshTmpDir();
+    const result = runCli(['agent', 'install', 'cursor', '--dir', tmpDir, '--output', 'json']);
+    expect(result.status).toBe(0);
+
+    expect(existsSync(join(tmpDir, pathFor('cursor', 'testsprite-verify')))).toBe(true);
+    expect(existsSync(join(tmpDir, pathFor('claude', 'testsprite-verify')))).toBe(false);
+  });
+
+  it('accepts every documented one-liner form (agent install <target>) for all 8 targets', () => {
+    for (const target of Object.keys(TARGETS) as AgentTarget[]) {
+      const tmpDir = freshTmpDir();
+      const result = runCli(['agent', 'install', target, '--dir', tmpDir, '--output', 'json']);
+      expect(result.status, `exit code for positional '${target}'`).toBe(0);
+      expect(
+        existsSync(join(tmpDir, pathFor(target, 'testsprite-verify'))),
+        `landing file for positional '${target}'`,
+      ).toBe(true);
+    }
+  });
+
+  it('accepts multiple positional targets in one invocation', () => {
+    const tmpDir = freshTmpDir();
+    const result = runCli([
+      'agent',
+      'install',
+      'cline',
+      'kiro',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
+    expect(result.status).toBe(0);
+    expect(existsSync(join(tmpDir, pathFor('cline', 'testsprite-verify')))).toBe(true);
+    expect(existsSync(join(tmpDir, pathFor('kiro', 'testsprite-verify')))).toBe(true);
+  });
+
+  it('merges a positional target with --target', () => {
+    const tmpDir = freshTmpDir();
+    const result = runCli([
+      'agent',
+      'install',
+      'antigravity',
+      '--target=windsurf',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
+    expect(result.status).toBe(0);
+    expect(existsSync(join(tmpDir, pathFor('antigravity', 'testsprite-verify')))).toBe(true);
+    expect(existsSync(join(tmpDir, pathFor('windsurf', 'testsprite-verify')))).toBe(true);
+  });
+
+  it('rejects an unknown positional target with exit 5 instead of silently defaulting', () => {
+    const tmpDir = freshTmpDir();
+    const result = runCli(['agent', 'install', 'banana', '--dir', tmpDir]);
+    expect(result.status).toBe(5);
+    expect(result.stderr).toContain('unknown target "banana"');
+    expect(existsSync(join(tmpDir, pathFor('claude', 'testsprite-verify')))).toBe(false);
+  });
+});

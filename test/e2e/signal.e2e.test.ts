@@ -83,7 +83,7 @@ async function waitAndInterrupt(
     {
       env: {
         ...process.env,
-        TESTSPRITE_API_KEY: 'sk-e2e-signal',
+        TESTSPRITE_API_KEY: 'sk-user-e2e-signal',
         TESTSPRITE_API_URL: baseUrl,
         TESTSPRITE_NO_SKILL_WARNING: '1',
         TESTSPRITE_NO_UPDATE_NOTIFIER: '1',
@@ -152,7 +152,7 @@ describe('signal e2e — graceful detach during test wait (DEV-331)', () => {
     const child = spawn(process.execPath, [BIN_PATH, 'test', 'list', '--project', 'p1'], {
       env: {
         ...process.env,
-        TESTSPRITE_API_KEY: 'sk-e2e-signal',
+        TESTSPRITE_API_KEY: 'sk-user-e2e-signal',
         TESTSPRITE_API_URL: baseUrl,
         TESTSPRITE_NO_SKILL_WARNING: '1',
         TESTSPRITE_NO_UPDATE_NOTIFIER: '1',

@@ -35,6 +35,29 @@ export const SKILL_NUDGE_COMMANDS: ReadonlySet<string> = new Set([
  */
 export const SKILL_NUDGE_OPT_OUT_ENV = 'TESTSPRITE_NO_SKILL_WARNING';
 
+/**
+ * True when this invocation is `test create --plan-template`, a
+ * pure-local/informational flag (prints the plan-file skeleton and exits)
+ * that must be treated like `setup` / `agent install`: exempt from BOTH the
+ * missing-skill nudge above AND the update-registry check
+ * (`src/lib/update-check.ts`'s `maybeNotifyUpdate`, which hits the network
+ * and writes `~/.testsprite/update-check.json` — both contradict "no
+ * network" for this flag). Neither allowlist (`SKILL_NUDGE_COMMANDS` here,
+ * the unconditional call site in `src/index.ts`) tracks individual flags,
+ * only whole commands, so `src/index.ts`'s `preAction` hook filters this one
+ * case via this pure, independently-testable helper instead of teaching
+ * either module about flags. Exported from `skill-nudge.ts` (rather than
+ * `src/index.ts`, which executes `program.parse()` at import time and so
+ * cannot be safely imported by a unit test) purely so it has a home that
+ * supports direct unit testing.
+ */
+export function isPlanTemplateInvocation(
+  commandPath: string,
+  planTemplate: boolean | undefined,
+): boolean {
+  return commandPath === 'test create' && planTemplate === true;
+}
+
 export interface SkillPresenceDeps {
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;

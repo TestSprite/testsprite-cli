@@ -294,7 +294,7 @@ async function pollLoop(
         shutdownSignal != null
           ? AbortSignal.any([altAbort.signal, shutdownSignal])
           : altAbort.signal;
-      let alternate: RunResponse | null = null;
+      let alternate: RunResponse | null;
       try {
         alternate = await resolveAlternate(run, elapsedMs, altSignal);
       } finally {

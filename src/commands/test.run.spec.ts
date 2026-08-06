@@ -2301,6 +2301,180 @@ describe('[finding-C] runTestRun --wait RequestTimeoutError — text mode render
 });
 
 // ---------------------------------------------------------------------------
+// RATE_LIMITED during --wait polling — partial stdout + honest hint, exit 11
+// kept (never reclassified to 7). Mirrors the RequestTimeoutError coverage
+// above; the 429 must be returned as a real HTTP response (not thrown
+// directly) so it exercises http.ts's own RATE_LIMITED retry-then-throw path.
+// ---------------------------------------------------------------------------
+
+function rateLimitedResponse(retryAfterSeconds?: number): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        code: 'RATE_LIMITED',
+        message: 'Run trigger rate limit exceeded: too many requests from this IP.',
+        nextAction: '',
+        requestId: 'req_rl_test',
+        details: {},
+      },
+    }),
+    {
+      status: 429,
+      headers: {
+        'content-type': 'application/json',
+        ...(retryAfterSeconds !== undefined ? { 'retry-after': String(retryAfterSeconds) } : {}),
+      },
+    },
+  );
+}
+
+describe('runTestRun --wait: RATE_LIMITED writes partial JSON to stdout, keeps exit 11', () => {
+  it('exit 11 (NOT reclassified to 7) AND stdout contains {runId, status:"running"} when poll exhausts RATE_LIMITED retries', async () => {
+    const { credentialsPath } = makeCreds();
+    let callCount = 0;
+    const fetchImpl: typeof globalThis.fetch = async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        return new Response(JSON.stringify(TRIGGER_RESP), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      // retry-after: 0 keeps http.ts's internal retry-then-throw budget fast.
+      return rateLimitedResponse(0);
+    };
+
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        verbose: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 600,
+      },
+      {
+        credentialsPath,
+        fetchImpl: fetchImpl as unknown as FetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('RATE_LIMITED');
+    expect((err as ApiError).exitCode).toBe(11);
+
+    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
+      runId: string;
+      status: string;
+      targetUrl: string;
+    };
+    expect(stdoutJson.runId).toBe(TRIGGER_RESP.runId);
+    expect(stdoutJson.status).toBe('running');
+    expect(stdoutJson.targetUrl).toBe(TRIGGER_RESP.targetUrl);
+
+    const stderrBlock = stderrLines.join('\n');
+    expect(stderrBlock).toContain(TRIGGER_RESP.runId);
+    expect(stderrBlock).toContain('test wait');
+    expect(stderrBlock).toContain('test cancel');
+    expect(stderrBlock).toContain('Rate limited');
+  });
+
+  it('text mode: renders human-readable partial (not raw JSON), still exit 11', async () => {
+    const { credentialsPath } = makeCreds();
+    let callCount = 0;
+    const fetchImpl: typeof globalThis.fetch = async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        return new Response(JSON.stringify(TRIGGER_RESP), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return rateLimitedResponse(0);
+    };
+
+    const stdoutLines: string[] = [];
+
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        verbose: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 600,
+      },
+      {
+        credentialsPath,
+        fetchImpl: fetchImpl as unknown as FetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+
+    expect((err as ApiError).exitCode).toBe(11);
+    const stdoutBlock = stdoutLines.join('\n');
+    expect(stdoutBlock).toContain('runId');
+    expect(stdoutBlock).toContain('running');
+    expect(stdoutBlock).not.toMatch(/^\{/);
+  });
+
+  it('honors Retry-After in the stderr hint when present', async () => {
+    const { credentialsPath } = makeCreds();
+    let callCount = 0;
+    const fetchImpl: typeof globalThis.fetch = async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        return new Response(JSON.stringify(TRIGGER_RESP), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      // A non-zero Retry-After still keeps the internal retry-then-throw
+      // budget fast (only 2 real sleeps of retryAfterSeconds*1000ms), so keep
+      // this small.
+      return rateLimitedResponse(1);
+    };
+
+    const stderrLines: string[] = [];
+
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        verbose: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 600,
+      },
+      {
+        credentialsPath,
+        fetchImpl: fetchImpl as unknown as FetchImpl,
+        stdout: () => {},
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+
+    const stderrBlock = stderrLines.join('\n');
+    expect(stderrBlock).toMatch(/retry after ~\d+s/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Finding D (codex round-2) — 409 conflict auto-resume without --target-url
 //   → timeout partial carries the real in-flight targetUrl (not '')
 // ---------------------------------------------------------------------------
@@ -2638,12 +2812,19 @@ describe('runTestRunAll — batch fresh run', () => {
     const { createTestCommand } = await import('./test.js');
     const test = createTestCommand();
     disableExits(test);
-    await expect(
-      test.parseAsync(
-        ['run', '--all', '--project', 'proj_1', '--target-url', 'https://example.com'],
-        { from: 'user' },
-      ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    const rejection = (await test
+      .parseAsync(['run', '--all', '--project', 'proj_1', '--target-url', 'https://example.com'], {
+        from: 'user',
+      })
+      .catch((error: unknown) => error)) as ApiError;
+    expect(rejection).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    // The rejection explains why + how to fix it, without a
+    // cosmetic doubled period at the end (the reason clause itself already
+    // ends with "Remove --target-url.", and the `nextAction` template used
+    // to blindly append a second one).
+    expect(rejection.nextAction).toContain('Remove --target-url.');
+    expect(rejection.nextAction.endsWith('..')).toBe(false);
+    expect(rejection.nextAction.endsWith('.')).toBe(true);
   });
 
   it('<test-id> --filter (without --all) → exit 5 (filter is --all-only)', async () => {

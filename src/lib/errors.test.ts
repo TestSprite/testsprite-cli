@@ -61,6 +61,7 @@ describe('exitCodeFor', () => {
     ['INSUFFICIENT_CREDITS', 12],
     ['FEATURE_GATED', 13],
     ['CLIENT_TOO_OLD', 14],
+    ['AMBIGUOUS_ORG', 6],
     ['INTERNAL', 1],
   ] as const)('%s → exit %d', (code, expected) => {
     expect(exitCodeFor(code)).toBe(expected);
@@ -137,6 +138,7 @@ describe('ApiError.fromEnvelope status fallback', () => {
   it.each([
     [400, 'VALIDATION_ERROR' as const],
     [401, 'AUTH_INVALID' as const],
+    [402, 'INSUFFICIENT_CREDITS' as const],
     [403, 'AUTH_FORBIDDEN' as const],
     [404, 'NOT_FOUND' as const],
     [409, 'CONFLICT' as const],
@@ -256,6 +258,29 @@ describe('localValidationError', () => {
     const err = localValidationError('code-file', 'file does not exist: /tmp/x.ts');
     expect(err.details).toEqual({ field: 'code-file', reason: 'file does not exist: /tmp/x.ts' });
     expect('accepted' in err.details).toBe(false);
+  });
+
+  // A reason string that already ends in a period (common when a
+  // call site composes multiple already-punctuated sentences, e.g.
+  // `test run --all --target-url` builds its rejection out of an
+  // explanatory sentence + an instruction sentence) must not end up with a
+  // doubled `..` once the template appends its own trailing period.
+  it('does not double the trailing period when reason already ends with one', () => {
+    const err = localValidationError(
+      'target-url',
+      '--target-url has no effect with --all. Remove --target-url.',
+    );
+    expect(err.nextAction).toBe(
+      'Flag `--target-url` is invalid: --target-url has no effect with --all. Remove --target-url.',
+    );
+    expect(err.nextAction.endsWith('..')).toBe(false);
+    expect(err.nextAction.endsWith('.')).toBe(true);
+  });
+
+  it('still appends exactly one period when reason has no trailing punctuation', () => {
+    const err = localValidationError('pageSize', 'must be a positive integer');
+    expect(err.nextAction).toBe('Flag `--page-size` is invalid: must be a positive integer.');
+    expect(err.nextAction.endsWith('..')).toBe(false);
   });
 });
 
@@ -394,6 +419,32 @@ describe('INSUFFICIENT_CREDITS detection', () => {
     expect(err.nextAction).not.toContain('https://');
   });
 
+  // V3 API keys are membership-bound: a team-org key spends that org's
+  // wallet, not the personal one. The CLI has no way to know which kind of
+  // key just failed here (this is a client-side synthesis with no backend
+  // nextAction), so the synthesized hint must not assert the personal
+  // billing page is the ONLY fix — it should also point an org-bound caller
+  // at their org admin instead of silently sending them to top up the wrong
+  // wallet.
+  it('synthesized billing hint does not assert a personal-only path (org-bound key wording)', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Insufficient credits: please top up.',
+          nextAction: '',
+          requestId: 'req_cred_org',
+          details: {},
+        },
+      },
+      429,
+    );
+    expect(err.nextAction.toLowerCase()).toContain('org admin');
+    // The personal-key link is still offered — it's a real, correct fix for
+    // the common case, just no longer presented as the only one.
+    expect(err.nextAction).toContain('(/dashboard/settings/billing)');
+  });
+
   it('synthesized billing link resolves the PROD portal from a prod apiUrl', () => {
     const err = ApiError.fromEnvelope(
       {
@@ -506,5 +557,74 @@ describe('INSUFFICIENT_CREDITS detection', () => {
     // required=0 is not a valid credit cost; stays RATE_LIMITED
     expect(err.code).toBe('RATE_LIMITED');
     expect(err.exitCode).toBe(11);
+  });
+});
+
+describe('AMBIGUOUS_ORG detection (409 CONFLICT + reason: ambiguous_org)', () => {
+  it('remaps a CONFLICT envelope with details.reason === "ambiguous_org" to AMBIGUOUS_ORG / exit 6', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'CONFLICT',
+          message: 'Test id "test_x" resolves in more than one of your organizations.',
+          nextAction: 'Open the specific project in the Portal, or contact support.',
+          requestId: 'req_ambig_1',
+          details: {
+            reason: 'ambiguous_org',
+            testId: 'test_x',
+            candidates: [
+              { projectId: 'project_a', orgId: 'org_a' },
+              { projectId: 'project_b', orgId: 'org_b' },
+            ],
+          },
+        },
+      },
+      409,
+    );
+    expect(err.code).toBe('AMBIGUOUS_ORG');
+    expect(err.exitCode).toBe(6);
+    // Message/nextAction pass through verbatim — the backend already
+    // supplies an actionable template, unlike the INSUFFICIENT_CREDITS
+    // sub-case which sometimes synthesizes one for older backends.
+    expect(err.message).toContain('resolves in more than one of your organizations');
+    expect(err.nextAction).toContain('Open the specific project');
+    expect(err.getDetail('testId')).toBe('test_x');
+    expect(err.getDetail('candidates')).toEqual([
+      { projectId: 'project_a', orgId: 'org_a' },
+      { projectId: 'project_b', orgId: 'org_b' },
+    ]);
+  });
+
+  it('a plain CONFLICT (snapshot in flight, no ambiguous_org reason) stays CONFLICT / exit 6', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'CONFLICT',
+          message: 'Snapshot in flight; retry shortly.',
+          nextAction: 'Retry in a few seconds.',
+          requestId: 'req_conflict_1',
+          details: { reason: 'snapshot_in_flight' },
+        },
+      },
+      409,
+    );
+    expect(err.code).toBe('CONFLICT');
+    expect(err.exitCode).toBe(6);
+  });
+
+  it('a CONFLICT with an unrelated reason string stays CONFLICT (not falsely remapped)', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'CONFLICT',
+          message: 'Another run is already in flight.',
+          nextAction: 'Poll it with test wait.',
+          requestId: 'req_conflict_2',
+          details: { reason: 'run_in_flight', currentRunId: 'run_abc' },
+        },
+      },
+      409,
+    );
+    expect(err.code).toBe('CONFLICT');
   });
 });

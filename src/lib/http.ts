@@ -354,8 +354,9 @@ export class HttpClient {
 
   /**
    * POST /api/cli/v1/tests/{testId}/runs/rerun
-   * Trigger a rerun (replay) for a single test. FE: verbatim script replay (no credits).
-   * BE: dependency-closure re-run. Returns `runId` + optional `closure` (BE).
+   * Trigger a rerun (replay) for a single test. FE: verbatim script replay, billed at
+   * 0.5 credits (same as a fresh run; legacy V2 accounts: free). BE: dependency-closure
+   * re-run, billed at 0.2 credits. Returns `runId` + optional `closure` (BE).
    *
    * `retryOnConflict: false` — 409 on rerun means the test is already in-flight,
    * a persistent condition. Retrying would race against the running test.
@@ -1055,6 +1056,9 @@ function apiRetryDecision(
     // case below and retries normally.
     // FEATURE_GATED is non-retriable: a paid-feature gate can't self-heal with
     // retries — the caller must upgrade their plan first.
+    // AMBIGUOUS_ORG is non-retriable: unlike a generic CONFLICT (mid-mutation
+    // snapshot race), this is a permanent id collision across the caller's
+    // organizations — retrying resolves the exact same ambiguity again.
     case 'AUTH_REQUIRED':
     case 'AUTH_INVALID':
     case 'AUTH_FORBIDDEN':
@@ -1067,6 +1071,7 @@ function apiRetryDecision(
     case 'INSUFFICIENT_CREDITS':
     case 'FEATURE_GATED':
     case 'CLIENT_TOO_OLD':
+    case 'AMBIGUOUS_ORG':
       // CLIENT_TOO_OLD: retrying re-sends the same too-old client — it can only
       // self-heal by upgrading, so fail fast with the upgrade guidance.
       return { retry: false, delayMs: 0 };

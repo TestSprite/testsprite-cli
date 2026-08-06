@@ -10,8 +10,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Command } from 'commander';
-import { ApiError } from '../lib/errors.js';
+import { ApiError, InterruptError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT } from '../lib/output.js';
+import { ShutdownController } from '../lib/interrupt.js';
 import {
   type CliFailureContext,
   type CliLatestResult,
@@ -21,6 +22,9 @@ import {
   type TestDeps,
   createTestCommand,
   isPresignedCodeUrl,
+  PLAN_SCHEMA_URL,
+  PLAN_TEMPLATE_TEXT,
+  PLAN_TEMPLATE_WITH_SCHEMA,
   runCodeGet,
   runCodePut,
   runCreate,
@@ -35,6 +39,7 @@ import {
   runList,
   runOpen,
   runPlanPut,
+  runPlanTemplate,
   runResult,
   runScaffold,
   runSteps,
@@ -202,6 +207,7 @@ describe('createTestCommand — surface', () => {
   it('result exposes --include-analysis (M2.1) + M3.4 piece-5 --history flags', () => {
     // M2.1 piece 3 adds `--include-analysis` to `test result`.
     // M3.4 piece 5 adds `--history`, `--source`, `--since`, `--page-size`, `--cursor`.
+    // The rerun history filter adds `--rerun` / `--no-rerun`.
     // Issue #165 adds text-table shaping via `--columns` and `--no-header`.
     // Pinning the surface so a future flag-consolidation sweep keeps every
     // option intentional. Back-compat: bare `test result <id>` (no --history)
@@ -216,6 +222,8 @@ describe('createTestCommand — surface', () => {
       '--since',
       '--page-size',
       '--cursor',
+      '--rerun',
+      '--no-rerun',
       '--columns',
       '--no-header',
     ]);
@@ -2594,6 +2602,69 @@ describe('runScaffold', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// `test create --plan-template`. Pure-local: no network, no
+// credentials required (unlike everything above, no makeCreds()/fetchImpl).
+// ---------------------------------------------------------------------------
+describe('runPlanTemplate', () => {
+  it('prints PLAN_TEMPLATE_TEXT verbatim to stdout (text mode) and makes no fetch calls', async () => {
+    const out: string[] = [];
+    let fetchCalled = false;
+    const result = await runPlanTemplate(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        stdout: line => out.push(line),
+        stderr: () => undefined,
+        fetchImpl: (() => {
+          fetchCalled = true;
+          throw new Error('runPlanTemplate must never call fetch');
+        }) as unknown as typeof globalThis.fetch,
+      },
+    );
+    expect(fetchCalled).toBe(false);
+    expect(out.join('\n')).toBe(PLAN_TEMPLATE_TEXT);
+    expect(result).toEqual(PLAN_TEMPLATE_WITH_SCHEMA);
+  });
+
+  it('prints byte-identical output in --output json mode (Output.print(JSON.stringify) matches PLAN_TEMPLATE_TEXT)', async () => {
+    const out: string[] = [];
+    await runPlanTemplate(
+      { profile: 'default', output: 'json', debug: false },
+      { stdout: line => out.push(line), stderr: () => undefined },
+    );
+    expect(out.join('\n')).toBe(PLAN_TEMPLATE_TEXT);
+  });
+
+  it('the printed template round-trips through the real plan-from validator (assertPlanShape via runCreateFromPlan --dry-run)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-plan-template-'));
+    const planFile = join(dir, 'plan.json');
+    writeFileSync(planFile, PLAN_TEMPLATE_TEXT, 'utf8');
+    // --dry-run swaps in the canned dry-run fetch implementation regardless of
+    // any injected fetchImpl (client-factory.ts) and needs no credentials file
+    // — local validation still runs in full, which is exactly the property
+    // under test here (mirrors the existing "--dry-run does NOT emit
+    // dashboardUrl" convention elsewhere in this file).
+    await expect(
+      runCreateFromPlan(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          planFrom: planFile,
+          dryRun: true,
+          endpointUrl: 'https://api.testsprite.com',
+        },
+        { stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).resolves.toBeDefined();
+  });
+
+  it('`$schema` is present and does not upset the validator (extra top-level key is allowed)', () => {
+    expect(PLAN_TEMPLATE_WITH_SCHEMA.$schema).toBe(PLAN_SCHEMA_URL);
+    expect(typeof PLAN_TEMPLATE_WITH_SCHEMA.$schema).toBe('string');
+  });
+});
+
 describe('runOpen', () => {
   // The mock endpoint host has no portal mapping; the operator override is the
   // supported escape hatch and gives the tests a deterministic base.
@@ -3295,10 +3366,16 @@ describe('runDiff', () => {
     expect(errs.join('\n')).toContain('different tests');
   });
 
-  it('--dry-run returns the canned sample fully offline (no credentials, no fetch)', async () => {
-    // Dry-run must not require credentials or hit the network — it returns a
-    // canned CliRunDiff so `--dry-run` shows the shape offline.
-    const diff = await runDiff(
+  it('--dry-run prints the canned sample fully offline (no credentials, no fetch) AND honors the exit-code contract', async () => {
+    // Dry-run must not require credentials or hit the network — it prints a
+    // canned CliRunDiff so `--dry-run` shows the shape offline. The
+    // canned sample has verdictChanged: true, so per the documented contract
+    // ("Exit 0 when verdicts match, 1 when they differ" — no dry-run
+    // exception) this MUST reject with exit 1, same as a real regressed
+    // pair. Before the fix, the early `return sample` bypassed the
+    // verdictChanged check entirely and `--dry-run` always exited 0.
+    const out: string[] = [];
+    const rejection = await runDiff(
       {
         profile: 'default',
         output: 'json',
@@ -3307,8 +3384,15 @@ describe('runDiff', () => {
         runA: 'run_aaa',
         runB: 'run_bbb',
       },
-      { stdout: () => undefined, stderr: () => undefined },
-    );
+      { stdout: line => out.push(line), stderr: () => undefined },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 1 });
+    const diff = JSON.parse(out.join('')) as {
+      runA: { runId: string };
+      runB: { runId: string };
+      verdictChanged: boolean;
+      changedSteps: Array<{ stepIndex: number; statusA: string; statusB: string }>;
+    };
     expect(diff.runA.runId).toBe('run_aaa');
     expect(diff.runB.runId).toBe('run_bbb');
     expect(diff.verdictChanged).toBe(true);
@@ -3336,6 +3420,25 @@ describe('runLint', () => {
     type: 'frontend',
     name: 'Broken',
     planSteps: [{ type: 'hover', description: 'Bad step type' }],
+  });
+  // Regression fixture: mirrors the customer repro (Topify,
+  // 2026-07-10/11) exactly — a `name` type error, an invalid `priority`
+  // enum value, AND an invalid step `type`, all in the SAME file. Before the
+  // fix, `test lint` reported only `name`; fixing it revealed `priority`;
+  // fixing THAT revealed the step-type error — three fix-and-rerun cycles
+  // for one file.
+  const MULTI_PROBLEM_PLAN = JSON.stringify({
+    projectId: 'project_alice',
+    type: 'frontend',
+    name: 123, // wrong type — must be a string
+    priority: 'urgent', // not one of CLI_CREATE_PRIORITIES
+    planSteps: [{ type: 'hover', description: 'Bad step type' }], // not a valid step type
+  });
+  const MULTI_PROBLEM_STEPS = JSON.stringify({
+    planSteps: [
+      { type: 'click', description: 'Click submit' }, // invalid step type
+      { type: 'action', description: 123 }, // wrong type — must be a string
+    ],
   });
 
   it('a directory with valid and invalid plans reports EVERY problem and exits 5', async () => {
@@ -3397,6 +3500,166 @@ describe('runLint', () => {
     await expect(
       runLint({ profile: 'default', output: 'json', debug: false }, { stdout: () => undefined }),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  // ---------- collect EVERY problem WITHIN a single file, not just
+  // the first ----------
+
+  it('--plan-from-dir: a single file with 3 distinct problems reports ALL of them in one pass', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-multi-'));
+    writeFileSync(join(dir, 'multi.json'), MULTI_PROBLEM_PLAN, 'utf8');
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, planFromDir: dir },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as {
+      checked: number;
+      valid: number;
+      issues: Array<{ file: string; field: string; reason: string }>;
+    };
+    expect(report.checked).toBe(1);
+    expect(report.valid).toBe(0);
+    const fields = report.issues.map(issue => issue.field);
+    expect(fields).toContain('name');
+    expect(fields).toContain('priority');
+    expect(fields).toContain('planSteps[0].type');
+    expect(report.issues.length).toBeGreaterThanOrEqual(3);
+    // All three problems are attributed to the ONE file, not scattered.
+    expect(report.issues.every(issue => issue.file === 'multi.json')).toBe(true);
+  });
+
+  it('--plan-from (single file, not a directory) also collects every problem in the file', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-single-'));
+    const file = join(dir, 'plan.json');
+    writeFileSync(file, MULTI_PROBLEM_PLAN, 'utf8');
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, planFrom: file },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as {
+      checked: number;
+      issues: Array<{ field: string }>;
+    };
+    expect(report.checked).toBe(1);
+    const fields = report.issues.map(issue => issue.field);
+    expect(fields).toContain('name');
+    expect(fields).toContain('priority');
+    expect(fields).toContain('planSteps[0].type');
+  });
+
+  it('--steps: a file with 2 distinct problems across different steps reports BOTH', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-steps-'));
+    const file = join(dir, 'steps.json');
+    writeFileSync(file, MULTI_PROBLEM_STEPS, 'utf8');
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, steps: file },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as {
+      checked: number;
+      issues: Array<{ field: string }>;
+    };
+    expect(report.checked).toBe(1);
+    const fields = report.issues.map(issue => issue.field);
+    expect(fields).toContain('planSteps[0].type');
+    expect(fields).toContain('planSteps[1].description');
+  });
+
+  it('--steps: 201 steps (over the cap) with a bad first element reports the cap issue AND the per-element issues together', async () => {
+    // Regression: a length/cap violation must
+    // NOT short-circuit per-element checking — `stepsRaw` is still a real,
+    // iterable array even when it's over MAX_PLAN_STEPS (200), so a bad
+    // step 0 must be reported in the SAME pass as the cap violation, not
+    // instead of it.
+    const steps: unknown[] = [{ type: 'hover', description: 123 }];
+    for (let i = 1; i < 201; i += 1) {
+      steps.push({ type: 'action', description: `ok step ${i}` });
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-steps-overcap-'));
+    const file = join(dir, 'steps.json');
+    writeFileSync(file, JSON.stringify({ planSteps: steps }), 'utf8');
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, steps: file },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as {
+      checked: number;
+      issues: Array<{ field: string; reason: string }>;
+    };
+    expect(report.checked).toBe(1);
+    const fields = report.issues.map(issue => issue.field);
+    // The cap violation AND both step-0 problems must all be present.
+    expect(fields).toContain('planSteps');
+    expect(fields).toContain('planSteps[0].type');
+    expect(fields).toContain('planSteps[0].description');
+    expect(report.issues.length).toBeGreaterThanOrEqual(3);
+    const capIssue = report.issues.find(issue => issue.field === 'planSteps');
+    expect(capIssue?.reason).toContain('at most 200 steps');
+  });
+
+  it('--plan-from: 201 planSteps (over the cap) with a bad first element reports the cap issue AND the per-element issues together', async () => {
+    // Same regression, exercised through the plan-shape path (collectPlanIssues)
+    // rather than the steps-shape path (collectPlanStepsIssues) — this one
+    // never had the bug (it already iterated unconditionally), but the
+    // coordinator asked to check every collect* function for the same
+    // pattern, so this locks in that it stays correct.
+    const planSteps: unknown[] = [{ type: 'hover', description: 123 }];
+    for (let i = 1; i < 201; i += 1) {
+      planSteps.push({ type: 'action', description: `ok step ${i}` });
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-plan-overcap-'));
+    const file = join(dir, 'plan.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'Over-cap plan',
+        planSteps,
+      }),
+      'utf8',
+    );
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, planFrom: file },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as { issues: Array<{ field: string; reason: string }> };
+    const fields = report.issues.map(issue => issue.field);
+    expect(fields).toContain('planSteps');
+    expect(fields).toContain('planSteps[0].type');
+    expect(fields).toContain('planSteps[0].description');
+    const capIssue = report.issues.find(issue => issue.field === 'planSteps');
+    expect(capIssue?.reason).toContain('at most 200 steps');
+  });
+
+  it('--plans (JSONL): a single line with multiple problems reports ALL of them, prefixed with specs[N].', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-jsonl-multi-'));
+    const file = join(dir, 'plans.jsonl');
+    writeFileSync(file, `${MULTI_PROBLEM_PLAN}\n`, 'utf8');
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, plans: file },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as {
+      issues: Array<{ field: string; file: string }>;
+    };
+    const fields = report.issues.map(issue => issue.field);
+    expect(fields).toContain('specs[0].name');
+    expect(fields).toContain('specs[0].priority');
+    expect(fields).toContain('specs[0].planSteps[0].type');
+    expect(report.issues.every(issue => issue.file === `${file}:1`)).toBe(true);
   });
 });
 
@@ -3551,6 +3814,329 @@ describe('runTestWaitMany', () => {
       { credentialsPath, fetchImpl, stdout: () => undefined },
     ).catch((error: unknown) => error);
     expect(rejection).toMatchObject({ exitCode: 3 });
+  });
+
+  // -------------------------------------------------------------------------
+  // RATE_LIMITED per-member handling. The 429 is returned as a real HTTP
+  // response (never thrown directly) so these exercise http.ts's own internal
+  // RATE_LIMITED retry-then-throw first, which is what makes reaching the
+  // command-level outer loop meaningful. `retry-after: 0` keeps both budgets
+  // fast; the header still yields a defined `retryAfterMs` (clamped to ≥1s),
+  // which is the signal `isTransientRateLimit` reads.
+  // -------------------------------------------------------------------------
+
+  const rateLimited = (opts: { retryAfter?: number; message?: string }): Response =>
+    new Response(
+      JSON.stringify({
+        error: {
+          code: 'RATE_LIMITED',
+          message: opts.message ?? 'Run trigger rate limit exceeded: 60 per minute per key.',
+          nextAction: '',
+          requestId: 'req_rl',
+          details: {},
+        },
+      }),
+      {
+        status: 429,
+        headers: {
+          'content-type': 'application/json',
+          ...(opts.retryAfter !== undefined ? { 'retry-after': String(opts.retryAfter) } : {}),
+        },
+      },
+    );
+
+  const jsonOk = (body: unknown): Response =>
+    new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+
+  it('retries a throttled poll and still reports the real verdict (exit 0, retry named on stderr)', async () => {
+    const { credentialsPath } = makeCreds();
+    let rateLimitedResponses = 0;
+    // Throttle every poll until http.ts has exhausted its own budget once, then
+    // let the run through: without the outer retry the member is a poll error
+    // and the invocation exits 7 even though the run passed.
+    const fetchImpl = (async () => {
+      if (rateLimitedResponses < 4) {
+        rateLimitedResponses += 1;
+        return rateLimited({ retryAfter: 0 });
+      }
+      return jsonOk(terminalRun('run_slow', 'passed'));
+    }) as unknown as typeof globalThis.fetch;
+
+    const out: string[] = [];
+    const errs: string[] = [];
+    const payload = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_slow'],
+        timeoutSeconds: 600,
+        maxConcurrency: 1,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => errs.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    );
+    expect(payload.summary).toMatchObject({ passed: 1, errors: 0 });
+    expect(errs.join('\n')).toContain('[wait] run_slow — rate limited (attempt 1/3)');
+  });
+
+  it('exits 11 (not 7) when a persistent throttle is the ONLY thing that went wrong', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = (async () =>
+      rateLimited({ retryAfter: 0 })) as unknown as typeof globalThis.fetch;
+    const errs: string[] = [];
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_a', 'run_b'],
+        timeoutSeconds: 600,
+        maxConcurrency: 2,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => errs.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 11 });
+    expect((rejection as Error).message).toContain('rate limited on 2 of 2 runs');
+    // Every member spent its full outer budget before the escalation.
+    expect(errs.filter(l => l.includes('attempt 3/3')).length).toBe(2);
+  });
+
+  it('reports a TIMEOUT (exit 7), not a rate limit, when the shared deadline is reached during a backoff', async () => {
+    // The escalation claims "nothing else went wrong". An invocation that spent
+    // its entire `--timeout` inside rate-limit backoff HAS had something else go
+    // wrong — the wait budget ran out — so exit 11 would be a false claim.
+    // `sleep` advances a fake clock past the deadline instead of resolving free.
+    const { credentialsPath } = makeCreds();
+    let now = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      // `retry-after: 0` keeps http.ts's OWN retry chain (real timers) instant.
+      // Each request advances the fake clock, so the budget is consumed by the
+      // POLL rather than by the backoff — which is what forces the deadline check
+      // inside the clamp (`clampedRetryMs <= 0`) rather than the one at the top of
+      // the loop, i.e. the branch under test.
+      const fetchImpl = (async () => {
+        now += 1200;
+        return rateLimited({ retryAfter: 0 });
+      }) as unknown as typeof globalThis.fetch;
+      const rejection = await runTestWaitMany(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          runIds: ['run_slowpoke'],
+          timeoutSeconds: 2,
+          maxConcurrency: 1,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => undefined,
+          stderr: () => undefined,
+          // Every sleep burns real budget on the fake clock.
+          sleep: (ms: number) => {
+            now += ms;
+            return Promise.resolve();
+          },
+        },
+      ).catch((error: unknown) => error);
+      expect(rejection).toMatchObject({ exitCode: 7 });
+      expect((rejection as Error).message).toContain('timed out');
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('a Ctrl-C during a rate-limit backoff still detaches gracefully (DEV-331), not a hard exit', async () => {
+    // `pollRunUntilTerminal` disarms the graceful scope in its own `finally`, so
+    // the outer backoff has to re-arm it — otherwise the sleep is a window where
+    // the first signal hard-exits with empty stdout.
+    const { credentialsPath } = makeCreds();
+    const shutdown = new ShutdownController();
+    const fetchImpl = (async () =>
+      rateLimited({ retryAfter: 0 })) as unknown as typeof globalThis.fetch;
+    const out: string[] = [];
+    const errs: string[] = [];
+    // Fire the signal from inside the OUTER backoff specifically. The stderr line
+    // is the unambiguous marker that we are in that window (and not in one of the
+    // poll loop's own sleeps, which share the same injected `sleep`).
+    let inOuterBackoff = false;
+    let armedDuringBackoff: boolean | undefined;
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_interrupted'],
+        timeoutSeconds: 600,
+        maxConcurrency: 1,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => {
+          errs.push(line);
+          if (line.includes('rate limited (attempt')) inOuterBackoff = true;
+        },
+        shutdown,
+        sleep: () => {
+          if (inOuterBackoff) {
+            // THE assertion that distinguishes the fix. `installSignalHandlers`
+            // branches on `isArmed`: armed ⇒ abort and let the wait paths own the
+            // detach; disarmed ⇒ immediate `process.exit(130)` with empty stdout.
+            // The in-process abort below would be picked up by the NEXT poll
+            // either way, so only the armed flag proves the window is covered.
+            armedDuringBackoff = shutdown.isArmed;
+            shutdown.interrupt('SIGINT');
+          }
+          return Promise.resolve();
+        },
+      },
+    ).catch((error: unknown) => error);
+    expect(inOuterBackoff).toBe(true);
+    expect(armedDuringBackoff).toBe(true);
+
+    expect(rejection).toBeInstanceOf(InterruptError);
+    // The DEV-331 contract: stdout stays parseable and names the still-running id.
+    const payload = JSON.parse(out.join('')) as {
+      results: Array<{ runId: string; status: string }>;
+    };
+    expect(payload.results[0]).toMatchObject({ runId: 'run_interrupted', status: 'running' });
+    expect(errs.join('\n')).toContain('run_interrupted');
+  });
+
+  it('declines to escalate when the caller repeated a run id (a real failure must not be masked)', async () => {
+    // `outcomes` is keyed by runId, so a duplicate has ONE shared entry that the
+    // last lane to finish overwrites. Without the uniqueness guard a later
+    // RATE_LIMITED replaces an observed `failed` and the invocation exits 11.
+    const { credentialsPath } = makeCreds();
+    let call = 0;
+    const fetchImpl = (async () => {
+      call += 1;
+      // First lane sees a terminal failure; every later poll is throttled.
+      if (call === 1) return jsonOk(terminalRun('run_dup', 'failed'));
+      return rateLimited({ retryAfter: 0 });
+    }) as unknown as typeof globalThis.fetch;
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_dup', 'run_dup'],
+        timeoutSeconds: 600,
+        maxConcurrency: 2,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    ).catch((error: unknown) => error);
+    expect(rejection).not.toMatchObject({ exitCode: 11 });
+  });
+
+  // NOTE: a guard, not a proof — exit 7 is also what the pre-change code returned
+  // here. It exists so nobody can widen the escalation to fire whenever ANY
+  // RATE_LIMITED is present without going red.
+  it('keeps exit 7 when a throttle is mixed with a non-rate-limit poll error (escalation stays narrow)', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = (async (input: unknown) => {
+      const url = String(input);
+      if (url.includes('run_gone')) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: 'NOT_FOUND',
+              message: 'no such run',
+              nextAction: 'check the id',
+              requestId: 'req_x',
+              details: {},
+            },
+          }),
+          { status: 404, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return rateLimited({ retryAfter: 0 });
+    }) as unknown as typeof globalThis.fetch;
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_throttled', 'run_gone'],
+        timeoutSeconds: 600,
+        maxConcurrency: 2,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 7 });
+  });
+
+  // NOTE: partly a guard — the exit code and the absence of retry logging also
+  // hold on the pre-change code. What it genuinely proves is the re-mapped CODE
+  // (`error:INSUFFICIENT_CREDITS`), i.e. that this envelope is structurally
+  // outside both the new retry loop and the new escalation.
+  it('does not spend the retry budget on a credit-depletion 429, and does not claim it was rate limited', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = (async () =>
+      rateLimited({
+        message: 'Insufficient credits: 2 credit(s) required.',
+      })) as unknown as typeof globalThis.fetch;
+    const out: string[] = [];
+    const errs: string[] = [];
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_broke'],
+        timeoutSeconds: 600,
+        maxConcurrency: 1,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => errs.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    ).catch((error: unknown) => error);
+    // `errors.ts` re-maps a credits-flavoured 429 to INSUFFICIENT_CREDITS before
+    // the poll catch sees it, so it is structurally excluded from both the retry
+    // loop and the exit-11 escalation — a depleted wallet can't be waited out.
+    const payload = JSON.parse(out.join('')) as { results: Array<{ status: string }> };
+    expect(payload.results[0]!.status).toBe('error:INSUFFICIENT_CREDITS');
+    expect(errs.filter(l => l.includes('rate limited (attempt')).length).toBe(0);
+    // Still folded into 7 (resumable-error bucket). Left alone deliberately:
+    // escalating a non-retriable code here would be speculative — a poll of
+    // `GET /runs/{id}` never charges credits, so this envelope is not reachable
+    // from a real backend on this path; the case exists only to prove the
+    // re-mapped code neither retries nor masquerades as a throttle.
+    expect(rejection).toMatchObject({ exitCode: 7 });
   });
 });
 
@@ -5577,6 +6163,67 @@ describe('runCreate', () => {
     ).toBe(true);
   });
 
+  // `test create --type backend --target-url --run` only soft-advises
+  // (this test's own [C1 Fix 4] case above) while `test run --all --target-url`
+  // hard-rejects (exit 5, test.run.spec.ts) for the same underlying condition —
+  // "the URL override has no effect here". The enforcement difference is
+  // deliberate and kept as-is; only the cosmetic doubled period + wording is
+  // fixed here. This test locks in the cosmetic half: neither message may
+  // contain a doubled `..`, regardless of which enforcement path it's on.
+  it('neither the create soft-advisory nor the run --all hard-reject double their trailing period', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('test("be", async () => {});');
+    const fetchImpl = makeFetch(url =>
+      url.includes('/runs')
+        ? {
+            body: {
+              runId: 'run_dev297',
+              status: 'queued',
+              enqueuedAt: '2026-07-16T00:00:00.000Z',
+              codeVersion: 'v-dev297',
+              targetUrl: '',
+            },
+          }
+        : { body: { ...SAMPLE_RESPONSE, testId: 'test_dev297', type: 'backend' } },
+    );
+    const createStderr: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_be',
+        type: 'backend',
+        name: 'be test dev297',
+        codeFile,
+        targetUrl: 'https://staging.example.com',
+        run: true,
+        wait: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => createStderr.push(line),
+      },
+    );
+    const createAdvisory = createStderr.find(
+      l => l.includes('[advisory]') && l.includes('--target-url'),
+    );
+    expect(createAdvisory).toBeDefined();
+    expect(createAdvisory).not.toContain('..');
+
+    const test = createTestCommand();
+    disableExits(test);
+    const rejection = (await test
+      .parseAsync(['run', '--all', '--project', 'proj_1', '--target-url', 'https://example.com'], {
+        from: 'user',
+      })
+      .catch((error: unknown) => error)) as ApiError;
+    expect(rejection.nextAction).toBeDefined();
+    expect(rejection.nextAction).not.toContain('..');
+  });
+
   // Fix 4 — B3: duplicate-name advisory
   it('Fix 4 — emits advisory on stderr when a test with the same name exists, but still proceeds', async () => {
     const { credentialsPath } = makeCreds();
@@ -7567,6 +8214,246 @@ describe('runCreateFromPlan', () => {
     expect(errText).toContain('--name');
   });
 
+  // ---------------------------------------------------------------------------
+  // Teach-the-schema validation errors (plan-schema discoverability
+  // trio: errors / docs+help / schema+template).
+  // ---------------------------------------------------------------------------
+
+  it('a top-level array gets a dedicated "one test per file" message pointing at create-batch', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile([FE_PLAN, FE_PLAN]);
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    await expect(
+      runCreateFromPlan(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          planFrom: planFile,
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      nextAction: expect.stringContaining('a plan file holds ONE test as a single JSON object'),
+    });
+    await expect(
+      runCreateFromPlan(
+        { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      nextAction: expect.stringContaining('test create-batch --plans'),
+    });
+    await expect(
+      runCreateFromPlan(
+        { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      nextAction: expect.stringContaining('--plan-from-dir'),
+    });
+  });
+
+  it('steps nested under `plan.steps` (the Copilot hallucination) hints at top-level `planSteps`', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      projectId: 'project_alice',
+      type: 'frontend',
+      name: 'x',
+      plan: { steps: [{ type: 'action', description: 'go' }] },
+    });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    await expect(
+      runCreateFromPlan(
+        { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'planSteps' }),
+      nextAction: expect.stringContaining('Did you mean `planSteps`?'),
+    });
+  });
+
+  it('a bare top-level `steps` array also triggers the `planSteps` hint', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      projectId: 'project_alice',
+      type: 'frontend',
+      name: 'x',
+      steps: [{ type: 'action', description: 'go' }],
+    });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    await expect(
+      runCreateFromPlan(
+        { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      nextAction: expect.stringContaining('Did you mean `planSteps`?'),
+    });
+  });
+
+  it('a plan with planSteps simply absent (no plan/steps hint fields either) keeps the generic message', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({ projectId: 'project_alice', type: 'frontend', name: 'x' });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    await expect(
+      runCreateFromPlan(
+        { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      details: expect.objectContaining({ field: 'planSteps' }),
+      nextAction: expect.not.stringContaining('Did you mean'),
+    });
+  });
+
+  it('a missing projectId AND a supplied --project flag appends the ignored-flag note to the SAME error', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      type: 'frontend',
+      name: 'x',
+      planSteps: [{ type: 'action', description: 'go' }],
+    });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    const stderrLines: string[] = [];
+    await expect(
+      runCreateFromPlan(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          planFrom: planFile,
+          ignoredFlags: ['--project'],
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: l => stderrLines.push(l) },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'projectId' }),
+      nextAction: expect.stringContaining(
+        'note: with --plan-from, --project is ignored; all fields live inside the file.',
+      ),
+    });
+    // L1778 regression guard: the separate ignored-flags stderr warning still
+    // must not precede/accompany a validation failure.
+    expect(stderrLines.join(' ')).not.toContain('warning: --plan-from');
+  });
+
+  it('the ignored-flag note is NOT appended when the flag was not actually supplied', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      type: 'frontend',
+      name: 'x',
+      planSteps: [{ type: 'action', description: 'go' }],
+    });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    await expect(
+      runCreateFromPlan(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          planFrom: planFile,
+          ignoredFlags: [], // --project was NOT supplied on the command line
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      details: expect.objectContaining({ field: 'projectId' }),
+      nextAction: expect.not.stringContaining('note: with --plan-from'),
+    });
+  });
+
+  it('a `{{VAR}}` placeholder in a step description is a non-fatal [advisory], not a validation error', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      ...FE_PLAN,
+      planSteps: [
+        { type: 'action', description: 'log in as {{LOGIN_USER}}' },
+        { type: 'assertion', description: 'no placeholder here' },
+      ],
+    });
+    let posted = false;
+    const fetchImpl = makeFetch(() => {
+      posted = true;
+      return { body: SAMPLE_RESPONSE };
+    });
+    const stderrLines: string[] = [];
+    const res = await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: l => stderrLines.push(l) },
+    );
+    expect(res).toEqual(SAMPLE_RESPONSE);
+    expect(posted).toBe(true);
+    const errText = stderrLines.join(' ');
+    expect(errText).toContain('[advisory]');
+    // `.description` must attach to EACH
+    // flagged path, not just the last one in a joined list.
+    expect(errText).toContain('planSteps[0].description');
+    expect(errText).toContain('contains a');
+    expect(errText).toContain('{{...}}');
+    expect(errText).not.toContain('planSteps[1]');
+    expect(errText).toContain('project update');
+  });
+
+  it('multiple flagged steps (0 and 2) each read `planSteps[N].description`, not a shared trailing suffix', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      ...FE_PLAN,
+      planSteps: [
+        { type: 'action', description: 'log in as {{LOGIN_USER}}' },
+        { type: 'action', description: 'no placeholder here' },
+        { type: 'assertion', description: 'verify the {{PRODUCT_NAME}} banner' },
+      ],
+    });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    const stderrLines: string[] = [];
+    await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: l => stderrLines.push(l) },
+    );
+    const errText = stderrLines.join(' ');
+    // Both flagged paths must EACH carry their own `.description` suffix —
+    // NOT `planSteps[0], planSteps[2].description` (misattributes to only
+    // the last entry).
+    expect(errText).toContain('planSteps[0].description');
+    expect(errText).toContain('planSteps[2].description');
+    expect(errText).not.toMatch(/planSteps\[0\],\s*planSteps\[2\]\.description/);
+    expect(errText).not.toContain('planSteps[1]');
+    // Plural grammar for 2+ flagged steps.
+    expect(errText).toContain('contain a');
+  });
+
+  it('the placeholder advisory still fires under --dry-run (the agent-iteration loop must not regress)', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      ...FE_PLAN,
+      planSteps: [{ type: 'action', description: 'log in as {{LOGIN_USER}}' }],
+    });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    const stderrLines: string[] = [];
+    await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile, dryRun: true },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: l => stderrLines.push(l) },
+    );
+    expect(stderrLines.join(' ')).toContain('[advisory]');
+  });
+
+  it('a plan with no placeholders never emits the advisory', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile(FE_PLAN);
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    const stderrLines: string[] = [];
+    await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: l => stderrLines.push(l) },
+    );
+    expect(stderrLines.join(' ')).not.toContain('[advisory]');
+  });
+
   it('rejects a plan with an invalid step type', async () => {
     const { credentialsPath } = makeCreds();
     const planFile = writePlanFile({
@@ -8596,7 +9483,7 @@ describe('Fix 5 — dashboardUrl emission', () => {
 
   it('runCreate: JSON mode includes dashboardUrl when API URL is prod', async () => {
     // Use prod API URL → resolvePortalUrl returns a URL
-    const { credentialsPath } = makeCreds('sk-test', 'https://api.testsprite.com');
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const codeFile = writeCodeFile('test("dash", async () => {});');
     const fetchImpl = makeFetch((_url, init) => {
       if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
@@ -8623,7 +9510,7 @@ describe('Fix 5 — dashboardUrl emission', () => {
   });
 
   it('runCreate: text mode emits Dashboard: line to stderr when API URL is prod', async () => {
-    const { credentialsPath } = makeCreds('sk-test', 'https://api.testsprite.com');
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const codeFile = writeCodeFile('test("dash", async () => {});');
     const fetchImpl = makeFetch((_url, init) => {
       if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
@@ -8653,7 +9540,7 @@ describe('Fix 5 — dashboardUrl emission', () => {
   });
 
   it('runCreate: no dashboardUrl when API URL is unknown (localhost)', async () => {
-    const { credentialsPath } = makeCreds('sk-test', 'http://localhost:13502');
+    const { credentialsPath } = makeCreds('sk-user-test', 'http://localhost:13502');
     const codeFile = writeCodeFile('test("dash", async () => {});');
     const fetchImpl = makeFetch((_url, init) => {
       if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
@@ -8738,7 +9625,7 @@ describe('Fix 5 — dashboardUrl emission', () => {
       writeFileSync(path, JSON.stringify(plan), 'utf8');
       return path;
     }
-    const { credentialsPath } = makeCreds('sk-test', 'https://api.testsprite.com');
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const planFile = writePlanFileDash({
       projectId: 'proj_dash_plan',
       type: 'frontend',
@@ -8828,7 +9715,7 @@ describe('Fix 5 — dashboardUrl emission', () => {
   // R3a: dashboardUrl in create --run JSON envelope
   it('runCreate --run: dashboardUrl is included in the merged { ...create, run } JSON envelope', async () => {
     // prod API URL so resolvePortalUrl maps correctly
-    const { credentialsPath } = makeCreds('sk-test', 'https://api.testsprite.com');
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const codeFile = writeCodeFile('test("chain", async () => {});');
     const CREATE_RESP = {
       testId: 'test_chain_01',
@@ -8901,7 +9788,7 @@ describe('Fix 5 — dashboardUrl emission', () => {
       return path;
     }
     // Use prod API URL
-    const { credentialsPath } = makeCreds('sk-test', 'https://api.testsprite.com');
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const spec = {
       projectId: 'proj_batch',
       type: 'frontend' as const,

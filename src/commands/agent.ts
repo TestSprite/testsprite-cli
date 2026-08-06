@@ -524,7 +524,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
         const bytes = Buffer.byteLength(section, 'utf8');
         let wouldBeContent = section;
         if (dryRunSt !== null) {
-          let existing: string | null = null;
+          let existing: string | null;
           try {
             existing = await agentFs.readFile(abs);
           } catch (err) {
@@ -1066,13 +1066,14 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
   );
 
   agent
-    .command('install')
+    .command('install [targets...]')
     .description(
-      'Write the TestSprite agent skills (verification loop + first-run onboarding) into a project for a coding agent',
+      'Write the TestSprite agent skills (verification loop + first-run onboarding) into a project for a coding agent. ' +
+        'Target(s) may be given positionally (e.g. `agent install cursor codex`) and/or via --target; the two are merged.',
     )
     .option(
       '--target <t>',
-      'Agent target(s): claude, cursor, cline, antigravity, kiro, windsurf, copilot, codex (comma-separated or repeated)',
+      'Agent target(s): claude, cursor, cline, antigravity, kiro, windsurf, copilot, codex (comma-separated or repeated). Merged with any positional target(s).',
       collect,
       [],
     )
@@ -1091,13 +1092,23 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(
       async (
+        // Positional targets: `agent install cursor` previously parsed
+        // as zero targets (Commander silently drops undeclared positionals),
+        // silently falling through to the non-TTY default-to-claude path — so
+        // 7 of the 8 documented one-liners installed the WRONG agent's skill
+        // with zero signal. Declaring `[targets...]` captures them; they are
+        // merged with `--target` (order: positional first, then flag values)
+        // and flow through runInstall's existing parse/validate/dedupe pipeline
+        // unchanged, so an unknown name (positional or flag) still rejects with
+        // exit 5 instead of silently defaulting.
+        positionalTargets: string[],
         cmdOpts: { target: string[]; skill: string[]; dir?: string; force?: boolean },
         command: Command,
       ) => {
         await runInstall(
           {
             ...resolveCommonOptions(command),
-            target: cmdOpts.target,
+            target: [...positionalTargets, ...cmdOpts.target],
             skills: cmdOpts.skill,
             dir: cmdOpts.dir,
             force: Boolean(cmdOpts.force),

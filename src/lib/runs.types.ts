@@ -48,6 +48,20 @@ export interface RerunClosure {
 }
 
 /**
+ * A machine-readable note that a requested option was forwarded to the
+ * execution engine but is not yet honored there. Emitted ONLY on a
+ * V3-routed rerun when the caller explicitly requested `autoHeal:false` —
+ * absent otherwise, including every V2 response and every V3 response that
+ * did not request an opt-out.
+ */
+export interface RerunAdvisory {
+  /** Machine-readable feature name the advisory concerns (e.g. "autoHeal"). */
+  feature: string;
+  /** Human-readable explanation of the current limitation. */
+  message: string;
+}
+
+/**
  * Response from `POST /api/cli/v1/tests/{testId}/runs/rerun`.
  * FE shape: no `closure`. BE shape: includes `closure` with per-member runIds.
  * `runId` is always non-null (minted synchronously before async invoke).
@@ -67,6 +81,12 @@ export interface RerunResponse {
    * the `!!closure` truthy check in the CLI already handles both).
    */
   closure?: RerunClosure | null;
+  /**
+   * Present only when this rerun was routed to V3 execution AND the caller
+   * explicitly requested `autoHeal:false` (see {@link RerunAdvisory}). Absent
+   * on every other response, including older backends that predate the field.
+   */
+  advisories?: RerunAdvisory[];
 }
 
 /**
@@ -122,6 +142,10 @@ export interface BatchRerunClosure {
  *   Present when the server supports partial-accept (SOME ids bad → 200 with accepted+notFound).
  *   When ALL ids are bad the server returns 404 (caught separately in the catch block).
  *   Optional for back-compat with older backends that don't send this field.
+ * `advisories` = present only when at least one FE test in the batch was routed to V3
+ *   execution AND explicitly requested `autoHeal:false` (see {@link RerunAdvisory}).
+ *   Absent on every other response. The CLI aggregates + dedupes this field across
+ *   chunked dispatch requests (see `dedupeRerunAdvisories` in `commands/test.ts`).
  */
 export interface BatchRerunResponse {
   accepted: BatchRerunAccepted[];
@@ -129,6 +153,7 @@ export interface BatchRerunResponse {
   conflicts: BatchRerunConflict[];
   closure: BatchRerunClosure;
   notFound?: string[];
+  advisories?: RerunAdvisory[];
 }
 
 /**
@@ -195,8 +220,19 @@ export interface RunResponse {
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
-  codeVersion: string;
-  targetUrl: string;
+  /**
+   * Code version stamped at trigger time. `null` on pre-M3.1 rows and on
+   * runs whose test has no stored code body (e.g. a plan-driven frontend
+   * test), per the server contract (`RunEnvelope.codeVersion` is
+   * `[string, 'null']`).
+   */
+  codeVersion: string | null;
+  /**
+   * Target URL stamped at trigger time. `null` for backend runs and for any
+   * run whose execution backend does not record one, per the server contract
+   * (`RunEnvelope.targetUrl` is `[string, 'null']`).
+   */
+  targetUrl: string | null;
   createdFrom: string | null;
   failedStepIndex: number | null;
   failureKind: string | null;
@@ -207,12 +243,21 @@ export interface RunResponse {
   /** Optional hint from the server; honored by the polling loop. */
   retryAfterSeconds?: number;
   /**
-   * CLIENT-synthesized Portal deep link — never sent by the server. The CLI
-   * adds it to terminal run output (`test run --wait`, `test wait`,
-   * `test rerun --wait`) when projectId+testId are present and the API
-   * endpoint maps to a known portal host (see `resolvePortalUrl`).
+   * Portal deep link for this run's test.
+   *
+   * **Server-provided when present, client-synthesized otherwise.** Newer
+   * backends send this field on `GET /runs/{runId}` because only the server
+   * knows which store answered the read (a V3-served run's page is a different
+   * route family, and the V2 route it replaces cannot render for a V3-native
+   * project) and only the server can resolve the portal origin outside prod.
+   *
+   * A server `null` means "no correct link exists for this run" — the CLI
+   * treats it as absent for rendering and does NOT substitute its own guess.
+   * A missing field (older backend) reopens the client path: `resolvePortalUrl`
+   * from projectId+testId when the endpoint maps to a known portal host. See
+   * `withRunDashboardUrl` in `commands/test.ts`.
    */
-  dashboardUrl?: string;
+  dashboardUrl?: string | null;
   /**
    * Full ordered step list. Only present when the request includes
    * `?includeSteps=true`. Absent (undefined) when the flag was not sent.
@@ -290,7 +335,8 @@ export interface RunHistoryItem {
   /** May be null — backend doesn't always stamp it. */
   startedAt: string | null;
   finishedAt: string | null;
-  codeVersion: string;
+  /** May be null — not stamped on pre-M3.2 rows or on tests with no code body. */
+  codeVersion: string | null;
   /** Null when the run passed. */
   failureKind: string | null;
   /**

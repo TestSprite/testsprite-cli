@@ -362,6 +362,59 @@ describe('makeHttpClient - API key validation', () => {
     expect(apiErr.nextAction).toContain('api-key');
   });
 
+  it.each([
+    ['legacy key', 'sk-user-abcdef123'],
+    // Constructed, not literal token-shaped strings — keeps secret scanners quiet.
+    ['membership key', `sk-member-${'A'.repeat(43)}`],
+    ['pre-rename membership key', `tsp_u_${'A'.repeat(43)}`],
+  ])('accepts a well-formed TestSprite key (%s)', (_label, apiKey) => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
+    expect(() =>
+      makeHttpClient(
+        { profile: 'default', output: 'json', debug: false, dryRun: false },
+        {
+          env: { TESTSPRITE_API_KEY: apiKey } as NodeJS.ProcessEnv,
+          credentialsPath: NO_CREDS_PATH,
+          fetchImpl,
+        },
+      ),
+    ).not.toThrow();
+  });
+
+  it.each([
+    ['no recognized prefix', 'not-a-valid-key-format!!'],
+    ['prefix only, empty body', 'sk-user-'],
+    ['membership prefix only, empty body', 'sk-member-'],
+    ['org prefix only, empty body', 'tsp_'],
+    ['wrong prefix', 'pk-user-abcdef'],
+    // `sk-` alone is not a family — it must not be treated as a valid prefix.
+    ['bare sk- prefix', 'sk-abcdef123'],
+  ])(
+    'rejects a header-legal key with a bad TestSprite format (%s) before any network call',
+    (_label, apiKey) => {
+      const fetchImpl = vi.fn();
+      let caught: unknown;
+      try {
+        makeHttpClient(
+          { profile: 'default', output: 'json', debug: false, dryRun: false },
+          {
+            env: { TESTSPRITE_API_KEY: apiKey } as NodeJS.ProcessEnv,
+            credentialsPath: NO_CREDS_PATH,
+            fetchImpl,
+          },
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(caught).toBeInstanceOf(ApiError);
+      const apiErr = caught as ApiError;
+      expect(apiErr.code).toBe('VALIDATION_ERROR');
+      expect(apiErr.exitCode).toBe(5);
+      expect(apiErr.nextAction).toContain('api-key');
+    },
+  );
+
   it('treats a whitespace-only TESTSPRITE_API_KEY env var as unset (AUTH_REQUIRED)', () => {
     const fetchImpl = vi.fn();
     let caught: unknown;

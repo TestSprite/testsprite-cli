@@ -280,6 +280,34 @@ describe('HttpClient error mapping', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
+  it('does not retry a CONFLICT remapped to AMBIGUOUS_ORG (permanent id collision, not a race)', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(
+        {
+          error: {
+            code: 'CONFLICT',
+            message: 'Test id "test_x" resolves in more than one of your organizations.',
+            nextAction: 'Open the specific project in the Portal, or contact support.',
+            requestId: 'req_ambig',
+            details: {
+              reason: 'ambiguous_org',
+              testId: 'test_x',
+              candidates: [{ projectId: 'p1', orgId: 'o1' }],
+            },
+          },
+        },
+        { status: 409 },
+      ),
+    );
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    const err = await client.get('/tests/test_x').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('AMBIGUOUS_ORG');
+    expect((err as ApiError).exitCode).toBe(6);
+    expect((err as ApiError).getDetail('candidates')).toEqual([{ projectId: 'p1', orgId: 'o1' }]);
+    expect(fetchImpl).toHaveBeenCalledTimes(1); // no retry — distinct from generic CONFLICT
+  });
+
   it('retries INTERNAL once then propagates', async () => {
     const fetchImpl = vi.fn(async () => errorEnvelopeResponse(500, 'INTERNAL'));
     const client = makeClient(fetchImpl as unknown as typeof fetch);

@@ -663,6 +663,93 @@ describe('R-FE1: FE rerun -- wait (replay, exit 0 on passed)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// RATE_LIMITED during single (FE / BE-without-closure) rerun --wait polling —
+// partial stdout + honest hint, exit 11 kept (never reclassified to 7). The
+// 429 must be a real HTTP response (not thrown directly) so it exercises
+// http.ts's own RATE_LIMITED retry-then-throw path.
+// ---------------------------------------------------------------------------
+
+describe('single rerun --wait: RATE_LIMITED writes partial stdout, keeps exit 11', () => {
+  it('exit 11 (NOT reclassified to 7) AND stdout contains {runId, status:"running"}', async () => {
+    const creds = makeCreds();
+    const rerunResp = makeFeRerunResp();
+
+    const fetchImpl: typeof globalThis.fetch = async (input, _init) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      if (url.includes('/tests/test_fe_01/runs/rerun')) {
+        return new Response(JSON.stringify(rerunResp), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (url.includes('/runs/run_rerun_fe_001')) {
+        // retry-after: 0 keeps http.ts's internal retry-then-throw budget fast.
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: 'RATE_LIMITED',
+              message: 'Run trigger rate limit exceeded: too many requests from this IP.',
+              nextAction: '',
+              requestId: 'req_rl_rerun_test',
+              details: {},
+            },
+          }),
+          { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '0' } },
+        );
+      }
+      return new Response(JSON.stringify({ error: { code: 'NOT_FOUND' } }), { status: 404 });
+    };
+
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+
+    const err = await runTestRerun(
+      {
+        testIds: ['test_fe_01'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl: fetchImpl as unknown as FetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    ).catch(e => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('RATE_LIMITED');
+    expect((err as ApiError).exitCode).toBe(11);
+
+    const stdoutJson = JSON.parse(stdoutLines.join('\n')) as { runId: string; status: string };
+    expect(stdoutJson.runId).toBe(rerunResp.runId);
+    expect(stdoutJson.status).toBe('running');
+
+    const stderrBlock = stderrLines.join('\n');
+    expect(stderrBlock).toContain(rerunResp.runId);
+    expect(stderrBlock).toContain('test wait');
+    expect(stderrBlock).toContain('test cancel');
+    expect(stderrBlock).toContain('Rate limited');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // R-FE2/R-FE4: --auto-heal flag
 // ---------------------------------------------------------------------------
 
@@ -816,9 +903,9 @@ describe('R-FE4: server unexpectedly echoes autoHeal:false — prints "not appli
   });
 });
 
-// R-FE5: --no-auto-heal explicit opt-out → body sends no autoHeal field
+// R-FE5: --no-auto-heal explicit opt-out → body sends autoHeal:false explicitly
 describe('R-FE5: --no-auto-heal opt-out', () => {
-  it('does NOT send autoHeal in body when autoHeal:false; no advisory emitted', async () => {
+  it('sends autoHeal:false explicitly in body (not omitted); no auto-heal advisory emitted', async () => {
     const creds = makeCreds();
     const rerunResp = makeFeRerunResp({ autoHeal: false }); // verbatim replay
     const stderrLines: string[] = [];
@@ -856,12 +943,138 @@ describe('R-FE5: --no-auto-heal opt-out', () => {
       },
     );
 
-    // autoHeal must NOT be sent to server (effectiveAutoHeal is false)
-    expect((sentBody as { autoHeal?: boolean }).autoHeal).toBeUndefined();
+    // autoHeal:false must be sent EXPLICITLY (not omitted) — an
+    // absent field defaults to heal-on server-side, which silently discards
+    // the user's --no-auto-heal opt-out.
+    expect((sentBody as { autoHeal?: boolean }).autoHeal).toBe(false);
 
     // No advisory for a verbatim replay (server echoes false, opts.autoHeal is false)
     const advisory = stderrLines.find(l => l.includes('[advisory]'));
     expect(advisory).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Single rerun renders server-side `advisories[]`
+// ---------------------------------------------------------------------------
+
+describe('single rerun renders server advisories', () => {
+  const advisory = {
+    feature: 'autoHeal',
+    message:
+      'The auto-heal opt-out was forwarded to the execution engine but is not yet enforced there.',
+  };
+
+  it('text mode: prints one [advisory] line per entry in rerunResp.advisories', async () => {
+    const creds = makeCreds();
+    const rerunResp = makeFeRerunResp({ autoHeal: false, advisories: [advisory] });
+    const stderrLines: string[] = [];
+
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_fe_01/runs/rerun')) {
+        return { body: rerunResp };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    await runTestRerun(
+      {
+        testIds: ['test_fe_01'],
+        all: false,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'text',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, sleep: instantSleep, fetchImpl, stderr: line => stderrLines.push(line) },
+    );
+
+    expect(stderrLines).toContain(`[advisory] ${advisory.message}`);
+  });
+
+  it('JSON mode: passes advisories through untouched on the printed response', async () => {
+    const creds = makeCreds();
+    const rerunResp = makeFeRerunResp({ autoHeal: false, advisories: [advisory] });
+    const printed: unknown[] = [];
+
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_fe_01/runs/rerun')) {
+        return { body: rerunResp };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    await runTestRerun(
+      {
+        testIds: ['test_fe_01'],
+        all: false,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, sleep: instantSleep, fetchImpl, stdout: line => printed.push(JSON.parse(line)) },
+    );
+
+    const result = printed[0] as RerunResponse;
+    expect(result.advisories).toEqual([advisory]);
+  });
+
+  it('absent advisories: no [advisory] line, and the JSON field stays absent (byte-identical passthrough)', async () => {
+    const creds = makeCreds();
+    const rerunResp = makeFeRerunResp({ autoHeal: false }); // no advisories field at all
+    const stderrLines: string[] = [];
+    const printed: unknown[] = [];
+
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_fe_01/runs/rerun')) {
+        return { body: rerunResp };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    await runTestRerun(
+      {
+        testIds: ['test_fe_01'],
+        all: false,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl,
+        stderr: line => stderrLines.push(line),
+        stdout: line => printed.push(JSON.parse(line)),
+      },
+    );
+
+    expect(stderrLines.some(l => l.includes('[advisory]'))).toBe(false);
+    const result = printed[0] as RerunResponse;
+    expect(result.advisories).toBeUndefined();
   });
 });
 
@@ -1158,7 +1371,7 @@ describe('R-BE2: --skip-dependencies', () => {
 // ---------------------------------------------------------------------------
 
 describe('R-BE3: auto-heal on BE test — default-on suppresses warning', () => {
-  it('auto-heal defaults true; BE type suppresses warning (autoHealExplicit:false); autoHeal NOT sent', async () => {
+  it('auto-heal defaults true; BE type suppresses warning (autoHealExplicit:false); autoHeal:false sent explicitly', async () => {
     const creds = makeCreds();
     const rerunResp = makeBeRerunResp({ autoHeal: false });
     const stderrLines: string[] = [];
@@ -1208,8 +1421,9 @@ describe('R-BE3: auto-heal on BE test — default-on suppresses warning', () => 
     );
     expect(warning).toBeUndefined();
 
-    // autoHeal must NOT be sent to server (effectiveAutoHeal is false for BE)
-    expect((sentBody as { autoHeal?: boolean }).autoHeal).toBeUndefined();
+    // autoHeal is sent EXPLICITLY as false (effectiveAutoHeal is
+    // false for BE) — not omitted.
+    expect((sentBody as { autoHeal?: boolean }).autoHeal).toBe(false);
   });
 
   it('auto-heal explicitly requested (autoHealExplicit:true); BE type emits warning', async () => {
@@ -1263,8 +1477,9 @@ describe('R-BE3: auto-heal on BE test — default-on suppresses warning', () => 
     );
     expect(warning).toBeDefined();
 
-    // autoHeal must NOT be sent to server (effectiveAutoHeal is false for BE)
-    expect((sentBody as { autoHeal?: boolean }).autoHeal).toBeUndefined();
+    // autoHeal is sent EXPLICITLY as false (effectiveAutoHeal is
+    // false for BE) — not omitted.
+    expect((sentBody as { autoHeal?: boolean }).autoHeal).toBe(false);
   });
 });
 
@@ -1328,6 +1543,65 @@ describe('[fix-2] BE rerun: spurious "not applied" advisory is suppressed', () =
 });
 
 // ---------------------------------------------------------------------------
+// "not applied" advisory wording — points at `testsprite usage`, never a
+// hardcoded personal billing URL. The CLI has no per-request org context
+// here (no backend nextAction feeds this client-side advisory, and a
+// personal-vs-org-bound key can't be told apart at this point), so it must
+// not assert "check your (personal) balance at <billing URL>" — `usage`
+// already renders whichever wallet actually governs this key.
+// ---------------------------------------------------------------------------
+describe('"not applied" auto-heal advisory wording (FE, server rejects the heal request)', () => {
+  it('points at `testsprite usage`, not a hardcoded billing URL', async () => {
+    const creds = makeCreds();
+    // Server echoes autoHeal:false despite the CLI sending true — the
+    // defensive "not applied" branch.
+    const rerunResp = makeFeRerunResp({ autoHeal: false });
+    const stderrLines: string[] = [];
+
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_fe_01') && !url.includes('/runs/rerun')) {
+        return { body: FE_TEST };
+      }
+      if (url.includes('/tests/test_fe_01/runs/rerun')) {
+        return { body: rerunResp };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    await runTestRerun(
+      {
+        testIds: ['test_fe_01'],
+        all: false,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: true,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+
+    const notAppliedLine = stderrLines.find(
+      l => l.includes('not applied') || l.includes('was not applied'),
+    );
+    expect(notAppliedLine).toBeDefined();
+    expect(notAppliedLine).toContain('testsprite usage');
+    expect(notAppliedLine).not.toContain('dashboard/settings/billing');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // R-BAT: Batch rerun
 // ---------------------------------------------------------------------------
 
@@ -1383,6 +1657,277 @@ describe('R-BAT: batch rerun (multi-id, no --wait)', () => {
     expect(result.accepted).toHaveLength(2);
     expect(result.accepted[0]!.runId).toBe('run_b1');
     expect(result.accepted[1]!.runId).toBe('run_b2');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Batch rerun (initial dispatch + deferred-retry) always sends an
+// explicit autoHeal boolean, including an explicit `false` opt-out.
+// ---------------------------------------------------------------------------
+
+describe('batch rerun always sends an explicit autoHeal boolean', () => {
+  it('initial dispatch sends autoHeal:true explicitly when auto-heal is default-on', async () => {
+    const creds = makeCreds();
+    const batchResp: BatchRerunResponse = {
+      accepted: [
+        { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+      ],
+      deferred: [],
+      conflicts: [],
+      closure: { byProject: [] },
+    };
+    let sentBody: unknown;
+    const fetchImpl = makeFetch((url, init) => {
+      if (url.includes('/tests/batch/rerun')) {
+        sentBody = init.body ? JSON.parse(init.body as string) : null;
+        return { status: 202, body: batchResp };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    await runTestRerun(
+      {
+        // Two ids so the batch path is exercised (a single id routes through
+        // the single-rerun code path instead of `POST /tests/batch/rerun`).
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: true,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, sleep: instantSleep, fetchImpl },
+    );
+
+    expect((sentBody as { autoHeal?: boolean }).autoHeal).toBe(true);
+  });
+
+  it('initial dispatch sends autoHeal:false explicitly (not omitted) when --no-auto-heal is passed', async () => {
+    const creds = makeCreds();
+    const batchResp: BatchRerunResponse = {
+      accepted: [
+        { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+      ],
+      deferred: [],
+      conflicts: [],
+      closure: { byProject: [] },
+    };
+    let sentBody: unknown;
+    const fetchImpl = makeFetch((url, init) => {
+      if (url.includes('/tests/batch/rerun')) {
+        sentBody = init.body ? JSON.parse(init.body as string) : null;
+        return { status: 202, body: batchResp };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, sleep: instantSleep, fetchImpl },
+    );
+
+    expect((sentBody as { autoHeal?: boolean }).autoHeal).toBe(false);
+  });
+
+  it('the D3 deferred-retry dispatch also re-sends autoHeal:false explicitly', async () => {
+    const creds = makeCreds();
+    // test_2 is accepted immediately; test_1 is rate-deferred on the initial
+    // dispatch and only accepted on the D3 retry.
+    const initialBatchResp: BatchRerunResponse = {
+      accepted: [{ testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' }],
+      deferred: [{ testId: 'test_1', reason: 'rate_limited' }],
+      conflicts: [],
+      closure: { byProject: [] },
+    };
+    const retryBatchResp: BatchRerunResponse = {
+      accepted: [{ testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:05.000Z' }],
+      deferred: [],
+      conflicts: [],
+      closure: { byProject: [] },
+    };
+    const sentBodies: unknown[] = [];
+    let batchCallCount = 0;
+    const run1 = makeTerminalRun('run_b1', 'passed');
+    run1.testId = 'test_1';
+    const run2 = makeTerminalRun('run_b2', 'passed');
+    run2.testId = 'test_2';
+
+    const fetchImpl = makeFetch((url, init) => {
+      if (url.includes('/tests/batch/rerun')) {
+        batchCallCount++;
+        sentBodies.push(init.body ? JSON.parse(init.body as string) : null);
+        return { status: 202, body: batchCallCount === 1 ? initialBatchResp : retryBatchResp };
+      }
+      if (url.includes('/runs/run_b1')) return { body: run1 };
+      if (url.includes('/runs/run_b2')) return { body: run2 };
+      return errorBody('NOT_FOUND');
+    });
+
+    await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, sleep: instantSleep, fetchImpl },
+    );
+
+    // 1 initial dispatch + 1 D3 retry that finally accepts the deferred test.
+    expect(batchCallCount).toBe(2);
+    expect((sentBodies[0] as { autoHeal?: boolean }).autoHeal).toBe(false);
+    expect((sentBodies[1] as { autoHeal?: boolean }).autoHeal).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Batch rerun renders server-side `advisories[]`
+// ---------------------------------------------------------------------------
+
+describe('batch rerun renders server advisories', () => {
+  const advisory = { feature: 'autoHeal', message: 'not yet enforced by the execution engine' };
+
+  it('prints the advisory once to stderr and passes it through in the JSON output', async () => {
+    const creds = makeCreds();
+    const batchResp: BatchRerunResponse = {
+      accepted: [
+        { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+      ],
+      deferred: [],
+      conflicts: [],
+      closure: { byProject: [] },
+      advisories: [advisory],
+    };
+    const stderrLines: string[] = [];
+    const printed: unknown[] = [];
+
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/rerun')) {
+        return { status: 202, body: batchResp };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    await runTestRerun(
+      {
+        // Two ids so the batch path is exercised (a single id routes through
+        // the single-rerun code path instead of `POST /tests/batch/rerun`).
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl,
+        stderr: line => stderrLines.push(line),
+        stdout: line => printed.push(JSON.parse(line)),
+      },
+    );
+
+    // Exactly one line — not once per accepted test in the batch.
+    const advisoryLines = stderrLines.filter(l => l === `[advisory] ${advisory.message}`);
+    expect(advisoryLines).toHaveLength(1);
+
+    const result = printed[0] as BatchRerunResponse;
+    expect(result.advisories).toEqual([advisory]);
+  });
+
+  it('absent advisories field: no [advisory] line is printed', async () => {
+    const creds = makeCreds();
+    const batchResp: BatchRerunResponse = {
+      accepted: [
+        { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+      ],
+      deferred: [],
+      conflicts: [],
+      closure: { byProject: [] },
+    };
+    const stderrLines: string[] = [];
+    const printed: unknown[] = [];
+
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/rerun')) {
+        return { status: 202, body: batchResp };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl,
+        stderr: line => stderrLines.push(line),
+        stdout: line => printed.push(JSON.parse(line)),
+      },
+    );
+
+    expect(stderrLines.some(l => l.includes('[advisory]'))).toBe(false);
+    // The CLI aggregates advisories client-side across chunked dispatch
+    // requests (same treatment as `notFound`), so an absent server field
+    // normalizes to an empty array here rather than staying undefined.
+    const result = printed[0] as BatchRerunResponse;
+    expect(result.advisories).toEqual([]);
   });
 });
 
@@ -3740,6 +4285,112 @@ describe('[finding-3] BE closure fan-out: RequestTimeoutError emits partial stdo
     expect(stderrBlock).toContain(namedRunId);
     expect(stderrBlock).toContain(producerRunId);
     expect(stderrBlock).toContain('test wait');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RATE_LIMITED in the BE closure fan-out: same partial-envelope contract as
+// the RequestTimeoutError test above, but exit code must stay 11 (never
+// reclassified to 7). `pollMember` only swallows `TimeoutError` into a null
+// return — every other error (including a RATE_LIMITED ApiError) propagates
+// through `.catch(reject)` exactly like RequestTimeoutError, so the outer
+// `catch (fanOutErr)` must list every dispatched closure-member runId.
+// ---------------------------------------------------------------------------
+
+describe('[RATE_LIMITED] BE closure fan-out: emits partial stdout for ALL runIds, keeps exit 11', () => {
+  it('RATE_LIMITED in a closure member poll → partial stdout with all runIds + exit 11 (not 7)', async () => {
+    const creds = makeCreds();
+    const rerunResp = makeBeRerunResp();
+    const namedRunId = rerunResp.runId; // 'run_rerun_be_named'
+    const producerRunId = rerunResp.closure!.members.find(m => m.role === 'producer')!.runId;
+
+    const fetchImpl: typeof globalThis.fetch = async (input, _init) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      if (url.includes('/tests/test_be_consumer_01/runs/rerun')) {
+        return new Response(JSON.stringify(rerunResp), {
+          status: 202,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (
+        url.includes('/tests/test_be_consumer_01') ||
+        url.includes('/tests/test_be_producer_01')
+      ) {
+        return new Response(JSON.stringify(BE_TEST), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      // Every closure-member poll gets rate-limited (retry-after: 0 keeps
+      // http.ts's internal retry-then-throw budget fast).
+      if (url.includes('/runs/')) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: 'RATE_LIMITED',
+              message: 'Run trigger rate limit exceeded: too many requests from this IP.',
+              nextAction: '',
+              requestId: 'req_rl_closure_test',
+              details: {},
+            },
+          }),
+          { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '0' } },
+        );
+      }
+      return new Response(JSON.stringify({ error: { code: 'NOT_FOUND' } }), { status: 404 });
+    };
+
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+
+    const err = await runTestRerun(
+      {
+        testIds: ['test_be_consumer_01'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl: fetchImpl as unknown as FetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    ).catch(e => e);
+
+    // Must stay exit 11 (RATE_LIMITED) — NOT reclassified to 7.
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('RATE_LIMITED');
+    expect((err as ApiError).exitCode).toBe(11);
+
+    // Stdout must list every dispatched closure-member runId.
+    expect(stdoutLines.length).toBeGreaterThan(0);
+    const stdoutBlock = stdoutLines.join('\n');
+    expect(stdoutBlock).toContain(namedRunId);
+    expect(stdoutBlock).toContain(producerRunId);
+
+    // Stderr must include re-attach hints for every closure-member runId.
+    const stderrBlock = stderrLines.join('\n');
+    expect(stderrBlock).toContain(namedRunId);
+    expect(stderrBlock).toContain(producerRunId);
+    expect(stderrBlock).toContain('test wait');
+    expect(stderrBlock).toContain('test cancel');
+    expect(stderrBlock).toContain('Rate limited');
   });
 });
 

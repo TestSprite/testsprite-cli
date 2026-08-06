@@ -87,6 +87,31 @@ testsprite test rerun test_3a9f21c7 --wait --output json
 #   → exits 0: passed. The test now lives in your durable suite.
 ```
 
+`./checkout-flow.plan.json` (the `--plan-from` argument above) is a JSON file describing the test in plain language — no browser code required. This is the exact, byte-identical output of `testsprite test create --plan-template` (also embedded verbatim in `test create --help`):
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.4.0/schemas/plan.schema.json",
+  "projectId": "prj_abc123",
+  "type": "frontend",
+  "name": "Login rejects an empty password",
+  "planSteps": [
+    {
+      "type": "action",
+      "description": "Navigate to /login and submit the form with an empty password"
+    },
+    {
+      "type": "assertion",
+      "description": "Verify an inline error says the password is required"
+    }
+  ]
+}
+```
+
+Get this exact skeleton without hand-copying it (and without the risk of it drifting from your installed version — see below): `testsprite test create --plan-template`. Full field reference (including the `{{...}}`-placeholder caveat, size caps, and the `$schema` hook for live editor validation): [Plan file format](./DOCUMENTATION.md#plan-file-format).
+
+> The `$schema` URL above is pinned to the CLI version that generated this doc (`v0.4.0`) — `--plan-template`'s live output always pins to **your installed version** instead, which is what actually resolves. If you're reading this on a later release, run the command yourself rather than trusting this snippet verbatim.
+
 Prefer to configure each step by hand (or learn the surface offline with `--dry-run` first)? See [Manual setup](./DOCUMENTATION.md#manual-setup) and [Install & verify](./DOCUMENTATION.md#install--verify).
 
 ## Commands
@@ -114,7 +139,7 @@ Prefer to configure each step by hand (or learn the surface offline with `--dry-
 |           | `project create` / `project update` / `project delete` | Manage projects; `delete` removes a project and everything under it (`--confirm` required, no restore window)                                         |
 |           | `project credential` / `project auto-auth`             | Configure backend-test auth: a static injected credential, or auto-refresh login (Pro)                                                                |
 | **Run**   | `test run`                                             | Trigger a fresh run; `--wait` blocks until terminal; `--all --project <id>` runs all tests in a project in wave order                                 |
-|           | `test rerun`                                           | Cheap replay of one/many tests (FE verbatim; BE with deps); `--all --project <id>` reruns all tests                                                   |
+|           | `test rerun`                                           | Replay one/many tests (FE verbatim; BE with deps); billed as a run (0.5 credits FE / 0.2 BE); `--all --project <id>` reruns all tests                 |
 |           | `test flaky`                                           | Replay a test several times (auto-heal off) and report a stability score                                                                              |
 |           | `test wait`                                            | Block on one or more `runId`s until terminal                                                                                                          |
 |           | `test cancel`                                          | Cancel one or more in-flight runs (Ctrl-C during `--wait` only detaches — `cancel` is the real stop)                                                  |

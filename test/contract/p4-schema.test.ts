@@ -277,7 +277,7 @@ function makeCreds(): { credentialsPath: string } {
   // sans the /api/cli/v1 suffix that facadeBaseUrl re-appends).
   writeFileSync(
     credentialsPath,
-    `[default]\napi_url = https://api.testsprite.com\napi_key = sk-test\n`,
+    `[default]\napi_url = https://api.testsprite.com\napi_key = sk-user-test\n`,
     { mode: 0o600 },
   );
   return { credentialsPath };

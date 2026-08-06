@@ -6,19 +6,33 @@ import { createAuthCommand } from './commands/auth.js';
 import { createCompletionCommand, type CompletionSpec } from './commands/completion.js';
 import { createDoctorCommand } from './commands/doctor.js';
 import {
+  addSetupOptions,
   createDeprecatedInitCommand,
   createSetupCommand,
   runConfigureViaSetup,
+  type SetupCmdOpts,
 } from './commands/init.js';
 import { createProjectCommand } from './commands/project.js';
 import { createTestCommand } from './commands/test.js';
 import { createUsageCommand } from './commands/usage.js';
+import { TARGETS, type AgentTarget } from './lib/agent-targets.js';
 import { ApiError, CLIError, InterruptError, RequestTimeoutError } from './lib/errors.js';
 import { installBrokenPipeGuard, installSignalHandlers } from './lib/interrupt.js';
 import { Output, isOutputMode } from './lib/output.js';
 import { maybeInstallProxyAgent } from './lib/proxy.js';
-import { renderCommanderError, rephraseUnknownOption } from './lib/render-error.js';
-import { maybeEmitSkillNudge } from './lib/skill-nudge.js';
+import {
+  renderAmbiguousOrgCandidates,
+  renderCommanderError,
+  rephraseUnknownOption,
+} from './lib/render-error.js';
+import { isPlanTemplateInvocation, maybeEmitSkillNudge } from './lib/skill-nudge.js';
+import {
+  classifyCliError,
+  isTelemetryOptedOut,
+  recordOutcome,
+  resolveTelemetryAuth,
+  type ResolvedTelemetryAuth,
+} from './lib/telemetry.js';
 import { maybeNotifyUpdate } from './lib/update-check.js';
 import { VERSION } from './version.js';
 import { shouldRejectNodeVersion } from './version-guard.js';
@@ -71,21 +85,23 @@ program.addCommand(createDeprecatedInitCommand({}), { hidden: true });
 // `auth configure` is a hidden, deprecated alias that runs FULL `setup`
 // (configure + skill install), so an agent reaching for the old command still
 // ends up with the skill. `setup` remains the ONLY path that writes credentials.
+// Attach the SAME flag set `setup` has (previously only
+// `--from-env` was wired up, so README's "runs the full setup" claim didn't
+// hold — `--yes`/`--agent`/`--api-key`/`--force`/`--dir`/`--no-agent` were all
+// rejected as `unknown option`).
 const authCommand = createAuthCommand();
-authCommand
-  .command('configure', { hidden: true })
-  .option(
-    '--from-env',
-    'Read TESTSPRITE_API_KEY (and optionally TESTSPRITE_API_URL) from the environment instead of prompting',
-    false,
-  )
-  .action(async (cmdOpts: { fromEnv?: boolean }, command: Command) => {
-    process.stderr.write(
-      '[deprecated] `testsprite auth configure` now runs full setup (configure + skill install) — ' +
-        'use `testsprite setup` (add --no-agent to skip the skill).\n',
-    );
-    await runConfigureViaSetup(command, {}, Boolean(cmdOpts.fromEnv));
-  });
+const authConfigureValidTargets = Object.keys(TARGETS) as AgentTarget[];
+addSetupOptions(
+  authCommand.command('configure', { hidden: true }),
+  authConfigureValidTargets,
+  'claude',
+).action(async (cmdOpts: SetupCmdOpts, command: Command) => {
+  process.stderr.write(
+    '[deprecated] `testsprite auth configure` now runs full setup (configure + skill install) — ' +
+      'use `testsprite setup` (add --no-agent to skip the skill).\n',
+  );
+  await runConfigureViaSetup(command, {}, cmdOpts);
+});
 program.addCommand(authCommand);
 
 program.addCommand(createProjectCommand({}));
@@ -122,6 +138,20 @@ function buildCompletionSpec(): CompletionSpec {
 // command throws CommanderError rather than calling process.exit directly.
 let pendingCommanderErrorMsg: string | null = null;
 
+// Leaf command path that actually reached an action (set by the preAction hook
+// below). Empty when no action ran (bare `--help`, parse error) — telemetry
+// skips those. Read by the success + error telemetry emits around parseAsync.
+let ranCommandPath = '';
+
+// Whether the command that ran should emit telemetry. `completion` (its stdout
+// is eval'd by shells) and `--plan-template` (pure-local) are kept off the
+// beacon, same as the update notice. Set by the preAction hook.
+let telemetryEmit = false;
+
+// Auth resolved in the preAction hook, before the command's action runs, so
+// `auth remove` (which deletes the profile) is still reported on the key it used.
+let telemetryAuth: ResolvedTelemetryAuth | undefined;
+
 // Propagate exitOverride AND the buffered outputError config to every
 // subcommand in the tree. Commander's addCommand() does NOT inherit either
 // from the parent, so commands built externally (createTestCommand, etc.) and
@@ -156,6 +186,22 @@ function commandPathOf(cmd: Command): string {
   return names.join(' ');
 }
 
+/** Global flags the telemetry emit needs (config resolution + context). */
+function telemetryGlobals(): {
+  profile?: string;
+  endpointUrl?: string;
+  output?: string;
+  dryRun?: boolean;
+} {
+  const g = program.opts<{
+    profile?: string;
+    endpointUrl?: string;
+    output?: string;
+    dryRun?: boolean;
+  }>();
+  return { profile: g.profile, endpointUrl: g.endpointUrl, output: g.output, dryRun: g.dryRun };
+}
+
 // Best-effort onboarding nudge (see lib/skill-nudge.ts): when a configured
 // caller drives a verify-loop command in a project with no installed skill,
 // point it at `testsprite setup`. A preAction hook runs before every leaf
@@ -165,24 +211,53 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
   const globals = actionCommand.optsWithGlobals() as {
     output?: string;
     profile?: string;
+    endpointUrl?: string;
     dryRun?: boolean;
+    planTemplate?: boolean;
   };
   const commandPath = commandPathOf(actionCommand);
-  maybeEmitSkillNudge({
-    commandPath,
-    output: isOutputMode(globals.output) ? globals.output : 'text',
-    dryRun: globals.dryRun ?? false,
-    profile: globals.profile ?? 'default',
-    cwd: process.cwd(),
-    env: process.env,
-  });
+  // Record which leaf command ran, for the telemetry emit around parseAsync.
+  ranCommandPath = commandPath;
+  // See `isPlanTemplateInvocation` for why this one case is
+  // filtered here rather than in skill-nudge.ts / update-check.ts.
+  const isPlanTemplate = isPlanTemplateInvocation(commandPath, globals.planTemplate);
+
+  // Telemetry gate, same reasons as the update notice below: skip `completion`
+  // (its stdout is eval'd by shells) and `--plan-template` (pure-local). Resolve
+  // auth now, before the command's action runs, so `auth remove` still reports
+  // on the key it used; skip the read for opt-out / dry-run.
+  telemetryEmit = commandPath !== 'completion' && !isPlanTemplate;
+  if (telemetryEmit && !isTelemetryOptedOut(process.env) && globals.dryRun !== true) {
+    telemetryAuth = resolveTelemetryAuth({
+      profile: globals.profile,
+      endpointUrl: globals.endpointUrl,
+    });
+  }
+  if (!isPlanTemplate) {
+    maybeEmitSkillNudge({
+      commandPath,
+      output: isOutputMode(globals.output) ? globals.output : 'text',
+      dryRun: globals.dryRun ?? false,
+      profile: globals.profile ?? 'default',
+      cwd: process.cwd(),
+      env: process.env,
+    });
+  }
 
   // Best-effort update notice (see lib/update-check.ts): self-gates on the
   // opt-out env, CI, TTY, and a 24h cache; the wiring adds the flag-level
   // gates the lib cannot see. Skipped for `completion` (its stdout is eval'd
-  // by shells), under --output json, and under --dry-run. Deliberately not
-  // awaited: an advisory must never delay the real command.
-  if (globals.output !== 'json' && globals.dryRun !== true && commandPath !== 'completion') {
+  // by shells), under --output json, under --dry-run, and for
+  // `--plan-template` (pure-local — this check hits the npm registry over
+  // the network and writes ~/.testsprite/update-check.json, both of which
+  // contradict "no network" for this flag). Deliberately not awaited: an
+  // advisory must never delay the real command.
+  if (
+    globals.output !== 'json' &&
+    globals.dryRun !== true &&
+    commandPath !== 'completion' &&
+    !isPlanTemplate
+  ) {
     void maybeNotifyUpdate();
   }
 });
@@ -202,9 +277,46 @@ installBrokenPipeGuard();
 // ignores them by default). No-op when no proxy variable is set.
 maybeInstallProxyAgent();
 
+const telemetryStartedAt = Date.now();
 try {
   await program.parseAsync(process.argv);
+  // Flush a success outcome event before the process exits 0. Bounded +
+  // best-effort (see lib/telemetry.ts); skips when no command ran / no key
+  // configured / opted out / --dry-run.
+  if (telemetryEmit) {
+    await recordOutcome(
+      {
+        command: ranCommandPath,
+        outcome: 'success',
+        exitCode: 0,
+        durationMs: Date.now() - telemetryStartedAt,
+        ...telemetryGlobals(),
+      },
+      { resolvedAuth: telemetryAuth },
+    );
+  }
 } catch (err) {
+  const telemetryOutcome = classifyCliError(err);
+  // Flush the outcome AFTER the error is rendered to stderr below (via each
+  // branch's `flushThenExit`), so a slow backend never delays the user's error.
+  // The classification mirrors the exit-code mapping the branches apply.
+  const flushThenExit = async (code: number): Promise<never> => {
+    if (telemetryEmit) {
+      await recordOutcome(
+        {
+          command: ranCommandPath,
+          outcome: telemetryOutcome.outcome,
+          exitCode: telemetryOutcome.exitCode,
+          errorCode: telemetryOutcome.errorCode,
+          durationMs: Date.now() - telemetryStartedAt,
+          ...telemetryGlobals(),
+        },
+        { resolvedAuth: telemetryAuth },
+      );
+    }
+    process.exit(code);
+  };
+
   const rawMode = program.opts<{ output?: string }>().output;
   const mode = isOutputMode(rawMode) ? rawMode : 'text';
   if (err instanceof ApiError) {
@@ -245,8 +357,16 @@ try {
           process.stderr.write(`  your version: ${your}, minimum supported: ${min}\n`);
         }
       }
+      // AMBIGUOUS_ORG: the same testId resolved inside more than one of the
+      // caller's organizations. List each colliding candidate plus a hint to
+      // disambiguate, mirroring the AUTH_FORBIDDEN required/granted pattern above.
+      if (err.code === 'AMBIGUOUS_ORG') {
+        for (const line of renderAmbiguousOrgCandidates(err.getDetail('candidates'))) {
+          process.stderr.write(`${line}\n`);
+        }
+      }
     }
-    process.exit(err.exitCode);
+    await flushThenExit(err.exitCode);
   }
   const output = new Output(mode);
   if (err instanceof InterruptError) {
@@ -271,7 +391,7 @@ try {
     } else {
       process.stderr.write(`Error: ${err.message}\n`);
     }
-    process.exit(err.exitCode);
+    await flushThenExit(err.exitCode);
   }
   if (err instanceof RequestTimeoutError) {
     // Structured rendering for per-request timeouts: JSON mode emits a
@@ -292,7 +412,7 @@ try {
     } else {
       process.stderr.write(`Error: ${err.message}\n`);
     }
-    process.exit(err.exitCode);
+    await flushThenExit(err.exitCode);
   }
   if (err instanceof CommanderError) {
     // Map exit codes per the CLI taxonomy:
@@ -313,7 +433,7 @@ try {
       err.code === 'commander.help' ||
       err.code === 'commander.version'
     ) {
-      process.exit(0);
+      await flushThenExit(0);
     }
     // For parse errors, write the buffered message in the correct format.
     // rawMode from program.opts() is reliable when --output was parsed before
@@ -332,12 +452,12 @@ try {
     process.stderr.write(
       renderCommanderError(pendingCommanderErrorMsg, err.message, commanderMode),
     );
-    process.exit(5);
+    await flushThenExit(5);
   }
   if (err instanceof CLIError) {
     output.error(err.message);
-    process.exit(err.exitCode);
+    await flushThenExit(err.exitCode);
   }
   output.error(err instanceof Error ? err.message : String(err));
-  process.exit(1);
+  await flushThenExit(1);
 }

@@ -18,6 +18,7 @@
  */
 import type {
   CliProject,
+  CliCreateProjectResponse,
   CliUpdateProjectResponse,
   CliDeleteProjectResponse,
 } from '../../commands/project.js';
@@ -110,6 +111,15 @@ const me: MeResponse = {
   scopes: ['read:projects', 'read:tests', 'write:tests', 'run:tests'],
   env: 'development',
   v3Enabled: true,
+  activeOrg: {
+    id: '22222222-2222-4222-8222-222222222222',
+    name: 'Dry Run Workspace',
+    plan: 'Standard',
+    role: 'owner',
+    remaining: 1650,
+    includedCredits: 1600,
+    seats: 1,
+  },
 };
 
 const projects: CliProject[] = [
@@ -389,16 +399,21 @@ const ENTRIES: DryRunSampleEntry[] = [
   entry('getProject', 'GET', '/projects/{projectId}', projects[0]),
   // P6 — POST /projects (create project). The id uses a stable dry-run
   // sentinel so agents can see a coherent field shape without a real key.
+  // Both `projectId` (the live field) and `id` (legacy/
+  // fallback) are shown — see `CliCreateProjectResponse`.
   entry('createProject', 'POST', '/projects', {
+    projectId: 'p_dryrun_create_2026',
     id: 'p_dryrun_create_2026',
     type: 'frontend',
     name: 'Dry-run project',
     createdFrom: 'cli',
     createdAt: '2026-05-16T00:00:00.000Z',
     updatedAt: '2026-05-16T00:00:00.000Z',
-  } satisfies CliProject),
-  // P7 — PATCH /projects/{id} (update project).
+  } satisfies CliCreateProjectResponse),
+  // P7 — PATCH /projects/{id} (update project). Both id
+  // field names shown — see `CliUpdateProjectResponse`.
   entry('updateProject', 'PATCH', '/projects/{projectId}', {
+    projectId: SAMPLE_PROJECT_ID,
     id: SAMPLE_PROJECT_ID,
     updatedFields: ['name'],
     updatedAt: '2026-05-16T00:00:00.000Z',

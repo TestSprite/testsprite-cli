@@ -9,11 +9,17 @@ describe('routingLabel', () => {
 });
 
 describe('V3 routing advisory', () => {
-  it('names each open behavior gap (cancel, delete, target-url)', () => {
+  it('names the open behavior gaps', () => {
     const text = V3_ROUTING_ADVISORY.join('\n');
-    expect(text).toContain('test cancel');
-    expect(text).toContain('test delete');
     expect(text).toContain('--target-url');
+    expect(text).toContain('rerun');
+  });
+
+  // Warning about behavior that now works trains users to ignore the block.
+  it('no longer warns about gaps that have shipped', () => {
+    const text = V3_ROUTING_ADVISORY.join('\n');
+    expect(text).not.toContain('test cancel');
+    expect(text).not.toContain('zombie');
   });
 
   it('emitV3RoutingAdvisory writes every line to the sink', () => {

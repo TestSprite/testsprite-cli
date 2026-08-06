@@ -316,8 +316,11 @@ describe('findSample', () => {
           break;
         }
         case 'createProject':
-          // P6 — POST /projects → CliProject shape.
+          // P6 — POST /projects → CliCreateProjectResponse shape. Both id
+          // field names present (the live field is
+          // `projectId`; `id` is kept for back-compat).
           expect(body).toMatchObject({
+            projectId: expect.any(String),
             id: expect.any(String),
             type: expect.any(String),
             name: expect.any(String),
@@ -326,8 +329,10 @@ describe('findSample', () => {
           });
           break;
         case 'updateProject':
-          // P7 — PATCH /projects/{id} → CliUpdateProjectResponse shape.
+          // P7 — PATCH /projects/{id} → CliUpdateProjectResponse shape. Both
+          // id field names present.
           expect(body).toMatchObject({
+            projectId: expect.any(String),
             id: expect.any(String),
             updatedFields: expect.any(Array),
             updatedAt: expect.any(String),

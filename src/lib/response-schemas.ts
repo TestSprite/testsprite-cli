@@ -36,6 +36,7 @@ import type {
   BatchRerunResponse,
   BatchRunFreshResponse,
   ListRunsResponse,
+  RerunAdvisory,
   RerunClosure,
   RerunResponse,
   RunResponse,
@@ -92,8 +93,13 @@ export const RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, RunResponse> = v.loos
   createdAt: v.string(),
   startedAt: v.nullish(v.string(), null),
   finishedAt: v.nullish(v.string(), null),
-  codeVersion: v.string(),
-  targetUrl: v.string(),
+  // Both are nullable on the wire (`RunEnvelope` declares
+  // `[string, 'null']`): `codeVersion` is null on pre-M3.1 rows and on tests
+  // with no stored code body, `targetUrl` is null for backend runs and for
+  // execution backends that record no URL. Renderers already omit the line
+  // when either is null (rule 3).
+  codeVersion: v.nullish(v.string(), null),
+  targetUrl: v.nullish(v.string(), null),
   createdFrom: v.nullish(v.string(), null),
   failedStepIndex: v.nullish(v.number(), null),
   failureKind: v.nullish(v.string(), null),
@@ -103,9 +109,25 @@ export const RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, RunResponse> = v.loos
   videoUrl: v.nullish(v.string(), null),
   stepSummary: RUN_STEP_SUMMARY_SCHEMA,
   retryAfterSeconds: v.optional(v.number()),
-  // Client-synthesized Portal link (never sent by the server); tolerated so a
-  // future server echo cannot fail validation.
-  dashboardUrl: v.optional(v.string()),
+  // Portal link. Newer backends DO send this (they alone know which store
+  // answered the read and can resolve a non-prod portal origin); older ones
+  // omit it and the CLI computes its own. `nullish` rather than `optional`
+  // deliberately: the backend omits the field when no correct link exists, but
+  // a `null` from any other producer must not fail validation and take down
+  // `test wait` — the same trap that had to be un-sprung for a null
+  // `targetUrl`/`codeVersion`.
+  //
+  // The `undefined` default (NOT `null`, unlike every field above) is load-bearing
+  // and measured: valibot applies a default only when the key is absent, and
+  // skips the assignment entirely when that default is `undefined` — so an
+  // omitted field stays an ABSENT key, which is exactly what
+  // `withRunDashboardUrl`'s `'dashboardUrl' in run` test reads to decide
+  // "old backend, compute the link myself". Aligning this with the
+  // `nullish(..., null)` fields above would materialize the key on every
+  // response and silently kill that fallback. A wire `null` is preserved as
+  // null here (nullable passes it through untouched) and normalized at the
+  // consumer, not in the schema. Locked by tests in response-schemas.test.ts.
+  dashboardUrl: v.nullish(v.string(), undefined),
   // Absence means "steps not requested" and drives command branching, so no
   // default is applied (rule 3, optional branch).
   steps: v.optional(v.nullable(v.array(RUN_STEP_DTO_SCHEMA))),
@@ -144,6 +166,18 @@ const RERUN_CLOSURE_SCHEMA: v.GenericSchema<unknown, RerunClosure> = v.looseObje
   clearedCaptured: v.number(),
 });
 
+/**
+ * Mirrors `RerunAdvisory` (runs.types.ts): a server-side note that a
+ * requested option was forwarded to the execution engine but is not yet
+ * honored there. Present only on a V3-routed rerun that explicitly opted
+ * out of auto-heal — absent everywhere else, so this schema is only ever
+ * used inside an `v.optional(v.array(...))` wrapper.
+ */
+const RERUN_ADVISORY_SCHEMA: v.GenericSchema<unknown, RerunAdvisory> = v.looseObject({
+  feature: v.string(),
+  message: v.string(),
+});
+
 /** Mirrors `RerunResponse` (runs.types.ts): `POST /tests/{testId}/runs/rerun`. */
 export const RERUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, RerunResponse> = v.looseObject({
   runId: v.string(),
@@ -154,6 +188,11 @@ export const RERUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, RerunResponse> = v.
   // FE reruns omit `closure`; the CLI's `!!closure` truthy check relies on
   // absent staying absent, so optional with no default (rule 3).
   closure: v.optional(v.nullable(RERUN_CLOSURE_SCHEMA)),
+  // Absent on every response except a V3-routed rerun with an explicit
+  // autoHeal:false opt-out (rule 3: optional, no default, so presence/absence
+  // survives validation byte-identically). Older backends that predate the
+  // field simply omit it — never fails validation.
+  advisories: v.optional(v.array(RERUN_ADVISORY_SCHEMA)),
 });
 
 // ---------------------------------------------------------------------------
@@ -185,6 +224,10 @@ export const BATCH_RERUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, BatchRerunRes
     }),
     // Optional on the wire for back-compat with older backends (D2-CLI).
     notFound: v.optional(v.array(v.string())),
+    // Absent on every response except a V3-routed batch containing at least
+    // one FE test with an explicit autoHeal:false opt-out. Same resilience
+    // rule as RERUN_RESPONSE_SCHEMA.advisories above.
+    advisories: v.optional(v.array(RERUN_ADVISORY_SCHEMA)),
   });
 
 // ---------------------------------------------------------------------------
@@ -224,7 +267,8 @@ const RUN_HISTORY_ITEM_SCHEMA = v.looseObject({
   createdAt: v.string(),
   startedAt: v.nullish(v.string(), null),
   finishedAt: v.nullish(v.string(), null),
-  codeVersion: v.string(),
+  // Nullable on the wire (`RunHistoryRow.codeVersion` is `[string, 'null']`).
+  codeVersion: v.nullish(v.string(), null),
   failureKind: v.nullish(v.string(), null),
   // G1b fields: optional on the wire for back-compat with older backends.
   targetUrl: v.optional(v.nullable(v.string())),
@@ -262,10 +306,39 @@ export const LIST_RUNS_RESPONSE_SCHEMA: v.GenericSchema<unknown, ListRunsRespons
 export interface MeIdentityWire {
   userId?: string;
   keyId?: string;
+  /**
+   * Account-wide organization membership list (mirrors `CliOrgSummary` in
+   * `lib/org-render.ts`). Optional/absent-safe: omitted on a server-side
+   * lookup failure or an older backend.
+   */
+  organizations?: Array<{ id: string; name: string; role: string; isPersonal: boolean }>;
+  /**
+   * The calling key's own org binding (mirrors `CliOrgBinding`). Present
+   * only for a Postgres-backed membership key (`sk-member-…`); `name` is
+   * nullable (best-effort resolution).
+   */
+  org?: { id: string; name: string | null; role: string };
 }
+
+/** Mirrors `CliOrgSummary` (lib/org-render.ts): one `Me.organizations[]` entry. */
+const ORG_SUMMARY_SCHEMA = v.looseObject({
+  id: v.string(),
+  name: v.string(),
+  role: v.string(),
+  isPersonal: v.boolean(),
+});
+
+/** Mirrors `CliOrgBinding` (lib/org-render.ts): `Me.org`. */
+const ORG_BINDING_SCHEMA = v.looseObject({
+  id: v.string(),
+  name: v.nullable(v.string()),
+  role: v.string(),
+});
 
 /** Mirrors `MeIdentity` (commands/doctor.ts): `GET /api/cli/v1/me` core. */
 export const ME_IDENTITY_SCHEMA: v.GenericSchema<unknown, MeIdentityWire> = v.looseObject({
   userId: v.optional(v.string()),
   keyId: v.optional(v.string()),
+  organizations: v.optional(v.array(ORG_SUMMARY_SCHEMA)),
+  org: v.optional(ORG_BINDING_SCHEMA),
 });

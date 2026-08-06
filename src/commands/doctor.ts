@@ -24,6 +24,8 @@ import {
 import { loadConfig } from '../lib/config.js';
 import { ApiError, CLIError, localValidationError } from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
+import type { CliOrgBinding, CliOrgSummary } from '../lib/org-render.js';
+import { formatOrgBinding, formatOrgsSummary, formatPersonalScopeHint } from '../lib/org-render.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
 import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
@@ -51,6 +53,10 @@ interface MeIdentity {
   userId?: string;
   keyId?: string;
   v3Enabled?: boolean;
+  /** Account-wide membership list. Absent-safe (older backends omit it). */
+  organizations?: CliOrgSummary[];
+  /** The calling key's own org binding — membership keys only. */
+  org?: CliOrgBinding;
 }
 
 export interface DoctorDeps {
@@ -110,6 +116,22 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
           ? `${label} (V3 execution routing is ON)`
           : `${label} (default routing)`,
     });
+  }
+
+  // Org attribution lines — only when the backend reported them (no new call).
+  const orgsSummary = formatOrgsSummary(connectivity.organizations);
+  if (orgsSummary) {
+    checks.push({ name: 'Organizations', status: 'ok', detail: orgsSummary });
+  }
+  const orgBinding = formatOrgBinding(connectivity.org);
+  if (orgBinding) {
+    checks.push({ name: 'Org binding', status: 'ok', detail: orgBinding });
+  }
+  // Warn, not fail: the key works — it just cannot see the team's work, which
+  // otherwise looks like missing data rather than a scoping choice.
+  const personalScopeHint = formatPersonalScopeHint(connectivity.organizations, connectivity.org);
+  if (personalScopeHint) {
+    checks.push({ name: 'Workspace scope', status: 'warn', detail: personalScopeHint });
   }
 
   checks.push(checkSkill(cwd, deps));
@@ -198,7 +220,12 @@ async function checkConnectivity(
   opts: CommonOptions,
   deps: DoctorDeps,
   ctx: { hasKey: boolean; endpointOk: boolean },
-): Promise<{ check: DoctorCheck; v3Enabled?: boolean }> {
+): Promise<{
+  check: DoctorCheck;
+  v3Enabled?: boolean;
+  organizations?: CliOrgSummary[];
+  org?: CliOrgBinding;
+}> {
   const name = 'Connectivity';
   if (opts.dryRun) return { check: { name, status: 'warn', detail: 'skipped under --dry-run' } };
   if (!ctx.hasKey)
@@ -218,6 +245,8 @@ async function checkConnectivity(
     return {
       check: { name, status: 'ok', detail: `reached GET /me, API key accepted${who}` },
       v3Enabled: me.v3Enabled,
+      organizations: me.organizations,
+      org: me.org,
     };
   } catch (error) {
     if (error instanceof ApiError) {

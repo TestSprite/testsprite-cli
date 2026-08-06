@@ -80,6 +80,21 @@ export interface ClientFactoryDeps {
 }
 
 /**
+ * Accepted TestSprite API-key prefixes, in the order they are reported to the
+ * user. Three families exist today and all three authenticate:
+ *
+ *   - `sk-user-…`   legacy encrypted-envelope key — acts as the human
+ *   - `sk-member-…` membership key — acts as ONE org membership of that human
+ *   - `tsp_…`       the pre-rename spelling of a membership key (`sk-member-…`);
+ *                   still issued to nobody, still valid for everyone holding one
+ *
+ * `sk-member-` is deliberately NOT shortened to `sk-` here: this list is only
+ * a fail-fast format check, but keeping the full prefixes means the message
+ * below can name exactly what the server will accept.
+ */
+export const API_KEY_PREFIXES = ['sk-user-', 'sk-member-', 'tsp_'] as const;
+
+/**
  * The fake API key used in dry-run. Never sent — the dry-run fetch
  * impl ignores headers and returns a canned sample. Documented in the
  * runbook so secret-scanners don't flag it as a leak.
@@ -189,6 +204,32 @@ export function assertValidEndpointUrl(rawUrl: string): void {
   }
 }
 
+/**
+ * Reject a key that isn't a TestSprite key, up front — so a malformed key
+ * fails fast instead of a slow live `fetch failed`. Checks only the prefix +
+ * non-empty body against {@link API_KEY_PREFIXES}, so it can never reject a
+ * real key of any issued family.
+ */
+export function assertValidApiKeyFormat(apiKey: string): void {
+  const matchesPrefix = (prefix: string): boolean =>
+    apiKey.startsWith(prefix) && apiKey.length > prefix.length;
+  if (!API_KEY_PREFIXES.some(matchesPrefix)) {
+    const shown = API_KEY_PREFIXES.map(p => `\`${p}\``).join(', ');
+    throw localValidationError(
+      'api-key',
+      `must be a TestSprite API key beginning with one of ${shown} (create one in the dashboard, then run \`testsprite setup\`)`,
+      undefined,
+      'field',
+    );
+  }
+}
+
+/** Up-front key validation: TestSprite format + legal HTTP header value. */
+export function assertValidApiKey(apiKey: string): void {
+  assertValidApiKeyFormat(apiKey);
+  assertValidApiKeyHeaderValue(apiKey);
+}
+
 export function assertValidApiKeyHeaderValue(apiKey: string): void {
   const reason =
     'must be a non-empty HTTP header value; paste the raw key without smart punctuation, emoji, or line breaks';
@@ -277,7 +318,7 @@ export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}
   // VALIDATION_ERROR rather than an opaque URL throw or a retried "fetch failed".
   assertValidEndpointUrl(config.apiUrl);
   if (!config.apiKey) throw ApiError.authRequired();
-  assertValidApiKeyHeaderValue(config.apiKey);
+  assertValidApiKey(config.apiKey);
   return new HttpClient({
     baseUrl: facadeBaseUrl(config.apiUrl),
     apiKey: config.apiKey,

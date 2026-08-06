@@ -57,16 +57,33 @@ describe('runConfigure', () => {
       { profile: 'default', output: 'text', debug: false, fromEnv: true },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-from-env', TESTSPRITE_API_URL: 'https://from-env' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-from-env', TESTSPRITE_API_URL: 'https://from-env' },
         credentialsPath,
         fetchImpl: meOkFetch,
       },
     );
     expect(readProfile('default', { path: credentialsPath })).toEqual({
-      apiKey: 'sk-from-env',
+      apiKey: 'sk-user-from-env',
       apiUrl: 'https://from-env',
     });
     expect(capture.stdout.join('\n')).toContain('configured');
+  });
+
+  it('rejects a malformed API key up front, before the pre-write /me ping', async () => {
+    const { deps } = makeCapture();
+    const fetchImpl = vi.fn();
+    await expect(
+      runConfigure(
+        { profile: 'default', output: 'text', debug: false, fromEnv: true },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'not-a-valid-key-format!!' },
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('--from-env without TESTSPRITE_API_URL uses the built-in default endpoint', async () => {
@@ -75,7 +92,7 @@ describe('runConfigure', () => {
       { profile: 'default', output: 'text', debug: false, fromEnv: true },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-min' },
         credentialsPath,
         fetchImpl: meOkFetch,
       },
@@ -98,7 +115,7 @@ describe('runConfigure', () => {
       {
         ...deps,
         env: {
-          TESTSPRITE_API_KEY: 'sk',
+          TESTSPRITE_API_KEY: 'sk-user-min',
           TESTSPRITE_API_URL: 'https://env-loses.example.com',
         },
         credentialsPath,
@@ -143,7 +160,7 @@ describe('runConfigure', () => {
         },
         {
           ...deps,
-          env: { TESTSPRITE_API_KEY: 'sk' },
+          env: { TESTSPRITE_API_KEY: 'sk-user-min' },
           credentialsPath,
           fetchImpl,
         },
@@ -179,7 +196,7 @@ describe('runConfigure', () => {
         },
         {
           ...deps,
-          env: { TESTSPRITE_API_KEY: 'sk' },
+          env: { TESTSPRITE_API_KEY: 'sk-user-min' },
           credentialsPath,
           fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
         },
@@ -210,7 +227,7 @@ describe('runConfigure', () => {
         },
         {
           ...deps,
-          env: { TESTSPRITE_API_KEY: 'sk' },
+          env: { TESTSPRITE_API_KEY: 'sk-user-min' },
           credentialsPath,
           fetchImpl: fetchImpl as unknown as AuthDeps['fetchImpl'],
         },
@@ -264,7 +281,7 @@ describe('runConfigure', () => {
     // the endpoint it would call an undefined `text` and throw — so a passing
     // test proves the endpoint is never prompted.
     const prompt = {
-      secret: vi.fn(async () => 'sk-typed'),
+      secret: vi.fn(async () => 'sk-user-typed'),
     };
     await runConfigure(
       { profile: 'default', output: 'text', debug: false, fromEnv: false },
@@ -272,7 +289,7 @@ describe('runConfigure', () => {
     );
     expect(prompt.secret).toHaveBeenCalledTimes(1);
     expect(readProfile('default', { path: credentialsPath })).toEqual({
-      apiKey: 'sk-typed',
+      apiKey: 'sk-user-typed',
       apiUrl: 'https://api.testsprite.com',
     });
     expect(capture.prelude.join('')).toContain('Configuring profile "default"');
@@ -294,7 +311,7 @@ describe('runConfigure', () => {
         { profile: 'default', output: 'text', debug: false, fromEnv: false },
         {
           stdout: line => stdout.push(line),
-          prompt: { secret: vi.fn(async () => 'sk-typed') },
+          prompt: { secret: vi.fn(async () => 'sk-user-typed') },
           fetchImpl: meOkFetch,
           credentialsPath,
           env: {},
@@ -309,7 +326,7 @@ describe('runConfigure', () => {
 
   it('interactive path resolves the endpoint from TESTSPRITE_API_URL without prompting', async () => {
     const { capture, deps } = makeCapture();
-    const prompt = { secret: vi.fn(async () => 'sk-typed') };
+    const prompt = { secret: vi.fn(async () => 'sk-user-typed') };
     await runConfigure(
       { profile: 'default', output: 'text', debug: false, fromEnv: false },
       {
@@ -321,7 +338,7 @@ describe('runConfigure', () => {
       },
     );
     expect(readProfile('default', { path: credentialsPath })).toEqual({
-      apiKey: 'sk-typed',
+      apiKey: 'sk-user-typed',
       apiUrl: 'https://api.example.com:8443',
     });
     // An env-supplied endpoint is explicit → no inherit advisory.
@@ -334,16 +351,16 @@ describe('runConfigure', () => {
     // (the internal dogfooding flow) without ever prompting for the endpoint.
     writeProfile(
       'dev',
-      { apiKey: 'sk-old', apiUrl: 'https://api.example.com:8443' },
+      { apiKey: 'sk-user-old', apiUrl: 'https://api.example.com:8443' },
       { path: credentialsPath },
     );
-    const prompt = { secret: vi.fn(async () => 'sk-typed') };
+    const prompt = { secret: vi.fn(async () => 'sk-user-typed') };
     await runConfigure(
       { profile: 'dev', output: 'text', debug: false, fromEnv: false },
       { ...deps, env: {}, credentialsPath, prompt, fetchImpl: meOkFetch },
     );
     expect(readProfile('dev', { path: credentialsPath })).toEqual({
-      apiKey: 'sk-typed',
+      apiKey: 'sk-user-typed',
       apiUrl: 'https://api.example.com:8443',
     });
     expect(capture.stderr.join('\n')).toContain(
@@ -364,7 +381,7 @@ describe('runConfigure', () => {
 
   it('honors --endpoint-url without prompting for the endpoint', async () => {
     const { capture, deps } = makeCapture();
-    const prompt = { secret: vi.fn(async () => 'sk-1') };
+    const prompt = { secret: vi.fn(async () => 'sk-user-1') };
     await runConfigure(
       {
         profile: 'default',
@@ -390,12 +407,12 @@ describe('runConfigure', () => {
       { profile: 'default', output: 'text', debug: false, fromEnv: true },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-good' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-good' },
         credentialsPath,
         fetchImpl: meOkFetch,
       },
     );
-    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-good');
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-good');
     expect(capture.stdout.join('\n')).toContain('configured');
   });
 
@@ -422,7 +439,7 @@ describe('runConfigure', () => {
         { profile: 'default', output: 'text', debug: false, fromEnv: true },
         {
           ...deps,
-          env: { TESTSPRITE_API_KEY: 'sk-bad' },
+          env: { TESTSPRITE_API_KEY: 'sk-user-bad' },
           credentialsPath,
           fetchImpl: rejectedFetch,
         },
@@ -462,7 +479,7 @@ describe('runConfigure', () => {
         { profile: 'default', output: 'json', debug: false, fromEnv: true },
         {
           ...deps,
-          env: { TESTSPRITE_API_KEY: 'sk-bad' },
+          env: { TESTSPRITE_API_KEY: 'sk-user-bad' },
           credentialsPath,
           fetchImpl: rejectedFetch,
         },
@@ -484,7 +501,7 @@ describe('runConfigure', () => {
       { profile: 'default', output: 'text', debug: false, fromEnv: true },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-good' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-good' },
         credentialsPath,
         fetchImpl: meOkFetch,
       },
@@ -498,7 +515,7 @@ describe('runConfigure', () => {
       { profile: 'default', output: 'json', debug: false, fromEnv: true },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-good' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-good' },
         credentialsPath,
         fetchImpl: meOkFetch,
       },
@@ -512,7 +529,7 @@ describe('runConfigure', () => {
       { profile: 'default', output: 'text', debug: false, fromEnv: true, dryRun: true },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-good' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-good' },
         credentialsPath,
         fetchImpl: meOkFetch,
       },
@@ -543,7 +560,7 @@ describe('runConfigure', () => {
         { profile: 'default', output: 'text', debug: false, fromEnv: true },
         {
           ...deps,
-          env: { TESTSPRITE_API_KEY: 'sk-bad' },
+          env: { TESTSPRITE_API_KEY: 'sk-user-bad' },
           credentialsPath,
           fetchImpl: rejectedFetch,
         },
@@ -559,7 +576,7 @@ describe('runConfigure', () => {
     // Pre-write an existing profile with a custom (non-default) endpoint.
     writeProfile(
       'default',
-      { apiKey: 'sk-old', apiUrl: 'https://api.example.com' },
+      { apiKey: 'sk-user-old', apiUrl: 'https://api.example.com' },
       { path: credentialsPath },
     );
     // codex-review P2 (2026-05-28): capture the URL the /me ping was made against
@@ -581,14 +598,14 @@ describe('runConfigure', () => {
       { profile: 'default', output: 'text', debug: false, fromEnv: true },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-new' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-new' },
         credentialsPath,
         fetchImpl: urlAwareFetch,
       },
     );
     // The new profile should reuse the inherited dev endpoint.
     expect(readProfile('default', { path: credentialsPath })).toEqual({
-      apiKey: 'sk-new',
+      apiKey: 'sk-user-new',
       apiUrl: 'https://api.example.com',
     });
     // The /me ping MUST have been issued against the inherited dev URL — this is
@@ -607,7 +624,7 @@ describe('runConfigure', () => {
     const { capture, deps } = makeCapture();
     writeProfile(
       'default',
-      { apiKey: 'sk-old', apiUrl: 'https://api.example.com' },
+      { apiKey: 'sk-user-old', apiUrl: 'https://api.example.com' },
       { path: credentialsPath },
     );
     await runConfigure(
@@ -620,7 +637,7 @@ describe('runConfigure', () => {
       },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-new' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-new' },
         credentialsPath,
         fetchImpl: meOkFetch,
       },
@@ -637,14 +654,14 @@ describe('runConfigure', () => {
     // Existing profile has the default prod endpoint — no advisory needed.
     writeProfile(
       'default',
-      { apiKey: 'sk-old', apiUrl: 'https://api.testsprite.com' },
+      { apiKey: 'sk-user-old', apiUrl: 'https://api.testsprite.com' },
       { path: credentialsPath },
     );
     await runConfigure(
       { profile: 'default', output: 'text', debug: false, fromEnv: true },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-new' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-new' },
         credentialsPath,
         fetchImpl: meOkFetch,
       },
@@ -659,7 +676,7 @@ describe('runConfigure', () => {
       { profile: 'default', output: 'text', debug: false, fromEnv: true },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-new' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-new' },
         credentialsPath,
         fetchImpl: meOkFetch,
       },
@@ -692,7 +709,7 @@ describe('runConfigure', () => {
       { profile: 'default', output: 'text', debug: false, fromEnv: true },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-bad' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-bad' },
         credentialsPath,
         fetchImpl: rejectedFetch,
       },
@@ -713,7 +730,7 @@ describe('runConfigure', () => {
     // to the existing profile's api_url.
     writeProfile(
       'default',
-      { apiKey: 'sk-old', apiUrl: 'https://api.example.com:8443' },
+      { apiKey: 'sk-user-old', apiUrl: 'https://api.example.com:8443' },
       { path: credentialsPath },
     );
     const seenFetchUrls: string[] = [];
@@ -730,7 +747,7 @@ describe('runConfigure', () => {
       { profile: 'default', output: 'text', debug: false, fromEnv: true },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-new', TESTSPRITE_API_URL: '   ' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-new', TESTSPRITE_API_URL: '   ' },
         credentialsPath,
         fetchImpl: urlAwareFetch,
       },
@@ -765,7 +782,7 @@ describe('runConfigure', () => {
       { profile: 'default', output: 'json', debug: false, fromEnv: true },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-min' },
         credentialsPath,
         fetchImpl: capturingFetch,
         commandTag: 'init',
@@ -790,7 +807,7 @@ describe('runConfigure', () => {
       { profile: 'default', output: 'json', debug: false, fromEnv: true },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-min' },
         credentialsPath,
         fetchImpl: capturingFetch,
       },
@@ -819,14 +836,14 @@ describe('runWhoami', () => {
   it('calls GET /me using the configured profile and prints text output', async () => {
     writeProfile(
       'default',
-      { apiKey: 'sk-stored', apiUrl: 'https://api.example.com' },
+      { apiKey: 'sk-user-stored', apiUrl: 'https://api.example.com' },
       { path: credentialsPath },
     );
     const { capture, deps } = makeCapture();
     const fetchImpl = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       expect(input.toString()).toBe('https://api.example.com/api/cli/v1/me');
       const headers = new Headers(init?.headers);
-      expect(headers.get('x-api-key')).toBe('sk-stored');
+      expect(headers.get('x-api-key')).toBe('sk-user-stored');
       expect(headers.get('authorization')).toBeNull();
       return meResponse();
     });
@@ -840,7 +857,7 @@ describe('runWhoami', () => {
   });
 
   it('emits JSON when --output json', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runWhoami(
       { profile: 'default', output: 'json', debug: false },
@@ -851,7 +868,7 @@ describe('runWhoami', () => {
   });
 
   it('renders routing: v3 and the gap advisory when v3Enabled is true', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const meV3 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: true }), {
       status: 200,
@@ -863,11 +880,11 @@ describe('runWhoami', () => {
     );
     expect(capture.stdout.join('\n')).toContain('routing: v3');
     expect(capture.stderr.join('\n')).toContain('[advisory]');
-    expect(capture.stderr.join('\n')).toContain('test cancel');
+    expect(capture.stderr.join('\n')).toContain('--target-url');
   });
 
   it('renders routing: v2 and NO advisory when v3Enabled is false', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const meV2 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: false }), {
       status: 200,
@@ -882,7 +899,7 @@ describe('runWhoami', () => {
   });
 
   it('omits the routing line when the backend does not return v3Enabled', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runWhoami(
       { profile: 'default', output: 'text', debug: false },
@@ -891,8 +908,74 @@ describe('runWhoami', () => {
     expect(capture.stdout.join('\n')).not.toContain('routing:');
   });
 
+  it('renders the org line when activeOrg is present on a V3-routed caller', async () => {
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meOrg = new Response(
+      JSON.stringify({
+        ...sampleMe,
+        v3Enabled: true,
+        activeOrg: {
+          id: 'org-1',
+          name: 'Acme QA',
+          plan: 'Standard',
+          role: 'member',
+          remaining: 1650,
+          includedCredits: 1600,
+          seats: 3,
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meOrg) },
+    );
+    expect(capture.stdout.join('\n')).toContain('org:    Acme QA (Standard, member)');
+  });
+
+  it('omits the org line when activeOrg is present but the caller is not V3-routed', async () => {
+    // Wallet selection follows the authoritative routing bit, never field
+    // presence alone — a V2-routed caller's commands charge the legacy
+    // wallet, so no org context may be shown even if a backend regression
+    // ships activeOrg to them again.
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meOrgV2 = new Response(
+      JSON.stringify({
+        ...sampleMe,
+        v3Enabled: false,
+        activeOrg: {
+          id: 'org-1',
+          name: 'Acme QA',
+          plan: 'Standard',
+          role: 'member',
+          remaining: 1650,
+          includedCredits: 1600,
+          seats: 3,
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meOrgV2) },
+    );
+    expect(capture.stdout.join('\n')).not.toContain('org:    Acme QA');
+  });
+
+  it('omits the org line when activeOrg is absent (older backends)', async () => {
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meResponse()) },
+    );
+    expect(capture.stdout.join('\n')).not.toContain('org:');
+  });
+
   it('does not emit the advisory in JSON mode even when v3Enabled is true', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const meV3 = new Response(JSON.stringify({ ...sampleMe, v3Enabled: true }), {
       status: 200,
@@ -905,6 +988,114 @@ describe('runWhoami', () => {
     expect(capture.stderr.join('\n')).not.toContain('[advisory]');
     const parsed = JSON.parse(capture.stdout.join('')) as MeResponse;
     expect(parsed.v3Enabled).toBe(true);
+  });
+
+  it('renders an `orgs:` line when the backend returns a non-empty organizations[]', async () => {
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meWithOrgs = new Response(
+      JSON.stringify({
+        ...sampleMe,
+        organizations: [
+          { id: 'org_1', name: 'Acme Corp', role: 'owner', isPersonal: false },
+          { id: 'org_2', name: "u-1's workspace", role: 'owner', isPersonal: true },
+        ],
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meWithOrgs) },
+    );
+    const out = capture.stdout.join('\n');
+    expect(out).toContain(
+      'orgs: Acme Corp (org_1, role: owner); ' + "u-1's workspace (org_2, personal, role: owner)",
+    );
+  });
+
+  it('renders an `org binding:` line when the backend returns a membership-key org binding', async () => {
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meWithBinding = new Response(
+      JSON.stringify({
+        ...sampleMe,
+        org: { id: 'org_1', name: 'Acme Corp', role: 'member' },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meWithBinding) },
+    );
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('org binding: Acme Corp (org_1, role: member)');
+  });
+
+  it('falls back to the org id in `org binding:` when name is null (resolution failed server-side)', async () => {
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meWithBinding = new Response(
+      JSON.stringify({
+        ...sampleMe,
+        org: { id: 'org_1', name: null, role: 'member' },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meWithBinding) },
+    );
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('org binding: org_1 (org_1, role: member)');
+  });
+
+  it('omits `orgs:` and `org binding:` lines entirely when the backend does not return them (older backend)', async () => {
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meResponse()) },
+    );
+    const out = capture.stdout.join('\n');
+    expect(out).not.toContain('orgs:');
+    expect(out).not.toContain('org binding:');
+    expect(out).not.toContain('undefined');
+  });
+
+  it('omits the `orgs:` line when organizations is present but empty', async () => {
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meEmptyOrgs = new Response(JSON.stringify({ ...sampleMe, organizations: [] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meEmptyOrgs) },
+    );
+    expect(capture.stdout.join('\n')).not.toContain('orgs:');
+  });
+
+  it('--output json: organizations[] and org pass through verbatim', async () => {
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meFull = new Response(
+      JSON.stringify({
+        ...sampleMe,
+        organizations: [{ id: 'org_1', name: 'Acme Corp', role: 'owner', isPersonal: false }],
+        org: { id: 'org_1', name: 'Acme Corp', role: 'owner' },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+    await runWhoami(
+      { profile: 'default', output: 'json', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meFull) },
+    );
+    const parsed = JSON.parse(capture.stdout.join('')) as MeResponse;
+    expect(parsed.organizations).toEqual([
+      { id: 'org_1', name: 'Acme Corp', role: 'owner', isPersonal: false },
+    ]);
+    expect(parsed.org).toEqual({ id: 'org_1', name: 'Acme Corp', role: 'owner' });
   });
 
   it('dry-run: whitespace-only TESTSPRITE_API_URL falls through to prod default endpoint', async () => {
@@ -924,7 +1115,7 @@ describe('runWhoami', () => {
   it('L1788: text output includes the resolved endpoint URL', async () => {
     writeProfile(
       'default',
-      { apiKey: 'sk-stored', apiUrl: 'https://api.example.com' },
+      { apiKey: 'sk-user-stored', apiUrl: 'https://api.example.com' },
       { path: credentialsPath },
     );
     const { capture, deps } = makeCapture();
@@ -952,7 +1143,7 @@ describe('runWhoami', () => {
   it('L1788: JSON output does NOT add endpoint (raw /me envelope is passed through)', async () => {
     writeProfile(
       'default',
-      { apiKey: 'sk-stored', apiUrl: 'https://api.example.com' },
+      { apiKey: 'sk-user-stored', apiUrl: 'https://api.example.com' },
       { path: credentialsPath },
     );
     const { capture, deps } = makeCapture();
@@ -979,7 +1170,7 @@ describe('runWhoami', () => {
   });
 
   it('L1866: renders email + name in text mode when the backend supplies them', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const meWithEmail = new Response(
       JSON.stringify({ ...sampleMe, email: 'alice@example.com', displayName: 'Alice' }),
@@ -996,7 +1187,7 @@ describe('runWhoami', () => {
   });
 
   it('L1866: omits email/name lines when the backend does not return them', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runWhoami(
       { profile: 'default', output: 'text', debug: false },
@@ -1009,7 +1200,7 @@ describe('runWhoami', () => {
   });
 
   it('L1866: passes email through verbatim in JSON mode when present', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const meWithEmail = new Response(JSON.stringify({ ...sampleMe, email: 'alice@example.com' }), {
       status: 200,
@@ -1039,7 +1230,7 @@ describe('runWhoami', () => {
       { profile: 'default', output: 'text', debug: false },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-env' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-env' },
         credentialsPath,
         fetchImpl: makeFetch(meResponse()),
       },
@@ -1047,7 +1238,7 @@ describe('runWhoami', () => {
   });
 
   it('emits debug events to stderr when debug is enabled', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runWhoami(
       { profile: 'default', output: 'json', debug: true },
@@ -1060,7 +1251,7 @@ describe('runWhoami', () => {
   });
 
   it('forwards server AUTH_INVALID with exit code 3', async () => {
-    writeProfile('default', { apiKey: 'sk-bad' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-bad' }, { path: credentialsPath });
     const { deps } = makeCapture();
     const errorBody = {
       error: {
@@ -1090,7 +1281,7 @@ describe('runWhoami', () => {
       ...sampleMe,
       scopes: ['read:projects', 'read:tests'],
     };
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const fetchImpl = makeFetch(
       new Response(JSON.stringify(readOnlyMe), {
@@ -1113,7 +1304,7 @@ describe('runWhoami', () => {
       ...sampleMe,
       scopes: ['read:projects', 'read:tests', 'write:tests', 'run:tests'],
     };
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const fetchImpl = makeFetch(
       new Response(JSON.stringify(fullMe), {
@@ -1134,7 +1325,7 @@ describe('runWhoami', () => {
       ...sampleMe,
       scopes: ['read:projects', 'read:tests'],
     };
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const fetchImpl = makeFetch(
       new Response(JSON.stringify(readOnlyMe), {
@@ -1156,8 +1347,8 @@ describe('runWhoami', () => {
 
 describe('runLogout', () => {
   it('removes the profile and reports success', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
-    writeProfile('dev', { apiKey: 'sk-dev' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+    writeProfile('dev', { apiKey: 'sk-user-dev' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     await runLogout(
       { profile: 'default', output: 'text', debug: false },
@@ -1205,7 +1396,7 @@ describe('createAuthCommand wiring', () => {
   });
 
   it('remove deletes the active profile and exits 0', async () => {
-    writeProfile('default', { apiKey: 'sk-remove' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-remove' }, { path: credentialsPath });
     const { deps } = makeCapture();
     const auth = createAuthCommand({ ...deps, credentialsPath });
     auth.exitOverride();
@@ -1215,7 +1406,7 @@ describe('createAuthCommand wiring', () => {
   });
 
   it('deprecated `whoami` alias emits a deprecation notice pointing at `auth status`', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const auth = createAuthCommand({
       ...deps,
@@ -1231,7 +1422,7 @@ describe('createAuthCommand wiring', () => {
   });
 
   it('whoami uses injected fetch and exits 0', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { deps } = makeCapture();
     const fetchImpl = vi.fn(
       async () =>
@@ -1248,7 +1439,7 @@ describe('createAuthCommand wiring', () => {
   });
 
   it('L1802: `status` alias resolves to the whoami action', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { deps } = makeCapture();
     const fetchImpl = vi.fn(
       async () =>
@@ -1265,7 +1456,7 @@ describe('createAuthCommand wiring', () => {
   });
 
   it('logout removes the profile', async () => {
-    writeProfile('default', { apiKey: 'sk' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { deps } = makeCapture();
     const auth = createAuthCommand({ ...deps, credentialsPath });
     auth.exitOverride();
@@ -1291,7 +1482,7 @@ describe('runConfigure -- skipIfConfigured', () => {
     const { capture, deps } = makeCapture();
     // Write a saved key first.
     writeProfile('default', { apiKey: 'sk-existing' }, { path: credentialsPath });
-    const prompt = { secret: vi.fn(async () => 'sk-new') };
+    const prompt = { secret: vi.fn(async () => 'sk-user-new') };
     const fetchImpl = vi.fn();
 
     await runConfigure(
@@ -1332,7 +1523,7 @@ describe('runConfigure -- skipIfConfigured', () => {
   it('proceeds normally when no credentials exist and skipIfConfigured is true', async () => {
     const { deps } = makeCapture();
     // No pre-existing profile -- skip has no effect, should fall through to prompt.
-    const prompt = { secret: vi.fn(async () => 'sk-new') };
+    const prompt = { secret: vi.fn(async () => 'sk-user-new') };
 
     await runConfigure(
       { profile: 'default', output: 'text', debug: false, fromEnv: false, skipIfConfigured: true },
@@ -1340,7 +1531,7 @@ describe('runConfigure -- skipIfConfigured', () => {
     );
 
     expect(prompt.secret).toHaveBeenCalledTimes(1);
-    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-new');
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-new');
   });
 
   it('ignores skipIfConfigured when --from-env is set', async () => {
@@ -1358,13 +1549,13 @@ describe('runConfigure -- skipIfConfigured', () => {
       },
       {
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-from-env' },
+        env: { TESTSPRITE_API_KEY: 'sk-user-from-env' },
         credentialsPath,
         fetchImpl: meOkFetch,
       },
     );
 
     // The env key must overwrite the saved key.
-    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-from-env');
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-from-env');
   });
 });

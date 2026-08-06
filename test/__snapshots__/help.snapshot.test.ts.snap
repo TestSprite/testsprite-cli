@@ -7,30 +7,37 @@ Install TestSprite guidance into coding-agent config (Claude Code, Cursor,
 Cline, Antigravity, Kiro, Windsurf, Copilot, Codex)
 
 Options:
-  -h, --help         display help for command
+  -h, --help                      display help for command
 
 Commands:
-  install [options]  Write the TestSprite agent skills (verification loop +
-                     first-run onboarding) into a project for a coding agent
-  list               List supported agent targets and skills, their status, and
-                     landing paths
-  status [options]   Check installed TestSprite skill files against this CLI
-                     version: ok, stale, modified, unmarked, absent, or corrupt
-                     (exits 1 when anything needs attention, so it can gate CI)
-  help [command]     display help for command
+  install [options] [targets...]  Write the TestSprite agent skills
+                                  (verification loop + first-run onboarding)
+                                  into a project for a coding agent. Target(s)
+                                  may be given positionally (e.g. \`agent
+                                  install cursor codex\`) and/or via --target;
+                                  the two are merged.
+  list                            List supported agent targets and skills,
+                                  their status, and landing paths
+  status [options]                Check installed TestSprite skill files
+                                  against this CLI version: ok, stale,
+                                  modified, unmarked, absent, or corrupt (exits
+                                  1 when anything needs attention, so it can
+                                  gate CI)
+  help [command]                  display help for command
 "
 `;
 
 exports[`--help snapshots > agent install 1`] = `
-"Usage: testsprite agent install [options]
+"Usage: testsprite agent install [options] [targets...]
 
 Write the TestSprite agent skills (verification loop + first-run onboarding)
-into a project for a coding agent
+into a project for a coding agent. Target(s) may be given positionally (e.g.
+\`agent install cursor codex\`) and/or via --target; the two are merged.
 
 Options:
   --target <t>    Agent target(s): claude, cursor, cline, antigravity, kiro,
-                  windsurf, copilot, codex (comma-separated or repeated)
-                  (default: [])
+                  windsurf, copilot, codex (comma-separated or repeated).
+                  Merged with any positional target(s). (default: [])
   --skill <name>  Skill(s) to install: testsprite-verify, testsprite-onboard
                   (comma-separated or repeated; default: all) (default: [])
   --dir <path>    Project root to write into (default: cwd)
@@ -78,9 +85,22 @@ exports[`--help snapshots > auth configure 1`] = `
 "Usage: testsprite auth configure [options]
 
 Options:
-  --from-env  Read TESTSPRITE_API_KEY (and optionally TESTSPRITE_API_URL) from
-              the environment instead of prompting (default: false)
-  -h, --help  display help for command
+  --api-key <key>       API key to configure (skips the interactive prompt)
+  --from-env            Read TESTSPRITE_API_KEY from the environment instead of
+                        prompting (default: false)
+  --agent <target>      Coding-agent target to install: claude, antigravity,
+                        cursor, cline, kiro, windsurf, copilot, codex (default:
+                        claude) (default: "claude")
+  --no-agent            Skip the agent skill install (configure credentials
+                        only)
+  --force               Overwrite an existing skill file (a .bak backup is
+                        kept)
+  --dir <path>          Project root for the skill install (default: current
+                        directory)
+  -y, --yes             Non-interactive: accept all defaults, never prompt
+  --skip-if-configured  Skip the API key prompt when credentials already exist
+                        for this profile (CI-safe idempotent re-run)
+  -h, --help            display help for command
 "
 `;
 
@@ -302,12 +322,17 @@ Commands:
        is recorded as error:<CODE> in its row and folded into exit 7)
     7  timeout or per-member poll error — resume with: testsprite test wait <run-id...>
    10  transport/network failure (UNAVAILABLE) — retry the command
+   11  rate limited, and nothing else went wrong — polls are retried
+       automatically honoring Retry-After first, so this means the throttle
+       outlasted that budget while the runs were still fine. Back off, then
+       re-attach with test wait. (A throttle that instead consumes the whole
+       --timeout reports 7, and any real timeout or failure keeps 7 / 1.)
   
   On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
   
   Ctrl-C detaches only (the run keeps executing and billing); stop it for
   real with: testsprite test cancel <run-id...>
-  rerun [options] [test-ids...]         Re-execute a test (or multiple) as a cheap replay — FE replays the saved script (no credit), BE re-runs the dependency closure.
+  rerun [options] [test-ids...]         Re-execute a test (or multiple) as a replay — FE replays the saved script, BE re-runs the dependency closure. Billed the same as a fresh run: 0.5 credits per FE rerun / 0.2 credits per BE rerun (legacy V2 accounts: FE rerun remains free).
   
   Exit codes:
     0  passed (or queued without --wait)
@@ -397,6 +422,86 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 "
 `;
 
+exports[`--help snapshots > test create 1`] = `
+"Usage: testsprite test create [options]
+
+Create a test from saved code (--code-file) or an agent-supplied plan
+(--plan-from, FE-only, M3.2 piece-5)
+
+Options:
+  --project <id>             project id (returned by \`testsprite project list\`)
+  --type <type>              frontend|backend
+  --name <name>              human-readable test name (becomes \`title\` in
+                             storage)
+  --description <text>       optional human description (≤ 2000 chars)
+  --priority <prio>          optional priority — one of: p0, p1, p2, p3
+  --code-file <path>         file containing the test code (≤ 350 KB)
+  --plan-from <path>         JSON file with the full FE test definition —
+                             projectId, type, name, planSteps[] all live in the
+                             file (≤ 256 KB; mutually exclusive with
+                             --code-file). In this mode
+                             --project/--type/--name/--description/--priority
+                             are ignored.
+  --plan-template            print a minimal valid plan-file skeleton to stdout
+                             and exit (pure-local: no network, no credentials,
+                             ignores every other flag). Pipe to a file and
+                             edit: \`--plan-template > plan.json\`. (default:
+                             false)
+  --run                      after create, trigger the test. Combine with
+                             --wait to block until terminal. (default: false)
+  --wait                     with --run, poll until terminal status (default:
+                             false)
+  --timeout <s>              with --run --wait, max seconds to wait
+  --target-url <url>         with --run, override the project default env URL
+  --idempotency-key <token>  opaque idempotency token (1-256 ASCII chars).
+                             Defaults to a UUIDv4 minted per invocation; pin
+                             one yourself for safe retries.
+  --produces <var>           BE only: variable name this test captures
+                             (repeatable). Drives dependency-aware wave
+                             ordering on \`test rerun\` and \`test run --all\`.
+                             (default: [])
+  --needs <var>              BE only: variable name this test consumes
+                             (repeatable). Use to declare upstream producer
+                             dependencies. (default: [])
+  --category <str>           BE only: test category. Use 'teardown' or
+                             'cleanup' to mark a final-wave cleanup test.
+  -h, --help                 display help for command
+
+Plan file format (--plan-from <file>) — minimal valid example:
+
+{
+  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.5.0/schemas/plan.schema.json",
+  "projectId": "prj_abc123",
+  "type": "frontend",
+  "name": "Login rejects an empty password",
+  "planSteps": [
+    {
+      "type": "action",
+      "description": "Navigate to /login and submit the form with an empty password"
+    },
+    {
+      "type": "assertion",
+      "description": "Verify an inline error says the password is required"
+    }
+  ]
+}
+
+Print this exact skeleton:      testsprite test create --plan-template
+Validate offline (no network):  testsprite test create --plan-from <file> --dry-run
+Multiple tests:                 test create-batch --plans <file.jsonl> | --plan-from-dir <dir>
+Full field reference: DOCUMENTATION.md -> "Plan file format"
+
+
+BE dependency authoring (M4):
+  --produces/--needs drive wave ordering on \`test rerun\` + \`test run --all\`.
+  --category teardown  marks a final-wave cleanup test.
+  These flags are backend-only; supplying with --type frontend is an error (exit 5).
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
 exports[`--help snapshots > test create-batch 1`] = `
 "Usage: testsprite test create-batch [options]
 
@@ -471,8 +576,11 @@ Options:
   -h, --help     display help for command
 
 Notes:
-  • Frontend replays are free verbatim script replays (no credit); backend replays
-    re-run the dependency closure and may cost credits — a one-line advisory is printed.
+  • Each replay is billed as a rerun — 0.5 credits for a frontend replay (verbatim
+    script), 0.2 credits for a backend replay (re-runs the dependency closure) —
+    same price as a fresh run, so \`--runs N\` costs roughly N×0.5 credits for a
+    frontend test (legacy V2 accounts: FE rerun remains free). A one-line advisory
+    is printed before a backend replay.
   • Replays use auto-heal OFF so a flaky test is not silently "healed" into a pass;
     this measures replay stability of the saved script against the configured URL.
   • \`--output json\` emits a machine-readable stability report for CI gating.
@@ -526,7 +634,7 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > test rerun 1`] = `
 "Usage: testsprite test rerun [options] [test-ids...]
 
-Re-execute a test (or multiple) as a cheap replay — FE replays the saved script (no credit), BE re-runs the dependency closure.
+Re-execute a test (or multiple) as a replay — FE replays the saved script, BE re-runs the dependency closure. Billed the same as a fresh run: 0.5 credits per FE rerun / 0.2 credits per BE rerun (legacy V2 accounts: FE rerun remains free).
 
 Exit codes:
   0  passed (or queued without --wait)
@@ -587,6 +695,8 @@ Notes:
     slow trigger/poll under load is not cut at the 120s default (see --request-timeout).
   • Batch --wait: rate-deferred tests appear in \`deferred[]\` and \`summary.deferred\`,
     and force a non-zero exit — they are NOT counted in \`summary.total\` (dispatched only).
+  • On V3-routed accounts, --no-auto-heal is still rolling out and may not yet be
+    honored server-side — check \`auth status\` for your routing.
 
 Dry-run shape notes:
   • --dry-run shows the BE rerun wire shape (includes \`closure{}\`); FE rerun responses
@@ -623,6 +733,8 @@ Options:
   --page-size <n>     with --history: number of runs per page (1–100, default
                       20)
   --cursor <token>    with --history: opaque cursor from a prior page
+  --rerun             with --history: show only reruns
+  --no-rerun          with --history: show only fresh (non-rerun) runs
   --columns <list>    with --history: select/reorder text table columns
   --no-header         with --history: suppress the text table header row
   -h, --help          display help for command

@@ -23,7 +23,7 @@ import { describe, expect, it } from 'vitest';
 import { ApiError } from '../lib/errors.js';
 import type { ListRunsResponse, RunHistoryItem } from '../lib/runs.types.js';
 import type { CliLatestResult } from './test.js';
-import { runResultHistory, runResult, parseDuration } from './test.js';
+import { runResultHistory, runResult, parseDuration, createTestCommand } from './test.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -413,6 +413,76 @@ describe('runResultHistory — text mode', () => {
 
     const output = lines.join('\n');
     expect(output).toMatch(/\byes\b/);
+  });
+
+  // --rerun / --no-rerun client-side filter (asserted in JSON mode for exactness)
+  const mixedRerunFetch = () =>
+    makeFetch(url => {
+      if (url.includes('/tests/test_abc/runs')) {
+        return {
+          body: makeHistoryResp([
+            makeHistoryItem({ runId: 'run_fresh', isRerun: false, createdFrom: null }),
+            makeHistoryItem({ runId: 'run_rerun', isRerun: true, createdFrom: 'rerun:prior' }),
+          ]),
+        };
+      }
+      return { status: 404, body: errorEnvelope('NOT_FOUND') };
+    });
+
+  it('--rerun keeps only reruns in the JSON runs array', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    await runResultHistory(
+      {
+        output: 'json',
+        testId: 'test_abc',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        rerun: true,
+      },
+      { credentialsPath, fetchImpl: mixedRerunFetch(), stdout: line => lines.push(line) },
+    );
+    const parsed = JSON.parse(lines.join('')) as { runs: RunHistoryItem[] };
+    expect(parsed.runs.map(r => r.runId)).toEqual(['run_rerun']);
+  });
+
+  it('--no-rerun keeps only fresh runs in the JSON runs array', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    await runResultHistory(
+      {
+        output: 'json',
+        testId: 'test_abc',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        rerun: false,
+      },
+      { credentialsPath, fetchImpl: mixedRerunFetch(), stdout: line => lines.push(line) },
+    );
+    const parsed = JSON.parse(lines.join('')) as { runs: RunHistoryItem[] };
+    expect(parsed.runs.map(r => r.runId)).toEqual(['run_fresh']);
+  });
+
+  it('no rerun flag keeps every run (no filter)', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    await runResultHistory(
+      {
+        output: 'json',
+        testId: 'test_abc',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { credentialsPath, fetchImpl: mixedRerunFetch(), stdout: line => lines.push(line) },
+    );
+    const parsed = JSON.parse(lines.join('')) as { runs: RunHistoryItem[] };
+    expect(parsed.runs.map(r => r.runId)).toEqual(['run_fresh', 'run_rerun']);
   });
 
   it('renders DURATION as "NmNs" when startedAt and finishedAt are present', async () => {
@@ -1463,5 +1533,43 @@ describe('runResultHistory — G1b targetUrl in history table (text mode)', () =
     expect(firstRun).toBeDefined();
     expect(firstRun?.targetUrl).toBe('https://example.com');
     expect(firstRun?.targetUrlSource).toBe('run');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// --rerun / --no-rerun parsing through Commander (the tri-state hop)
+// ---------------------------------------------------------------------------
+
+describe('createTestCommand — --rerun / --no-rerun parsing', () => {
+  // The runResultHistory tests above call the function directly, so they never
+  // exercise Commander's --rerun/--no-rerun parsing. This pins the tri-state:
+  // undefined (no filter) | true | false. A silent default to true would filter
+  // every `test result --history` to reruns only, unnoticed.
+  async function parsedRerun(extraArgs: string[]): Promise<boolean | undefined> {
+    const { credentialsPath } = makeCreds();
+    // Benign history response so parseAsync's action completes without a real
+    // network call — the assertion reads the parsed opts, not the output.
+    const fetchImpl = makeFetch(() => ({ body: makeHistoryResp([]) }));
+    const test = createTestCommand({
+      credentialsPath,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: () => undefined,
+    });
+    await test.parseAsync(['result', 'test_abc', '--history', ...extraArgs], { from: 'user' });
+    const resultCmd = test.commands.find(c => c.name() === 'result');
+    return (resultCmd?.opts() as { rerun?: boolean }).rerun;
+  }
+
+  it('no flag → rerun is undefined (no filter)', async () => {
+    expect(await parsedRerun([])).toBeUndefined();
+  });
+
+  it('--rerun → rerun is true', async () => {
+    expect(await parsedRerun(['--rerun'])).toBe(true);
+  });
+
+  it('--no-rerun → rerun is false', async () => {
+    expect(await parsedRerun(['--no-rerun'])).toBe(false);
   });
 });

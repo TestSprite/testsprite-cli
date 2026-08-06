@@ -179,7 +179,7 @@ describe('runInit — happy path (interactive)', () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs } = makeMemFs();
     const fetchMock = makeOkFetch();
-    const secretPrompt = vi.fn(async () => 'sk-test-key');
+    const secretPrompt = vi.fn(async () => 'sk-user-test-key');
 
     await runInit(makeBaseOpts(), {
       ...deps,
@@ -215,7 +215,7 @@ describe('runInit — happy path (interactive)', () => {
     const { fs: agentFs } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ output: 'json', apiKey: 'sk-json-test' }), {
+    await runInit(makeBaseOpts({ output: 'json', apiKey: 'sk-user-json-test' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -264,7 +264,7 @@ describe('runInit — happy path (interactive)', () => {
     }) as unknown as InitDeps['fetchImpl'];
 
     await runInit(
-      makeBaseOpts({ apiKey: 'sk-json-test', debug: true, noAgent: true, output: 'json' }),
+      makeBaseOpts({ apiKey: 'sk-user-json-test', debug: true, noAgent: true, output: 'json' }),
       {
         ...deps,
         fetchImpl: fetchMock,
@@ -290,7 +290,7 @@ describe('runInit — --yes --api-key (non-interactive)', () => {
     const fetchMock = makeOkFetch();
     const secretPrompt = vi.fn(async () => 'should-never-be-called');
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-test', yes: true }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test', yes: true }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -319,7 +319,7 @@ describe('runInit — --no-agent', () => {
     const { fs: agentFs, writeCalls } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-test', noAgent: true, output: 'json' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test', noAgent: true, output: 'json' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -341,7 +341,7 @@ describe('runInit — --no-agent', () => {
     const { fs: agentFs } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-test', noAgent: true }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test', noAgent: true }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -368,7 +368,7 @@ describe('runInit — --no-agent', () => {
     const { fs: agentFs } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-test' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -395,7 +395,7 @@ describe('runInit — default claude target installs 2 skill files', () => {
     const { fs: agentFs, writeCalls } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-test' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -424,7 +424,7 @@ describe('runInit — --agent cursor', () => {
     const { fs: agentFs, writeCalls } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-test', agent: 'cursor' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test', agent: 'cursor' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -459,7 +459,7 @@ describe('runInit — --dry-run', () => {
       async () => new Response('{}', { status: 200 }),
     ) as unknown as InitDeps['fetchImpl'];
 
-    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-dry' }), {
+    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-user-dry' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -479,7 +479,7 @@ describe('runInit — --dry-run', () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs } = makeMemFs();
 
-    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-dry' }), {
+    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-user-dry' }), {
       ...deps,
       fetchImpl: vi.fn(async () => new Response('{}')) as unknown as InitDeps['fetchImpl'],
       credentialsPath,
@@ -497,7 +497,7 @@ describe('runInit — --dry-run', () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs } = makeMemFs();
 
-    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-dry', output: 'json' }), {
+    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-user-dry', output: 'json' }), {
       ...deps,
       fetchImpl: vi.fn(async () => new Response('{}')) as unknown as InitDeps['fetchImpl'],
       credentialsPath,
@@ -520,14 +520,17 @@ describe('runInit — --dry-run', () => {
     const { fs: agentFs, writeCalls } = makeMemFs();
     const fetchMock = vi.fn(async () => new Response('{}')) as unknown as InitDeps['fetchImpl'];
 
-    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-dry', noAgent: true, output: 'json' }), {
-      ...deps,
-      fetchImpl: fetchMock,
-      credentialsPath,
-      isTTY: false,
-      cwd: CWD,
-      fs: agentFs,
-    });
+    await runInit(
+      makeBaseOpts({ dryRun: true, apiKey: 'sk-user-dry', noAgent: true, output: 'json' }),
+      {
+        ...deps,
+        fetchImpl: fetchMock,
+        credentialsPath,
+        isTTY: false,
+        cwd: CWD,
+        fs: agentFs,
+      },
+    );
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(writeCalls).toHaveLength(0);
@@ -587,7 +590,7 @@ describe('runInit — codex-review hardening', () => {
     const fetchImpl = makeOkFetch();
     // env has NO TESTSPRITE_API_KEY; if --from-env wrongly won, runConfigure would
     // read undefined and throw. Success proves --api-key took precedence.
-    await runInit(makeBaseOpts({ apiKey: 'sk-wins', fromEnv: true, noAgent: true }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-wins', fromEnv: true, noAgent: true }), {
       ...deps,
       env: {},
       fetchImpl,
@@ -611,7 +614,7 @@ describe('runInit — codex-review hardening', () => {
         }),
         {
           ...deps,
-          env: { TESTSPRITE_API_KEY: 'sk' },
+          env: { TESTSPRITE_API_KEY: 'sk-user-min' },
           fetchImpl,
           credentialsPath,
           isTTY: false,
@@ -634,7 +637,7 @@ describe('runInit — codex-review hardening', () => {
     // production/no-email banner even though configure wrote the correct key.
     const fetchImpl = vi.fn(async (_url: string, init: { headers?: Record<string, string> }) => {
       const key = init.headers?.['x-api-key'] ?? init.headers?.['X-API-Key'];
-      if (key === 'sk-real') {
+      if (key === 'sk-user-real') {
         return new Response(JSON.stringify(ME), {
           status: 200,
           headers: { 'content-type': 'application/json' },
@@ -648,9 +651,9 @@ describe('runInit — codex-review hardening', () => {
       );
     }) as unknown as InitDeps['fetchImpl'];
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-real', noAgent: true, output: 'json' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-real', noAgent: true, output: 'json' }), {
       ...deps,
-      env: { TESTSPRITE_API_KEY: 'sk-stale-bogus' },
+      env: { TESTSPRITE_API_KEY: 'sk-user-stale-bogus' },
       fetchImpl,
       credentialsPath,
       isTTY: false,
@@ -668,7 +671,7 @@ describe('runInit — codex-review hardening', () => {
 
   it('summary reports the endpoint from TESTSPRITE_API_URL, not a flat prod default', async () => {
     const { captured, deps } = makeCapture();
-    await runInit(makeBaseOpts({ apiKey: 'sk-env-url', noAgent: true, output: 'json' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-env-url', noAgent: true, output: 'json' }), {
       ...deps,
       env: { TESTSPRITE_API_URL: 'https://api.example.com:8443' },
       fetchImpl: makeOkFetch(),
@@ -709,7 +712,7 @@ describe('runInit — bad API key', () => {
 
     let thrown: unknown;
     try {
-      await runInit(makeBaseOpts({ apiKey: 'sk-bad' }), {
+      await runInit(makeBaseOpts({ apiKey: 'sk-user-bad' }), {
         ...deps,
         fetchImpl: makeAuthFailFetch(),
         credentialsPath,
@@ -743,7 +746,7 @@ describe('runInit — summary JSON shape', () => {
     const { fs: agentFs } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-shape', output: 'json' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-shape', output: 'json' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -766,7 +769,7 @@ describe('runInit — summary JSON shape', () => {
     const { fs: agentFs } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-agent-shape', output: 'json' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-agent-shape', output: 'json' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -805,7 +808,7 @@ describe('runInit — --from-env', () => {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
-      env: { TESTSPRITE_API_KEY: 'sk-from-env-key' },
+      env: { TESTSPRITE_API_KEY: 'sk-user-from-env-key' },
       prompt: { secret: secretPrompt },
       isTTY: false,
       cwd: CWD,
@@ -840,7 +843,7 @@ describe('runInit — all agent targets', () => {
         'credentials',
       );
 
-      await runInit(makeBaseOpts({ apiKey: 'sk-target', agent: target }), {
+      await runInit(makeBaseOpts({ apiKey: 'sk-user-target', agent: target }), {
         ...deps,
         fetchImpl: fetchMock,
         credentialsPath: localCreds,
@@ -889,14 +892,17 @@ describe('[B-E2E-05] runInit: --no-agent + --agent conflict emits [warn] on stde
     // Pass rawArgConflict signal: noAgent=true wins (--no-agent was last)
     // runInit exposes a rawArgConflict option that the command action passes
     // when it detects both --agent and --no-agent in rawArgs.
-    await runInit(makeBaseOpts({ apiKey: 'sk-conflict', noAgent: true, rawArgConflict: true }), {
-      ...deps,
-      fetchImpl: fetchMock,
-      credentialsPath: localCreds,
-      isTTY: false,
-      cwd: CWD,
-      fs: agentFs,
-    });
+    await runInit(
+      makeBaseOpts({ apiKey: 'sk-user-conflict', noAgent: true, rawArgConflict: true }),
+      {
+        ...deps,
+        fetchImpl: fetchMock,
+        credentialsPath: localCreds,
+        isTTY: false,
+        cwd: CWD,
+        fs: agentFs,
+      },
+    );
 
     const warnLine = captured.stderr.find(l => l.includes('[warn]') && l.includes('--no-agent'));
     expect(warnLine).toBeDefined();
@@ -911,7 +917,7 @@ describe('[B-E2E-05] runInit: --no-agent + --agent conflict emits [warn] on stde
 
     await runInit(
       makeBaseOpts({
-        apiKey: 'sk-conflict2',
+        apiKey: 'sk-user-conflict2',
         agent: 'cursor',
         noAgent: false,
         rawArgConflict: true,
@@ -942,7 +948,7 @@ describe('[B-E2E-05] runInit: --no-agent + --agent conflict emits [warn] on stde
 
     await runInit(
       // rawArgConflict not set (default undefined/false)
-      makeBaseOpts({ apiKey: 'sk-no-conflict', agent: 'claude' }),
+      makeBaseOpts({ apiKey: 'sk-user-no-conflict', agent: 'claude' }),
       {
         ...deps,
         fetchImpl: fetchMock,
@@ -990,7 +996,7 @@ describe('[B-E2E-06] runInit: install failure → info message on stderr + re-th
 
     let caughtErr: unknown;
     try {
-      await runInit(makeBaseOpts({ apiKey: 'sk-install-fail', agent: 'claude' }), {
+      await runInit(makeBaseOpts({ apiKey: 'sk-user-install-fail', agent: 'claude' }), {
         ...deps,
         fetchImpl: fetchMock,
         credentialsPath: localCreds,
@@ -1031,7 +1037,7 @@ describe('runInit — telemetry attribution (X-CLI-Command)', () => {
       });
     }) as unknown as InitDeps['fetchImpl'];
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-tag', noAgent: true, output: 'json' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-tag', noAgent: true, output: 'json' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -1084,7 +1090,7 @@ describe('runInit -- skipIfConfigured', () => {
     const { fs: agentFs } = makeMemFs();
     // No pre-existing credentials -- skip has no effect.
     const fetchMock = makeOkFetch();
-    const prompt = { secret: vi.fn(async () => 'sk-fresh') };
+    const prompt = { secret: vi.fn(async () => 'sk-user-fresh') };
 
     await runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'text' }), {
       ...deps,
@@ -1097,7 +1103,7 @@ describe('runInit -- skipIfConfigured', () => {
 
     // With no saved key, the prompt should fire.
     expect(prompt.secret).toHaveBeenCalledTimes(1);
-    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-fresh');
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-fresh');
     expect(captured.stdout.join('')).toContain('initialized');
   });
 
@@ -1128,7 +1134,12 @@ describe('runInit -- skipIfConfigured', () => {
     const fetchMock = makeOkFetch();
 
     await runInit(
-      makeBaseOpts({ apiKey: 'sk-new', skipIfConfigured: true, noAgent: true, output: 'text' }),
+      makeBaseOpts({
+        apiKey: 'sk-user-new',
+        skipIfConfigured: true,
+        noAgent: true,
+        output: 'text',
+      }),
       {
         ...deps,
         credentialsPath,
@@ -1139,6 +1150,6 @@ describe('runInit -- skipIfConfigured', () => {
     );
 
     // Explicit --api-key must overwrite regardless of skipIfConfigured.
-    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-new');
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-new');
   });
 });
