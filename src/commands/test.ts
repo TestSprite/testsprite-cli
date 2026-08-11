@@ -1895,6 +1895,15 @@ export interface CliPlanInput {
   name: string;
   description?: string;
   priority?: CliCreatePriority;
+  /**
+   * Optional desktop viewport for the frontend browser run, in
+   * `<width>x<height>` form (e.g. `"390x844"` for a mobile device).
+   * When present it is forwarded to the backend so the browser-use
+   * runner can size the viewport before executing plan steps — the
+   * only way responsive/mobile-only UI (e.g. `md:hidden` bottom nav)
+   * can be exercised. Absent means the runner's desktop default.
+   */
+  viewport?: string;
   planSteps: CliPlanStep[];
 }
 
@@ -2337,6 +2346,13 @@ interface CreateFromPlanOptions extends CommonOptions {
   /** Reserved for the M3.3 chain. Per-run target URL override. */
   targetUrl?: string;
   /**
+   * Optional browser viewport override for the frontend runner, in
+   * `<width>x<height>` form (e.g. "390x844"). When set alongside
+   * `--plan-from`, overrides any viewport in the plan JSON file.
+   * Validated client-side before the POST.
+   */
+  viewport?: string;
+  /**
    * Names of `test create` flags the caller supplied that `--plan-from`
    * ignores (identity lives in the JSON). Surfaced as a stderr advisory
    * AFTER the plan validates, so a malformed plan (e.g. missing
@@ -2425,6 +2441,23 @@ export async function runCreateFromPlan(
 
   const plan = readPlanFromGuarded(opts.planFrom, { ignoredFlags: opts.ignoredFlags });
 
+  // `--viewport` is a CLI-level override of the viewport in the plan JSON —
+  // the one `--plan-from` field that is legitimately overridable from the
+  // command line (the plan file pins projectId/type/name/planSteps, but the
+  // viewport is a run-environment concern the caller may want to vary
+  // without editing the file, e.g. a mobile smoke pass on a desktop plan).
+  if (opts.viewport !== undefined) {
+    if (!/^\d+x\d+$/.test(opts.viewport)) {
+      throw localValidationError(
+        'viewport',
+        'must be a string in `<width>x<height>` format (e.g. "390x844")',
+        undefined,
+        'flag',
+      );
+    }
+    plan.viewport = opts.viewport;
+  }
+
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   // Non-fatal advisory for `{{...}}`-style placeholders in step
@@ -2472,6 +2505,7 @@ export async function runCreateFromPlan(
     name: plan.name,
     description: plan.description,
     priority: plan.priority,
+    viewport: plan.viewport,
     planSteps: plan.planSteps,
   };
 
@@ -2726,6 +2760,17 @@ function assertPlanShape(
     requireEnum(`${prefix}priority`, obj.priority, CLI_CREATE_PRIORITIES);
   }
 
+  if (obj.viewport !== undefined) {
+    if (typeof obj.viewport !== 'string' || !/^\d+x\d+$/.test(obj.viewport)) {
+      throw localValidationError(
+        `${prefix}viewport`,
+        'must be a string in `<width>x<height>` format when present (e.g. "390x844")',
+        undefined,
+        'field',
+      );
+    }
+  }
+
   // `planSteps` missing is the single most common agent
   // hallucination: LLMs (Copilot included) reliably nest steps under
   // `plan.steps` or a bare top-level `steps`. Point directly at the fix
@@ -2805,6 +2850,11 @@ function collectPlanIssues(
   }
   if (obj.priority !== undefined) {
     check(() => requireEnum(`${prefix}priority`, obj.priority, CLI_CREATE_PRIORITIES));
+  }
+  if (obj.viewport !== undefined) {
+    if (typeof obj.viewport !== 'string' || !/^\d+x\d+$/.test(obj.viewport)) {
+      issues.push({ field: `${prefix}viewport`, reason: 'must be a string in `<width>x<height>` format' });
+    }
   }
   check(() =>
     requireArrayLength(`${prefix}planSteps`, obj.planSteps, {
@@ -9548,10 +9598,16 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .option('--name <name>', 'human-readable test name (becomes `title` in storage)')
     .option('--description <text>', 'optional human description (≤ 2000 chars)')
     .option('--priority <prio>', 'optional priority — one of: p0, p1, p2, p3')
+    .option(
+      '--viewport <WxH>',
+      'optional browser viewport for the frontend runner (e.g. "390x844" for mobile). ' +
+        'With --plan-from, overrides the viewport in the plan JSON.',
+    )
     .option('--code-file <path>', 'file containing the test code (≤ 350 KB)')
     .option(
       '--plan-from <path>',
-      'JSON file with the full FE test definition — projectId, type, name, planSteps[] all live in the file ' +
+      'JSON file with the full FE test definition — projectId, type, name, planSteps[], ' +
+        'and optional viewport/description/priority all live in the file ' +
         '(≤ 256 KB; mutually exclusive with --code-file). In this mode --project/--type/--name/--description/--priority are ignored.',
     )
     .option(
@@ -9649,6 +9705,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           {
             ...resolveCommonOptions(command),
             planFrom: cmdOpts.planFrom,
+            viewport: cmdOpts.viewport,
             run: cmdOpts.run === true,
             wait: cmdOpts.wait === true,
             timeout: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
@@ -10774,6 +10831,7 @@ interface CreateFlagOpts {
   planFrom?: string;
   /** Print the canonical plan-file skeleton and exit. */
   planTemplate?: boolean;
+  viewport?: string;
   run?: boolean;
   wait?: boolean;
   timeout?: string;

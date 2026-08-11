@@ -35,6 +35,11 @@
       "enum": ["p0", "p1", "p2", "p3"],
       "description": "Optional. p0 = must-pass, p1 = important paths, p2 = edge cases, p3 = cosmetic."
     },
+    "viewport": {
+      "type": "string",
+      "pattern": "^[1-9]\\d*x[1-9]\\d*$",
+      "description": "Optional. Desktop viewport for the frontend browser run, in `<width>x<height>` form (e.g. \"390x844\" for a mobile device). Forwarded to the backend so the browser-use runner can size the viewport before executing plan steps — the only way responsive/mobile-only UI (e.g. an `md:hidden` bottom nav) can be exercised. Absent means the runner's desktop default."
+    },
     "planSteps": {
       "type": "array",
       "minItems": 1,

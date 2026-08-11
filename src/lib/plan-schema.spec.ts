@@ -134,6 +134,33 @@ describe('schemas/plan.schema.json', () => {
     expect(await passesRealValidator(dir, plan)).toBe(true);
   });
 
+  it('accepts a valid viewport string (e.g. "390x844") and rejects an invalid one', async () => {
+    const valid = { ...PLAN_TEMPLATE_WITH_SCHEMA, viewport: '390x844' };
+    expect(validate(valid)).toBe(true);
+    expect(await passesRealValidator(dir, valid)).toBe(true);
+
+    const invalid = { ...PLAN_TEMPLATE_WITH_SCHEMA, viewport: 'abc' };
+    expect(validate(invalid)).toBe(false);
+    expect(await passesRealValidator(dir, invalid)).toBe(false);
+  });
+
+  it('accepts a plan with viewport + all other optional fields', async () => {
+    const plan = {
+      projectId: 'prj_abc123',
+      type: 'frontend',
+      name: 'Mobile test plan',
+      description: 'Exercises mobile layout.',
+      priority: 'p1',
+      viewport: '390x844',
+      planSteps: [
+        { type: 'action', description: 'tap the bottom nav' },
+        { type: 'assertion', description: 'verify the mobile sidebar is visible' },
+      ],
+    };
+    expect(validate(plan)).toBe(true);
+    expect(await passesRealValidator(dir, plan)).toBe(true);
+  });
+
   it('rejects type: "backend" — schema is the ground truth for the --plan-from COMMAND, which rejects backend end-to-end (both sides must agree)', async () => {
     const plan = { ...PLAN_TEMPLATE_WITH_SCHEMA, type: 'backend' };
     expect(validate(plan)).toBe(false);
