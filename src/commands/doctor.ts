@@ -30,7 +30,7 @@ import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '..
 import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
 import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 import { VERSION } from '../version.js';
-import { SUPPORTED_NODE_RANGE, shouldRejectNodeVersion } from '../version-guard.js';
+import { MIN_SUPPORTED_NODE_MAJOR, shouldRejectNodeVersion } from '../version-guard.js';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -53,7 +53,9 @@ interface MeIdentity {
   userId?: string;
   keyId?: string;
   v3Enabled?: boolean;
+  /** Account-wide membership list. Absent-safe (older backends omit it). */
   organizations?: CliOrgSummary[];
+  /** The calling key's own org binding — membership keys only. */
   org?: CliOrgBinding;
 }
 
@@ -63,7 +65,9 @@ export interface DoctorDeps {
   fetchImpl?: FetchImpl;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
+  /** Project dir for the skill check. Defaults to `process.cwd()`. */
   cwd?: string;
+  /** Runtime version string (e.g. "22.9.0"). Defaults to `process.versions.node`. */
   nodeVersion?: string;
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
@@ -77,11 +81,20 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   const cwd = deps.cwd ?? process.cwd();
   const nodeVersion = deps.nodeVersion ?? process.versions.node;
 
-  const config = loadConfig({ profile: opts.profile, endpointUrl: opts.endpointUrl, env, credentialsPath: deps.credentialsPath });
+  const config = loadConfig({
+    profile: opts.profile,
+    endpointUrl: opts.endpointUrl,
+    env,
+    credentialsPath: deps.credentialsPath,
+  });
   const endpointCheck = checkEndpoint(config.apiUrl);
   const hasKey = Boolean(config.apiKey);
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-  const connectivity = await checkConnectivity(opts, deps, { hasKey, endpointOk: endpointCheck.status === 'ok' });
+
+  const connectivity = await checkConnectivity(opts, deps, {
+    hasKey,
+    endpointOk: endpointCheck.status === 'ok',
+  });
 
   const checks: DoctorCheck[] = [
     { name: 'CLI version', status: 'ok', detail: VERSION },
@@ -102,6 +115,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   if (orgBinding) checks.push({ name: 'Org binding', status: 'ok', detail: orgBinding });
   const personalScopeHint = formatPersonalScopeHint(connectivity.organizations, connectivity.org);
   if (personalScopeHint) checks.push({ name: 'Workspace scope', status: 'warn', detail: personalScopeHint });
+
   checks.push(checkSkill(cwd, deps));
 
   const failures = checks.filter(check => check.status === 'fail').length;
@@ -119,8 +133,8 @@ function checkNodeVersion(nodeVersion: string): DoctorCheck {
     name: 'Node.js',
     status: rejected ? 'fail' : 'ok',
     detail: rejected
-      ? `v${nodeVersion} is outside the supported Node range ${SUPPORTED_NODE_RANGE}; upgrade Node.js`
-      : `v${nodeVersion} (supported range: ${SUPPORTED_NODE_RANGE})`,
+      ? `v${nodeVersion} is below the required Node ${MIN_SUPPORTED_NODE_MAJOR}; upgrade Node.js`
+      : `v${nodeVersion} (>=${MIN_SUPPORTED_NODE_MAJOR} required)`,
   };
 }
 
@@ -139,7 +153,11 @@ function checkSkill(cwd: string, deps: DoctorDeps): DoctorCheck {
   return { name: 'Verify skill', status: installed ? 'ok' : 'warn', detail: installed ? 'installed in this project' : 'not installed here; run `testsprite setup` so your agent verifies its changes' };
 }
 
-async function checkConnectivity(opts: CommonOptions, deps: DoctorDeps, ctx: { hasKey: boolean; endpointOk: boolean }): Promise<{ check: DoctorCheck; v3Enabled?: boolean; organizations?: CliOrgSummary[]; org?: CliOrgBinding }> {
+async function checkConnectivity(
+  opts: CommonOptions,
+  deps: DoctorDeps,
+  ctx: { hasKey: boolean; endpointOk: boolean },
+): Promise<{ check: DoctorCheck; v3Enabled?: boolean; organizations?: CliOrgSummary[]; org?: CliOrgBinding }> {
   const name = 'Connectivity';
   if (opts.dryRun) return { check: { name, status: 'warn', detail: 'skipped under --dry-run' } };
   if (!ctx.hasKey) return { check: { name, status: 'warn', detail: 'skipped; no API key to test with' } };
