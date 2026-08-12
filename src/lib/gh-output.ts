@@ -1,8 +1,9 @@
 /**
- * CI-native output layer for the batch run path (issue #99, reshaped from
- * the withdrawn top-level `ci` command per the #264 review).
+ * CI-native output layer for the run path (issue #99, reshaped from
+ * the withdrawn top-level `ci` command per the #264 review). Covers both a
+ * single `test run <test-id> --wait` and the `test run --all --wait` batch.
  *
- * `test run --all --wait` presents its result in the formats CI consumes:
+ * A `--wait` run presents its result in the formats CI consumes:
  *   (a) a stable machine summary `{total, passed, failed, timedOut, runs[]}`
  *       written to `--summary-file <path>` when requested,
  *   (b) a Markdown results table appended to `$GITHUB_STEP_SUMMARY` when
@@ -32,10 +33,40 @@ export interface CiSummary {
 }
 
 /**
+ * Reduce a non-dispatched bucket (`deferred` / `conflicts` / `notFound`) into
+ * CI rows. Items are either bare testId strings (`notFound`) or
+ * `{ testId, currentRunId? }` objects; both shapes are handled. `note` becomes
+ * the row's error text so the annotation explains why the item did not run.
+ */
+function bucketRows(bucket: unknown, status: string, note: string): CiRunRow[] {
+  if (!Array.isArray(bucket)) return [];
+  return bucket.map(item => {
+    const rec =
+      item !== null && typeof item === 'object' ? (item as Record<string, unknown>) : undefined;
+    const testId =
+      typeof item === 'string' ? item : typeof rec?.testId === 'string' ? rec.testId : '';
+    const currentRunId = typeof rec?.currentRunId === 'string' ? rec.currentRunId : undefined;
+    return {
+      testId,
+      status,
+      ...(currentRunId ? { runId: currentRunId } : {}),
+      error: note,
+    };
+  });
+}
+
+/**
  * Reduce the batch command's JSON payload into the CI summary. The parse is
  * defensive: it reads the same `accepted[]` rows the automation contract
  * documents, and anything unparseable (dry-run envelope, partial output
  * after a timeout) reduces to an empty run list rather than a crash.
+ *
+ * Non-dispatched work (`deferred` / `conflicts` / `notFound`) is folded in as
+ * non-passed rows: those buckets already force a non-zero exit (deferred /
+ * timeout → 7, all-conflict → 6) but were previously absent from the summary,
+ * so a partial batch like `1 accepted passed + 1 deferred` read as "1/1 passed"
+ * with no annotation. (`skippedFrontend` / `skippedIntegration` are NOT folded
+ * in — they exit 0 and are the Action layer's allow-partial concern.)
  */
 export function summarizeAcceptedPayload(capturedJson: string): CiSummary {
   let parsed: unknown;
@@ -47,9 +78,13 @@ export function summarizeAcceptedPayload(capturedJson: string): CiSummary {
   }
   // `JSON.parse('null')` and non-object payloads are valid JSON but carry no
   // batch envelope — treat them like unparseable input instead of crashing.
-  const payload: { accepted?: unknown } =
-    parsed !== null && typeof parsed === 'object' ? (parsed as { accepted?: unknown }) : {};
-  const rows: CiRunRow[] = Array.isArray(payload.accepted)
+  const payload: {
+    accepted?: unknown;
+    deferred?: unknown;
+    conflicts?: unknown;
+    notFound?: unknown;
+  } = parsed !== null && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+  const acceptedRows: CiRunRow[] = Array.isArray(payload.accepted)
     ? payload.accepted
         .filter(
           (entry): entry is Record<string, unknown> => entry !== null && typeof entry === 'object',
@@ -68,10 +103,66 @@ export function summarizeAcceptedPayload(capturedJson: string): CiSummary {
           };
         })
     : [];
+  const rows: CiRunRow[] = [
+    ...acceptedRows,
+    ...bucketRows(payload.deferred, 'deferred', 'rate-deferred (not dispatched)'),
+    ...bucketRows(payload.conflicts, 'conflict', 'already in flight (not dispatched)'),
+    ...bucketRows(payload.notFound, 'not_found', 'no replayable run (not dispatched)'),
+  ];
   const passed = rows.filter(row => row.status === 'passed').length;
   const timedOut = rows.filter(row => row.status === 'timeout').length;
   const failed = rows.length - passed - timedOut;
   return { total: rows.length, passed, failed, timedOut, runs: rows };
+}
+
+/**
+ * Reduce a single `test run <test-id> --wait` result into the same CI summary
+ * shape as the batch path, so `--gh-output` / `--summary-file` behave
+ * identically for a one-test CI job. Unlike the batch envelope, a single
+ * RunResponse carries `error` as a raw string (not `{ message }`) and
+ * `dashboardUrl` as `string | null`; both are normalized here.
+ */
+export function summarizeSingleRun(run: {
+  testId?: string;
+  runId?: string;
+  status?: string;
+  dashboardUrl?: string | null;
+  error?: string | null;
+}): CiSummary {
+  const row: CiRunRow = {
+    testId: String(run.testId ?? ''),
+    ...(typeof run.runId === 'string' ? { runId: run.runId } : {}),
+    status: String(run.status ?? 'unknown'),
+    ...(typeof run.dashboardUrl === 'string' ? { dashboardUrl: run.dashboardUrl } : {}),
+    ...(typeof run.error === 'string' && run.error.length > 0 ? { error: run.error } : {}),
+  };
+  const passed = row.status === 'passed' ? 1 : 0;
+  const timedOut = row.status === 'timeout' ? 1 : 0;
+  const failed = 1 - passed - timedOut;
+  return { total: 1, passed, failed, timedOut, runs: [row] };
+}
+
+/**
+ * Escape a value for a Markdown table cell. A raw `|` would break the column
+ * layout and a CR/LF would inject extra Markdown lines (rows are newline-joined)
+ * — the same injection class the annotation escaping guards against, on the
+ * step-summary surface.
+ */
+function escapeTableCell(value: string): string {
+  return value.replace(/\|/g, '\\|').replace(/[\r\n]+/g, ' ');
+}
+
+/**
+ * Escape a URL for a Markdown `[text](url)` link: a literal `)` closes the link
+ * early and whitespace / `|` / CR-LF break the link or the surrounding cell.
+ */
+function escapeMarkdownUrl(url: string): string {
+  return url
+    .replace(/[\r\n]+/g, '')
+    .replace(/ /g, '%20')
+    .replace(/\(/g, '%28')
+    .replace(/\)/g, '%29')
+    .replace(/\|/g, '%7C');
 }
 
 /** Markdown table for the GitHub job summary. */
@@ -83,14 +174,34 @@ export function renderJobSummaryMarkdown(summary: CiSummary): string {
     '',
     '| Test | Status | Run |',
     '| --- | --- | --- |',
-    ...summary.runs.map(
-      row =>
-        `| ${row.testId} | ${row.status} | ${
-          row.dashboardUrl ? `[dashboard](${row.dashboardUrl})` : (row.runId ?? '')
-        } |`,
-    ),
+    ...summary.runs.map(row => {
+      const run = row.dashboardUrl
+        ? `[dashboard](${escapeMarkdownUrl(row.dashboardUrl)})`
+        : escapeTableCell(row.runId ?? '');
+      return `| ${escapeTableCell(row.testId)} | ${escapeTableCell(row.status)} | ${run} |`;
+    }),
     '',
   ].join('\n');
+}
+
+/**
+ * Escape a value destined for the DATA half of a workflow command (the text
+ * after `::`). Per GitHub's rules, `%`, CR and LF are percent-encoded so a raw
+ * multiline run error can never introduce a newline that starts a second
+ * `::command::` line in the Actions output stream (`%` first, so the encodings
+ * we add are not themselves re-encoded).
+ */
+function escapeCommandData(value: string): string {
+  return value.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+}
+
+/**
+ * Escape a value destined for a command PROPERTY (e.g. `title=...`). Beyond the
+ * data rules, `:` and `,` are encoded so the value cannot terminate the
+ * property list or the command header.
+ */
+function escapeCommandProperty(value: string): string {
+  return escapeCommandData(value).replace(/:/g, '%3A').replace(/,/g, '%2C');
 }
 
 /**
@@ -133,7 +244,11 @@ export function emitGithubOutputs(
       if (row.status === 'passed') continue;
       const detail = row.error !== undefined ? ` ${row.error}` : '';
       const link = row.dashboardUrl !== undefined ? ` ${row.dashboardUrl}` : '';
-      annotate(`::error title=TestSprite ${row.testId}::status=${row.status}${detail}${link}`);
+      // Escape both halves: a raw multiline run error (or a testId) must not be
+      // able to smuggle a second workflow command into the Actions stream.
+      const title = `TestSprite ${escapeCommandProperty(row.testId)}`;
+      const message = escapeCommandData(`status=${row.status}${detail}${link}`);
+      annotate(`::error title=${title}::${message}`);
     }
   }
 }

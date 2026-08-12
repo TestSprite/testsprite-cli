@@ -6276,6 +6276,69 @@ describe('runCreate', () => {
     expect(advisoryLine).toContain('test update');
   });
 
+  it('a 429 with a long Retry-After on the dup-name lookup cannot delay the create', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('// test code');
+    let listCallCount = 0;
+    let postCalled = false;
+    // Raw fetch impl rather than makeFetch, because this needs a real
+    // `Retry-After` response header.
+    const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      if ((init.method ?? 'GET') === 'GET' && url.includes('/tests')) {
+        listCallCount++;
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: 'RATE_LIMITED',
+              message: 'Too many requests',
+              nextAction: 'Wait Retry-After seconds and retry.',
+              requestId: 'req_dup',
+            },
+          }),
+          { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '60' } },
+        );
+      }
+      postCalled = true;
+      return new Response(JSON.stringify(SAMPLE_RESPONSE), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof globalThis.fetch;
+
+    const stderrLines: string[] = [];
+    const result = await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'Sign-up happy',
+        codeFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+    );
+
+    // The create still happens — a best-effort advisory must never gate it.
+    expect(result.testId).toBe('test_new');
+    expect(postCalled).toBe(true);
+    // Exactly one attempt. The load-bearing assertion: `retryOnRateLimit: false`
+    // makes the 429 throw on the first response instead of entering a retry
+    // sleep. That sleep observes only the process shutdown signal, so the
+    // lookup's own 5s AbortController could not have interrupted it — without
+    // this, a 60s Retry-After honoured across 3 attempts would park the create
+    // behind the advisory for roughly two minutes.
+    expect(listCallCount).toBe(1);
+    // And nothing leaks to the user about it.
+    expect(stderrLines.filter(l => l.includes('[advisory]'))).toHaveLength(0);
+  });
+
   it('Fix 4 — swallows listing error and still proceeds with create', async () => {
     const { credentialsPath } = makeCreds();
     const codeFile = writeCodeFile('// test code');
@@ -9879,5 +9942,976 @@ describe('Fix 5 — dashboardUrl emission', () => {
       { stdout: line => out.push(line), stderr: () => undefined },
     );
     expect(out.join('').includes('dashboardUrl')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEV-737 — server-provided dashboardUrl precedence on create paths
+// ---------------------------------------------------------------------------
+
+describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () => {
+  function writeCodeFileDev737(contents: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-'));
+    const path = join(dir, 'test.py');
+    writeFileSync(path, contents, 'utf8');
+    return path;
+  }
+
+  it('runCreate JSON: a server-provided dashboardUrl wins over the client V2 guess', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const serverUrl =
+      'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_dash/test-cases/test_dash_01';
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          dashboardUrl: serverUrl,
+        },
+      };
+    });
+    const out: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_dash',
+        type: 'frontend',
+        name: 'dash test',
+        codeFile,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => undefined },
+    );
+    const printed = JSON.parse(out.join('')) as { dashboardUrl?: string };
+    // NOT the client-computed V2 shape (`/dashboard/tests/...`) — the server's
+    // V3 org-scoped link, verbatim.
+    expect(printed.dashboardUrl).toBe(serverUrl);
+  });
+
+  it('runCreate JSON: server dashboardUrl absent (backend predates this field) — falls back to the client-computed legacy link, no suppression advisory', async () => {
+    // Third state of the pinned three-state contract, alongside the
+    // present-string test above and the present-null test below: a wire
+    // response that OMITS the key entirely (not merely nullish) must be
+    // treated as "backend predates this field", never as suppression.
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          // No `dashboardUrl` key at all.
+        },
+      };
+    });
+    const out: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_dash',
+        type: 'frontend',
+        name: 'dash test',
+        codeFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as { dashboardUrl?: string };
+    expect(printed.dashboardUrl).toBe(
+      'https://www.testsprite.com/dashboard/tests/proj_dash/test/test_dash_01',
+    );
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      false,
+    );
+  });
+
+  it('runCreate JSON: server dashboardUrl:null suppresses the link — no client guess, and an advisory fires', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          dashboardUrl: null,
+        },
+      };
+    });
+    const out: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_dash',
+        type: 'frontend',
+        name: 'dash test',
+        codeFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as Record<string, unknown>;
+    // The field must be OMITTED, not serialized as a literal `null`.
+    expect('dashboardUrl' in printed).toBe(false);
+    expect(
+      stderrLines.some(l => l.includes('[advisory]') && l.includes('test get test_dash_01')),
+    ).toBe(true);
+  });
+
+  it('runCreate text mode: suppressed link — no dead Dashboard: line, advisory still fires on stderr', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          dashboardUrl: null,
+        },
+      };
+    });
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_dash',
+        type: 'frontend',
+        name: 'dash test',
+        codeFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    expect(stderrLines.some(l => l.startsWith('Dashboard:'))).toBe(false);
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      true,
+    );
+  });
+
+  it('runCreate --run chain: suppressed server link is not replaced by the client guess', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET' && url.includes('/tests?')) return { status: 200, body: { items: [] } };
+      if (method === 'POST' && url.endsWith('/tests')) {
+        return {
+          status: 200,
+          body: {
+            testId: 'test_dash_01',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-08-09T10:00:00.000Z',
+            dashboardUrl: null,
+          },
+        };
+      }
+      // POST /tests/{id}/runs — trigger
+      return {
+        status: 200,
+        body: {
+          runId: 'run_dash_01',
+          status: 'queued',
+          enqueuedAt: '2026-08-09T10:00:01.000Z',
+          codeVersion: 'v1',
+          targetUrl: '',
+        },
+      };
+    });
+    const out: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_dash',
+        type: 'frontend',
+        name: 'dash test',
+        codeFile,
+        run: true,
+        wait: false,
+        timeout: 60,
+        timeoutIsDefault: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as Record<string, unknown>;
+    expect('dashboardUrl' in printed).toBe(false);
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      true,
+    );
+  });
+
+  it('runCreateFromPlan JSON: a server-provided dashboardUrl wins over the plan-derived client guess', async () => {
+    function writePlanFileDev737(plan: unknown): string {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-plan-'));
+      const path = join(dir, 'plan.json');
+      writeFileSync(path, JSON.stringify(plan), 'utf8');
+      return path;
+    }
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const planFile = writePlanFileDev737({
+      projectId: 'proj_dash_plan',
+      type: 'frontend',
+      name: 'dash plan test',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    });
+    const serverUrl =
+      'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_dash_plan/test-cases/test_dash_01';
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          dashboardUrl: serverUrl,
+        },
+      };
+    });
+    const out: string[] = [];
+    await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => undefined },
+    );
+    const printed = JSON.parse(out.join('')) as { dashboardUrl?: string };
+    expect(printed.dashboardUrl).toBe(serverUrl);
+  });
+
+  it('runCreateFromPlan JSON: server dashboardUrl:null suppresses the link — no plan-derived client guess', async () => {
+    function writePlanFileDev737(plan: unknown): string {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-plan-'));
+      const path = join(dir, 'plan.json');
+      writeFileSync(path, JSON.stringify(plan), 'utf8');
+      return path;
+    }
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const planFile = writePlanFileDev737({
+      projectId: 'proj_dash_plan',
+      type: 'frontend',
+      name: 'dash plan test',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    });
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          dashboardUrl: null,
+        },
+      };
+    });
+    const out: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as Record<string, unknown>;
+    expect('dashboardUrl' in printed).toBe(false);
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      true,
+    );
+  });
+
+  it('runCreateFromPlan JSON: server dashboardUrl absent (backend predates this field) — falls back to the plan-derived client guess', async () => {
+    function writePlanFileDev737(plan: unknown): string {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-plan-'));
+      const path = join(dir, 'plan.json');
+      writeFileSync(path, JSON.stringify(plan), 'utf8');
+      return path;
+    }
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const planFile = writePlanFileDev737({
+      projectId: 'proj_dash_plan',
+      type: 'frontend',
+      name: 'dash plan test',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    });
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          // No `dashboardUrl` key at all.
+        },
+      };
+    });
+    const out: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as { dashboardUrl?: string };
+    expect(printed.dashboardUrl).toBe(
+      'https://www.testsprite.com/dashboard/tests/proj_dash_plan/test/test_dash_01',
+    );
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      false,
+    );
+  });
+
+  it('runCreateBatch JSON: per-item server dashboardUrl wins/suppresses independently; one aggregate advisory', async () => {
+    function writePlansJsonlDev737(plans: unknown[]): string {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-batch-'));
+      const path = join(dir, 'plans.jsonl');
+      writeFileSync(path, plans.map(p => JSON.stringify(p)).join('\n') + '\n', 'utf8');
+      return path;
+    }
+    const specA = {
+      projectId: 'proj_batch_a',
+      type: 'frontend' as const,
+      name: 'batch spec a',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    const specB = {
+      projectId: 'proj_batch_b',
+      type: 'frontend' as const,
+      name: 'batch spec b',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    const plansFile = writePlansJsonlDev737([specA, specB]);
+    const serverUrlA =
+      'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_batch_a/test-cases/test_a';
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const fetchImpl = makeFetch(() => ({
+      status: 200,
+      body: {
+        results: [
+          { specIndex: 0, status: 'created', testId: 'test_a', dashboardUrl: serverUrlA },
+          { specIndex: 1, status: 'created', testId: 'test_b', dashboardUrl: null },
+        ],
+        summary: { total: 2, created: 2, failed: 0 },
+      },
+    }));
+    const out: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        plans: plansFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as {
+      results: Array<{ testId: string; dashboardUrl?: string }>;
+    };
+    const itemA = printed.results.find(r => r.testId === 'test_a')!;
+    const itemB = printed.results.find(r => r.testId === 'test_b')!;
+    expect(itemA.dashboardUrl).toBe(serverUrlA);
+    expect('dashboardUrl' in itemB).toBe(false);
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      true,
+    );
+  });
+
+  // R3b (finding 2) — the `--run` fan-out must reuse the SAME per-item
+  // dashboard decision the create phase already resolved, not recompute a
+  // client-side URL from testId→projectId. Covers both `--output json`
+  // (the field is directly assertable) and `--output text` (asserts no
+  // legacy URL leaks anywhere and the batch-run summary still renders).
+  function writeTwoSpecPlansDev737(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-batch-run-'));
+    const path = join(dir, 'plans.jsonl');
+    const specA = {
+      projectId: 'proj_run_a',
+      type: 'frontend' as const,
+      name: 'batch run spec a',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    const specB = {
+      projectId: 'proj_run_b',
+      type: 'frontend' as const,
+      name: 'batch run spec b',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    writeFileSync(path, [specA, specB].map(p => JSON.stringify(p)).join('\n') + '\n', 'utf8');
+    return path;
+  }
+
+  const RUN_SERVER_URL_A =
+    'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_run_a/test-cases/test_run_a';
+  const LEGACY_V2_URL_FRAGMENT = '/dashboard/tests/'; // the dead link this feature removes
+
+  function makeBatchRunFanoutFetch(): typeof globalThis.fetch {
+    return makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      if (url.includes('/tests/batch')) {
+        return {
+          status: 200,
+          body: {
+            results: [
+              {
+                specIndex: 0,
+                status: 'created',
+                testId: 'test_run_a',
+                dashboardUrl: RUN_SERVER_URL_A,
+              },
+              { specIndex: 1, status: 'created', testId: 'test_run_b', dashboardUrl: null },
+            ],
+            summary: { total: 2, created: 2, failed: 0 },
+          },
+        };
+      }
+      // POST /tests/{id}/runs — trigger
+      return {
+        status: 200,
+        body: {
+          runId: 'run_fanout',
+          status: 'queued',
+          enqueuedAt: '2026-08-09T10:00:01.000Z',
+          codeVersion: 'v1',
+          targetUrl: '',
+        },
+      };
+    });
+  }
+
+  it('runCreateBatch --run --output json: per-item run results reuse the create-time server dashboardUrl/suppression — not a client-side recompute', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansDev737();
+    const out: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeBatchRunFanoutFetch(),
+        stdout: line => out.push(line),
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as {
+      results: Array<{ testId: string; dashboardUrl?: string }>;
+    };
+    const itemA = printed.results.find(r => r.testId === 'test_run_a')!;
+    const itemB = printed.results.find(r => r.testId === 'test_run_b')!;
+    // The server's V3-shaped link survives into the RUN result unchanged —
+    // a client-side recompute would have produced the legacy V2 shape instead.
+    expect(itemA.dashboardUrl).toBe(RUN_SERVER_URL_A);
+    expect(itemA.dashboardUrl).not.toContain(LEGACY_V2_URL_FRAGMENT);
+    // The suppressed item carries no link at all in its RUN result — a
+    // client-side recompute would have resurrected the dead legacy link here.
+    expect('dashboardUrl' in itemB).toBe(false);
+    expect(out.join('')).not.toContain(LEGACY_V2_URL_FRAGMENT);
+  });
+
+  it('runCreateBatch --run --output text: no legacy dashboard link leaks anywhere; batch-run summary still prints', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansDev737();
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeBatchRunFanoutFetch(),
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    );
+    // Text mode never prints per-item run dashboard links today, but the
+    // create-time suppression state must still be honored end to end: no
+    // dead legacy V2 link may appear anywhere in the output, and the
+    // create-phase aggregate advisory (now computed unconditionally,
+    // regardless of --output mode) must fire for the suppressed item.
+    expect(stdoutLines.join('\n')).not.toContain(LEGACY_V2_URL_FRAGMENT);
+    expect(stderrLines.join('\n')).not.toContain(LEGACY_V2_URL_FRAGMENT);
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      true,
+    );
+    expect(stderrLines.some(l => l.includes('batch-run summary:'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3 (dogfood 2026-08-09) — `test create --run` in text mode must still
+// print the authoritative `Dashboard:` line. The create's own print is
+// suppressed on the --run chain (delegated to `runTestRun` -> `printRunOrChain`,
+// whose text-mode header renders via `renderCreateText`, which never prints
+// `dashboardUrl`), so without an explicit emission the link silently
+// disappears — worst on a no-wait V3 create, where the client cannot
+// recompute it at all.
+// ---------------------------------------------------------------------------
+
+describe('[finding-3] test create --run text mode prints the authoritative Dashboard: line', () => {
+  function writeCodeFileFinding3(contents: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-finding3-'));
+    const path = join(dir, 'test.py');
+    writeFileSync(path, contents, 'utf8');
+    return path;
+  }
+
+  const TRIGGER_RESP_F3 = {
+    runId: 'run_f3_01',
+    status: 'queued' as const,
+    enqueuedAt: '2026-08-09T10:00:01.000Z',
+    codeVersion: 'v1',
+    targetUrl: '',
+  };
+
+  it('server dashboardUrl (string) → printed verbatim on stderr as Dashboard: <url>', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileFinding3('test("dash", async () => {});');
+    const serverUrl =
+      'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_f3/test-cases/test_f3_01';
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      if (method === 'POST' && url.endsWith('/tests')) {
+        return {
+          status: 200,
+          body: {
+            testId: 'test_f3_01',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-08-09T10:00:00.000Z',
+            dashboardUrl: serverUrl,
+          },
+        };
+      }
+      // POST /tests/{id}/runs — trigger.
+      return { status: 200, body: TRIGGER_RESP_F3 };
+    });
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_f3',
+        type: 'frontend',
+        name: 'f3 test',
+        codeFile,
+        run: true,
+        wait: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    expect(stderrLines.some(l => l === `Dashboard: ${serverUrl}`)).toBe(true);
+  });
+
+  it('server dashboardUrl:null → no Dashboard: line (no legacy guess); suppressed advisory fires instead', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileFinding3('test("dash", async () => {});');
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      if (method === 'POST' && url.endsWith('/tests')) {
+        return {
+          status: 200,
+          body: {
+            testId: 'test_f3_02',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-08-09T10:00:00.000Z',
+            dashboardUrl: null,
+          },
+        };
+      }
+      return { status: 200, body: TRIGGER_RESP_F3 };
+    });
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_f3',
+        type: 'frontend',
+        name: 'f3 test',
+        codeFile,
+        run: true,
+        wait: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    expect(stderrLines.some(l => l.startsWith('Dashboard:'))).toBe(false);
+    expect(
+      stderrLines.some(l => l.includes('[advisory]') && l.includes('test get test_f3_02')),
+    ).toBe(true);
+  });
+
+  it('absent dashboardUrl key (backend that predates the field) → legacy client-computed link still prints', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileFinding3('test("dash", async () => {});');
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      if (method === 'POST' && url.endsWith('/tests')) {
+        return {
+          status: 200,
+          body: {
+            testId: 'test_f3_03',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-08-09T10:00:00.000Z',
+            // No dashboardUrl key at all — simulates a backend that predates
+            // the field; the legacy client-side fallback is the correct
+            // behavior here (not suppression).
+          },
+        };
+      }
+      return { status: 200, body: TRIGGER_RESP_F3 };
+    });
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_f3',
+        type: 'frontend',
+        name: 'f3 test',
+        codeFile,
+        run: true,
+        wait: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    expect(
+      stderrLines.some(
+        l => l === 'Dashboard: https://www.testsprite.com/dashboard/tests/proj_f3/test/test_f3_03',
+      ),
+    ).toBe(true);
+  });
+
+  it('--output json is unaffected (no duplicate Dashboard: line; field stays in the merged envelope)', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileFinding3('test("dash", async () => {});');
+    const serverUrl =
+      'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_f3/test-cases/test_f3_04';
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      if (method === 'POST' && url.endsWith('/tests')) {
+        return {
+          status: 200,
+          body: {
+            testId: 'test_f3_04',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-08-09T10:00:00.000Z',
+            dashboardUrl: serverUrl,
+          },
+        };
+      }
+      return { status: 200, body: TRIGGER_RESP_F3 };
+    });
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_f3',
+        type: 'frontend',
+        name: 'f3 test',
+        codeFile,
+        run: true,
+        wait: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    expect(stderrLines.some(l => l.startsWith('Dashboard:'))).toBe(false);
+    const printed = JSON.parse(stdoutLines.join('')) as Record<string, unknown>;
+    expect(printed['dashboardUrl']).toBe(serverUrl);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding 2 (dogfood 2026-08-09) — create-batch --run --target-url must still
+// warn a V3-routed caller once, up front, even though this fan-out calls
+// `triggerRunWithMeta` directly and bypasses `runTestRun` (where the
+// `--target-url` V3 advisory normally lives).
+// ---------------------------------------------------------------------------
+
+describe('[finding-2] create-batch --run --target-url V3 advisory fires once, not per item', () => {
+  function writeTwoSpecPlansFinding2(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-finding2-batch-run-'));
+    const path = join(dir, 'plans.jsonl');
+    const specA = {
+      projectId: 'proj_f2_a',
+      type: 'frontend' as const,
+      name: 'finding2 spec a',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    const specB = {
+      projectId: 'proj_f2_b',
+      type: 'frontend' as const,
+      name: 'finding2 spec b',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    writeFileSync(path, [specA, specB].map(p => JSON.stringify(p)).join('\n') + '\n', 'utf8');
+    return path;
+  }
+
+  /** Routes GET /me to `me`; POST /tests/batch to a 2-item created response; everything else to the run trigger. */
+  function makeFinding2Fetch(
+    me: { v3Enabled?: boolean } | undefined,
+    meCalls: string[],
+  ): typeof globalThis.fetch {
+    return makeFetch(url => {
+      if (url.endsWith('/me')) {
+        meCalls.push('called');
+        return { status: 200, body: me ?? {} };
+      }
+      if (url.includes('/tests/batch')) {
+        return {
+          status: 200,
+          body: {
+            results: [
+              { specIndex: 0, status: 'created', testId: 'test_f2_a' },
+              { specIndex: 1, status: 'created', testId: 'test_f2_b' },
+            ],
+            summary: { total: 2, created: 2, failed: 0 },
+          },
+        };
+      }
+      // POST /tests/{id}/runs — trigger, once per created item.
+      return {
+        status: 200,
+        body: {
+          runId: `run_f2_${meCalls.length}`,
+          status: 'queued',
+          enqueuedAt: '2026-08-09T10:00:01.000Z',
+          codeVersion: 'v1',
+          targetUrl: '',
+        },
+      };
+    });
+  }
+
+  it('fires exactly once for the whole batch (not once per item) when V3-routed', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansFinding2();
+    const meCalls: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: 'https://staging.example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFinding2Fetch({ v3Enabled: true }, meCalls),
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    );
+    // Exactly one /me probe for the whole batch, regardless of how many
+    // items are in it (two created + triggered here).
+    expect(meCalls).toHaveLength(1);
+    const advisoryLines = stderrLines.filter(
+      l => l.includes('[advisory]') && l.includes('--target-url'),
+    );
+    expect(advisoryLines).toHaveLength(1);
+  });
+
+  it('does not fire when --target-url is absent, even for a V3-routed caller', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansFinding2();
+    const meCalls: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFinding2Fetch({ v3Enabled: true }, meCalls),
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    );
+    // No --target-url supplied: the probe must not even fire (mirrors
+    // single `test run`'s "only pay the extra /me round trip when
+    // --target-url was actually supplied" gating).
+    expect(meCalls).toHaveLength(0);
+    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
+  });
+
+  it('v3Enabled:false → no advisory even with --target-url set', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansFinding2();
+    const meCalls: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: 'https://staging.example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFinding2Fetch({ v3Enabled: false }, meCalls),
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    );
+    expect(meCalls).toHaveLength(1);
+    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
+  });
+
+  it('--output json: the advisory stays on stderr only — stdout parses clean with no [advisory] text', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansFinding2();
+    const meCalls: string[] = [];
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: 'https://staging.example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFinding2Fetch({ v3Enabled: true }, meCalls),
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    );
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('--target-url'))).toBe(
+      true,
+    );
+    expect(() => JSON.parse(stdoutLines.join(''))).not.toThrow();
+    expect(stdoutLines.join('')).not.toContain('[advisory]');
   });
 });

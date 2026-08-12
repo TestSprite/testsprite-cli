@@ -558,8 +558,18 @@ export class HttpClient {
       // in-flight fetch immediately (reason: InterruptError) instead of
       // letting a long-poll drain its window before the interrupt surfaces.
       if (this.shutdownSignal != null) composedSignals.push(this.shutdownSignal);
-      const effectiveSignal =
-        composedSignals.length > 1 ? AbortSignal.any(composedSignals) : timeoutSignal;
+      // Composed via `composeAbortSignals` (manual listeners), NOT the native
+      // `AbortSignal.any` — see that function's doc comment. `this.shutdownSignal`
+      // is process-lifetime (`globalShutdown.signal`, `client-factory.ts`) and is
+      // pushed into `composedSignals` on essentially every request, so
+      // `AbortSignal.any` here was measured to register ~330K dependent-signal
+      // trackings against that one long-lived signal over a single request-heavy
+      // test file — the same `FinalizationRegistry` backlog mechanism already
+      // fixed once in `poll.ts`, just recreated per-request instead of
+      // per-poll-iteration. `cleanupAbortComposition` MUST be called once the
+      // request settles (below, alongside `requestTimeout.clear()`).
+      const { signal: effectiveSignal, cleanup: cleanupAbortComposition } =
+        composeAbortSignals(composedSignals);
 
       try {
         try {
@@ -797,6 +807,11 @@ export class HttpClient {
         await this.sleepBeforeRetry(decision.delayMs);
       } finally {
         requestTimeout.clear();
+        // Remove the manually-added abort listeners now, synchronously —
+        // see `composeAbortSignals`. Runs on every path out of the try
+        // (return, throw, or `continue` into the next attempt), so nothing
+        // outlives the request it was created for.
+        cleanupAbortComposition();
       }
     }
   }
@@ -903,6 +918,68 @@ function newRequestId(): string {
 interface RequestTimeoutHandle {
   signal: AbortSignal;
   clear: () => void;
+}
+
+interface AbortComposition {
+  signal: AbortSignal;
+  cleanup: () => void;
+}
+
+/**
+ * Compose multiple `AbortSignal`s into one — abort on whichever fires first —
+ * WITHOUT using the native `AbortSignal.any`.
+ *
+ * `AbortSignal.any` builds a persistent "dependent signal" relationship: the
+ * signal it returns is tracked (via a `WeakRef` + `FinalizationRegistry`)
+ * against EVERY source signal passed in, including any long-lived one. Every
+ * outgoing request here composes `this.shutdownSignal` — process-lifetime
+ * (`globalShutdown.signal`, wired by `client-factory.ts` on essentially every
+ * command invocation) — into `composedSignals`, so each request added one
+ * more tracked dependent against that single long-lived signal, reclaimed
+ * only whenever V8 next got around to running ITS `FinalizationRegistry`
+ * cleanup pass. Under a request-heavy path (retries, a wide closure/batch
+ * fan-out, RATE_LIMITED backoff) this reproduces — per HTTP request instead
+ * of per poll-iteration — the exact backlog mechanism already fixed once in
+ * `poll.ts` (`JSFinalizationRegistry::Cleanup` → `KeepDuringJob` →
+ * `OrderedHashSet::Add` pegging the CPU once the deferred backlog is finally
+ * walked). Measured directly: the RATE_LIMITED closure-fanout scenario in
+ * `test.rerun.spec.ts` alone drives ~330K `AbortSignal.any` calls against the
+ * one process-lifetime `globalShutdown.signal` over the life of that single
+ * test file.
+ *
+ * This performs the identical "first one wins, propagate its `.reason`"
+ * composition with a plain `AbortController` and ordinary
+ * `addEventListener`/`removeEventListener` — no dependent-signal tracking, no
+ * `WeakRef`, no GC-deferred cleanup. The caller MUST invoke the returned
+ * `cleanup()` once the request settles (success, error, or retry) so the
+ * listeners are removed immediately rather than left for a cleanup pass that,
+ * for this composition, no longer exists.
+ */
+function composeAbortSignals(signals: readonly AbortSignal[]): AbortComposition {
+  if (signals.length <= 1) {
+    return { signal: signals[0]!, cleanup: () => {} };
+  }
+  // Mirror AbortSignal.any's already-aborted short-circuit: if a source is
+  // already aborted at composition time, propagate its reason immediately —
+  // no listeners are ever added, so cleanup is a no-op.
+  const alreadyAborted = signals.find(s => s.aborted);
+  const controller = new AbortController();
+  if (alreadyAborted) {
+    controller.abort(alreadyAborted.reason);
+    return { signal: controller.signal, cleanup: () => {} };
+  }
+  const removers: Array<() => void> = [];
+  for (const source of signals) {
+    const onAbort = (): void => controller.abort(source.reason);
+    source.addEventListener('abort', onAbort, { once: true });
+    removers.push(() => source.removeEventListener('abort', onAbort));
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      for (const remove of removers) remove();
+    },
+  };
 }
 
 function createRequestTimeout(timeoutMs: number): RequestTimeoutHandle {

@@ -4,6 +4,19 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-12
+
+### Added
+
+- **CI-native output now covers single-run `--wait` and batch rerun.** `--gh-output` / `--summary-file` (contributed in community PR #264 for `test run --all --wait`) now also work on `test run <id> --wait` and `test rerun --all --wait`, so a CI job that runs one test or reruns a batch gets the same `::error::` annotations and machine summary as a fresh batch — written right after the JUnit report on the rerun path. The summary and annotations land even when the command exits non-zero, the emit is best-effort (a sink write failure such as EPIPE can never change the command's exit code), and non-dispatched work — rate-deferred, conflicted, or not-found tests — is folded into the summary as non-passed rows, so a partial batch can never read as "all passed". Workflow-command data and job-summary table cells are escaped: a multiline run error cannot inject `::commands` into the Actions stream or break the summary table.
+- **`--target-url` now warns when it cannot apply (V3 path).** On a V3-routed account, `test run --target-url` is validated server-side and then discarded — V3 resolves the run's environment at execution time, so there is no per-run override. The CLI now makes a bounded, best-effort account check (only when the flag was supplied) and prints a stderr `[advisory]` that the flag will not take effect; `test create-batch --run` fires the same advisory once before the fan-out. It fires in every `--output` mode — JSON/CI is exactly the unattended case that needs it — and can never affect stdout or the exit code.
+
+### Fixed
+
+- **Create paths prefer the server's dashboard link and never print a dead one.** `test create` / `test create-batch` / `--plan-from` computed the Portal `dashboardUrl` entirely client-side in the legacy route shape, which 404s for a V3-native create. A server-provided `dashboardUrl` on the create response now wins, under the same three-state contract the run paths use: a string is used verbatim; `null` means the server looked and there is no correct link, so an `[advisory]` points at `test get <id>` instead of printing a URL that would 404; only an absent field (an older backend) falls back to the client computation. The decision is resolved once at create time and reused verbatim by the `--run` fan-out, and `test create --run` in text mode prints the server link again (its `Dashboard:` line had been dropped in the delegation to the run renderer).
+- **Best-effort pre-flight lookups can no longer stall a real command behind a rate limit.** The duplicate-name advisory's 5-second deadline bounded the fetch but not the retry sleep, so a 429 carrying a long `Retry-After` could park an otherwise-healthy `test create` behind an advisory; the same applied to the `--target-url` account check. Both lookups now skip rate-limit retries entirely — a throttled advisory is dropped, never waited on.
+- **Long `--wait` sessions no longer accumulate abort-signal churn.** Every poll iteration and every HTTP attempt composed a fresh abort signal against the process-lifetime shutdown signal, registering finalization-tracked dependents by the hundreds of thousands over a large batch — measured as multi-second stalls during engine cleanup passes. The poll loop now reuses one controller per session and the HTTP layer composes signals manually with listeners it removes synchronously; timeout, Ctrl-C, and retry behavior are unchanged.
+
 ## [0.5.0] - 2026-08-05
 
 ### Added

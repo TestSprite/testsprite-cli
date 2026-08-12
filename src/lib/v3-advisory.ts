@@ -31,3 +31,29 @@ export const V3_ROUTING_ADVISORY: string[] = [
 export function emitV3RoutingAdvisory(stderr: (line: string) => void): void {
   for (const line of V3_ROUTING_ADVISORY) stderr(line);
 }
+
+/**
+ * Point-of-use advisory for `test run --target-url` on a V3-routed caller
+ * (DEV-749). `V3_ROUTING_ADVISORY` above already names this gap once, in
+ * the account-level summary `auth status`/`doctor` print — this is the
+ * SAME gap surfaced at the moment the caller actually hits it, matching
+ * the existing backend-test `--target-url` advisory in `runCreate`
+ * (`commands/test.ts`): unconditional across every `--output` mode. That
+ * advisory's family is "a flag the caller just passed has a structural
+ * consequence" — `--output json` is precisely the unattended/CI case that
+ * needs the warning most, not the case to withhold it from (unlike the
+ * routing-advisory family above, which a JSON caller can skip by reading
+ * `v3Enabled` directly off that command's own structured output — `test
+ * run`'s JSON output carries no such field). Deliberately type-agnostic
+ * (no "on frontend runs" claim): the CLI cannot learn a test's type at
+ * `test run <existing-test-id>` time without an extra round trip, and the
+ * override is equally inert on the V3 backend-run path.
+ */
+export const TARGET_URL_V3_ADVISORY =
+  "[advisory] --target-url is not applied on the V3 execution path; the run uses the test's " +
+  'configured environment instead.';
+
+/** Write the target-url advisory to a stderr sink. */
+export function emitTargetUrlV3Advisory(stderr: (line: string) => void): void {
+  stderr(TARGET_URL_V3_ADVISORY);
+}

@@ -14,6 +14,21 @@ useDefault = true
 
 [allowlist]
 description = "Unit-test dummy keys and documented placeholder keys (not real secrets)"
+# Full-history scanning (new: the `gitleaks-history` job in
+# security.yml, push-triggered only) sees commits the working-tree scan
+# never could. It found exactly one hit across the whole history: a fixture
+# in src/lib/client-factory.test.ts that once hardcoded a fake `tsp_u_`
+# test value literally, before a later commit rewrote it to build the value
+# at test-run time specifically so no token-shaped literal exists in source
+# (see that file's own comment). Not a real credential — never minted by a
+# real backend, never live. Allowlisted by COMMIT, not by value: writing the
+# literal string itself into this file would trip
+# scripts/make-public-snapshot.sh's own release-time leak grep, since this
+# file ships to the public repo. Verified this is the only finding in the
+# repo's history before adding the exemption.
+commits = [
+  "da04640835a2d9b02901c88581680ec2445c85b0",
+]
 regexes = [
   # Unit-test fixtures, e.g. sk-secret-12345 in *.test.ts
   '''sk-secret-[0-9]+''',

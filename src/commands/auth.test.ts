@@ -867,6 +867,27 @@ describe('runWhoami', () => {
     expect(printed).toEqual(sampleMe);
   });
 
+  // Confirms `auth whoami` / `auth status` never sends X-CLI-Command — it must
+  // stay a plain, untagged /me call (only `runInit`'s configure-validate step
+  // and `test run --target-url`'s v3Enabled probe tag this header).
+  it('sends no X-CLI-Command header', async () => {
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+    const { deps } = makeCapture();
+    const sentHeaders: Array<Record<string, string> | undefined> = [];
+    const capturingFetch = vi.fn(
+      async (_url: string, init: { headers?: Record<string, string> }) => {
+        sentHeaders.push(init?.headers);
+        return meResponse();
+      },
+    ) as unknown as AuthDeps['fetchImpl'];
+    await runWhoami(
+      { profile: 'default', output: 'json', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: capturingFetch },
+    );
+    expect(sentHeaders).toHaveLength(1);
+    expect(sentHeaders[0]?.['x-cli-command']).toBeUndefined();
+  });
+
   it('renders routing: v3 and the gap advisory when v3Enabled is true', async () => {
     writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();

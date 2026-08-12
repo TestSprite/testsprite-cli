@@ -24,10 +24,10 @@
  * regression escapes to dev.
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { makeTempDir } from '../helpers/tempDir.js';
 import { runCodeGet, runResult, runSteps } from '../../src/commands/test.js';
 import {
   failureContextFixture,
@@ -269,10 +269,14 @@ describe('P4 schema contract — fixtures match the OpenAPI shapes', () => {
 // CLI's typed contract matches the wire shape." If a runner ever
 // silently omits or coerces a field, this fails.
 
+// Every makeCreds() call gets its own temp dir; each is registered here and
+// swept in afterEach so a failing assertion mid-test still leaves nothing behind.
+const pendingCredsCleanups: Array<() => void> = [];
+
 function makeCreds(): { credentialsPath: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'cli-p4-contract-'));
-  const credentialsPath = join(dir, 'credentials');
-  mkdirSync(dir, { recursive: true });
+  const dir = makeTempDir('cli-p4-contract-');
+  pendingCredsCleanups.push(dir.cleanup);
+  const credentialsPath = join(dir.path, 'credentials');
   // The base URL must match what the MSW handlers serve (DEFAULT_BASE_URL
   // sans the /api/cli/v1 suffix that facadeBaseUrl re-appends).
   writeFileSync(
@@ -282,6 +286,10 @@ function makeCreds(): { credentialsPath: string } {
   );
   return { credentialsPath };
 }
+
+afterEach(() => {
+  while (pendingCredsCleanups.length > 0) pendingCredsCleanups.pop()?.();
+});
 
 describe('P4 schema contract — CLI runners return §6.x shapes', () => {
   it('runCodeGet (inline) returns a §6.3 TestCode', async () => {

@@ -2,18 +2,65 @@
  * Unit tests for `test rerun` — M3.4 piece-3.
  *
  * All HTTP is mocked via `makeFetch`. The polling loop's sleep injection is
- * wired through `TestDeps.sleep` to avoid real delays.
+ * wired through `TestDeps.sleep` (`instantSleep` below) to avoid real delays
+ * — every test in this file already routes through it; there is no
+ * uninjected real sleep on the deferred-retry/polling paths.
+ *
+ * `testTimeout` is pinned below (rather than left at the vitest default) so
+ * a *future* regression that reintroduces a real, uninjected sleep on the
+ * rerun path fails within seconds instead of silently burning minutes.
+ *
+ * A splitting-by-seam mitigation was evaluated (batch/fan-out cases into
+ * their own file, matching `test.rerun.closure-fanout.spec.ts`'s existing
+ * precedent) and rejected: the slow CI runs for this file were not a real
+ * sleep or a vitest reporter-RPC timeout, but V8's `FinalizationRegistry`/
+ * `WeakRef` cleanup (`JSFinalizationRegistry::Cleanup` → `KeepDuringJob` →
+ * `OrderedHashSet::Add`, confirmed via CPU stack sampling) processing a large
+ * backlog of kept-alive objects. Splitting made the stall *deterministic*
+ * (4/4 attempts) instead of occasional, because vitest's inter-file teardown
+ * forced the cleanup task to run right after the fan-out tests' churn.
+ *
+ * Two independent sources of that churn have since been found and fixed —
+ * do not re-attempt a file split as a mitigation for either without first
+ * checking whether a new one has appeared:
+ *
+ *   1. `poll.ts` minted a fresh `AbortController` + composed `AbortSignal`
+ *      on every poll *iteration*, even though the abort target (an absolute
+ *      deadline) never changes within a session. Fixed by hoisting the
+ *      controller/signal to poll-session scope.
+ *   2. `http.ts::requestWithMeta` composed a fresh `AbortSignal.any([
+ *      timeoutSignal, options.signal?, shutdownSignal?])` on every HTTP
+ *      *request* (per retry attempt). `shutdownSignal` defaults to the
+ *      process-lifetime `globalShutdown.signal`, so this registered one more
+ *      `FinalizationRegistry`-tracked dependent against that single
+ *      long-lived signal per request — CI (Node 22) caught this directly:
+ *      this file's `RATE_LIMITED in a closure member poll` test (every
+ *      closure-member poll 429s, retried up to 3× by `http.ts`) hit this
+ *      file's 10s `testTimeout` guard on CI while measuring 8ms locally, the
+ *      same signature as the `poll.ts` stall. Fixed by `composeAbortSignals`
+ *      (manual `AbortController` + explicit `addEventListener`/
+ *      `removeEventListener`, cleaned up synchronously per attempt) instead
+ *      of the native `AbortSignal.any`. Measured on this file: `AbortSignal.
+ *      any` calls against `globalShutdown.signal` dropped from ~330K to 94
+ *      (the remainder is `poll.ts`'s own per-session compositions).
+ *
+ * `testTimeout: 10_000` is what surfaced fix 2 above — it is doing its job.
+ * Kept at 10s rather than raised: a genuinely reintroduced real sleep (~10s
+ * per attempt) still blows the budget on its very first attempt.
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import type { Command } from 'commander';
+import { describe, expect, it, vi } from 'vitest';
 import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import type { RunResponse, RerunResponse, BatchRerunResponse } from '../lib/runs.types.js';
 import type { FetchImpl } from '../lib/http.js';
 import { runTestRerun, resolveWaitRequestTimeoutMs } from './test.js';
+
+vi.setConfig({ testTimeout: 10_000 });
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -5626,5 +5673,146 @@ describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatc
     expect(stderrBlock).toContain('billing');
     expect(stderrBlock).toContain('run_b1');
     expect(stderrBlock).toContain('run_b2');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gap B — CI-native output on batch rerun --wait (::error:: + summary file)
+// ---------------------------------------------------------------------------
+
+describe('gh-output integration on batch rerun --wait (Gap B)', () => {
+  function mixedBatchHarness() {
+    const creds = makeCreds();
+    const batchResp: BatchRerunResponse = {
+      accepted: [
+        { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+        { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+      ],
+      deferred: [],
+      conflicts: [],
+      closure: { byProject: [] },
+    };
+    const run1 = makeTerminalRun('run_b1', 'passed');
+    run1.testId = 'test_1';
+    const run2 = makeTerminalRun('run_b2', 'failed');
+    run2.testId = 'test_2';
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/rerun')) return { status: 202, body: batchResp };
+      if (url.includes('/runs/run_b1')) return { body: run1 };
+      if (url.includes('/runs/run_b2')) return { body: run2 };
+      return errorBody('NOT_FOUND');
+    });
+    return { creds, fetchImpl };
+  }
+
+  it('--gh-output --summary-file writes the reduced artifact + annotates the failed run (exit 1)', async () => {
+    const { creds, fetchImpl } = mixedBatchHarness();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-gh-output-rerun-'));
+    const summaryFile = join(dir, 'summary.json');
+    const stdoutLines: string[] = [];
+    const err = await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 10,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'text',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        ghOutput: true,
+        summaryFile,
+      },
+      {
+        ...creds,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
+        env: {} as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ exitCode: 1 });
+    const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
+      total: number;
+      passed: number;
+      failed: number;
+      runs: unknown[];
+    };
+    expect(artifact).toMatchObject({ total: 2, passed: 1, failed: 1 });
+    // Forced annotations (off-Actions) land on the text stdout for the failed run only.
+    const annotations = stdoutLines.filter(line => line.startsWith('::error'));
+    expect(annotations).toHaveLength(1);
+    expect(annotations[0]).toContain('test_2');
+  });
+
+  it('under Actions with --output json: stdout stays parseable JSON, ::error:: goes to stderr', async () => {
+    const { creds, fetchImpl } = mixedBatchHarness();
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    const err = await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 10,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        ghOutput: true,
+      },
+      {
+        ...creds,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        env: { GITHUB_ACTIONS: 'true' } as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ exitCode: 1 });
+    // The batch envelope on stdout must remain parseable as-is.
+    const payload = JSON.parse(stdoutLines.join('\n')) as { accepted?: unknown[] };
+    expect(Array.isArray(payload.accepted)).toBe(true);
+    expect(stdoutLines.some(line => line.startsWith('::error'))).toBe(false);
+    const annotations = stderrLines.filter(line => line.startsWith('::error'));
+    expect(annotations).toHaveLength(1);
+    expect(annotations[0]).toContain('test_2');
+  });
+});
+
+describe('rerun --gh-output / --summary-file require a batch --wait (Gap B guard)', () => {
+  function disableExits(cmd: Command): void {
+    cmd.exitOverride();
+    cmd.commands.forEach(disableExits);
+  }
+
+  it('--gh-output on a single rerun (no --wait) → exit 5', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const test = createTestCommand();
+    disableExits(test);
+    await expect(
+      test.parseAsync(['rerun', 'test_1', '--gh-output'], { from: 'user' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('--gh-output on a batch without --wait → exit 5', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const test = createTestCommand();
+    disableExits(test);
+    await expect(
+      test.parseAsync(['rerun', 'test_1', 'test_2', '--gh-output'], { from: 'user' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 });

@@ -96,6 +96,30 @@ describe('runUsage — dry-run', () => {
 });
 
 describe('runUsage — real path without credits (current backend)', () => {
+  // Confirms `usage` never sends X-CLI-Command — it must stay a plain,
+  // untagged /me call (only `runInit`'s configure-validate step and
+  // `test run --target-url`'s v3Enabled probe tag this header).
+  it('sends no X-CLI-Command header on its GET /me call', async () => {
+    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
+    const { deps } = makeCapture();
+    const sentHeaders: Array<Record<string, string> | undefined> = [];
+    const capturingFetch = vi.fn(
+      async (_url: string, init: { headers?: Record<string, string> }) => {
+        sentHeaders.push(init?.headers);
+        return new Response(JSON.stringify(meWithoutCredits), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    ) as unknown as UsageDeps['fetchImpl'];
+    await runUsage(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, credentialsPath, fetchImpl: capturingFetch },
+    );
+    expect(sentHeaders).toHaveLength(1);
+    expect(sentHeaders[0]?.['x-cli-command']).toBeUndefined();
+  });
+
   it('returns the /me response and emits a note about missing balance', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();

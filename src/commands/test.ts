@@ -97,7 +97,12 @@ import {
 import { createTicker } from '../lib/ticker.js';
 import { RateThrottle } from '../lib/rate-throttle.js';
 import { resolvePortalBase, resolvePortalUrl } from '../lib/facade.js';
-import { emitGithubOutputs, summarizeAcceptedPayload } from '../lib/gh-output.js';
+import { emitTargetUrlV3Advisory } from '../lib/v3-advisory.js';
+import {
+  emitGithubOutputs,
+  summarizeAcceptedPayload,
+  summarizeSingleRun,
+} from '../lib/gh-output.js';
 import { loadConfig } from '../lib/config.js';
 import {
   flakyExitCode,
@@ -652,6 +657,18 @@ export interface CliCreateTestResponse {
    * still succeeded.
    */
   warnings?: string[];
+  /**
+   * Server-built Portal deep link for the created test (DEV-737). Same
+   * presence/absence contract as `RunResponse.dashboardUrl`
+   * (`withRunDashboardUrl` below): PRESENT (string or falsy) on a backend
+   * that resolved the question at all — a falsy value means "there is no
+   * correct link for this test" (e.g. a V3-native create with no DynamoDB
+   * mirror row for the client's V2-shaped guess to land on) and must never
+   * be replaced by the client fallback; ABSENT on an older backend that
+   * predates this field, which safely reopens the client fallback via
+   * `resolveDashboardUrl` below. See that function's doc for the reasoning.
+   */
+  dashboardUrl?: string | null;
 }
 
 export const CLI_CREATE_PRIORITIES = ['p0', 'p1', 'p2', 'p3'] as const;
@@ -760,15 +777,26 @@ async function emitDupNameAdvisoryIfNeeded(
   // Use an AbortController with a 5 s deadline. When the timer fires it
   // calls ac.abort(), which causes client.get (via the `signal` option) to
   // throw an AbortError — caught below and swallowed. This ensures a stalled
-  // or retrying listing endpoint can't delay an otherwise-healthy create by
-  // the full request-timeout (120 s) or multiple transport retries.
+  // listing endpoint can't delay an otherwise-healthy create by the full
+  // request-timeout (120 s).
   // No secondary setTimeout is used to avoid leaking timers in tests.
+  //
+  // The deadline alone is NOT sufficient, because `signal` is composed into
+  // the fetch only — `sleepBeforeRetry` observes the process-lifetime
+  // shutdown signal and nothing else, so a retry sleep runs to completion
+  // no matter what this controller does. A 429 carrying `Retry-After` is
+  // honoured up to 60 s per attempt across 3 attempts, which would park the
+  // create behind a best-effort advisory for up to ~2 minutes. `429` is a
+  // live response for CLI callers (the in-flight run cap returns it), so
+  // this is reachable, not theoretical. `retryOnRateLimit: false` makes the
+  // 429 throw straight into the catch below, which is the correct outcome
+  // for a lookup whose entire purpose is to be skippable.
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), DUP_NAME_ADVISORY_TIMEOUT_MS);
   try {
     const listing = await client.get<{ items: CliTest[] }>(
       `/tests?projectId=${encodeURIComponent(projectId)}&pageSize=100`,
-      { signal: ac.signal },
+      { signal: ac.signal, retryOnRateLimit: false },
     );
     const nameLower = name.toLowerCase();
     const match = listing.items?.find(t => t.name.toLowerCase() === nameLower);
@@ -966,11 +994,36 @@ export async function runCreate(
     // the merged { ...createContext, run } envelope in JSON mode and
     // appears on the Dashboard: stderr line in text mode.
     // R1: suppress under --dry-run (fake canned test id).
-    const chainDashboardUrl = opts.dryRun
-      ? undefined
-      : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId);
-    const createContextWithUrl =
-      chainDashboardUrl !== undefined ? { ...response, dashboardUrl: chainDashboardUrl } : response;
+    // DEV-737: prefer a server-provided dashboardUrl over the client guess
+    // (`withDashboardUrl`/`resolveDashboardUrl` above); when the server
+    // explicitly withheld one, never fall back to the client-computed
+    // V2-shaped link and tell the caller where to find the test instead.
+    const { entity: createContextWithUrl, suppressed: dashboardSuppressedOnRun } = withDashboardUrl(
+      response,
+      () =>
+        opts.dryRun
+          ? undefined
+          : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId),
+    );
+    const runDashboardStderrFn =
+      deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    if (dashboardSuppressedOnRun) {
+      emitDashboardLinkSuppressedAdvisory(response.testId, runDashboardStderrFn);
+    } else if (opts.output !== 'json' && createContextWithUrl.dashboardUrl !== undefined) {
+      // Finding 3 (dogfood 2026-08-09): the merged create+run chain suppresses
+      // the create's own print (delegating to `runTestRun` -> `printRunOrChain`),
+      // whose text-mode header renders `createContext` via `renderCreateText` —
+      // which never prints `dashboardUrl` — and there is otherwise no stderr
+      // emission point for it on this chain (unlike the non-`--run` path below,
+      // which prints this same line explicitly). Without this, a text-mode
+      // `create --run` silently drops the authoritative link — worst on a
+      // no-wait V3 create, where the client cannot recompute it at all. Mirrors
+      // the non-run path's three-state handling exactly: a suppressed (`null`)
+      // server link takes the advisory branch above instead (no legacy guess);
+      // an absent key already resolved to the legacy client fallback (or
+      // `undefined` when unmapped) via `createContextWithUrl` above.
+      runDashboardStderrFn(`Dashboard: ${createContextWithUrl.dashboardUrl}`);
+    }
     await runTestRun(
       {
         ...opts,
@@ -996,19 +1049,32 @@ export async function runCreate(
   // (no extra network call — both come from opts / response).
   // R1: suppress under --dry-run — the test id is a fake canned value
   // (e.g. "test_dryrun_create_2026") and a live-looking URL would mislead.
-  const dashboardUrl = opts.dryRun
-    ? undefined
-    : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId);
+  // DEV-737: prefer a server-provided dashboardUrl over the client guess;
+  // never fall back when the server explicitly withheld one (see
+  // `withDashboardUrl`/`resolveDashboardUrl` above), and tell the caller
+  // where to find the test instead of printing a link that would 404.
+  const { entity: responseWithDashboardUrl, suppressed: dashboardSuppressed } = withDashboardUrl(
+    response,
+    () =>
+      opts.dryRun
+        ? undefined
+        : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId),
+  );
+  const dashboardUrl = responseWithDashboardUrl.dashboardUrl ?? undefined;
   if (opts.output === 'json') {
-    out.print(dashboardUrl !== undefined ? { ...response, dashboardUrl } : response, data =>
-      renderCreateText(data as CliCreateTestResponse),
-    );
+    out.print(responseWithDashboardUrl, data => renderCreateText(data as CliCreateTestResponse));
   } else {
     out.print(response, data => renderCreateText(data as CliCreateTestResponse));
     if (dashboardUrl !== undefined) {
       const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
       stderrFn(`Dashboard: ${dashboardUrl}`);
     }
+  }
+  if (dashboardSuppressed) {
+    emitDashboardLinkSuppressedAdvisory(
+      response.testId,
+      deps.stderr ?? (line => process.stderr.write(`${line}\n`)),
+    );
   }
   return response;
 }
@@ -2012,6 +2078,12 @@ export interface CliBatchSpecResult {
     message: string;
     field?: string;
   };
+  /**
+   * Server-built Portal deep link for this created item (DEV-737). Same
+   * presence/absence contract as `CliCreateTestResponse.dashboardUrl` —
+   * see that field's doc.
+   */
+  dashboardUrl?: string | null;
 }
 
 export interface CliCreateBatchResponse {
@@ -2043,6 +2115,13 @@ export interface CliBatchRunResult {
   failureKind?: string | null;
   /** Error envelope when the trigger itself failed (network/auth/validation). */
   error?: { code: string; message: string; exitCode: number };
+  /**
+   * Portal deep link (R3b), threaded through from the SAME per-item
+   * create-time decision `test create-batch`'s own output carries — never
+   * recomputed at run time. Absent when unresolvable OR explicitly
+   * suppressed by the server (see `resolveDashboardUrl`'s doc).
+   */
+  dashboardUrl?: string;
 }
 
 /** Envelope emitted by `test create-batch --run` in JSON mode. */
@@ -2493,9 +2572,17 @@ export async function runCreateFromPlan(
   // Fix 5 (plan-from coverage): the projectId for the deep-link comes from
   // the validated PLAN body (not opts — `--plan-from` has no --project-id
   // flag). Same dry-run suppression as runCreate (fake canned test id).
-  const planDashboardUrl = opts.dryRun
-    ? undefined
-    : resolvePortalUrl(resolveApiUrl(opts, deps), plan.projectId, response.testId);
+  // DEV-737: prefer a server-provided dashboardUrl over the client guess
+  // (`withDashboardUrl`/`resolveDashboardUrl`, defined near
+  // `withRunDashboardUrl`); never fall back when the server explicitly
+  // withheld one, and tell the caller where to find the test instead.
+  const { entity: responseWithDashboardUrl, suppressed: planDashboardSuppressed } =
+    withDashboardUrl(response, () =>
+      opts.dryRun
+        ? undefined
+        : resolvePortalUrl(resolveApiUrl(opts, deps), plan.projectId, response.testId),
+    );
+  const planDashboardUrl = responseWithDashboardUrl.dashboardUrl ?? undefined;
 
   // --run chain (M3.3 piece-3): trigger + optionally wait. Per codex
   // round-1 P1: suppress the create's own print when chaining;
@@ -2504,8 +2591,9 @@ export async function runCreateFromPlan(
     // Idempotency key for the run is the create key + ":run" suffix so a
     // retry of the whole chain gets the same runId. Per piece-3 spec.
     const runIdempotencyKey = `${idempotencyKey}:run`;
-    const createContextWithUrl =
-      planDashboardUrl !== undefined ? { ...response, dashboardUrl: planDashboardUrl } : response;
+    if (planDashboardSuppressed) {
+      emitDashboardLinkSuppressedAdvisory(response.testId, stderrFn);
+    }
     return runTestRun(
       {
         ...opts,
@@ -2516,22 +2604,22 @@ export async function runCreateFromPlan(
         // first-run hint fires for `test create --plan-from --run --wait`.
         timeoutIsDefault: opts.timeoutIsDefault ?? false,
         wait: opts.wait === true,
-        createContext: createContextWithUrl,
+        createContext: responseWithDashboardUrl,
       },
       deps,
     ).then(() => response);
   }
 
   if (opts.output === 'json') {
-    out.print(
-      planDashboardUrl !== undefined ? { ...response, dashboardUrl: planDashboardUrl } : response,
-      data => renderCreateText(data as CliCreateTestResponse),
-    );
+    out.print(responseWithDashboardUrl, data => renderCreateText(data as CliCreateTestResponse));
   } else {
     out.print(response, data => renderCreateText(data as CliCreateTestResponse));
     if (planDashboardUrl !== undefined) {
       stderrFn(`Dashboard: ${planDashboardUrl}`);
     }
+  }
+  if (planDashboardSuppressed) {
+    emitDashboardLinkSuppressedAdvisory(response.testId, stderrFn);
   }
   return response;
 }
@@ -3019,23 +3107,70 @@ export async function runCreateBatch(
     });
   }
 
-  // Fix 5: enrich results with per-item dashboardUrl in JSON mode.
+  // Fix 5: enrich results with per-item dashboardUrl.
   // projectId comes from specs[specIndex].projectId; testId from the result row.
   // Only emitted where both are known client-side — no extra network calls.
   // R1: suppress under --dry-run — test ids are fake canned values and a
   // live-looking URL would mislead the caller.
+  // DEV-737: prefer a server-provided per-item dashboardUrl over the client
+  // guess (`withDashboardUrl`/`resolveDashboardUrl`, defined near
+  // `withRunDashboardUrl`); never fall back when the server explicitly
+  // withheld one for a given item — that would print exactly the dead
+  // V2-shaped link the server declined to emit.
+  //
+  // The per-item decision is captured into `testIdToDashboardState` — computed
+  // ONCE here, regardless of `--output` mode — so the `--run` fan-out below
+  // (`runBatchRun`) can reuse the SAME decision instead of recomputing a
+  // client-side URL from testId→projectId, which would silently replace a
+  // server-provided V3 link with the dead legacy V2 guess and lose
+  // suppression state entirely. Computing it unconditionally (not gated on
+  // `opts.output === 'json'`) also means the aggregate suppression advisory
+  // below now correctly fires in text mode too — it previously only ever
+  // fired in JSON mode because the per-item loop was skipped entirely in text
+  // mode, silently under-warning a text-mode caller. That matches the
+  // documented "advisory fires on stderr regardless of --output mode"
+  // convention this repo already follows for the single-`test create` advisory.
   const apiUrlForDashboard = resolveApiUrl(opts, deps);
+  let anyDashboardSuppressed = false;
+  const testIdToDashboardState = new Map<
+    string,
+    { dashboardUrl: string | undefined; suppressed: boolean }
+  >();
+  if (!opts.dryRun) {
+    for (const r of response.results) {
+      if (r.status !== 'created' || r.testId === undefined) continue;
+      const testId = r.testId;
+      const spec = specs[r.specIndex];
+      const projectId = spec?.projectId;
+      const { entity, suppressed } = withDashboardUrl(r, () =>
+        projectId ? resolvePortalUrl(apiUrlForDashboard, projectId, testId) : undefined,
+      );
+      if (suppressed) anyDashboardSuppressed = true;
+      testIdToDashboardState.set(testId, {
+        dashboardUrl: entity.dashboardUrl ?? undefined,
+        suppressed,
+      });
+    }
+  }
+  if (anyDashboardSuppressed) {
+    const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    stderrFn(
+      '[advisory] no dashboard link is available for one or more created tests right now; ' +
+        'use `testsprite test get <test-id>` to look them up.',
+    );
+  }
+
+  // JSON-mode create output is enriched from the same map, so it stays
+  // byte-identical to before this refactor.
   const enrichedResponse: CliCreateBatchResponse =
     !opts.dryRun && opts.output === 'json'
       ? {
           ...response,
           results: response.results.map(r => {
             if (r.status !== 'created' || r.testId === undefined) return r;
-            const spec = specs[r.specIndex];
-            const projectId = spec?.projectId;
-            if (!projectId) return r;
-            const dashboardUrl = resolvePortalUrl(apiUrlForDashboard, projectId, r.testId);
-            return dashboardUrl !== undefined ? { ...r, dashboardUrl } : r;
+            const state = testIdToDashboardState.get(r.testId);
+            if (!state) return r;
+            return { ...r, dashboardUrl: state.dashboardUrl };
           }),
         }
       : response;
@@ -3051,23 +3186,13 @@ export async function runCreateBatch(
 
   // --run: fan out a trigger for each created test, then emit results.
   if (opts.run === true) {
-    // R3b: build testId → projectId map from the create results + specs so
-    // runBatchRun can enrich per-item run JSON with dashboardUrl.
-    const runTestIdToProjectId = new Map<string, string>();
-    for (const r of response.results) {
-      if (r.status === 'created' && r.testId !== undefined) {
-        const projectId = specs[r.specIndex]?.projectId;
-        if (projectId) runTestIdToProjectId.set(r.testId, projectId);
-      }
-    }
     await runBatchRun(
       opts,
       response,
       client,
       out,
       deps,
-      opts.dryRun ? undefined : runTestIdToProjectId,
-      opts.dryRun ? undefined : apiUrlForDashboard,
+      opts.dryRun ? undefined : testIdToDashboardState,
     );
     // runBatchRun handles its own exit-code logic via CLIError.
     // Return the create response to satisfy the return type; callers that
@@ -3104,12 +3229,17 @@ async function runBatchRun(
   client: HttpClient,
   out: Output,
   deps: TestDeps,
-  /** R3b: testId → projectId mapping built from create results + specs, used to enrich
-   *  run-path JSON items with dashboardUrl. Populated by the caller; absent (undefined)
-   *  means no enrichment (e.g. dry-run or caller didn't supply it). */
-  testIdToProjectId?: Map<string, string>,
-  /** R3b: resolved API URL for portal link resolution. */
-  apiUrlForDashboard?: string,
+  /**
+   * R3b: per-testId dashboard-link decision, ALREADY resolved at create time
+   * via `withDashboardUrl`/`resolveDashboardUrl` (the shared three-state
+   * precedence helper — see its doc). Populated by the caller; absent
+   * (undefined) means no enrichment (e.g. dry-run). Reusing this decision
+   * — rather than recomputing a client-side URL from testId→projectId here
+   * — is the fix: a fresh `resolvePortalUrl` call at this point would
+   * silently replace a server-provided V3 link with the dead legacy V2
+   * guess, and would have no way to know a link was explicitly suppressed.
+   */
+  testIdToDashboardState?: Map<string, { dashboardUrl: string | undefined; suppressed: boolean }>,
 ): Promise<void> {
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const timeoutSeconds = opts.timeoutSeconds ?? DEFAULT_RUN_TIMEOUT_SECONDS;
@@ -3123,6 +3253,21 @@ async function runBatchRun(
   if (testIds.length === 0) {
     // All specs failed at create time — already threw above; unreachable.
     return;
+  }
+
+  // Finding 2 (dogfood 2026-08-09): this fan-out calls `triggerRunWithMeta`
+  // directly (below), bypassing `runTestRun` entirely — so `runTestRun`'s own
+  // `--target-url` V3 advisory (`emitTargetUrlV3AdvisoryIfNeeded`) never fired
+  // here, even though every triggered run in the batch ignores `--target-url`
+  // exactly like a single V3-routed `test run` does. Reuses the same helper
+  // and advisory text (no duplicated probe logic or copy) and fires exactly
+  // ONCE for the whole batch, before the fan-out — not per item. Mirrors
+  // `runTestRun`'s own gating (only pay the extra `/me` round trip when
+  // `--target-url` was actually supplied) and its "fires under --dry-run too"
+  // behavior (the dry-run client's canned `/me` sample demonstrates the same
+  // advisory at zero real-network cost).
+  if (opts.targetUrl !== undefined) {
+    await emitTargetUrlV3AdvisoryIfNeeded(client, stderrFn);
   }
 
   // Dry-run: print a descriptor envelope and return without real triggers.
@@ -3583,16 +3728,19 @@ async function runBatchRun(
 
   // Emit output.
   if (opts.output === 'json') {
-    // R3b: enrich per-item run results with dashboardUrl when both testId and
-    // projectId are known (from the testIdToProjectId map built by the caller).
-    // Additive-optional: items where projectId is unknown are left unchanged.
+    // R3b: enrich per-item run results with the dashboard state ALREADY
+    // resolved at create time (`testIdToDashboardState`, built by the
+    // caller). Never recompute a client-side URL here — that would silently
+    // replace a server-provided V3 link with the dead legacy V2 guess, and
+    // would have no way to represent "the server explicitly suppressed
+    // this". A suppressed item (dashboardUrl undefined, suppressed: true)
+    // is left with no key at all, same as the create-time convention.
     const enrichedResults =
-      !opts.dryRun && testIdToProjectId !== undefined && apiUrlForDashboard !== undefined
+      !opts.dryRun && testIdToDashboardState !== undefined
         ? batchRunResults.map(r => {
-            const projectId = testIdToProjectId.get(r.testId);
-            if (!projectId || !r.testId) return r;
-            const dashboardUrl = resolvePortalUrl(apiUrlForDashboard, projectId, r.testId);
-            return dashboardUrl !== undefined ? { ...r, dashboardUrl } : r;
+            const state = testIdToDashboardState.get(r.testId);
+            if (!state || state.dashboardUrl === undefined) return r;
+            return { ...r, dashboardUrl: state.dashboardUrl };
           })
         : batchRunResults;
     out.print({ results: enrichedResults });
@@ -5546,6 +5694,14 @@ interface RunTestRunOptions extends CommonOptions {
   timeoutIsDefault?: boolean;
   idempotencyKey?: string;
   /**
+   * --gh-output: force the GitHub-native output layer (::error:: annotations +
+   * job-summary table) even off-Actions. On the single-test `--wait` path the
+   * result is reduced to a one-row CI summary (`summarizeSingleRun`).
+   */
+  ghOutput?: boolean;
+  /** --summary-file: also write the reduced machine summary JSON to this path. */
+  summaryFile?: string;
+  /**
    * Per codex round-1 P1: when chained from `test create --run`, the caller
    * passes the create response here so `runTestRun` can emit a single merged
    * envelope `{ ...createContext, run: <trigger|final> }` on stdout. Without
@@ -5632,6 +5788,13 @@ interface RunTestRerunOptions extends CommonOptions {
   reportFile?: string;
   /** --report-suite-name: optional override for the JUnit <testsuite name=...>. */
   reportSuiteName?: string;
+  /**
+   * --gh-output: force the GitHub-native output layer (::error:: annotations +
+   * job-summary table) on the batch-rerun `--wait` result, even off-Actions.
+   */
+  ghOutput?: boolean;
+  /** --summary-file: also write the reduced machine summary JSON to this path. */
+  summaryFile?: string;
 }
 
 /**
@@ -5834,6 +5997,86 @@ function printRunOrChain<T>(
 }
 
 /**
+ * Server-first precedence for a `dashboardUrl` field on any wire response
+ * that can carry one (`RunResponse`, `CliCreateTestResponse`,
+ * `CliBatchSpecResult`). Single source of truth for the rule so the create
+ * paths (DEV-737) and the run-completion path (`withRunDashboardUrl` below)
+ * can't drift apart.
+ *
+ * This is a PINNED three-state wire contract — a prior revision let a
+ * present-but-falsy value and a truly-absent key both mean "no server
+ * opinion," which was ambiguous with the real backend behavior of omitting
+ * the key on a deliberate "no correct link" response, printing the dead
+ * legacy link this feature exists to remove. The backend now always
+ * includes the key (typed `string | null`, never omitted when it has an
+ * opinion), so the three states below are mutually exclusive on the wire:
+ *
+ *  - **Present + truthy** → the server built a correct link (it alone knows
+ *    which store answered and this environment's portal origin); use it
+ *    verbatim.
+ *  - **Present + falsy (`null`/`''`)** → the server explicitly has no
+ *    correct link — e.g. a V3-native entity with no DynamoDB mirror row for
+ *    the client's V2-shaped `/dashboard/tests/…` guess to land on. NEVER
+ *    fall back here: a client-side guess would be exactly the dead link the
+ *    server declined to emit. `suppressed: true` tells the caller a link
+ *    was actively withheld (vs. simply never computed) so it can point the
+ *    user elsewhere instead of printing nothing unexplained.
+ *  - **Absent** → an older backend that predates this field entirely. Such a
+ *    backend cannot have produced a V3-native/unmirrored entity either —
+ *    that capability and this field ship together — so the client fallback
+ *    is safe and reproduces exactly today's behavior.
+ */
+function resolveDashboardUrl(
+  wire: { dashboardUrl?: string | null },
+  computeFallback: () => string | undefined,
+): { dashboardUrl: string | undefined; suppressed: boolean } {
+  if ('dashboardUrl' in wire) {
+    return wire.dashboardUrl
+      ? { dashboardUrl: wire.dashboardUrl, suppressed: false }
+      : { dashboardUrl: undefined, suppressed: true };
+  }
+  return { dashboardUrl: computeFallback(), suppressed: false };
+}
+
+/**
+ * Applies {@link resolveDashboardUrl} to a whole entity, returning a
+ * NORMALIZED copy: a server-suppressed (`null`/`''`) value is rewritten to
+ * `undefined` so `JSON.stringify` omits the key entirely instead of
+ * serializing a literal `"dashboardUrl": null` — the same normalization
+ * `withRunDashboardUrl` already did inline for `RunResponse`, generalized
+ * here so the create paths (DEV-737) can share it byte-for-byte.
+ */
+function withDashboardUrl<T extends { dashboardUrl?: string | null }>(
+  wire: T,
+  computeFallback: () => string | undefined,
+): { entity: T; suppressed: boolean } {
+  const { dashboardUrl, suppressed } = resolveDashboardUrl(wire, computeFallback);
+  if ('dashboardUrl' in wire) return { entity: { ...wire, dashboardUrl }, suppressed };
+  return { entity: dashboardUrl !== undefined ? { ...wire, dashboardUrl } : wire, suppressed };
+}
+
+/**
+ * DEV-737: advisory printed when the server explicitly withheld a dashboard
+ * link (`resolveDashboardUrl`'s `suppressed: true`) rather than silently
+ * omitting the field with no explanation. Fires on stderr regardless of
+ * `--output` mode — the field's absence from a JSON envelope carries no
+ * reason on its own, and `--output json` is routinely unattended, so the
+ * hint is worth the line there too (same reasoning as the `project create
+ * --type backend` no-URL advisory in `project.ts`). Printing nothing beats
+ * printing a dead link, but telling the caller where to look instead beats
+ * printing nothing unexplained.
+ */
+function emitDashboardLinkSuppressedAdvisory(
+  testId: string,
+  stderrFn: (line: string) => void,
+): void {
+  stderrFn(
+    `[advisory] no dashboard link is available for this test right now; use ` +
+      `\`testsprite test get ${testId}\` to look it up.`,
+  );
+}
+
+/**
  * Attach the Portal deep link to a terminal RunResponse.
  *
  * **A server-provided `dashboardUrl` always wins.** The backend knows two
@@ -5854,17 +6097,10 @@ function printRunOrChain<T>(
  * backend chose not to emit.
  */
 function withRunDashboardUrl(run: RunResponse, apiUrl: string): RunResponse {
-  // A server value of `null` is meaningful, not missing: it says "there is no
-  // correct link for this run" (e.g. a workspace-scoped page the environment's
-  // portal build does not serve yet). Falling back to our own guess there would
-  // reintroduce exactly the wrong link the server declined to send — so only an
-  // ABSENT field (older backend) reopens the client path.
-  if ('dashboardUrl' in run) {
-    return run.dashboardUrl ? run : { ...run, dashboardUrl: undefined };
-  }
-  if (!run.projectId || !run.testId) return run;
-  const dashboardUrl = resolvePortalUrl(apiUrl, run.projectId, run.testId);
-  return dashboardUrl !== undefined ? { ...run, dashboardUrl } : run;
+  return withDashboardUrl(run, () => {
+    if (!run.projectId || !run.testId) return undefined;
+    return resolvePortalUrl(apiUrl, run.projectId, run.testId);
+  }).entity;
 }
 
 /**
@@ -5985,6 +6221,82 @@ function parseTimeoutFlag(raw: string | undefined, flagName: string): number {
 }
 
 /**
+ * Short deadline for the best-effort `v3Enabled` lookup behind the
+ * `--target-url` advisory (DEV-749). Mirrors `DUP_NAME_ADVISORY_TIMEOUT_MS`
+ * — a stalled `/me` must never meaningfully delay a run trigger.
+ */
+const TARGET_URL_ADVISORY_TIMEOUT_MS = 5_000;
+
+/**
+ * DEV-749 (client half): `--target-url` is silently dropped on the V3
+ * execution path — the backend validates it (SSRF guard, defence in depth)
+ * and then discards it, because V3 resolves the run's environment from
+ * `test_environment` at execution time; there is no injection point for a
+ * per-run override. This is a client-side advisory only — the real fix
+ * (an actual per-run override on V3) needs a product decision and is out
+ * of scope here.
+ *
+ * Gated on `v3Enabled`, the same authoritative per-user routing bit
+ * `auth status`/`doctor` already render (`GET /me`, `src/lib/v3-advisory.ts`).
+ * Best-effort: a single bounded lookup (mirrors `emitDupNameAdvisoryIfNeeded`'s
+ * `AbortController` + 5 s deadline), swallows every error, and must never
+ * block or fail the actual run trigger — a broken/slow `/me` degrades to
+ * "no advisory printed", not a failed `test run`.
+ */
+/**
+ * `X-CLI-Command` tag for this probe's `GET /me` — same advisory-header
+ * mechanism `runInit` uses (`toAuthDeps`'s `commandTag: 'init'` in
+ * `commands/init.ts`, sent via `AuthDeps.commandTag` in `auth.ts`), reused
+ * directly here rather than invented fresh. The backend's CLI-audit
+ * allowlist (`KNOWN_CLI_COMMANDS` + `resolveCliEvent`'s `/me` branch) maps this
+ * exact string to `null` — no PostHog event at all, not `cli.session_started`
+ * and not `cli.initialized` (init's tag would be a MORE specific, and equally
+ * wrong, misattribution of a probe that is neither a session start nor an
+ * onboarding run).
+ *
+ * Forward-compatible by construction: an unlisted `X-CLI-Command` value is
+ * dropped by the backend before event selection (see
+ * `capturePostHogEvent`/`KNOWN_CLI_COMMANDS` in the interceptor above), so
+ * against a backend that predates this allowlist entry the header is a no-op
+ * and behavior is exactly what it was before this fix — the CLI can ship
+ * this independently of backend deploy order in either direction.
+ */
+const TARGET_URL_ADVISORY_CLI_COMMAND = 'run-target-url-probe';
+
+async function emitTargetUrlV3AdvisoryIfNeeded(
+  client: HttpClient,
+  stderrFn: (line: string) => void,
+): Promise<void> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), TARGET_URL_ADVISORY_TIMEOUT_MS);
+  try {
+    const me = await client.get<{ v3Enabled?: boolean }>('/me', {
+      signal: ac.signal,
+      headers: { 'x-cli-command': TARGET_URL_ADVISORY_CLI_COMMAND },
+      // Finding 1 (dogfood 2026-08-09): `HttpClient.sleepBeforeRetry` (src/lib/http.ts)
+      // only observes the process-lifetime shutdown signal, never a per-request
+      // `options.signal` — the abort controller above bounds the FETCH itself but
+      // not a post-response retry sleep. A retryable 429 carrying a real
+      // `Retry-After` (e.g. 60s, a live `inflight_cap` response) would put this
+      // best-effort probe into a retry sleep this 5s deadline cannot interrupt,
+      // stalling the real run trigger behind it. `retryOnRateLimit: false` makes
+      // the HTTP layer throw on the first 429 instead of sleeping — the existing,
+      // already-used-elsewhere knob (see the batch-run trigger site above) rather
+      // than changing `sleepBeforeRetry` itself, which every other caller (e.g.
+      // the polling path) relies on to keep sleeping through a caller signal.
+      retryOnRateLimit: false,
+    });
+    if (me.v3Enabled === true) {
+      emitTargetUrlV3Advisory(stderrFn);
+    }
+  } catch {
+    // Swallow — this is best-effort; must not block or fail the run trigger.
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * `test run <test-id>` — M3.3 piece-3.
  *
  * Triggers a run via `POST /api/cli/v1/tests/{testId}/runs`. With
@@ -5999,6 +6311,16 @@ export async function runTestRun(
   assertIdempotencyKey(opts.idempotencyKey);
   if (opts.targetUrl !== undefined) {
     assertNotLocal(opts.targetUrl);
+  }
+
+  // DEV-749: only spend the extra `/me` round trip when --target-url was
+  // actually supplied — the common case (no override) pays nothing. Fires
+  // in both the dry-run and real paths below (the dry-run `/me` sample sets
+  // `v3Enabled: true`, so `--dry-run --target-url` demonstrates the same
+  // advisory a real V3-routed caller would see, at zero real-network cost).
+  if (opts.targetUrl !== undefined) {
+    const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    await emitTargetUrlV3AdvisoryIfNeeded(makeClient(opts, deps), stderrFn);
   }
 
   if (opts.dryRun) {
@@ -6365,11 +6687,9 @@ export async function runTestRun(
     beFallbackUsed || opts.type === 'backend',
   );
 
-  printRunOrChain(
-    out,
-    withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)),
-    opts.createContext,
-    data => renderRunResponseText(data as RunResponse, { isBackend }),
+  const finalRunWithUrl = withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps));
+  printRunOrChain(out, finalRunWithUrl, opts.createContext, data =>
+    renderRunResponseText(data as RunResponse, { isBackend }),
   );
 
   // Surface the trigger requestId under --verbose/--debug or JSON mode so
@@ -6386,6 +6706,45 @@ export async function runTestRun(
         ? `Run finished with status: ${finalRun.status}. Backend failure artifacts are addressed by testId — use 'testsprite test failure get ${finalRun.testId}' to download the bundle.`
         : `Run finished with status: ${finalRun.status}. Use 'testsprite test artifact get ${finalRun.runId}' to download the failure bundle.`,
     );
+  }
+
+  // CI-native output layer (issue #99): single-test parity with the --all batch.
+  // Emitted before the exit-code gate throws below so the summary file and
+  // annotations land even when the run exits non-zero (mirrors the batch path).
+  // The summary file is a machine artifact written regardless of --output mode;
+  // under --output json the run envelope above owns stdout, so ::error::
+  // workflow commands are routed to stderr (the Actions runner parses both).
+  // Best-effort: a sink write throwing (e.g. EPIPE) must never skip the
+  // exit-code gate below or change the command's exit status.
+  try {
+    const env = deps.env ?? process.env;
+    const ghEnabled = opts.ghOutput === true || env.GITHUB_ACTIONS === 'true';
+    if (ghEnabled || opts.summaryFile !== undefined) {
+      const ciSummary = summarizeSingleRun(finalRunWithUrl);
+      if (opts.summaryFile !== undefined) {
+        try {
+          writeFileSync(opts.summaryFile, `${JSON.stringify(ciSummary, null, 2)}\n`, 'utf8');
+        } catch {
+          stderrFn(`[run] could not write --summary-file ${opts.summaryFile}; continuing`);
+        }
+      }
+      if (ghEnabled) {
+        const stdoutFn = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
+        emitGithubOutputs(
+          ciSummary,
+          env,
+          {
+            stdout: stdoutFn,
+            stderr: stderrFn,
+            appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf8'),
+            annotations: opts.output === 'json' ? stderrFn : stdoutFn,
+          },
+          { force: opts.ghOutput === true },
+        );
+      }
+    }
+  } catch (ciErr) {
+    stderrFn(`[run] CI output emission failed; continuing: ${(ciErr as Error).message}`);
   }
 
   const exitCode = exitCodeForRunStatus(finalRun.status);
@@ -9180,6 +9539,39 @@ export async function runTestRerun(
   };
   await writeBatchJUnitReportIfRequested(opts, rerunResults);
   out.print(jsonPayload);
+  // CI-native output layer (issue #99): batch-rerun parity with `run --all`.
+  // Emitted before the exit-code gates below so the summary file / annotations
+  // land even when the batch exits non-zero. Summary-file is a machine artifact
+  // written regardless of --output mode; under --output json the envelope above
+  // owns stdout, so ::error:: workflow commands go to stderr instead.
+  {
+    const env = deps.env ?? process.env;
+    const ghEnabled = opts.ghOutput === true || env.GITHUB_ACTIONS === 'true';
+    if (ghEnabled || opts.summaryFile !== undefined) {
+      const ciSummary = summarizeAcceptedPayload(JSON.stringify(jsonPayload));
+      if (opts.summaryFile !== undefined) {
+        try {
+          writeFileSync(opts.summaryFile, `${JSON.stringify(ciSummary, null, 2)}\n`, 'utf8');
+        } catch {
+          stderrFn(`[rerun] could not write --summary-file ${opts.summaryFile}; continuing`);
+        }
+      }
+      if (ghEnabled) {
+        const stdoutFn = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
+        emitGithubOutputs(
+          ciSummary,
+          env,
+          {
+            stdout: stdoutFn,
+            stderr: stderrFn,
+            appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf8'),
+            annotations: opts.output === 'json' ? stderrFn : stdoutFn,
+          },
+          { force: opts.ghOutput === true },
+        );
+      }
+    }
+  }
 
   // Determine exit code: timeout (deferred or any timeout) → 7; any fail → 1; all pass → 0
   if (deferred.length > 0 || timedOut > 0) {
@@ -10076,11 +10468,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--gh-output',
-      'with --all --wait: emit GitHub-native output (::error:: annotations per non-passed run; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
+      'with --wait (single test or --all): emit GitHub-native output (::error:: annotations per non-passed run; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
     )
     .option(
       '--summary-file <path>',
-      'with --all --wait: also write the reduced machine summary JSON {total, passed, failed, timedOut, runs[]} to this file',
+      'with --wait (single test or --all): also write the reduced machine summary JSON {total, passed, failed, timedOut, runs[]} to this file',
     )
     .addHelpText(
       'after',
@@ -10130,20 +10522,21 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         wait: cmdOpts.wait === true,
         batchPath: isAll,
       });
-      // --gh-output / --summary-file reduce the terminal batch envelope, which
-      // only exists on the --all --wait path (without --wait the command returns
-      // after enqueueing). Anywhere else they would silently no-op — reject
-      // loudly (same rule as --filter and the JUnit report flags).
-      if (cmdOpts.ghOutput === true && (!isAll || cmdOpts.wait !== true)) {
+      // --gh-output / --summary-file reduce a --wait run's terminal result into
+      // the CI summary. They require --wait (without it the command returns after
+      // enqueueing, before any terminal result exists) but apply to BOTH a single
+      // <test-id> run and the --all batch. Without --wait they would silently
+      // no-op — reject loudly (same rule as --filter and the JUnit report flags).
+      if (cmdOpts.ghOutput === true && cmdOpts.wait !== true) {
         throw localValidationError(
           'gh-output',
-          '--gh-output only applies with --all --wait (it reduces the terminal batch envelope). Remove --gh-output, or add --all --wait.',
+          '--gh-output requires --wait (it reduces the terminal run result). Add --wait.',
         );
       }
-      if (cmdOpts.summaryFile !== undefined && (!isAll || cmdOpts.wait !== true)) {
+      if (cmdOpts.summaryFile !== undefined && cmdOpts.wait !== true) {
         throw localValidationError(
           'summary-file',
-          '--summary-file only applies with --all --wait (it reduces the terminal batch envelope). Remove --summary-file, or add --all --wait.',
+          '--summary-file requires --wait (it reduces the terminal run result). Add --wait.',
         );
       }
 
@@ -10199,6 +10592,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           // B2(c): tell runTestRun whether --timeout was explicitly provided.
           timeoutIsDefault: cmdOpts.timeout === undefined,
           idempotencyKey: cmdOpts.idempotencyKey,
+          ghOutput: cmdOpts.ghOutput === true,
+          summaryFile: cmdOpts.summaryFile,
         },
         deps,
       );
@@ -10336,6 +10731,14 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       '--report-suite-name <name>',
       'optional JUnit <testsuite name=...> override (default: testsprite:<projectId>)',
     )
+    .option(
+      '--gh-output',
+      'with batch --wait: emit GitHub-native output (::error:: annotations per non-passed run; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
+    )
+    .option(
+      '--summary-file <path>',
+      'with batch --wait: also write the reduced machine summary JSON {total, passed, failed, timedOut, runs[]} to this file',
+    )
     .addHelpText(
       'after',
       '\nNotes:\n' +
@@ -10373,6 +10776,21 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         wait: cmdOpts.wait === true,
         batchPath: isBatch,
       });
+      // --gh-output / --summary-file reduce the batch-rerun --wait envelope, which
+      // only exists on the batch (--all or 2+ ids) --wait path. Anywhere else they
+      // would silently no-op — reject loudly (same rule as the JUnit report flags).
+      if (cmdOpts.ghOutput === true && (!isBatch || cmdOpts.wait !== true)) {
+        throw localValidationError(
+          'gh-output',
+          '--gh-output requires a batch rerun with --wait (--all or 2+ test ids). Remove --gh-output, or add --all --wait.',
+        );
+      }
+      if (cmdOpts.summaryFile !== undefined && (!isBatch || cmdOpts.wait !== true)) {
+        throw localValidationError(
+          'summary-file',
+          '--summary-file requires a batch rerun with --wait (--all or 2+ test ids). Remove --summary-file, or add --all --wait.',
+        );
+      }
       await runTestRerun(
         {
           ...resolveCommonOptions(command),
@@ -10394,6 +10812,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           report,
           reportFile: cmdOpts.reportFile,
           reportSuiteName: cmdOpts.reportSuiteName,
+          ghOutput: cmdOpts.ghOutput === true,
+          summaryFile: cmdOpts.summaryFile,
         },
         deps,
       );
@@ -10724,6 +11144,8 @@ interface RerunFlagOpts {
   report?: string;
   reportFile?: string;
   reportSuiteName?: string;
+  ghOutput?: boolean;
+  summaryFile?: string;
 }
 
 interface UpdateFlagOpts {

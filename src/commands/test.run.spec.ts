@@ -4263,3 +4263,476 @@ describe('gh-output integration on run --all --wait (issue #99 reshape)', () => 
     expect(stdoutLines.some(line => line.startsWith('::error'))).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// DEV-749 (client half) — --target-url advisory when the caller is V3-routed
+// ---------------------------------------------------------------------------
+
+describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
+  /** Routes GET /me to `me`, everything else to `rest`. */
+  function fetchWithMe(
+    me: { v3Enabled?: boolean } | (() => never),
+    rest: (url: string) => { status?: number; body: unknown },
+  ): typeof globalThis.fetch {
+    return makeFetch(url => {
+      if (url.endsWith('/me')) {
+        if (typeof me === 'function') me();
+        return { body: me };
+      }
+      return rest(url);
+    });
+  }
+
+  it('v3Enabled:true → prints the advisory on stderr, not stdout; exit code unaffected', async () => {
+    const { credentialsPath } = makeCreds();
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    const fetchImpl = fetchWithMe({ v3Enabled: true }, () => ({ body: TRIGGER_RESP }));
+    const result = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+        targetUrl: 'https://staging.example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+    expect(result).toMatchObject({ runId: 'run_abc' });
+    expect(stderrLines.some(l => l.includes('--target-url') && l.includes('[advisory]'))).toBe(
+      true,
+    );
+    // stdout must stay pure JSON — no advisory text, and it must still parse.
+    expect(() => JSON.parse(stdoutLines.join(''))).not.toThrow();
+    expect(stdoutLines.join('')).not.toContain('[advisory]');
+  });
+
+  it('tags the v3Enabled probe GET /me with X-CLI-Command: run-target-url-probe, and NOT the trigger POST', async () => {
+    const { credentialsPath } = makeCreds();
+    const meHeaders: Array<Record<string, string> | undefined> = [];
+    const triggerHeaders: Array<Record<string, string> | undefined> = [];
+    const fetchImpl = makeFetch((url, init) => {
+      if (url.endsWith('/me')) {
+        meHeaders.push(init.headers as Record<string, string> | undefined);
+        return { body: { v3Enabled: true } };
+      }
+      triggerHeaders.push(init.headers as Record<string, string> | undefined);
+      return { body: TRIGGER_RESP };
+    });
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+        targetUrl: 'https://staging.example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    expect(meHeaders).toHaveLength(1);
+    expect(meHeaders[0]?.['x-cli-command']).toBe('run-target-url-probe');
+    expect(triggerHeaders).toHaveLength(1);
+    expect(triggerHeaders[0]?.['x-cli-command']).toBeUndefined();
+  });
+
+  it('v3Enabled:false → no advisory', async () => {
+    const { credentialsPath } = makeCreds();
+    const stderrLines: string[] = [];
+    const fetchImpl = fetchWithMe({ v3Enabled: false }, () => ({ body: TRIGGER_RESP }));
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+        targetUrl: 'https://staging.example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
+  });
+
+  it('v3Enabled absent (older backend) → no advisory', async () => {
+    const { credentialsPath } = makeCreds();
+    const stderrLines: string[] = [];
+    const fetchImpl = fetchWithMe({}, () => ({ body: TRIGGER_RESP }));
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+        targetUrl: 'https://staging.example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
+  });
+
+  it('no --target-url → GET /me is never called', async () => {
+    const { credentialsPath } = makeCreds();
+    const meCalls: string[] = [];
+    const fetchImpl = fetchWithMe(
+      () => {
+        meCalls.push('called');
+        throw new Error('unreachable');
+      },
+      () => ({ body: TRIGGER_RESP }),
+    );
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    expect(meCalls).toHaveLength(0);
+  });
+
+  it('fires in --output text mode too (matches the C1 backend-test advisory: unconditional across modes)', async () => {
+    const { credentialsPath } = makeCreds();
+    const stderrLines: string[] = [];
+    const fetchImpl = fetchWithMe({ v3Enabled: true }, () => ({ body: TRIGGER_RESP }));
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+        targetUrl: 'https://staging.example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('--target-url'))).toBe(
+      true,
+    );
+  });
+
+  it('/me lookup failure is swallowed — the run still succeeds and no advisory prints', async () => {
+    const { credentialsPath } = makeCreds();
+    const stderrLines: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url.endsWith('/me')) throw new Error('network blip');
+      return { body: TRIGGER_RESP };
+    });
+    const result = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+        targetUrl: 'https://staging.example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+    expect(result).toMatchObject({ runId: 'run_abc' });
+    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
+  });
+
+  it('--dry-run --target-url: the canned /me sample (v3Enabled:true) still demonstrates the advisory', async () => {
+    const { credentialsPath } = makeCreds();
+    const stderrLines: string[] = [];
+    const stdoutLines: string[] = [];
+    // No custom fetchImpl override: the dry-run client's own canned fetch
+    // answers GET /me with the real `me` sample (v3Enabled: true).
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+        targetUrl: 'https://staging.example.com',
+      },
+      {
+        credentialsPath,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('--target-url'))).toBe(
+      true,
+    );
+    expect(stdoutLines.join('')).not.toContain('[advisory]');
+  });
+
+  // Finding 1 (dogfood 2026-08-09): `HttpClient.sleepBeforeRetry` (src/lib/http.ts)
+  // observes only the process-lifetime shutdown signal, never a per-request
+  // `AbortSignal` — so this probe's own 5s deadline could not interrupt a
+  // retry sleep. A retryable 429 carrying a real `Retry-After` (e.g. the
+  // production `inflight_cap` response) would previously stall the probe —
+  // and the run trigger behind it — for up to a minute. Fixed via
+  // `retryOnRateLimit: false` on the probe's `GET /me` call.
+  it('a 429 with a long Retry-After on the /me probe cannot delay the run trigger', async () => {
+    const { credentialsPath } = makeCreds();
+    const stderrLines: string[] = [];
+    let meCallCount = 0;
+    const fetchImpl = (async (input: FetchInput) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      if (url.endsWith('/me')) {
+        meCallCount++;
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: 'RATE_LIMITED',
+              message: 'Too many requests',
+              nextAction: 'Wait Retry-After seconds and retry.',
+              requestId: 'req_probe',
+            },
+          }),
+          { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '60' } },
+        );
+      }
+      return new Response(JSON.stringify(TRIGGER_RESP), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof globalThis.fetch;
+
+    const startedAt = Date.now();
+    const result = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+        targetUrl: 'https://staging.example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    // The run still triggers promptly — the probe's failure must never
+    // block or delay it.
+    expect(result).toMatchObject({ runId: 'run_abc' });
+    // Exactly one attempt: `retryOnRateLimit: false` makes the HTTP layer
+    // throw on the first 429 instead of sleeping out the (would-be) 60s
+    // Retry-After — proving the probe never entered a retry sleep at all.
+    // (Without the fix, HttpClient's real `setTimeout`-backed default sleep
+    // would block here for up to 60s per retry attempt.)
+    expect(meCallCount).toBe(1);
+    expect(elapsedMs).toBeLessThan(2_000);
+    // v3Enabled was never learned (the probe failed) — swallow-on-error
+    // still holds, no advisory printed either way.
+    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
+  });
+});
+
+describe('gh-output integration on single-test run --wait (Gap A)', () => {
+  function singleRunHarness(run: RunResponse) {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      // Trigger POST: /tests/{id}/runs (not the /runs/{runId} poll).
+      if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
+        return { body: TRIGGER_RESP };
+      }
+      return { body: run };
+    });
+    return { credentialsPath, fetchImpl };
+  }
+
+  it('--gh-output --summary-file writes the one-row artifact even though the run failed (exit 1)', async () => {
+    const { credentialsPath, fetchImpl } = singleRunHarness(makeFailedRun());
+    const dir = mkdtempSync(join(tmpdir(), 'cli-gh-output-single-'));
+    const summaryFile = join(dir, 'summary.json');
+    const stdoutLines: string[] = [];
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+        ghOutput: true,
+        summaryFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
+        env: {} as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ exitCode: 1 });
+    const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
+      total: number;
+      passed: number;
+      failed: number;
+      runs: unknown[];
+    };
+    expect(artifact).toMatchObject({ total: 1, passed: 0, failed: 1 });
+    expect(artifact.runs).toHaveLength(1);
+    // Forced annotations (off-Actions) land on the text stdout for the failed run.
+    expect(stdoutLines.some(line => line.startsWith('::error') && line.includes('test_xyz'))).toBe(
+      true,
+    );
+  });
+
+  it('under Actions with --output json: stdout stays parseable JSON, ::error:: goes to stderr', async () => {
+    const { credentialsPath, fetchImpl } = singleRunHarness(makeFailedRun());
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+        ghOutput: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        env: { GITHUB_ACTIONS: 'true' } as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ exitCode: 1 });
+    // The run envelope on stdout must remain parseable as-is.
+    const printed = JSON.parse(stdoutLines.join('')) as Record<string, unknown>;
+    expect(printed.status).toBe('failed');
+    expect(stdoutLines.some(line => line.startsWith('::error'))).toBe(false);
+    const annotations = stderrLines.filter(line => line.startsWith('::error'));
+    expect(annotations).toHaveLength(1);
+    expect(annotations[0]).toContain('test_xyz');
+  });
+
+  it('auto-enables under GITHUB_ACTIONS=true without --gh-output (no summary file needed)', async () => {
+    const { credentialsPath, fetchImpl } = singleRunHarness(makeFailedRun());
+    const stdoutLines: string[] = [];
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
+        env: { GITHUB_ACTIONS: 'true' } as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ exitCode: 1 });
+    expect(stdoutLines.some(line => line.startsWith('::error') && line.includes('test_xyz'))).toBe(
+      true,
+    );
+  });
+});
+
+describe('run --gh-output / --summary-file still require --wait (Gap A guard)', () => {
+  it('--gh-output without --wait → exit 5', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const test = createTestCommand();
+    disableExits(test);
+    await expect(
+      test.parseAsync(['run', 'test_xyz', '--gh-output'], { from: 'user' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('--summary-file without --wait → exit 5', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const test = createTestCommand();
+    disableExits(test);
+    await expect(
+      test.parseAsync(['run', 'test_xyz', '--summary-file', '/tmp/x.json'], { from: 'user' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+});
