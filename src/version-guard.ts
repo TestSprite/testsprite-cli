@@ -32,7 +32,8 @@ export function parseMajorVersion(nodeVersion: string): number {
 function parseMajorMinor(nodeVersion: string): { major: number; minor: number } | null {
   const [majorRaw, minorRaw] = nodeVersion.split('.');
   const major = Number(majorRaw);
-  const minor = Number(minorRaw);
+  // Preserve the old guard's behavior for injectable major-only versions such as "18".
+  const minor = minorRaw === undefined ? 0 : Number(minorRaw);
   if (!Number.isInteger(major) || !Number.isInteger(minor) || major < 0 || minor < 0) {
     return null;
   }
@@ -42,10 +43,10 @@ function parseMajorMinor(nodeVersion: string): { major: number; minor: number } 
 /**
  * Decide whether the given Node.js version is outside the supported engine range.
  *
- * Node 20 is supported from 20.19, Node 22 from 22.13, and Node 24+ is supported.
- * Odd-numbered intermediate releases are rejected. An unparseable string is
- * treated as "do not reject" so the guard never blocks on a version string it
- * cannot understand (the runtime would surface any real incompatibility itself).
+ * Mirrors `^20.19.0 || ^22.13.0 || >=24`: Node 20 is supported from 20.19,
+ * Node 22 from 22.13, odd intermediate majors 21/23 are rejected, and 24+ is supported.
+ * An unparseable string is treated as "do not reject" so the guard never blocks on a
+ * version string it cannot understand (the runtime would surface any incompatibility).
  *
  * @param nodeVersion - a `process.versions.node` style string (e.g. `"18.19.1"`).
  * @returns `true` when the runtime is unsupported and should be rejected.
@@ -55,7 +56,7 @@ export function shouldRejectNodeVersion(nodeVersion: string): boolean {
   if (parsed === null) return false;
 
   const { major, minor } = parsed;
-  if (major < 20) return true;
+  if (major < MIN_SUPPORTED_NODE_MAJOR) return true;
   if (major === 20) return minor < MIN_NODE_20_MINOR;
   if (major === 21) return true;
   if (major === 22) return minor < MIN_NODE_22_MINOR;
