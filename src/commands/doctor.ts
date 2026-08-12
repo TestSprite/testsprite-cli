@@ -30,7 +30,7 @@ import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '..
 import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
 import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 import { VERSION } from '../version.js';
-import { MIN_SUPPORTED_NODE_MAJOR, shouldRejectNodeVersion } from '../version-guard.js';
+import { SUPPORTED_NODE_RANGE, shouldRejectNodeVersion } from '../version-guard.js';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -67,7 +67,7 @@ export interface DoctorDeps {
   stderr?: (line: string) => void;
   /** Project dir for the skill check. Defaults to `process.cwd()`. */
   cwd?: string;
-  /** Runtime version string (e.g. "22.9.0"). Defaults to `process.versions.node`. */
+  /** Runtime version string (e.g. "22.13.0"). Defaults to `process.versions.node`. */
   nodeVersion?: string;
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
@@ -105,7 +105,6 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     connectivity.check,
   ];
 
-  // Informational routing line, only when the backend reported it (no new call).
   if (connectivity.v3Enabled !== undefined) {
     const label = routingLabel(connectivity.v3Enabled);
     checks.push({
@@ -118,7 +117,6 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     });
   }
 
-  // Org attribution lines — only when the backend reported them (no new call).
   const orgsSummary = formatOrgsSummary(connectivity.organizations);
   if (orgsSummary) {
     checks.push({ name: 'Organizations', status: 'ok', detail: orgsSummary });
@@ -127,8 +125,6 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   if (orgBinding) {
     checks.push({ name: 'Org binding', status: 'ok', detail: orgBinding });
   }
-  // Warn, not fail: the key works — it just cannot see the team's work, which
-  // otherwise looks like missing data rather than a scoping choice.
   const personalScopeHint = formatPersonalScopeHint(connectivity.organizations, connectivity.org);
   if (personalScopeHint) {
     checks.push({ name: 'Workspace scope', status: 'warn', detail: personalScopeHint });
@@ -147,26 +143,20 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   }
 
   if (failures > 0) {
-    // Non-zero exit so `testsprite doctor && ...` gates a CI step or an agent
-    // preflight. The full report already printed above; this line is the stderr
-    // summary index.ts renders before exiting 1.
     throw new CLIError(`doctor: ${failures} check(s) failed, ${warnings} warning(s)`, 1);
   }
   return report;
 }
 
 function checkNodeVersion(nodeVersion: string): DoctorCheck {
-  // Reuse the CLI's own runtime guard so the verdict matches exactly what the
-  // entrypoint enforces at startup, rather than a divergent hardcoded check.
-  // The precise engines floor (20.19+/22.13+/24+) is enforced by npm at install
-  // time via .npmrc engine-strict. sourceRef: src/version-guard.ts.
+  // Reuse the CLI runtime guard so doctor and startup enforce and describe the same range.
   const rejected = shouldRejectNodeVersion(nodeVersion);
   return {
     name: 'Node.js',
     status: rejected ? 'fail' : 'ok',
     detail: rejected
-      ? `v${nodeVersion} is below the required Node ${MIN_SUPPORTED_NODE_MAJOR}; upgrade Node.js`
-      : `v${nodeVersion} (>=${MIN_SUPPORTED_NODE_MAJOR} required)`,
+      ? `v${nodeVersion} is outside the supported Node range ${SUPPORTED_NODE_RANGE}; upgrade Node.js`
+      : `v${nodeVersion} (supported range: ${SUPPORTED_NODE_RANGE})`,
   };
 }
 
@@ -185,14 +175,12 @@ function checkEndpoint(apiUrl: string): DoctorCheck {
 
 function checkCredentials(hasKey: boolean, profile: string, dryRun: boolean): DoctorCheck {
   if (hasKey) {
-    // Never print any part of the key (security). Confirm presence only.
     return {
       name: 'Credentials',
       status: 'ok',
       detail: `API key configured (profile "${profile}")`,
     };
   }
-  // Under --dry-run no key is expected, so a missing key is not a failure.
   return {
     name: 'Credentials',
     status: dryRun ? 'warn' : 'fail',
@@ -329,8 +317,6 @@ function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
   if (raw === undefined) return undefined;
   const seconds = Number(raw);
   if (!Number.isFinite(seconds) || seconds <= 0) {
-    // Match the other commands: a malformed --request-timeout is a validation
-    // error, not a silently-ignored default.
     throw localValidationError(
       'request-timeout',
       `must be a positive number of seconds (got "${raw}")`,
