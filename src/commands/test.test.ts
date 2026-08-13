@@ -3096,6 +3096,40 @@ describe('runSteps', () => {
     expect(block.match(/error: /g)).toHaveLength(1);
   });
 
+  it('--run-id run_failed_sample dry-run sample maps the failed step error and contributor flag', async () => {
+    const out: string[] = [];
+    const page = await runSteps(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        testId: 'test_fe',
+        runId: 'run_failed_sample',
+      },
+      {
+        env: {} as NodeJS.ProcessEnv,
+        credentialsPath: join(tmpdir(), 'testsprite-no-creds'),
+        stdout: line => out.push(line),
+        stderr: () => undefined,
+      },
+    );
+
+    const failing = page.items.find(step => step.stepIndex === 3);
+    expect(failing).toMatchObject({
+      status: 'failed',
+      error: expect.any(String),
+      stepType: 'assertion',
+      outcomeContributesToFailure: true,
+    });
+    expect(page.items.find(step => step.stepIndex === 1)?.outcomeContributesToFailure).toBe(false);
+
+    const printed = JSON.parse(out[0]!) as { items: Array<{ stepIndex: number; error?: string }> };
+    expect(printed.items.some(step => step.stepIndex === 3 && typeof step.error === 'string')).toBe(
+      true,
+    );
+  });
+
   it('--run-id: rejects a runId that belongs to a different test (exit 4)', async () => {
     const { credentialsPath } = makeCreds();
     // The run-scoped endpoint returns a run whose testId differs from the
