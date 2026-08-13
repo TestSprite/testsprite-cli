@@ -1,9 +1,11 @@
 import {
+  appendFileSync,
   createWriteStream,
   existsSync,
   readFileSync,
   readdirSync,
   statSync,
+  writeFileSync,
   type WriteStream,
 } from 'node:fs';
 import { rename, stat, unlink } from 'node:fs/promises';
@@ -21,6 +23,7 @@ import {
   assertContextIntegrity,
   buildMeta,
   pickCodeExtension,
+  pickVideoExtension,
   resolveBundleDir,
   stepFilenamePrefix,
   writeBundle,
@@ -54,6 +57,7 @@ import {
 import { REQUEST_TIMEOUT_DEFAULT_MS, REQUEST_TIMEOUT_MAX_MS } from '../lib/http.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
+import { VERSION } from '../version.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import {
   fetchSinglePage,
@@ -69,6 +73,7 @@ import type {
   RunStepDto,
   TriggerRunResponse,
   RerunResponse,
+  RerunAdvisory,
   BatchRerunResponse,
   BatchRerunAccepted,
   BatchRerunClosureByProject,
@@ -92,6 +97,12 @@ import {
 import { createTicker } from '../lib/ticker.js';
 import { RateThrottle } from '../lib/rate-throttle.js';
 import { resolvePortalBase, resolvePortalUrl } from '../lib/facade.js';
+import { emitTargetUrlV3Advisory } from '../lib/v3-advisory.js';
+import {
+  emitGithubOutputs,
+  summarizeAcceptedPayload,
+  summarizeSingleRun,
+} from '../lib/gh-output.js';
 import { loadConfig } from '../lib/config.js';
 import {
   flakyExitCode,
@@ -258,13 +269,7 @@ export type CliVerdict = 'passed' | 'failed' | 'blocked';
 
 /** execution LIFECYCLE (where the test is in its run lifecycle). */
 export type CliExecutionStatus =
-  | 'draft'
-  | 'ready'
-  | 'queued'
-  | 'running'
-  | 'completed'
-  | 'cancelled'
-  | 'unknown';
+  'draft' | 'ready' | 'queued' | 'running' | 'completed' | 'cancelled' | 'unknown';
 
 /** §6.5 LatestResult wire shape. All correlation fields are required. */
 export interface CliLatestResult {
@@ -484,10 +489,36 @@ function interruptDetachMessage(err: InterruptError, runIds: string[]): string {
   );
 }
 
+/**
+ * The honest-detach stderr line for a RATE_LIMITED (429) hit during a
+ * `--wait` poll. The backend's pre-auth rate limiter is an in-process LRU
+ * keyed on `request.ip`, checked before any DB contact — it can trip on a
+ * shared egress IP (a CI runner, a NAT) and then 429 otherwise-valid keys
+ * from that IP for its window. The run itself was already triggered (and is
+ * already billed) and keeps executing server-side regardless of this local
+ * poll giving up — mirrors `interruptDetachMessage` so the re-attach and
+ * cancel commands read identically across every detach reason.
+ */
+function rateLimitedDetachMessage(err: ApiError, runIds: string[]): string {
+  const retrySuffix =
+    err.retryAfterMs !== undefined
+      ? `; the server asked to retry after ~${Math.ceil(err.retryAfterMs / 1000)}s`
+      : '';
+  const subject =
+    runIds.length === 1
+      ? `Run ${runIds[0]} is still executing on the server and will keep running (and billing) until it finishes.`
+      : `${runIds.length} runs are still executing on the server and will keep running (and billing) until they finish.`;
+  return (
+    `Rate limited by the server (HTTP 429)${retrySuffix}. ${subject}\n` +
+    `  Re-attach with: testsprite test wait ${runIds.join(' ')}\n` +
+    `  Cancel with:    testsprite test cancel ${runIds.join(' ')}`
+  );
+}
+
 type CommonOptions = FactoryCommonOptions;
 
 interface ListOptions extends CommonOptions {
-  projectId: string;
+  projectId?: string;
   type?: 'frontend' | 'backend';
   createdFrom?: 'portal' | 'mcp' | 'cli';
   /**
@@ -552,7 +583,8 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
   // (exit 3) when the caller also lacks a configured key. Order matters
   // for the CLI error spec §2 — bad input is a caller bug, not an auth
   // gate.
-  requireProjectId(opts.projectId);
+  const projectId = resolveProjectId(opts.projectId, deps);
+  requireProjectId(projectId);
 
   const paginationFlags: PaginationFlags = validatePaginationFlags({
     pageSize: opts.pageSize,
@@ -578,7 +610,7 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
   const useSinglePage = opts.pageSize !== undefined && opts.maxItems === undefined;
 
   const baseQuery: Record<string, string | number | boolean | undefined> = {
-    projectId: opts.projectId,
+    projectId,
     type: opts.type,
     createdFrom: opts.createdFrom,
     status: opts.status,
@@ -625,6 +657,18 @@ export interface CliCreateTestResponse {
    * still succeeded.
    */
   warnings?: string[];
+  /**
+   * Server-built Portal deep link for the created test (DEV-737). Same
+   * presence/absence contract as `RunResponse.dashboardUrl`
+   * (`withRunDashboardUrl` below): PRESENT (string or falsy) on a backend
+   * that resolved the question at all — a falsy value means "there is no
+   * correct link for this test" (e.g. a V3-native create with no DynamoDB
+   * mirror row for the client's V2-shaped guess to land on) and must never
+   * be replaced by the client fallback; ABSENT on an older backend that
+   * predates this field, which safely reopens the client fallback via
+   * `resolveDashboardUrl` below. See that function's doc for the reasoning.
+   */
+  dashboardUrl?: string | null;
 }
 
 export const CLI_CREATE_PRIORITIES = ['p0', 'p1', 'p2', 'p3'] as const;
@@ -642,7 +686,7 @@ export type CliCreatePriority = (typeof CLI_CREATE_PRIORITIES)[number];
 const MAX_INLINE_CODE_BYTES = 350 * 1024;
 
 interface CreateOptions extends CommonOptions {
-  projectId: string;
+  projectId?: string;
   type: 'frontend' | 'backend';
   name: string;
   description?: string;
@@ -733,15 +777,26 @@ async function emitDupNameAdvisoryIfNeeded(
   // Use an AbortController with a 5 s deadline. When the timer fires it
   // calls ac.abort(), which causes client.get (via the `signal` option) to
   // throw an AbortError — caught below and swallowed. This ensures a stalled
-  // or retrying listing endpoint can't delay an otherwise-healthy create by
-  // the full request-timeout (120 s) or multiple transport retries.
+  // listing endpoint can't delay an otherwise-healthy create by the full
+  // request-timeout (120 s).
   // No secondary setTimeout is used to avoid leaking timers in tests.
+  //
+  // The deadline alone is NOT sufficient, because `signal` is composed into
+  // the fetch only — `sleepBeforeRetry` observes the process-lifetime
+  // shutdown signal and nothing else, so a retry sleep runs to completion
+  // no matter what this controller does. A 429 carrying `Retry-After` is
+  // honoured up to 60 s per attempt across 3 attempts, which would park the
+  // create behind a best-effort advisory for up to ~2 minutes. `429` is a
+  // live response for CLI callers (the in-flight run cap returns it), so
+  // this is reachable, not theoretical. `retryOnRateLimit: false` makes the
+  // 429 throw straight into the catch below, which is the correct outcome
+  // for a lookup whose entire purpose is to be skippable.
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), DUP_NAME_ADVISORY_TIMEOUT_MS);
   try {
     const listing = await client.get<{ items: CliTest[] }>(
       `/tests?projectId=${encodeURIComponent(projectId)}&pageSize=100`,
-      { signal: ac.signal },
+      { signal: ac.signal, retryOnRateLimit: false },
     );
     const nameLower = name.toLowerCase();
     const match = listing.items?.find(t => t.name.toLowerCase() === nameLower);
@@ -790,7 +845,8 @@ export async function runCreate(
   assertChainedRunKeyFits(opts.run, opts.idempotencyKey);
   // Validate inputs before touching credentials or fs — matches the
   // M2 read commands' "input gates first, then auth, then I/O" ordering.
-  requireProjectId(opts.projectId);
+  const projectId = resolveProjectId(opts.projectId, deps);
+  requireProjectId(projectId);
   requireNonEmpty('name', opts.name);
   // P1-3: client-side length checks matching server limits (name ≤200,
   // description ≤2000) so the user gets instant, actionable errors instead
@@ -871,7 +927,7 @@ export async function runCreate(
   }
 
   const body: Record<string, unknown> = {
-    projectId: opts.projectId,
+    projectId,
     type: opts.type,
     name: opts.name,
     description: opts.description,
@@ -915,7 +971,7 @@ export async function runCreate(
   // B3: best-effort duplicate-name advisory. Skip under --dry-run.
   if (!opts.dryRun) {
     const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-    await emitDupNameAdvisoryIfNeeded(client, opts.projectId, opts.name, stderrFn);
+    await emitDupNameAdvisoryIfNeeded(client, projectId, opts.name, stderrFn);
   }
 
   const response = await client.post<CliCreateTestResponse>('/tests', {
@@ -938,11 +994,36 @@ export async function runCreate(
     // the merged { ...createContext, run } envelope in JSON mode and
     // appears on the Dashboard: stderr line in text mode.
     // R1: suppress under --dry-run (fake canned test id).
-    const chainDashboardUrl = opts.dryRun
-      ? undefined
-      : resolvePortalUrl(resolveApiUrl(opts, deps), opts.projectId, response.testId);
-    const createContextWithUrl =
-      chainDashboardUrl !== undefined ? { ...response, dashboardUrl: chainDashboardUrl } : response;
+    // DEV-737: prefer a server-provided dashboardUrl over the client guess
+    // (`withDashboardUrl`/`resolveDashboardUrl` above); when the server
+    // explicitly withheld one, never fall back to the client-computed
+    // V2-shaped link and tell the caller where to find the test instead.
+    const { entity: createContextWithUrl, suppressed: dashboardSuppressedOnRun } = withDashboardUrl(
+      response,
+      () =>
+        opts.dryRun
+          ? undefined
+          : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId),
+    );
+    const runDashboardStderrFn =
+      deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    if (dashboardSuppressedOnRun) {
+      emitDashboardLinkSuppressedAdvisory(response.testId, runDashboardStderrFn);
+    } else if (opts.output !== 'json' && createContextWithUrl.dashboardUrl !== undefined) {
+      // Finding 3 (dogfood 2026-08-09): the merged create+run chain suppresses
+      // the create's own print (delegating to `runTestRun` -> `printRunOrChain`),
+      // whose text-mode header renders `createContext` via `renderCreateText` —
+      // which never prints `dashboardUrl` — and there is otherwise no stderr
+      // emission point for it on this chain (unlike the non-`--run` path below,
+      // which prints this same line explicitly). Without this, a text-mode
+      // `create --run` silently drops the authoritative link — worst on a
+      // no-wait V3 create, where the client cannot recompute it at all. Mirrors
+      // the non-run path's three-state handling exactly: a suppressed (`null`)
+      // server link takes the advisory branch above instead (no legacy guess);
+      // an absent key already resolved to the legacy client fallback (or
+      // `undefined` when unmapped) via `createContextWithUrl` above.
+      runDashboardStderrFn(`Dashboard: ${createContextWithUrl.dashboardUrl}`);
+    }
     await runTestRun(
       {
         ...opts,
@@ -968,19 +1049,32 @@ export async function runCreate(
   // (no extra network call — both come from opts / response).
   // R1: suppress under --dry-run — the test id is a fake canned value
   // (e.g. "test_dryrun_create_2026") and a live-looking URL would mislead.
-  const dashboardUrl = opts.dryRun
-    ? undefined
-    : resolvePortalUrl(resolveApiUrl(opts, deps), opts.projectId, response.testId);
+  // DEV-737: prefer a server-provided dashboardUrl over the client guess;
+  // never fall back when the server explicitly withheld one (see
+  // `withDashboardUrl`/`resolveDashboardUrl` above), and tell the caller
+  // where to find the test instead of printing a link that would 404.
+  const { entity: responseWithDashboardUrl, suppressed: dashboardSuppressed } = withDashboardUrl(
+    response,
+    () =>
+      opts.dryRun
+        ? undefined
+        : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId),
+  );
+  const dashboardUrl = responseWithDashboardUrl.dashboardUrl ?? undefined;
   if (opts.output === 'json') {
-    out.print(dashboardUrl !== undefined ? { ...response, dashboardUrl } : response, data =>
-      renderCreateText(data as CliCreateTestResponse),
-    );
+    out.print(responseWithDashboardUrl, data => renderCreateText(data as CliCreateTestResponse));
   } else {
     out.print(response, data => renderCreateText(data as CliCreateTestResponse));
     if (dashboardUrl !== undefined) {
       const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
       stderrFn(`Dashboard: ${dashboardUrl}`);
     }
+  }
+  if (dashboardSuppressed) {
+    emitDashboardLinkSuppressedAdvisory(
+      response.testId,
+      deps.stderr ?? (line => process.stderr.write(`${line}\n`)),
+    );
   }
   return response;
 }
@@ -1247,6 +1341,19 @@ function renderPlanPutText(response: CliPutPlanStepsResponse): string {
  * 256 KB (vs. 350 KB for code) per the piece-6 spec.
  */
 function readPlanStepsFileGuarded(path: string): CliPlanStep[] {
+  return assertPlanStepsShape(parsePlanStepsFile(path));
+}
+
+/**
+ * File I/O + JSON.parse half of `readPlanStepsFileGuarded`, split out so
+ * `test lint` can reuse the SAME stat/size/read/parse guards while
+ * substituting the collect-all `collectPlanStepsIssues` shape check for the
+ * throw-on-first `assertPlanStepsShape` that `test plan put` still uses. A
+ * failure here (missing file, oversize, invalid JSON syntax) is always a
+ * single fatal issue either way — there is nothing left to validate once the
+ * file itself can't be read or parsed.
+ */
+function parsePlanStepsFile(path: string): unknown {
   const absolute = resolveAbsolute(path);
 
   let stat;
@@ -1287,15 +1394,12 @@ function readPlanStepsFileGuarded(path: string): CliPlanStep[] {
     throw localValidationError('steps', `cannot read ${path}: ${reason}`);
   }
 
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    return JSON.parse(raw);
   } catch (err) {
     const reason = err instanceof Error ? err.message : 'unknown error';
     throw localValidationError('steps', `not valid JSON: ${reason}`);
   }
-
-  return assertPlanStepsShape(parsed);
 }
 
 /**
@@ -1328,6 +1432,62 @@ function assertPlanStepsShape(parsed: unknown): CliPlanStep[] {
   }
 
   return stepsRaw as CliPlanStep[];
+}
+
+/**
+ * Collect-all counterpart to `assertPlanStepsShape` — same field checks
+ * (reusing the identical `requireArrayLength`/`requireEnum`/`requireString`
+ * helpers so wording never drifts), but continues past the first failing
+ * field instead of throwing. Used exclusively by `test lint`: a
+ * `--steps` file with several bad steps previously cost one fix-and-rerun
+ * cycle per step. `assertPlanStepsShape` itself is UNCHANGED and stays
+ * throw-on-first — `test plan put` only needs the first blocking error per
+ * network round-trip.
+ */
+function collectPlanStepsIssues(parsed: unknown): Array<{ field: string; reason: string }> {
+  const issues: Array<{ field: string; reason: string }> = [];
+  const check = (validate: () => void): void => {
+    try {
+      validate();
+    } catch (err) {
+      issues.push(toLintIssue(err));
+    }
+  };
+
+  let stepsRaw: unknown;
+  if (Array.isArray(parsed)) {
+    stepsRaw = parsed;
+  } else if (typeof parsed === 'object' && parsed !== null) {
+    stepsRaw = (parsed as Record<string, unknown>).planSteps;
+  } else {
+    issues.push({ field: 'steps', reason: 'must be a JSON object with a `planSteps` array' });
+    return issues;
+  }
+
+  check(() =>
+    requireArrayLength('planSteps', stepsRaw, { min: 1, max: MAX_PLAN_STEPS, itemNoun: 'step' }),
+  );
+  // A length/cap violation (e.g. 201 steps, over
+  // MAX_PLAN_STEPS) does NOT mean there's nothing left to check — `stepsRaw`
+  // is still a real, iterable array, so per-element problems must be
+  // collected too (a 201-step file with a bad step 0 must report the cap
+  // issue AND planSteps[0].type/description in the SAME pass, not one or the
+  // other). Only bail when `stepsRaw` isn't an array at all — `requireArrayLength`'s
+  // structural check failed, so there is genuinely nothing to iterate.
+  if (!Array.isArray(stepsRaw)) return issues;
+
+  for (let i = 0; i < stepsRaw.length; i += 1) {
+    const step: unknown = stepsRaw[i];
+    if (typeof step !== 'object' || step === null || Array.isArray(step)) {
+      issues.push({ field: `planSteps[${i}]`, reason: 'must be an object' });
+      continue;
+    }
+    const s = step as Record<string, unknown>;
+    check(() => requireEnum(`planSteps[${i}].type`, s.type, PLAN_STEP_TYPES));
+    check(() => requireString(`planSteps[${i}].description`, s.description));
+  }
+
+  return issues;
 }
 
 /**
@@ -1815,6 +1975,95 @@ export interface CliCreateFromPlanResponse extends CliCreateTestResponse {
   planSteps?: CliPlanStep[];
 }
 
+/**
+ * Public raw-content URL for
+ * `schemas/plan.schema.json`, shipped in both the npm package (see
+ * `package.json` `files`) and the repo. Points at the PUBLIC mirror
+ * (`TestSprite/testsprite-cli`) since that's what ships to npm consumers;
+ * the private atlas repo syncs to it via `scripts/make-public-snapshot.sh`.
+ *
+ * Pinned to the running CLI's own `v<VERSION>` git tag (the same `VERSION`
+ * constant `--version` / `doctor` / the update-check registry probe already
+ * read from `src/version.ts`) rather than the mutable `main` branch — a plan
+ * file authored against one CLI version should resolve the SAME schema
+ * forever, not whatever `main` happens to contain when the file is opened
+ * months later (`main` can gain new required fields between versions).
+ *
+ * This is deliberately DIFFERENT from `schemas/plan.schema.json`'s own
+ * internal `$id`, which stays the canonical `main` URL — `$id` is a schema
+ * IDENTITY (what this document calls itself, used for cross-referencing),
+ * not a fetch instruction, so it is intentionally version-independent.
+ * `PLAN_SCHEMA_URL` is the fetch instruction embedded in generated plan
+ * files and is intentionally version-PINNED. See DOCUMENTATION.md's "Plan
+ * file format" section for the same distinction spelled out for humans.
+ *
+ * Caveat: the pinned tag only resolves once that version is actually
+ * released — a locally-built/pre-release checkout may see a 404 until then.
+ */
+export const PLAN_SCHEMA_URL = `https://raw.githubusercontent.com/TestSprite/testsprite-cli/v${VERSION}/schemas/plan.schema.json`;
+
+/**
+ * The SINGLE canonical example plan. This
+ * exact value (via `PLAN_TEMPLATE_TEXT` below) is:
+ *   - printed to stdout by `test create --plan-template`
+ *   - embedded verbatim in `test create --help` (`PLAN_TEMPLATE_HELP_TEXT`)
+ *   - asserted in tests against `schemas/plan.schema.json` and against
+ *     `assertPlanShape` so the three surfaces can't drift
+ *
+ * Deliberately minimal (no optional `description`/`priority`) — this is
+ * the smallest shape `assertPlanShape` accepts, not a fully-annotated
+ * showcase (that lives in `skills/testsprite-verify.skill.md`).
+ */
+export const PLAN_TEMPLATE: CliPlanInput = {
+  projectId: 'prj_abc123',
+  type: 'frontend',
+  name: 'Login rejects an empty password',
+  planSteps: [
+    {
+      type: 'action',
+      description: 'Navigate to /login and submit the form with an empty password',
+    },
+    {
+      type: 'assertion',
+      description: 'Verify an inline error says the password is required',
+    },
+  ],
+};
+
+/** `CliPlanInput` plus the optional editor-discoverability hint. */
+export interface PlanFileTemplate extends CliPlanInput {
+  $schema: string;
+}
+
+/**
+ * `$schema` is an ordinary extra property from `assertPlanShape`'s point of
+ * view (no `additionalProperties` check exists on the plan-from path) — it
+ * validates exactly like a bare `CliPlanInput` while giving editors (VS
+ * Code's JSON language service, and by extension Copilot inline
+ * completions) something to resolve for live validation as the file is
+ * edited.
+ */
+export const PLAN_TEMPLATE_WITH_SCHEMA: PlanFileTemplate = {
+  $schema: PLAN_SCHEMA_URL,
+  ...PLAN_TEMPLATE,
+};
+
+/**
+ * Rendered once from the object above (never hand-formatted separately) so
+ * `test create --plan-template`'s stdout and `test create --help`'s example
+ * are generated from — not merely modeled on — the same source.
+ */
+export const PLAN_TEMPLATE_TEXT: string = JSON.stringify(PLAN_TEMPLATE_WITH_SCHEMA, null, 2);
+
+/** `test create --help` after-text. Wraps `PLAN_TEMPLATE_TEXT` unmodified. */
+const PLAN_TEMPLATE_HELP_TEXT =
+  '\nPlan file format (--plan-from <file>) — minimal valid example:\n\n' +
+  `${PLAN_TEMPLATE_TEXT}\n\n` +
+  'Print this exact skeleton:      testsprite test create --plan-template\n' +
+  'Validate offline (no network):  testsprite test create --plan-from <file> --dry-run\n' +
+  'Multiple tests:                 test create-batch --plans <file.jsonl> | --plan-from-dir <dir>\n' +
+  'Full field reference: DOCUMENTATION.md -> "Plan file format"\n';
+
 /** Per-spec result from `POST /tests/batch`. */
 export interface CliBatchSpecResult {
   /** Position of the spec in the input JSONL, preserved across the response. */
@@ -1829,6 +2078,12 @@ export interface CliBatchSpecResult {
     message: string;
     field?: string;
   };
+  /**
+   * Server-built Portal deep link for this created item (DEV-737). Same
+   * presence/absence contract as `CliCreateTestResponse.dashboardUrl` —
+   * see that field's doc.
+   */
+  dashboardUrl?: string | null;
 }
 
 export interface CliCreateBatchResponse {
@@ -1860,6 +2115,13 @@ export interface CliBatchRunResult {
   failureKind?: string | null;
   /** Error envelope when the trigger itself failed (network/auth/validation). */
   error?: { code: string; message: string; exitCode: number };
+  /**
+   * Portal deep link (R3b), threaded through from the SAME per-item
+   * create-time decision `test create-batch`'s own output carries — never
+   * recomputed at run time. Absent when unresolvable OR explicitly
+   * suppressed by the server (see `resolveDashboardUrl`'s doc).
+   */
+  dashboardUrl?: string;
 }
 
 /** Envelope emitted by `test create-batch --run` in JSON mode. */
@@ -1900,6 +2162,37 @@ const MAX_BATCH_RERUN_IDS = 50;
  * the caller can warn the operator that a shared BE producer/teardown was
  * triggered more than once.
  */
+/**
+ * Dedupe `RerunAdvisory[]` by `feature`+`message`. Used to aggregate
+ * `advisories` across chunked batch-rerun dispatch requests (initial dispatch
+ * + D3 deferred-retry attempts) into a single list, and to collapse repeated
+ * per-attempt advisories in `test flaky` into a single summary line.
+ */
+function dedupeRerunAdvisories(entries: RerunAdvisory[]): RerunAdvisory[] {
+  const seen = new Map<string, RerunAdvisory>();
+  for (const entry of entries) {
+    seen.set(`${entry.feature}|${entry.message}`, entry);
+  }
+  return [...seen.values()];
+}
+
+/**
+ * Print one `[advisory]` stderr line per entry in `advisories`. Mirrors the
+ * existing style of the other rerun advisories (auto-heal engaged / not
+ * applied, BE rerun history). No-op when `advisories` is absent or empty —
+ * this is the common case (every V2 response, every V3 response that did not
+ * request an autoHeal:false opt-out).
+ */
+function emitRerunAdvisories(
+  stderrFn: (line: string) => void,
+  advisories: RerunAdvisory[] | undefined,
+): void {
+  if (!advisories || advisories.length === 0) return;
+  for (const advisory of advisories) {
+    stderrFn(`[advisory] ${advisory.message}`);
+  }
+}
+
 function dedupeBatchRerunAccepted(entries: BatchRerunAccepted[]): {
   deduped: BatchRerunAccepted[];
   droppedCount: number;
@@ -1977,6 +2270,69 @@ export const BATCH_RUN_RATE_LIMIT = 50;
 export const BATCH_RUN_RATE_WINDOW_MS = 60_000;
 /** Maximum number of outer RATE_LIMITED retries inside the batch fan-out (beyond HTTP-layer retries). */
 export const BATCH_RUN_RATE_MAX_OUTER_RETRIES = 5;
+/**
+ * Maximum number of outer RATE_LIMITED retries per member inside the multi-id
+ * `test wait` fan-out (beyond HTTP-layer retries). Lower than the trigger
+ * fan-out's budget on purpose: a throttled *poll* costs nothing but latency and
+ * the run is already executing, so a couple of Retry-After-length backoffs is
+ * enough to ride out one limiter window — burning the whole `--timeout` on
+ * backoff instead of reporting the throttle would be worse than reporting it.
+ */
+export const WAIT_POLL_RATE_MAX_OUTER_RETRIES = 3;
+
+/**
+ * Backoff to honour before retrying a `RATE_LIMITED` response, in ms.
+ *
+ * Precedence: `ApiError.retryAfterMs` (set by `HttpClient` from the HTTP
+ * `Retry-After` header, already clamped to [1s, 300s]) → `details.retryAfterSeconds`
+ * from the envelope body, capped at 120s → 60s. Callers clamp the result to their
+ * own remaining deadline; this function only decides "how long does the server
+ * want us to wait."
+ *
+ * Shared by the `test run --all` trigger fan-out and the multi-id `test wait`
+ * poll fan-out so the two can't drift — they were hand-copies of the same
+ * precedence rule.
+ */
+/**
+ * Sleep that a termination signal cuts short by rejecting with the signal's
+ * `InterruptError`, so the caller's existing DEV-331 catch owns the detach UX.
+ *
+ * Mirrors `HttpClient.sleepBeforeRetry` — an in-flight backoff must not be a
+ * window where a first Ctrl-C hard-exits with empty stdout. The caller is
+ * responsible for having ARMED the shutdown scope; a disarmed controller never
+ * aborts its signal, so this would otherwise sleep straight through the signal.
+ */
+export function sleepUntilOrInterrupt(
+  ms: number,
+  signal: AbortSignal | undefined,
+  sleep: (ms: number) => Promise<void>,
+): Promise<void> {
+  if (signal === undefined) return sleep(ms);
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    sleep(ms).then(
+      () => {
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      },
+      err => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
+}
+
+export function resolveRateLimitRetryMs(err: ApiError): number {
+  if (err.retryAfterMs !== undefined) return err.retryAfterMs;
+  const retryAfterSec = err.getDetail<number>(
+    'retryAfterSeconds',
+    (v): v is number => typeof v === 'number' && v > 0,
+  );
+  return Math.min((retryAfterSec ?? 60) * 1000, 120_000);
+}
 
 /**
  * D3: max automatic retry attempts for deferred tests under `--wait`.
@@ -2069,6 +2425,49 @@ interface CreateFromPlanOptions extends CommonOptions {
   ignoredFlags?: string[];
 }
 
+/** Matches `{{ANYTHING}}`-style template placeholders in a step description. */
+const PLACEHOLDER_PATTERN = /\{\{.*?\}\}/;
+
+/**
+ * Indices of `planSteps` whose `description` contains a
+ * `{{...}}`-style placeholder. Structurally valid (schema-and-validator
+ * agree these plans pass) — this is a content-quality signal, not a shape
+ * violation, so it's surfaced separately as a non-fatal advisory rather
+ * than folded into `assertPlanShape`.
+ */
+function findPlaceholderStepIndices(plan: CliPlanInput): number[] {
+  const indices: number[] = [];
+  plan.planSteps.forEach((step, i) => {
+    if (PLACEHOLDER_PATTERN.test(step.description)) indices.push(i);
+  });
+  return indices;
+}
+
+/**
+ * Non-fatal `[advisory]` when one or more `planSteps[].description` values
+ * contain a `{{...}}`-style placeholder — the most common false assumption
+ * agent-authored plans make (that the CLI does variable substitution). The
+ * CLI does none: the browser agent types the literal braces into the
+ * field. Points at storing credentials on the project instead, which is
+ * the actual mechanism for injecting auth into a run.
+ */
+function emitPlaceholderAdvisory(plan: CliPlanInput, stderrFn: (line: string) => void): void {
+  const indices = findPlaceholderStepIndices(plan);
+  if (indices.length === 0) return;
+  // Each path must read
+  // `planSteps[N].description` on its OWN — appending `.description` once
+  // after a joined `planSteps[0], planSteps[2]` list misattributed it to
+  // only the last entry.
+  const paths = indices.map(i => `planSteps[${i}].description`).join(', ');
+  const verb = indices.length === 1 ? 'contains' : 'contain';
+  stderrFn(
+    `[advisory] ${paths} ${verb} a ` +
+      '`{{...}}`-style placeholder; the CLI does no variable substitution — ' +
+      'the browser agent will type the literal braces. Store login credentials on the project instead: ' +
+      '`testsprite project update <project-id> --username <user> --password <pw>`, or Portal -> Project Settings.',
+  );
+}
+
 /**
  * `test create --plan-from <plan.json>` — M3.2 piece-5.
  *
@@ -2103,15 +2502,23 @@ export async function runCreateFromPlan(
     assertNotLocal(opts.targetUrl);
   }
 
-  const plan = readPlanFromGuarded(opts.planFrom);
+  const plan = readPlanFromGuarded(opts.planFrom, { ignoredFlags: opts.ignoredFlags });
+
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+
+  // Non-fatal advisory for `{{...}}`-style placeholders in step
+  // descriptions. The CLI does no variable substitution — the browser agent
+  // types the literal braces — so this is a content-quality nudge, not a
+  // validation failure. Fires regardless of --dry-run (dry-run still runs
+  // full local validation; this advisory is part of that same offline pass).
+  emitPlaceholderAdvisory(plan, stderrFn);
 
   // The plan validated (projectId/type/name/planSteps present). Only NOW
   // warn that overlapping `test create` flags were ignored — emitting this
   // before validation made a missing-projectId failure look like the
   // ignored --project flag was the cause (dogfood L1778).
   if (opts.ignoredFlags && opts.ignoredFlags.length > 0) {
-    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-    stderr(
+    stderrFn(
       `warning: --plan-from supplies the test definition; ignoring ${opts.ignoredFlags.join(', ')}. ` +
         `Edit the plan JSON to change these fields.`,
     );
@@ -2135,8 +2542,7 @@ export async function runCreateFromPlan(
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-create-plan-${randomUUID()}`;
   if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
-    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-    stderr(`idempotency-key: ${idempotencyKey}`);
+    stderrFn(`idempotency-key: ${idempotencyKey}`);
   }
 
   const body = {
@@ -2155,7 +2561,6 @@ export async function runCreateFromPlan(
   // The plan's projectId + name are available after validation above. Skip
   // under dry-run (no network calls); swallow all errors (advisory only).
   if (!opts.dryRun) {
-    const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
     await emitDupNameAdvisoryIfNeeded(client, plan.projectId, plan.name, stderrFn);
   }
 
@@ -2167,9 +2572,17 @@ export async function runCreateFromPlan(
   // Fix 5 (plan-from coverage): the projectId for the deep-link comes from
   // the validated PLAN body (not opts — `--plan-from` has no --project-id
   // flag). Same dry-run suppression as runCreate (fake canned test id).
-  const planDashboardUrl = opts.dryRun
-    ? undefined
-    : resolvePortalUrl(resolveApiUrl(opts, deps), plan.projectId, response.testId);
+  // DEV-737: prefer a server-provided dashboardUrl over the client guess
+  // (`withDashboardUrl`/`resolveDashboardUrl`, defined near
+  // `withRunDashboardUrl`); never fall back when the server explicitly
+  // withheld one, and tell the caller where to find the test instead.
+  const { entity: responseWithDashboardUrl, suppressed: planDashboardSuppressed } =
+    withDashboardUrl(response, () =>
+      opts.dryRun
+        ? undefined
+        : resolvePortalUrl(resolveApiUrl(opts, deps), plan.projectId, response.testId),
+    );
+  const planDashboardUrl = responseWithDashboardUrl.dashboardUrl ?? undefined;
 
   // --run chain (M3.3 piece-3): trigger + optionally wait. Per codex
   // round-1 P1: suppress the create's own print when chaining;
@@ -2178,8 +2591,9 @@ export async function runCreateFromPlan(
     // Idempotency key for the run is the create key + ":run" suffix so a
     // retry of the whole chain gets the same runId. Per piece-3 spec.
     const runIdempotencyKey = `${idempotencyKey}:run`;
-    const createContextWithUrl =
-      planDashboardUrl !== undefined ? { ...response, dashboardUrl: planDashboardUrl } : response;
+    if (planDashboardSuppressed) {
+      emitDashboardLinkSuppressedAdvisory(response.testId, stderrFn);
+    }
     return runTestRun(
       {
         ...opts,
@@ -2190,23 +2604,22 @@ export async function runCreateFromPlan(
         // first-run hint fires for `test create --plan-from --run --wait`.
         timeoutIsDefault: opts.timeoutIsDefault ?? false,
         wait: opts.wait === true,
-        createContext: createContextWithUrl,
+        createContext: responseWithDashboardUrl,
       },
       deps,
     ).then(() => response);
   }
 
   if (opts.output === 'json') {
-    out.print(
-      planDashboardUrl !== undefined ? { ...response, dashboardUrl: planDashboardUrl } : response,
-      data => renderCreateText(data as CliCreateTestResponse),
-    );
+    out.print(responseWithDashboardUrl, data => renderCreateText(data as CliCreateTestResponse));
   } else {
     out.print(response, data => renderCreateText(data as CliCreateTestResponse));
     if (planDashboardUrl !== undefined) {
-      const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
       stderrFn(`Dashboard: ${planDashboardUrl}`);
     }
+  }
+  if (planDashboardSuppressed) {
+    emitDashboardLinkSuppressedAdvisory(response.testId, stderrFn);
   }
   return response;
 }
@@ -2220,7 +2633,27 @@ export async function runCreateFromPlan(
  * obvious oversize files BEFORE loading them into V8's heap. For
  * plans the cap is 256 KB (vs. 350 KB for code).
  */
-function readPlanFromGuarded(path: string): CliPlanInput {
+function readPlanFromGuarded(
+  path: string,
+  context: { ignoredFlags?: string[] } = {},
+): CliPlanInput {
+  return assertPlanShape(parsePlanFile(path), context);
+}
+
+/**
+ * File I/O + JSON.parse half of `readPlanFromGuarded`, split out so `test
+ * lint` can reuse the SAME stat/size/read/parse guards while
+ * substituting the collect-all `collectPlanIssues` shape check for the
+ * throw-on-first `assertPlanShape` that `create`/`create-batch` still use. A
+ * failure here (missing file, oversize, invalid JSON syntax) is always a
+ * single fatal issue either way — there is nothing left to validate once the
+ * file itself can't be read or parsed.
+ *
+ * Stat-first guard mirrors piece-2's `readCodeFileGuarded` — reject
+ * obvious oversize files BEFORE loading them into V8's heap. For
+ * plans the cap is 256 KB (vs. 350 KB for code).
+ */
+function parsePlanFile(path: string): unknown {
   const absolute = resolveAbsolute(path);
 
   let stat;
@@ -2261,15 +2694,49 @@ function readPlanFromGuarded(path: string): CliPlanInput {
     throw localValidationError('plan-from', `cannot read ${path}: ${reason}`);
   }
 
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    return JSON.parse(raw);
   } catch (err) {
     const reason = err instanceof Error ? err.message : 'unknown error';
     throw localValidationError('plan-from', `not valid JSON: ${reason}`);
   }
+}
 
-  return assertPlanShape(parsed);
+/**
+ * Rethrow a validation error enriched with a note that the
+ * caller's `--project`/`--type`/`--name` flag was ignored, but ONLY when
+ * that flag was actually supplied. Keeps the L1778 ordering intact
+ * (validation still runs, and still throws, before the general
+ * ignored-flags warning in `runCreateFromPlan`) — this only changes the
+ * WORDING of the validation error itself so the one hint that would
+ * explain a missing-field failure lands inside the error the caller
+ * already sees, instead of depending on a separate warning that (per
+ * L1778) deliberately fires after validation succeeds.
+ */
+function appendIgnoredFlagNote(err: ApiError, flag: string): ApiError {
+  return new ApiError({
+    code: err.code,
+    message: err.message,
+    nextAction: `${err.nextAction} note: with --plan-from, ${flag} is ignored; all fields live inside the file.`,
+    requestId: err.requestId,
+    details: err.details,
+  });
+}
+
+/** Runs `fn`, enriching any thrown `ApiError` via {@link appendIgnoredFlagNote} when `flag` was ignored. */
+function requireFieldNotIgnored<T>(
+  fn: () => T,
+  flag: string,
+  ignoredFlags: string[] | undefined,
+): T {
+  try {
+    return fn();
+  } catch (err) {
+    if (err instanceof ApiError && ignoredFlags?.includes(flag)) {
+      throw appendIgnoredFlagNote(err, flag);
+    }
+    throw err;
+  }
 }
 
 /**
@@ -2278,22 +2745,63 @@ function readPlanFromGuarded(path: string): CliPlanInput {
  * `create-batch --plans`. Throws `VALIDATION_ERROR` with a typed
  * `details.field` pointer so callers can fix specific issues without
  * re-reading the whole file.
+ *
+ * `context.ignoredFlags` is populated only on the single
+ * `--plan-from` path (`test create --plan-from` also received overlapping
+ * `--project`/`--type`/`--name` flags); batch/dir/JSONL callers never pass
+ * it, so `requireFieldNotIgnored` below is a no-op for them.
+ *
+ * Throw-on-first is intentional here: `create` / `create-batch` POST over
+ * the network, so surfacing the first blocking error per round-trip is the
+ * right cost/detail tradeoff. `test lint`'s collect-all sibling is
+ * `collectPlanIssues` below — do not merge the two; the doc comment on
+ * `collectPlanIssues` explains why they must stay separate.
  */
-function assertPlanShape(parsed: unknown, context: { specIndex?: number } = {}): CliPlanInput {
+function assertPlanShape(
+  parsed: unknown,
+  context: { specIndex?: number; ignoredFlags?: string[] } = {},
+): CliPlanInput {
   const prefix = context.specIndex !== undefined ? `specs[${context.specIndex}].` : '';
+
+  // A top-level JSON array is the single most common
+  // agent-authored mistake: a plan file holds exactly ONE test. Give it a
+  // dedicated message pointing at the batch surfaces, instead of the
+  // generic "must be a JSON object" (which doesn't say what to do about an
+  // array).
+  if (Array.isArray(parsed)) {
+    throw localValidationError(
+      `${prefix}plan`,
+      `a plan file holds ONE test as a single JSON object (got an array of ${parsed.length}). ` +
+        'To create many tests use `test create-batch --plans <file.jsonl>` or `--plan-from-dir <dir>`',
+      undefined,
+      'field',
+    );
+  }
 
   // Every field below is a JSON body path inside the plan file (or
   // JSONL spec), not a CLI flag — pass `'field'` so the error message
   // says `Field \`projectId\` is invalid: ...` instead of inventing a
   // `--projectId` flag the user can't pass.
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+  if (typeof parsed !== 'object' || parsed === null) {
     throw localValidationError(`${prefix}plan`, 'must be a JSON object', undefined, 'field');
   }
   const obj = parsed as Record<string, unknown>;
 
-  requireString(`${prefix}projectId`, obj.projectId);
-  requireEnum(`${prefix}type`, obj.type, ['frontend', 'backend'] as const);
-  requireString(`${prefix}name`, obj.name);
+  requireFieldNotIgnored(
+    () => requireString(`${prefix}projectId`, obj.projectId),
+    '--project',
+    context.ignoredFlags,
+  );
+  requireFieldNotIgnored(
+    () => requireEnum(`${prefix}type`, obj.type, ['frontend', 'backend'] as const),
+    '--type',
+    context.ignoredFlags,
+  );
+  requireFieldNotIgnored(
+    () => requireString(`${prefix}name`, obj.name),
+    '--name',
+    context.ignoredFlags,
+  );
   if (obj.description !== undefined && typeof obj.description !== 'string') {
     throw localValidationError(
       `${prefix}description`,
@@ -2304,6 +2812,21 @@ function assertPlanShape(parsed: unknown, context: { specIndex?: number } = {}):
   }
   if (obj.priority !== undefined) {
     requireEnum(`${prefix}priority`, obj.priority, CLI_CREATE_PRIORITIES);
+  }
+
+  // `planSteps` missing is the single most common agent
+  // hallucination: LLMs (Copilot included) reliably nest steps under
+  // `plan.steps` or a bare top-level `steps`. Point directly at the fix
+  // instead of falling through to the generic "is required and must be an
+  // array" message, which doesn't say WHERE the steps actually belong.
+  if (obj.planSteps === undefined && (obj.plan !== undefined || obj.steps !== undefined)) {
+    throw localValidationError(
+      `${prefix}planSteps`,
+      'is required and must be an array. Did you mean `planSteps`? Steps live at the top level: ' +
+        '`"planSteps": [{ "type": "action" | "assertion", "description": "..." }]`',
+      undefined,
+      'field',
+    );
   }
   requireArrayLength(`${prefix}planSteps`, obj.planSteps, {
     min: 1,
@@ -2326,6 +2849,72 @@ function assertPlanShape(parsed: unknown, context: { specIndex?: number } = {}):
   }
 
   return obj as unknown as CliPlanInput;
+}
+
+/**
+ * Collect-all counterpart to `assertPlanShape` — same field checks (reusing
+ * the identical `requireString`/`requireEnum`/`requireArrayLength` helpers
+ * so wording never drifts), but continues past the first failing field
+ * instead of throwing. Used exclusively by `test lint` (issue #98
+ * follow-up): the throw-on-first
+ * `assertPlanShape` meant a plan with 6 independent problems reported one at
+ * a time across 6 fix-and-rerun cycles. `assertPlanShape` itself is
+ * UNCHANGED — `create`/`create-batch` only need the first blocking error per
+ * network round-trip, and duplicating the field checks here (rather than
+ * threading a "collect" flag through the throw-on-first assert) keeps both
+ * functions simple and matches the existing sibling-validator convention
+ * already used between `assertPlanShape` and `assertPlanStepsShape`.
+ */
+function collectPlanIssues(
+  parsed: unknown,
+  context: { specIndex?: number } = {},
+): Array<{ field: string; reason: string }> {
+  const prefix = context.specIndex !== undefined ? `specs[${context.specIndex}].` : '';
+  const issues: Array<{ field: string; reason: string }> = [];
+  const check = (validate: () => void): void => {
+    try {
+      validate();
+    } catch (err) {
+      issues.push(toLintIssue(err));
+    }
+  };
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    issues.push({ field: `${prefix}plan`, reason: 'must be a JSON object' });
+    return issues;
+  }
+  const obj = parsed as Record<string, unknown>;
+
+  check(() => requireString(`${prefix}projectId`, obj.projectId));
+  check(() => requireEnum(`${prefix}type`, obj.type, ['frontend', 'backend'] as const));
+  check(() => requireString(`${prefix}name`, obj.name));
+  if (obj.description !== undefined && typeof obj.description !== 'string') {
+    issues.push({ field: `${prefix}description`, reason: 'must be a string when present' });
+  }
+  if (obj.priority !== undefined) {
+    check(() => requireEnum(`${prefix}priority`, obj.priority, CLI_CREATE_PRIORITIES));
+  }
+  check(() =>
+    requireArrayLength(`${prefix}planSteps`, obj.planSteps, {
+      min: 1,
+      max: MAX_PLAN_STEPS,
+      itemNoun: 'step',
+    }),
+  );
+  if (Array.isArray(obj.planSteps)) {
+    for (let i = 0; i < obj.planSteps.length; i += 1) {
+      const step: unknown = obj.planSteps[i];
+      if (typeof step !== 'object' || step === null || Array.isArray(step)) {
+        issues.push({ field: `${prefix}planSteps[${i}]`, reason: 'must be an object' });
+        continue;
+      }
+      const s = step as Record<string, unknown>;
+      check(() => requireEnum(`${prefix}planSteps[${i}].type`, s.type, PLAN_STEP_TYPES));
+      check(() => requireString(`${prefix}planSteps[${i}].description`, s.description));
+    }
+  }
+
+  return issues;
 }
 
 interface CreateBatchOptions extends CommonOptions {
@@ -2518,23 +3107,70 @@ export async function runCreateBatch(
     });
   }
 
-  // Fix 5: enrich results with per-item dashboardUrl in JSON mode.
+  // Fix 5: enrich results with per-item dashboardUrl.
   // projectId comes from specs[specIndex].projectId; testId from the result row.
   // Only emitted where both are known client-side — no extra network calls.
   // R1: suppress under --dry-run — test ids are fake canned values and a
   // live-looking URL would mislead the caller.
+  // DEV-737: prefer a server-provided per-item dashboardUrl over the client
+  // guess (`withDashboardUrl`/`resolveDashboardUrl`, defined near
+  // `withRunDashboardUrl`); never fall back when the server explicitly
+  // withheld one for a given item — that would print exactly the dead
+  // V2-shaped link the server declined to emit.
+  //
+  // The per-item decision is captured into `testIdToDashboardState` — computed
+  // ONCE here, regardless of `--output` mode — so the `--run` fan-out below
+  // (`runBatchRun`) can reuse the SAME decision instead of recomputing a
+  // client-side URL from testId→projectId, which would silently replace a
+  // server-provided V3 link with the dead legacy V2 guess and lose
+  // suppression state entirely. Computing it unconditionally (not gated on
+  // `opts.output === 'json'`) also means the aggregate suppression advisory
+  // below now correctly fires in text mode too — it previously only ever
+  // fired in JSON mode because the per-item loop was skipped entirely in text
+  // mode, silently under-warning a text-mode caller. That matches the
+  // documented "advisory fires on stderr regardless of --output mode"
+  // convention this repo already follows for the single-`test create` advisory.
   const apiUrlForDashboard = resolveApiUrl(opts, deps);
+  let anyDashboardSuppressed = false;
+  const testIdToDashboardState = new Map<
+    string,
+    { dashboardUrl: string | undefined; suppressed: boolean }
+  >();
+  if (!opts.dryRun) {
+    for (const r of response.results) {
+      if (r.status !== 'created' || r.testId === undefined) continue;
+      const testId = r.testId;
+      const spec = specs[r.specIndex];
+      const projectId = spec?.projectId;
+      const { entity, suppressed } = withDashboardUrl(r, () =>
+        projectId ? resolvePortalUrl(apiUrlForDashboard, projectId, testId) : undefined,
+      );
+      if (suppressed) anyDashboardSuppressed = true;
+      testIdToDashboardState.set(testId, {
+        dashboardUrl: entity.dashboardUrl ?? undefined,
+        suppressed,
+      });
+    }
+  }
+  if (anyDashboardSuppressed) {
+    const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    stderrFn(
+      '[advisory] no dashboard link is available for one or more created tests right now; ' +
+        'use `testsprite test get <test-id>` to look them up.',
+    );
+  }
+
+  // JSON-mode create output is enriched from the same map, so it stays
+  // byte-identical to before this refactor.
   const enrichedResponse: CliCreateBatchResponse =
     !opts.dryRun && opts.output === 'json'
       ? {
           ...response,
           results: response.results.map(r => {
             if (r.status !== 'created' || r.testId === undefined) return r;
-            const spec = specs[r.specIndex];
-            const projectId = spec?.projectId;
-            if (!projectId) return r;
-            const dashboardUrl = resolvePortalUrl(apiUrlForDashboard, projectId, r.testId);
-            return dashboardUrl !== undefined ? { ...r, dashboardUrl } : r;
+            const state = testIdToDashboardState.get(r.testId);
+            if (!state) return r;
+            return { ...r, dashboardUrl: state.dashboardUrl };
           }),
         }
       : response;
@@ -2550,23 +3186,13 @@ export async function runCreateBatch(
 
   // --run: fan out a trigger for each created test, then emit results.
   if (opts.run === true) {
-    // R3b: build testId → projectId map from the create results + specs so
-    // runBatchRun can enrich per-item run JSON with dashboardUrl.
-    const runTestIdToProjectId = new Map<string, string>();
-    for (const r of response.results) {
-      if (r.status === 'created' && r.testId !== undefined) {
-        const projectId = specs[r.specIndex]?.projectId;
-        if (projectId) runTestIdToProjectId.set(r.testId, projectId);
-      }
-    }
     await runBatchRun(
       opts,
       response,
       client,
       out,
       deps,
-      opts.dryRun ? undefined : runTestIdToProjectId,
-      opts.dryRun ? undefined : apiUrlForDashboard,
+      opts.dryRun ? undefined : testIdToDashboardState,
     );
     // runBatchRun handles its own exit-code logic via CLIError.
     // Return the create response to satisfy the return type; callers that
@@ -2603,12 +3229,17 @@ async function runBatchRun(
   client: HttpClient,
   out: Output,
   deps: TestDeps,
-  /** R3b: testId → projectId mapping built from create results + specs, used to enrich
-   *  run-path JSON items with dashboardUrl. Populated by the caller; absent (undefined)
-   *  means no enrichment (e.g. dry-run or caller didn't supply it). */
-  testIdToProjectId?: Map<string, string>,
-  /** R3b: resolved API URL for portal link resolution. */
-  apiUrlForDashboard?: string,
+  /**
+   * R3b: per-testId dashboard-link decision, ALREADY resolved at create time
+   * via `withDashboardUrl`/`resolveDashboardUrl` (the shared three-state
+   * precedence helper — see its doc). Populated by the caller; absent
+   * (undefined) means no enrichment (e.g. dry-run). Reusing this decision
+   * — rather than recomputing a client-side URL from testId→projectId here
+   * — is the fix: a fresh `resolvePortalUrl` call at this point would
+   * silently replace a server-provided V3 link with the dead legacy V2
+   * guess, and would have no way to know a link was explicitly suppressed.
+   */
+  testIdToDashboardState?: Map<string, { dashboardUrl: string | undefined; suppressed: boolean }>,
 ): Promise<void> {
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const timeoutSeconds = opts.timeoutSeconds ?? DEFAULT_RUN_TIMEOUT_SECONDS;
@@ -2622,6 +3253,21 @@ async function runBatchRun(
   if (testIds.length === 0) {
     // All specs failed at create time — already threw above; unreachable.
     return;
+  }
+
+  // Finding 2 (dogfood 2026-08-09): this fan-out calls `triggerRunWithMeta`
+  // directly (below), bypassing `runTestRun` entirely — so `runTestRun`'s own
+  // `--target-url` V3 advisory (`emitTargetUrlV3AdvisoryIfNeeded`) never fired
+  // here, even though every triggered run in the batch ignores `--target-url`
+  // exactly like a single V3-routed `test run` does. Reuses the same helper
+  // and advisory text (no duplicated probe logic or copy) and fires exactly
+  // ONCE for the whole batch, before the fan-out — not per item. Mirrors
+  // `runTestRun`'s own gating (only pay the extra `/me` round trip when
+  // `--target-url` was actually supplied) and its "fires under --dry-run too"
+  // behavior (the dry-run client's canned `/me` sample demonstrates the same
+  // advisory at zero real-network cost).
+  if (opts.targetUrl !== undefined) {
+    await emitTargetUrlV3AdvisoryIfNeeded(client, stderrFn);
   }
 
   // Dry-run: print a descriptor envelope and return without real triggers.
@@ -2803,16 +3449,9 @@ async function runBatchRun(
             // MAJOR 3: use retryAfterMs from the thrown ApiError when available
             // (set by HttpClient from the HTTP Retry-After header, clamped to
             // [1s, 300s]). Fall back to details.retryAfterSeconds, then 60 s.
-            let retryAfterMs: number;
-            if (err.retryAfterMs !== undefined) {
-              retryAfterMs = err.retryAfterMs;
-            } else {
-              const retryAfterSec = err.getDetail<number>(
-                'retryAfterSeconds',
-                (v): v is number => typeof v === 'number' && v > 0,
-              );
-              retryAfterMs = Math.min((retryAfterSec ?? 60) * 1000, 120_000);
-            }
+            // Extracted to `resolveRateLimitRetryMs` so the multi-id `test wait`
+            // poll fan-out applies the identical precedence.
+            const retryAfterMs = resolveRateLimitRetryMs(err);
 
             // MAJOR 2: clamp to remaining deadline so we don't overshoot the
             // --wait budget.
@@ -3016,7 +3655,9 @@ async function runBatchRun(
       testId: finalRun.testId,
       runId: finalRun.runId,
       status: finalRun.status,
-      codeVersion: finalRun.codeVersion,
+      // Runs without a stored code body report `codeVersion: null`; the batch
+      // envelope uses '' for "unknown", as the trigger-error paths above do.
+      codeVersion: finalRun.codeVersion ?? '',
       videoUrl: finalRun.videoUrl,
       failureKind: finalRun.failureKind,
     };
@@ -3087,19 +3728,33 @@ async function runBatchRun(
 
   // Emit output.
   if (opts.output === 'json') {
-    // R3b: enrich per-item run results with dashboardUrl when both testId and
-    // projectId are known (from the testIdToProjectId map built by the caller).
-    // Additive-optional: items where projectId is unknown are left unchanged.
+    // R3b: enrich per-item run results with the dashboard state ALREADY
+    // resolved at create time (`testIdToDashboardState`, built by the
+    // caller). Never recompute a client-side URL here — that would silently
+    // replace a server-provided V3 link with the dead legacy V2 guess, and
+    // would have no way to represent "the server explicitly suppressed
+    // this". A suppressed item (dashboardUrl undefined, suppressed: true)
+    // is left with no key at all, same as the create-time convention.
     const enrichedResults =
-      !opts.dryRun && testIdToProjectId !== undefined && apiUrlForDashboard !== undefined
+      !opts.dryRun && testIdToDashboardState !== undefined
         ? batchRunResults.map(r => {
-            const projectId = testIdToProjectId.get(r.testId);
-            if (!projectId || !r.testId) return r;
-            const dashboardUrl = resolvePortalUrl(apiUrlForDashboard, projectId, r.testId);
-            return dashboardUrl !== undefined ? { ...r, dashboardUrl } : r;
+            const state = testIdToDashboardState.get(r.testId);
+            if (!state || state.dashboardUrl === undefined) return r;
+            return { ...r, dashboardUrl: state.dashboardUrl };
           })
         : batchRunResults;
     out.print({ results: enrichedResults });
+  } else if (!opts.wait) {
+    // Text mode, no --wait: statuses are non-terminal by design ('queued'),
+    // so a pass/fail summary would misread a successful dispatch as
+    // "0/N passed". Report what actually happened: triggers.
+    const total = batchRunResults.length;
+    const erroredCount = batchRunResults.filter(r => r.error !== undefined).length;
+    const parts = [`${total - erroredCount}/${total} triggered`];
+    if (erroredCount > 0) {
+      parts.push(`${erroredCount} trigger error${erroredCount !== 1 ? 's' : ''}`);
+    }
+    stderrFn(`batch-run summary: ${parts.join(', ')}`);
   } else {
     // Text mode: print summary line.
     const passed = batchRunResults.filter(r => r.status === 'passed').length;
@@ -3118,20 +3773,23 @@ async function runBatchRun(
     stderrFn(`batch-run summary: ${parts.join(', ')}`);
   }
 
-  // Determine exit code.
-  const allPassed = batchRunResults.every(r => r.status === 'passed');
-  if (allPassed) return; // exit 0
+  // Determine exit code. With --wait, success means every run reached the
+  // terminal status 'passed'. Without --wait, statuses are non-terminal by
+  // design ('queued' per CliBatchRunResult), so success means every trigger
+  // dispatched without error — mirroring single `test run` (no --wait),
+  // which exits 0 on a successful queued dispatch.
+  const failing = opts.wait
+    ? batchRunResults.filter(r => r.status !== 'passed')
+    : batchRunResults.filter(r => r.error !== undefined);
+  if (failing.length === 0) return; // exit 0
 
-  // Check for a uniform non-pass exit code across all non-passed results.
-  const errorExitCodes = batchRunResults
-    .filter(r => r.error !== undefined)
-    .map(r => r.error!.exitCode);
-  const nonPassedStatuses = batchRunResults.filter(r => r.status !== 'passed');
+  // Check for a uniform non-pass exit code across all failing results.
+  const errorExitCodes = failing.filter(r => r.error !== undefined).map(r => r.error!.exitCode);
   // Exit 7 only when EVERY run timed out — a mix of pass + timeout is "mixed
-  // outcomes" (exit 1), not "all timed out". `nonPassedStatuses.every(...)`
+  // outcomes" (exit 1), not "all timed out". `failing.every(...)` alone
   // would incorrectly fire exit 7 when 1 of N passed and the rest timed out.
   const allTimeout =
-    batchRunResults.length > 0 &&
+    failing.length === batchRunResults.length &&
     batchRunResults.every(r => r.status === 'timeout' || r.error?.exitCode === 7);
   if (allTimeout) {
     throw new CLIError(
@@ -3139,8 +3797,8 @@ async function runBatchRun(
       7,
     );
   }
-  // If all non-passed results share the same specific exit code (6 or 11), use it.
-  if (errorExitCodes.length > 0 && errorExitCodes.length === nonPassedStatuses.length) {
+  // If all failing results share the same specific exit code (6 or 11), use it.
+  if (errorExitCodes.length > 0 && errorExitCodes.length === failing.length) {
     const uniformCode = errorExitCodes[0];
     if (
       uniformCode !== undefined &&
@@ -3149,14 +3807,16 @@ async function runBatchRun(
       uniformCode !== 7
     ) {
       throw new CLIError(
-        `Batch run finished: ${nonPassedStatuses.length} run(s) failed with exit code ${uniformCode}.`,
+        `Batch run finished: ${failing.length} run(s) failed with exit code ${uniformCode}.`,
         uniformCode,
       );
     }
   }
   // Default: mixed outcomes or generic failure → exit 1.
   throw new CLIError(
-    `Batch run finished: ${batchRunResults.filter(r => r.status !== 'passed').length} of ${batchRunResults.length} run(s) did not pass.`,
+    opts.wait
+      ? `Batch run finished: ${failing.length} of ${batchRunResults.length} run(s) did not pass.`
+      : `Batch run trigger finished: ${failing.length} of ${batchRunResults.length} trigger(s) failed.`,
     1,
   );
 }
@@ -3897,12 +4557,36 @@ export interface CliRunDiff {
 }
 
 /**
+ * The `test diff` exit-code contract, applied identically to a real
+ * two-run comparison and the `--dry-run` canned sample: the
+ * result is always printed first (`out.print` already ran by the time this
+ * is called), then a `verdictChanged` diff throws so the process exits 1.
+ * Before this helper existed, `--dry-run`'s early `return sample` bypassed
+ * the check entirely — the canned sample has `verdictChanged: true`, so
+ * `test diff --dry-run` always exited 0 even though the documented contract
+ * ("Exit 0 when verdicts match, 1 when they differ") makes no dry-run
+ * exception. That made the command useless for its stated CI-gate
+ * pre-verification purpose.
+ */
+function enforceDiffExitContract(diff: CliRunDiff): void {
+  if (diff.verdictChanged) {
+    throw new CLIError(
+      `verdicts differ: ${diff.runA.runId}=${diff.runA.status} vs ${diff.runB.runId}=${diff.runB.status}`,
+      1,
+    );
+  }
+}
+
+/**
  * `test diff <runA> <runB>` (issue #124): isolate what regressed between two
  * runs, the first question when CI goes red ("what changed since the last
  * green run?"). Pure client-side composition of the existing per-run read
  * (`GET /runs/{id}?includeSteps=true`); the endpoint accepts any two run-ids,
  * so a cross-test pair is a WARNING, not an error. Exit 0 when the verdicts
- * match, exit 1 when they differ, so the command is CI-scriptable.
+ * match, exit 1 when they differ, so the command is CI-scriptable —
+ * `--dry-run` honors the same contract: the canned sample has a
+ * changed verdict, so `test diff --dry-run` (with no overrides) exits 1,
+ * same as a real regressed pair would.
  */
 export async function runDiff(opts: DiffOptions, deps: TestDeps = {}): Promise<CliRunDiff> {
   const out = makeOutput(opts.output, deps);
@@ -3935,6 +4619,7 @@ export async function runDiff(opts: DiffOptions, deps: TestDeps = {}): Promise<C
       changedSteps: [{ stepIndex: 2, statusA: 'passed', statusB: 'failed' }],
     };
     out.print(sample, () => renderRunDiffText(sample));
+    enforceDiffExitContract(sample);
     return sample;
   }
 
@@ -4003,13 +4688,8 @@ export async function runDiff(opts: DiffOptions, deps: TestDeps = {}): Promise<C
   };
   out.print(diff, () => renderRunDiffText(diff));
 
-  if (diff.verdictChanged) {
-    // Result already printed; the typed exit makes `test diff` a CI gate.
-    throw new CLIError(
-      `verdicts differ: ${runA.runId}=${runA.status} vs ${runB.runId}=${runB.status}`,
-      1,
-    );
-  }
+  // Result already printed; the typed exit makes `test diff` a CI gate.
+  enforceDiffExitContract(diff);
   return diff;
 }
 
@@ -4065,6 +4745,26 @@ export interface CliLintReport {
 }
 
 /**
+ * Turn a thrown validation error into a lint issue's `field`+`reason` pair.
+ * Shared by `runLint`'s file-level failures (bad path, oversize, invalid JSON
+ * syntax — always a single issue, there's nothing left to validate) and the
+ * collect-all `collectPlanIssues` / `collectPlanStepsIssues` helpers above
+ * (one call per field, so every problem in a file is captured, not just the
+ * first). Preserves the typed envelope's `details.field` / `details.reason`
+ * verbatim (e.g. `planSteps[2].type`) so a caller sees the exact same pointer
+ * whether the error surfaced via lint or via `create`.
+ */
+function toLintIssue(err: unknown): { field: string; reason: string } {
+  if (err instanceof ApiError) {
+    return {
+      field: String(err.getDetail('field') ?? '(file)'),
+      reason: String(err.getDetail('reason') ?? err.nextAction ?? err.message),
+    };
+  }
+  return { field: '(file)', reason: err instanceof Error ? err.message : String(err) };
+}
+
+/**
  * `test lint` (issue #98): validate plan/steps files fully OFFLINE with the
  * SAME validators the create paths run, but collecting EVERY problem instead
  * of dying on the first one, and without any network write. The create-batch
@@ -4072,6 +4772,15 @@ export interface CliLintReport {
  * so authoring a 12-plan directory meant one error per paid round-trip. Zero
  * network, zero credentials: exit 0 when everything is valid, 5 otherwise, so
  * it drops into a pre-commit hook or CI step before `create-batch`.
+ *
+ * The collection granularity used to be per-FILE, not per-PROBLEM — a single
+ * plan with 6 independent field errors reported one at a time across 6
+ * fix-and-rerun cycles, because each file was validated through the
+ * throw-on-first `assertPlanShape`/`assertPlanStepsShape`. Every branch below
+ * now separates "parse the file" (still a single fatal issue on I/O/JSON
+ * failure — there's nothing left to validate) from "check the parsed shape"
+ * (routed through `collectPlanIssues` / `collectPlanStepsIssues`, which
+ * report every failing field in one pass).
  */
 export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<CliLintReport> {
   const out = makeOutput(opts.output, deps);
@@ -4087,36 +4796,39 @@ export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<C
 
   const issues: CliLintIssue[] = [];
   let checked = 0;
-  // Run one existing validator, converting its typed throw into a report row
-  // (same envelopes, so `details.field` pointers like planSteps[2].type
-  // survive verbatim).
-  const collect = (file: string, validate: () => void): void => {
+
+  const lintPlanFile = (file: string, path: string, specIndex?: number): void => {
     checked += 1;
+    let parsed: unknown;
     try {
-      validate();
+      parsed = parsePlanFile(path);
     } catch (err) {
-      if (err instanceof ApiError) {
-        issues.push({
-          file,
-          field: String(err.getDetail('field') ?? '(file)'),
-          reason: String(err.getDetail('reason') ?? err.nextAction ?? err.message),
-        });
-      } else {
-        issues.push({
-          file,
-          field: '(file)',
-          reason: err instanceof Error ? err.message : String(err),
-        });
-      }
+      issues.push({ file, ...toLintIssue(err) });
+      return;
+    }
+    for (const issue of collectPlanIssues(parsed, { specIndex })) {
+      issues.push({ file, ...issue });
+    }
+  };
+
+  const lintStepsFile = (file: string, path: string): void => {
+    checked += 1;
+    let parsed: unknown;
+    try {
+      parsed = parsePlanStepsFile(path);
+    } catch (err) {
+      issues.push({ file, ...toLintIssue(err) });
+      return;
+    }
+    for (const issue of collectPlanStepsIssues(parsed)) {
+      issues.push({ file, ...issue });
     }
   };
 
   if (opts.planFrom !== undefined) {
-    const planFrom = opts.planFrom;
-    collect(planFrom, () => void readPlanFromGuarded(planFrom));
+    lintPlanFile(opts.planFrom, opts.planFrom);
   } else if (opts.steps !== undefined) {
-    const steps = opts.steps;
-    collect(steps, () => void readPlanStepsFileGuarded(steps));
+    lintStepsFile(opts.steps, opts.steps);
   } else if (opts.planFromDir !== undefined) {
     const dir = resolveAbsolute(opts.planFromDir);
     let entries: string[];
@@ -4131,11 +4843,12 @@ export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<C
       throw localValidationError('plan-from-dir', 'contains no *.json plan files');
     }
     for (const entry of entries) {
-      collect(entry, () => void readPlanFromGuarded(join(dir, entry)));
+      lintPlanFile(entry, join(dir, entry));
     }
   } else if (opts.plans !== undefined) {
-    // JSONL: validate PER LINE so every bad line reports (the create path's
-    // reader stays throw-on-first; this is the collecting counterpart).
+    // JSONL: validate PER LINE, and every problem WITHIN each line (the
+    // create path's reader stays throw-on-first; this is the collecting
+    // counterpart, both per-line and per-field).
     const absolute = resolveAbsolute(opts.plans);
     let content: string;
     try {
@@ -4152,20 +4865,24 @@ export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<C
       .filter(entry => entry.line.length > 0);
     if (numberedLines.length === 0) throw localValidationError('plans', 'contains no plan lines');
     for (const { line, lineNo } of numberedLines) {
-      collect(`${opts.plans}:${lineNo}`, () => {
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(line);
-        } catch {
-          throw localValidationError(
-            'plans',
-            `line ${lineNo} is not valid JSON`,
-            undefined,
-            'field',
-          );
-        }
-        assertPlanShape(parsed, { specIndex: lineNo - 1 });
-      });
+      const file = `${opts.plans}:${lineNo}`;
+      checked += 1;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        const err = localValidationError(
+          'plans',
+          `line ${lineNo} is not valid JSON`,
+          undefined,
+          'field',
+        );
+        issues.push({ file, ...toLintIssue(err) });
+        continue;
+      }
+      for (const issue of collectPlanIssues(parsed, { specIndex: lineNo - 1 })) {
+        issues.push({ file, ...issue });
+      }
     }
   }
 
@@ -4289,6 +5006,26 @@ export async function runScaffold(
   // No --out: the scaffold body IS the stdout payload (`> plan.json` works).
   out.print(payload, () => body.trimEnd());
   return payload;
+}
+
+/**
+ * `test create --plan-template` — prints the canonical minimal
+ * valid plan file (`PLAN_TEMPLATE_WITH_SCHEMA` / `PLAN_TEMPLATE_TEXT`,
+ * defined above near `CliPlanInput`) to stdout and exits — before any of
+ * `test create`'s other flag handling runs. Pure-local: no network, no
+ * credentials, no filesystem I/O.
+ *
+ * Deliberately simpler than `test scaffold --type frontend` (which
+ * substitutes a live `TESTSPRITE_PROJECT_ID` when set, and supports
+ * `--out`): `--plan-template`'s job is a single deterministic ground-truth
+ * document that is BYTE-IDENTICAL every invocation, because it doubles as
+ * the literal example embedded in `test create --help` and the
+ * fixture asserted against `schemas/plan.schema.json` in tests.
+ */
+export function runPlanTemplate(opts: CommonOptions, deps: TestDeps = {}): PlanFileTemplate {
+  const out = makeOutput(opts.output, deps);
+  out.print(PLAN_TEMPLATE_WITH_SCHEMA, () => PLAN_TEMPLATE_TEXT);
+  return PLAN_TEMPLATE_WITH_SCHEMA;
 }
 
 export interface OpenOptions extends CommonOptions {
@@ -4557,6 +5294,11 @@ interface ResultHistoryOptions extends CommonOptions {
   pageSize?: number;
   /** Opaque cursor from a prior page's `nextCursor`. */
   cursor?: string;
+  /**
+   * Client-side rerun filter. `true` → only reruns (isRerun), `false` → only
+   * fresh runs, `undefined` → no filter. Applied to each page after the fetch.
+   */
+  rerun?: boolean;
   columns?: string;
   noHeader?: boolean;
 }
@@ -4602,9 +5344,16 @@ export async function runResultHistory(
     since: sinceIso,
   });
 
+  // Client-side rerun filter (--rerun / --no-rerun). isRerun is on every row;
+  // the backend has no rerun filter. Undefined → no filter. Like --source, a
+  // filtered page can be short/empty while more history exists — the empty-page
+  // and short-page hints below cover that.
+  const runs =
+    opts.rerun === undefined ? resp.runs : resp.runs.filter(r => r.isRerun === opts.rerun);
+
   if (opts.output !== 'text') {
-    out.print({ runs: resp.runs, nextCursor: resp.nextCursor }, data => JSON.stringify(data));
-    return resp;
+    out.print({ runs, nextCursor: resp.nextCursor }, data => JSON.stringify(data));
+    return { ...resp, runs };
   }
 
   // Text mode rendering
@@ -4615,7 +5364,7 @@ export async function runResultHistory(
   // backend filters AFTER limiting rows (limit-before-filter). Matching runs
   // may exist on later pages — surface the cursor instead of reporting
   // "no history".
-  if (resp.runs.length === 0) {
+  if (runs.length === 0) {
     if (resp.nextCursor !== null) {
       // Filtered-empty page, but more pages exist: prompt user to paginate.
       const msg =
@@ -4639,7 +5388,7 @@ export async function runResultHistory(
   }
 
   const lines: string[] = [];
-  lines.push(renderRunHistoryTable(resp.runs, { columns: opts.columns, noHeader: opts.noHeader }));
+  lines.push(renderRunHistoryTable(runs, { columns: opts.columns, noHeader: opts.noHeader }));
 
   // Footer: pointer to per-run detail commands.
   lines.push('');
@@ -4656,14 +5405,14 @@ export async function runResultHistory(
 
   // Short-filtered-page hint: non-null nextCursor even though this page was
   // shorter than requested — "none in THIS window" does not mean end-of-history.
-  if (resp.nextCursor !== null && resp.runs.length < pageSize) {
+  if (resp.nextCursor !== null && runs.length < pageSize) {
     stderr(
       `[hint] Fewer than ${pageSize} rows returned but more may exist — ` +
-        `source filter skipped some entries. Pass --cursor ${resp.nextCursor} to continue.`,
+        `a source/rerun filter skipped some entries. Pass --cursor ${resp.nextCursor} to continue.`,
     );
   }
 
-  return resp;
+  return { ...resp, runs };
 }
 
 const RUN_HISTORY_TABLE_COLUMNS: ReadonlyArray<TextTableColumn<RunHistoryItem>> = [
@@ -4945,6 +5694,14 @@ interface RunTestRunOptions extends CommonOptions {
   timeoutIsDefault?: boolean;
   idempotencyKey?: string;
   /**
+   * --gh-output: force the GitHub-native output layer (::error:: annotations +
+   * job-summary table) even off-Actions. On the single-test `--wait` path the
+   * result is reduced to a one-row CI summary (`summarizeSingleRun`).
+   */
+  ghOutput?: boolean;
+  /** --summary-file: also write the reduced machine summary JSON to this path. */
+  summaryFile?: string;
+  /**
    * Per codex round-1 P1: when chained from `test create --run`, the caller
    * passes the create response here so `runTestRun` can emit a single merged
    * envelope `{ ...createContext, run: <trigger|final> }` on stdout. Without
@@ -5031,6 +5788,13 @@ interface RunTestRerunOptions extends CommonOptions {
   reportFile?: string;
   /** --report-suite-name: optional override for the JUnit <testsuite name=...>. */
   reportSuiteName?: string;
+  /**
+   * --gh-output: force the GitHub-native output layer (::error:: annotations +
+   * job-summary table) on the batch-rerun `--wait` result, even off-Actions.
+   */
+  ghOutput?: boolean;
+  /** --summary-file: also write the reduced machine summary JSON to this path. */
+  summaryFile?: string;
 }
 
 /**
@@ -5094,8 +5858,11 @@ function backendResultToRunResponse(result: CliLatestResult, run: RunResponse): 
     retryAfterSeconds: undefined,
     startedAt: result.startedAt ?? run.startedAt,
     finishedAt: result.finishedAt ?? run.finishedAt,
-    codeVersion: run.codeVersion || (result.codeVersion ?? ''),
-    targetUrl: run.targetUrl || (result.targetUrl ?? ''),
+    // Neither side having a value stays null (not ''), so the text renderer
+    // omits the line instead of printing a label with nothing after it. A
+    // backend run legitimately has no target URL at all.
+    codeVersion: run.codeVersion || result.codeVersion || null,
+    targetUrl: run.targetUrl || result.targetUrl || null,
     // createdFrom / projectId / userId / runId / testId / source / createdAt
     // inherited from the polled run row via the spread above.
     failedStepIndex: result.failedStepIndex,
@@ -5230,16 +5997,110 @@ function printRunOrChain<T>(
 }
 
 /**
- * Enrich a terminal RunResponse with a client-synthesized Portal deep link.
- * Emitted only when the wire row carries both projectId and testId (the BE
- * testId-fallback path synthesizes rows with an empty projectId — those stay
- * unenriched) and the API endpoint maps to a known portal host
- * (`resolvePortalUrl` returns undefined otherwise).
+ * Server-first precedence for a `dashboardUrl` field on any wire response
+ * that can carry one (`RunResponse`, `CliCreateTestResponse`,
+ * `CliBatchSpecResult`). Single source of truth for the rule so the create
+ * paths (DEV-737) and the run-completion path (`withRunDashboardUrl` below)
+ * can't drift apart.
+ *
+ * This is a PINNED three-state wire contract — a prior revision let a
+ * present-but-falsy value and a truly-absent key both mean "no server
+ * opinion," which was ambiguous with the real backend behavior of omitting
+ * the key on a deliberate "no correct link" response, printing the dead
+ * legacy link this feature exists to remove. The backend now always
+ * includes the key (typed `string | null`, never omitted when it has an
+ * opinion), so the three states below are mutually exclusive on the wire:
+ *
+ *  - **Present + truthy** → the server built a correct link (it alone knows
+ *    which store answered and this environment's portal origin); use it
+ *    verbatim.
+ *  - **Present + falsy (`null`/`''`)** → the server explicitly has no
+ *    correct link — e.g. a V3-native entity with no DynamoDB mirror row for
+ *    the client's V2-shaped `/dashboard/tests/…` guess to land on. NEVER
+ *    fall back here: a client-side guess would be exactly the dead link the
+ *    server declined to emit. `suppressed: true` tells the caller a link
+ *    was actively withheld (vs. simply never computed) so it can point the
+ *    user elsewhere instead of printing nothing unexplained.
+ *  - **Absent** → an older backend that predates this field entirely. Such a
+ *    backend cannot have produced a V3-native/unmirrored entity either —
+ *    that capability and this field ship together — so the client fallback
+ *    is safe and reproduces exactly today's behavior.
+ */
+function resolveDashboardUrl(
+  wire: { dashboardUrl?: string | null },
+  computeFallback: () => string | undefined,
+): { dashboardUrl: string | undefined; suppressed: boolean } {
+  if ('dashboardUrl' in wire) {
+    return wire.dashboardUrl
+      ? { dashboardUrl: wire.dashboardUrl, suppressed: false }
+      : { dashboardUrl: undefined, suppressed: true };
+  }
+  return { dashboardUrl: computeFallback(), suppressed: false };
+}
+
+/**
+ * Applies {@link resolveDashboardUrl} to a whole entity, returning a
+ * NORMALIZED copy: a server-suppressed (`null`/`''`) value is rewritten to
+ * `undefined` so `JSON.stringify` omits the key entirely instead of
+ * serializing a literal `"dashboardUrl": null` — the same normalization
+ * `withRunDashboardUrl` already did inline for `RunResponse`, generalized
+ * here so the create paths (DEV-737) can share it byte-for-byte.
+ */
+function withDashboardUrl<T extends { dashboardUrl?: string | null }>(
+  wire: T,
+  computeFallback: () => string | undefined,
+): { entity: T; suppressed: boolean } {
+  const { dashboardUrl, suppressed } = resolveDashboardUrl(wire, computeFallback);
+  if ('dashboardUrl' in wire) return { entity: { ...wire, dashboardUrl }, suppressed };
+  return { entity: dashboardUrl !== undefined ? { ...wire, dashboardUrl } : wire, suppressed };
+}
+
+/**
+ * DEV-737: advisory printed when the server explicitly withheld a dashboard
+ * link (`resolveDashboardUrl`'s `suppressed: true`) rather than silently
+ * omitting the field with no explanation. Fires on stderr regardless of
+ * `--output` mode — the field's absence from a JSON envelope carries no
+ * reason on its own, and `--output json` is routinely unattended, so the
+ * hint is worth the line there too (same reasoning as the `project create
+ * --type backend` no-URL advisory in `project.ts`). Printing nothing beats
+ * printing a dead link, but telling the caller where to look instead beats
+ * printing nothing unexplained.
+ */
+function emitDashboardLinkSuppressedAdvisory(
+  testId: string,
+  stderrFn: (line: string) => void,
+): void {
+  stderrFn(
+    `[advisory] no dashboard link is available for this test right now; use ` +
+      `\`testsprite test get ${testId}\` to look it up.`,
+  );
+}
+
+/**
+ * Attach the Portal deep link to a terminal RunResponse.
+ *
+ * **A server-provided `dashboardUrl` always wins.** The backend knows two
+ * things this process cannot:
+ *
+ *  - **Which store answered.** For a run served from V3 Postgres the
+ *    `/dashboard/tests/…` route we would template reads DynamoDB only, and a
+ *    CLI-created project under the V3-native write path has no DynamoDB row at
+ *    all — so our link is not merely org-less, it cannot render. The server
+ *    sends the V3 test-case page instead, scoped to the workspace that owns the
+ *    run.
+ *  - **The portal origin for this environment.** `resolvePortalUrl` maps only
+ *    the prod host, so against any other endpoint it returns undefined and we
+ *    print nothing. The server reads its own `PORTAL_URL`.
+ *
+ * The client computation stays as the fallback so an older backend (no field)
+ * behaves exactly as before, and so does a V2-served run whose server link the
+ * backend chose not to emit.
  */
 function withRunDashboardUrl(run: RunResponse, apiUrl: string): RunResponse {
-  if (!run.projectId || !run.testId) return run;
-  const dashboardUrl = resolvePortalUrl(apiUrl, run.projectId, run.testId);
-  return dashboardUrl !== undefined ? { ...run, dashboardUrl } : run;
+  return withDashboardUrl(run, () => {
+    if (!run.projectId || !run.testId) return undefined;
+    return resolvePortalUrl(apiUrl, run.projectId, run.testId);
+  }).entity;
 }
 
 /**
@@ -5360,6 +6221,82 @@ function parseTimeoutFlag(raw: string | undefined, flagName: string): number {
 }
 
 /**
+ * Short deadline for the best-effort `v3Enabled` lookup behind the
+ * `--target-url` advisory (DEV-749). Mirrors `DUP_NAME_ADVISORY_TIMEOUT_MS`
+ * — a stalled `/me` must never meaningfully delay a run trigger.
+ */
+const TARGET_URL_ADVISORY_TIMEOUT_MS = 5_000;
+
+/**
+ * DEV-749 (client half): `--target-url` is silently dropped on the V3
+ * execution path — the backend validates it (SSRF guard, defence in depth)
+ * and then discards it, because V3 resolves the run's environment from
+ * `test_environment` at execution time; there is no injection point for a
+ * per-run override. This is a client-side advisory only — the real fix
+ * (an actual per-run override on V3) needs a product decision and is out
+ * of scope here.
+ *
+ * Gated on `v3Enabled`, the same authoritative per-user routing bit
+ * `auth status`/`doctor` already render (`GET /me`, `src/lib/v3-advisory.ts`).
+ * Best-effort: a single bounded lookup (mirrors `emitDupNameAdvisoryIfNeeded`'s
+ * `AbortController` + 5 s deadline), swallows every error, and must never
+ * block or fail the actual run trigger — a broken/slow `/me` degrades to
+ * "no advisory printed", not a failed `test run`.
+ */
+/**
+ * `X-CLI-Command` tag for this probe's `GET /me` — same advisory-header
+ * mechanism `runInit` uses (`toAuthDeps`'s `commandTag: 'init'` in
+ * `commands/init.ts`, sent via `AuthDeps.commandTag` in `auth.ts`), reused
+ * directly here rather than invented fresh. The backend's CLI-audit
+ * allowlist (`KNOWN_CLI_COMMANDS` + `resolveCliEvent`'s `/me` branch) maps this
+ * exact string to `null` — no PostHog event at all, not `cli.session_started`
+ * and not `cli.initialized` (init's tag would be a MORE specific, and equally
+ * wrong, misattribution of a probe that is neither a session start nor an
+ * onboarding run).
+ *
+ * Forward-compatible by construction: an unlisted `X-CLI-Command` value is
+ * dropped by the backend before event selection (see
+ * `capturePostHogEvent`/`KNOWN_CLI_COMMANDS` in the interceptor above), so
+ * against a backend that predates this allowlist entry the header is a no-op
+ * and behavior is exactly what it was before this fix — the CLI can ship
+ * this independently of backend deploy order in either direction.
+ */
+const TARGET_URL_ADVISORY_CLI_COMMAND = 'run-target-url-probe';
+
+async function emitTargetUrlV3AdvisoryIfNeeded(
+  client: HttpClient,
+  stderrFn: (line: string) => void,
+): Promise<void> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), TARGET_URL_ADVISORY_TIMEOUT_MS);
+  try {
+    const me = await client.get<{ v3Enabled?: boolean }>('/me', {
+      signal: ac.signal,
+      headers: { 'x-cli-command': TARGET_URL_ADVISORY_CLI_COMMAND },
+      // Finding 1 (dogfood 2026-08-09): `HttpClient.sleepBeforeRetry` (src/lib/http.ts)
+      // only observes the process-lifetime shutdown signal, never a per-request
+      // `options.signal` — the abort controller above bounds the FETCH itself but
+      // not a post-response retry sleep. A retryable 429 carrying a real
+      // `Retry-After` (e.g. 60s, a live `inflight_cap` response) would put this
+      // best-effort probe into a retry sleep this 5s deadline cannot interrupt,
+      // stalling the real run trigger behind it. `retryOnRateLimit: false` makes
+      // the HTTP layer throw on the first 429 instead of sleeping — the existing,
+      // already-used-elsewhere knob (see the batch-run trigger site above) rather
+      // than changing `sleepBeforeRetry` itself, which every other caller (e.g.
+      // the polling path) relies on to keep sleeping through a caller signal.
+      retryOnRateLimit: false,
+    });
+    if (me.v3Enabled === true) {
+      emitTargetUrlV3Advisory(stderrFn);
+    }
+  } catch {
+    // Swallow — this is best-effort; must not block or fail the run trigger.
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * `test run <test-id>` — M3.3 piece-3.
  *
  * Triggers a run via `POST /api/cli/v1/tests/{testId}/runs`. With
@@ -5374,6 +6311,16 @@ export async function runTestRun(
   assertIdempotencyKey(opts.idempotencyKey);
   if (opts.targetUrl !== undefined) {
     assertNotLocal(opts.targetUrl);
+  }
+
+  // DEV-749: only spend the extra `/me` round trip when --target-url was
+  // actually supplied — the common case (no override) pays nothing. Fires
+  // in both the dry-run and real paths below (the dry-run `/me` sample sets
+  // `v3Enabled: true`, so `--dry-run --target-url` demonstrates the same
+  // advisory a real V3-routed caller would see, at zero real-network cost).
+  if (opts.targetUrl !== undefined) {
+    const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    await emitTargetUrlV3AdvisoryIfNeeded(makeClient(opts, deps), stderrFn);
   }
 
   if (opts.dryRun) {
@@ -5467,7 +6414,7 @@ export async function runTestRun(
               code: 'CONFLICT',
               message:
                 `Conflict: another run for this test is in flight against a different ` +
-                `target URL (${inFlightRun.targetUrl}). Your --target-url ${opts.targetUrl} ` +
+                `target URL (${inFlightRun.targetUrl ?? 'not reported'}). Your --target-url ${opts.targetUrl} ` +
                 `cannot attach to that run. Wait for it to finish ` +
                 `(\`testsprite test wait ${currentRunId}\`) or retry your trigger when ` +
                 `the test is free.`,
@@ -5491,8 +6438,9 @@ export async function runTestRun(
             runId: currentRunId,
             status: 'queued',
             enqueuedAt: new Date().toISOString(),
-            codeVersion: inFlightRun.codeVersion,
-            targetUrl: inFlightRun.targetUrl,
+            codeVersion: inFlightRun.codeVersion ?? '',
+            // The check above proved the in-flight run targets exactly this URL.
+            targetUrl: opts.targetUrl,
           };
         } else {
           // D: No --target-url supplied — fetch the in-flight run so the
@@ -5664,6 +6612,37 @@ export async function runTestRun(
       );
       throw err;
     }
+    // RATE_LIMITED during polling — the backend's pre-auth rate limiter can
+    // trip on a shared egress IP (CI runner, NAT) and 429 an otherwise-valid
+    // key for its window; the HTTP layer already retried internally and gave
+    // up. The run was already triggered (and billed) and keeps executing
+    // server-side, so this must not be a silent, runId-less death: same
+    // partial-envelope contract as the RequestTimeoutError branch above, and
+    // the SAME thrown ApiError is rethrown unchanged so its native exit code
+    // (11) is preserved — never reclassified to 7.
+    if (err instanceof ApiError && err.code === 'RATE_LIMITED') {
+      ticker.finalize(`Run ${triggerResponse.runId} — rate limited by the server`);
+      const partial = {
+        runId: triggerResponse.runId,
+        status: 'running' as const,
+        enqueuedAt: triggerResponse.enqueuedAt,
+        codeVersion: triggerResponse.codeVersion,
+        targetUrl: triggerResponse.targetUrl || null,
+      };
+      printRunOrChain(out, partial, opts.createContext, data => {
+        const p = data as typeof partial;
+        const lines = [
+          `runId       ${p.runId}`,
+          `status      ${p.status} (rate limited by the server)`,
+        ];
+        if (p.targetUrl) lines.push(`targetUrl   ${p.targetUrl}`);
+        lines.push(`hint        Re-attach with: testsprite test wait ${p.runId}`);
+        lines.push(`hint        Cancel with:    testsprite test cancel ${p.runId}`);
+        return lines.join('\n');
+      });
+      stderrFn(rateLimitedDetachMessage(err, [triggerResponse.runId]));
+      throw err;
+    }
     // Graceful detach on SIGINT/SIGTERM (DEV-331 piece 1): same partial-
     // envelope shape as the timeout paths so stdout stays parseable, plus the
     // honest "keeps running and billing" stderr line. Rethrow → index.ts
@@ -5708,11 +6687,9 @@ export async function runTestRun(
     beFallbackUsed || opts.type === 'backend',
   );
 
-  printRunOrChain(
-    out,
-    withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)),
-    opts.createContext,
-    data => renderRunResponseText(data as RunResponse, { isBackend }),
+  const finalRunWithUrl = withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps));
+  printRunOrChain(out, finalRunWithUrl, opts.createContext, data =>
+    renderRunResponseText(data as RunResponse, { isBackend }),
   );
 
   // Surface the trigger requestId under --verbose/--debug or JSON mode so
@@ -5729,6 +6706,45 @@ export async function runTestRun(
         ? `Run finished with status: ${finalRun.status}. Backend failure artifacts are addressed by testId — use 'testsprite test failure get ${finalRun.testId}' to download the bundle.`
         : `Run finished with status: ${finalRun.status}. Use 'testsprite test artifact get ${finalRun.runId}' to download the failure bundle.`,
     );
+  }
+
+  // CI-native output layer (issue #99): single-test parity with the --all batch.
+  // Emitted before the exit-code gate throws below so the summary file and
+  // annotations land even when the run exits non-zero (mirrors the batch path).
+  // The summary file is a machine artifact written regardless of --output mode;
+  // under --output json the run envelope above owns stdout, so ::error::
+  // workflow commands are routed to stderr (the Actions runner parses both).
+  // Best-effort: a sink write throwing (e.g. EPIPE) must never skip the
+  // exit-code gate below or change the command's exit status.
+  try {
+    const env = deps.env ?? process.env;
+    const ghEnabled = opts.ghOutput === true || env.GITHUB_ACTIONS === 'true';
+    if (ghEnabled || opts.summaryFile !== undefined) {
+      const ciSummary = summarizeSingleRun(finalRunWithUrl);
+      if (opts.summaryFile !== undefined) {
+        try {
+          writeFileSync(opts.summaryFile, `${JSON.stringify(ciSummary, null, 2)}\n`, 'utf8');
+        } catch {
+          stderrFn(`[run] could not write --summary-file ${opts.summaryFile}; continuing`);
+        }
+      }
+      if (ghEnabled) {
+        const stdoutFn = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
+        emitGithubOutputs(
+          ciSummary,
+          env,
+          {
+            stdout: stdoutFn,
+            stderr: stderrFn,
+            appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf8'),
+            annotations: opts.output === 'json' ? stderrFn : stdoutFn,
+          },
+          { force: opts.ghOutput === true },
+        );
+      }
+    }
+  } catch (ciErr) {
+    stderrFn(`[run] CI output emission failed; continuing: ${(ciErr as Error).message}`);
   }
 
   const exitCode = exitCodeForRunStatus(finalRun.status);
@@ -5794,6 +6810,7 @@ export async function runTestWaitMany(
     deps,
   );
   const ticker = createTicker(stderrFn, opts.output === 'json' ? false : undefined);
+  const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
 
   // One shared deadline across every member (the whole point of the shared
   // pool: `--timeout 600` means the invocation ends within ~600s, not
@@ -5806,39 +6823,91 @@ export async function runTestWaitMany(
     | { kind: 'error'; code: string; exitCode: number };
 
   const pollOne = async (runId: string): Promise<WaitOutcome> => {
-    // A member dequeued AFTER the shared deadline has passed must not be
-    // granted a fresh minimum poll window (with --max-concurrency 1 that
-    // would extend the invocation by ~1s per queued run past --timeout).
-    const remainingSeconds = Math.ceil((deadlineMs - Date.now()) / 1000);
-    if (remainingSeconds <= 0) return { kind: 'timeout' };
     const resolveAlternate = makeBackendWaitFallback({
       client,
       resolveTestId: run => run.testId,
       resolveNotBefore: run => run.createdAt,
       onResolved: () => undefined,
     });
-    try {
-      const run = await pollRunUntilTerminal(client, runId, {
-        timeoutSeconds: remainingSeconds,
-        sleep: deps.sleep,
-        shutdown: shutdownOf(deps),
-        onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
-        onTick: (run, elapsedMs) => {
-          const elapsed = Math.round(elapsedMs / 1000);
-          ticker.update(`Run ${run.runId} — ${run.status} (elapsed=${elapsed}s)`);
-        },
-        resolveAlternate,
-      });
-      return { kind: 'result', run };
-    } catch (err) {
-      if (err instanceof TimeoutError) return { kind: 'timeout' };
-      if (err instanceof RequestTimeoutError) throw err;
-      // Interrupt must reject the fan-out (handled at the collect point), not
-      // be flattened into a per-member 'error' outcome that would swallow the
-      // 128+signum exit (DEV-331).
-      if (err instanceof InterruptError) throw err;
-      if (err instanceof ApiError) return { kind: 'error', code: err.code, exitCode: err.exitCode };
-      return { kind: 'error', code: 'TRANSPORT', exitCode: 10 };
+    // Outer RATE_LIMITED retry, per member. `http.ts` already retries a 429
+    // internally (`MAX_ATTEMPTS_RATE_LIMITED`), so reaching this catch means the
+    // transport gave up — but a shared-egress 429 (CI runner / NAT tripping the
+    // backend's ip-keyed pre-auth limiter) is a property of the *window*, not of
+    // this run, and the run is still executing. Without this loop a single 429
+    // ended the whole member's wait, which is what made a healthy run report as
+    // a poll error. Mirrors the `test run --all` trigger fan-out's outer loop
+    // (`BATCH_RUN_RATE_MAX_OUTER_RETRIES`), including its two invariants: the
+    // sleep is clamped to the SHARED deadline (so a retry can never stretch
+    // `--timeout`), and the retry is per member — one throttled run does not
+    // stall the pool, because each lane runs this loop inside its own task.
+    let rateLimitAttempt = 0;
+    for (;;) {
+      // A member dequeued AFTER the shared deadline has passed must not be
+      // granted a fresh minimum poll window (with --max-concurrency 1 that
+      // would extend the invocation by ~1s per queued run past --timeout).
+      // Re-evaluated on every iteration so a retry obeys the same rule.
+      const remainingSeconds = Math.ceil((deadlineMs - Date.now()) / 1000);
+      if (remainingSeconds <= 0) return { kind: 'timeout' };
+      try {
+        const run = await pollRunUntilTerminal(client, runId, {
+          timeoutSeconds: remainingSeconds,
+          sleep: deps.sleep,
+          shutdown: shutdownOf(deps),
+          onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
+          onTick: (run, elapsedMs) => {
+            const elapsed = Math.round(elapsedMs / 1000);
+            ticker.update(`Run ${run.runId} — ${run.status} (elapsed=${elapsed}s)`);
+          },
+          resolveAlternate,
+        });
+        return { kind: 'result', run };
+      } catch (err) {
+        if (err instanceof TimeoutError) return { kind: 'timeout' };
+        if (err instanceof RequestTimeoutError) throw err;
+        // Interrupt must reject the fan-out (handled at the collect point), not
+        // be flattened into a per-member 'error' outcome that would swallow the
+        // 128+signum exit (DEV-331).
+        if (err instanceof InterruptError) throw err;
+        if (err instanceof ApiError) {
+          // `isTransientRateLimit` is the second gate, for an "unknown" 429 that
+          // carries neither a Retry-After nor the per-minute wording: treat it as
+          // permanent rather than burn the budget on it. (The credit-depletion
+          // 429 never reaches here at all — `errors.ts` re-maps that envelope to
+          // INSUFFICIENT_CREDITS before this catch sees it.)
+          if (
+            err.code === 'RATE_LIMITED' &&
+            isTransientRateLimit(err) &&
+            rateLimitAttempt < WAIT_POLL_RATE_MAX_OUTER_RETRIES
+          ) {
+            rateLimitAttempt++;
+            const retryAfterMs = resolveRateLimitRetryMs(err);
+            const clampedRetryMs = Math.min(retryAfterMs, deadlineMs - Date.now());
+            // Deadline already reached: the wait budget genuinely ran out, so the
+            // honest outcome is `timeout` — the same call the trigger fan-out
+            // makes ("Timed out … during rate-limit backoff"). Reporting the 429
+            // instead would let the exit-11 escalation below claim "nothing else
+            // went wrong" for an invocation that in fact exhausted `--timeout`.
+            if (clampedRetryMs <= 0) return { kind: 'timeout' };
+            stderrFn(
+              `[wait] ${runId} — rate limited (attempt ${rateLimitAttempt}/${WAIT_POLL_RATE_MAX_OUTER_RETRIES}): retrying in ${Math.ceil(clampedRetryMs / 1000)}s`,
+            );
+            // Arm the graceful-detach scope across the backoff. `pollRunUntilTerminal`
+            // disarms in its own `finally`, so without this the sleep is a window
+            // where a first Ctrl-C hard-exits instead of taking the DEV-331 detach
+            // path (partial `{runId, status:'running'}` on stdout + honest hint).
+            const shutdown = shutdownOf(deps);
+            const disarm = shutdown.arm();
+            try {
+              await sleepUntilOrInterrupt(clampedRetryMs, shutdown.signal, sleepFn);
+            } finally {
+              disarm();
+            }
+            continue;
+          }
+          return { kind: 'error', code: err.code, exitCode: err.exitCode };
+        }
+        return { kind: 'error', code: 'TRANSPORT', exitCode: 10 };
+      }
     }
   };
 
@@ -5949,6 +7018,36 @@ export async function runTestWaitMany(
     throw new CLIError(
       `Multi-run wait: authentication failed (${authError.code})`,
       authError.exitCode,
+    );
+  }
+  // Rate limiting escalates the same way auth does, for the same reason: when it
+  // is the ONLY thing that went wrong, exit 7 ("timeout or per-member poll
+  // error") is actively misleading — nothing timed out and no run misbehaved, the
+  // client was throttled — and 7 tells an automated caller to re-attach
+  // immediately, which walks straight back into the limiter. Exit 11 says "back
+  // off, then re-attach", which is the correct action. Deliberately narrow: it
+  // requires that EVERY non-passed member is a rate-limited poll error, so a real
+  // timeout or a genuinely failed run is never masked (those keep 7 / 1). By this
+  // point each member has already spent its `WAIT_POLL_RATE_MAX_OUTER_RETRIES`
+  // Retry-After backoffs, so this is a persistently throttled window, not a blip.
+  // `outcomes` is keyed by runId, so a REPEATED id has one shared entry that the
+  // last lane to finish overwrites — a genuine `failed` can be replaced by a
+  // later RATE_LIMITED, which would make the counts below claim "nothing else
+  // went wrong" for an invocation that observed a failure. Rather than change the
+  // long-standing one-row-per-input-id output shape, the escalation simply
+  // declines to fire when the caller passed a duplicate; exit 7 is then the same
+  // answer as before this change.
+  const idsAreUnique = new Set(opts.runIds).size === opts.runIds.length;
+  const rateLimitedOnly =
+    idsAreUnique &&
+    errors > 0 &&
+    timedOut === 0 &&
+    failed === 0 &&
+    [...outcomes.values()].every(o => o.kind !== 'error' || o.code === 'RATE_LIMITED');
+  if (rateLimitedOnly) {
+    throw new CLIError(
+      `Multi-run wait: rate limited on ${errors} of ${results.length} runs — back off and re-attach with: testsprite test wait ${unfinishedIds.join(' ')}`,
+      11,
     );
   }
   if (timedOut > 0 || errors > 0) {
@@ -6265,6 +7364,26 @@ export async function runTestWait(
       );
       throw err;
     }
+    // RATE_LIMITED during polling — see the matching comment in runTestRun.
+    // The HTTP layer already retried internally and gave up; the run keeps
+    // executing (and billing) server-side, so this must emit the same
+    // partial-envelope + honest hint as the timeout/interrupt paths. The SAME
+    // ApiError is rethrown unchanged so its native exit code (11) is kept.
+    if (err instanceof ApiError && err.code === 'RATE_LIMITED') {
+      ticker.finalize(`Run ${opts.runId} — rate limited by the server`);
+      const partial = { runId: opts.runId, status: 'running' as const };
+      out.print(partial, data => {
+        const p = data as typeof partial;
+        return [
+          `runId       ${p.runId}`,
+          `status      ${p.status} (rate limited by the server)`,
+          `hint        Re-attach with: testsprite test wait ${p.runId}`,
+          `hint        Cancel with:    testsprite test cancel ${p.runId}`,
+        ].join('\n');
+      });
+      stderrFn(rateLimitedDetachMessage(err, [opts.runId]));
+      throw err;
+    }
     // Graceful detach on SIGINT/SIGTERM (DEV-331 piece 1) — see runTestRun.
     if (err instanceof InterruptError) {
       ticker.finalize(`Run ${opts.runId} — interrupted (${err.signal})`);
@@ -6327,8 +7446,8 @@ export async function runTestWait(
 // ---------------------------------------------------------------------------
 
 interface RunTestRunAllOptions extends CommonOptions {
-  /** projectId to run all tests in. */
-  projectId: string;
+  /** projectId to run all tests in; may be resolved from --project or TESTSPRITE_PROJECT_ID. */
+  projectId?: string;
   /** --filter <substr>: only run tests whose name contains this substring (case-insensitive). */
   nameFilter?: string;
   /** --wait: block until terminal or --timeout. */
@@ -6345,6 +7464,10 @@ interface RunTestRunAllOptions extends CommonOptions {
   reportFile?: string;
   /** --report-suite-name: optional override for the JUnit <testsuite name=...>. */
   reportSuiteName?: string;
+  /** --gh-output: force the GitHub-native output layer even off-Actions (issue #99). */
+  ghOutput?: boolean;
+  /** --summary-file: also write the reduced machine summary JSON to this path. */
+  summaryFile?: string;
 }
 
 async function writeBatchJUnitReportIfRequested(
@@ -6393,7 +7516,8 @@ export async function runTestRunAll(
   deps: TestDeps = {},
 ): Promise<BatchRunFreshResponse | undefined> {
   assertIdempotencyKey(opts.idempotencyKey);
-  requireProjectId(opts.projectId);
+  const projectId = resolveProjectId(opts.projectId, deps);
+  requireProjectId(projectId);
   if (
     !Number.isInteger(opts.maxConcurrency) ||
     opts.maxConcurrency < 1 ||
@@ -6424,7 +7548,7 @@ export async function runTestRunAll(
       method: 'POST',
       path: '/api/cli/v1/tests/batch/run',
       body: {
-        projectId: opts.projectId,
+        projectId,
         testIds: opts.nameFilter ? ['<filtered by --filter>'] : undefined,
         source: 'cli' as const,
       },
@@ -6453,9 +7577,9 @@ export async function runTestRunAll(
   const projectDashboardUrl =
     batchPortalBase === undefined
       ? undefined
-      : `${batchPortalBase}/dashboard/tests/${encodeURIComponent(opts.projectId)}`;
+      : `${batchPortalBase}/dashboard/tests/${encodeURIComponent(projectId)}`;
   const withBatchDashboardUrl = <T extends { testId: string }>(item: T): T => {
-    const dashboardUrl = resolvePortalUrl(batchApiUrl, opts.projectId, item.testId);
+    const dashboardUrl = resolvePortalUrl(batchApiUrl, projectId, item.testId);
     return dashboardUrl !== undefined ? { ...item, dashboardUrl } : item;
   };
 
@@ -6471,7 +7595,7 @@ export async function runTestRunAll(
     const allPage = await paginate<CliTest>(
       async ({ pageSize, cursor }) =>
         client.get<Page<CliTest>>('/tests', {
-          query: { projectId: opts.projectId, pageSize, cursor },
+          query: { projectId, pageSize, cursor },
         }),
       {},
     );
@@ -6487,7 +7611,7 @@ export async function runTestRunAll(
     testIds = filtered.map(t => t.id);
     if (testIds.length === 0) {
       stderrFn(
-        `No tests found in project ${opts.projectId} matching --filter "${opts.nameFilter}" — nothing to run.`,
+        `No tests found in project ${projectId} matching --filter "${opts.nameFilter}" — nothing to run.`,
       );
       out.print({
         accepted: [],
@@ -6499,7 +7623,7 @@ export async function runTestRunAll(
       return undefined;
     }
     stderrFn(
-      `Resolved ${testIds.length} test${testIds.length !== 1 ? 's' : ''} in project ${opts.projectId} for batch run.`,
+      `Resolved ${testIds.length} test${testIds.length !== 1 ? 's' : ''} in project ${projectId} for batch run.`,
     );
   }
   // When no --filter, omit testIds → server runs ALL tests in the project
@@ -6507,7 +7631,7 @@ export async function runTestRunAll(
 
   const batchResp = await client.triggerBatchRunFresh(
     {
-      projectId: opts.projectId,
+      projectId,
       ...(testIds !== undefined ? { testIds } : {}),
       source: 'cli',
     },
@@ -6651,7 +7775,7 @@ export async function runTestRunAll(
     try {
       retryResp = await client.triggerBatchRunFresh(
         {
-          projectId: opts.projectId,
+          projectId,
           testIds: retryIds,
           source: 'cli',
         },
@@ -6908,6 +8032,41 @@ export async function runTestRunAll(
   };
   await writeBatchJUnitReportIfRequested(opts, freshRunResults);
   out.print(jsonPayload);
+  // CI-native output layer (issue #99): emitted before the gate throws below so
+  // the artifacts land even when the batch exits non-zero. The summary file is a
+  // machine artifact written regardless of --output mode; stdout stays owned by
+  // the envelope above (plus Actions workflow commands, which Actions parses).
+  {
+    const env = deps.env ?? process.env;
+    const ghEnabled = opts.ghOutput === true || env.GITHUB_ACTIONS === 'true';
+    if (ghEnabled || opts.summaryFile !== undefined) {
+      const ciSummary = summarizeAcceptedPayload(JSON.stringify(jsonPayload));
+      if (opts.summaryFile !== undefined) {
+        try {
+          writeFileSync(opts.summaryFile, `${JSON.stringify(ciSummary, null, 2)}\n`, 'utf8');
+        } catch {
+          stderrFn(`[run] could not write --summary-file ${opts.summaryFile}; continuing`);
+        }
+      }
+      if (ghEnabled) {
+        const stdoutFn = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
+        emitGithubOutputs(
+          ciSummary,
+          env,
+          {
+            stdout: stdoutFn,
+            stderr: stderrFn,
+            appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf8'),
+            // Under --output json the envelope above owns stdout; workflow
+            // commands go to stderr instead (the Actions runner parses both
+            // streams), keeping the documented machine output parseable.
+            annotations: opts.output === 'json' ? stderrFn : stdoutFn,
+          },
+          { force: opts.ghOutput === true },
+        );
+      }
+    }
+  }
 
   // Rate-deferred tests were never dispatched → the batch is incomplete (exit 7),
   // mirroring `test rerun --all`. Checked before the failed-run throw so the
@@ -6989,8 +8148,9 @@ interface CliRerunResult {
 /**
  * `test rerun` — M3.4 piece-3.
  *
- * FE: `POST /tests/{id}/runs/rerun` → verbatim replay (no credit). With
- * `--wait`, polls `GET /runs/{runId}` until terminal.
+ * FE: `POST /tests/{id}/runs/rerun` → verbatim replay, billed at 0.5 credits
+ * (same as a fresh run; legacy V2 accounts: free). With `--wait`, polls
+ * `GET /runs/{runId}` until terminal.
  *
  * BE: same route → closure + per-member runIds. With `--wait`, polls every
  * closure-member runId; exits on the named test's verdict; failed closure
@@ -7176,7 +8336,10 @@ export async function runTestRerun(
         testId,
         {
           source: 'cli',
-          ...(effectiveAutoHeal ? { autoHeal: true } : {}),
+          // Always send the effective boolean, including an explicit `false`
+          // opt-out — the server defaults an ABSENT field to heal-on, so
+          // omitting the key on opt-out silently discarded --no-auto-heal.
+          autoHeal: effectiveAutoHeal,
           ...(opts.skipDependencies ? { skipDependencies: true } : {}),
         },
         { idempotencyKey },
@@ -7221,8 +8384,11 @@ export async function runTestRerun(
     // Print auto-heal advisory.
     // CLI path: auto-heal is default-on for FE reruns (--no-auto-heal to opt
     // out). Free and paid CLI callers both get auto-heal; backend no longer
-    // tier-gates for source='cli'. Cost: 0.2 credits per engage (charged only
-    // when Phase-2 heal actually runs; verbatim replay passes are free).
+    // tier-gates for source='cli'. The rerun itself is billed at 0.5 credits
+    // regardless of whether heal engages (same as a fresh run; legacy V2
+    // accounts: a verbatim replay pass is free). A heal engage costs an
+    // additional 0.2 credits on top of that, charged only when Phase-2 heal
+    // actually runs.
     //
     // Defensive branch: if the server still echoes autoHeal:false after we sent
     // autoHeal:true, the server did not apply it (unexpected; may happen on
@@ -7236,22 +8402,25 @@ export async function runTestRerun(
     // default-on `true`, so opts.autoHeal && !rerunResp.autoHeal would
     // fire spuriously for every BE rerun).
     if (effectiveAutoHeal && !rerunResp.autoHeal) {
-      // Env-correct billing link (dev/prod portals differ); route-only when
-      // the API host is unknown.
-      const advisoryPortalBase = resolvePortalBase(resolveApiUrl(opts, deps));
+      // Points at `testsprite usage`, not a hardcoded billing URL: this CLI
+      // path has no per-request org context (no backend nextAction feeds
+      // this advisory, and a personal-vs-org-bound key can't be told apart
+      // here), while `usage` already renders whichever wallet (personal or
+      // organization) actually governs this key's balance.
       stderrFn(
         `[advisory] auto-heal was not applied by the server (verbatim replay).` +
-          ` If this was unexpected, check your balance at ${
-            advisoryPortalBase !== undefined
-              ? `${advisoryPortalBase}/dashboard/settings/billing`
-              : 'the portal Billing page (/dashboard/settings/billing)'
-          }.`,
+          ` If this was unexpected, check your balance with \`testsprite usage\`.`,
       );
     } else if (rerunResp.autoHeal) {
       stderrFn(
         `[advisory] auto-heal on (FE rerun default). If a step has drifted, healing runs and costs 0.2 credit. Disable with --no-auto-heal.`,
       );
     }
+
+    // Server advisory: the autoHeal opt-out was forwarded to the execution
+    // engine but is not yet enforced there. Present only on a V3-routed
+    // rerun with an explicit autoHeal:false request; absent everywhere else.
+    emitRerunAdvisories(stderrFn, rerunResp.advisories);
 
     const isBERerun = !!rerunResp.closure;
 
@@ -7306,9 +8475,24 @@ export async function runTestRerun(
       // BE rerun: poll every closure-member runId, exit on named test's verdict.
       const namedRunId = rerunResp.runId;
       const closureMembers = rerunResp.closure.members;
-      const closureFailures: Array<{ testId: string; runId: string; status: string }> = [];
+      // `unobserved`: member never reached a terminal verdict (timed out or its
+      // poll errored). Distinct from an observed non-passed run (failed/blocked).
+      const closureFailures: Array<{
+        testId: string;
+        runId: string;
+        status: string;
+        unobserved?: boolean;
+      }> = [];
 
-      const pollMember = async (member: RerunClosureMember): Promise<RunResponse | null> => {
+      // A member poll settles as one of these. Making the poll "total" (never
+      // throwing for a per-member failure) is what stops one member's error
+      // from rejecting the whole fan-out and discarding every sibling result.
+      type MemberOutcome =
+        | { kind: 'terminal'; run: RunResponse }
+        | { kind: 'timeout' }
+        | { kind: 'error'; status: string; error: unknown };
+
+      const pollMember = async (member: RerunClosureMember): Promise<MemberOutcome> => {
         const resolveAlternate = makeBackendWaitFallback({
           client,
           resolveTestId: () => member.testId,
@@ -7316,7 +8500,7 @@ export async function runTestRerun(
           onResolved: () => undefined,
         });
         try {
-          return await pollRunUntilTerminal(client, member.runId, {
+          const finalRun = await pollRunUntilTerminal(client, member.runId, {
             timeoutSeconds: opts.timeoutSeconds,
             sleep: deps.sleep,
             shutdown: shutdownOf(deps),
@@ -7335,11 +8519,19 @@ export async function runTestRerun(
             },
             resolveAlternate,
           });
+          return { kind: 'terminal', run: finalRun };
         } catch (err) {
-          if (err instanceof TimeoutError) {
-            return null;
-          }
-          throw err;
+          if (err instanceof TimeoutError) return { kind: 'timeout' };
+          // Preserve the two intentional whole-fan-out aborts: each has a
+          // dedicated outer-catch branch (RequestTimeoutError → all-running
+          // partial + re-attach hints + exit 7; InterruptError → DEV-331
+          // graceful detach). Re-throw so the fan-out's `.catch(reject)` fires.
+          if (err instanceof RequestTimeoutError || err instanceof InterruptError) throw err;
+          // Any other member error (ApiError, transient 5xx, malformed
+          // response) is classified per-member instead of rejecting the whole
+          // fan-out and discarding every already-collected sibling result.
+          const status = err instanceof ApiError ? err.code : 'error';
+          return { kind: 'error', status, error: err };
         }
       };
 
@@ -7349,6 +8541,10 @@ export async function runTestRerun(
       const concurrencyLimit = opts.maxConcurrency;
       let inFlight = 0;
       let memberIdx = 0;
+      // Set when the NAMED test's own poll errors (not a timeout). Re-thrown
+      // after the payload is printed so its real error/exit code is preserved
+      // without discarding the sibling results collected alongside it.
+      let namedPollError: unknown;
 
       try {
         await new Promise<void>((resolve, reject) => {
@@ -7357,29 +8553,53 @@ export async function runTestRerun(
               const member = members[memberIdx++]!;
               inFlight++;
               pollMember(member)
-                .then(result => {
-                  memberResults.set(member.runId, result);
-                  if (member.runId !== namedRunId) {
-                    if (result === null) {
-                      // Timed-out closure member: treat as incomplete/failed so
-                      // the exit-code path fires exit 7 rather than silently
-                      // succeeding with an unobserved member.
+                .then(outcome => {
+                  if (outcome.kind === 'terminal') {
+                    memberResults.set(member.runId, outcome.run);
+                    if (member.runId !== namedRunId && outcome.run.status !== 'passed') {
+                      closureFailures.push({
+                        testId: member.testId,
+                        runId: member.runId,
+                        status: outcome.run.status,
+                      });
+                      stderrFn(
+                        `⚠ closure member ${member.testId} (runId: ${member.runId}) finished with status: ${outcome.run.status}`,
+                      );
+                    }
+                  } else if (outcome.kind === 'timeout') {
+                    // Timed-out closure member: treat as incomplete/failed so
+                    // the exit-code path fires exit 7 rather than silently
+                    // succeeding with an unobserved member.
+                    memberResults.set(member.runId, null);
+                    if (member.runId !== namedRunId) {
                       closureFailures.push({
                         testId: member.testId,
                         runId: member.runId,
                         status: 'timeout',
+                        unobserved: true,
                       });
                       stderrFn(
                         `⚠ closure member ${member.testId} (runId: ${member.runId}) timed out — rerun did not reach terminal within --timeout`,
                       );
-                    } else if (result.status !== 'passed') {
+                    }
+                  } else {
+                    // Classified per-member error — recorded, never aborts the
+                    // fan-out. The named test's error is stashed for re-throw;
+                    // sibling errors surface in closureFailures[].
+                    memberResults.set(member.runId, null);
+                    if (member.runId === namedRunId) {
+                      namedPollError = outcome.error;
+                    } else {
+                      // A poll error means we never saw a terminal verdict — the
+                      // run may still be in flight — so it's unobserved too.
                       closureFailures.push({
                         testId: member.testId,
                         runId: member.runId,
-                        status: result.status,
+                        status: outcome.status,
+                        unobserved: true,
                       });
                       stderrFn(
-                        `⚠ closure member ${member.testId} (runId: ${member.runId}) finished with status: ${result.status}`,
+                        `⚠ closure member ${member.testId} (runId: ${member.runId}) could not be confirmed terminal — poll error: ${outcome.status}`,
                       );
                     }
                   }
@@ -7421,6 +8641,34 @@ export async function runTestRerun(
           stderrFn(
             `Closure members are still in progress (request timed out). Re-attach with:\n${reattachHints}\n` +
               `Or cancel with:\n${cancelHints}`,
+          );
+          throw fanOutErr;
+        }
+        // RATE_LIMITED from any member's poll (pollMember only swallows
+        // TimeoutError into a null return — see above; every other error,
+        // including a RATE_LIMITED ApiError, propagates through .catch(reject)
+        // exactly like RequestTimeoutError). Same partial shape as the
+        // timeout path so the caller always has every closure-member runId on
+        // stdout; the SAME thrown ApiError is rethrown unchanged so its
+        // native exit code (11) is preserved.
+        if (fanOutErr instanceof ApiError && fanOutErr.code === 'RATE_LIMITED') {
+          ticker.finalize(`Closure fan-out — rate limited by the server`);
+          const dispatchedRunIds = closureMembers.map(m => ({
+            runId: m.runId,
+            testId: m.testId,
+            role: m.role,
+            status: 'running' as const,
+          }));
+          out.print({ runId: namedRunId, status: 'running', closure: dispatchedRunIds }, () =>
+            dispatchedRunIds
+              .map(m => `${m.role.padEnd(9)} ${m.testId} (runId: ${m.runId}) — running`)
+              .join('\n'),
+          );
+          stderrFn(
+            rateLimitedDetachMessage(
+              fanOutErr,
+              closureMembers.map(m => m.runId),
+            ),
           );
           throw fanOutErr;
         }
@@ -7480,6 +8728,24 @@ export async function runTestRerun(
       });
 
       if (!namedResult) {
+        // Named test's own poll errored (not a timeout): re-throw its real
+        // error now that the payload (incl. sibling closureFailures) is
+        // printed, preserving the true exit code instead of masking it as a
+        // timeout.
+        if (namedPollError !== undefined) {
+          // Every dispatched member is still executing (and billing), so a
+          // rate-limited named poll owes the same detach hints the fan-out's
+          // own branch emits — which this re-throw bypasses.
+          if (namedPollError instanceof ApiError && namedPollError.code === 'RATE_LIMITED') {
+            stderrFn(
+              rateLimitedDetachMessage(
+                namedPollError,
+                closureMembers.map(m => m.runId),
+              ),
+            );
+          }
+          throw namedPollError;
+        }
         // timeout
         throw ApiError.fromEnvelope({
           error: {
@@ -7499,24 +8765,24 @@ export async function runTestRerun(
         throw new CLIError(`Run ${namedRunId} finished with status: ${namedResult.status}`, 1);
       }
 
-      // Fix B: timed-out closure members (non-named) are recorded in
-      // closureFailures with status 'timeout'. Even when the named run passes,
-      // we must exit 7 so --wait does not silently succeed when the closure
-      // as a whole was never observed to reach terminal.
-      const timedOutMembers = closureFailures.filter(f => f.status === 'timeout');
-      if (timedOutMembers.length > 0) {
-        const timedOutIds = timedOutMembers.map(f => f.runId);
+      // Any unobserved member (timed out OR poll-errored) flips --wait to exit 7,
+      // even when the named run passes — otherwise a dependency whose status was
+      // never confirmed would let --wait exit 0. Observed-failed members are not
+      // included; that's the future --fail-on-closure decision.
+      const unobservedMembers = closureFailures.filter(f => f.unobserved);
+      if (unobservedMembers.length > 0) {
+        const unobservedIds = unobservedMembers.map(f => f.runId);
         const resumeHints =
-          timedOutIds.map(runId => `testsprite test wait ${runId}`).join('\n') +
-          `\nCancel instead: testsprite test cancel ${timedOutIds.join(' ')}`;
+          unobservedIds.map(runId => `testsprite test wait ${runId}`).join('\n') +
+          `\nCancel instead: testsprite test cancel ${unobservedIds.join(' ')}`;
         throw ApiError.fromEnvelope({
           error: {
             code: 'UNSUPPORTED',
-            message: `${timedOutMembers.length} closure member${timedOutMembers.length !== 1 ? 's' : ''} timed out before reaching terminal status.`,
+            message: `${unobservedMembers.length} closure member${unobservedMembers.length !== 1 ? 's' : ''} did not reach an observed terminal status (timed out or errored during polling).`,
             nextAction: resumeHints,
             requestId: 'local',
             details: {
-              timedOutRunIds: timedOutMembers.map(f => f.runId),
+              unobservedRunIds: unobservedIds,
               timeoutSeconds: opts.timeoutSeconds,
             },
           },
@@ -7600,6 +8866,24 @@ export async function runTestRerun(
           `Run ${rerunResp.runId} is still in progress (request timed out). ` +
             `Re-attach with: testsprite test wait ${rerunResp.runId}, or cancel with: testsprite test cancel ${rerunResp.runId}`,
         );
+        throw err;
+      }
+      // RATE_LIMITED during polling — see the matching comment in runTestRun.
+      // Same partial-envelope contract; the SAME thrown ApiError is rethrown
+      // unchanged so its native exit code (11) is preserved.
+      if (err instanceof ApiError && err.code === 'RATE_LIMITED') {
+        ticker.finalize(`Run ${rerunResp.runId} — rate limited by the server`);
+        const partial = { runId: rerunResp.runId, status: 'running' as const };
+        out.print(partial, data => {
+          const p = data as typeof partial;
+          return [
+            `runId       ${p.runId}`,
+            `status      ${p.status} (rate limited by the server)`,
+            `hint        Re-attach with: testsprite test wait ${p.runId}`,
+            `hint        Cancel with:    testsprite test cancel ${p.runId}`,
+          ].join('\n');
+        });
+        stderrFn(rateLimitedDetachMessage(err, [rerunResp.runId]));
         throw err;
       }
       // Graceful detach on SIGINT/SIGTERM (DEV-331 piece 1) — see runTestRun.
@@ -7774,7 +9058,9 @@ export async function runTestRerun(
         {
           source: 'cli',
           testIds: chunk,
-          ...(effectiveAutoHeal ? { autoHeal: true } : {}),
+          // Always send the effective boolean, including an explicit `false`
+          // opt-out — see the matching comment on the single-rerun call site.
+          autoHeal: effectiveAutoHeal,
           ...(opts.skipDependencies ? { skipDependencies: true } : {}),
         },
         { idempotencyKey: chunkKey },
@@ -7823,11 +9109,18 @@ export async function runTestRerun(
       byProject: mergeBatchRerunClosureByProject(chunkResponses.flatMap(r => r.closure.byProject)),
     },
     notFound: chunkResponses.flatMap(r => r.notFound ?? []),
+    // Absent on every response except a V3-routed batch containing
+    // at least one FE test with an explicit autoHeal:false opt-out. Dedupe
+    // across chunks — every chunk in the same invocation carries the same
+    // autoHeal request, so the same advisory would otherwise repeat per chunk.
+    advisories: dedupeRerunAdvisories(chunkResponses.flatMap(r => r.advisories ?? [])),
   };
 
   // Print dispatch summary
   // Mutable: D3 deferred-retry loop may append to `accepted`/`conflicts` and
-  // drain `deferred` under --wait.
+  // drain `deferred` under --wait. `advisories` may also grow if a D3 retry
+  // response carries an advisory the initial dispatch didn't (defensive —
+  // in practice the same request shape produces the same advisory set).
   let accepted = batchResp.accepted.slice();
   let deferred = batchResp.deferred.slice();
   let conflicts = batchResp.conflicts.slice();
@@ -7835,6 +9128,9 @@ export async function runTestRerun(
   // the retry window; the retry response's notFound[] is merged into this set so
   // the test is never reported as "resolved" when it actually vanished.
   let notFound = (batchResp.notFound ?? []).slice();
+  // Mutable so a D3 deferred-retry response can contribute an
+  // advisory the initial dispatch didn't carry (defensive; see comment above).
+  let advisories = (batchResp.advisories ?? []).slice();
   const closureByProject = batchResp.closure.byProject;
   const addedProducersTotal = closureByProject.reduce((n, p) => n + p.addedProducers.length, 0);
 
@@ -7939,7 +9235,10 @@ export async function runTestRerun(
             {
               source: 'cli',
               testIds: chunk,
-              ...(effectiveAutoHeal ? { autoHeal: true } : {}),
+              // Always send the effective boolean, including an explicit
+              // `false` opt-out — see the matching comment on the initial
+              // dispatch call site above.
+              autoHeal: effectiveAutoHeal,
               ...(opts.skipDependencies ? { skipDependencies: true } : {}),
             },
             { idempotencyKey: retryKey },
@@ -7962,6 +9261,12 @@ export async function runTestRerun(
       // into the running notFound set and remove from deferred so it isn't
       // reported as "resolved" in the final output.
       const newlyNotFound = retryChunkResponses.flatMap(r => r.notFound ?? []);
+      // Merge any advisories the retry response carries into the
+      // running set (deduped — see the initial-dispatch comment above).
+      const newlyAdvisories = retryChunkResponses.flatMap(r => r.advisories ?? []);
+      if (newlyAdvisories.length > 0) {
+        advisories = dedupeRerunAdvisories(advisories.concat(newlyAdvisories));
+      }
 
       if (newlyDuplicateCount > 0) {
         stderrFn(
@@ -8004,10 +9309,14 @@ export async function runTestRerun(
     }
   }
 
+  // Print the (deduped) advisory set once, after any D3 retries have
+  // had a chance to contribute one, not once per chunk/attempt.
+  emitRerunAdvisories(stderrFn, advisories);
+
   if (!opts.wait) {
     // [P2] Build output from post-retry mutable state so deferred/conflicts/notFound
     // reflect what the D3 loop discovered, not just the initial batchResp.
-    out.print({ ...batchResp, accepted, deferred, conflicts, notFound });
+    out.print({ ...batchResp, accepted, deferred, conflicts, notFound, advisories });
     if (deferred.length > 0) {
       throw new CLIError(
         `Batch rerun incomplete: ${deferred.length} test${deferred.length !== 1 ? 's' : ''} were rate-deferred. Retry with: testsprite test rerun ${deferred.map(d => d.testId).join(' ')}`,
@@ -8033,13 +9342,13 @@ export async function runTestRerun(
       });
     }
     // [P2] Return post-retry state including merged notFound.
-    return { ...batchResp, accepted, deferred, conflicts, notFound };
+    return { ...batchResp, accepted, deferred, conflicts, notFound, advisories };
   }
 
   // --wait: fan-out poll each accepted run by its runId
   if (accepted.length === 0) {
     // [P2] Build output from post-retry mutable state including merged notFound.
-    out.print({ ...batchResp, accepted, deferred, conflicts, notFound });
+    out.print({ ...batchResp, accepted, deferred, conflicts, notFound, advisories });
     if (deferred.length > 0) {
       throw new CLIError(
         `Batch rerun: no tests were accepted (${deferred.length} deferred). ` +
@@ -8065,7 +9374,7 @@ export async function runTestRerun(
       });
     }
     // [P2] Return post-retry state including merged notFound.
-    return { ...batchResp, accepted, deferred, conflicts, notFound };
+    return { ...batchResp, accepted, deferred, conflicts, notFound, advisories };
   }
 
   const ticker = createTicker(stderrFn, opts.output === 'json' ? false : undefined);
@@ -8222,6 +9531,9 @@ export async function runTestRerun(
     // report the partial run as fully successful. Mirrors the non-wait
     // `out.print(batchResp)` path.
     notFound,
+    // Mirrors the non-wait `out.print(batchResp)` path — carry the
+    // (deduped, post-retry) advisory set into the --wait JSON payload too.
+    advisories,
     closure: batchResp.closure,
     summary: {
       passed,
@@ -8239,6 +9551,39 @@ export async function runTestRerun(
   };
   await writeBatchJUnitReportIfRequested(opts, rerunResults);
   out.print(jsonPayload);
+  // CI-native output layer (issue #99): batch-rerun parity with `run --all`.
+  // Emitted before the exit-code gates below so the summary file / annotations
+  // land even when the batch exits non-zero. Summary-file is a machine artifact
+  // written regardless of --output mode; under --output json the envelope above
+  // owns stdout, so ::error:: workflow commands go to stderr instead.
+  {
+    const env = deps.env ?? process.env;
+    const ghEnabled = opts.ghOutput === true || env.GITHUB_ACTIONS === 'true';
+    if (ghEnabled || opts.summaryFile !== undefined) {
+      const ciSummary = summarizeAcceptedPayload(JSON.stringify(jsonPayload));
+      if (opts.summaryFile !== undefined) {
+        try {
+          writeFileSync(opts.summaryFile, `${JSON.stringify(ciSummary, null, 2)}\n`, 'utf8');
+        } catch {
+          stderrFn(`[rerun] could not write --summary-file ${opts.summaryFile}; continuing`);
+        }
+      }
+      if (ghEnabled) {
+        const stdoutFn = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
+        emitGithubOutputs(
+          ciSummary,
+          env,
+          {
+            stdout: stdoutFn,
+            stderr: stderrFn,
+            appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf8'),
+            annotations: opts.output === 'json' ? stderrFn : stdoutFn,
+          },
+          { force: opts.ghOutput === true },
+        );
+      }
+    }
+  }
 
   // Determine exit code: timeout (deferred or any timeout) → 7; any fail → 1; all pass → 0
   if (deferred.length > 0 || timedOut > 0) {
@@ -8289,7 +9634,7 @@ export async function runTestRerun(
   // final accounting (accepted = original BatchRerunAccepted[] dispatch list
   // as required by the BatchRerunResponse type; rerunResults is the polled
   // outcome printed to stdout and is not part of the returned shape).
-  return { ...batchResp, accepted, deferred, conflicts, notFound };
+  return { ...batchResp, accepted, deferred, conflicts, notFound, advisories };
 }
 
 // ---------------------------------------------------------------------------
@@ -8614,6 +9959,12 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '(≤ 256 KB; mutually exclusive with --code-file). In this mode --project/--type/--name/--description/--priority are ignored.',
     )
     .option(
+      '--plan-template',
+      'print a minimal valid plan-file skeleton to stdout and exit (pure-local: no network, no credentials, ' +
+        'ignores every other flag). Pipe to a file and edit: `--plan-template > plan.json`.',
+      false,
+    )
+    .option(
       '--run',
       'after create, trigger the test. Combine with --wait to block until terminal.',
       false,
@@ -8641,6 +9992,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       '--category <str>',
       "BE only: test category. Use 'teardown' or 'cleanup' to mark a final-wave cleanup test.",
     )
+    .addHelpText('after', PLAN_TEMPLATE_HELP_TEXT)
     .addHelpText(
       'after',
       '\nBE dependency authoring (M4):\n' +
@@ -8650,6 +10002,13 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts: CreateFlagOpts, command: Command) => {
+      // Pure-local, no network/credentials, no other flag is
+      // consulted. Checked first so `--plan-template` never trips the
+      // --plan-from/--code-file mutual-exclusivity guard below.
+      if (cmdOpts.planTemplate === true) {
+        runPlanTemplate(resolveCommonOptions(command), deps);
+        return;
+      }
       // --plan-from and --code-file are mutually exclusive. Dispatch
       // here so each `run*` function stays single-purpose. If neither
       // is set, the existing runCreate path enforces --code-file.
@@ -8715,8 +10074,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           name: cmdOpts.name,
           description: cmdOpts.description,
           priority: parseEnumFlag(cmdOpts.priority, 'priority', CLI_CREATE_PRIORITIES) as
-            | CliCreatePriority
-            | undefined,
+            CliCreatePriority | undefined,
           codeFile: cmdOpts.codeFile,
           idempotencyKey: cmdOpts.idempotencyKey,
           // M3.3 chain flags:
@@ -8912,6 +10270,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option('--page-size <n>', 'with --history: number of runs per page (1–100, default 20)')
     .option('--cursor <token>', 'with --history: opaque cursor from a prior page')
+    .option('--rerun', 'with --history: show only reruns')
+    .option('--no-rerun', 'with --history: show only fresh (non-rerun) runs')
     .option('--columns <list>', 'with --history: select/reorder text table columns')
     .option('--no-header', 'with --history: suppress the text table header row')
     .addHelpText('after', GLOBAL_OPTS_HINT)
@@ -8929,6 +10289,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
                 ? parseNumericFlag(cmdOpts.pageSize, 'page-size')
                 : undefined,
             cursor: cmdOpts.cursor,
+            rerun: cmdOpts.rerun,
             columns: cmdOpts.columns,
             noHeader: cmdOpts.header === false,
           },
@@ -8982,8 +10343,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           name: cmdOpts.name,
           description: cmdOpts.description,
           priority: parseEnumFlag(cmdOpts.priority, 'priority', CLI_CREATE_PRIORITIES) as
-            | CliCreatePriority
-            | undefined,
+            CliCreatePriority | undefined,
           produces: cmdOpts.produces,
           needs: cmdOpts.needs,
           category: cmdOpts.category,
@@ -9094,12 +10454,12 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--all',
-      'run all tests in the project (wave-ordered fresh run; requires --project). Mutually exclusive with <test-id>.',
+      'run all tests in the project (wave-ordered fresh run; uses --project or TESTSPRITE_PROJECT_ID). Mutually exclusive with <test-id>.',
       false,
     )
     .option(
       '--project <id>',
-      'project id (required with --all; returned by `testsprite project list`)',
+      'project id (with --all, overrides TESTSPRITE_PROJECT_ID; returned by `testsprite project list`)',
     )
     .option(
       '--filter <substr>',
@@ -9118,12 +10478,22 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       '--report-suite-name <name>',
       'optional JUnit <testsuite name=...> override (default: testsprite:<projectId>)',
     )
+    .option(
+      '--gh-output',
+      'with --wait (single test or --all): emit GitHub-native output (::error:: annotations per non-passed run; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
+    )
+    .option(
+      '--summary-file <path>',
+      'with --wait (single test or --all): also write the reduced machine summary JSON {total, passed, failed, timedOut, runs[]} to this file',
+    )
     .addHelpText(
       'after',
       '\nDependency-aware fresh run (M4):\n' +
-        '  testsprite test run --all --project <id>           run all project tests in wave order\n' +
-        '  testsprite test run --all --project <id> --filter <substr>  name-glob subset\n' +
-        '  testsprite test run --all --project <id> --wait --report junit --report-file ./results.xml\n' +
+        '  testsprite test run --all --project <id>                run all project tests in wave order\n' +
+        '  TESTSPRITE_PROJECT_ID=<id> testsprite test run --all    use env default project\n' +
+        '  testsprite test run --all --filter <substr>             name-glob subset (uses --project/env)\n' +
+        '  testsprite test run --all --wait --report junit --report-file ./results.xml\n' +
+        '  project id precedence: --project wins over TESTSPRITE_PROJECT_ID\n' +
         '\nBE tests can declare --produces/--needs at create time to drive wave ordering\n' +
         '(see `testsprite test create --help` for details).\n' +
         '\nFrontend tests: the current unified engine runs FE tests too (they are billed\n' +
@@ -9144,7 +10514,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       if (testIdArg === undefined && !isAll) {
         throw localValidationError(
           'test-id',
-          'provide a <test-id>, or use --all --project <id> to run all tests in a project',
+          'provide a <test-id>, or use --all with --project <id> or TESTSPRITE_PROJECT_ID',
         );
       }
       // --filter is an --all-only narrowing flag (mirrors `test rerun --filter`).
@@ -9153,7 +10523,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       if (cmdOpts.filter !== undefined && cmdOpts.filter !== '' && !isAll) {
         throw localValidationError(
           'filter',
-          '--filter only applies with --all (it narrows which project tests run). Remove --filter, or add --all --project <id>.',
+          '--filter only applies with --all (it narrows which project tests run). Remove --filter, or add --all with --project <id> or TESTSPRITE_PROJECT_ID.',
         );
       }
       const report = parseJUnitReportFormat(cmdOpts.report);
@@ -9164,21 +10534,37 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         wait: cmdOpts.wait === true,
         batchPath: isAll,
       });
+      // --gh-output / --summary-file reduce a --wait run's terminal result into
+      // the CI summary. They require --wait (without it the command returns after
+      // enqueueing, before any terminal result exists) but apply to BOTH a single
+      // <test-id> run and the --all batch. Without --wait they would silently
+      // no-op — reject loudly (same rule as --filter and the JUnit report flags).
+      if (cmdOpts.ghOutput === true && cmdOpts.wait !== true) {
+        throw localValidationError(
+          'gh-output',
+          '--gh-output requires --wait (it reduces the terminal run result). Add --wait.',
+        );
+      }
+      if (cmdOpts.summaryFile !== undefined && cmdOpts.wait !== true) {
+        throw localValidationError(
+          'summary-file',
+          '--summary-file requires --wait (it reduces the terminal run result). Add --wait.',
+        );
+      }
 
       if (isAll) {
         // --all path: wave-ordered fresh batch run.
-        if (!cmdOpts.project) {
-          throw localValidationError(
-            'project',
-            '--all requires a project id — pass --project <id>',
-          );
-        }
+        const projectId = resolveProjectId(cmdOpts.project, deps);
+        requireProjectId(
+          projectId,
+          '--all requires a project id - pass --project <id> or set TESTSPRITE_PROJECT_ID',
+        );
         // --target-url has no effect on the --all batch path: a BE test's base
         // URL is baked into its code, and the unified engine resolves each
         // project's configured environment server-side (per-run URL overrides
         // are not applied to batch FE runs either). Silently dropping it could
-        // run the suite against an unintended environment in the caller's mind
-        // — reject loudly instead.
+        // run the suite against an unintended environment in the caller's mind,
+        // so reject loudly.
         if (cmdOpts.targetUrl !== undefined && cmdOpts.targetUrl !== '') {
           throw localValidationError(
             'target-url',
@@ -9188,7 +10574,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         await runTestRunAll(
           {
             ...resolveCommonOptions(command),
-            projectId: cmdOpts.project,
+            projectId,
             nameFilter: cmdOpts.filter,
             wait: cmdOpts.wait === true,
             timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
@@ -9199,6 +10585,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             report,
             reportFile: cmdOpts.reportFile,
             reportSuiteName: cmdOpts.reportSuiteName,
+            ghOutput: cmdOpts.ghOutput === true,
+            summaryFile: cmdOpts.summaryFile,
           },
           deps,
         );
@@ -9216,6 +10604,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           // B2(c): tell runTestRun whether --timeout was explicitly provided.
           timeoutIsDefault: cmdOpts.timeout === undefined,
           idempotencyKey: cmdOpts.idempotencyKey,
+          ghOutput: cmdOpts.ghOutput === true,
+          summaryFile: cmdOpts.summaryFile,
         },
         deps,
       );
@@ -9237,6 +10627,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '     is recorded as error:<CODE> in its row and folded into exit 7)\n' +
         '  7  timeout or per-member poll error — resume with: testsprite test wait <run-id...>\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
+        ' 11  rate limited, and nothing else went wrong — polls are retried\n' +
+        '     automatically honoring Retry-After first, so this means the throttle\n' +
+        '     outlasted that budget while the runs were still fine. Back off, then\n' +
+        '     re-attach with test wait. (A throttle that instead consumes the whole\n' +
+        '     --timeout reports 7, and any real timeout or failure keeps 7 / 1.)\n' +
         '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>\n' +
         '\nCtrl-C detaches only (the run keeps executing and billing); stop it for\n' +
         'real with: testsprite test cancel <run-id...>',
@@ -9283,7 +10678,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
   test
     .command('rerun [test-ids...]')
     .description(
-      'Re-execute a test (or multiple) as a cheap replay — FE replays the saved script (no credit), BE re-runs the dependency closure.\n' +
+      'Re-execute a test (or multiple) as a replay — FE replays the saved script, BE re-runs the dependency closure. ' +
+        'Billed the same as a fresh run: 0.5 credits per FE rerun / 0.2 credits per BE rerun (legacy V2 accounts: FE rerun remains free).\n' +
         '\nExit codes:\n' +
         '  0  passed (or queued without --wait)\n' +
         '  1  failed / blocked / cancelled\n' +
@@ -9347,6 +10743,14 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       '--report-suite-name <name>',
       'optional JUnit <testsuite name=...> override (default: testsprite:<projectId>)',
     )
+    .option(
+      '--gh-output',
+      'with batch --wait: emit GitHub-native output (::error:: annotations per non-passed run; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
+    )
+    .option(
+      '--summary-file <path>',
+      'with batch --wait: also write the reduced machine summary JSON {total, passed, failed, timedOut, runs[]} to this file',
+    )
     .addHelpText(
       'after',
       '\nNotes:\n' +
@@ -9356,7 +10760,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '  • Under --wait the per-request HTTP timeout is auto-raised to cover --timeout so a\n' +
         '    slow trigger/poll under load is not cut at the 120s default (see --request-timeout).\n' +
         '  • Batch --wait: rate-deferred tests appear in `deferred[]` and `summary.deferred`,\n' +
-        '    and force a non-zero exit — they are NOT counted in `summary.total` (dispatched only).',
+        '    and force a non-zero exit — they are NOT counted in `summary.total` (dispatched only).\n' +
+        '  • On V3-routed accounts, --no-auto-heal is still rolling out and may not yet be\n' +
+        '    honored server-side — check `auth status` for your routing.',
     )
     .addHelpText(
       'after',
@@ -9382,6 +10788,21 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         wait: cmdOpts.wait === true,
         batchPath: isBatch,
       });
+      // --gh-output / --summary-file reduce the batch-rerun --wait envelope, which
+      // only exists on the batch (--all or 2+ ids) --wait path. Anywhere else they
+      // would silently no-op — reject loudly (same rule as the JUnit report flags).
+      if (cmdOpts.ghOutput === true && (!isBatch || cmdOpts.wait !== true)) {
+        throw localValidationError(
+          'gh-output',
+          '--gh-output requires a batch rerun with --wait (--all or 2+ test ids). Remove --gh-output, or add --all --wait.',
+        );
+      }
+      if (cmdOpts.summaryFile !== undefined && (!isBatch || cmdOpts.wait !== true)) {
+        throw localValidationError(
+          'summary-file',
+          '--summary-file requires a batch rerun with --wait (--all or 2+ test ids). Remove --summary-file, or add --all --wait.',
+        );
+      }
       await runTestRerun(
         {
           ...resolveCommonOptions(command),
@@ -9403,6 +10824,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           report,
           reportFile: cmdOpts.reportFile,
           reportSuiteName: cmdOpts.reportSuiteName,
+          ghOutput: cmdOpts.ghOutput === true,
+          summaryFile: cmdOpts.summaryFile,
         },
         deps,
       );
@@ -9440,8 +10863,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .addHelpText(
       'after',
       '\nNotes:\n' +
-        '  • Frontend replays are free verbatim script replays (no credit); backend replays\n' +
-        '    re-run the dependency closure and may cost credits — a one-line advisory is printed.\n' +
+        '  • Each replay is billed as a rerun — 0.5 credits for a frontend replay (verbatim\n' +
+        '    script), 0.2 credits for a backend replay (re-runs the dependency closure) —\n' +
+        '    same price as a fresh run, so `--runs N` costs roughly N×0.5 credits for a\n' +
+        '    frontend test (legacy V2 accounts: FE rerun remains free). A one-line advisory\n' +
+        '    is printed before a backend replay.\n' +
         '  • Replays use auto-heal OFF so a flaky test is not silently "healed" into a pass;\n' +
         '    this measures replay stability of the saved script against the configured URL.\n' +
         '  • `--output json` emits a machine-readable stability report for CI gating.',
@@ -9479,7 +10905,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 // `test flaky` — repeat-run flaky-test detector
 // ---------------------------------------------------------------------------
 
-/** Upper bound on `--runs` so a repeat-runner can't amplify free FE replays. */
+/** Upper bound on `--runs` so a repeat-runner can't rack up unbounded rerun charges. */
 const MAX_FLAKY_RUNS = 10;
 /** Default replay count when `--runs` is omitted. */
 const DEFAULT_FLAKY_RUNS = 5;
@@ -9510,9 +10936,10 @@ interface RunTestFlakyOptions extends CommonOptions {
  * `test flaky <test-id>` — replay a test N times and report a stability score.
  *
  * Each attempt is a `POST /tests/{id}/runs/rerun` with auto-heal OFF (a strict
- * verbatim replay) followed by `pollRunUntilTerminal`. Frontend replays are
- * free verbatim script replays; backend replays re-run the dependency closure
- * (a one-line credit advisory is printed). The pure scoring lives in
+ * verbatim replay) followed by `pollRunUntilTerminal`. Each replay is billed
+ * as a rerun (0.5 credits FE / 0.2 credits BE, same as a fresh run; legacy V2
+ * accounts: FE rerun remains free) — a one-line credit advisory is printed
+ * for backend tests. The pure scoring lives in
  * `lib/flaky.ts`; this function is the I/O orchestrator.
  *
  * Exit code: 0 when every observed attempt passed (stable), else 1 — so CI can
@@ -9565,12 +10992,16 @@ export async function runFlaky(
   if (isBackend) {
     stderrFn(
       `[advisory] ${opts.testId} is a backend test — each replay re-runs its dependency closure ` +
-        `and may cost credits. Frontend replays are free verbatim script replays; backend replays are not.`,
+        `and is billed at 0.2 credits per rerun, same as a fresh run (frontend reruns are 0.5 credits).`,
     );
   }
 
   const ticker = createTicker(stderrFn, opts.output === 'json' ? false : undefined);
   const attempts: FlakyAttempt[] = [];
+  // Collected across attempts and deduped — same request shape every
+  // attempt, so the server would otherwise repeat the identical advisory once
+  // per replay. Surfaced ONCE in the final report/summary, not N times.
+  let advisories: RerunAdvisory[] = [];
 
   for (let i = 1; i <= opts.runs; i++) {
     const idempotencyKey = `cli-flaky-${randomUUID()}`;
@@ -9578,8 +11009,16 @@ export async function runFlaky(
     let rerunResp: RerunResponse;
     try {
       // auto-heal is intentionally OFF: flaky detection needs a strict verbatim
-      // replay so healed drift cannot mask a nondeterministic pass/fail.
-      rerunResp = await client.triggerRerun(opts.testId, { source: 'cli' }, { idempotencyKey });
+      // replay so healed drift cannot mask a nondeterministic pass/fail. Sent
+      // explicitly (not omitted) — an absent field defaults to heal-on server-side.
+      rerunResp = await client.triggerRerun(
+        opts.testId,
+        { source: 'cli', autoHeal: false },
+        { idempotencyKey },
+      );
+      if (rerunResp.advisories && rerunResp.advisories.length > 0) {
+        advisories = dedupeRerunAdvisories(advisories.concat(rerunResp.advisories));
+      }
     } catch (err) {
       // A missing replayable run is fatal for the whole command (mirror rerun):
       // there is nothing to repeat, so point the user at a fresh `test run`.
@@ -9635,6 +11074,16 @@ export async function runFlaky(
         stderrFn(interruptDetachMessage(err, [runId]));
         throw err;
       }
+      // RATE_LIMITED during polling (same defect class as the InterruptError
+      // branch above): the HTTP layer already retried and gave up, but this
+      // attempt's run keeps executing (and billing) server-side. Name it on
+      // stderr before rethrowing so the runId is never silently dropped;
+      // rethrow the SAME ApiError unchanged so its exit code (11) is kept.
+      if (err instanceof ApiError && err.code === 'RATE_LIMITED') {
+        ticker.finalize(`Attempt ${i}/${opts.runs} — rate limited by the server`);
+        stderrFn(rateLimitedDetachMessage(err, [runId]));
+        throw err;
+      }
       // A per-attempt deadline (poll TimeoutError) or a client-side request
       // timeout both count as a non-passing "timeout" outcome for this attempt.
       if (err instanceof TimeoutError || err instanceof RequestTimeoutError) {
@@ -9653,7 +11102,11 @@ export async function runFlaky(
 
   ticker.finalize();
 
-  const report = summarizeFlaky(opts.testId, attempts);
+  // Print the deduped advisory set once for the whole probe, not
+  // once per replay attempt (mirrors the `test rerun` advisory rendering).
+  emitRerunAdvisories(stderrFn, advisories);
+
+  const report = summarizeFlaky(opts.testId, attempts, advisories);
   out.print(report, data => renderFlakyText(data as FlakyReport));
 
   const exitCode = flakyExitCode(report);
@@ -9679,6 +11132,8 @@ interface RunFlagOpts {
   report?: string;
   reportFile?: string;
   reportSuiteName?: string;
+  ghOutput?: boolean;
+  summaryFile?: string;
 }
 
 interface WaitFlagOpts {
@@ -9701,6 +11156,8 @@ interface RerunFlagOpts {
   report?: string;
   reportFile?: string;
   reportSuiteName?: string;
+  ghOutput?: boolean;
+  summaryFile?: string;
 }
 
 interface UpdateFlagOpts {
@@ -9737,6 +11194,8 @@ interface ResultFlagOpts {
   pageSize?: string;
   /** Opaque pagination cursor from a prior page's nextCursor. */
   cursor?: string;
+  /** Filter history by rerun-ness: --rerun (only reruns) / --no-rerun (only fresh). */
+  rerun?: boolean;
   columns?: string;
   header?: boolean;
 }
@@ -9747,6 +11206,8 @@ interface CreateFlagOpts {
   name: string;
   description?: string;
   planFrom?: string;
+  /** Print the canonical plan-file skeleton and exit. */
+  planTemplate?: boolean;
   run?: boolean;
   wait?: boolean;
   timeout?: string;
@@ -9797,9 +11258,19 @@ interface StepsFlagOpts {
   runId?: string;
 }
 
-function requireProjectId(projectId: string): void {
+function resolveProjectId(projectId: string | undefined, deps: TestDeps): string | undefined {
+  const explicit = projectId?.trim();
+  if (explicit && explicit.length > 0) return explicit;
+  const envValue = (deps.env ?? process.env).TESTSPRITE_PROJECT_ID;
+  const trimmed = envValue?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+function requireProjectId(
+  projectId: string | undefined,
+  message = 'is required; pass --project <id> or set TESTSPRITE_PROJECT_ID',
+): asserts projectId is string {
   if (typeof projectId !== 'string' || projectId.length === 0) {
-    throw localValidationError('project', 'is required');
+    throw localValidationError('project', message);
   }
 }
 
@@ -10373,7 +11844,7 @@ function plannedBundleFiles(ctx: CliFailureContext, failedOnly: boolean): string
   files.push('result.json');
   files.push('failure.json');
   files.push(`code.${pickCodeExtension(ctx.code.language, ctx.code.framework)}`);
-  if (ctx.result.videoUrl) files.push('video.mp4');
+  if (ctx.result.videoUrl) files.push(`video.${pickVideoExtension(ctx.result.videoUrl)}`);
 
   const stepsToInclude = failedOnly
     ? ctx.steps.filter(s => {
@@ -10649,8 +12120,7 @@ function createTestCodeCommand(deps: TestDeps): Command {
           expectedVersion: cmdOpts.expectedVersion,
           force: cmdOpts.force === true,
           language: parseEnumFlag(cmdOpts.language, 'language', CODE_PUT_LANGUAGES) as
-            | CodePutLanguage
-            | undefined,
+            CodePutLanguage | undefined,
           idempotencyKey: cmdOpts.idempotencyKey,
           dryRunSimulateError:
             simulateError === 'PRECONDITION_FAILED' ? 'PRECONDITION_FAILED' : undefined,

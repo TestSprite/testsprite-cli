@@ -1,7 +1,16 @@
 import { randomUUID } from 'node:crypto';
+import * as v from 'valibot';
 import type { ErrorCode } from './errors.js';
 import { ApiError, InterruptError, RequestTimeoutError, TransportError } from './errors.js';
 import { VERSION } from '../version.js';
+import {
+  BATCH_RERUN_RESPONSE_SCHEMA,
+  BATCH_RUN_FRESH_RESPONSE_SCHEMA,
+  LIST_RUNS_RESPONSE_SCHEMA,
+  RERUN_RESPONSE_SCHEMA,
+  RUN_RESPONSE_SCHEMA,
+  TRIGGER_RUN_RESPONSE_SCHEMA,
+} from './response-schemas.js';
 import type {
   TriggerRunBody,
   TriggerRunResponse,
@@ -106,12 +115,36 @@ export interface HttpClientOptions {
    * `globalShutdown.signal` via the client factory.
    */
   shutdownSignal?: AbortSignal;
+  /**
+   * Upper bound (bytes) on a successful JSON response body the client will
+   * buffer before parsing. A response whose declared `Content-Length` — or
+   * actual streamed size — exceeds this fails fast with a typed
+   * `PAYLOAD_TOO_LARGE` error instead of growing the heap without limit.
+   * Defaults to {@link MAX_RESPONSE_BYTES_DEFAULT} (64 MiB).
+   */
+  maxResponseBytes?: number;
 }
 
-export interface RequestOptions {
+export interface RequestOptions<T = unknown> {
   query?: Record<string, string | number | boolean | undefined>;
   signal?: AbortSignal;
   requestId?: string;
+  /**
+   * Optional valibot schema for the parsed 2xx response body (issue #102).
+   *
+   * When present, `requestWithMeta` runs `v.safeParse` on the OK-path JSON:
+   * success returns the parsed output (unknown extra keys preserved via
+   * `looseObject`); failure throws an INTERNAL `ApiError` envelope naming the
+   * request path and the first {@link MAX_SCHEMA_ISSUES_IN_DETAILS} mismatched
+   * field paths (never the body itself). When absent, behavior is unchanged:
+   * the body is returned via the historical blind `as T` cast.
+   *
+   * Wired by the typed run helpers only (`triggerRun`, `triggerRunWithMeta`,
+   * `triggerRerun`, `triggerBatchRerun`, `triggerBatchRunFresh`, `getRun`,
+   * `listTestRuns`); generic `get`/`post`/... callers stay opt-in.
+   * sourceRef: response-schemas.ts.
+   */
+  schema?: v.GenericSchema<unknown, T>;
   /**
    * Optional JSON body for non-GET requests. Serialized with
    * `JSON.stringify`; `Content-Type: application/json` is auto-attached
@@ -168,6 +201,20 @@ const MAX_RATE_LIMITED_DELAY_MS = 60_000;
 const CONFLICT_DELAY_MS = 1000;
 const INTERNAL_DELAY_MS = 500;
 
+// Upper bound on the size of a successful JSON response body the client will
+// buffer into memory. `response.json()` reads the ENTIRE body before parsing,
+// with no limit, so a large `test result --history` page or a run with a long
+// `steps[]` array (getRun `includeSteps`) would grow the heap in proportion to
+// the payload. 64 MiB sits far above any legitimate metadata/history/steps
+// response yet still bounds a pathological — or hostile — one. Override per
+// client via `HttpClientOptions.maxResponseBytes`.
+const MAX_RESPONSE_BYTES_DEFAULT = 64 * 1024 * 1024;
+
+// Cap on how many valibot issues a shape-mismatch INTERNAL envelope carries in
+// `details.issues` (path + message each). Keeps the envelope readable and
+// guarantees the response body itself is never echoed back to the operator.
+const MAX_SCHEMA_ISSUES_IN_DETAILS = 3;
+
 /**
  * Result of a successful HTTP request, including the parsed body and the
  * `x-request-id` that was sent (useful for surfacing in happy-path output).
@@ -189,6 +236,7 @@ export class HttpClient {
   private readonly onServerVersion?: (info: { minVersion?: string }) => void;
   private readonly requestTimeoutMs: number;
   private readonly shutdownSignal?: AbortSignal;
+  private readonly maxResponseBytes: number;
 
   constructor(options: HttpClientOptions) {
     this.baseUrl = trimTrailingSlash(options.baseUrl);
@@ -201,6 +249,7 @@ export class HttpClient {
     this.onTransition = options.onTransition;
     this.onServerVersion = options.onServerVersion;
     this.requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_DEFAULT_MS;
+    this.maxResponseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES_DEFAULT;
   }
 
   /**
@@ -222,23 +271,23 @@ export class HttpClient {
     }
   }
 
-  async get<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  async get<T>(path: string, options: RequestOptions<T> = {}): Promise<T> {
     return this.requestWithMeta<T>('GET', path, options).then(r => r.body);
   }
 
-  async post<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  async post<T>(path: string, options: RequestOptions<T> = {}): Promise<T> {
     return this.requestWithMeta<T>('POST', path, options).then(r => r.body);
   }
 
-  async put<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  async put<T>(path: string, options: RequestOptions<T> = {}): Promise<T> {
     return this.requestWithMeta<T>('PUT', path, options).then(r => r.body);
   }
 
-  async patch<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  async patch<T>(path: string, options: RequestOptions<T> = {}): Promise<T> {
     return this.requestWithMeta<T>('PATCH', path, options).then(r => r.body);
   }
 
-  async delete<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  async delete<T>(path: string, options: RequestOptions<T> = {}): Promise<T> {
     return this.requestWithMeta<T>('DELETE', path, options).then(r => r.body);
   }
 
@@ -247,23 +296,26 @@ export class HttpClient {
    * `requestId` and `status`, so callers can surface the requestId in
    * happy-path output (dogfood item 1).
    */
-  async getWithMeta<T>(path: string, options: RequestOptions = {}): Promise<RequestResult<T>> {
+  async getWithMeta<T>(path: string, options: RequestOptions<T> = {}): Promise<RequestResult<T>> {
     return this.requestWithMeta<T>('GET', path, options);
   }
 
-  async postWithMeta<T>(path: string, options: RequestOptions = {}): Promise<RequestResult<T>> {
+  async postWithMeta<T>(path: string, options: RequestOptions<T> = {}): Promise<RequestResult<T>> {
     return this.requestWithMeta<T>('POST', path, options);
   }
 
-  async putWithMeta<T>(path: string, options: RequestOptions = {}): Promise<RequestResult<T>> {
+  async putWithMeta<T>(path: string, options: RequestOptions<T> = {}): Promise<RequestResult<T>> {
     return this.requestWithMeta<T>('PUT', path, options);
   }
 
-  async patchWithMeta<T>(path: string, options: RequestOptions = {}): Promise<RequestResult<T>> {
+  async patchWithMeta<T>(path: string, options: RequestOptions<T> = {}): Promise<RequestResult<T>> {
     return this.requestWithMeta<T>('PATCH', path, options);
   }
 
-  async deleteWithMeta<T>(path: string, options: RequestOptions = {}): Promise<RequestResult<T>> {
+  async deleteWithMeta<T>(
+    path: string,
+    options: RequestOptions<T> = {},
+  ): Promise<RequestResult<T>> {
     return this.requestWithMeta<T>('DELETE', path, options);
   }
 
@@ -282,6 +334,7 @@ export class HttpClient {
       body,
       headers: { 'idempotency-key': options.idempotencyKey },
       signal: options.signal,
+      schema: TRIGGER_RUN_RESPONSE_SCHEMA,
       // 409 on POST /runs means "another run is already in flight" — a
       // persistent condition, not a transient snapshot conflict. Retrying
       // would enqueue a second run once the first finishes.
@@ -310,6 +363,7 @@ export class HttpClient {
       body,
       headers: { 'idempotency-key': options.idempotencyKey },
       signal: options.signal,
+      schema: TRIGGER_RUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
       // Default true: single `test run` / `test create --run` retain 429 retry.
       // Batch call site passes false to keep outer-loop as sole rate-limit owner.
@@ -319,8 +373,9 @@ export class HttpClient {
 
   /**
    * POST /api/cli/v1/tests/{testId}/runs/rerun
-   * Trigger a rerun (replay) for a single test. FE: verbatim script replay (no credits).
-   * BE: dependency-closure re-run. Returns `runId` + optional `closure` (BE).
+   * Trigger a rerun (replay) for a single test. FE: verbatim script replay, billed at
+   * 0.5 credits (same as a fresh run; legacy V2 accounts: free). BE: dependency-closure
+   * re-run, billed at 0.2 credits. Returns `runId` + optional `closure` (BE).
    *
    * `retryOnConflict: false` — 409 on rerun means the test is already in-flight,
    * a persistent condition. Retrying would race against the running test.
@@ -334,6 +389,7 @@ export class HttpClient {
       body,
       headers: { 'idempotency-key': options.idempotencyKey },
       signal: options.signal,
+      schema: RERUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
     }).then(r => r.body);
   }
@@ -353,6 +409,7 @@ export class HttpClient {
       body,
       headers: { 'idempotency-key': options.idempotencyKey },
       signal: options.signal,
+      schema: BATCH_RERUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
     }).then(r => r.body);
   }
@@ -373,6 +430,7 @@ export class HttpClient {
       body,
       headers: { 'idempotency-key': options.idempotencyKey },
       signal: options.signal,
+      schema: BATCH_RUN_FRESH_RESPONSE_SCHEMA,
       retryOnConflict: false,
     }).then(r => r.body);
   }
@@ -391,7 +449,10 @@ export class HttpClient {
     if (query.pageSize !== undefined) q.pageSize = query.pageSize;
     if (query.source !== undefined) q.source = query.source;
     if (query.since !== undefined) q.since = query.since;
-    return this.get<ListRunsResponse>(`/tests/${encodeURIComponent(testId)}/runs`, { query: q });
+    return this.get<ListRunsResponse>(`/tests/${encodeURIComponent(testId)}/runs`, {
+      query: q,
+      schema: LIST_RUNS_RESPONSE_SCHEMA,
+    });
   }
 
   /**
@@ -421,6 +482,7 @@ export class HttpClient {
     return this.get<RunResponse>(`/runs/${encodeURIComponent(runId)}`, {
       query: Object.keys(query).length > 0 ? query : undefined,
       signal: options?.signal,
+      schema: RUN_RESPONSE_SCHEMA,
     });
   }
 
@@ -481,7 +543,7 @@ export class HttpClient {
   async requestWithMeta<T>(
     method: string,
     path: string,
-    options: RequestOptions = {},
+    options: RequestOptions<T> = {},
   ): Promise<RequestResult<T>> {
     if (!this.apiKey) throw ApiError.authRequired();
 
@@ -515,8 +577,18 @@ export class HttpClient {
       // in-flight fetch immediately (reason: InterruptError) instead of
       // letting a long-poll drain its window before the interrupt surfaces.
       if (this.shutdownSignal != null) composedSignals.push(this.shutdownSignal);
-      const effectiveSignal =
-        composedSignals.length > 1 ? AbortSignal.any(composedSignals) : timeoutSignal;
+      // Composed via `composeAbortSignals` (manual listeners), NOT the native
+      // `AbortSignal.any` — see that function's doc comment. `this.shutdownSignal`
+      // is process-lifetime (`globalShutdown.signal`, `client-factory.ts`) and is
+      // pushed into `composedSignals` on essentially every request, so
+      // `AbortSignal.any` here was measured to register ~330K dependent-signal
+      // trackings against that one long-lived signal over a single request-heavy
+      // test file — the same `FinalizationRegistry` backlog mechanism already
+      // fixed once in `poll.ts`, just recreated per-request instead of
+      // per-poll-iteration. `cleanupAbortComposition` MUST be called once the
+      // request settles (below, alongside `requestTimeout.clear()`).
+      const { signal: effectiveSignal, cleanup: cleanupAbortComposition } =
+        composeAbortSignals(composedSignals);
 
       try {
         try {
@@ -594,11 +666,19 @@ export class HttpClient {
             requestId,
             durationMs,
           });
+          let raw: unknown;
           try {
-            return { body: (await response.json()) as T, requestId, status: response.status };
+            // Bounded read, then parse — assigning to `raw` rather than returning
+            // here keeps the schema validation below on the success path.
+            const text = await readBoundedText(response, this.maxResponseBytes, requestId);
+            raw = JSON.parse(text);
           } catch (err) {
             // Interrupt passthrough (see the fetch catch above).
             if (err instanceof InterruptError) throw err;
+            // A bounded-read rejection (PAYLOAD_TOO_LARGE) — or any typed ApiError —
+            // is a real, actionable outcome; surface it unchanged rather than
+            // masking it as a malformed-body error below.
+            if (err instanceof ApiError) throw err;
             // A timeout/abort can fire mid-body-read (headers received, stream stalls).
             this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
             // Otherwise the successful response body was not valid JSON — a
@@ -609,6 +689,34 @@ export class HttpClient {
             // and break the --output json envelope contract.
             throw malformedResponseError(response, requestId, err);
           }
+          if (options.schema !== undefined) {
+            const parsed = v.safeParse(options.schema, raw);
+            if (!parsed.success) {
+              const issues = parsed.issues.slice(0, MAX_SCHEMA_ISSUES_IN_DETAILS).map(issue => ({
+                path: v.getDotPath(issue) ?? '(root)',
+                message: issue.message,
+              }));
+              // Shape drift is a server-side contract break: surface a typed
+              // INTERNAL envelope (requestId + the first mismatched paths,
+              // never the body) instead of letting a blind cast poison
+              // downstream output with undefined fields or a raw TypeError.
+              throw ApiError.fromEnvelope(
+                {
+                  error: {
+                    code: 'INTERNAL',
+                    message: `Response shape mismatch from ${shortPath(path)}.`,
+                    nextAction:
+                      'Retry; if it persists, report this requestId (the server returned an unexpected shape).',
+                    requestId,
+                    details: { issues },
+                  },
+                },
+                response.status,
+              );
+            }
+            return { body: parsed.output as T, requestId, status: response.status };
+          }
+          return { body: raw as T, requestId, status: response.status };
         }
 
         let rawBody: unknown;
@@ -725,6 +833,11 @@ export class HttpClient {
         await this.sleepBeforeRetry(decision.delayMs);
       } finally {
         requestTimeout.clear();
+        // Remove the manually-added abort listeners now, synchronously —
+        // see `composeAbortSignals`. Runs on every path out of the try
+        // (return, throw, or `continue` into the next attempt), so nothing
+        // outlives the request it was created for.
+        cleanupAbortComposition();
       }
     }
   }
@@ -790,7 +903,7 @@ export class HttpClient {
    * `client.request(...)` directly. New callers should use
    * `requestWithMeta` or the typed helpers (`get`, `post`, etc.).
    */
-  async request<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
+  async request<T>(method: string, path: string, options: RequestOptions<T> = {}): Promise<T> {
     return this.requestWithMeta<T>(method, path, options).then(r => r.body);
   }
 }
@@ -831,6 +944,68 @@ function newRequestId(): string {
 interface RequestTimeoutHandle {
   signal: AbortSignal;
   clear: () => void;
+}
+
+interface AbortComposition {
+  signal: AbortSignal;
+  cleanup: () => void;
+}
+
+/**
+ * Compose multiple `AbortSignal`s into one — abort on whichever fires first —
+ * WITHOUT using the native `AbortSignal.any`.
+ *
+ * `AbortSignal.any` builds a persistent "dependent signal" relationship: the
+ * signal it returns is tracked (via a `WeakRef` + `FinalizationRegistry`)
+ * against EVERY source signal passed in, including any long-lived one. Every
+ * outgoing request here composes `this.shutdownSignal` — process-lifetime
+ * (`globalShutdown.signal`, wired by `client-factory.ts` on essentially every
+ * command invocation) — into `composedSignals`, so each request added one
+ * more tracked dependent against that single long-lived signal, reclaimed
+ * only whenever V8 next got around to running ITS `FinalizationRegistry`
+ * cleanup pass. Under a request-heavy path (retries, a wide closure/batch
+ * fan-out, RATE_LIMITED backoff) this reproduces — per HTTP request instead
+ * of per poll-iteration — the exact backlog mechanism already fixed once in
+ * `poll.ts` (`JSFinalizationRegistry::Cleanup` → `KeepDuringJob` →
+ * `OrderedHashSet::Add` pegging the CPU once the deferred backlog is finally
+ * walked). Measured directly: the RATE_LIMITED closure-fanout scenario in
+ * `test.rerun.spec.ts` alone drives ~330K `AbortSignal.any` calls against the
+ * one process-lifetime `globalShutdown.signal` over the life of that single
+ * test file.
+ *
+ * This performs the identical "first one wins, propagate its `.reason`"
+ * composition with a plain `AbortController` and ordinary
+ * `addEventListener`/`removeEventListener` — no dependent-signal tracking, no
+ * `WeakRef`, no GC-deferred cleanup. The caller MUST invoke the returned
+ * `cleanup()` once the request settles (success, error, or retry) so the
+ * listeners are removed immediately rather than left for a cleanup pass that,
+ * for this composition, no longer exists.
+ */
+function composeAbortSignals(signals: readonly AbortSignal[]): AbortComposition {
+  if (signals.length <= 1) {
+    return { signal: signals[0]!, cleanup: () => {} };
+  }
+  // Mirror AbortSignal.any's already-aborted short-circuit: if a source is
+  // already aborted at composition time, propagate its reason immediately —
+  // no listeners are ever added, so cleanup is a no-op.
+  const alreadyAborted = signals.find(s => s.aborted);
+  const controller = new AbortController();
+  if (alreadyAborted) {
+    controller.abort(alreadyAborted.reason);
+    return { signal: controller.signal, cleanup: () => {} };
+  }
+  const removers: Array<() => void> = [];
+  for (const source of signals) {
+    const onAbort = (): void => controller.abort(source.reason);
+    source.addEventListener('abort', onAbort, { once: true });
+    removers.push(() => source.removeEventListener('abort', onAbort));
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      for (const remove of removers) remove();
+    },
+  };
 }
 
 function createRequestTimeout(timeoutMs: number): RequestTimeoutHandle {
@@ -919,6 +1094,105 @@ export function malformedResponseError(
   );
 }
 
+/**
+ * Read a successful response body as text, bounded to `maxBytes`.
+ *
+ * `response.json()` buffers the ENTIRE body into memory before parsing, with no
+ * upper limit — a large `test result --history` page, or a run with a long
+ * `steps[]` array (getRun `includeSteps`), grows the heap in proportion to the
+ * payload. This reads the body incrementally and stops once the accumulated
+ * size crosses `maxBytes`, so a pathological (or hostile) response fails fast
+ * with a typed PAYLOAD_TOO_LARGE error instead of exhausting memory.
+ *
+ * A declared `Content-Length` over the cap is rejected before any body is read.
+ * Chunked bodies (no `Content-Length`) are bounded by counting bytes as they
+ * stream. Decoding happens once, at the end, so multi-byte UTF-8 sequences that
+ * straddle a chunk boundary still decode correctly.
+ */
+async function readBoundedText(
+  response: Response,
+  maxBytes: number,
+  requestId: string,
+): Promise<string> {
+  const declared = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw responseTooLargeError(requestId, maxBytes, declared);
+  }
+  const stream = response.body;
+  if (stream === null) {
+    // No readable stream exposed (some runtimes / test doubles): fall back to a
+    // buffered read, then enforce the cap on the materialized text.
+    const text = await response.text();
+    if (new TextEncoder().encode(text).length > maxBytes) {
+      throw responseTooLargeError(requestId, maxBytes);
+    }
+    return text;
+  }
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw responseTooLargeError(requestId, maxBytes, total);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // The reader may already be released after cancel(); releasing twice is a
+      // no-op we don't want surfacing over the original error.
+    }
+  }
+  return new TextDecoder('utf-8').decode(concatChunks(chunks, total));
+}
+
+/** Concatenate byte chunks into a single `Uint8Array` of known total length. */
+function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Typed error for a response body that exceeds the client-side buffering cap.
+ * Reuses PAYLOAD_TOO_LARGE (exit 5, validation family) — the same code the
+ * backend returns for oversized request bodies — so machine consumers route on
+ * it uniformly. `nextAction` names the knobs that shrink the result set.
+ */
+function responseTooLargeError(
+  requestId: string,
+  maxBytes: number,
+  observedBytes?: number,
+): ApiError {
+  const limitMiB = Math.round(maxBytes / (1024 * 1024));
+  return new ApiError({
+    code: 'PAYLOAD_TOO_LARGE',
+    message:
+      `The server response exceeded the client-side ${limitMiB} MiB limit and was not ` +
+      `buffered, to avoid unbounded memory use.`,
+    nextAction:
+      'Narrow the result set and retry — e.g. a smaller --page-size, a tighter --since ' +
+      'window, or scope --history to a single run.',
+    requestId,
+    details: {
+      maxBytes,
+      ...(observedBytes !== undefined ? { observedBytes } : {}),
+    },
+  });
+}
+
 export function parseRetryAfter(headerValue: string | null): number | undefined {
   if (!headerValue) return undefined;
   const numeric = Number(headerValue);
@@ -984,6 +1258,9 @@ function apiRetryDecision(
     // case below and retries normally.
     // FEATURE_GATED is non-retriable: a paid-feature gate can't self-heal with
     // retries — the caller must upgrade their plan first.
+    // AMBIGUOUS_ORG is non-retriable: unlike a generic CONFLICT (mid-mutation
+    // snapshot race), this is a permanent id collision across the caller's
+    // organizations — retrying resolves the exact same ambiguity again.
     case 'AUTH_REQUIRED':
     case 'AUTH_INVALID':
     case 'AUTH_FORBIDDEN':
@@ -996,6 +1273,7 @@ function apiRetryDecision(
     case 'INSUFFICIENT_CREDITS':
     case 'FEATURE_GATED':
     case 'CLIENT_TOO_OLD':
+    case 'AMBIGUOUS_ORG':
       // CLIENT_TOO_OLD: retrying re-sends the same too-old client — it can only
       // self-heal by upgrading, so fail fast with the upgrade guidance.
       return { retry: false, delayMs: 0 };

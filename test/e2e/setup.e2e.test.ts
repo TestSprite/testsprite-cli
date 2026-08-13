@@ -95,7 +95,7 @@ describe('setup --dry-run --no-agent', () => {
     const credsTmpDir = freshTmpDir();
 
     const result = runCli(
-      ['--dry-run', 'setup', '--api-key', 'sk-dry-no-agent', '--no-agent', '--dir', tmpDir],
+      ['--dry-run', 'setup', '--api-key', 'sk-user-dry-no-agent', '--no-agent', '--dir', tmpDir],
       { HOME: credsTmpDir },
     );
 
@@ -124,7 +124,7 @@ describe('setup --dry-run (with agent)', () => {
         '--dry-run',
         'setup',
         '--api-key',
-        'sk-dry-with-agent',
+        'sk-user-dry-with-agent',
         '--agent',
         'claude',
         '--dir',
@@ -198,7 +198,7 @@ describe('deprecated `init` alias', () => {
     const credsTmpDir = freshTmpDir();
 
     const result = runCli(
-      ['--dry-run', 'init', '--api-key', 'sk-dep-init', '--no-agent', '--dir', tmpDir],
+      ['--dry-run', 'init', '--api-key', 'sk-user-dep-init', '--no-agent', '--dir', tmpDir],
       { HOME: credsTmpDir },
     );
 
@@ -249,7 +249,7 @@ describe('setup --agent <t> --no-agent conflict warn fires through real binary',
         '--dry-run',
         'setup',
         '--api-key',
-        'sk-conflict-e2e',
+        'sk-user-conflict-e2e',
         '--agent',
         'cursor',
         '--no-agent',

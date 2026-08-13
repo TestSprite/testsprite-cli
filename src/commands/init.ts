@@ -489,8 +489,8 @@ function resolveCommonOptions(command: Command): CommonOptions {
 const SETUP_DESCRIPTION =
   'Set up TestSprite: configure your API key and install the TestSprite agent skills for your coding agent';
 
-/** Raw Commander options shared by `setup` and the deprecated `init` alias. */
-interface SetupCmdOpts {
+/** Raw Commander options shared by `setup` and the deprecated `init`/`auth configure` aliases. */
+export interface SetupCmdOpts {
   apiKey?: string;
   fromEnv?: boolean;
   /**
@@ -506,8 +506,8 @@ interface SetupCmdOpts {
   skipIfConfigured?: boolean;
 }
 
-/** Attach the onboarding flags shared by `setup` and the `init` alias. */
-function addSetupOptions(
+/** Attach the onboarding flags shared by `setup` and the `init`/`auth configure` aliases. */
+export function addSetupOptions(
   cmd: Command,
   validTargets: AgentTarget[],
   defaultAgent: AgentTarget,
@@ -632,11 +632,17 @@ export function createDeprecatedInitCommand(deps: InitDeps = {}): Command {
  * consolidation, `auth configure` now runs FULL setup (configure + install)
  * so an agent that reaches for the old command still ends up with the skill.
  * `setup` is the ONLY path that writes credentials.
+ *
+ * Accepts the SAME `SetupCmdOpts` shape `setup` does — the alias previously
+ * only wired up `--from-env`, so README's "runs the full setup" claim didn't
+ * hold: `--yes`/`--agent`/`--api-key`/`--force`/`--dir`/`--no-agent` were all
+ * rejected as unknown options. `index.ts` attaches the full flag set via
+ * `addSetupOptions` before wiring this action.
  */
 export async function runConfigureViaSetup(
   command: Command,
   deps: InitDeps,
-  fromEnv: boolean,
+  cmdOpts: SetupCmdOpts,
 ): Promise<void> {
-  await runSetupAction({ agent: 'claude', fromEnv }, command, deps, 'claude');
+  await runSetupAction(cmdOpts, command, deps, 'claude');
 }

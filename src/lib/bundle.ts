@@ -364,6 +364,28 @@ export function pickCodeExtension(language: string, framework: string): string {
   return 'py';
 }
 
+/** Recording container extensions the bundle writer will trust from `videoUrl`. */
+const KNOWN_VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'mov', 'mkv', 'avi']);
+
+/**
+ * Pick the on-disk extension for `<dir>/video.<ext>` from the actual
+ * `result.videoUrl`, instead of hardcoding `mp4` (the
+ * recording is sometimes a `.webm` container; saving it under a `video.mp4`
+ * name misleads strict-extension consumers). Falls back to `mp4` when the
+ * URL is malformed or its extension isn't a recognized container, so a
+ * response-controlled field can never smuggle an arbitrary suffix onto disk.
+ */
+export function pickVideoExtension(url: string): string {
+  try {
+    const match = /\.([A-Za-z0-9]+)$/.exec(new URL(url).pathname);
+    const ext = match?.[1]?.toLowerCase();
+    if (ext !== undefined && KNOWN_VIDEO_EXTENSIONS.has(ext)) return ext;
+  } catch {
+    // Malformed URL — fall through to the default below.
+  }
+  return 'mp4';
+}
+
 /**
  * Step filename per §7.2 — 1-based index, zero-padded to two digits
  * for indices ≤ 99, three digits for ≥ 100. `${stepIndex}-snapshot.html`
@@ -421,8 +443,9 @@ export function buildMeta(ctx: CliFailureContext, fetchedAt: Date = new Date()):
  *   2. `applyFailedOnly` — narrow before download (saves bytes).
  *   3. `mkdir <dir>/.tmp/` — fresh; clean any stale temp.
  *   4. `writeFile result.json / failure.json / code.<ext>` — local data.
- *   5. `fetch + stream` for `video.mp4` (when set) and per-step
- *      snapshot/screenshot/evidence-json files.
+ *   5. `fetch + stream` for `video.<ext>` (when set; extension matches the
+ *      actual recording container) and per-step snapshot/screenshot/
+ *      evidence-json files.
  *   6. `writeFile meta.json` LAST — its presence means "bundle complete".
  *   7. `rename .tmp/<file> -> <file>` for every file. Last rename
  *      makes meta.json visible.
@@ -489,10 +512,12 @@ export async function writeBundle(
     // Optional video. Wire field is `result.videoUrl` (not in `failure`),
     // and the CLI surfaces it as a top-level on-disk artifact for agent
     // ergonomics — the agent doesn't have to know which sub-object held
-    // it on the wire.
+    // it on the wire. Extension matches the actual recording container
+    // (some runs ship `.webm`, not `.mp4`).
     if (filtered.result.videoUrl) {
-      await streamUrlToFile(filtered.result.videoUrl, join(tmpDir, 'video.mp4'), fetchImpl);
-      filesWritten.push('video.mp4');
+      const videoFile = `video.${pickVideoExtension(filtered.result.videoUrl)}`;
+      await streamUrlToFile(filtered.result.videoUrl, join(tmpDir, videoFile), fetchImpl);
+      filesWritten.push(videoFile);
     }
 
     for (const step of filtered.steps) {
@@ -540,17 +565,17 @@ async function freshTmpDir(dir: string): Promise<string> {
 /**
  * Whether a top-level directory entry belongs to the bundle format —
  * i.e. something a prior `writeBundle` could have produced and this
- * commit is therefore allowed to clean up. `code.<ext>` is matched by
- * pattern (not the current run's extension) so a stale `code.py` is
- * still swept when the new bundle writes `code.ts`. Everything else in
- * the directory is the user's and must never be deleted (`--out` can
- * point at a pre-existing, populated directory).
+ * commit is therefore allowed to clean up. `code.<ext>` and `video.<ext>`
+ * are matched by pattern (not the current run's extension) so a stale
+ * `code.py` or `video.webm` is still swept when the new bundle writes
+ * `code.ts` / `video.mp4` (or no video at all). Everything else in the
+ * directory is the user's and must never be deleted (`--out` can point at
+ * a pre-existing, populated directory).
  */
 export function isBundleOwnedEntry(entry: string): boolean {
   if (
     entry === 'result.json' ||
     entry === 'failure.json' ||
-    entry === 'video.mp4' ||
     entry === 'meta.json' ||
     entry === 'steps' ||
     entry === '.tmp' ||
@@ -558,7 +583,14 @@ export function isBundleOwnedEntry(entry: string): boolean {
   ) {
     return true;
   }
-  return /^code\.[A-Za-z0-9]+$/.test(entry);
+  // Videos: only the extensions the bundle itself can write (see
+  // KNOWN_VIDEO_EXTENSIONS / pickVideoExtension). A broader `video.*`
+  // pattern would claim user files like `video.txt` sitting in a
+  // pre-existing `--out` directory and delete them in the sweep.
+  return (
+    /^code\.[A-Za-z0-9]+$/.test(entry) ||
+    (entry.startsWith('video.') && KNOWN_VIDEO_EXTENSIONS.has(entry.slice('video.'.length)))
+  );
 }
 
 /**

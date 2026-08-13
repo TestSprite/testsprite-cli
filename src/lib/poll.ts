@@ -136,7 +136,7 @@ async function pollLoop(
   runId: string,
   options: PollOptions,
 ): Promise<RunResponse> {
-  const { timeoutSeconds, onTick, onTransition, resolveAlternate } = options;
+  const { timeoutSeconds, resolveAlternate } = options;
   const shutdownSignal = options.shutdown?.signal;
   const rawSleep = options.sleep ?? defaultSleep;
   // Every sleep site (retryAfterSeconds, backoff schedule, not_yet_visible,
@@ -146,6 +146,89 @@ async function pollLoop(
 
   const startMs = Date.now();
   const deadlineMs = startMs + timeoutSeconds * 1000;
+
+  // Hoisted ONCE per poll *session* rather than re-minted every iteration.
+  // The abort target here — deadlineMs + a transport cushion — is a fixed
+  // absolute instant that does not change from one iteration to the next
+  // (remainingMs shrinks, but remainingMs + TRANSPORT_CUSHION_MS measured
+  // from "now" always lands on the same deadlineMs + cushion point). Minting
+  // a fresh AbortController + setTimeout + `AbortSignal.any` composite every
+  // iteration was therefore pure churn with no behavioral purpose: on a
+  // `--wait` fan-out over many concurrent runIds, each polling for many
+  // iterations, this created thousands of composite signals per invocation.
+  // Every `AbortSignal.any` call registers an internal dependency listener
+  // on the long-lived `shutdownSignal`, tracked via a WeakRef +
+  // FinalizationRegistry so the listener can be reclaimed once the derived
+  // signal is garbage-collected without leaking on the long-lived source —
+  // but under a high allocation rate with no macrotask yield between
+  // iterations (`TestDeps.sleep` in tests resolves via a bare microtask),
+  // V8 can fall behind on running that reclamation incrementally, and the
+  // eventual cleanup pass then has to walk a large backlog in one go
+  // (`JSFinalizationRegistry::Cleanup` → `KeepDuringJob` →
+  // `OrderedHashSet::Add`), pegging the CPU for minutes. One controller,
+  // one timer, and one composed signal — created once, reused for every
+  // iteration and every retry, cleared once when the session ends —
+  // removes that per-iteration scaling factor entirely; the deadline
+  // semantics are unchanged, since the abort target was already the same
+  // absolute instant on every iteration.
+  const TRANSPORT_CUSHION_MS = 2000;
+  const deadlineController = new AbortController();
+  const deadlineTimer = setTimeout(
+    () => deadlineController.abort(),
+    deadlineMs - startMs + TRANSPORT_CUSHION_MS,
+  );
+  const sessionSignal =
+    shutdownSignal != null
+      ? AbortSignal.any([deadlineController.signal, shutdownSignal])
+      : deadlineController.signal;
+
+  // Same hoisting rationale for the `resolveAlternate` abort target
+  // (deadlineMs, no cushion — also a fixed absolute instant). Allocated
+  // lazily so callers that never pass `resolveAlternate` pay nothing for it.
+  let altAbort: AbortController | undefined;
+  let altTimer: ReturnType<typeof setTimeout> | undefined;
+  let altSignal: AbortSignal | undefined;
+  if (resolveAlternate) {
+    altAbort = new AbortController();
+    const controller = altAbort;
+    altTimer = setTimeout(() => controller.abort(), deadlineMs - startMs);
+    altSignal =
+      shutdownSignal != null ? AbortSignal.any([altAbort.signal, shutdownSignal]) : altAbort.signal;
+  }
+
+  try {
+    return await pollIterations(client, runId, options, {
+      startMs,
+      deadlineMs,
+      sessionSignal,
+      altSignal,
+      sleep,
+    });
+  } finally {
+    clearTimeout(deadlineTimer);
+    if (altTimer !== undefined) clearTimeout(altTimer);
+  }
+}
+
+interface PollLoopContext {
+  startMs: number;
+  deadlineMs: number;
+  /** Hoisted per-session signal for the run-row GET (deadline + cushion, composed with shutdown). */
+  sessionSignal: AbortSignal;
+  /** Hoisted per-session signal for `resolveAlternate` lookups (deadline, no cushion), if applicable. */
+  altSignal: AbortSignal | undefined;
+  sleep: (ms: number) => Promise<void>;
+}
+
+async function pollIterations(
+  client: RunClient,
+  runId: string,
+  options: PollOptions,
+  ctx: PollLoopContext,
+): Promise<RunResponse> {
+  const { timeoutSeconds, onTick, onTransition, resolveAlternate } = options;
+  const shutdownSignal = options.shutdown?.signal;
+  const { startMs, deadlineMs, sessionSignal, altSignal, sleep } = ctx;
 
   // Track whether the server supports ?waitSeconds. Start optimistic.
   let useBackoff = false;
@@ -166,43 +249,25 @@ async function pollLoop(
     const remainingMs = deadlineMs - now;
     const remainingSeconds = Math.ceil(remainingMs / 1000);
 
-    // Mint a per-iteration AbortController. The signal fires at the remaining
-    // deadline plus a small transport cushion (2 s) so a hung fetch does not
-    // block the CLI past --timeout.
-    const TRANSPORT_CUSHION_MS = 2000;
-    const abortController = new AbortController();
-    const abortTimer = setTimeout(() => {
-      abortController.abort();
-    }, remainingMs + TRANSPORT_CUSHION_MS);
-    // Compose the interrupt into the per-iteration signal: a `--wait` can sit
-    // inside one <=25s long-poll fetch (and the auto-raised per-request
-    // timeout means even longer for slow backends) — checking the flag
-    // between iterations is not enough, the in-flight fetch must abort.
-    const iterationSignal =
-      shutdownSignal != null
-        ? AbortSignal.any([abortController.signal, shutdownSignal])
-        : abortController.signal;
-
     let run: RunResponse;
     try {
       if (useBackoff) {
-        run = await client.getRun(runId, { signal: iterationSignal });
+        run = await client.getRun(runId, { signal: sessionSignal });
       } else {
         const waitSeconds = Math.min(remainingSeconds, LONG_POLL_WAIT_SECONDS);
-        run = await client.getRun(runId, { waitSeconds, signal: iterationSignal });
+        run = await client.getRun(runId, { waitSeconds, signal: sessionSignal });
       }
       // Successful GET resets the consecutive-error counter.
       consecutiveErrors = 0;
       notYetVisibleRetries = 0;
     } catch (err) {
-      clearTimeout(abortTimer);
       // Interrupt classification precedes the timeout mapping: the composed
       // signal makes the fetch reject on Ctrl-C, and that abort must surface
       // as the InterruptError — not as a spurious TimeoutError.
       if (err instanceof InterruptError) throw err;
       if (shutdownSignal?.aborted) throw shutdownSignal.reason;
-      // An AbortError from our per-iteration controller means the deadline
-      // passed while the fetch was in flight — surface as TimeoutError.
+      // An AbortError from the session controller means the deadline passed
+      // while the fetch was in flight — surface as TimeoutError.
       if (isAbortError(err)) {
         throw new TimeoutError(runId, timeoutSeconds);
       }
@@ -264,9 +329,6 @@ async function pollLoop(
       throw err;
     }
 
-    // fetch completed — cancel the per-iteration abort timer.
-    clearTimeout(abortTimer);
-
     const elapsedMs = Date.now() - startMs;
     onTick?.(run, elapsedMs);
 
@@ -285,21 +347,13 @@ async function pollLoop(
       if (altRemainingMs <= 0) {
         throw new TimeoutError(runId, timeoutSeconds);
       }
-      const altAbort = new AbortController();
-      const altTimer = setTimeout(() => altAbort.abort(), altRemainingMs);
       // The alternate lookup aborts on interrupt too; its errors are swallowed
       // by the fallback (best-effort), so the loop-top interrupt check above
-      // surfaces the InterruptError on the next iteration.
-      const altSignal =
-        shutdownSignal != null
-          ? AbortSignal.any([altAbort.signal, shutdownSignal])
-          : altAbort.signal;
-      let alternate: RunResponse | null = null;
-      try {
-        alternate = await resolveAlternate(run, elapsedMs, altSignal);
-      } finally {
-        clearTimeout(altTimer);
-      }
+      // surfaces the InterruptError on the next iteration. `altSignal` is the
+      // hoisted per-session signal (allocated once, above, whenever
+      // `resolveAlternate` is present) — reused across every non-terminal
+      // tick rather than re-composed each time.
+      const alternate = await resolveAlternate(run, elapsedMs, altSignal!);
       // Enforce the hard cap: reject a terminal alternate that only arrived
       // at/after the deadline, same as the run-row long-poll path below.
       if (Date.now() >= deadlineMs) {

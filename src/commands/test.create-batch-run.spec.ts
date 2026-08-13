@@ -334,6 +334,225 @@ describe('runCreateBatch --run --wait: mixed outcomes', () => {
 });
 
 // ---------------------------------------------------------------------------
+// No --wait: exit-code contract (issue #161)
+//
+// Without --wait, every trigger response is non-terminal ('queued') by design.
+// A fully successful dispatch must exit 0 — success means every trigger was
+// dispatched without error, mirroring single `test run` (no --wait). A trigger
+// error must still exit non-zero. Existing no-wait specs only exercised error
+// scenarios and never asserted the success exit code, which is how the
+// "always exits 1 even when every trigger succeeds" bug slipped through.
+// ---------------------------------------------------------------------------
+
+describe('runCreateBatch --run (no --wait): exit-code contract', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+    errorSpy.mockRestore();
+  });
+
+  it('all triggers succeed (queued) → resolves without error, exit 0; results all queued, no error (json)', async () => {
+    const { credentialsPath } = makeCreds();
+    const testIds = ['test_q1', 'test_q2', 'test_q3'];
+    const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC, FE_SPEC]);
+
+    let pollCount = 0;
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch')) {
+        return { body: makeBatchCreateResponse(testIds) };
+      }
+      const triggerMatch = /\/tests\/(test_[a-z0-9]+)\/runs$/.exec(url);
+      if (triggerMatch?.[1]) {
+        const testId = triggerMatch[1];
+        return { body: makeTriggerResponse(testId, `run_${testId}`) };
+      }
+      // No --wait must NOT poll — count any GET /runs as a violation.
+      if (/\/runs\/run_test_[a-z0-9]+/.exec(url)) {
+        pollCount++;
+      }
+      return {
+        status: 404,
+        body: {
+          error: { code: 'NOT_FOUND', message: 'not found', nextAction: '', requestId: 'r1' },
+        },
+      };
+    });
+
+    const stdout: string[] = [];
+    const stderrLines: string[] = [];
+
+    // Must NOT throw — a fully successful no-wait dispatch exits 0.
+    // (If runBatchRun threw a CLIError, this await would reject and fail the test.)
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdout.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+
+    expect(pollCount).toBe(0); // no polling without --wait
+
+    const printed = JSON.parse(stdout.join('')) as {
+      results: Array<{ testId: string; status: string; error?: unknown }>;
+    };
+    expect(printed.results).toHaveLength(3);
+    expect(printed.results.every(r => r.status === 'queued')).toBe(true);
+    expect(printed.results.every(r => r.error === undefined)).toBe(true);
+  });
+
+  it('all triggers succeed (queued) → text summary reports "3/3 triggered", exit 0 (no "0/N passed")', async () => {
+    const { credentialsPath } = makeCreds();
+    const testIds = ['test_t1', 'test_t2', 'test_t3'];
+    const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC, FE_SPEC]);
+
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch')) {
+        return { body: makeBatchCreateResponse(testIds) };
+      }
+      const triggerMatch = /\/tests\/(test_[a-z0-9]+)\/runs$/.exec(url);
+      if (triggerMatch?.[1]) {
+        const testId = triggerMatch[1];
+        return { body: makeTriggerResponse(testId, `run_${testId}`) };
+      }
+      return {
+        status: 404,
+        body: {
+          error: { code: 'NOT_FOUND', message: 'not found', nextAction: '', requestId: 'r1' },
+        },
+      };
+    });
+
+    const stdout: string[] = [];
+    const stderrLines: string[] = [];
+
+    // Must NOT throw — a fully successful no-wait dispatch exits 0.
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdout.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+
+    const summary = stderrLines.find(l => l.startsWith('batch-run summary:'));
+    expect(summary).toBeDefined();
+    expect(summary).toContain('3/3 triggered');
+    // The pre-fix bug printed a pass/fail summary ("0/3 passed") for a fully
+    // successful no-wait dispatch — assert that misleading wording is gone.
+    expect(summary).not.toContain('passed');
+    expect(stderrLines.some(l => l.includes('did not pass'))).toBe(false);
+  });
+
+  it('partial trigger failure (2 queued, 1 errors) → still exits non-zero; all 3 results in envelope', async () => {
+    const { credentialsPath } = makeCreds();
+    const testIds = ['test_p1', 'test_p2', 'test_p3'];
+    const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC, FE_SPEC]);
+
+    // test_p3's trigger returns 404 NOT_FOUND — a non-retryable error (exit 4)
+    // that surfaces immediately as an error result. The other two dispatch fine.
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch')) {
+        return { body: makeBatchCreateResponse(testIds) };
+      }
+      const triggerMatch = /\/tests\/(test_[a-z0-9]+)\/runs$/.exec(url);
+      if (triggerMatch?.[1]) {
+        const testId = triggerMatch[1];
+        if (testId === 'test_p3') {
+          return {
+            status: 404,
+            body: {
+              error: {
+                code: 'NOT_FOUND',
+                message: 'test not found',
+                nextAction: '',
+                requestId: 'req_p3',
+              },
+            },
+          };
+        }
+        return { body: makeTriggerResponse(testId, `run_${testId}`) };
+      }
+      return {
+        status: 404,
+        body: {
+          error: { code: 'NOT_FOUND', message: 'not found', nextAction: '', requestId: 'r1' },
+        },
+      };
+    });
+
+    const stdout: string[] = [];
+    const stderrLines: string[] = [];
+
+    const err = await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdout.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+
+    // A dispatch with any trigger error must exit non-zero.
+    expect(err).toBeInstanceOf(CLIError);
+    expect((err as CLIError).exitCode).not.toBe(0);
+
+    const printed = JSON.parse(stdout.join('')) as {
+      results: Array<{ testId: string; status: string; error?: { code: string } }>;
+    };
+    expect(printed.results).toHaveLength(3);
+    const queued = printed.results.filter(r => r.status === 'queued');
+    const errored = printed.results.filter(r => r.error !== undefined);
+    expect(queued).toHaveLength(2);
+    expect(errored).toHaveLength(1);
+    expect(errored[0]?.testId).toBe('test_p3');
+    expect(errored[0]?.error?.code).toBe('NOT_FOUND');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // --max-concurrency: verify only N in-flight at any time
 // ---------------------------------------------------------------------------
 

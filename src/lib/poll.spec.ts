@@ -541,7 +541,14 @@ describe('pollRunUntilTerminal — AbortSignal + timeout enforcement', () => {
     expect(receivedSignals[0]).toBeInstanceOf(AbortSignal);
   });
 
-  it('passes a fresh AbortSignal on each poll iteration', async () => {
+  it('reuses the same session AbortSignal across poll iterations (no per-iteration churn)', async () => {
+    // Regression guard for the AbortController/AbortSignal.any churn fix: a
+    // fresh controller + composed signal per iteration was pure waste (the
+    // abort target — deadlineMs + cushion — never changes between
+    // iterations), and on a `--wait` fan-out over many concurrent runIds it
+    // produced enough short-lived `AbortSignal.any` composites to make V8's
+    // FinalizationRegistry cleanup pass pathologically slow. The signal is
+    // now hoisted once per poll session and reused for every iteration.
     const receivedSignals: Array<AbortSignal | undefined> = [];
     const client: RunClient = {
       getRun: async (_runId, opts) => {
@@ -555,8 +562,8 @@ describe('pollRunUntilTerminal — AbortSignal + timeout enforcement', () => {
       sleep: instantSleep,
     });
     expect(receivedSignals).toHaveLength(2);
-    // Each iteration gets its own controller → distinct signal objects
-    expect(receivedSignals[0]).not.toBe(receivedSignals[1]);
+    expect(receivedSignals[0]).toBeInstanceOf(AbortSignal);
+    expect(receivedSignals[0]).toBe(receivedSignals[1]);
   });
 
   it('surfaces TimeoutError when fetch resolves as AbortError (hung fetch past deadline)', async () => {

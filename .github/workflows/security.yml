@@ -1,0 +1,244 @@
+# Ported from community PR https://github.com/TestSprite/testsprite-cli/pull/220
+# (author @OkeyAmy), adapted to this repo's actual constraints:
+#
+#   - No CodeQL job. This repo (testsprite-cli-atlas) is a private Team-plan
+#     repo without GitHub Advanced Security purchased — the CodeQL Action
+#     (init/analyze) hard-fails here (`Code Security must be enabled for this
+#     repository to use code scanning`, verified against the live API before
+#     writing this file). CodeQL is free on the public mirror
+#     (TestSprite/testsprite-cli) instead, enabled there via GitHub's
+#     repository-level "default setup" — a SETTING, not a workflow file — so
+#     there is nothing here for the outbound snapshot to carry or exclude,
+#     and no risk of the two CodeQL configuration modes (default setup vs.
+#     workflow-based) conflicting on the public repo.
+#   - `dependency-review-action` has the same Advanced-Security requirement on
+#     private repos, so its job only executes once this file is running in
+#     the public mirror (see the job's own `if:`) — it still exists as a
+#     no-op step on every atlas PR/push rather than failing one.
+#   - `eslint-plugin-security` lints only files changed in this PR/push (see
+#     the `lint-security` job), not the whole tree: a full-tree run surfaces
+#     ~380 pre-existing findings (almost entirely
+#     `security/detect-non-literal-fs-filename` on ordinary local-path fs
+#     calls a config-file-reading CLI makes routinely — not a real
+#     vulnerability signal for this codebase shape). Blocking on that
+#     backlog on day one would make the job noise from the first run; this
+#     keeps every rule at its designed severity and holds new/changed code to
+#     it without silently exempting the existing tree from the rule.
+#   - Secret scanning: this repo's `ci.yml` already runs a gitleaks
+#     WORKING-TREE scan on every PR/push (added by atlas #274, 2026-07). This
+#     file adds the complementary FULL-HISTORY scan from #220 as its own job,
+#     scoped to `push` only (not every PR iteration) — full-history scanning
+#     needs `fetch-depth: 0` and walks every past commit, which is too slow
+#     to run per-PR (the same tradeoff `docs/internal/cli-oss/
+#     supply-chain-hardening.md` §1.4 already made for `ci.yml`'s job) but is
+#     the only mode that catches a secret that was committed and later
+#     removed from the working tree. Uses the checksum-verified pinned-binary
+#     install pattern already established by `ci.yml`/`divergence-sentinel.yml`
+#     rather than `gitleaks/gitleaks-action` (#220's choice): that action
+#     requires a `GITLEAKS_LICENSE` for org-owned repos — this org owns both
+#     testsprite-cli repos, so "free mode" does not apply — and adding it
+#     would introduce a new third-party `uses:` entry that the public repo's
+#     `allowed_actions` allowlist does not carry.
+#   - No `pnpm-lock.yaml` (this is an npm-only repo — see package-lock.json)
+#     and no `sandbox/**` ignore additions (no such directory exists in this
+#     repo; #220 never explained the addition).
+
+name: Security
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, dev, stg]
+
+# Least-privilege default (same convention as ci.yml). No job below needs
+# write; anything more must opt in locally.
+permissions:
+  contents: read
+
+jobs:
+  # ── 1. Dependency audit ────────────────────────────────────────────────────
+  # Blocks on HIGH/CRITICAL in production dependencies (what ships to users).
+  # Dev-only vulns are reported but do not fail the build — they never reach
+  # a user's machine.
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Audit production dependencies (blocking)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Audit all dependencies (informational)
+        run: npm audit --audit-level=high || true
+
+  # ── 2. Dependency review on PRs (public mirror only) ──────────────────────
+  # Blocks PRs that introduce a new vulnerable package. Requires GitHub
+  # Advanced Security, which atlas (private) does not have — see header.
+  # This is exactly the point in the pipeline where a community PR against
+  # a new dependency actually lands, so gating to the public repo costs
+  # nothing.
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.repository == 'TestSprite/testsprite-cli'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: high
+
+  # ── 3. ESLint with security rules (changed files only) ────────────────────
+  # See header for why this is diff-scoped rather than full-tree.
+  lint-security:
+    name: ESLint Security (changed files)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Determine changed TypeScript files under src/
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/changed-ts-files.txt"
+          rm -f "$RUNNER_TEMP/lint-empty-reason.txt"
+          # Two different things can leave that list empty, and they must not
+          # read the same in the log. "A real diff against a real base found
+          # no src TypeScript changes" is normal and stays green. "We had no
+          # base to diff against, so we never looked" must NOT be a green
+          # no-op — a green check that inspected nothing is worse than no
+          # check, because it reads as coverage. So this step never just
+          # skips: it either resolves a real base to diff (possibly via a
+          # fallback) or it fails the job outright.
+          #
+          # A pull_request always supplies a base SHA and fetch-depth: 0 makes
+          # it resolvable, so an unusable base there means this job's own
+          # checkout/base resolution is broken — fail loudly instead of
+          # reporting a false green. A push can legitimately have no usable
+          # base (github.event.before is all-zeros on a first push to a
+          # branch, or unreachable after certain force-pushes); on push we
+          # fall back to a real diff against HEAD^ (the tip commit's own
+          # diff, reachable thanks to fetch-depth: 0) instead of skipping, and
+          # only fall back further — to linting the full tracked src/**/*.ts
+          # set — when HEAD itself has no parent (a genuine first commit).
+          if [ -n "${BASE_SHA:-}" ] && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            RESOLVED_BASE="$BASE_SHA"
+            BASE_DESC="$BASE_SHA (event-provided base)"
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "::error title=Security lint broken::pull_request base SHA ('${BASE_SHA:-<empty>}') is empty or unreachable even with fetch-depth: 0. A pull_request always supplies a resolvable base, so this means base resolution is broken, not that there is nothing to check. Failing the job instead of reporting a false green." >&2
+            exit 1
+          elif git rev-parse --verify -q HEAD^ >/dev/null 2>&1; then
+            RESOLVED_BASE="HEAD^"
+            BASE_DESC="HEAD^ (fallback: push event supplied no usable base SHA — was '${BASE_SHA:-<empty>}' — so diffing HEAD's own commit instead of skipping)"
+          else
+            RESOLVED_BASE=""
+            BASE_DESC="none (fallback: HEAD has no parent, a genuine first commit; linting the full tracked src/**/*.ts set instead of skipping)"
+          fi
+
+          echo "Base used: ${BASE_DESC}"
+
+          if [ -n "$RESOLVED_BASE" ]; then
+            git diff --name-only --diff-filter=ACMR -z "$RESOLVED_BASE" "$HEAD_SHA" -- ':(glob)src/**/*.ts' \
+              > "$RUNNER_TEMP/changed-ts-files.txt"
+          else
+            git ls-files -z -- ':(glob)src/**/*.ts' > "$RUNNER_TEMP/changed-ts-files.txt"
+          fi
+
+          # NUL-terminated, so a newline count (`wc -l`) would be wrong here —
+          # count NUL bytes instead (git filenames can never contain one, so
+          # this always equals the number of entries).
+          FILE_COUNT=$(tr -dc '\0' < "$RUNNER_TEMP/changed-ts-files.txt" | wc -c)
+          echo "Files matched: ${FILE_COUNT}"
+
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "::notice title=Security lint: genuinely nothing to check::${BASE_DESC} produced zero src/**/*.ts files. This is a real result (empty diff, or an empty tree), not a skip."
+            echo "EMPTY" > "$RUNNER_TEMP/lint-empty-reason.txt"
+          fi
+
+      - name: Run security lint on changed files
+        run: |
+          set -euo pipefail
+          # The file list is NUL-separated end-to-end: git diff/ls-files -z ->
+          # file -> xargs -0. Git filenames may contain a literal newline (or
+          # start with `-`), so converting to newlines (as this step used to,
+          # via `tr '\0' '\n'` + `xargs -d '\n'`) lets a filename like
+          # "src/x.ts\n--no-error-on-unmatched-pattern\nnot-a-real-file.ts"
+          # split into a real path, an injected ESLint OPTION, and a
+          # nonexistent path — ESLint then exits 0 having never linted the
+          # malicious file. NUL is the one byte git filenames cannot contain,
+          # so `-0`/`-z` is the only splitting mode that is actually safe
+          # here (the previous comment on this step claiming xargs was doing
+          # "NUL/newline-safe" splitting was false: the `tr` upstream had
+          # already destroyed the NUL delimiters before xargs ever saw the
+          # list). The trailing `--` additionally stops ESLint's own option
+          # parser at the file-list boundary, so no filename starting with
+          # `-` can be misread as a flag.
+          if [ -f "$RUNNER_TEMP/lint-empty-reason.txt" ]; then
+            echo "Zero files to lint (see the previous step's log for which base was used and why) — nothing to lint, reporting success on a genuine empty result, not a skip."
+            exit 0
+          fi
+          FILE_COUNT=$(tr -dc '\0' < "$RUNNER_TEMP/changed-ts-files.txt" | wc -c)
+          echo "Linting ${FILE_COUNT} file(s)."
+          xargs -a "$RUNNER_TEMP/changed-ts-files.txt" -0 \
+            npx eslint --config eslint.security.config.mjs --format stylish --
+
+  # ── 4. Full-history secret scan (push only) ────────────────────────────────
+  # Complements ci.yml's working-tree gitleaks job (every PR/push) with the
+  # one thing that job structurally cannot see: a secret that was committed
+  # and later removed. See header for why this doesn't also run per-PR.
+  gitleaks-history:
+    name: Secret scan — full history (gitleaks)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # full history required for a history-mode scan
+
+      # Same pinned version + checksum-verified install as ci.yml /
+      # divergence-sentinel.yml — see those files for why this pin.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: '8.28.0'
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          TARBALL="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSL -o "$TARBALL" "${BASE}/${TARBALL}"
+          curl -sSL -o checksums.txt "${BASE}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " ${TARBALL}\$" checksums.txt | sha256sum -c -
+          tar -xzf "$TARBALL" gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Scan full git history for secrets
+        run: gitleaks detect --no-banner --redact --source .

@@ -52,7 +52,7 @@ function homeWithCreds(): string {
   mkdirSync(join(home, '.testsprite'), { recursive: true });
   writeFileSync(
     join(home, '.testsprite', 'credentials'),
-    `[default]\napi_key = sk-fake-nudge\napi_url = ${DEAD_ENDPOINT}\n`,
+    `[default]\napi_key = sk-user-fake-nudge\napi_url = ${DEAD_ENDPOINT}\n`,
     'utf8',
   );
   return home;
@@ -137,4 +137,18 @@ describe('skill nudge — suppression gates', () => {
     },
     NETWORK_TIMEOUT_MS,
   );
+
+  // `test create --plan-template` is pure-local and informational
+  // (same family as `setup` / `agent install`) — it must not trip the
+  // "test create" entry in SKILL_NUDGE_COMMANDS even with a configured
+  // profile and no skill installed. Regression guard for the flag-aware
+  // skip added to src/index.ts's preAction hook.
+  it('is silent for `test create --plan-template` even with a configured profile and no skill installed', () => {
+    const proj = freshDir('ts-nudge-proj-');
+    const home = homeWithCreds();
+    const result = runCli(['test', 'create', '--plan-template'], { cwd: proj, home });
+    expect(result.status).toBe(0);
+    expect(result.stderr).not.toContain(WARN_SUBSTR);
+    expect(result.stdout).toContain('"planSteps"');
+  });
 });

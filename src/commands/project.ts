@@ -11,6 +11,7 @@ import { ApiError } from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
+import { readSecretFileGuarded } from '../lib/secret-file.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
@@ -29,6 +30,38 @@ export interface CliProject {
   createdFrom: 'portal' | 'mcp' | 'cli';
   createdAt: string;
   updatedAt: string;
+  /**
+   * Owning organization id + human-readable name. Additive + absent-safe:
+   * populated only for a membership-key (`sk-member-…`) caller on `project list`
+   * (org attribution across the caller's org-scoped view); `project get`
+   * does not populate them today even for a bound key. `orgName` may be
+   * absent even when `orgId` is present (best-effort name lookup). Legacy
+   * (unbound) callers never see either field.
+   */
+  orgId?: string;
+  orgName?: string;
+  /**
+   * The project's default target/environment URL, or `null` when the project has
+   * none configured.
+   *
+   * **Absent vs. `null` is load-bearing here.** `null` means "the server resolved
+   * it and this project has no URL configured" — actionable, so the renderer
+   * prints the `project update … --url` remedy. **Absent** means "no answer", and
+   * the server uses it for every case where a remedy would be a lie: an older
+   * backend, the `list` endpoint (which would pay an extra read per row), a
+   * resolution that failed (a transient outage must never be reported as "no URL
+   * set"), and a V2 backend project (V2 backend runs resolve no project URL at
+   * all, so there is nothing to report and nothing `--url` would change).
+   *
+   * So the renderer must key on presence, not truthiness: printing "(not set)"
+   * for an absent field would report every project on an older backend — and
+   * every project in a `list` — as having no URL, including the ones that do.
+   *
+   * A backend project with no URL is not merely cosmetic: on the V3 execution
+   * path the first run of any of its tests is rejected `no-target-resolvable`
+   * (see the `project create --type backend` note in CLAUDE.md).
+   */
+  targetUrl?: string | null;
 }
 
 export interface ProjectDeps {
@@ -123,7 +156,37 @@ export interface CliCreateProjectRequest {
   instruction?: string;
 }
 
-export type CliCreateProjectResponse = CliProject;
+/**
+ * Response shape for `POST /projects`.
+ *
+ * The validation sweep found the LIVE `POST /projects`
+ * response keying its id as `projectId` (matching `CliDeleteProjectResponse`'s
+ * convention), not `id` like the read paths (`GET /projects`, `GET
+ * /projects/{id}` — those are proven-`id` via the dev-e2e smoke test) — and
+ * possibly omitting `targetUrl`/`updatedAt` entirely. Rather than guess which
+ * single shape is "the real one" and risk flipping the drift instead of
+ * fixing it, both id field names are accepted here (and normalized — see
+ * `resolveCreatedProjectId` — so JSON consumers keyed on either `id` or
+ * `projectId` keep working), and `targetUrl`/`updatedAt` are optional.
+ */
+export interface CliCreateProjectResponse {
+  /** Preferred — matches the live backend's response and `project delete`'s `projectId`. */
+  projectId?: string;
+  /** Legacy/fallback name; some responses (and the read paths) use this instead. */
+  id?: string;
+  name: string;
+  type: 'frontend' | 'backend';
+  createdFrom: 'portal' | 'mcp' | 'cli';
+  createdAt: string;
+  /** Absent-safe: not guaranteed on every backend response. */
+  updatedAt?: string;
+  targetUrl?: string;
+}
+
+/** Resolve the created project's id regardless of which field name the backend used. */
+export function resolveCreatedProjectId(r: CliCreateProjectResponse): string | undefined {
+  return r.projectId ?? r.id;
+}
 
 interface CreateOptions extends CommonOptions {
   type: 'frontend' | 'backend';
@@ -194,7 +257,11 @@ export async function runCreate(
     ) {
       stderr(`idempotency-key: ${idempotencyKey}`);
     }
+    // Teach both id field names — `projectId` is the field the
+    // live backend actually sends; `id` is kept so this sample still matches
+    // callers written against the pre-fix shape.
     const sample: CliCreateProjectResponse = {
+      projectId: 'p_dryrun_2026',
       id: 'p_dryrun_2026',
       type: opts.type,
       name: opts.name,
@@ -202,15 +269,15 @@ export async function runCreate(
       createdFrom: 'cli',
       createdAt: '2026-05-16T00:00:00.000Z',
       updatedAt: '2026-05-16T00:00:00.000Z',
-    } as unknown as CliCreateProjectResponse;
-    out.print(sample, data => renderProjectText(data as CliProject));
+    };
+    out.print(sample, data => renderCreateProjectText(data as CliCreateProjectResponse));
     return sample;
   }
 
   // Resolve password: flag > file > none
   let password = opts.password;
   if (password === undefined && opts.passwordFile !== undefined) {
-    password = readFileSync(opts.passwordFile, 'utf8').trim();
+    password = readSecretFileGuarded('password-file', opts.passwordFile);
   }
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-create-${randomUUID()}`;
@@ -228,12 +295,63 @@ export async function runCreate(
   };
 
   const client = makeClient(opts, deps);
-  const created = await client.post<CliCreateProjectResponse>('/projects', {
+  const rawCreated = await client.post<CliCreateProjectResponse>('/projects', {
     body,
     headers: { 'idempotency-key': idempotencyKey },
   });
+  // Normalize whichever id field name the backend actually
+  // sent onto BOTH `projectId` and `id`, so JSON consumers keyed on either
+  // name keep working regardless of which one the live response used.
+  const resolvedId = resolveCreatedProjectId(rawCreated);
+  const created: CliCreateProjectResponse = {
+    ...rawCreated,
+    ...(resolvedId !== undefined ? { projectId: resolvedId, id: resolvedId } : {}),
+  };
 
-  out.print(created, data => renderProjectText(data as CliProject));
+  out.print(created, data => renderCreateProjectText(data as CliCreateProjectResponse));
+
+  // A backend project created without --url has no default environment URL.
+  // On the V3 execution path, the shared admission guard (`runProjectGuarded`
+  // -> `assertProjectEnvNotLocal`, called by every V3 run/rerun/batch entry
+  // point, including `backendRun`) rejects the FIRST run of any test in the
+  // project with 400 no-target-resolvable. On the V2 path (`cli-run.service.ts`
+  // -> `resolveRunPrereqsFE`), this URL resolution is frontend-only and is
+  // never applied to a backend run, so a V2-routed backend project without a
+  // URL runs fine — V2 is the only execution path live in production today
+  // (V3 is dev-only pending its own GA release), so the wording below is
+  // conditioned on V3 rather than stated as a universal consequence.
+  // `--url` is intentionally NOT made mandatory here (that would break the
+  // published --help contract: npm 0.4.0 already ships text saying the URL
+  // is frontend-only), so this stays advisory-only. The CLI does not call
+  // GET /me here to check the caller's actual v3Enabled routing before
+  // deciding whether to print this — an extra round-trip on every create is
+  // not worth it just to gate a hint — so it points the reader at `auth
+  // status` (which already renders the routing: v2|v3 line) instead.
+  // Emitted in EVERY output mode, including --output json: this goes to
+  // stderr, which never touches JSON stdout, so there is nothing to protect
+  // by suppressing it (unlike `emitV3RoutingAdvisory`, which withholds
+  // account-context advisory in JSON mode because a JSON caller can read
+  // `v3Enabled` directly instead — there is no equivalent structured signal
+  // for this one). And --output json is precisely the case that needs it
+  // most: a script or agent creating a project non-interactively has no one
+  // watching a terminal, so a silent dead-on-arrival project only surfaces
+  // later as an unexplained 400 on the first run. Same family as the C1
+  // `--target-url` advisory above (a flag/setup the caller just made has a
+  // structural consequence) rather than the routing-advisory family.
+  // Real path only — NOT duplicated into the dry-run branch above, because
+  // the remedy command below embeds the created project id, and under
+  // --dry-run that id is the canned `p_dryrun_2026` sample: emitting a
+  // live-looking fix-it command against a fake resource is exactly what the
+  // `dashboardUrl` convention (see CLAUDE.md) already decided to suppress.
+  if (opts.type === 'backend' && !opts.targetUrl) {
+    stderr(
+      `[advisory] this backend project has no default environment URL. On the V3 execution ` +
+        `path (check with \`testsprite auth status\`), test runs are rejected with ` +
+        `no-target-resolvable until one is set. Fix: testsprite project update ` +
+        `${resolvedId ?? '<project-id>'} --url <url>`,
+    );
+  }
+
   return created;
 }
 
@@ -241,11 +359,27 @@ export async function runCreate(
 // project update
 // ---------------------------------------------------------------------------
 
+/**
+ * Response shape for `PATCH /projects/{id}`.
+ *
+ * Same `id`-field drift as `CliCreateProjectResponse` — both
+ * names are accepted and normalized (see `resolveUpdatedProjectId`), and
+ * `updatedAt` is optional since the live response may omit it.
+ */
 export interface CliUpdateProjectResponse {
-  id: string;
+  /** Preferred — matches the live backend's response and `project delete`'s `projectId`. */
+  projectId?: string;
+  /** Legacy/fallback name; some responses use this instead. */
+  id?: string;
   /** Backend may omit this field; treat absence as no specific fields reported. */
   updatedFields?: string[];
-  updatedAt: string;
+  /** Absent-safe: not guaranteed on every backend response. */
+  updatedAt?: string;
+}
+
+/** Resolve the updated project's id regardless of which field name the backend used. */
+export function resolveUpdatedProjectId(r: CliUpdateProjectResponse): string | undefined {
+  return r.projectId ?? r.id;
 }
 
 interface UpdateOptions extends CommonOptions {
@@ -313,7 +447,11 @@ export async function runUpdate(
     ) {
       stderr(`idempotency-key: ${idempotencyKey}`);
     }
+    // Teach both id field names — `projectId` is the field the
+    // live backend actually sends; `id` is kept so this sample still matches
+    // callers written against the pre-fix shape.
     const sample: CliUpdateProjectResponse = {
+      projectId: opts.projectId,
       id: opts.projectId,
       updatedFields: presentFieldNames,
       updatedAt: '2026-05-16T00:00:00.000Z',
@@ -326,7 +464,7 @@ export async function runUpdate(
   // filesystem, even when --password-file is present.
   let password = opts.password;
   if (password === undefined && opts.passwordFile !== undefined) {
-    password = readFileSync(opts.passwordFile, 'utf8').trim();
+    password = readSecretFileGuarded('password-file', opts.passwordFile);
   }
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-update-${randomUUID()}`;
@@ -345,13 +483,23 @@ export async function runUpdate(
     Object.entries(bodyFields).filter(([, v]) => v !== undefined),
   ) as Record<string, string>;
   const client = makeClient(opts, deps);
-  const updated = await client.patch<CliUpdateProjectResponse>(
+  const rawUpdated = await client.patch<CliUpdateProjectResponse>(
     `/projects/${encodeURIComponent(opts.projectId)}`,
     {
       body,
       headers: { 'idempotency-key': idempotencyKey },
     },
   );
+  // Normalize whichever id field name the backend actually
+  // sent onto BOTH `projectId` and `id`, so JSON consumers keyed on either
+  // name keep working regardless of which one the live response used.
+  const resolvedUpdatedId = resolveUpdatedProjectId(rawUpdated);
+  const updated: CliUpdateProjectResponse = {
+    ...rawUpdated,
+    ...(resolvedUpdatedId !== undefined
+      ? { projectId: resolvedUpdatedId, id: resolvedUpdatedId }
+      : {}),
+  };
 
   out.print(updated, data => renderUpdateText(data as CliUpdateProjectResponse));
   return updated;
@@ -704,7 +852,11 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .description('Create a new project')
     .option('--type <frontend|backend>', 'project type (required)')
     .option('--name <name>', 'project name (required)')
-    .option('--url <url>', 'target URL (required for frontend)')
+    .option(
+      '--url <url>',
+      'target URL (required for frontend; also required for backend on the V3 execution ' +
+        'path — see `auth status` for your routing)',
+    )
     .option(
       '--description <text>',
       'not supported — projects have no description (test-level descriptions are set on `test create`)',
@@ -1013,6 +1165,14 @@ function makeOutput(mode: OutputMode, deps: ProjectDeps): Output {
   return new Output(mode, { stdout: deps.stdout, stderr: deps.stderr });
 }
 
+/**
+ * Master column set — includes ORG so `--columns` validation and explicit
+ * `--columns ...,org` selection both work regardless of whether any row in
+ * THIS response happens to carry org attribution. The default (no
+ * `--columns` flag) rendering uses {@link defaultProjectListColumns} instead,
+ * which drops ORG unless at least one row carries it — this keeps the table
+ * unchanged for legacy (non-org-scoped) callers.
+ */
 const PROJECT_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliProject>> = [
   {
     header: 'ID',
@@ -1026,8 +1186,30 @@ const PROJECT_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliProject>> = [
   },
   { header: 'TYPE', width: 8, render: project => project.type },
   { header: 'FROM', width: 6, render: project => project.createdFrom },
+  {
+    header: 'ORG',
+    width: rows =>
+      Math.max(3, ...rows.map(project => (project.orgName ?? project.orgId ?? '').length)),
+    render: project => project.orgName ?? project.orgId ?? '',
+  },
   { header: 'CREATED', width: 0, render: project => project.createdAt },
 ];
+
+const PROJECT_LIST_ORG_COLUMN = PROJECT_LIST_COLUMNS.find(c => c.header === 'ORG')!;
+
+/**
+ * Default (no explicit `--columns`) column set. ORG is included only when
+ * at least one row in this page carries `orgId` — avoids widening the table
+ * for callers whose projects have no org attribution at all.
+ */
+function defaultProjectListColumns(
+  rows: readonly CliProject[],
+): ReadonlyArray<TextTableColumn<CliProject>> {
+  const hasOrgInfo = rows.some(project => project.orgId !== undefined);
+  return hasOrgInfo
+    ? PROJECT_LIST_COLUMNS
+    : PROJECT_LIST_COLUMNS.filter(c => c !== PROJECT_LIST_ORG_COLUMN);
+}
 
 function renderProjectListText(
   page: Page<CliProject>,
@@ -1038,8 +1220,13 @@ function renderProjectListText(
       ? `No projects on this page.\nnextToken: ${page.nextToken}`
       : 'No projects.';
   }
+  // Explicit --columns: resolve against the FULL master set (so `org` can be
+  // requested even when this page happens to have no org-scoped rows).
+  // Default: only include ORG when the data actually carries it.
+  const columns =
+    options.columns !== undefined ? PROJECT_LIST_COLUMNS : defaultProjectListColumns(page.items);
   const lines = [
-    renderTextTable(page.items, PROJECT_LIST_COLUMNS, {
+    renderTextTable(page.items, columns, {
       columns: options.columns,
       noHeader: options.noHeader,
     }),
@@ -1049,22 +1236,55 @@ function renderProjectListText(
 }
 
 function renderProjectText(p: CliProject): string {
-  return [
+  const lines = [
     `id:          ${p.id}`,
     `name:        ${p.name}`,
     `type:        ${p.type}`,
     `createdFrom: ${p.createdFrom}`,
     `createdAt:   ${p.createdAt}`,
     `updatedAt:   ${p.updatedAt}`,
-  ].join('\n');
+  ];
+  if (p.orgId !== undefined) {
+    lines.push(`org:         ${p.orgName ?? '(name unknown)'} (${p.orgId})`);
+  }
+  // Presence, not truthiness — see the `targetUrl` docstring on `CliProject`.
+  // `'targetUrl' in p` distinguishes "the backend answered 'no URL'" (render the
+  // hint) from "this endpoint doesn't report it" (say nothing).
+  if ('targetUrl' in p) {
+    lines.push(
+      p.targetUrl
+        ? `targetUrl:   ${p.targetUrl}`
+        : `targetUrl:   (not set — set one with: testsprite project update ${p.id} --url <url>)`,
+    );
+  }
+  return lines.join('\n');
+}
+
+/**
+ * `project create`'s text renderer. Distinct from
+ * `renderProjectText` (used by `project get`/`list`, where the live `id`
+ * field is proven reliable) because the create response's id field name and
+ * `updatedAt` presence are not guaranteed — see `CliCreateProjectResponse`.
+ */
+function renderCreateProjectText(p: CliCreateProjectResponse): string {
+  const lines = [
+    `id:          ${resolveCreatedProjectId(p) ?? '(unknown)'}`,
+    `name:        ${p.name}`,
+    `type:        ${p.type}`,
+    `createdFrom: ${p.createdFrom}`,
+    `createdAt:   ${p.createdAt}`,
+  ];
+  if (p.updatedAt !== undefined) lines.push(`updatedAt:   ${p.updatedAt}`);
+  return lines.join('\n');
 }
 
 function renderUpdateText(r: CliUpdateProjectResponse): string {
-  return [
-    `id:            ${r.id}`,
+  const lines = [
+    `id:            ${resolveUpdatedProjectId(r) ?? '(unknown)'}`,
     `updatedFields: ${r.updatedFields?.join(', ') ?? '(none)'}`,
-    `updatedAt:     ${r.updatedAt}`,
-  ].join('\n');
+  ];
+  if (r.updatedAt !== undefined) lines.push(`updatedAt:     ${r.updatedAt}`);
+  return lines.join('\n');
 }
 
 function renderDeleteText(r: CliDeleteProjectResponse): string {

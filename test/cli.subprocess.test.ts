@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { execNpm } from './helpers/execNpm.js';
+import { assertFreshBuild } from './helpers/assertFreshBuild.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..');
@@ -33,12 +33,12 @@ let baseUrl: string;
 let tmpHome: string;
 
 beforeAll(async () => {
-  // Always rebuild — `npm run build` is fast and a stale `dist/index.js`
-  // would silently mask ESM/import regressions in this suite. The
-  // existsSync skip we used to do here let `dist` rot under
-  // refactors and gave false-green on `project list` once
-  // already.
-  execNpm(['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
+  // The build now happens exactly once in `test/global-setup.ts`, before any
+  // test file runs — no per-file rebuild here, so this suite can
+  // never race a concurrent rebuild for access to `dist/`. Fail fast (missing
+  // OR stale relative to src/, e.g. watch-mode reruns) instead of silently
+  // spawning a binary that isn't the code under test.
+  assertFreshBuild(REPO_ROOT, BIN_PATH);
   server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const url = req.url ?? '/';
     if (url.startsWith('/api/cli/v1/projects/')) {
@@ -175,6 +175,31 @@ beforeAll(async () => {
               },
             ],
             nextToken: null,
+          }),
+        );
+        return;
+      }
+      if (testId === 'test_ambiguous_org' && subPath === undefined) {
+        res.writeHead(409, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: {
+              code: 'CONFLICT',
+              message:
+                'Test id "test_ambiguous_org" resolves in more than one of your organizations.',
+              nextAction:
+                'This id is ambiguous across your organizations. Open the specific project in the ' +
+                'Portal to act on it, or contact support — uuid-derived ids should not normally collide.',
+              requestId: 'req_subproc_ambiguous',
+              details: {
+                reason: 'ambiguous_org',
+                testId: 'test_ambiguous_org',
+                candidates: [
+                  { projectId: 'project_a', orgId: 'org_a' },
+                  { projectId: 'project_b', orgId: 'org_b' },
+                ],
+              },
+            },
           }),
         );
         return;
@@ -351,6 +376,11 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+  // tmpHome accumulates a real (if fake-valued) credentials file across this
+  // suite's `auth configure` / `setup` runs — remove it so the suite doesn't
+  // leave one directory behind per test run. Guarded: if `beforeAll` threw
+  // before assigning it, there is nothing to remove.
+  if (tmpHome) rmSync(tmpHome, { recursive: true, force: true });
 });
 
 interface SpawnResult {
@@ -386,7 +416,7 @@ function runCli(args: string[], envOverrides: Record<string, string> = {}): Prom
 describe('auth status subprocess (+ deprecated whoami alias)', () => {
   it('prints JSON me and exits 0 against the local server', async () => {
     const result = await runCli(['auth', 'status', '--output', 'json'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -418,7 +448,7 @@ describe('auth status subprocess (+ deprecated whoami alias)', () => {
 
   it('text mode renders userId/scopes legibly', async () => {
     const result = await runCli(['auth', 'status'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -428,19 +458,19 @@ describe('auth status subprocess (+ deprecated whoami alias)', () => {
 
   it('--debug emits structured debug events to stderr without leaking the key', async () => {
     const result = await runCli(['--debug', 'auth', 'status', '--output', 'json'], {
-      TESTSPRITE_API_KEY: 'sk-subproc-secret',
+      TESTSPRITE_API_KEY: 'sk-user-subproc-secret',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toContain('"kind":"request"');
     expect(result.stderr).toContain('"kind":"response"');
-    expect(result.stderr).not.toContain('sk-subproc-secret');
+    expect(result.stderr).not.toContain('sk-user-subproc-secret');
     expect(result.stderr).not.toContain('x-api-key');
   }, 30_000);
 
   it('deprecated `auth whoami` alias still works and prints a deprecation notice', async () => {
     const result = await runCli(['auth', 'whoami', '--output', 'json'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -453,7 +483,7 @@ describe('auth status subprocess (+ deprecated whoami alias)', () => {
 describe('project list subprocess', () => {
   it('--output json returns the §6.1 ProjectList shape', async () => {
     const result = await runCli(['--output', 'json', 'project', 'list'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -465,7 +495,7 @@ describe('project list subprocess', () => {
 
   it('text output renders a header row and the project name', async () => {
     const result = await runCli(['project', 'list'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -484,7 +514,7 @@ describe('project list subprocess', () => {
 
   it('--page-size 0 exits 5 (VALIDATION_ERROR), not 1 (generic)', async () => {
     const result = await runCli(['--output', 'json', 'project', 'list', '--page-size', '0'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(5);
@@ -496,7 +526,7 @@ describe('project list subprocess', () => {
     // Previously silently clamped to 100; now rejected at exit 5 so callers
     // get fast feedback that the value is out of range (Fix 7 — B-E2E-01 wave).
     const result = await runCli(['--output', 'json', 'project', 'list', '--page-size', '101'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(5);
@@ -512,7 +542,7 @@ describe('project list subprocess', () => {
     const result = await runCli(
       ['--output', 'json', '--request-timeout', '30s', 'project', 'list'],
       {
-        TESTSPRITE_API_KEY: 'sk-subproc',
+        TESTSPRITE_API_KEY: 'sk-user-subproc',
         TESTSPRITE_API_URL: baseUrl,
       },
     );
@@ -533,7 +563,7 @@ describe('malformed --endpoint-url is rejected (exit 5), not retried as a networ
   it('an unparseable endpoint exits 5 with a VALIDATION_ERROR naming endpoint-url', async () => {
     const result = await runCli(
       ['--output', 'json', '--endpoint-url', 'not a url', 'project', 'list'],
-      { TESTSPRITE_API_KEY: 'sk-subproc' },
+      { TESTSPRITE_API_KEY: 'sk-user-subproc' },
     );
     expect(result.exitCode).toBe(5);
     const parsed = JSON.parse(result.stderr) as { error: { code: string; nextAction: string } };
@@ -544,7 +574,7 @@ describe('malformed --endpoint-url is rejected (exit 5), not retried as a networ
   it('a non-http(s) scheme exits 5 instead of being retried as a network failure', async () => {
     const result = await runCli(
       ['--output', 'json', '--endpoint-url', 'ftp://example.com', 'project', 'list'],
-      { TESTSPRITE_API_KEY: 'sk-subproc' },
+      { TESTSPRITE_API_KEY: 'sk-user-subproc' },
     );
     expect(result.exitCode).toBe(5);
     const parsed = JSON.parse(result.stderr) as { error: { code: string } };
@@ -571,7 +601,7 @@ describe('invalid --output is rejected uniformly (exit 5)', () => {
 
   it('auth status --output yaml exits 5 before any network call', async () => {
     const result = await runCli(['--output', 'yaml', 'auth', 'status'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(5);
@@ -586,7 +616,7 @@ describe('a malformed --profile is rejected (exit 5), not silently corrupting cr
   // any credential read/write path.
   it('exits 5 with a VALIDATION_ERROR naming the profile flag', async () => {
     const result = await runCli(['--output', 'json', '--profile', 'prod]', 'project', 'list'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(5);
@@ -599,7 +629,7 @@ describe('a malformed --profile is rejected (exit 5), not silently corrupting cr
 describe('project get subprocess', () => {
   it('--output json returns the §6.1 Project shape', async () => {
     const result = await runCli(['--output', 'json', 'project', 'get', 'project_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -611,7 +641,7 @@ describe('project get subprocess', () => {
 
   it('text output prints the labeled fields block', async () => {
     const result = await runCli(['project', 'get', 'project_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -621,7 +651,7 @@ describe('project get subprocess', () => {
 
   it('exits 4 (NOT_FOUND) for an unknown project id', async () => {
     const result = await runCli(['--output', 'json', 'project', 'get', 'project_does_not_exist'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(4);
@@ -635,7 +665,7 @@ describe('test list subprocess', () => {
     const result = await runCli(
       ['--output', 'json', 'test', 'list', '--project', 'project_subproc'],
       {
-        TESTSPRITE_API_KEY: 'sk-subproc',
+        TESTSPRITE_API_KEY: 'sk-user-subproc',
         TESTSPRITE_API_URL: baseUrl,
       },
     );
@@ -651,7 +681,7 @@ describe('test list subprocess', () => {
     const result = await runCli(
       ['--output', 'json', 'test', 'list', '--project', 'project_subproc', '--type', 'frontend'],
       {
-        TESTSPRITE_API_KEY: 'sk-subproc',
+        TESTSPRITE_API_KEY: 'sk-user-subproc',
         TESTSPRITE_API_URL: baseUrl,
       },
     );
@@ -664,7 +694,7 @@ describe('test list subprocess', () => {
     const result = await runCli(
       ['--output', 'json', 'test', 'list', '--project', 'project_subproc', '--type', 'backend'],
       {
-        TESTSPRITE_API_KEY: 'sk-subproc',
+        TESTSPRITE_API_KEY: 'sk-user-subproc',
         TESTSPRITE_API_URL: baseUrl,
       },
     );
@@ -674,7 +704,7 @@ describe('test list subprocess', () => {
 
   it('text output renders header + status column', async () => {
     const result = await runCli(['test', 'list', '--project', 'project_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -695,7 +725,7 @@ describe('test list subprocess', () => {
 
   it('missing --project exits 5 with VALIDATION_ERROR (typed envelope)', async () => {
     const result = await runCli(['--output', 'json', 'test', 'list'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     // Per the CLI error spec §2 ("missing required field" → VALIDATION_ERROR)
@@ -712,7 +742,7 @@ describe('test list subprocess', () => {
   it('--type=junk exits 5 with VALIDATION_ERROR (local validation)', async () => {
     const result = await runCli(
       ['--output', 'json', 'test', 'list', '--project', 'project_subproc', '--type', 'junk'],
-      { TESTSPRITE_API_KEY: 'sk-subproc', TESTSPRITE_API_URL: baseUrl },
+      { TESTSPRITE_API_KEY: 'sk-user-subproc', TESTSPRITE_API_URL: baseUrl },
     );
     expect(result.exitCode).toBe(5);
     const parsed = JSON.parse(result.stderr) as { error: { code: string } };
@@ -723,7 +753,7 @@ describe('test list subprocess', () => {
 describe('test get subprocess', () => {
   it('--output json returns the §6.2 Test shape', async () => {
     const result = await runCli(['--output', 'json', 'test', 'get', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -735,7 +765,7 @@ describe('test get subprocess', () => {
 
   it('text output prints the labeled fields block', async () => {
     const result = await runCli(['test', 'get', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -746,7 +776,7 @@ describe('test get subprocess', () => {
 
   it('exits 4 (NOT_FOUND) for an unknown test id', async () => {
     const result = await runCli(['--output', 'json', 'test', 'get', 'test_does_not_exist'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(4);
@@ -755,10 +785,44 @@ describe('test get subprocess', () => {
   }, 30_000);
 });
 
+describe('AMBIGUOUS_ORG conflict rendering (test get)', () => {
+  it('text mode: exit 6, prints one candidate line per colliding project + a --project hint', async () => {
+    const result = await runCli(['test', 'get', 'test_ambiguous_org'], {
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(6);
+    expect(result.stderr).toContain('resolves in more than one of your organizations');
+    expect(result.stderr).toContain('candidate: project project_a (org org_a)');
+    expect(result.stderr).toContain('candidate: project project_b (org org_b)');
+    expect(result.stderr).toContain('--project <id>');
+  }, 30_000);
+
+  it('--output json: exit 6, error envelope carries code + candidates verbatim', async () => {
+    const result = await runCli(['--output', 'json', 'test', 'get', 'test_ambiguous_org'], {
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(6);
+    const parsed = JSON.parse(result.stderr) as {
+      error: {
+        code: string;
+        details: { reason: string; candidates: Array<{ projectId: string; orgId: string }> };
+      };
+    };
+    expect(parsed.error.code).toBe('AMBIGUOUS_ORG');
+    expect(parsed.error.details.reason).toBe('ambiguous_org');
+    expect(parsed.error.details.candidates).toEqual([
+      { projectId: 'project_a', orgId: 'org_a' },
+      { projectId: 'project_b', orgId: 'org_b' },
+    ]);
+  }, 30_000);
+});
+
 describe('test code get subprocess', () => {
   it('--output json returns the §6.3 TestCode shape', async () => {
     const result = await runCli(['--output', 'json', 'test', 'code', 'get', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -777,7 +841,7 @@ describe('test code get subprocess', () => {
 
   it('text mode prints the inline source body without a JSON envelope', async () => {
     const result = await runCli(['test', 'code', 'get', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -791,7 +855,7 @@ describe('test code get subprocess', () => {
   it('exits 4 (NOT_FOUND) for an unknown test id', async () => {
     const result = await runCli(
       ['--output', 'json', 'test', 'code', 'get', 'test_does_not_exist'],
-      { TESTSPRITE_API_KEY: 'sk-subproc', TESTSPRITE_API_URL: baseUrl },
+      { TESTSPRITE_API_KEY: 'sk-user-subproc', TESTSPRITE_API_URL: baseUrl },
     );
     expect(result.exitCode).toBe(4);
     const parsed = JSON.parse(result.stderr) as { error: { code: string } };
@@ -802,7 +866,7 @@ describe('test code get subprocess', () => {
 describe('test steps subprocess', () => {
   it('--output json returns the §6.4 TestStepList shape', async () => {
     const result = await runCli(['--output', 'json', 'test', 'steps', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -821,7 +885,7 @@ describe('test steps subprocess', () => {
 
   it('text mode renders the step table and shared run metadata', async () => {
     const result = await runCli(['test', 'steps', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -837,7 +901,7 @@ describe('test steps subprocess', () => {
 describe('test result subprocess', () => {
   it('--output json returns the §6.5 LatestResult shape with correlation block', async () => {
     const result = await runCli(['--output', 'json', 'test', 'result', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -861,7 +925,7 @@ describe('test result subprocess', () => {
 
   it('text mode highlights failureKind + failedStepIndex above timestamps', async () => {
     const result = await runCli(['test', 'result', 'test_subproc'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -881,7 +945,7 @@ describe('auth remove subprocess', () => {
   it('removes the profile file entry and exits 0', async () => {
     // First configure a profile (via the consolidated `setup` path)
     const configureResult = await runCli(['setup', '--from-env', '--no-agent'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(configureResult.exitCode).toBe(0);
@@ -895,7 +959,7 @@ describe('auth remove subprocess', () => {
 describe('setup --from-env subprocess', () => {
   it('writes the credentials file with mode 0600', async () => {
     const result = await runCli(['setup', '--from-env', '--no-agent'], {
-      TESTSPRITE_API_KEY: 'sk-mode-test',
+      TESTSPRITE_API_KEY: 'sk-user-mode-test',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(0);
@@ -1070,7 +1134,7 @@ describe('--dry-run subprocess smoke', () => {
   it('auth logout --dry-run does NOT delete credentials', async () => {
     // First configure a real profile so there's something to (not) delete.
     await runCli(['setup', '--from-env', '--no-agent'], {
-      TESTSPRITE_API_KEY: 'sk-keep-me',
+      TESTSPRITE_API_KEY: 'sk-user-keep-me',
       TESTSPRITE_API_URL: baseUrl,
     });
     const credPath = join(tmpHome, '.testsprite', 'credentials');
@@ -1201,7 +1265,7 @@ describe('test artifact get --dry-run subprocess (Item-9 regression)', () => {
 describe('[fix-5] Commander parse errors → exit 5; help/version → exit 0', () => {
   it('`test result` with no test-id argument exits 5', async () => {
     const result = await runCli(['test', 'result'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     // Missing required argument is a VALIDATION_ERROR family error → exit 5.
@@ -1234,7 +1298,7 @@ describe('[fix-5] Commander parse errors → exit 5; help/version → exit 0', (
     // a coding agent parsing stderr does not receive an unexpected plain-text
     // error and crash its JSON.parse.
     const result = await runCli(['--output', 'json', 'test', 'result'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(5);
@@ -1251,7 +1315,7 @@ describe('[fix-5] Commander parse errors → exit 5; help/version → exit 0', (
     // --output json appears before the unknown subcommand, so Commander parses
     // it and program.opts().output is 'json' when the error fires.
     const result = await runCli(['--output', 'json', 'test', 'not-a-real-subcommand'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(5);
@@ -1266,7 +1330,7 @@ describe('[fix-5] Commander parse errors → exit 5; help/version → exit 0', (
     // The error fires before --output json is parsed, so program.opts().output
     // is the default 'text'. The argv fallback scan must still detect json mode.
     const result = await runCli(['test', 'not-a-real-subcommand', '--output', 'json'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(5);
@@ -1279,7 +1343,7 @@ describe('[fix-5] Commander parse errors → exit 5; help/version → exit 0', (
 
   it('text mode: Commander parse error still emits plain text (no regression)', async () => {
     const result = await runCli(['test', 'result'], {
-      TESTSPRITE_API_KEY: 'sk-subproc',
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
       TESTSPRITE_API_URL: baseUrl,
     });
     expect(result.exitCode).toBe(5);

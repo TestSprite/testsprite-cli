@@ -5,15 +5,17 @@
  *
  * Lives under `test/`
  * (not `src/`) to mirror the existing subprocess test pattern — the
- * snapshot runs the real built binary and therefore needs a build in
- * `beforeAll`, the same way `test/cli.subprocess.test.ts` does.
+ * snapshot runs the real built binary. The build itself happens exactly
+ * once in `test/global-setup.ts`, before any test file runs, so
+ * this suite only asserts the binary is there rather than rebuilding it
+ * itself.
  */
 
 import { execFileSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { execNpm } from './helpers/execNpm.js';
+import { assertFreshBuild } from './helpers/assertFreshBuild.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '..');
@@ -42,6 +44,8 @@ const cases: Array<[string, string[]]> = [
   ['test rerun', ['test', 'rerun', '--help']],
   ['test flaky', ['test', 'flaky', '--help']],
   // R5: regression guard for commands that gained new flag wording
+  // Locks the "Plan file format" example + --plan-template pointer
+  ['test create', ['test', 'create', '--help']],
   ['test create-batch', ['test', 'create-batch', '--help']],
   ['test run', ['test', 'run', '--help']],
   // DEV-331 piece 3
@@ -50,7 +54,9 @@ const cases: Array<[string, string[]]> = [
 
 describe('--help snapshots', () => {
   beforeAll(() => {
-    execNpm(['run', 'build'], { cwd: REPO_ROOT, stdio: 'pipe' });
+    // Missing OR stale (watch-mode reruns skip globalSetup's build) → fail
+    // fast instead of snapshotting a binary that isn't the code under test.
+    assertFreshBuild(REPO_ROOT, BIN_PATH);
   });
 
   for (const [name, args] of cases) {
