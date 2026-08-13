@@ -50,7 +50,7 @@ function healthyDeps(credentialsPath: string, extra: Partial<DoctorDeps> = {}): 
     env: {},
     credentialsPath,
     cwd: '/project',
-    nodeVersion: '22.9.0',
+    nodeVersion: '22.13.0',
     existsSync: () => true, // skill landing file present
     fetchImpl: makeFetch(OK_ME),
     ...extra,
@@ -259,17 +259,17 @@ describe('runDoctor — failing checks exit non-zero', () => {
     expect(capture.stdout.join('\n')).toContain('GET /me failed (NOT_FOUND)');
   });
 
-  it('an outdated Node runtime fails the Node.js check', async () => {
+  it('an excluded in-range Node runtime fails the Node.js check', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const rejection = await runDoctor(
       { profile: 'default', output: 'text', debug: false },
-      { ...healthyDeps(credentialsPath, { nodeVersion: '18.0.0' }), ...deps },
+      { ...healthyDeps(credentialsPath, { nodeVersion: '22.9.0' }), ...deps },
     ).catch((error: unknown) => error);
     expect(rejection).toBeInstanceOf(CLIError);
     const out = capture.stdout.join('\n');
     expect(out).toContain('Node.js');
-    expect(out).toContain('below the required Node 20');
+    expect(out).toContain('outside the supported Node range 20.19+, 22.13+, or 24+');
   });
 });
 
@@ -299,7 +299,7 @@ describe('runDoctor — warnings do not fail', () => {
         env: {},
         credentialsPath,
         cwd: '/project',
-        nodeVersion: '22.9.0',
+        nodeVersion: '22.13.0',
         existsSync: () => true,
         fetchImpl,
         ...deps,
