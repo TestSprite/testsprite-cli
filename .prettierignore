@@ -3,6 +3,10 @@ coverage/
 node_modules/
 *.tgz
 package-lock.json
+# ESLint-generated (bulk suppressions baseline) — written/rewritten by
+# `eslint --suppress-all` / `--prune-suppressions`, so leave it in ESLint's own
+# format rather than fighting it with Prettier on every regeneration.
+eslint-suppressions.json
 .claude/worktrees/
 
 # Internal design docs (dropped wholesale from the public snapshot) — not Prettier-governed

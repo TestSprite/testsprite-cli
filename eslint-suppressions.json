@@ -1,0 +1,147 @@
+{
+  "src/commands/agent.test.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 7
+    }
+  },
+  "src/commands/agent.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 4
+    }
+  },
+  "src/commands/project.test.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 3
+    }
+  },
+  "src/commands/project.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 6
+    }
+  },
+  "src/commands/test.artifact.spec.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 12
+    }
+  },
+  "src/commands/test.cancel.spec.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 2
+    }
+  },
+  "src/commands/test.create-batch-run.spec.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 3
+    }
+  },
+  "src/commands/test.flaky.spec.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 2
+    }
+  },
+  "src/commands/test.quickwins.spec.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 20
+    }
+  },
+  "src/commands/test.rerun.closure-fanout.spec.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 2
+    }
+  },
+  "src/commands/test.rerun.spec.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 3
+    }
+  },
+  "src/commands/test.result.history.spec.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 2
+    }
+  },
+  "src/commands/test.run.spec.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 4
+    }
+  },
+  "src/commands/test.test.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 92
+    }
+  },
+  "src/commands/test.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 29
+    }
+  },
+  "src/commands/test.wait.spec.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 2
+    }
+  },
+  "src/lib/agent-targets.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 1
+    }
+  },
+  "src/lib/bundle.commit.test.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 19
+    }
+  },
+  "src/lib/bundle.test.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 18
+    }
+  },
+  "src/lib/bundle.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 23
+    }
+  },
+  "src/lib/credentials.test.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 17
+    }
+  },
+  "src/lib/credentials.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 14
+    }
+  },
+  "src/lib/junit-report.test.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 4
+    }
+  },
+  "src/lib/junit-report.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 6
+    }
+  },
+  "src/lib/plan-schema.spec.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 1
+    }
+  },
+  "src/lib/skill-nudge.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 1
+    }
+  },
+  "src/lib/telemetry.spec.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 2
+    }
+  },
+  "src/lib/update-check.test.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 1
+    }
+  },
+  "src/lib/update-check.ts": {
+    "security/detect-non-literal-fs-filename": {
+      "count": 3
+    }
+  }
+}
