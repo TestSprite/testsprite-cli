@@ -276,6 +276,57 @@ describe('createTicker — terminal width', () => {
       expect(lines[0]).not.toContain('\x1b[2K');
     });
   });
+
+  it('measures wide glyphs by display columns', () => {
+    withStderrColumns(32, () => {
+      const raw: string[] = [];
+      const ticker = createTicker(
+        () => {},
+        true,
+        text => raw.push(text),
+        false,
+      );
+
+      ticker.update('界界界界');
+
+      const rendered = raw[0]!.slice('\x1b[2K\r'.length);
+      expect(rendered.slice(rendered.indexOf(' ') + 1)).toBe('界界…');
+    });
+  });
+
+  it('does not split an emoji grapheme cluster', () => {
+    withStderrColumns(29, () => {
+      const raw: string[] = [];
+      const ticker = createTicker(
+        () => {},
+        true,
+        text => raw.push(text),
+        false,
+      );
+
+      ticker.update('👨‍👩‍👧‍👦xx');
+
+      const rendered = raw[0]!.slice('\x1b[2K\r'.length);
+      expect(rendered.slice(rendered.indexOf(' ') + 1)).toBe('👨‍👩‍👧‍👦…');
+    });
+  });
+
+  it('keeps combining sequences intact and counts them as one column', () => {
+    withStderrColumns(29, () => {
+      const raw: string[] = [];
+      const ticker = createTicker(
+        () => {},
+        true,
+        text => raw.push(text),
+        false,
+      );
+
+      ticker.update('e\u0301e\u0301xx');
+
+      const rendered = raw[0]!.slice('\x1b[2K\r'.length);
+      expect(rendered.slice(rendered.indexOf(' ') + 1)).toBe('e\u0301e\u0301…');
+    });
+  });
 });
 
 describe('createTicker — default isTTY detection', () => {
