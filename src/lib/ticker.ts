@@ -42,7 +42,12 @@ const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme
 const markPattern = /^\p{Mark}$/u;
 const emojiPattern = /\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20e3/u;
 
-/** Return whether a Unicode code point normally occupies two terminal columns. */
+/**
+ * Return whether a Unicode code point normally occupies two terminal columns.
+ *
+ * @param codePoint - Unicode scalar value to classify.
+ * @returns Whether the code point is full-width in a terminal.
+ */
 function isFullwidthCodePoint(codePoint: number): boolean {
   return (
     codePoint >= 0x1100 &&
@@ -62,7 +67,12 @@ function isFullwidthCodePoint(codePoint: number): boolean {
   );
 }
 
-/** Measure one grapheme cluster in terminal display columns. */
+/**
+ * Measure one grapheme cluster in terminal display columns.
+ *
+ * @param grapheme - User-perceived character produced by the segmenter.
+ * @returns The number of terminal columns occupied by the grapheme.
+ */
 function graphemeWidth(grapheme: string): number {
   if (emojiPattern.test(grapheme)) return 2;
 
@@ -84,7 +94,12 @@ function graphemeWidth(grapheme: string): number {
   return width;
 }
 
-/** Measure a complete string in terminal display columns. */
+/**
+ * Measure a complete string in terminal display columns.
+ *
+ * @param text - Text to measure.
+ * @returns The number of terminal columns occupied by the text.
+ */
 function terminalWidth(text: string): number {
   let width = 0;
   for (const { segment } of graphemeSegmenter.segment(text)) {
