@@ -8826,6 +8826,18 @@ export async function runTestRerun(
     } catch (err) {
       if (err instanceof TimeoutError) {
         ticker.finalize(`Run ${rerunResp.runId} — timed out after ${opts.timeoutSeconds}s`);
+        // Mirror the RequestTimeoutError path: emit a partial run to stdout so
+        // JSON consumers and AI agents can grab the runId and chain into
+        // `testsprite test wait <runId>` without parsing the stderr error envelope.
+        const timeoutPartial = { runId: rerunResp.runId, status: 'running' as const };
+        out.print(timeoutPartial, data => {
+          const p = data as typeof timeoutPartial;
+          return [
+            `runId       ${p.runId}`,
+            `status      ${p.status} (timed out after ${opts.timeoutSeconds}s)`,
+            `hint        Re-attach with: testsprite test wait ${p.runId}`,
+          ].join('\n');
+        });
         throw ApiError.fromEnvelope({
           error: {
             code: 'UNSUPPORTED',
