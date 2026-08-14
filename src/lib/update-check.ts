@@ -4,25 +4,25 @@
  * result cached on disk, advisory printed to stderr so stdout stays parseable.
  *
  * Behavior (`maybeNotifyUpdate`):
- *   1. Gate through `shouldCheckForUpdate`; every gate below must pass.
- *   2. Probe the npm registry for the `latest` dist-tag (1.5s hard timeout).
- *   3. Stamp the cache with `lastCheckMs` (plus `latestKnown` when the probe
- *      succeeded) so the next 24h of invocations skip the network entirely.
- *      The stamp happens even after a failed probe: a dead registry must not
- *      trigger a retry on every command.
- *   4. When `latest` is strictly newer than the running version, write exactly
- *      one advisory line to stderr. The function never throws or rejects and
- *      never alters the exit status of the command it rides along with.
+ * 1. Gate through `shouldCheckForUpdate`; every gate below must pass.
+ * 2. Probe the npm registry for the `latest` dist-tag (1.5s hard timeout).
+ * 3. Stamp the cache with `lastCheckMs` (plus `latestKnown` when the probe
+ * succeeded) so the next 24h of invocations skip the network entirely.
+ * The stamp happens even after a failed probe: a dead registry must not
+ * trigger a retry on every command.
+ * 4. When `latest` is strictly newer than the running version, write exactly
+ * one advisory line to stderr. The function never throws or rejects and
+ * never alters the exit status of the command it rides along with.
  *
  * Gates, in order (`shouldCheckForUpdate`):
- *   - `TESTSPRITE_NO_UPDATE_NOTIFIER` set to any non-empty value: opted out.
- *     Presence-style, mirroring gh's GH_NO_UPDATE_NOTIFIER: even "0" disables.
- *   - `CI` set to anything except the literal "false": CI logs are not the
- *     place for update nags. `CI=false` explicitly re-enables the notice.
- *   - stderr is not a TTY: piped or redirected output stays clean.
- *   - the on-disk cache is fresh (last probe within the TTL). A missing,
- *     unreadable, corrupt, or wrong-shape cache counts as stale, and so does a
- *     `lastCheckMs` in the future (clock rollback or corrupt data).
+ * - `TESTSPRITE_NO_UPDATE_NOTIFIER` set to any non-empty value: opted out.
+ * Presence-style, mirroring gh's GH_NO_UPDATE_NOTIFIER: even "0" disables.
+ * - `CI` set to anything except the literal "false": CI logs are not the
+ * place for update nags. `CI=false` explicitly re-enables the notice.
+ * - stderr is not a TTY: piped or redirected output stays clean.
+ * - the on-disk cache is fresh (last probe within the TTL). A missing,
+ * unreadable, corrupt, or wrong-shape cache counts as stale, and so does a
+ * `lastCheckMs` in the future (clock rollback or corrupt data).
  *
  * Why not the npm `update-notifier` package: this CLI's runtime dependency
  * budget is commander + valibot only (package.json). `update-notifier` would
@@ -117,6 +117,10 @@ function resolveUpdateCheckDeps(deps: UpdateCheckDeps): ResolvedUpdateCheckDeps 
   };
 }
 
+function isDebugLoggingEnabled(argv: string[] = process.argv): boolean {
+  return argv.includes('--debug') || argv.includes('--verbose');
+}
+
 /**
  * Read and validate the cache file. Every failure mode (missing file,
  * unreadable file, invalid JSON, wrong shape) returns undefined, which the
@@ -128,7 +132,10 @@ function readUpdateCheckCache(resolved: ResolvedUpdateCheckDeps): UpdateCheckCac
     const body: unknown = JSON.parse(raw);
     const parsed = v.safeParse(UPDATE_CHECK_CACHE_SCHEMA, body);
     return parsed.success ? parsed.output : undefined;
-  } catch {
+  } catch (err) {
+    if (isDebugLoggingEnabled()) {
+      resolved.stderr(`[debug] readUpdateCheckCache: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
     // Missing or unreadable cache: treat as stale.
     return undefined;
   }
@@ -143,7 +150,10 @@ function writeUpdateCheckCache(resolved: ResolvedUpdateCheckDeps, cache: UpdateC
   try {
     resolved.mkdir(dirname(resolved.cachePath));
     resolved.writeFile(resolved.cachePath, `${JSON.stringify(cache)}\n`);
-  } catch {
+  } catch (err) {
+    if (isDebugLoggingEnabled()) {
+      resolved.stderr(`[debug] writeUpdateCheckCache: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
     // Cache persistence is optional; never surface fs errors to the command.
   }
 }
