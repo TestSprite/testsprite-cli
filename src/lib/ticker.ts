@@ -37,6 +37,25 @@ export function isNoColor(env: NodeJS.ProcessEnv = process.env): boolean {
   return typeof value === 'string' && value.length > 0;
 }
 
+const DEFAULT_TERMINAL_COLUMNS = 80;
+
+/**
+ * Keep a ticker frame inside the terminal's last safe column. Terminal width is
+ * read for every frame so an in-progress ticker follows live resizes.
+ */
+function fitToTerminal(line: string): string {
+  const reportedColumns = typeof process !== 'undefined' ? process.stderr.columns : undefined;
+  const columns =
+    typeof reportedColumns === 'number' && Number.isFinite(reportedColumns) && reportedColumns > 0
+      ? Math.floor(reportedColumns)
+      : DEFAULT_TERMINAL_COLUMNS;
+  const maxLength = Math.max(0, columns - 1);
+
+  if (line.length <= maxLength) return line;
+  if (maxLength === 0) return '';
+  return `${line.slice(0, maxLength - 1)}…`;
+}
+
 /**
  * Create a ticker bound to the given stderr writer. Respects
  * `isTTY` to silently no-op in CI environments.
@@ -78,13 +97,13 @@ export function createTicker(
     // TTY but NO_COLOR: emit plain-text lines without ANSI escape sequences.
     return {
       update(line: string): void {
-        const stamped = `${new Date().toISOString()} ${line}`;
+        const stamped = fitToTerminal(`${new Date().toISOString()} ${line}`);
         stderrWrite(stamped);
         lastLength = stamped.length;
       },
       finalize(line?: string): void {
         if (line !== undefined) {
-          const stamped = `${new Date().toISOString()} ${line}`;
+          const stamped = fitToTerminal(`${new Date().toISOString()} ${line}`);
           stderrWrite(stamped);
           lastLength = stamped.length;
         }
@@ -96,13 +115,13 @@ export function createTicker(
   return {
     update(line: string): void {
       // ANSI ESC[2K clears the entire line; \r moves to column 0.
-      const stamped = `${new Date().toISOString()} ${line}`;
+      const stamped = fitToTerminal(`${new Date().toISOString()} ${line}`);
       rawWrite(`\x1b[2K\r${stamped}`);
       lastLength = stamped.length;
     },
     finalize(line?: string): void {
       if (line !== undefined) {
-        const stamped = `${new Date().toISOString()} ${line}`;
+        const stamped = fitToTerminal(`${new Date().toISOString()} ${line}`);
         rawWrite(`\x1b[2K\r${stamped}`);
         lastLength = stamped.length;
       }
