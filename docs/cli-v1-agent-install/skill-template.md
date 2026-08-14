@@ -173,6 +173,10 @@ blue 'Submit' button"`. The agent does its own semantic match; a guessed label
 - **1–2 assertions, at the end, on content existence** rather than UI copy /
   formatting. (Quoting a literal you submitted earlier in the same plan, to verify
   it round-trips, is fine.)
+- **Keep each assertion single and decisive.** Avoid conditional or multi-branch
+  wording such as "either A or B", "if A then B", `unless`, or `whether` — it can
+  exhaust the frontend run budget before a verdict is emitted. `test lint` warns
+  on these patterns before the plan consumes run credits.
 - **Assertion targets name the specific page region** (panel / tab / output area).
   Otherwise the agent settles for "some element with that text is visible
   anywhere," which passes for wrong reasons.
