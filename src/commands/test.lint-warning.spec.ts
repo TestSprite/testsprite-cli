@@ -40,6 +40,38 @@ describe('runLint assertion-complexity warnings', () => {
     ]);
   });
 
+  it('keeps text warnings on stderr and stdout machine-safe', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-warning-streams-'));
+    const file = join(dir, 'plan.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'Knowledge Web renders',
+        planSteps: [
+          {
+            type: 'assertion',
+            description: 'Verify either an interactive graph canvas or a clear empty-state message',
+          },
+        ],
+      }),
+      'utf8',
+    );
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+
+    await runLint(
+      { profile: 'default', output: 'text', debug: false, planFrom: file },
+      { stdout: line => stdout.push(line), stderr: line => stderr.push(line) },
+    );
+
+    expect(stdout.join('\n')).toBe('1/1 valid, 0 problem(s)');
+    expect(stdout.join('\n')).not.toContain('[warning]');
+    expect(stderr.join('\n')).toContain('[warning]');
+    expect(stderr.at(-1)).toBe('1 warning(s)');
+  });
+
   it('does not flag actions or single-outcome assertions', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cli-lint-decisive-'));
     const file = join(dir, 'plan.json');
