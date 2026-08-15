@@ -4940,12 +4940,17 @@ export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<C
     issues,
     ...(warnings.length > 0 ? { warnings } : {}),
   };
+  if (opts.output === 'text' && warnings.length > 0) {
+    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    for (const warning of warnings) {
+      stderr(`[warning] ${warning.file}: ${warning.field}: ${warning.reason}`);
+    }
+    stderr(`${warnings.length} warning(s)`);
+  }
   out.print(report, () =>
     [
       ...issues.map(issue => `${issue.file}: ${issue.field}: ${issue.reason}`),
-      ...warnings.map(warning => `[warning] ${warning.file}: ${warning.field}: ${warning.reason}`),
-      `${report.valid}/${report.checked} valid, ${issues.length} problem(s)` +
-        (warnings.length > 0 ? `, ${warnings.length} warning(s)` : ''),
+      `${report.valid}/${report.checked} valid, ${issues.length} problem(s)`,
     ].join('\n'),
   );
   if (issues.length > 0) {
