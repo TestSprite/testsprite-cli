@@ -376,6 +376,11 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+  // tmpHome accumulates a real (if fake-valued) credentials file across this
+  // suite's `auth configure` / `setup` runs — remove it so the suite doesn't
+  // leave one directory behind per test run. Guarded: if `beforeAll` threw
+  // before assigning it, there is nothing to remove.
+  if (tmpHome) rmSync(tmpHome, { recursive: true, force: true });
 });
 
 interface SpawnResult {

@@ -445,6 +445,44 @@ describe('findSample', () => {
     expect(body.stepSummary.failedCount).toBe(0);
   });
 
+  it('GET /runs/run_failed_sample resolves to the sentinel failed run-scoped step sample', () => {
+    const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/runs/run_failed_sample');
+    expect(e?.operationId).toBe('getRun');
+    const body = e?.body() as {
+      status: string;
+      runId: string;
+      failedStepIndex: number | null;
+      failureKind: string | null;
+      error: string | null;
+      stepSummary: { total: number; completed: number; passedCount: number; failedCount: number };
+      steps: Array<{
+        stepIndex: string;
+        type: string;
+        status: string | null;
+        error: string | null;
+      }>;
+    };
+    expect(body.runId).toBe('run_failed_sample');
+    expect(body.status).toBe('failed');
+    expect(body.failedStepIndex).toBe(3);
+    expect(body.failureKind).toBe('assertion');
+    expect(body.error).toEqual(expect.any(String));
+    expect(body.stepSummary).toMatchObject({
+      total: 3,
+      completed: 3,
+      passedCount: 2,
+      failedCount: 1,
+    });
+
+    const failingStep = body.steps.find(step => step.stepIndex === '0003');
+    expect(failingStep).toMatchObject({
+      type: 'assertion',
+      status: 'failed',
+      error: expect.any(String),
+    });
+    expect(failingStep?.error).not.toBe('');
+  });
+
   // DEV-331 piece 3: POST /runs/{runId}/cancel must resolve to `cancelRun`,
   // never fall through to the GET-only `getRun` entry despite sharing the
   // `/runs/{runId}` path prefix — findSample filters by method first.
@@ -562,13 +600,23 @@ describe('findSample', () => {
     expect(body.summary.total).toBeGreaterThanOrEqual(1);
   });
 
-  it('only one getRun entry exists in the registry (no duplicate)', () => {
-    // Guards against re-introducing the duplicate by ensuring exactly one
-    // sample is registered for GET /runs/{runId}.
-    const matches = DRY_RUN_SAMPLE_ENTRIES.filter(
-      e => e.method === 'GET' && e.operationId === 'getRun',
+  it('keeps the failed run sentinel before generic getRun while retaining cancelRun', () => {
+    // findSample is first-match-wins; exact run fixtures must precede
+    // `/runs/{runId}` so `test wait --dry-run` still gets the passed sample.
+    // The adjacent POST cancel fixture was added on main after this branch forked.
+    const failedRunIndex = DRY_RUN_SAMPLE_ENTRIES.findIndex(
+      e => e.method === 'GET' && e.pathTemplate === '/runs/run_failed_sample',
     );
-    expect(matches).toHaveLength(1);
+    const genericRunIndex = DRY_RUN_SAMPLE_ENTRIES.findIndex(
+      e => e.method === 'GET' && e.pathTemplate === '/runs/{runId}',
+    );
+    const cancelRunIndex = DRY_RUN_SAMPLE_ENTRIES.findIndex(
+      e => e.method === 'POST' && e.pathTemplate === '/runs/{runId}/cancel',
+    );
+    expect(failedRunIndex).toBeGreaterThanOrEqual(0);
+    expect(genericRunIndex).toBeGreaterThanOrEqual(0);
+    expect(cancelRunIndex).toBeGreaterThanOrEqual(0);
+    expect(failedRunIndex).toBeLessThan(genericRunIndex);
   });
 
   // Input-derived sample tests (Fix #1 — dogfood 2026-05-15)

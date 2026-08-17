@@ -12,6 +12,7 @@ import {
   emitGithubOutputs,
   renderJobSummaryMarkdown,
   summarizeAcceptedPayload,
+  summarizeSingleRun,
   type CiSummary,
 } from './gh-output.js';
 
@@ -57,6 +58,85 @@ describe('summarizeAcceptedPayload', () => {
     expect(mixed.total).toBe(1);
     expect(mixed.runs[0]).toMatchObject({ testId: 'test_ok', status: 'passed' });
   });
+
+  it('folds deferred/conflicts/notFound into non-passed rows — a partial batch is not green', () => {
+    const summary = summarizeAcceptedPayload(
+      JSON.stringify({
+        accepted: [{ testId: 'test_a', runId: 'run_a', status: 'passed' }],
+        deferred: [{ testId: 'test_d' }],
+        conflicts: [{ testId: 'test_c', currentRunId: 'run_x' }],
+        notFound: ['test_nf'],
+      }),
+    );
+    // 1 accepted-passed + 3 not-dispatched → NOT reported as "1/1 passed".
+    expect(summary).toMatchObject({ total: 4, passed: 1, timedOut: 0 });
+    expect(summary.failed).toBe(3);
+    expect(summary.runs.map(r => r.status)).toEqual([
+      'passed',
+      'deferred',
+      'conflict',
+      'not_found',
+    ]);
+    // conflict carries the in-flight runId; each incomplete row explains itself.
+    expect(summary.runs[2]).toMatchObject({ testId: 'test_c', runId: 'run_x', status: 'conflict' });
+    expect(summary.runs[1]!.error).toContain('deferred');
+    expect(summary.runs[3]).toMatchObject({ testId: 'test_nf', status: 'not_found' });
+  });
+
+  it('an all-passed batch with empty buckets is unchanged (backward compatible)', () => {
+    const summary = summarizeAcceptedPayload(
+      JSON.stringify({
+        accepted: [{ testId: 'test_a', runId: 'run_a', status: 'passed' }],
+        deferred: [],
+        conflicts: [],
+        notFound: [],
+      }),
+    );
+    expect(summary).toMatchObject({ total: 1, passed: 1, failed: 0, timedOut: 0 });
+  });
+});
+
+describe('summarizeSingleRun', () => {
+  it('reduces a passed single run to a one-row summary', () => {
+    const summary = summarizeSingleRun({
+      testId: 'test_a',
+      runId: 'run_a',
+      status: 'passed',
+      dashboardUrl: 'https://portal.example.com/a',
+      error: null,
+    });
+    expect(summary).toMatchObject({ total: 1, passed: 1, failed: 0, timedOut: 0 });
+    expect(summary.runs).toHaveLength(1);
+    expect(summary.runs[0]).toMatchObject({
+      testId: 'test_a',
+      runId: 'run_a',
+      status: 'passed',
+      dashboardUrl: 'https://portal.example.com/a',
+    });
+    expect(summary.runs[0]!.error).toBeUndefined();
+  });
+
+  it('carries the raw error string (RunResponse.error is a string, not {message})', () => {
+    const summary = summarizeSingleRun({
+      testId: 'test_b',
+      runId: 'run_b',
+      status: 'failed',
+      dashboardUrl: null,
+      error: 'assertion failed at step 2',
+    });
+    expect(summary).toMatchObject({ total: 1, passed: 0, failed: 1, timedOut: 0 });
+    expect(summary.runs[0]).toMatchObject({ testId: 'test_b', status: 'failed' });
+    expect(summary.runs[0]!.error).toBe('assertion failed at step 2');
+    expect(summary.runs[0]!.dashboardUrl).toBeUndefined();
+  });
+
+  it('omits empty error / null dashboardUrl and defaults a missing status', () => {
+    const summary = summarizeSingleRun({ testId: 'test_c', runId: 'run_c', error: '' });
+    expect(summary.runs[0]).toMatchObject({ testId: 'test_c', status: 'unknown' });
+    expect(summary.runs[0]!.error).toBeUndefined();
+    // a non-passed, non-timeout status counts as failed
+    expect(summary).toMatchObject({ total: 1, passed: 0, failed: 1 });
+  });
 });
 
 describe('renderJobSummaryMarkdown', () => {
@@ -65,6 +145,31 @@ describe('renderJobSummaryMarkdown', () => {
     expect(md).toContain('**1/3 passed** (1 failed, 1 timed out)');
     expect(md).toContain('| test_a | passed | [dashboard](https://portal.example.com/a) |');
     expect(md).toContain('| test_c | timeout | run_c |');
+  });
+
+  it('escapes cell content so a pipe / newline / paren cannot break or inject table rows', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 1,
+      passed: 0,
+      failed: 1,
+      timedOut: 0,
+      runs: [
+        {
+          testId: 'evil|id\n✅ fake passed',
+          status: 'failed',
+          dashboardUrl: 'https://x.example.com/a(b)c',
+        },
+      ],
+    });
+    // The whole run renders as exactly ONE table row (no injected lines).
+    const rowLines = md.split('\n').filter(l => l.startsWith('| ') && !l.startsWith('| ---'));
+    // header row + the single data row
+    expect(rowLines).toHaveLength(2);
+    const dataRow = rowLines[1]!;
+    expect(dataRow).not.toContain('\n');
+    expect(dataRow).toContain('evil\\|id'); // pipe escaped
+    expect(dataRow).not.toContain('✅ fake passed\n'); // newline neutralized to a space
+    expect(dataRow).toContain('%28b%29'); // parens in the URL percent-encoded
   });
 });
 
@@ -130,6 +235,37 @@ describe('emitGithubOutputs', () => {
     const annotations = forced.stdout.filter(line => line.startsWith('::error'));
     expect(annotations).toHaveLength(2);
     expect(forced.appended).toHaveLength(0);
+  });
+
+  it('escapes raw errors and ids so a run error cannot inject a second workflow command', () => {
+    const { stdout, sinks } = makeSinks();
+    const malicious: CiSummary = {
+      total: 1,
+      passed: 0,
+      failed: 1,
+      timedOut: 0,
+      runs: [
+        {
+          testId: 'evil:id,x',
+          runId: 'run_x',
+          status: 'failed',
+          error: 'line1\n::add-mask::supersecret\n::stop-commands::abc',
+        },
+      ],
+    };
+    emitGithubOutputs(malicious, { GITHUB_ACTIONS: 'true' }, sinks);
+    // One annotate() call → one array element; the invariant that neutralizes
+    // the injection is that the string carries NO raw newline (so the embedded
+    // ::add-mask:: / ::stop-commands:: sit mid-line, where Actions does not
+    // parse them as commands) — the newline is percent-encoded instead.
+    expect(stdout).toHaveLength(1);
+    const line = stdout[0]!;
+    expect(line.startsWith('::error')).toBe(true);
+    expect(line).not.toContain('\n');
+    expect(line).not.toContain('\r');
+    expect((line.match(/%0A/g) ?? []).length).toBe(2); // both newlines encoded
+    // testId ':' and ',' are property-escaped in the title.
+    expect(line).toContain('title=TestSprite evil%3Aid%2Cx::');
   });
 
   it('a dedicated annotations sink diverts workflow commands off the primary stdout', () => {

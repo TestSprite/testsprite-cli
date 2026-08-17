@@ -505,11 +505,16 @@ testsprite test run --all --project proj_xxxxxxxx --wait \
 # Optional custom suite name (default: testsprite:<projectId>)
 testsprite test run --all --project proj_xxxxxxxx --wait \
   --report junit --report-file ./results.xml --report-suite-name my-ci-suite --output json
+
+# GitHub-native CI output: ::error:: annotations + job-summary table + machine summary
+testsprite test run test_xxxxxxxx --wait --summary-file ./summary.json --output json
 ```
 
 Batch `--report` flags apply only to `test run --all --wait` (and batch `test rerun --wait`). `--report junit --report-file <path>` writes a JUnit XML sidecar after polling completes (atomic write); `--output json` is unchanged. Optional `--report-suite-name <name>` overrides the default `testsprite:<projectId>` suite name.
 
-`--target-url` must be a publicly reachable URL — the CLI pre-flights it against local addresses (`localhost`, `127.x`, `::1`, `0.0.0.0`, `169.254.x`, RFC1918) and the backend resolves it via DNS. For testing against localhost, use the [TestSprite MCP plugin](https://www.testsprite.com/docs), which handles the local tunnel. The CLI auto-mints an idempotency key (printed to stderr under `--output json`, `--verbose`, or `--debug`); pass `--idempotency-key <uuid>` to control it explicitly.
+**GitHub-native CI output** (contributed in [#264](https://github.com/TestSprite/testsprite-cli/pull/264)): when `GITHUB_ACTIONS=true`, any `test run --wait` (single test or `--all`) and any batch `test rerun --wait` additionally emit one `::error::` workflow-command line per non-passed run (annotating the PR checks tab) and append a Markdown results table to the job summary (`$GITHUB_STEP_SUMMARY`). Pass `--gh-output` to force the annotations outside Actions (previewable locally), and `--summary-file <path>` to also write the reduced machine summary JSON (`{total, passed, failed, timedOut, runs[]}`). Everything is written even when the command exits non-zero, and every write is best-effort — a failed write never changes the exit code. Tests that never dispatched (rate-deferred, conflicted, not found) appear as non-passed rows, so a partial batch cannot read as all-passed. Annotation and table content is escaped, so run-error text cannot inject workflow commands or break the table.
+
+`--target-url` must be a publicly reachable URL — the CLI pre-flights it against local addresses (`localhost`, `127.x`, `::1`, `0.0.0.0`, `169.254.x`, RFC1918) and the backend resolves it via DNS. For testing against localhost, use the [TestSprite MCP plugin](https://www.testsprite.com/docs), which handles the local tunnel. On a V3-routed account (`testsprite auth status` shows `routing: v3`), `--target-url` is currently **not applied** — V3 resolves the run's environment from the project configuration at execution time, so the run executes against the configured URL and the CLI prints an `[advisory]` on stderr saying so. The CLI auto-mints an idempotency key (printed to stderr under `--output json`, `--verbose`, or `--debug`); pass `--idempotency-key <uuid>` to control it explicitly.
 
 #### `testsprite test rerun [test-id...]`
 
@@ -551,6 +556,7 @@ Flags:
 - `--max-concurrency <n>` — with `--wait`, cap on in-flight polls during a batch rerun.
 - `--idempotency-key <key>` — auto-minted when omitted (the minted key is printed to stderr under `--output json`, `--verbose`, or `--debug`).
 - `--report junit --report-file <path>` — with batch `--wait`, write a JUnit XML sidecar after polling (atomic write). Optional `--report-suite-name <name>` overrides the default `testsprite:<projectId>` suite name. Requires `--wait`; not available on single-test reruns.
+- `--gh-output` / `--summary-file <path>` — with batch `--wait`: GitHub-native CI output, same behavior as on `test run` (see above) — `::error::` annotations per non-passed run, a job-summary table under GitHub Actions, and the reduced machine summary JSON. Not available on single-test reruns.
 
 A batch rerun returns `accepted[]` (one `runId` per dispatched test) plus `deferred[]` for any test shed by the per-key run-rate limit; under `--wait`, a non-empty `deferred[]` exits 7 with a `nextAction` you can retry with a fresh idempotency key.
 

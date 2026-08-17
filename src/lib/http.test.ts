@@ -33,6 +33,7 @@ function makeClient(
     apiKey?: string | null;
     onDebug?: (e: DebugEvent) => void;
     onServerVersion?: (info: { minVersion?: string }) => void;
+    maxResponseBytes?: number;
   } = {},
 ): HttpClient {
   const apiKey = 'apiKey' in options ? (options.apiKey ?? undefined) : 'sk-test';
@@ -44,8 +45,60 @@ function makeClient(
     random: () => 0,
     onDebug: options.onDebug,
     onServerVersion: options.onServerVersion,
+    maxResponseBytes: options.maxResponseBytes,
   });
 }
+
+describe('response size guard (maxResponseBytes)', () => {
+  it('rejects a response whose Content-Length exceeds the cap', async () => {
+    // jsonResponse sets a real Content-Length; a 50-byte cap is well under it.
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ blob: 'x'.repeat(500) }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch, { maxResponseBytes: 50 });
+
+    const err = await client.get('/tests').catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('PAYLOAD_TOO_LARGE');
+    expect((err as ApiError).exitCode).toBe(5);
+    expect((err as ApiError).getDetail('maxBytes')).toBe(50);
+  });
+
+  it('rejects an over-cap chunked response that has no Content-Length', async () => {
+    // A body built from a ReadableStream carries no Content-Length, so only the
+    // streaming byte-counter can catch it.
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('{"data":"'));
+        controller.enqueue(encoder.encode('y'.repeat(500)));
+        controller.enqueue(encoder.encode('"}'));
+        controller.close();
+      },
+    });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(stream, { status: 200, headers: { 'content-type': 'application/json' } }),
+      );
+    const client = makeClient(fetchImpl as unknown as typeof fetch, { maxResponseBytes: 50 });
+
+    const err = await client.get('/tests').catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('PAYLOAD_TOO_LARGE');
+  });
+
+  it('reads a within-cap response unchanged', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ ok: true, items: [1, 2, 3] }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch, {
+      maxResponseBytes: 1_000_000,
+    });
+
+    const body = await client.get<{ ok: boolean; items: number[] }>('/tests');
+
+    expect(body).toEqual({ ok: true, items: [1, 2, 3] });
+  });
+});
 
 describe('CLIENT_TOO_OLD (426)', () => {
   it('is not retried — fails fast with the typed error', async () => {
@@ -745,7 +798,12 @@ describe('HttpClient per-request timeout', () => {
       return {
         ok: true,
         status: 200,
-        json: () => Promise.reject(timeoutErr),
+        headers: new Headers(),
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(timeoutErr);
+          },
+        }),
       } as unknown as Response;
     });
     const client = new HttpClient({

@@ -24,10 +24,10 @@
  * regression escapes to dev.
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { makeTempDir } from '../helpers/tempDir.js';
 import { runCodeGet, runResult, runSteps } from '../../src/commands/test.js';
 import {
   failureContextFixture,
@@ -83,6 +83,8 @@ const LATEST_RESULT_REQUIRED = [
   'targetUrl',
   'failedStepIndex',
   'failureKind',
+  'verdict',
+  'executionStatus',
   'summary',
 ] as const;
 // `targetUrlSource` (D1) is OPTIONAL — present on backends that shipped the D1
@@ -108,6 +110,15 @@ const FAILURE_KINDS = new Set<unknown>([
   'infra',
   'unknown',
   null,
+]);
+const VERDICTS = new Set<unknown>(['passed', 'failed', 'blocked', 'cancelled', 'unknown', null]);
+const EXECUTION_STATUSES = new Set<unknown>([
+  'queued',
+  'running',
+  'completed',
+  'cancelled',
+  'error',
+  'unknown',
 ]);
 
 function expectKeysMatch(value: Record<string, unknown>, allowed: Set<string>, label: string) {
@@ -178,17 +189,6 @@ function validateTestStepList(value: unknown, label = 'TestStepList'): void {
   }
 }
 
-function validateResultSummary(value: unknown, label: string): void {
-  expect(value, label).toBeTypeOf('object');
-  expect(value, label).not.toBeNull();
-  const obj = value as Record<string, unknown>;
-  expectKeysMatch(obj, new Set(['passed', 'failed', 'skipped']), label);
-  for (const k of ['passed', 'failed', 'skipped']) {
-    expect(typeof obj[k], `${label}.${k}`).toBe('number');
-    expect((obj[k] as number) >= 0, `${label}.${k} >= 0`).toBe(true);
-  }
-}
-
 function validateLatestResult(value: unknown, label = 'LatestResult'): void {
   expect(value, `${label}: must be an object`).toBeTypeOf('object');
   expect(value, `${label}: must not be null`).not.toBeNull();
@@ -215,7 +215,9 @@ function validateLatestResult(value: unknown, label = 'LatestResult'): void {
     expect((obj.failedStepIndex as number) >= 1, `${label}.failedStepIndex >= 1`).toBe(true);
   }
   expect(FAILURE_KINDS.has(obj.failureKind), `${label}.failureKind`).toBe(true);
-  validateResultSummary(obj.summary, `${label}.summary`);
+  expect(VERDICTS.has(obj.verdict), `${label}.verdict`).toBe(true);
+  expect(EXECUTION_STATUSES.has(obj.executionStatus), `${label}.executionStatus`).toBe(true);
+  expect(typeof obj.summary, `${label}.summary`).toBe('string');
 }
 
 describe('P4 schema contract — fixtures match the OpenAPI shapes', () => {
@@ -269,10 +271,14 @@ describe('P4 schema contract — fixtures match the OpenAPI shapes', () => {
 // CLI's typed contract matches the wire shape." If a runner ever
 // silently omits or coerces a field, this fails.
 
+// Every makeCreds() call gets its own temp dir; each is registered here and
+// swept in afterEach so a failing assertion mid-test still leaves nothing behind.
+const pendingCredsCleanups: Array<() => void> = [];
+
 function makeCreds(): { credentialsPath: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'cli-p4-contract-'));
-  const credentialsPath = join(dir, 'credentials');
-  mkdirSync(dir, { recursive: true });
+  const dir = makeTempDir('cli-p4-contract-');
+  pendingCredsCleanups.push(dir.cleanup);
+  const credentialsPath = join(dir.path, 'credentials');
   // The base URL must match what the MSW handlers serve (DEFAULT_BASE_URL
   // sans the /api/cli/v1 suffix that facadeBaseUrl re-appends).
   writeFileSync(
@@ -282,6 +288,10 @@ function makeCreds(): { credentialsPath: string } {
   );
   return { credentialsPath };
 }
+
+afterEach(() => {
+  while (pendingCredsCleanups.length > 0) pendingCredsCleanups.pop()?.();
+});
 
 describe('P4 schema contract — CLI runners return §6.x shapes', () => {
   it('runCodeGet (inline) returns a §6.3 TestCode', async () => {

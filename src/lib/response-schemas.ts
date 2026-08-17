@@ -109,24 +109,34 @@ export const RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, RunResponse> = v.loos
   videoUrl: v.nullish(v.string(), null),
   stepSummary: RUN_STEP_SUMMARY_SCHEMA,
   retryAfterSeconds: v.optional(v.number()),
-  // Portal link. Newer backends DO send this (they alone know which store
-  // answered the read and can resolve a non-prod portal origin); older ones
-  // omit it and the CLI computes its own. `nullish` rather than `optional`
-  // deliberately: the backend omits the field when no correct link exists, but
-  // a `null` from any other producer must not fail validation and take down
-  // `test wait` — the same trap that had to be un-sprung for a null
-  // `targetUrl`/`codeVersion`.
+  // Portal link. Three-state wire contract (pinned): **absent** — an older
+  // backend that predates this field, and cannot have produced a V3-native/
+  // unmirrored entity either (that capability and this field ship together)
+  // — the CLI computes its own legacy V2-shaped link. **Present + string** —
+  // the backend built a correct link (it alone knows which store answered
+  // and this environment's portal origin) — use it verbatim. **Present +
+  // `null`** — the backend deliberately has no correct link to offer (e.g. a
+  // V3-native entity with no DynamoDB mirror row for the client's V2-shaped
+  // guess to land on) — suppress the link entirely; a client-side guess here
+  // would be exactly the dead link the server declined to emit. The backend
+  // always includes the key going forward (typed `string | null`, never
+  // omitted when it has an opinion) — an earlier revision of this comment
+  // described the backend as omitting the key on "no correct link", which
+  // was the actual production defect this contract closes: the client's
+  // absent-branch fallback was firing on real V3-native no-link responses
+  // and printing the dead legacy URL this whole feature exists to remove.
   //
   // The `undefined` default (NOT `null`, unlike every field above) is load-bearing
   // and measured: valibot applies a default only when the key is absent, and
   // skips the assignment entirely when that default is `undefined` — so an
   // omitted field stays an ABSENT key, which is exactly what
-  // `withRunDashboardUrl`'s `'dashboardUrl' in run` test reads to decide
-  // "old backend, compute the link myself". Aligning this with the
-  // `nullish(..., null)` fields above would materialize the key on every
-  // response and silently kill that fallback. A wire `null` is preserved as
-  // null here (nullable passes it through untouched) and normalized at the
-  // consumer, not in the schema. Locked by tests in response-schemas.test.ts.
+  // `withRunDashboardUrl`'s `'dashboardUrl' in run` test (via the shared
+  // `resolveDashboardUrl` helper) reads to decide "old backend, compute the
+  // link myself". Aligning this with the `nullish(..., null)` fields above
+  // would materialize the key on every response and silently kill that
+  // fallback. A wire `null` is preserved as null here (nullable passes it
+  // through untouched) and normalized at the consumer, not in the schema.
+  // Locked by tests in response-schemas.test.ts.
   dashboardUrl: v.nullish(v.string(), undefined),
   // Absence means "steps not requested" and drives command branching, so no
   // default is applied (rule 3, optional branch).

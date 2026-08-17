@@ -53,6 +53,10 @@ const SAMPLE_TEST_ID_FAILED = 'test_8f2a4d10';
 const SAMPLE_TEST_ID_PASSED = 'test_3a91bb02';
 const SAMPLE_TEST_ID_BLOCKED = 'test_blocked_4f7a';
 export const SAMPLE_RUN_ID = 'run_abc';
+// Documented sentinel for `test steps --run-id run_failed_sample --dry-run`:
+// keeps wait flows on the default passed sample while still demonstrating a
+// run-scoped failed step offline.
+const SAMPLE_FAILED_RUN_ID = 'run_failed_sample';
 // M3.4 rerun dry-run sample IDs
 const SAMPLE_RERUN_ID_BE_NAMED = 'run_rerun_be_named';
 const SAMPLE_RERUN_ID_BE_PRODUCER = 'run_rerun_be_producer';
@@ -355,6 +359,118 @@ const failureSummary: CliFailureSummary = {
   snapshotId: SAMPLE_SNAPSHOT_ID,
   rootCauseHypothesis: failureContext.failure.rootCauseHypothesis,
   recommendedFixTarget: failureContext.failure.recommendedFixTarget,
+};
+
+const passedRunSample: RunResponse = {
+  runId: SAMPLE_RUN_ID,
+  testId: SAMPLE_TEST_ID_PASSED,
+  projectId: SAMPLE_PROJECT_ID,
+  userId: SAMPLE_USER_ID,
+  status: 'passed',
+  source: 'cli',
+  createdAt: '2026-05-15T19:32:00.000Z',
+  startedAt: '2026-05-15T19:32:05.000Z',
+  finishedAt: '2026-05-15T19:34:00.000Z',
+  codeVersion: 'v1',
+  targetUrl: SAMPLE_TARGET_URL,
+  createdFrom: null,
+  failedStepIndex: null,
+  failureKind: null,
+  error: null,
+  videoUrl: null,
+  stepSummary: {
+    total: 2,
+    completed: 2,
+    passedCount: 2,
+    failedCount: 0,
+  },
+  // Representative per-run steps so `test steps --run-id <id> --dry-run`
+  // demonstrates real output instead of an empty list (the generic
+  // `/runs/{runId}` sample is also used by `test wait`, which ignores steps).
+  steps: [
+    {
+      stepIndex: '0001',
+      type: 'action',
+      action: 'navigate',
+      status: 'passed',
+      description: 'Open the target URL',
+      error: null,
+      screenshotUrl: null,
+      htmlSnapshotUrl: null,
+      createdAt: '2026-05-15T19:32:10.000Z',
+    },
+    {
+      stepIndex: '0002',
+      type: 'assertion',
+      action: 'assert_visible',
+      status: 'passed',
+      description: 'Dashboard heading is visible',
+      error: null,
+      screenshotUrl: null,
+      htmlSnapshotUrl: null,
+      createdAt: '2026-05-15T19:32:20.000Z',
+    },
+  ],
+};
+
+const failedRunSample: RunResponse = {
+  runId: SAMPLE_FAILED_RUN_ID,
+  testId: SAMPLE_TEST_ID_FAILED,
+  projectId: SAMPLE_PROJECT_ID,
+  userId: SAMPLE_USER_ID,
+  status: 'failed',
+  source: 'cli',
+  createdAt: '2026-05-15T19:32:00.000Z',
+  startedAt: '2026-05-15T19:32:05.000Z',
+  finishedAt: '2026-05-15T19:34:00.000Z',
+  codeVersion: 'v1',
+  targetUrl: SAMPLE_TARGET_URL,
+  createdFrom: null,
+  failedStepIndex: 3,
+  failureKind: 'assertion',
+  error: 'Expected billing status badge to be visible, but it was not found.',
+  videoUrl: null,
+  stepSummary: {
+    total: 3,
+    completed: 3,
+    passedCount: 2,
+    failedCount: 1,
+  },
+  steps: [
+    {
+      stepIndex: '0001',
+      type: 'action',
+      action: 'navigate',
+      status: 'passed',
+      description: 'Open the target URL',
+      error: null,
+      screenshotUrl: null,
+      htmlSnapshotUrl: null,
+      createdAt: '2026-05-15T19:32:10.000Z',
+    },
+    {
+      stepIndex: '0002',
+      type: 'assertion',
+      action: 'assert_visible',
+      status: 'passed',
+      description: 'Dashboard heading is visible',
+      error: null,
+      screenshotUrl: null,
+      htmlSnapshotUrl: null,
+      createdAt: '2026-05-15T19:32:20.000Z',
+    },
+    {
+      stepIndex: '0003',
+      type: 'assertion',
+      action: 'assert_visible',
+      status: 'failed',
+      description: 'Billing status badge is visible',
+      error: 'Expected billing status badge to be visible, but it was not found.',
+      screenshotUrl: null,
+      htmlSnapshotUrl: null,
+      createdAt: '2026-05-15T19:32:30.000Z',
+    },
+  ],
 };
 
 /**
@@ -722,57 +838,8 @@ const ENTRIES: DryRunSampleEntry[] = [
   // fix(2026-05-21): a duplicate failed-shape entry that appeared before
   // this entry was removed; findSample first-match-wins was always
   // returning status: "failed" for `test wait --dry-run`.
-  entry('getRun', 'GET', '/runs/{runId}', {
-    runId: SAMPLE_RUN_ID,
-    testId: SAMPLE_TEST_ID_PASSED,
-    projectId: SAMPLE_PROJECT_ID,
-    userId: SAMPLE_USER_ID,
-    status: 'passed',
-    source: 'cli',
-    createdAt: '2026-05-15T19:32:00.000Z',
-    startedAt: '2026-05-15T19:32:05.000Z',
-    finishedAt: '2026-05-15T19:34:00.000Z',
-    codeVersion: 'v1',
-    targetUrl: SAMPLE_TARGET_URL,
-    createdFrom: null,
-    failedStepIndex: null,
-    failureKind: null,
-    error: null,
-    videoUrl: null,
-    stepSummary: {
-      total: 8,
-      completed: 8,
-      passedCount: 8,
-      failedCount: 0,
-    },
-    // Representative per-run steps so `test steps --run-id <id> --dry-run`
-    // demonstrates real output instead of an empty list (the generic
-    // `/runs/{runId}` sample is also used by `test wait`, which ignores steps).
-    steps: [
-      {
-        stepIndex: '0001',
-        type: 'action',
-        action: 'navigate',
-        status: 'passed',
-        description: 'Open the target URL',
-        error: null,
-        screenshotUrl: null,
-        htmlSnapshotUrl: null,
-        createdAt: '2026-05-15T19:32:10.000Z',
-      },
-      {
-        stepIndex: '0002',
-        type: 'assertion',
-        action: 'assert_visible',
-        status: 'passed',
-        description: 'Dashboard heading is visible',
-        error: null,
-        screenshotUrl: null,
-        htmlSnapshotUrl: null,
-        createdAt: '2026-05-15T19:32:20.000Z',
-      },
-    ],
-  } satisfies RunResponse),
+  entry('getRun', 'GET', `/runs/${SAMPLE_FAILED_RUN_ID}`, failedRunSample),
+  entry('getRun', 'GET', '/runs/{runId}', passedRunSample),
   // DEV-331 piece 3 — POST /runs/{runId}/cancel. Method-guarded in
   // `findSample` (POST vs `getRun`'s GET), so this can't be shadowed by the
   // broader `/runs/{runId}` pattern above despite sharing its path prefix.
@@ -854,10 +921,8 @@ export function findSample(
   const pathOnly = extractPath(url);
   for (const e of ENTRIES) {
     if (e.method === upper && e.pattern.test(pathOnly)) {
-      // Rebind body so callers get the resolved value, not the factory.
-      // We return a new object with `body` already applied so downstream
-      // code can keep calling `e.body` as-before (no API break for tests
-      // that call `findSample` directly).
+      // Rebind body so downstream code can call `e.body` as before while
+      // still preserving the original lazy factory semantics.
       return { ...e, body: () => e.body(requestBody) };
     }
   }

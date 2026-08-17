@@ -115,6 +115,14 @@ export interface HttpClientOptions {
    * `globalShutdown.signal` via the client factory.
    */
   shutdownSignal?: AbortSignal;
+  /**
+   * Upper bound (bytes) on a successful JSON response body the client will
+   * buffer before parsing. A response whose declared `Content-Length` — or
+   * actual streamed size — exceeds this fails fast with a typed
+   * `PAYLOAD_TOO_LARGE` error instead of growing the heap without limit.
+   * Defaults to {@link MAX_RESPONSE_BYTES_DEFAULT} (64 MiB).
+   */
+  maxResponseBytes?: number;
 }
 
 export interface RequestOptions<T = unknown> {
@@ -193,6 +201,15 @@ const MAX_RATE_LIMITED_DELAY_MS = 60_000;
 const CONFLICT_DELAY_MS = 1000;
 const INTERNAL_DELAY_MS = 500;
 
+// Upper bound on the size of a successful JSON response body the client will
+// buffer into memory. `response.json()` reads the ENTIRE body before parsing,
+// with no limit, so a large `test result --history` page or a run with a long
+// `steps[]` array (getRun `includeSteps`) would grow the heap in proportion to
+// the payload. 64 MiB sits far above any legitimate metadata/history/steps
+// response yet still bounds a pathological — or hostile — one. Override per
+// client via `HttpClientOptions.maxResponseBytes`.
+const MAX_RESPONSE_BYTES_DEFAULT = 64 * 1024 * 1024;
+
 // Cap on how many valibot issues a shape-mismatch INTERNAL envelope carries in
 // `details.issues` (path + message each). Keeps the envelope readable and
 // guarantees the response body itself is never echoed back to the operator.
@@ -219,6 +236,7 @@ export class HttpClient {
   private readonly onServerVersion?: (info: { minVersion?: string }) => void;
   private readonly requestTimeoutMs: number;
   private readonly shutdownSignal?: AbortSignal;
+  private readonly maxResponseBytes: number;
 
   constructor(options: HttpClientOptions) {
     this.baseUrl = trimTrailingSlash(options.baseUrl);
@@ -231,6 +249,7 @@ export class HttpClient {
     this.onTransition = options.onTransition;
     this.onServerVersion = options.onServerVersion;
     this.requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_DEFAULT_MS;
+    this.maxResponseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES_DEFAULT;
   }
 
   /**
@@ -558,8 +577,18 @@ export class HttpClient {
       // in-flight fetch immediately (reason: InterruptError) instead of
       // letting a long-poll drain its window before the interrupt surfaces.
       if (this.shutdownSignal != null) composedSignals.push(this.shutdownSignal);
-      const effectiveSignal =
-        composedSignals.length > 1 ? AbortSignal.any(composedSignals) : timeoutSignal;
+      // Composed via `composeAbortSignals` (manual listeners), NOT the native
+      // `AbortSignal.any` — see that function's doc comment. `this.shutdownSignal`
+      // is process-lifetime (`globalShutdown.signal`, `client-factory.ts`) and is
+      // pushed into `composedSignals` on essentially every request, so
+      // `AbortSignal.any` here was measured to register ~330K dependent-signal
+      // trackings against that one long-lived signal over a single request-heavy
+      // test file — the same `FinalizationRegistry` backlog mechanism already
+      // fixed once in `poll.ts`, just recreated per-request instead of
+      // per-poll-iteration. `cleanupAbortComposition` MUST be called once the
+      // request settles (below, alongside `requestTimeout.clear()`).
+      const { signal: effectiveSignal, cleanup: cleanupAbortComposition } =
+        composeAbortSignals(composedSignals);
 
       try {
         try {
@@ -639,10 +668,17 @@ export class HttpClient {
           });
           let raw: unknown;
           try {
-            raw = await response.json();
+            // Bounded read, then parse — assigning to `raw` rather than returning
+            // here keeps the schema validation below on the success path.
+            const text = await readBoundedText(response, this.maxResponseBytes, requestId);
+            raw = JSON.parse(text);
           } catch (err) {
             // Interrupt passthrough (see the fetch catch above).
             if (err instanceof InterruptError) throw err;
+            // A bounded-read rejection (PAYLOAD_TOO_LARGE) — or any typed ApiError —
+            // is a real, actionable outcome; surface it unchanged rather than
+            // masking it as a malformed-body error below.
+            if (err instanceof ApiError) throw err;
             // A timeout/abort can fire mid-body-read (headers received, stream stalls).
             this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
             // Otherwise the successful response body was not valid JSON — a
@@ -797,6 +833,11 @@ export class HttpClient {
         await this.sleepBeforeRetry(decision.delayMs);
       } finally {
         requestTimeout.clear();
+        // Remove the manually-added abort listeners now, synchronously —
+        // see `composeAbortSignals`. Runs on every path out of the try
+        // (return, throw, or `continue` into the next attempt), so nothing
+        // outlives the request it was created for.
+        cleanupAbortComposition();
       }
     }
   }
@@ -905,6 +946,68 @@ interface RequestTimeoutHandle {
   clear: () => void;
 }
 
+interface AbortComposition {
+  signal: AbortSignal;
+  cleanup: () => void;
+}
+
+/**
+ * Compose multiple `AbortSignal`s into one — abort on whichever fires first —
+ * WITHOUT using the native `AbortSignal.any`.
+ *
+ * `AbortSignal.any` builds a persistent "dependent signal" relationship: the
+ * signal it returns is tracked (via a `WeakRef` + `FinalizationRegistry`)
+ * against EVERY source signal passed in, including any long-lived one. Every
+ * outgoing request here composes `this.shutdownSignal` — process-lifetime
+ * (`globalShutdown.signal`, wired by `client-factory.ts` on essentially every
+ * command invocation) — into `composedSignals`, so each request added one
+ * more tracked dependent against that single long-lived signal, reclaimed
+ * only whenever V8 next got around to running ITS `FinalizationRegistry`
+ * cleanup pass. Under a request-heavy path (retries, a wide closure/batch
+ * fan-out, RATE_LIMITED backoff) this reproduces — per HTTP request instead
+ * of per poll-iteration — the exact backlog mechanism already fixed once in
+ * `poll.ts` (`JSFinalizationRegistry::Cleanup` → `KeepDuringJob` →
+ * `OrderedHashSet::Add` pegging the CPU once the deferred backlog is finally
+ * walked). Measured directly: the RATE_LIMITED closure-fanout scenario in
+ * `test.rerun.spec.ts` alone drives ~330K `AbortSignal.any` calls against the
+ * one process-lifetime `globalShutdown.signal` over the life of that single
+ * test file.
+ *
+ * This performs the identical "first one wins, propagate its `.reason`"
+ * composition with a plain `AbortController` and ordinary
+ * `addEventListener`/`removeEventListener` — no dependent-signal tracking, no
+ * `WeakRef`, no GC-deferred cleanup. The caller MUST invoke the returned
+ * `cleanup()` once the request settles (success, error, or retry) so the
+ * listeners are removed immediately rather than left for a cleanup pass that,
+ * for this composition, no longer exists.
+ */
+function composeAbortSignals(signals: readonly AbortSignal[]): AbortComposition {
+  if (signals.length <= 1) {
+    return { signal: signals[0]!, cleanup: () => {} };
+  }
+  // Mirror AbortSignal.any's already-aborted short-circuit: if a source is
+  // already aborted at composition time, propagate its reason immediately —
+  // no listeners are ever added, so cleanup is a no-op.
+  const alreadyAborted = signals.find(s => s.aborted);
+  const controller = new AbortController();
+  if (alreadyAborted) {
+    controller.abort(alreadyAborted.reason);
+    return { signal: controller.signal, cleanup: () => {} };
+  }
+  const removers: Array<() => void> = [];
+  for (const source of signals) {
+    const onAbort = (): void => controller.abort(source.reason);
+    source.addEventListener('abort', onAbort, { once: true });
+    removers.push(() => source.removeEventListener('abort', onAbort));
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      for (const remove of removers) remove();
+    },
+  };
+}
+
 function createRequestTimeout(timeoutMs: number): RequestTimeoutHandle {
   const controller = new AbortController();
   const timer = setTimeout(() => {
@@ -989,6 +1092,105 @@ export function malformedResponseError(
     },
     response.status,
   );
+}
+
+/**
+ * Read a successful response body as text, bounded to `maxBytes`.
+ *
+ * `response.json()` buffers the ENTIRE body into memory before parsing, with no
+ * upper limit — a large `test result --history` page, or a run with a long
+ * `steps[]` array (getRun `includeSteps`), grows the heap in proportion to the
+ * payload. This reads the body incrementally and stops once the accumulated
+ * size crosses `maxBytes`, so a pathological (or hostile) response fails fast
+ * with a typed PAYLOAD_TOO_LARGE error instead of exhausting memory.
+ *
+ * A declared `Content-Length` over the cap is rejected before any body is read.
+ * Chunked bodies (no `Content-Length`) are bounded by counting bytes as they
+ * stream. Decoding happens once, at the end, so multi-byte UTF-8 sequences that
+ * straddle a chunk boundary still decode correctly.
+ */
+async function readBoundedText(
+  response: Response,
+  maxBytes: number,
+  requestId: string,
+): Promise<string> {
+  const declared = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw responseTooLargeError(requestId, maxBytes, declared);
+  }
+  const stream = response.body;
+  if (stream === null) {
+    // No readable stream exposed (some runtimes / test doubles): fall back to a
+    // buffered read, then enforce the cap on the materialized text.
+    const text = await response.text();
+    if (new TextEncoder().encode(text).length > maxBytes) {
+      throw responseTooLargeError(requestId, maxBytes);
+    }
+    return text;
+  }
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw responseTooLargeError(requestId, maxBytes, total);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // The reader may already be released after cancel(); releasing twice is a
+      // no-op we don't want surfacing over the original error.
+    }
+  }
+  return new TextDecoder('utf-8').decode(concatChunks(chunks, total));
+}
+
+/** Concatenate byte chunks into a single `Uint8Array` of known total length. */
+function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Typed error for a response body that exceeds the client-side buffering cap.
+ * Reuses PAYLOAD_TOO_LARGE (exit 5, validation family) — the same code the
+ * backend returns for oversized request bodies — so machine consumers route on
+ * it uniformly. `nextAction` names the knobs that shrink the result set.
+ */
+function responseTooLargeError(
+  requestId: string,
+  maxBytes: number,
+  observedBytes?: number,
+): ApiError {
+  const limitMiB = Math.round(maxBytes / (1024 * 1024));
+  return new ApiError({
+    code: 'PAYLOAD_TOO_LARGE',
+    message:
+      `The server response exceeded the client-side ${limitMiB} MiB limit and was not ` +
+      `buffered, to avoid unbounded memory use.`,
+    nextAction:
+      'Narrow the result set and retry — e.g. a smaller --page-size, a tighter --since ' +
+      'window, or scope --history to a single run.',
+    requestId,
+    details: {
+      maxBytes,
+      ...(observedBytes !== undefined ? { observedBytes } : {}),
+    },
+  });
 }
 
 export function parseRetryAfter(headerValue: string | null): number | undefined {

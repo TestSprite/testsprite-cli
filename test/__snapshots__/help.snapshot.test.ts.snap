@@ -470,7 +470,7 @@ Options:
 Plan file format (--plan-from <file>) — minimal valid example:
 
 {
-  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.5.0/schemas/plan.schema.json",
+  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.6.0/schemas/plan.schema.json",
   "projectId": "prj_abc123",
   "type": "frontend",
   "name": "Login rejects an empty password",
@@ -685,6 +685,13 @@ Options:
   --report-file <path>        output path for --report (atomic write)
   --report-suite-name <name>  optional JUnit <testsuite name=...> override
                               (default: testsprite:<projectId>)
+  --gh-output                 with batch --wait: emit GitHub-native output
+                              (::error:: annotations per non-passed run;
+                              job-summary table when $GITHUB_STEP_SUMMARY is
+                              set). Auto-enabled when GITHUB_ACTIONS=true
+  --summary-file <path>       with batch --wait: also write the reduced machine
+                              summary JSON {total, passed, failed, timedOut,
+                              runs[]} to this file
   -h, --help                  display help for command
 
 Notes:
@@ -791,13 +798,14 @@ Options:
   --report-file <path>        output path for --report (atomic write)
   --report-suite-name <name>  optional JUnit <testsuite name=...> override
                               (default: testsprite:<projectId>)
-  --gh-output                 with --all --wait: emit GitHub-native output
-                              (::error:: annotations per non-passed run;
-                              job-summary table when $GITHUB_STEP_SUMMARY is
-                              set). Auto-enabled when GITHUB_ACTIONS=true
-  --summary-file <path>       with --all --wait: also write the reduced machine
-                              summary JSON {total, passed, failed, timedOut,
-                              runs[]} to this file
+  --gh-output                 with --wait (single test or --all): emit
+                              GitHub-native output (::error:: annotations per
+                              non-passed run; job-summary table when
+                              $GITHUB_STEP_SUMMARY is set). Auto-enabled when
+                              GITHUB_ACTIONS=true
+  --summary-file <path>       with --wait (single test or --all): also write
+                              the reduced machine summary JSON {total, passed,
+                              failed, timedOut, runs[]} to this file
   -h, --help                  display help for command
 
 Dependency-aware fresh run (M4):
