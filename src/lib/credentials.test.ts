@@ -219,27 +219,17 @@ describe('ensureRestrictiveMode', () => {
     // First call: /reset re-enables inheritance from the parent directory so the
     // owner can always access the file (fixes EPERM on Microsoft Account / domain
     // account machines where USERNAME does not resolve to the file-owner SID).
-    expect(spawn).toHaveBeenNthCalledWith(
-      1,
-      'icacls',
-      [credentialsPath, '/reset'],
-      {
-        shell: false,
-        stdio: 'ignore',
-        windowsHide: true,
-      },
-    );
+    expect(spawn).toHaveBeenNthCalledWith(1, 'icacls', [credentialsPath, '/reset'], {
+      shell: false,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
     // Second call: /grant:r adds an explicit Full Control entry as belt-and-suspenders.
-    expect(spawn).toHaveBeenNthCalledWith(
-      2,
-      'icacls',
-      [credentialsPath, '/grant:r', 'alice:F'],
-      {
-        shell: false,
-        stdio: 'ignore',
-        windowsHide: true,
-      },
-    );
+    expect(spawn).toHaveBeenNthCalledWith(2, 'icacls', [credentialsPath, '/grant:r', 'alice:F'], {
+      shell: false,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
     expect(spawn).toHaveBeenCalledTimes(2);
   });
 
