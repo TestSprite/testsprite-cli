@@ -4,6 +4,8 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+- **Unsupported Node.js releases now fail fast.** The CLI exits at startup on Node 20.0–20.18, 21.x, 22.0–22.12, and 23.x instead of continuing on an unsupported runtime.
+
 ## [0.6.0] - 2026-08-12
 
 ### Added
