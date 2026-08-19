@@ -8,71 +8,97 @@ import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptText } from '../lib/prompt.js';
 import {
   type AgentTarget,
-  TARGETS,
-  SKILLS,
+  type LegacyOwnFileSpec,
   DEFAULT_SKILLS,
-  MARKER_SKILL_SEPARATOR,
-  pathFor,
-  loadSkillBodyFor,
+  LEGACY_OWN_FILE_TARGETS,
+  SKILLS,
+  TARGETS,
+  acceptedTargetTokens,
   bodyHash12,
-  compactBodyFor,
-  buildCodexAggregate,
   buildSkillMarker,
+  canonicalSkillDir,
+  canonicalSkillFile,
+  findManagedSectionBounds,
+  legacyOwnFilePath,
+  loadSkillFull,
   parseSkillMarker,
-  renderForTarget,
-  renderOwnFileWithMarker,
-  MANAGED_SECTION_BEGIN,
-  MANAGED_SECTION_END,
+  pathFor,
+  renderCanonicalWithMarker,
+  resolveTarget,
+  targetLandingDir,
 } from '../lib/agent-targets.js';
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/**
- * Codex loads AGENTS.md files lazily and has a documented 32 KiB load budget
- * per file. Content beyond that offset is silently truncated. We warn (but do
- * not refuse to write) when a managed-section write would produce a file larger
- * than this threshold so operators have early visibility.
- */
-export const AGENTS_MD_CODEX_BUDGET_BYTES = 32768; // 32 KiB
 
 // ---------------------------------------------------------------------------
 // Filesystem port (injectable for tests)
 // ---------------------------------------------------------------------------
 
+/** lstat does not follow symlinks (null = ENOENT), so the safety walk can see them. */
 export interface AgentFs {
-  // lstat semantics: does NOT follow symlinks (null = ENOENT). Critical for the
-  // path-safety walk — fs writes follow symlinks, so we must be able to see them.
   lstat(p: string): Promise<{ isFile: boolean; isSymbolicLink: boolean } | null>;
   readFile(p: string): Promise<string>;
-  // exclusive: fail with EEXIST if the path already exists. O_EXCL|O_CREAT does
-  // not follow a final symlink, so exclusive writes never clobber or traverse a
-  // planted symlink — used for backups and fresh installs.
+  /** With `exclusive`, fail with EEXIST if the path exists (never clobbering or following a symlink). */
   writeFile(p: string, data: string, opts?: { exclusive?: boolean }): Promise<void>;
   mkdir(p: string): Promise<void>; // recursive
+  /** Read a symlink's stored target (null when not a symlink / ENOENT). */
+  readlink(p: string): Promise<string | null>;
+  symlink(target: string, linkPath: string): Promise<void>;
+  unlink(p: string): Promise<void>;
+  /** Remove a file, symlink, or (recursively) a directory. */
+  rm(p: string): Promise<void>;
+  /** List the direct children of a directory (entry names only). Throws on ENOENT. */
+  readdir(p: string): Promise<string[]>;
 }
 
 const defaultAgentFs: AgentFs = {
-  async lstat(p: string): Promise<{ isFile: boolean; isSymbolicLink: boolean } | null> {
+  async lstat(p) {
     try {
       const s = await fs.lstat(p);
       return { isFile: s.isFile(), isSymbolicLink: s.isSymbolicLink() };
     } catch (err: unknown) {
-      if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-        return null;
-      }
+      if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') return null;
       throw err;
     }
   },
-  async readFile(p: string): Promise<string> {
+  async readFile(p) {
     return fs.readFile(p, 'utf8');
   },
-  async writeFile(p: string, data: string, opts?: { exclusive?: boolean }): Promise<void> {
+  async writeFile(p, data, opts) {
     await fs.writeFile(p, data, { encoding: 'utf8', flag: opts?.exclusive ? 'wx' : 'w' });
   },
-  async mkdir(p: string): Promise<void> {
+  async mkdir(p) {
     await fs.mkdir(p, { recursive: true });
+  },
+  async readlink(p) {
+    try {
+      return await fs.readlink(p);
+    } catch (err: unknown) {
+      const code = err instanceof Error ? (err as NodeJS.ErrnoException).code : undefined;
+      if (code === 'ENOENT' || code === 'EINVAL') return null; // missing, or not a symlink
+      throw err;
+    }
+  },
+  async symlink(target, linkPath) {
+    // Windows directory symlinks need a junction to work without Developer Mode/Admin
+    // rights; junctions require an absolute target. Everywhere else, store a portable
+    // relative target.
+    if (process.platform === 'win32') {
+      // `target` is relative to the link's directory (see linkOrCopy), so resolve
+      // it against that directory — path.resolve(target) alone would resolve
+      // against process.cwd() and point the junction at the wrong place
+      // whenever --dir is not the cwd.
+      await fs.symlink(path.resolve(path.dirname(linkPath), target), linkPath, 'junction');
+    } else {
+      await fs.symlink(target, linkPath);
+    }
+  },
+  async unlink(p) {
+    await fs.unlink(p);
+  },
+  async rm(p) {
+    await fs.rm(p, { recursive: true, force: true });
+  },
+  async readdir(p) {
+    return fs.readdir(p);
   },
 };
 
@@ -81,19 +107,10 @@ const defaultAgentFs: AgentFs = {
 // ---------------------------------------------------------------------------
 
 /**
- * Walk each component of `relPath` beneath `root`, refusing to traverse or
- * write through a symlink. `fs.mkdir`/`writeFile` follow symlinks, so a planted
- * symlink at any existing path component (e.g. `.claude` -> /etc, or the final
- * `SKILL.md` -> ~/.bashrc) could place or clobber files outside `--dir`. The
- * lexical containment guard in `runInstall` is a string compare and cannot see
- * this; only an `lstat`-per-component walk can. Fail-closed: any symlink is
- * rejected (exit 5).
- *
- * Returns the target's `{ isFile }` when it already exists, or `null` when it
- * (or any ancestor) does not yet exist — in which case the missing tail is
- * created fresh and cannot be a pre-planted symlink. A small TOCTOU window
- * remains between this check and the write; that is acceptable for a local,
- * single-user CLI and avoids non-portable O_NOFOLLOW / rename gymnastics.
+ * Walk each component of `relPath` beneath `root`, rejecting any symlink so a
+ * planted symlink can't redirect a write outside `--dir` (fs writes follow
+ * symlinks). Returns `{ isFile }` of the final component, or null if it (or an
+ * ancestor) doesn't exist yet.
  */
 async function inspectTargetPath(
   agentFs: AgentFs,
@@ -106,20 +123,15 @@ async function inspectTargetPath(
   for (const [i, seg] of segments.entries()) {
     current = path.join(current, seg);
     const ls = await agentFs.lstat(current);
-    if (ls === null) {
-      // This component and everything below it does not exist yet.
-      return null;
-    }
+    if (ls === null) return null;
     if (ls.isSymbolicLink) {
-      const shown = segments.slice(0, i + 1).join('/');
-      throw new CLIError(
-        `refusing to write through a symlink: "${shown}" — installing here could place files outside --dir. Remove the symlink or choose a different --dir.`,
-        5,
-      );
+      throw new CLIError(refusesSymlink(segments.slice(0, i + 1).join('/')), 5);
     }
     if (i < segments.length - 1 && ls.isFile) {
-      const shown = segments.slice(0, i + 1).join('/');
-      throw new CLIError(`cannot create ${relPath}: "${shown}" exists and is not a directory.`, 5);
+      throw new CLIError(
+        `cannot create ${relPath}: "${segments.slice(0, i + 1).join('/')}" exists and is not a directory.`,
+        5,
+      );
     }
     finalIsFile = ls.isFile;
   }
@@ -127,11 +139,39 @@ async function inspectTargetPath(
 }
 
 /**
- * Back up the current bytes at `abs` next to it without clobbering any existing
- * backup or writing through a symlink. Exclusive create (`wx`) fails with
- * EEXIST on an existing regular file OR symlink, so we walk `.bak`, `.bak.1`,
- * `.bak.2`, … until a free slot is found. Returns the absolute path used.
+ * Walk the ancestors of `relPath`, rejecting symlinks, and return the lstat of
+ * the final component (or null if absent). The final component is allowed to be
+ * a symlink — for symlink landings that's our own link.
  */
+async function inspectAncestors(
+  agentFs: AgentFs,
+  root: string,
+  relPath: string,
+): Promise<{ isFile: boolean; isSymbolicLink: boolean } | null> {
+  const segments = relPath.split(/[/\\]+/).filter(Boolean);
+  const ancestors = segments.slice(0, -1);
+  let current = root;
+  for (const [i, seg] of ancestors.entries()) {
+    current = path.join(current, seg);
+    const ls = await agentFs.lstat(current);
+    if (ls === null) break;
+    if (ls.isSymbolicLink)
+      throw new CLIError(refusesSymlink(ancestors.slice(0, i + 1).join('/')), 5);
+    if (ls.isFile) {
+      throw new CLIError(
+        `cannot create ${relPath}: "${ancestors.slice(0, i + 1).join('/')}" exists and is not a directory.`,
+        5,
+      );
+    }
+  }
+  return agentFs.lstat(path.resolve(root, ...segments));
+}
+
+function refusesSymlink(shown: string): string {
+  return `refusing to write through a symlink: "${shown}" — installing here could place files outside --dir. Remove the symlink or choose a different --dir.`;
+}
+
+/** Back up `existing` next to `abs` without clobbering a prior backup; return the path used. */
 async function writeBackup(agentFs: AgentFs, abs: string, existing: string): Promise<string> {
   for (let n = 0; n < 100; n++) {
     const candidate = n === 0 ? `${abs}.bak` : `${abs}.bak.${n}`;
@@ -139,9 +179,7 @@ async function writeBackup(agentFs: AgentFs, abs: string, existing: string): Pro
       await agentFs.writeFile(candidate, existing, { exclusive: true });
       return candidate;
     } catch (err) {
-      if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'EEXIST') {
-        continue;
-      }
+      if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'EEXIST') continue;
       throw err;
     }
   }
@@ -152,154 +190,7 @@ async function writeBackup(agentFs: AgentFs, abs: string, existing: string): Pro
 }
 
 // ---------------------------------------------------------------------------
-// Managed-section helpers (codex target)
-// ---------------------------------------------------------------------------
-
-/**
- * Build the section block to inject (sentinels + marker + body + trailing
- * newline). The provenance marker line sits just inside the BEGIN sentinel so
- * `agent status` can fingerprint the section. The same skill set + CLI version
- * + body always produce byte-identical output, so the classifySection
- * 'unchanged' fast-path keeps working across re-installs.
- * Uses \n throughout; the caller handles CRLF normalisation.
- */
-function buildSection(body: string, markerLine: string): string {
-  return `${MANAGED_SECTION_BEGIN}\n${markerLine}\n${body.trimEnd()}\n${MANAGED_SECTION_END}\n`;
-}
-
-/**
- * Managed-section install result — what happened to AGENTS.md.
- *
- * 'create'  — file did not exist; write the section as a new file.
- * 'append'  — file exists, no sentinels; append section at end.
- * 'replace' — file exists with sentinels; replace section content in-place.
- * 'unchanged' — file exists with sentinels and content is byte-identical.
- * 'corrupt' — BEGIN sentinel without matching END; refuse to touch the file.
- */
-type SectionState =
-  | { kind: 'create' }
-  | { kind: 'append'; existing: string }
-  | { kind: 'replace'; existing: string; before: string; after: string }
-  | { kind: 'unchanged' }
-  | { kind: 'corrupt' };
-
-/**
- * Inspect an existing AGENTS.md and classify the managed-section state.
- *
- * Sentinel-matching rules (P2 hardening):
- *  - Only STANDALONE sentinel lines count (a line that consists solely of the
- *    marker, optionally followed by whitespace/CR before the LF). This prevents
- *    inline mentions in prose (e.g. documentation quoting the markers) from
- *    being mis-classified as a managed block.
- *  - Multiple standalone BEGIN or END lines → ambiguous → corrupt (exit 5).
- *  - CRLF files are handled by stripping trailing \r from each line before
- *    comparison.
- */
-function classifySection(existing: string, section: string): SectionState {
-  // Split on LF; strip trailing CR so CRLF files normalise correctly.
-  const lines = existing.split('\n');
-
-  // Collect line INDICES (0-based) where the sentinel appears as the whole line
-  // (trimEnd removes trailing CR and spaces).
-  const beginLines: number[] = [];
-  const endLines: number[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const stripped = (lines[i] ?? '').trimEnd();
-    if (stripped === MANAGED_SECTION_BEGIN) beginLines.push(i);
-    else if (stripped === MANAGED_SECTION_END) endLines.push(i);
-  }
-
-  const hasBegin = beginLines.length > 0;
-  const hasEnd = endLines.length > 0;
-
-  if (!hasBegin && !hasEnd) {
-    // No standalone sentinels — append path.
-    return { kind: 'append', existing };
-  }
-
-  // Duplicate standalone sentinels are ambiguous — treat as corrupt.
-  if (beginLines.length > 1) {
-    return { kind: 'corrupt' };
-  }
-  if (endLines.length > 1) {
-    return { kind: 'corrupt' };
-  }
-
-  if (hasBegin && !hasEnd) {
-    // BEGIN present but no standalone END — corrupt.
-    return { kind: 'corrupt' };
-  }
-
-  if (!hasBegin && hasEnd) {
-    // END present but no standalone BEGIN — corrupt.
-    return { kind: 'corrupt' };
-  }
-
-  const beginLineIdx = beginLines[0]!;
-  const endLineIdx = endLines[0]!;
-
-  if (endLineIdx < beginLineIdx) {
-    // END appears before BEGIN — corrupt.
-    return { kind: 'corrupt' };
-  }
-
-  // Both sentinels present, in the right order, with no duplicates.
-  // Reconstruct byte offsets from line positions so we can slice the original
-  // string (preserving its exact byte content for the before/after split).
-  //
-  // lineStart[i] = byte offset of the first character of line i.
-  let byteOffset = 0;
-  const lineStart: number[] = [];
-  for (const line of lines) {
-    lineStart.push(byteOffset);
-    byteOffset += line.length + 1; // +1 for the '\n' that split() removed
-  }
-
-  const beginByteIdx = lineStart[beginLineIdx]!;
-
-  // The END sentinel line ends at: lineStart[endLineIdx] + raw line length.
-  // We want to include the trailing '\n' after END when present.
-  const endLineRawLength = (lines[endLineIdx] ?? '').length;
-  const endOfEndByte = lineStart[endLineIdx]! + endLineRawLength;
-  // Include one trailing newline after END if present.
-  const charAfterEnd = existing[endOfEndByte];
-  const trailingNewline = charAfterEnd === '\n' ? 1 : charAfterEnd === '\r' ? 2 : 0;
-
-  const before = existing.slice(0, beginByteIdx);
-  const after = existing.slice(endOfEndByte + trailingNewline);
-  const currentSection = existing.slice(beginByteIdx, endOfEndByte + trailingNewline);
-
-  if (currentSection === section) {
-    return { kind: 'unchanged' };
-  }
-
-  return { kind: 'replace', existing, before, after };
-}
-
-/**
- * Compose the new AGENTS.md content for the 'append' and 'replace' paths.
- *
- * 'append': ensure a single blank line separator between existing content
- *   and the section (but don't add two blank lines if the file already ends
- *   with one).
- * 'replace': splice the new section between `before` and `after`.
- */
-function composeManagedFile(
-  state: SectionState & { kind: 'append' | 'replace' },
-  section: string,
-): string {
-  if (state.kind === 'append') {
-    const existing = state.existing;
-    const sep = existing.length === 0 || existing.endsWith('\n\n') ? '' : '\n';
-    return `${existing}${sep}${section}`;
-  }
-  // replace
-  return `${state.before}${section}${state.after}`;
-}
-
-// ---------------------------------------------------------------------------
-// Deps
+// Deps / result types / options
 // ---------------------------------------------------------------------------
 
 export interface AgentDeps {
@@ -311,44 +202,200 @@ export interface AgentDeps {
   prompt?: (question: string) => Promise<string>;
 }
 
-// ---------------------------------------------------------------------------
-// Result types
-// ---------------------------------------------------------------------------
-
 export type InstallAction =
-  | 'written'
-  | 'skipped'
-  | 'blocked'
-  | 'updated'
-  | 'dry-run'
-  | 'section-installed'
-  | 'section-updated'
-  | 'section-unchanged';
+  'written' | 'skipped' | 'blocked' | 'updated' | 'migrated' | 'dry-run' | 'copy-fallback';
 
 export interface InstallResult {
-  target: AgentTarget;
-  path: string; // repo-relative matrix path
+  target: string;
+  /** Repo-relative SKILL.md the agent reads. */
+  path: string;
   action: InstallAction;
-  /**
-   * Skill(s) this result covers. Own-file targets produce one result per skill
-   * (`[skill]`); the codex managed-section target produces ONE result whose
-   * section aggregates every installed skill (`[...skills]`).
-   */
   skills: string[];
+  /** 'canonical' = real file at .agents/skills; 'symlink' = linked/copied into the agent's own dir. */
+  mode: 'canonical' | 'symlink';
 }
-
-// ---------------------------------------------------------------------------
-// Options
-// ---------------------------------------------------------------------------
 
 type CommonOptions = FactoryCommonOptions;
 
 interface InstallOptions extends CommonOptions {
   target: string[];
-  /** Skill subset to install; empty/absent → {@link DEFAULT_SKILLS}. */
   skills?: string[];
   dir?: string;
   force: boolean;
+}
+
+/** Action ensureCanonical can return (canonical writes never copy-fallback). */
+type CanonicalAction = Exclude<InstallAction, 'copy-fallback'>;
+
+// ---------------------------------------------------------------------------
+// Canonical write + per-agent link
+// ---------------------------------------------------------------------------
+
+/**
+ * Write or refresh the canonical `.agents/skills/<skill>/SKILL.md` — the single
+ * source of truth every agent reads. Path-safe, idempotent, and backs up before
+ * a `--force` overwrite.
+ */
+async function ensureCanonical(
+  agentFs: AgentFs,
+  root: string,
+  skill: string,
+  content: string,
+  force: boolean,
+  dryRun: boolean,
+  stderr: (line: string) => void,
+): Promise<CanonicalAction> {
+  const relPath = canonicalSkillFile(skill);
+  const abs = path.resolve(root, relPath);
+
+  const st = await inspectTargetPath(agentFs, root, relPath);
+  if (st !== null && !st.isFile) {
+    throw new CLIError(`${relPath} exists but is not a regular file — remove it and re-run.`, 5);
+  }
+  if (dryRun) return 'dry-run';
+
+  if (st === null) {
+    await agentFs.mkdir(path.dirname(abs));
+    try {
+      await agentFs.writeFile(abs, content, { exclusive: true });
+    } catch (err) {
+      if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new CLIError(
+          `${relPath} appeared after the path check — re-run, or pass --force to overwrite.`,
+          6,
+        );
+      }
+      throw err;
+    }
+    return 'written';
+  }
+
+  const existing = await agentFs.readFile(abs);
+  if (existing === content) return 'skipped';
+  if (!force) return 'blocked';
+
+  const backupPath = await writeBackup(agentFs, abs, existing);
+  await agentFs.writeFile(abs, content);
+  stderr(`backed up ${relPath} to ${path.relative(root, backupPath)}`);
+  return 'updated';
+}
+
+/** After removing a wrong link and recreating it, the action is 'updated', not 'written'. */
+function upgraded(action: InstallAction): InstallAction {
+  return action === 'written' ? 'updated' : action;
+}
+
+/** Create the symlink `linkAbs` → `canonicalAbs`, falling back to a copy if symlinks are unavailable. */
+async function linkOrCopy(
+  agentFs: AgentFs,
+  linkAbs: string,
+  canonicalAbs: string,
+  landingRel: string,
+  content: string,
+  stderr: (line: string) => void,
+): Promise<InstallAction> {
+  const relativeTarget = path.relative(path.dirname(linkAbs), canonicalAbs);
+  try {
+    await agentFs.symlink(relativeTarget, linkAbs);
+    return 'written';
+  } catch {
+    // Symlinks unavailable (e.g. Windows without Developer Mode): write a real
+    // SKILL.md so the agent still discovers the skill.
+    await agentFs.mkdir(linkAbs);
+    await agentFs.writeFile(path.join(linkAbs, 'SKILL.md'), content);
+    stderr(
+      `[info] could not symlink ${landingRel} → .agents/skills (symlinks unavailable here) — copied instead.`,
+    );
+    return 'copy-fallback';
+  }
+}
+
+/**
+ * Create or refresh a non-universal agent's symlink `<skillsDir>/<skill>` →
+ * canonical. Idempotent; `--force` replaces a link/file that points elsewhere.
+ */
+async function ensureAgentLink(
+  agentFs: AgentFs,
+  root: string,
+  target: AgentTarget,
+  skill: string,
+  content: string,
+  force: boolean,
+  dryRun: boolean,
+  stderr: (line: string) => void,
+): Promise<InstallAction> {
+  const landingRel = targetLandingDir(target, skill);
+  const landingAbs = path.resolve(root, landingRel);
+  const canonicalAbs = path.resolve(root, canonicalSkillDir(skill));
+
+  const st = await inspectAncestors(agentFs, root, landingRel);
+  if (dryRun) {
+    if (st === null) return 'dry-run';
+    if (st.isSymbolicLink) {
+      const resolved = await resolveLink(agentFs, landingAbs);
+      return resolved === canonicalAbs ? 'skipped' : 'dry-run';
+    }
+    return 'dry-run';
+  }
+
+  await agentFs.mkdir(path.dirname(landingAbs));
+
+  if (st === null) {
+    return linkOrCopy(agentFs, landingAbs, canonicalAbs, landingRel, content, stderr);
+  }
+
+  if (st.isSymbolicLink) {
+    const resolved = await resolveLink(agentFs, landingAbs);
+    if (resolved === canonicalAbs) return 'skipped';
+    if (!force) return 'blocked';
+    await agentFs.rm(landingAbs);
+    return upgraded(
+      await linkOrCopy(agentFs, landingAbs, canonicalAbs, landingRel, content, stderr),
+    );
+  }
+
+  if (st.isFile) {
+    if (!force) return 'blocked';
+    const existing = await agentFs.readFile(landingAbs);
+    const backupPath = await writeBackup(agentFs, landingAbs, existing);
+    stderr(`backed up ${landingRel} to ${path.relative(root, backupPath)}`);
+    await agentFs.unlink(landingAbs);
+    return upgraded(
+      await linkOrCopy(agentFs, landingAbs, canonicalAbs, landingRel, content, stderr),
+    );
+  }
+
+  // Directory at the landing: a previous copy-fallback. Refresh the SKILL.md inside.
+  const skillMdAbs = path.join(landingAbs, 'SKILL.md');
+  const mdStat = await agentFs.lstat(skillMdAbs);
+  if (mdStat === null) {
+    await agentFs.writeFile(skillMdAbs, content);
+    return 'written';
+  }
+  if (!mdStat.isFile) return 'blocked';
+  const existing = await agentFs.readFile(skillMdAbs);
+  if (existing === content) return 'skipped';
+  // A real folder with a provenance marker is a legacy skill.
+  // Under --force migration already handled it; refuse without --force.
+  if (parseSkillMarker(existing) !== null && !force) {
+    throw new CLIError(
+      `${landingRel} is a legacy TestSprite skill folder that must be ` +
+        `replaced by a symlink to ${canonicalSkillDir(skill)}. Re-run with --force to back it up ` +
+        `to ${landingRel}.bak and link to the canonical skill.`,
+      6,
+    );
+  }
+  if (!force) return 'blocked';
+  const backupPath = await writeBackup(agentFs, skillMdAbs, existing);
+  stderr(`backed up ${path.relative(root, skillMdAbs)} to ${path.relative(root, backupPath)}`);
+  await agentFs.writeFile(skillMdAbs, content);
+  return 'updated';
+}
+
+/** Resolve a symlink to an absolute path (null if not a link / unreadable). */
+async function resolveLink(agentFs: AgentFs, linkAbs: string): Promise<string | null> {
+  const target = await agentFs.readlink(linkAbs);
+  return target !== null ? path.resolve(path.dirname(linkAbs), target) : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -360,55 +407,46 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const out = makeOutput(opts.output, deps);
 
-  // 1. Parse targets
+  // 1. Resolve targets (aliases → canonical ids).
   const rawTargets = opts.target
     .flatMap(s => s.split(','))
     .map(s => s.trim())
     .filter(Boolean);
-
   let resolvedTargetStrings: string[];
-
   if (rawTargets.length === 0) {
-    const isTTY = deps.isTTY ?? Boolean(process.stdin.isTTY);
-    if (!isTTY) {
-      stderrFn(
-        '[info] --target not specified; defaulting to claude. Pass --target=<target> to select a different agent.',
-      );
-      resolvedTargetStrings = ['claude'];
-    } else {
+    if (deps.isTTY ?? Boolean(process.stdin.isTTY)) {
       const promptFn = deps.prompt ?? ((q: string) => promptText(q));
-      const answer = (await promptFn('Targets to install (comma-separated) [claude]: ')).trim();
-      const defaulted = answer || 'claude';
-      resolvedTargetStrings = defaulted
+      const answer = (
+        await promptFn('Targets to install (comma-separated) [claude-code]: ')
+      ).trim();
+      resolvedTargetStrings = (answer || 'claude-code')
         .split(',')
         .map(s => s.trim())
         .filter(Boolean);
+    } else {
+      stderrFn(
+        '[info] --target not specified; defaulting to claude-code. Pass --target=<target> to select a different agent.',
+      );
+      resolvedTargetStrings = ['claude-code'];
     }
   } else {
     resolvedTargetStrings = rawTargets;
   }
 
-  // 2. Validate targets
-  const validTargets = Object.keys(TARGETS) as AgentTarget[];
+  const targets: AgentTarget[] = [];
   for (const t of resolvedTargetStrings) {
-    if (!validTargets.includes(t as AgentTarget)) {
+    const r = resolveTarget(t);
+    if (r === null) {
       throw localValidationError(
         'target',
-        `unknown target "${t}"; supported: ${validTargets.join(', ')}`,
+        `unknown target "${t}"; supported: ${acceptedTargetTokens().join(', ')}`,
       );
     }
+    targets.push(r);
   }
+  const dedupedTargets = [...new Set(targets)];
 
-  // De-duplicate while preserving first-seen order
-  const seen = new Set<string>();
-  const targets = resolvedTargetStrings.filter(t => {
-    if (seen.has(t)) return false;
-    seen.add(t);
-    return true;
-  }) as AgentTarget[];
-
-  // 2b. Resolve + validate the skill set (empty/absent → DEFAULT_SKILLS).
-  // Accepts comma-separated or repeated --skill values, same shape as --target.
+  // 2. Resolve skills (default: DEFAULT_SKILLS).
   const rawSkills = (opts.skills ?? [])
     .flatMap(s => s.split(','))
     .map(s => s.trim())
@@ -422,352 +460,171 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
       );
     }
   }
-  const seenSkill = new Set<string>();
-  const skills = (rawSkills.length > 0 ? rawSkills : [...DEFAULT_SKILLS]).filter(s => {
-    if (seenSkill.has(s)) return false;
-    seenSkill.add(s);
-    return true;
-  });
+  const skills = rawSkills.length > 0 ? [...new Set(rawSkills)] : [...DEFAULT_SKILLS];
 
-  // 3. Resolve dir
-  const dir = opts.dir ?? deps.cwd ?? process.cwd();
-  const root = path.resolve(dir);
+  const root = path.resolve(opts.dir ?? deps.cwd ?? process.cwd());
 
-  // 4. Lazy asset loaders — only touch disk if a target actually needs it.
-  // own-file bodies are per-skill (cached); the codex section aggregates EVERY
-  // installed skill's contribution into ONE managed section.
-  const skillBodyCache = new Map<string, string>();
-  const bodyForSkill = (skill: string): string => {
-    let b = skillBodyCache.get(skill);
-    if (b === undefined) {
-      b = loadSkillBodyFor(skill);
-      skillBodyCache.set(skill, b);
+  // 3. Cached canonical content (raw asset, and rendered with the marker).
+  const rawCache = new Map<string, string>();
+  const rawContent = (skill: string): string => cached(rawCache, skill, () => loadSkillFull(skill));
+  const renderCache = new Map<string, string>();
+  const installContent = (skill: string): string =>
+    cached(renderCache, skill, () =>
+      renderCanonicalWithMarker(skill, buildSkillMarker(skill, rawContent(skill))),
+    );
+
+  // Under --force, retire legacy artifacts FIRST so the canonical/symlink
+  // phases land on a clean tree.
+  const migrated = new Set<string>();
+  if (opts.force) {
+    const migration = await migrateLegacyArtifacts(
+      agentFs,
+      root,
+      dedupedTargets,
+      skills,
+      Boolean(opts.dryRun),
+    );
+    if (migration.length > 0) {
+      printMigrationSummary(migration, stderrFn);
+      // Report each migrated (target, skill) as 'migrated' rather than 'skipped'.
+      for (const r of migration) {
+        if (r.skill !== null) {
+          migrated.add(`${r.targetId}\0${r.skill}`);
+        } else {
+          // codex managed section covers every skill.
+          for (const s of skills) migrated.add(`${r.targetId}\0${s}`);
+        }
+      }
     }
-    return b;
-  };
-  // Budget-capped own-file targets (e.g. windsurf) render the compact per-skill
-  // body so the rule file isn't truncated by the agent. Cached separately; must
-  // match renderForTarget's default selection so written bytes equal the asserted
-  // render.
-  const compactBodyCache = new Map<string, string>();
-  const compactBodyForSkill = (skill: string): string => {
-    let b = compactBodyCache.get(skill);
-    if (b === undefined) {
-      b = compactBodyFor(skill);
-      compactBodyCache.set(skill, b);
-    }
-    return b;
-  };
-  const ownFileBodyFor = (t: AgentTarget, skill: string): string =>
-    TARGETS[t].compactBody ? compactBodyForSkill(skill) : bodyForSkill(skill);
-  let codexSectionCache: string | undefined;
-  const getCodexSection = (): string => {
-    if (codexSectionCache === undefined) {
-      const aggregate = buildCodexAggregate(skills);
-      // ONE marker for the whole managed section: it names every aggregated
-      // skill ('+'-joined) and hashes the canonical aggregate body, so
-      // `agent status` can attribute and fingerprint the section per skill.
-      codexSectionCache = buildSection(
-        aggregate,
-        buildSkillMarker(skills.join(MARKER_SKILL_SEPARATOR), aggregate),
-      );
-    }
-    return codexSectionCache;
-  };
+  }
 
   const results: InstallResult[] = [];
+  const dryRunLines: { rel: string; bytes: number; note: string }[] = [];
 
-  // Track bytes for dry-run output
-  const dryRunLines: { abs: string; bytes: number; note: string }[] = [];
+  // 4. Write the canonical file once per skill. A blocked canonical blocks every
+  //    target for that skill (the source of truth couldn't be written).
+  const canonicalAction = new Map<string, CanonicalAction>();
+  for (const skill of skills) {
+    const content = installContent(skill);
+    const action = await ensureCanonical(
+      agentFs,
+      root,
+      skill,
+      content,
+      opts.force,
+      Boolean(opts.dryRun),
+      stderrFn,
+    );
+    canonicalAction.set(skill, action);
+    if (opts.dryRun) {
+      dryRunLines.push({
+        rel: canonicalSkillFile(skill),
+        bytes: Buffer.byteLength(content, 'utf8'),
+        note: 'canonical',
+      });
+    }
+  }
 
-  // 5. Process each target
-  for (const t of targets) {
-    const spec = TARGETS[t];
+  // 5. Per-target landing: universal targets read canonical; others get a symlink/copy.
+  for (const t of dedupedTargets) {
+    const spec = TARGETS[t]!;
+    for (const skill of skills) {
+      const cAction = canonicalAction.get(skill)!;
+      const mode: 'canonical' | 'symlink' = spec.universal ? 'canonical' : 'symlink';
 
-    // -----------------------------------------------------------------------
-    // managed-section mode (codex target) — ONE section aggregating all skills
-    // -----------------------------------------------------------------------
-    if (spec.mode === 'managed-section') {
-      const relPath = spec.path; // 'AGENTS.md' — skill-independent (all skills merge here)
-      const abs = path.resolve(root, relPath);
-      // Path safety: ensure abs is inside root (defense against .. in relPath or dir)
-      if (abs !== root && !abs.startsWith(root + path.sep)) {
-        throw new CLIError(`refusing to write outside --dir: ${relPath}`, 5);
-      }
-      const section = getCodexSection();
-
-      if (opts.dryRun) {
-        // Dry-run: report what would happen without writing disk.
-        //
-        // [P2] Apply the SAME symlink fail-close guard as the real install path.
-        // Without this, a symlinked AGENTS.md gets followed in dry-run even
-        // though the real install would refuse (exit 5). Run inspectTargetPath
-        // first; only lstat-check the final file (not write) after that.
-        const dryRunSt = await inspectTargetPath(agentFs, root, relPath);
-        if (dryRunSt !== null && !dryRunSt.isFile) {
-          throw new CLIError(
-            `${relPath} exists but is not a regular file — remove it and re-run.`,
-            5,
-          );
-        }
-
-        // We DO read the existing file (if present) to compute the
-        // would-be byte count and emit the 32 KiB budget warning — without
-        // this the warning was silently absent on --dry-run runs (Fix 4).
-        //
-        // [P3 round-2] Measure the ACTUAL composed result via the same
-        // classifySection + composeManagedFile pipeline the real install
-        // uses — `existing + section` double-counts the old block on the
-        // replace path and misses the append separator. Read failures other
-        // than ENOENT are surfaced (EACCES/EIO must not read as "absent" —
-        // absence is already represented by dryRunSt === null).
-        const bytes = Buffer.byteLength(section, 'utf8');
-        let wouldBeContent = section;
-        if (dryRunSt !== null) {
-          let existing: string | null;
-          try {
-            existing = await agentFs.readFile(abs);
-          } catch (err) {
-            if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
-              existing = null; // raced away between lstat and read → would-be = create
-            } else {
-              throw new CLIError(
-                `cannot read ${relPath} for dry-run: ${err instanceof Error ? err.message : String(err)}`,
-                5,
-              );
-            }
-          }
-          if (existing !== null) {
-            const state = classifySection(existing, section);
-            if (state.kind === 'corrupt') {
-              // The real install would refuse with exit 5 — dry-run reports
-              // the same outcome rather than a misleading success.
-              throw new CLIError(
-                `${relPath} contains a malformed TestSprite sentinel (BEGIN without END or vice-versa). ` +
-                  `Manually remove the partial sentinel block and re-run.`,
-                5,
-              );
-            }
-            wouldBeContent =
-              state.kind === 'unchanged'
-                ? existing
-                : state.kind === 'create'
-                  ? section
-                  : composeManagedFile(state, section);
-          }
-        }
-        const wouldBeBytes = Buffer.byteLength(wouldBeContent, 'utf8');
-        if (wouldBeBytes > AGENTS_MD_CODEX_BUDGET_BYTES) {
-          stderrFn(
-            `[warn] ${relPath} will be ${wouldBeBytes} bytes after this write — Codex may not load content beyond its 32 KiB (${AGENTS_MD_CODEX_BUDGET_BYTES} byte) budget. Trim AGENTS.md to stay within the limit.`,
-          );
-        }
-        dryRunLines.push({ abs, bytes, note: 'managed section' });
-        results.push({ target: t, path: relPath, action: 'dry-run', skills: [...skills] });
+      if (cAction === 'blocked') {
+        results.push({
+          target: t,
+          path: pathFor(t, skill),
+          action: 'blocked',
+          skills: [skill],
+          mode,
+        });
         continue;
       }
 
-      // Inspect the target path via lstat walk (symlink-safe, same as own-file).
-      const st = await inspectTargetPath(agentFs, root, relPath);
-
-      if (st !== null && !st.isFile) {
-        throw new CLIError(
-          `${relPath} exists but is not a regular file — remove it and re-run.`,
-          5,
-        );
-      }
-
-      /**
-       * [P2] Emit a stderr warn when the would-be file content exceeds Codex's
-       * 32 KiB load budget. We still write — this is a warn, not a refusal —
-       * but the operator needs early visibility so they can trim AGENTS.md.
-       */
-      function warnIfOverBudget(wouldBeContent: string): void {
-        const byteLen = Buffer.byteLength(wouldBeContent, 'utf8');
-        if (byteLen > AGENTS_MD_CODEX_BUDGET_BYTES) {
-          stderrFn(
-            `[warn] ${relPath} will be ${byteLen} bytes after this write — Codex may not load content beyond its 32 KiB (${AGENTS_MD_CODEX_BUDGET_BYTES} byte) budget. Trim AGENTS.md to stay within the limit.`,
+      if (opts.dryRun) {
+        if (!spec.universal) {
+          const action = await ensureAgentLink(
+            agentFs,
+            root,
+            t,
+            skill,
+            installContent(skill),
+            opts.force,
+            true,
+            stderrFn,
           );
-        }
-      }
-
-      if (st === null) {
-        // File absent → create AGENTS.md containing just the section.
-        warnIfOverBudget(section);
-        await agentFs.mkdir(path.dirname(abs));
-        try {
-          await agentFs.writeFile(abs, section, { exclusive: true });
-        } catch (err) {
-          if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'EEXIST') {
-            throw new CLIError(
-              `${relPath} appeared after the path check — re-run, or pass --force to overwrite.`,
-              6,
-            );
-          }
-          throw err;
+          dryRunLines.push({
+            rel: targetLandingDir(t, skill),
+            bytes: 0,
+            note: `symlink → ${canonicalSkillDir(skill)} (${action})`,
+          });
         }
         results.push({
           target: t,
-          path: relPath,
-          action: 'section-installed',
-          skills: [...skills],
+          path: pathFor(t, skill),
+          action: 'dry-run',
+          skills: [skill],
+          mode,
         });
-      } else {
-        const existing = await agentFs.readFile(abs);
-        const state = classifySection(existing, section);
-
-        if (state.kind === 'corrupt') {
-          // BEGIN without matching END (or vice-versa) — never destroy user content.
-          throw new CLIError(
-            `${relPath} contains a malformed TestSprite sentinel (BEGIN without END or vice-versa). ` +
-              `Manually remove the partial sentinel block and re-run.`,
-            5,
-          );
-        }
-
-        if (state.kind === 'unchanged') {
-          results.push({
-            target: t,
-            path: relPath,
-            action: 'section-unchanged',
-            skills: [...skills],
-          });
-        } else if (state.kind === 'create') {
-          // Shouldn't happen (st !== null means file exists), but guard anyway.
-          warnIfOverBudget(section);
-          await agentFs.writeFile(abs, section);
-          results.push({
-            target: t,
-            path: relPath,
-            action: 'section-installed',
-            skills: [...skills],
-          });
-        } else {
-          // 'append' or 'replace' — write the new content.
-          // --force has no special meaning for managed-section: we always merge
-          // rather than replacing the whole file, so force is effectively always
-          // on for the section (user content is never at risk).
-          const newContent = composeManagedFile(state, section);
-          warnIfOverBudget(newContent);
-          await agentFs.writeFile(abs, newContent);
-          const action: InstallAction =
-            state.kind === 'append' ? 'section-installed' : 'section-updated';
-          results.push({ target: t, path: relPath, action, skills: [...skills] });
-        }
-      }
-      continue;
-    }
-
-    // -----------------------------------------------------------------------
-    // own-file mode (all other targets) — one file per skill
-    // -----------------------------------------------------------------------
-    for (const skill of skills) {
-      const relPath = pathFor(t, skill);
-      const abs = path.resolve(root, relPath);
-      // Path safety: ensure abs is inside root (defense against .. in relPath or dir)
-      if (abs !== root && !abs.startsWith(root + path.sep)) {
-        throw new CLIError(`refusing to write outside --dir: ${relPath}`, 5);
-      }
-      const content = renderForTarget(t, skill, ownFileBodyFor(t, skill)).content;
-
-      if (opts.dryRun) {
-        // Apply the SAME symlink fail-close guard as the real install path
-        // below (the codex managed-section branch already does this). Without
-        // it, dry-run reports success for a planted symlink that the real
-        // install would refuse with exit 5.
-        const dryRunSt = await inspectTargetPath(agentFs, root, relPath);
-        if (dryRunSt !== null && !dryRunSt.isFile) {
-          throw new CLIError(
-            `${relPath} exists but is not a regular file — remove it and re-run.`,
-            5,
-          );
-        }
-        const bytes = Buffer.byteLength(content, 'utf8');
-        dryRunLines.push({ abs, bytes, note: '' });
-        results.push({ target: t, path: relPath, action: 'dry-run', skills: [skill] });
         continue;
       }
 
-      // Inspect the target path: refuse to traverse or write through a symlink
-      // (fs writes follow symlinks, which would let a planted symlink escape
-      // --dir), and reject a non-regular-file landing path. The lexical guard
-      // above is necessary but not sufficient — it cannot see symlinks.
-      const st = await inspectTargetPath(agentFs, root, relPath);
-
-      if (st !== null && !st.isFile) {
-        throw new CLIError(
-          `${relPath} exists but is not a regular file — remove it and re-run.`,
-          5,
-        );
-      }
-
-      if (st === null) {
-        // Path does not exist — create it. inspectTargetPath verified every
-        // existing ancestor is a real directory; exclusive create (wx) then
-        // ensures a file or symlink that races in after the check is not followed
-        // or silently overwritten.
-        await agentFs.mkdir(path.dirname(abs));
-        try {
-          await agentFs.writeFile(abs, content, { exclusive: true });
-        } catch (err) {
-          if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'EEXIST') {
-            throw new CLIError(
-              `${relPath} appeared after the path check — re-run, or pass --force to overwrite.`,
-              6,
-            );
-          }
-          throw err;
-        }
-        results.push({ target: t, path: relPath, action: 'written', skills: [skill] });
+      if (spec.universal) {
+        // canonical already correct → 'skipped'; migration upgrades it.
+        let action: InstallAction = cAction;
+        if (action === 'skipped' && migrated.has(`${t}\0${skill}`)) action = 'migrated';
+        results.push({
+          target: t,
+          path: pathFor(t, skill),
+          action,
+          skills: [skill],
+          mode,
+        });
       } else {
-        const existing = await agentFs.readFile(abs);
-        if (existing === content) {
-          // Byte-identical — skip
-          results.push({ target: t, path: relPath, action: 'skipped', skills: [skill] });
-        } else if (!opts.force) {
-          // Differs and no --force → blocked
-          results.push({ target: t, path: relPath, action: 'blocked', skills: [skill] });
-        } else {
-          // Differs and --force → back up the current bytes to a fresh slot
-          // (never clobbering an existing backup or following a symlink), then
-          // overwrite. The overwrite itself can follow a symlink swapped in after
-          // the check — an accepted TOCTOU residual for a local, single-user CLI.
-          const backupPath = await writeBackup(agentFs, abs, existing);
-          await agentFs.writeFile(abs, content);
-          if (opts.output === 'text') {
-            stderrFn(`backed up ${relPath} to ${path.relative(root, backupPath)}`);
-          }
-          results.push({ target: t, path: relPath, action: 'updated', skills: [skill] });
-        }
+        let action = await ensureAgentLink(
+          agentFs,
+          root,
+          t,
+          skill,
+          installContent(skill),
+          opts.force,
+          false,
+          stderrFn,
+        );
+        // The agent reads canonical THROUGH its link, so a canonical refresh this
+        // run is a content change for this target even when the link was already correct.
+        if (action === 'skipped' && (cAction === 'written' || cAction === 'updated'))
+          action = 'updated';
+        if (action === 'skipped' && migrated.has(`${t}\0${skill}`)) action = 'migrated';
+        results.push({ target: t, path: pathFor(t, skill), action, skills: [skill], mode });
       }
     }
   }
 
-  // 6. Dry-run output
   if (opts.dryRun) {
     stderrFn('[dry-run] no files written — preview only');
-    for (const { abs, bytes, note } of dryRunLines) {
-      const suffix = note ? ` (${note}, ${bytes} bytes)` : ` (${bytes} bytes)`;
-      stderrFn(`[dry-run] would write ${abs}${suffix}`);
+    for (const { rel, bytes, note } of dryRunLines) {
+      stderrFn(`[dry-run] would write ${rel} (${note}${bytes > 0 ? `, ${bytes} bytes` : ''})`);
     }
   }
 
-  // 7. Blocked hints
   for (const r of results) {
     if (r.action === 'blocked') {
       stderrFn(
-        `${r.path} exists and differs from the canonical skill — re-run with --force to overwrite (the existing file is backed up to .bak).`,
+        `${r.path} exists and differs from the canonical skill — re-run with --force to overwrite (a .bak is kept).`,
       );
     }
   }
 
-  // 8. Print results
   out.print(results, data => {
     const items = data as InstallResult[];
-    return items.map(r => `${r.target.padEnd(12)} ${r.action.padEnd(12)} ${r.path}`).join('\n');
+    return items
+      .map(r => `${r.target.padEnd(16)} ${r.mode.padEnd(10)} ${r.action.padEnd(13)} ${r.path}`)
+      .join('\n');
   });
 
-  // 9. Exit with 6 if any blocked
   if (results.some(r => r.action === 'blocked')) {
     throw new CLIError(
       'one or more targets already exist and differ; re-run with --force to overwrite (a .bak is kept).',
@@ -776,86 +633,66 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
   }
 }
 
+/** Memoize a per-skill computation. */
+function cached(cache: Map<string, string>, skill: string, compute: () => string): string {
+  let value = cache.get(skill);
+  if (value === undefined) {
+    value = compute();
+    cache.set(skill, value);
+  }
+  return value;
+}
+
 // ---------------------------------------------------------------------------
 // runList
 // ---------------------------------------------------------------------------
 
 export interface ListResult {
-  target: AgentTarget;
-  skill: string;
-  status: string;
-  mode: string;
+  target: string;
+  displayName: string;
+  mode: 'universal' | 'symlink';
+  skillsDir: string;
+  /** Example landing path for testsprite-verify. */
   path: string;
 }
 
 export async function runList(opts: CommonOptions, deps: AgentDeps = {}): Promise<void> {
   const out = makeOutput(opts.output, deps);
-
-  // One row per (target × default skill). Own-file targets land each skill at a
-  // distinct path; the codex managed-section target merges all skills into the
-  // single AGENTS.md (so every codex row shares that path — truthful, since both
-  // skills' content lands there).
-  const results: ListResult[] = [];
-  for (const [t, spec] of Object.entries(TARGETS) as [
-    AgentTarget,
-    { status: string; mode: string },
-  ][]) {
-    for (const skill of DEFAULT_SKILLS) {
-      results.push({
-        target: t,
-        skill,
-        status: spec.status,
-        mode: spec.mode,
-        path: pathFor(t, skill),
-      });
-    }
-  }
+  const results: ListResult[] = (Object.keys(TARGETS) as AgentTarget[]).map(t => {
+    const spec = TARGETS[t]!;
+    return {
+      target: t,
+      displayName: spec.displayName,
+      mode: spec.universal ? 'universal' : 'symlink',
+      skillsDir: spec.skillsDir,
+      path: pathFor(t, 'testsprite-verify'),
+    };
+  });
 
   out.print(results, data => {
     const items = data as ListResult[];
-    const header = `${'TARGET'.padEnd(14)} ${'SKILL'.padEnd(20)} ${'STATUS'.padEnd(12)} ${'MODE'.padEnd(18)} PATH`;
+    const header = `${'TARGET'.padEnd(18)} ${'MODE'.padEnd(10)} ${'SKILLS_DIR'.padEnd(22)} PATH`;
     const rows = items.map(
-      r =>
-        `${r.target.padEnd(14)} ${r.skill.padEnd(20)} ${r.status.padEnd(12)} ${r.mode.padEnd(18)} ${r.path}`,
+      r => `${r.target.padEnd(18)} ${r.mode.padEnd(10)} ${r.skillsDir.padEnd(22)} ${r.path}`,
     );
     return [header, ...rows].join('\n');
   });
 }
 
 // ---------------------------------------------------------------------------
-// runStatus (issue #123: detect silently stale installed skill files)
+// runStatus
 // ---------------------------------------------------------------------------
 
 /**
- * Health of one installed skill artifact, as reported by `agent status`.
- *
- * Decision order (first match wins):
- *  - 'absent'   : nothing at the landing path (codex: no managed section,
- *                 including an AGENTS.md that exists without our sentinels).
- *  - 'corrupt'  : codex only. Dangling or duplicated sentinels, the same
- *                 classification `agent install` refuses on; status REPORTS it
- *                 instead of refusing.
- *  - 'unmarked' : artifact present but carries no testsprite-skill marker
- *                 (installed before markers existed), or the landing path is
- *                 occupied by a non-regular file (never followed).
- *  - 'stale'    : marker present, but its hash differs from the current
- *                 canonical body: a re-install would change the content. Edits
- *                 on top of an OLD install also read stale (older renders
- *                 cannot be reproduced); the remedy is the same re-install.
- *  - 'modified' : marker hash matches the current body, but the artifact bytes
- *                 differ from the canonical render carrying that same marker
- *                 line: the user edited the artifact after install.
- *  - 'ok'       : marker hash matches and the bytes equal the canonical render
- *                 with the file's own marker line (a version-string-only lag
- *                 with an unchanged body still reads ok).
- *
- * For the codex managed section, ONE marker names every aggregated skill
- * ('+'-joined); skills not named by the marker report 'absent'.
+ * Health of one installed skill, reported by `agent status`:
+ * absent / unmarked (no marker) / stale (marker hash differs) / modified (bytes
+ * differ from the canonical render) / ok. `agent status` emits only non-absent
+ * rows and exits 1 when any row needs attention, so it can gate CI.
  */
-export type SkillArtifactState = 'ok' | 'stale' | 'modified' | 'unmarked' | 'absent' | 'corrupt';
+export type SkillArtifactState = 'ok' | 'stale' | 'modified' | 'unmarked' | 'absent';
 
 export interface StatusResult {
-  target: AgentTarget;
+  target: string;
   skill: string;
   path: string;
   state: SkillArtifactState;
@@ -865,191 +702,333 @@ interface StatusOptions extends CommonOptions {
   dir?: string;
 }
 
-/**
- * Classify one own-file artifact per the {@link SkillArtifactState} contract.
- * Comparisons are byte-exact, matching the installer's own skipped/blocked
- * comparison for own-file targets.
- */
-async function classifyOwnFileState(
+/** Classify a SKILL.md (canonical or copy-fallback) against the shipped content. */
+async function classifySkillFile(
   agentFs: AgentFs,
   abs: string,
-  target: AgentTarget,
   skill: string,
-  bodyForSkill: (skill: string) => string,
+  contentForSkill: (skill: string) => string,
 ): Promise<SkillArtifactState> {
   const stat = await agentFs.lstat(abs);
   if (stat === null) return 'absent';
-  // Occupied by a directory or symlink: not something our installer wrote, and
-  // never followed (mirrors the installer's fail-closed stance on symlinks).
   if (!stat.isFile) return 'unmarked';
-
   const existing = await agentFs.readFile(abs);
   const marker = parseSkillMarker(existing);
   if (marker === null) return 'unmarked';
-
-  const canonicalBody = bodyForSkill(skill);
-  if (marker.hash12 !== bodyHash12(canonicalBody)) return 'stale';
-
-  // Hash matches the current body: pristine iff the file equals the canonical
-  // render carrying its own marker line, so a marker whose version string lags
-  // behind an unchanged body still reads ok.
-  const reRender = renderOwnFileWithMarker(target, skill, marker.line, canonicalBody);
-  return existing === reRender ? 'ok' : 'modified';
+  if (marker.hash12 !== bodyHash12(contentForSkill(skill))) return 'stale';
+  return existing === renderCanonicalWithMarker(skill, marker.line) ? 'ok' : 'modified';
 }
 
-/**
- * Classify the codex managed section per skill. The section is ONE artifact
- * carrying ONE marker that names every aggregated skill, so a single
- * inspection answers all skill rows; the returned function maps a skill name
- * to its state. Comparisons are CRLF-insensitive on the section bytes.
- */
-async function classifyManagedSectionStates(
+/** Classify a non-universal landing: a symlink to canonical, a copy-fallback dir, or absent. */
+async function classifySymlinked(
   agentFs: AgentFs,
-  abs: string,
-): Promise<(skill: string) => SkillArtifactState> {
-  const constantState =
-    (state: SkillArtifactState): ((skill: string) => SkillArtifactState) =>
-    () =>
-      state;
-
-  const stat = await agentFs.lstat(abs);
-  if (stat === null) return constantState('absent');
-  // Occupied by a directory or symlink: never followed (fail-closed).
-  if (!stat.isFile) return constantState('unmarked');
-
-  const existing = await agentFs.readFile(abs);
-
-  // Current canonical section for the default skill set. classifySection's
-  // 'unchanged' answers the common all-defaults-fresh case; its
-  // corrupt/append classification is reused verbatim for status verdicts.
-  const defaultAggregate = buildCodexAggregate(DEFAULT_SKILLS);
-  const defaultSection = buildSection(
-    defaultAggregate,
-    buildSkillMarker(DEFAULT_SKILLS.join(MARKER_SKILL_SEPARATOR), defaultAggregate),
-  );
-  const sectionState = classifySection(existing, defaultSection);
-
-  if (sectionState.kind === 'corrupt') return constantState('corrupt');
-  // No standalone sentinels anywhere: the managed section is not installed.
-  if (sectionState.kind === 'append') return constantState('absent');
-  if (sectionState.kind === 'unchanged') {
-    // Byte-identical to today's default install.
-    return skill => ((DEFAULT_SKILLS as readonly string[]).includes(skill) ? 'ok' : 'absent');
+  root: string,
+  target: AgentTarget,
+  skill: string,
+  contentForSkill: (skill: string) => string,
+): Promise<SkillArtifactState> {
+  const landingAbs = path.resolve(root, targetLandingDir(target, skill));
+  const stat = await agentFs.lstat(landingAbs);
+  if (stat === null) return 'absent';
+  if (stat.isSymbolicLink) {
+    const resolved = await resolveLink(agentFs, landingAbs);
+    if (resolved !== path.resolve(root, canonicalSkillDir(skill))) return 'modified';
+    return classifySkillFile(
+      agentFs,
+      path.resolve(root, canonicalSkillFile(skill)),
+      skill,
+      contentForSkill,
+    );
   }
-  if (sectionState.kind !== 'replace') {
-    // 'create' is unreachable when the file exists; treat defensively as absent.
-    return constantState('absent');
-  }
-
-  // Sentinels are present but the section differs from today's default
-  // canonical: slice the live section bytes out of the file and inspect its
-  // own marker (before/after are exact byte prefix/suffix around the section).
-  const sectionContent = existing.slice(
-    sectionState.before.length,
-    existing.length - sectionState.after.length,
-  );
-  const marker = parseSkillMarker(sectionContent);
-  if (marker === null) return constantState('unmarked');
-
-  const installedSkills = marker.skill.split(MARKER_SKILL_SEPARATOR);
-  const coversSkill = (skill: string): boolean => installedSkills.includes(skill);
-
-  // A marker naming a skill this CLI does not ship cannot be re-rendered;
-  // report the named skills stale (a re-install refreshes the section).
-  if (installedSkills.some(name => SKILLS[name] === undefined)) {
-    return skill => (coversSkill(skill) ? 'stale' : 'absent');
-  }
-
-  const canonicalAggregate = buildCodexAggregate(installedSkills);
-  if (marker.hash12 !== bodyHash12(canonicalAggregate)) {
-    return skill => (coversSkill(skill) ? 'stale' : 'absent');
-  }
-
-  // Hash matches the current aggregate: the section is pristine iff its bytes
-  // equal a re-render carrying its own marker line (version-string-only lag
-  // with an unchanged body still reads ok).
-  const pristine =
-    sectionContent.replace(/\r\n/g, '\n') === buildSection(canonicalAggregate, marker.line);
-  return skill => (coversSkill(skill) ? (pristine ? 'ok' : 'modified') : 'absent');
+  if (stat.isFile) return 'unmarked';
+  return classifySkillFile(agentFs, path.join(landingAbs, 'SKILL.md'), skill, contentForSkill);
 }
 
-/**
- * `agent status`: one row per (target × default skill), each classified per
- * the {@link SkillArtifactState} contract. Exit contract: returns normally
- * (exit 0) when every row is 'ok' or 'absent'; throws CLIError exit 1 when any
- * row is stale/modified/unmarked/corrupt, so the command can gate CI.
- */
 export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Promise<void> {
   const agentFs = deps.fs ?? defaultAgentFs;
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const out = makeOutput(opts.output, deps);
 
-  // An explicit but empty --dir must not silently resolve to cwd
-  // (path.resolve('') === cwd).
   if (opts.dir !== undefined && opts.dir.trim() === '') {
     throw localValidationError('dir', 'must not be empty');
   }
-  const dir = opts.dir !== undefined ? opts.dir.trim() : (deps.cwd ?? process.cwd());
-  const root = path.resolve(dir);
+  const root = path.resolve(opts.dir !== undefined ? opts.dir.trim() : (deps.cwd ?? process.cwd()));
 
-  // Canonical own-file bodies, read once per skill (same lazy caching pattern
-  // as runInstall's bodyForSkill).
-  const skillBodyCache = new Map<string, string>();
-  const bodyForSkill = (skill: string): string => {
-    let cachedBody = skillBodyCache.get(skill);
-    if (cachedBody === undefined) {
-      cachedBody = loadSkillBodyFor(skill);
-      skillBodyCache.set(skill, cachedBody);
-    }
-    return cachedBody;
-  };
+  const contentCache = new Map<string, string>();
+  const contentForSkill = (skill: string): string =>
+    cached(contentCache, skill, () => loadSkillFull(skill));
 
   const results: StatusResult[] = [];
-  for (const [target, spec] of Object.entries(TARGETS) as [
-    AgentTarget,
-    { mode: string; path: string },
-  ][]) {
-    if (spec.mode === 'managed-section') {
-      const stateFor = await classifyManagedSectionStates(agentFs, path.resolve(root, spec.path));
-      for (const skill of DEFAULT_SKILLS) {
-        results.push({ target, skill, path: spec.path, state: stateFor(skill) });
-      }
-      continue;
-    }
+  for (const target of Object.keys(TARGETS) as AgentTarget[]) {
+    const spec = TARGETS[target]!;
     for (const skill of DEFAULT_SKILLS) {
-      const relPath = pathFor(target, skill);
-      results.push({
-        target,
-        skill,
-        path: relPath,
-        state: await classifyOwnFileState(
-          agentFs,
-          path.resolve(root, relPath),
-          target,
-          skill,
-          bodyForSkill,
-        ),
-      });
+      const state = spec.universal
+        ? await classifySkillFile(
+            agentFs,
+            path.resolve(root, canonicalSkillFile(skill)),
+            skill,
+            contentForSkill,
+          )
+        : await classifySymlinked(agentFs, root, target, skill, contentForSkill);
+      if (state === 'absent') continue;
+      results.push({ target, skill, path: pathFor(target, skill), state });
     }
+  }
+
+  // Advisory: surface a scoped --force hint for any legacy artifacts (stderr
+  // only, never changes exit code).
+  const legacyTargets = await detectLegacyTargets(agentFs, root);
+  if (legacyTargets.length > 0) {
+    const list = legacyTargets.join(',');
+    stderrFn(
+      `[info] found legacy installs for: ${legacyTargets.join(', ')}. ` +
+        `Run \`testsprite agent install --force --target ${list}\` to back them up and migrate them (*.bak kept).`,
+    );
   }
 
   out.print(results, data => {
     const items = data as StatusResult[];
-    const header = `${'TARGET'.padEnd(14)} ${'SKILL'.padEnd(20)} ${'STATE'.padEnd(10)} PATH`;
+    if (items.length === 0) return 'No TestSprite skill artifacts installed in this project.';
+    const header = `${'TARGET'.padEnd(18)} ${'SKILL'.padEnd(20)} ${'STATE'.padEnd(10)} PATH`;
     const rows = items.map(
-      row => `${row.target.padEnd(14)} ${row.skill.padEnd(20)} ${row.state.padEnd(10)} ${row.path}`,
+      row => `${row.target.padEnd(18)} ${row.skill.padEnd(20)} ${row.state.padEnd(10)} ${row.path}`,
     );
     return [header, ...rows].join('\n');
   });
 
-  const needingAttention = results.filter(
-    result => result.state !== 'ok' && result.state !== 'absent',
-  );
+  const needingAttention = results.filter(r => r.state !== 'ok');
   if (needingAttention.length > 0) {
     throw new CLIError(
-      `${needingAttention.length} skill artifact(s) need attention (stale/modified/unmarked/corrupt); re-run \`testsprite agent install\` (add --force for own-file targets) to refresh them.`,
+      `${needingAttention.length} skill artifact(s) need attention (stale/modified/unmarked); re-run \`testsprite agent install\` (add --force for symlink/copy targets) to refresh them.`,
       1,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy migration
+// ---------------------------------------------------------------------------
+
+/** One legacy artifact retired by `agent install --force` (stderr summary only). */
+interface MigrationRow {
+  /** 'own-file' = a legacy per-target skill file/folder; 'managed-section' = the codex AGENTS.md block. */
+  kind: 'own-file' | 'managed-section';
+  targetId: AgentTarget;
+  /** Legacy target id (own-file) or 'codex' (managed-section) — messaging only. */
+  legacyTarget: string;
+  /** null for the codex managed section (it aggregated skills). */
+  skill: string | null;
+  from: string;
+  backup: string;
+  to: string;
+}
+
+/**
+ * Read a legacy own-file artifact, or null when none is present. Requires a
+ * file at the legacy path AND a provenance marker inside it (so user-authored
+ * files are never touched). A 'dir'-kind symlink landing is the new format, not
+ * a legacy artifact, and is skipped.
+ */
+async function readLegacyOwnFile(
+  agentFs: AgentFs,
+  root: string,
+  spec: LegacyOwnFileSpec,
+  skill: string,
+): Promise<{ path: string; content: string } | null> {
+  const rel = legacyOwnFilePath(spec, skill);
+  if (spec.kind === 'dir') {
+    const skillDirRel = rel.slice(0, rel.length - '/SKILL.md'.length);
+    const skillDirStat = await agentFs.lstat(path.resolve(root, skillDirRel));
+    if (skillDirStat === null) return null;
+    if (skillDirStat.isSymbolicLink) return null;
+    const fileStat = await agentFs.lstat(path.resolve(root, rel));
+    if (fileStat === null || !fileStat.isFile) return null;
+    const content = await agentFs.readFile(path.resolve(root, rel));
+    return parseSkillMarker(content) === null ? null : { path: rel, content };
+  }
+  const abs = path.resolve(root, rel);
+  const st = await agentFs.lstat(abs);
+  if (st === null || !st.isFile) return null;
+  const content = await agentFs.readFile(abs);
+  return parseSkillMarker(content) === null ? null : { path: rel, content };
+}
+
+/** Targets that have a legacy artifact under `root` (for the status nudge). */
+async function detectLegacyTargets(agentFs: AgentFs, root: string): Promise<AgentTarget[]> {
+  const found = new Set<AgentTarget>();
+  for (const spec of LEGACY_OWN_FILE_TARGETS) {
+    for (const skill of Object.keys(SKILLS)) {
+      if ((await readLegacyOwnFile(agentFs, root, spec, skill)) !== null) {
+        found.add(spec.newTarget);
+        break; // one artifact is enough to know this target has legacy
+      }
+    }
+  }
+  const agentsStat = await agentFs.lstat(path.resolve(root, 'AGENTS.md'));
+  if (agentsStat !== null && agentsStat.isFile) {
+    const existing = await agentFs.readFile(path.resolve(root, 'AGENTS.md'));
+    if (findManagedSectionBounds(existing).state === 'present') found.add('codex');
+  }
+  return [...found];
+}
+
+/**
+ * Retire legacy artifacts for the REQUESTED targets (scoped). Idempotent.
+ *
+ * 'file'-kind → backed up to `<path>.bak` and unlinked.
+ * 'dir'-kind  → folder backed up to `<folder>.bak/` and removed (install phase
+ *               plants the symlink in its place).
+ * codex       → the AGENTS.md managed section is removed in place.
+ *
+ * Malformed sentinels or non-file entries in a 'dir'-kind folder throw (exit 5).
+ */
+async function migrateLegacyArtifacts(
+  agentFs: AgentFs,
+  root: string,
+  targets: readonly AgentTarget[],
+  skills: readonly string[],
+  dryRun: boolean,
+): Promise<MigrationRow[]> {
+  const rows: MigrationRow[] = [];
+
+  // codex: the AGENTS.md managed section (one section, aggregates skills) — retire once.
+  if (targets.includes('codex')) {
+    const agentsMdRel = 'AGENTS.md';
+    const agentsMdAbs = path.resolve(root, agentsMdRel);
+    const agentsStat = await agentFs.lstat(agentsMdAbs);
+    if (agentsStat !== null && agentsStat.isFile) {
+      const existing = await agentFs.readFile(agentsMdAbs);
+      const bounds = findManagedSectionBounds(existing);
+      if (bounds.state === 'corrupt') {
+        throw new CLIError(
+          `${agentsMdRel} contains a malformed TestSprite sentinel block (${bounds.reason}). ` +
+            `Manually remove the partial sentinel lines and re-run.`,
+          5,
+        );
+      }
+      if (bounds.state === 'present') {
+        let backupRel: string;
+        if (dryRun) {
+          backupRel = path.relative(root, `${agentsMdAbs}.bak`);
+        } else {
+          const backupAbs = await writeBackup(agentFs, agentsMdAbs, existing);
+          backupRel = path.relative(root, backupAbs);
+          const next = existing.slice(0, bounds.start) + existing.slice(bounds.end);
+          await agentFs.writeFile(agentsMdAbs, next);
+        }
+        rows.push({
+          kind: 'managed-section',
+          targetId: 'codex',
+          legacyTarget: 'codex',
+          skill: null,
+          from: agentsMdRel,
+          backup: backupRel,
+          to: canonicalSkillFile('testsprite-verify'),
+        });
+      }
+    }
+  }
+
+  for (const target of targets) {
+    const spec = LEGACY_OWN_FILE_TARGETS.find(s => s.newTarget === target);
+    if (spec === undefined) continue; // target has no legacy format (e.g. amp, antigravity)
+    for (const skill of skills) {
+      const hit = await readLegacyOwnFile(agentFs, root, spec, skill);
+      if (hit === null) continue;
+      const legacyAbs = path.resolve(root, hit.path);
+      let backupRel: string;
+      if (spec.kind === 'dir') {
+        const dirRel = hit.path.slice(0, -'/SKILL.md'.length);
+        backupRel = await backupLegacyDir(agentFs, root, dirRel, dryRun);
+        if (!dryRun) await agentFs.rm(path.resolve(root, dirRel));
+      } else {
+        if (dryRun) {
+          backupRel = path.relative(root, `${legacyAbs}.bak`);
+        } else {
+          const backupAbs = await writeBackup(agentFs, legacyAbs, hit.content);
+          backupRel = path.relative(root, backupAbs);
+          await agentFs.unlink(legacyAbs);
+        }
+      }
+      rows.push({
+        kind: 'own-file',
+        targetId: spec.newTarget,
+        legacyTarget: spec.legacyTarget,
+        skill,
+        from: hit.path,
+        backup: backupRel,
+        to: pathFor(spec.newTarget, skill),
+      });
+    }
+  }
+
+  return rows;
+}
+
+/**
+ * Back up a legacy 'dir'-kind folder to a non-clobbering sibling `<folder>.bak[.N]/`.
+ * Refuses (exit 5) on nested dirs/symlinks — only `SKILL.md` is expected.
+ */
+async function backupLegacyDir(
+  agentFs: AgentFs,
+  root: string,
+  dirRel: string,
+  dryRun: boolean,
+): Promise<string> {
+  if (dryRun) return `${dirRel}.bak`;
+  const dirAbs = path.resolve(root, dirRel);
+  const baseRel = `${dirRel}.bak`;
+  const baseAbs = path.resolve(root, baseRel);
+  let backupAbs = baseAbs;
+  let n = 0;
+  while ((await agentFs.lstat(backupAbs)) !== null) {
+    n += 1;
+    backupAbs = `${baseAbs}.${n}`;
+  }
+  const entries = await agentFs.readdir(dirAbs);
+  await agentFs.mkdir(backupAbs);
+  for (const name of entries) {
+    const childAbs = path.join(dirAbs, name);
+    const cst = await agentFs.lstat(childAbs);
+    if (cst === null) continue;
+    if (!cst.isFile) {
+      throw new CLIError(
+        `${dirRel} contains a non-file entry "${name}" (old installs only wrote SKILL.md). ` +
+          `Remove it manually and re-run.`,
+        5,
+      );
+    }
+    await agentFs.writeFile(path.join(backupAbs, name), await agentFs.readFile(childAbs), {
+      exclusive: true,
+    });
+  }
+  return n === 0 ? baseRel : `${baseRel}.${n}`;
+}
+
+/**
+ * Emit the per-row summary and the *.bak cleanup tip (stderr only).
+ * 'dir'-kind (claude/kiro): "converted" (folder → symlink, from === to).
+ * 'file'-kind: "migrated" (obsolete file → canonical/symlink path).
+ * codex managed section: "migrated" (removed from AGENTS.md).
+ */
+function printMigrationSummary(rows: MigrationRow[], stderr: (line: string) => void): void {
+  for (const r of rows) {
+    if (r.kind === 'managed-section') {
+      stderr(`migrated codex managed section in ${r.from} → ${r.to} (backup: ${r.backup})`);
+    } else if (r.from === r.to) {
+      // In-place: the folder at the agent's own skills path became a symlink.
+      stderr(
+        `converted ${r.legacyTarget} skill at ${r.from} (folder → symlink; backup: ${r.backup})`,
+      );
+    } else {
+      stderr(`migrated ${r.legacyTarget} skill at ${r.from} → ${r.to} (backup: ${r.backup})`);
+    }
+  }
+  stderr(
+    'tip: a backup of each converted legacy artifact was kept as *.bak. Once you have confirmed ' +
+      'everything looks correct, you can delete them — for example: ' +
+      'find . -name "*.bak" -prune -exec rm -rf {} +.',
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,7 +1041,7 @@ function collect(v: string, prev: string[]): string[] {
 
 export function createAgentCommand(deps: AgentDeps = {}): Command {
   const agent = new Command('agent').description(
-    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Kiro, Windsurf, Copilot, Codex)',
+    'Install TestSprite skills into each coding agent (Claude Code, Codex, Cursor, Cline, Gemini CLI, Copilot, and 60+ more)',
   );
 
   agent
@@ -1073,7 +1052,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
     )
     .option(
       '--target <t>',
-      'Agent target(s): claude, cursor, cline, antigravity, kiro, windsurf, copilot, codex (comma-separated or repeated). Merged with any positional target(s).',
+      'Agent target(s): claude-code, codex, cursor, gemini-cli, github-copilot, kiro-cli, windsurf, cline, antigravity (comma-separated or repeated). Merged with any positional target(s).',
       collect,
       [],
     )
@@ -1086,8 +1065,8 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
     .option('--dir <path>', 'Project root to write into (default: cwd)')
     .option(
       '--force',
-      'For own-file targets: overwrite existing file (a .bak backup is kept). ' +
-        'For codex (managed-section): replaces the section unconditionally; user content outside the section is never destroyed.',
+      'Overwrite an existing canonical file or landing, and migrate any legacy ' +
+        'artifacts found in the repo (originals kept as *.bak).',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(
@@ -1120,7 +1099,9 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
 
   agent
     .command('list')
-    .description('List supported agent targets and skills, their status, and landing paths')
+    .description(
+      'List supported agent targets, their skill folder, and whether they read .agents/skills directly (universal) or via symlink',
+    )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_o, command: Command) => {
       await runList(resolveCommonOptions(command), deps);
@@ -1129,7 +1110,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
   agent
     .command('status')
     .description(
-      'Check installed TestSprite skill files against this CLI version: ok, stale, modified, unmarked, absent, or corrupt (exits 1 when anything needs attention, so it can gate CI)',
+      'Check installed TestSprite skills against this CLI version (ok/stale/modified/unmarked). Universal agents share one canonical skill file (installing for any one serves all); symlinked agents appear only when their own landing exists. Exits 1 when any need attention, so it can gate CI',
     )
     .option('--dir <path>', 'Project root to inspect (default: cwd)')
     .addHelpText('after', GLOBAL_OPTS_HINT)
@@ -1139,10 +1120,6 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
 
   return agent;
 }
-
-// ---------------------------------------------------------------------------
-// Per-file helpers (per convention: copy from auth.ts)
-// ---------------------------------------------------------------------------
 
 function resolveCommonOptions(command: Command): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions>;

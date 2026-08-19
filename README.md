@@ -61,13 +61,13 @@ npm install -g @testsprite/testsprite-cli
 testsprite setup
 ```
 
-`testsprite setup` prompts for your [API key](https://www.testsprite.com), verifies it, and installs the verification-loop skill for your coding agent (`claude`, `cursor`, `cline`, `windsurf`, `antigravity`, `codex`, etc.) — one command, so your agent is wired to verify its own work. Non-interactive (CI / onboarding scripts):
+`testsprite setup` prompts for your [API key](https://www.testsprite.com), verifies it, and installs the verification-loop skill for your coding agent (Claude Code, Codex, Cursor, Cline, Gemini CLI, GitHub Copilot, Windsurf, Kiro, Antigravity, and [60+ more](#supported-agents)) — one command, so your agent is wired to verify its own work. Non-interactive (CI / onboarding scripts):
 
 ```bash
-TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --yes --agent claude
+TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --yes --agent claude-code
 ```
 
-> **Pointing a coding agent (Claude Code, Cursor, Codex, Cline, …) at TestSprite?** Have it run `testsprite setup` first — that installs the verification skill, so the agent knows how to create, run, and triage tests on its own (instead of guessing from this README). New here? Start with the **[getting-started overview](https://docs.testsprite.com/cli/getting-started/overview)**.
+> **Pointing a [coding agent](#supported-agents) (Claude Code, Cursor, Codex, Cline, …) at TestSprite?** Have it run `testsprite setup` first — that installs the verification skill, so the agent knows how to create, run, and triage tests on its own (instead of guessing from this README). New here? Start with the **[getting-started overview](https://docs.testsprite.com/cli/getting-started/overview)**.
 
 > **Privacy note:** interactive runs check the npm registry at most once per 24 h to offer a "new version available" notice — package name only, never your key or data; `TESTSPRITE_NO_UPDATE_NOTIFIER=1` disables it. The backend also advertises its minimum supported CLI version — a below-floor CLI prints a one-line upgrade advisory on stderr, and a too-old client may be rejected with exit 14 (`CLIENT_TOO_OLD`). Details in [DOCUMENTATION.md → Update notice](./DOCUMENTATION.md#update-notice).
 
@@ -116,35 +116,35 @@ Prefer to configure each step by hand (or learn the surface offline with `--dry-
 
 ## Commands
 
-| Group     | Command                                                | What it does                                                                                                                                          |
-| --------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Setup** | `setup`                                                | **Start here** — one command: configure your API key, verify it, and install the agent verification skill                                             |
-|           | `doctor`                                               | Environment diagnostic — CLI/Node versions, profile, endpoint, credentials, connectivity, agent skill; exits non-zero on failure                      |
-| **Auth**  | `auth status`                                          | Resolve the active profile to its user, key, env, and scopes                                                                                          |
-|           | `auth remove`                                          | Remove the active profile from the credentials file                                                                                                   |
-|           | `usage` (alias `credits`)                              | Account pre-flight: identity, plus credit balance / plan info when the backend supplies them                                                          |
-| **Read**  | `project list` / `project get`                         | List projects / fetch one by id                                                                                                                       |
-|           | `test list` / `test get`                               | List tests under a project / fetch one by id                                                                                                          |
-|           | `test code get`                                        | Print (or write) the generated test source                                                                                                            |
-|           | `test steps`                                           | List the latest run's steps with screenshot / DOM pointers                                                                                            |
-|           | `test result`                                          | Latest result; `--history` lists a test's prior runs                                                                                                  |
-|           | `test failure get`                                     | The agent entry point: one self-contained latest-failure bundle                                                                                       |
-|           | `test failure summary`                                 | One-screen triage card (no media download)                                                                                                            |
-|           | `test diff`                                            | Compare two runs — verdict, failure kind, per-step status flips, code-version drift                                                                   |
-| **Write** | `test scaffold` / `test lint`                          | Author plans locally: emit a schema-correct starter, validate plan files offline — no network, no credentials                                         |
-|           | `test create` / `test create-batch`                    | Create a test (or bulk-create from a plan file); `--produces` / `--needs` / `--category` wire BE dependency metadata                                  |
-|           | `test update` / `test delete` / `test delete-batch`    | Edit metadata and BE dependency declarations (`--produces` / `--needs` / `--category`) / permanently delete (no restore window; `--confirm` required) |
-|           | `test code put`                                        | Replace generated code (etag-guarded)                                                                                                                 |
-|           | `test plan put`                                        | Replace a frontend test's plan-steps                                                                                                                  |
-|           | `project create` / `project update` / `project delete` | Manage projects; `delete` removes a project and everything under it (`--confirm` required, no restore window)                                         |
-|           | `project credential` / `project auto-auth`             | Configure backend-test auth: a static injected credential, or auto-refresh login (Pro)                                                                |
-| **Run**   | `test run`                                             | Trigger a fresh run; `--wait` blocks until terminal; `--all --project <id>` runs all tests in a project in wave order                                 |
-|           | `test rerun`                                           | Replay one/many tests (FE verbatim; BE with deps); billed as a run (0.5 credits FE / 0.2 BE); `--all --project <id>` reruns all tests                 |
-|           | `test flaky`                                           | Replay a test several times (auto-heal off) and report a stability score                                                                              |
-|           | `test wait`                                            | Block on one or more `runId`s until terminal                                                                                                          |
-|           | `test cancel`                                          | Cancel one or more in-flight runs (Ctrl-C during `--wait` only detaches — `cancel` is the real stop)                                                  |
-|           | `test artifact get`                                    | Download the failure bundle for a specific `runId`                                                                                                    |
-| **Agent** | `agent install` / `agent list` / `agent status`        | Add, list, or health-check coding-agent skills (pure-local): `claude`, `codex`, `cursor`, `cline`, `antigravity`, `kiro`, `windsurf`, `copilot`       |
+| Group     | Command                                                | What it does                                                                                                                                                                                                                               |
+| --------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Setup** | `setup`                                                | **Start here** — one command: configure your API key, verify it, and install the agent verification skill                                                                                                                                  |
+|           | `doctor`                                               | Environment diagnostic — CLI/Node versions, profile, endpoint, credentials, connectivity, agent skill; exits non-zero on failure                                                                                                           |
+| **Auth**  | `auth status`                                          | Resolve the active profile to its user, key, env, and scopes                                                                                                                                                                               |
+|           | `auth remove`                                          | Remove the active profile from the credentials file                                                                                                                                                                                        |
+|           | `usage` (alias `credits`)                              | Account pre-flight: identity, plus credit balance / plan info when the backend supplies them                                                                                                                                               |
+| **Read**  | `project list` / `project get`                         | List projects / fetch one by id                                                                                                                                                                                                            |
+|           | `test list` / `test get`                               | List tests under a project / fetch one by id                                                                                                                                                                                               |
+|           | `test code get`                                        | Print (or write) the generated test source                                                                                                                                                                                                 |
+|           | `test steps`                                           | List the latest run's steps with screenshot / DOM pointers                                                                                                                                                                                 |
+|           | `test result`                                          | Latest result; `--history` lists a test's prior runs                                                                                                                                                                                       |
+|           | `test failure get`                                     | The agent entry point: one self-contained latest-failure bundle                                                                                                                                                                            |
+|           | `test failure summary`                                 | One-screen triage card (no media download)                                                                                                                                                                                                 |
+|           | `test diff`                                            | Compare two runs — verdict, failure kind, per-step status flips, code-version drift                                                                                                                                                        |
+| **Write** | `test scaffold` / `test lint`                          | Author plans locally: emit a schema-correct starter, validate plan files offline — no network, no credentials                                                                                                                              |
+|           | `test create` / `test create-batch`                    | Create a test (or bulk-create from a plan file); `--produces` / `--needs` / `--category` wire BE dependency metadata                                                                                                                       |
+|           | `test update` / `test delete` / `test delete-batch`    | Edit metadata and BE dependency declarations (`--produces` / `--needs` / `--category`) / permanently delete (no restore window; `--confirm` required)                                                                                      |
+|           | `test code put`                                        | Replace generated code (etag-guarded)                                                                                                                                                                                                      |
+|           | `test plan put`                                        | Replace a frontend test's plan-steps                                                                                                                                                                                                       |
+|           | `project create` / `project update` / `project delete` | Manage projects; `delete` removes a project and everything under it (`--confirm` required, no restore window)                                                                                                                              |
+|           | `project credential` / `project auto-auth`             | Configure backend-test auth: a static injected credential, or auto-refresh login (Pro)                                                                                                                                                     |
+| **Run**   | `test run`                                             | Trigger a fresh run; `--wait` blocks until terminal; `--all --project <id>` runs all tests in a project in wave order                                                                                                                      |
+|           | `test rerun`                                           | Replay one/many tests (FE verbatim; BE with deps); billed as a run (0.5 credits FE / 0.2 BE); `--all --project <id>` reruns all tests                                                                                                      |
+|           | `test flaky`                                           | Replay a test several times (auto-heal off) and report a stability score                                                                                                                                                                   |
+|           | `test wait`                                            | Block on one or more `runId`s until terminal                                                                                                                                                                                               |
+|           | `test cancel`                                          | Cancel one or more in-flight runs (Ctrl-C during `--wait` only detaches — `cancel` is the real stop)                                                                                                                                       |
+|           | `test artifact get`                                    | Download the failure bundle for a specific `runId`                                                                                                                                                                                         |
+| **Agent** | `agent install` / `agent list` / `agent status`        | Add, list, or health-check [coding-agent skills](#supported-agents) (pure-local) — including `claude`, `codex`, `cursor`, `cline`, `antigravity`, `kiro`, `windsurf`, `copilot`; full registry under [Supported agents](#supported-agents) |
 
 > The earlier command names — `init`, `auth configure`, `auth whoami`, `auth logout` — still work as hidden, deprecated aliases (each prints a one-line notice pointing at the new name), so existing scripts keep running. `auth configure` now runs the full `setup` (it also installs the skill).
 
@@ -157,7 +157,7 @@ Prefer to configure each step by hand (or learn the surface offline with `--dry-
 - ♻️ **A loop, not a one-shot.** `create → run → failure get → fix → rerun` — every pass is banked, not thrown away.
 - 📐 **Scriptable & deterministic.** Stable `--output json` contract, predictable [exit codes](./DOCUMENTATION.md#exit-codes), and a `--dry-run` that exercises the full code path offline with canned data.
 - 🚦 **CI-native.** On GitHub Actions, `--wait` runs annotate the PR checks tab with one `::error::` per failure and append a results table to the job summary — automatically. Add `--report junit` for a JUnit XML sidecar, `--summary-file` for a machine summary, or `--gh-output` to preview the annotations locally. [Details →](./DOCUMENTATION.md#run-commands)
-- 🔌 **One command to onboard your agent.** `testsprite agent install claude` drops a ready-made skill file into your repo so your coding agent knows how to drive the loop on its own.
+- 🔌 **One command to onboard your agent.** `testsprite agent install --target claude` drops a ready-made skill file into your repo so your coding agent knows how to drive the loop on its own.
 
 ## How it works
 
@@ -197,6 +197,90 @@ The cloud is a black box on purpose: your agent describes intent and reads resul
 On [**CoderCup**](https://codercup.ai) — an open leaderboard where frontier coding agents build the _same_ app under the _same_ rules, with TestSprite as the referee — the **cheapest** model in the field shipped the **most correct** app on the board: **89%**, at half the cost of the priciest one.
 
 That's the point of all of this: you no longer need the biggest, most expensive model to ship software you can trust — top-tier quality, without paying top-tier prices, within reach of every team.
+
+## Supported agents
+
+`agent install --target <id>` wires the verification skill into any of the agents below. Names in parentheses are **aliases** — legacy short names or product variants that resolve to the canonical id; always prefer the canonical id.
+
+### Universal agents
+
+`.agents/skills` → **Universal agent**: reads the skill directly from the shared folder, meaning that installing for **one** universal agent makes it available to **all** of them (e.g., `agent install --target codex` also serves Cursor, Copilot, Amp, etc.).
+
+| `--target` id                    | Agent                                                                                          | Skills folder    |
+| -------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------- |
+| `amp`                            | [Amp](https://ampcode.com/manual#agent-skills)                                                 | `.agents/skills` |
+| `antigravity`                    | [Antigravity](https://antigravity.google/docs/skills)                                          | `.agents/skills` |
+| `antigravity-cli` (`gemini-cli`) | [Antigravity CLI](https://antigravity.google/docs/cli/plugins)                                 | `.agents/skills` |
+| `augment`                        | [Augment](https://docs.augmentcode.com/cli/skills)                                             | `.agents/skills` |
+| `codestudio`                     | [Code Studio](https://help.syncfusion.com/code-studio/reference/configure-properties/skills)   | `.agents/skills` |
+| `codex`                          | [Codex](https://developers.openai.com/codex/skills/)                                           | `.agents/skills` |
+| `command-code`                   | [Command Code](https://commandcode.ai/docs/skills)                                             | `.agents/skills` |
+| `crush`                          | [Crush](https://github.com/charmbracelet/crush#agent-skills)                                   | `.agents/skills` |
+| `cursor`                         | [Cursor](https://cursor.com/docs/context/skills)                                               | `.agents/skills` |
+| `devin-cloud`                    | [Devin Cloud](https://docs.devin.ai/product-guides/skills)                                     | `.agents/skills` |
+| `firebender`                     | [Firebender](https://docs.firebender.com/multi-agent/skills)                                   | `.agents/skills` |
+| `github-copilot` (`copilot`)     | [GitHub Copilot](https://docs.github.com/en/copilot/concepts/agents/about-agent-skills)        | `.agents/skills` |
+| `goose`                          | [Goose](https://goose-docs.ai/docs/guides/context-engineering/using-skills/)                   | `.agents/skills` |
+| `kilo`                           | [Kilo Code](https://kilo.ai/docs/customize/skills)                                             | `.agents/skills` |
+| `kimi-code-cli`                  | [Kimi Code CLI](https://www.kimi.com/code/docs/en/kimi-code-cli/customization/skills.html)     | `.agents/skills` |
+| `mcpjam`                         | [MCPJam](https://docs.mcpjam.com/inspector/skills)                                             | `.agents/skills` |
+| `mistral-vibe`                   | [Mistral Vibe](https://docs.mistral.ai/vibe/code/cli/skills)                                   | `.agents/skills` |
+| `mux`                            | [Mux](https://mux.coder.com/agents/agent-skills)                                               | `.agents/skills` |
+| `ona`                            | [Ona](https://ona.com/docs/ona/agents/skills)                                                  | `.agents/skills` |
+| `openclaw`                       | [OpenClaw](https://docs.openclaw.ai/tools/skills)                                              | `.agents/skills` |
+| `opencode`                       | [OpenCode](https://opencode.ai/docs/skills/)                                                   | `.agents/skills` |
+| `openhands`                      | [OpenHands](https://docs.openhands.dev/overview/skills)                                        | `.agents/skills` |
+| `pi`                             | [Pi](https://pi.dev/docs/latest/skills)                                                        | `.agents/skills` |
+| `pochi`                          | [Pochi](https://docs.getpochi.com/skills/)                                                     | `.agents/skills` |
+| `promptscript`                   | [PromptScript](https://getpromptscript.dev)                                                    | `.agents/skills` |
+| `replit`                         | [Replit](https://docs.replit.com/features/agent/skills)                                        | `.agents/skills` |
+| `rovodev`                        | [Rovo Dev](https://support.atlassian.com/rovo/docs/extend-rovo-dev-cli-with-agent-skills/)     | `.agents/skills` |
+| `tabnine-cli`                    | [Tabnine CLI](https://docs.tabnine.com/main/getting-started/tabnine-cli/features/agent-skills) | `.agents/skills` |
+| `vtcode`                         | [VT Code](https://github.com/vinhnx/VTCode/blob/main/docs/skills/SKILLS_GUIDE.md)              | `.agents/skills` |
+| `warp`                           | [Warp](https://docs.warp.dev/agent-platform/capabilities/skills/)                              | `.agents/skills` |
+| `zed`                            | [Zed](https://zed.dev/docs/ai/skills)                                                          | `.agents/skills` |
+| `zencoder` (`zenflow`)           | [Zencoder](https://docs.zencoder.ai/features/skills)                                           | `.agents/skills` |
+
+### Symlinked agents
+
+Any other folder → **Symlinked agent**: installing a skill for a symlinked agent first installs it into `.agents/skills/`, then creates a symlink in that agent's own folder (for example, `agent install --target claude-code` installs to `.agents/skills/` and symlinks into `.claude/skills/`). Because `.agents/skills/` is the shared source for all symlinked agents, installing a skill for any one of them also makes it available to every universal agent above. On systems without symlink support (such as Windows without Developer Mode), a plain copy is used instead and will not auto-update.
+
+| `--target` id                | Agent                                                                                          | Skills folder          |
+| ---------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------- |
+| `adal`                       | [AdaL](https://docs.sylph.ai/features/plugins-and-skills)                                      | `.adal/skills`         |
+| `aider-desk`                 | [AiderDesk](https://aiderdesk.hotovo.com/docs/features/skills)                                 | `.aider-desk/skills`   |
+| `astrbot`                    | [AstrBot](https://docs.astrbot.app/en/use/skills.html)                                         | `data/skills`          |
+| `autohand-code`              | [Autohand Code CLI](https://docs.autohand.ai/working-with-autohand-code/skills)                | `.autohand/skills`     |
+| `bob`                        | [IBM Bob](https://bob.ibm.com/docs/ide/features/skills)                                        | `.bob/skills`          |
+| `claude-code` (`claude`)     | [Claude Code](https://code.claude.com/docs/en/skills)                                          | `.claude/skills`       |
+| `cline`                      | [Cline](https://docs.cline.bot/customization/skills)                                           | `.cline/skills`        |
+| `codearts-agent`             | [CodeArts Agent](https://support.huaweicloud.com/usermanual-cli/codeartsagent_cli_0019.html)   | `.codeartsdoer/skills` |
+| `codebuddy`                  | [CodeBuddy](https://www.codebuddy.ai/docs/ide/Features/Skills)                                 | `.codebuddy/skills`    |
+| `codebuddy-cli`              | [CodeBuddy CLI](https://www.codebuddy.ai/docs/cli/skills)                                      | `.codebuddy/skills`    |
+| `codebuddy-cn`               | [CodeBuddy CN](https://www.codebuddy.cn/docs/ide/Features/Skills)                              | `.codebuddy/skills`    |
+| `codebuddy-cn-cli`           | [CodeBuddy CN CLI](https://www.codebuddy.cn/docs/cli/skills)                                   | `.codebuddy/skills`    |
+| `continue`                   | [Continue](https://github.com/continuedev/continue/pull/9696)                                  | `.continue/skills`     |
+| `cortex`                     | [Cortex Code](https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code-desktop/skills) | `.cortex/skills`       |
+| `devin`                      | [Devin for Terminal](https://docs.devin.ai/cli/extensibility/skills/overview)                  | `.devin/skills`        |
+| `devin-desktop` (`windsurf`) | [Devin Desktop](https://docs.devin.ai/desktop/cascade/skills)                                  | `.windsurf/skills`     |
+| `droid`                      | [Droid](https://docs.factory.ai/cli/configuration/skills)                                      | `.factory/skills`      |
+| `eve`                        | [Eve](https://eve.dev/docs/skills)                                                             | `agent/skills`         |
+| `forgecode`                  | [ForgeCode](https://forgecode.dev/docs/skills/)                                                | `.forge/skills`        |
+| `hermes-agent`               | [Hermes Agent](https://github.com/nicepkg/hermes)                                              | `.hermes/skills`       |
+| `junie`                      | [Junie](https://junie.jetbrains.com/docs/agent-skills.html)                                    | `.junie/skills`        |
+| `kiro`                       | [Kiro IDE](https://kiro.dev/docs/skills/)                                                      | `.kiro/skills`         |
+| `kiro-cli`                   | [Kiro CLI](https://kiro.dev/docs/cli/skills/)                                                  | `.kiro/skills`         |
+| `kode`                       | [Kode](https://github.com/shareAI-lab/kode/blob/main/docs/skills.md)                           | `.kode/skills`         |
+| `neovate`                    | [Neovate](https://github.com/neovateai/neovateai.dev/blob/master/content/en/docs/skills.mdx)   | `.neovate/skills`      |
+| `qoder`                      | [Qoder](https://docs.qoder.com/extensions/skills)                                              | `.qoder/skills`        |
+| `qoder-cli` (`iflow-cli`)    | [Qoder CLI](https://docs.qoder.com/en/cli/Skills)                                              | `.qoder/skills`        |
+| `qoder-cn` (`lingma`)        | [Qoder CN](https://docs.qoder.cn/user-guide/skills)                                            | `.lingma/skills`       |
+| `qoder-cn-cli`               | [Qoder CN CLI](https://docs.qoder.cn/cli/skills)                                               | `.qoder/skills`        |
+| `qwen-code`                  | [Qwen Code](https://qwenlm.github.io/qwen-code-docs/en/users/features/skills/)                 | `.qwen/skills`         |
+| `reasonix`                   | [Reasonix](https://github.com/esengine/DeepSeek-Reasonix/blob/main-v2/docs/GUIDE.md)           | `.reasonix/skills`     |
+| `trae`                       | [Trae](https://docs.trae.ai/ide/skills)                                                        | `.trae/skills`         |
+| `trae-cn`                    | [Trae CN](https://docs.trae.cn/ide_skills)                                                     | `.trae/skills`         |
+| `trae-cn-cli`                | [Trae CN CLI](https://docs.trae.cn/cli_skills)                                                 | `.traecli/skills`      |
 
 ## Getting help
 

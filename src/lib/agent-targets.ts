@@ -2,524 +2,465 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { VERSION } from '../version.js';
 
-export type AgentTarget =
-  'claude' | 'cursor' | 'cline' | 'antigravity' | 'codex' | 'kiro' | 'windsurf' | 'copilot';
+/**
+ * Agent-skill installation, following the [Agent Skills](https://agentskills.io)
+ * open standard. Each skill has one canonical copy at
+ * `.agents/skills/<skill>/SKILL.md`. "Universal" agents read it directly;
+ * every other agent gets a symlink from its own skills folder back to it.
+ */
 
-export interface TargetSpec {
-  status: 'ga' | 'experimental';
-  /**
-   * Repo-relative landing path for the CANONICAL skill (`testsprite-verify`),
-   * POSIX separators. Kept for back-compat: `skill-nudge.ts` reads this to detect
-   * a verify install, and `agent list`/tests reference it. For any skill, derive
-   * the real path via {@link pathFor} — this field is `pathFor(target, SKILL_NAME)`.
-   */
-  path: string;
-  /**
-   * 'own-file': the CLI owns the whole file (claude/cursor/cline/antigravity/windsurf).
-   * 'managed-section': the CLI writes only a sentinel-delimited section inside
-   * a potentially user-authored file (codex target, AGENTS.md).
-   */
-  mode: 'own-file' | 'managed-section';
-  /**
-   * When true, render the budget-friendly body (see {@link compactBodyFor})
-   * instead of the full own-file skill body. Used for own-file targets whose
-   * rule files are size-capped — currently `windsurf` (`.windsurf/rules/*.md`
-   * files cap at ~12 K characters and Cascade silently truncates beyond that,
-   * which would cut the full ~22 KB verify skill in half).
-   */
-  compactBody?: boolean;
-  /**
-   * Wrap a skill body in this target's frontmatter/header. Takes the skill's
-   * `name`+`description` (own-file targets emit them as frontmatter) and the body.
-   * No-op for cline (body verbatim) and codex (managed-section authors plain
-   * Markdown with no frontmatter).
-   */
-  wrap(name: string, description: string, body: string): string;
-}
+/** Canonical skills directory (POSIX, repo-relative). */
+export const CANONICAL_SKILLS_DIR = '.agents/skills';
 
 // ---------------------------------------------------------------------------
-// Skill registry
+// Skill registry — name/description live in each SKILL.md's frontmatter.
 // ---------------------------------------------------------------------------
 
-/**
- * How a skill contributes to the codex target's always-on `AGENTS.md` section.
- *
- * - 'full': inject the skill's trimmed codex body (a `*.codex.md` asset). Used by
- *   `testsprite-verify` (~6 KiB).
- * - 'line': inject a single short line authored inline here. Used by
- *   `testsprite-onboard` — the full 6-step flow doesn't belong in an always-on,
- *   32 KiB-budgeted file, but a one-line signal does.
- * - 'none': skill is not represented in AGENTS.md at all (reserved).
- */
-export type CodexContribution =
-  { kind: 'full'; file: string } | { kind: 'line'; text: string } | { kind: 'none' };
-
-export interface SkillSpec {
-  /** Skill name — appears in own-file frontmatter and the landing path. */
-  name: string;
-  /** ≤1536 chars (claude description cap). Byte-identical to its template doc. */
-  description: string;
-  /** Own-file body asset basename under `skills/`, e.g. 'testsprite-verify.skill.md'. */
-  bodyFile: string;
-  /** How this skill contributes to the codex AGENTS.md managed section. */
-  codex: CodexContribution;
+/** Static index of a shipped skill → its SKILL.md asset. Disk-free on import. */
+interface SkillAsset {
+  /** Asset basename under `skills/`, e.g. 'testsprite-verify.skill.md'. */
+  file: string;
 }
 
-/**
- * `testsprite-onboard` codex contribution — a single always-on line. Kept here
- * (not in a `*.codex.md` asset) because it is one line; see {@link CodexContribution}.
- */
-export const ONBOARD_CODEX_LINE =
-  '**First-time setup:** if this repo has no TestSprite tests yet, seed a *broad* first suite across its main user flows — not just one test — each with a concrete, observable assertion, before reporting setup as done.';
-
-/**
- * The skill registry. Each entry owns its name, description (drift-guarded by a
- * byte-identity unit test against a template doc), own-file body asset, and codex
- * contribution. `agent install` / `setup` install {@link DEFAULT_SKILLS}; the
- * codex target aggregates every installed skill's codex contribution into ONE
- * AGENTS.md section.
- */
-export const SKILLS: Record<string, SkillSpec> = {
-  'testsprite-verify': {
-    name: 'testsprite-verify',
-    description:
-      'TestSprite verification loop — after finishing a feature or fix in a TestSprite-tested repo, use the `testsprite` CLI to run the relevant TestSprite tests against the change and inspect any failure artifacts before reporting the work as done. Use whenever code has changed outside docs/config and is about to be reported complete — by running an existing test that covers the change, or by creating a new TestSprite test (a frontend plan, or a backend Python assertion) and running it to a terminal verdict.',
-    bodyFile: 'testsprite-verify.skill.md',
-    codex: { kind: 'full', file: 'testsprite-verify.codex.md' },
-  },
-  'testsprite-onboard': {
-    name: 'testsprite-onboard',
-    description:
-      'Stand up a complete, runnable TestSprite test suite for the current repo at first use — create a project (with a target URL and auth), derive a coherent set of tests from the codebase, batch-create them, and smoke-run a few to a green verdict so the user immediately has something worth running. Use ONLY when a repo has no TestSprite tests yet (a fresh project), right after `testsprite setup`, or when the user asks to "set up / bootstrap / seed tests". This is first-run setup, NOT change verification — once a project already has tests, use the testsprite-verify skill instead.',
-    bodyFile: 'testsprite-onboard.skill.md',
-    codex: { kind: 'line', text: ONBOARD_CODEX_LINE },
-  },
+/** id → SKILL.md asset. Disk-free on import; metadata is parsed on load. */
+export const SKILLS: Record<string, SkillAsset> = {
+  'testsprite-verify': { file: 'testsprite-verify.skill.md' },
+  'testsprite-onboard': { file: 'testsprite-onboard.skill.md' },
 };
 
-/**
- * Skills installed by `setup` and by `agent install` when no `--skill` subset is
- * given. Order is significant for the codex aggregate (verify first, then the
- * onboard line as a short addendum).
- */
+/** Skills installed by `setup` and `agent install` when `--skill` is omitted. */
 export const DEFAULT_SKILLS = ['testsprite-verify', 'testsprite-onboard'] as const;
 
 // ---------------------------------------------------------------------------
-// Back-compat single-skill exports (= the canonical `testsprite-verify` skill)
+// Agent registry
 // ---------------------------------------------------------------------------
 
-/** @deprecated The canonical skill name. New code: iterate {@link SKILLS}. */
-export const SKILL_NAME = 'testsprite-verify';
-
-/**
- * @deprecated The canonical skill's description. New code:
- * `SKILLS['testsprite-verify'].description`. Kept so existing importers and the
- * byte-identity unit test keep working.
- */
-export const SKILL_DESCRIPTION = SKILLS['testsprite-verify']!.description;
-
-// ---------------------------------------------------------------------------
-// Wrappers
-// ---------------------------------------------------------------------------
-
-function wrapSkill(name: string, description: string, body: string): string {
-  return `---\nname: ${name}\ndescription: ${description}\n---\n\n${body}\n`;
+export interface TargetSpec {
+  displayName: string;
+  /** Project-relative skills directory (POSIX). Universal agents use CANONICAL_SKILLS_DIR. */
+  skillsDir: string;
+  /** True when the agent reads .agents/skills directly (no symlink needed). */
+  universal: boolean;
 }
 
-function wrapMdc(_name: string, description: string, body: string): string {
-  return `---\ndescription: ${description}\nalwaysApply: false\n---\n\n${body}\n`;
-}
-
-/**
- * Windsurf (Cascade) reads workspace rules from `.windsurf/rules/*.md` with YAML
- * frontmatter. `trigger: model_decision` is the Cascade equivalent of the Cursor
- * `.mdc` `alwaysApply: false` mode: only the `description` is surfaced up front,
- * and Cascade pulls in the full rule body when the description shows it is
- * relevant — exactly the on-demand activation these skills want. (The other
- * triggers are `always_on`, `manual`, and `glob`.)
- */
-function wrapWindsurf(_name: string, description: string, body: string): string {
-  return `---\ntrigger: model_decision\ndescription: ${description}\n---\n\n${body}\n`;
-}
-
-/**
- * GitHub Copilot reads path-specific custom instructions from
- * `.github/instructions/*.instructions.md` (VS Code / Visual Studio / GitHub
- * Copilot Chat). Each file carries YAML frontmatter with `applyTo` — a glob that
- * scopes when the instructions attach. `applyTo: '**'` attaches the guidance to
- * every request in the repo, which is what a persistent verification skill wants
- * (there is no on-demand "model decides" mode for Copilot instruction files, so
- * always-apply is the correct idiom). `description` is surfaced in Copilot's UI.
- */
-function wrapCopilot(_name: string, description: string, body: string): string {
-  return `---\ndescription: ${description}\napplyTo: '**'\n---\n\n${body}\n`;
-}
-
-// ---------------------------------------------------------------------------
-// Landing paths
-// ---------------------------------------------------------------------------
-
-/**
- * Repo-relative landing path for a given skill on a given target (POSIX
- * separators). Own-file targets embed the skill name in the path so multiple
- * skills coexist; the codex target always lands at the single shared `AGENTS.md`
- * (every skill's codex contribution is merged into one managed section there).
- */
-export function pathFor(target: AgentTarget, skill: string): string {
-  switch (target) {
-    case 'claude':
-      return `.claude/skills/${skill}/SKILL.md`;
-    case 'antigravity':
-      return `.agents/skills/${skill}/SKILL.md`;
-    case 'cursor':
-      return `.cursor/rules/${skill}.mdc`;
-    case 'cline':
-      return `.clinerules/${skill}.md`;
-    case 'kiro':
-      return `.kiro/skills/${skill}/SKILL.md`;
-    case 'windsurf':
-      return `.windsurf/rules/${skill}.md`;
-    case 'copilot':
-      return `.github/instructions/${skill}.instructions.md`;
-    case 'codex':
-      return 'AGENTS.md';
-  }
-}
-
-export const TARGETS: Record<AgentTarget, TargetSpec> = {
-  claude: {
-    status: 'ga',
-    path: pathFor('claude', SKILL_NAME),
-    mode: 'own-file',
-    wrap: wrapSkill,
+/** Standard agent id → its project skills directory and universal flag. */
+export const TARGETS: Record<string, TargetSpec> = {
+  adal: { displayName: 'AdaL', skillsDir: '.adal/skills', universal: false },
+  'aider-desk': { displayName: 'AiderDesk', skillsDir: '.aider-desk/skills', universal: false },
+  amp: { displayName: 'Amp', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  antigravity: { displayName: 'Antigravity', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  'antigravity-cli': {
+    displayName: 'Antigravity CLI',
+    skillsDir: CANONICAL_SKILLS_DIR,
+    universal: true,
   },
-  antigravity: {
-    status: 'experimental',
-    path: pathFor('antigravity', SKILL_NAME),
-    mode: 'own-file',
-    wrap: wrapSkill,
+  astrbot: { displayName: 'AstrBot', skillsDir: 'data/skills', universal: false },
+  augment: { displayName: 'Augment', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  'autohand-code': {
+    displayName: 'Autohand Code CLI',
+    skillsDir: '.autohand/skills',
+    universal: false,
   },
-  cursor: {
-    status: 'experimental',
-    path: pathFor('cursor', SKILL_NAME),
-    mode: 'own-file',
-    wrap: wrapMdc,
+  bob: { displayName: 'IBM Bob', skillsDir: '.bob/skills', universal: false },
+  'claude-code': { displayName: 'Claude Code', skillsDir: '.claude/skills', universal: false },
+  cline: { displayName: 'Cline', skillsDir: '.cline/skills', universal: false },
+  'codearts-agent': {
+    displayName: 'CodeArts Agent',
+    skillsDir: '.codeartsdoer/skills',
+    universal: false,
   },
-  cline: {
-    status: 'experimental',
-    path: pathFor('cline', SKILL_NAME),
-    mode: 'own-file',
-    wrap: (_name, _description, body) => body,
+  codebuddy: { displayName: 'CodeBuddy', skillsDir: '.codebuddy/skills', universal: false },
+  'codebuddy-cli': {
+    displayName: 'CodeBuddy CLI',
+    skillsDir: '.codebuddy/skills',
+    universal: false,
   },
-  kiro: {
-    status: 'experimental',
-    path: pathFor('kiro', SKILL_NAME),
-    mode: 'own-file',
-    // kiro reads SKILL.md files with name/description frontmatter, same as
-    // claude/antigravity, so it shares the wrapSkill wrapper.
-    wrap: wrapSkill,
+  'codebuddy-cn': { displayName: 'CodeBuddy CN', skillsDir: '.codebuddy/skills', universal: false },
+  'codebuddy-cn-cli': {
+    displayName: 'CodeBuddy CN CLI',
+    skillsDir: '.codebuddy/skills',
+    universal: false,
   },
-  windsurf: {
-    status: 'experimental',
-    path: pathFor('windsurf', SKILL_NAME),
-    mode: 'own-file',
-    // Windsurf rules files are budget-capped (~12 K chars per `.windsurf/rules/*.md`),
-    // so render the compact body per skill (see compactBodyFor).
-    compactBody: true,
-    wrap: wrapWindsurf,
+  codestudio: { displayName: 'Code Studio', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  codex: { displayName: 'Codex', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  'command-code': { displayName: 'Command Code', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  continue: { displayName: 'Continue', skillsDir: '.continue/skills', universal: false },
+  cortex: { displayName: 'Cortex Code', skillsDir: '.cortex/skills', universal: false },
+  crush: { displayName: 'Crush', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  cursor: { displayName: 'Cursor', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  devin: { displayName: 'Devin for Terminal', skillsDir: '.devin/skills', universal: false },
+  'devin-cloud': { displayName: 'Devin Cloud', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  'devin-desktop': {
+    displayName: 'Devin Desktop',
+    skillsDir: '.windsurf/skills',
+    universal: false,
   },
-  copilot: {
-    status: 'experimental',
-    path: pathFor('copilot', SKILL_NAME),
-    mode: 'own-file',
-    // GitHub Copilot path-specific instructions: frontmatter carries `applyTo`.
-    // `applyTo: '**'` means the file is ALWAYS injected into Copilot requests
-    // (there is no on-demand "model decides" mode like Cursor/Windsurf), so
-    // render the compact body to keep the always-on context cost small — the
-    // same reasoning that drives windsurf's compact render.
-    compactBody: true,
-    wrap: wrapCopilot,
+  droid: { displayName: 'Droid', skillsDir: '.factory/skills', universal: false },
+  eve: { displayName: 'Eve', skillsDir: 'agent/skills', universal: false },
+  firebender: { displayName: 'Firebender', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  forgecode: { displayName: 'ForgeCode', skillsDir: '.forge/skills', universal: false },
+  'github-copilot': {
+    displayName: 'GitHub Copilot',
+    skillsDir: CANONICAL_SKILLS_DIR,
+    universal: true,
   },
-  /**
-   * codex target — managed-section mode.
-   *
-   * Codex auto-loads AGENTS.md from the project root (always-on, 32 KiB budget
-   * for the whole file). Unlike own-file targets, we must NOT clobber a user's
-   * existing AGENTS.md: we write only a sentinel-delimited section so other
-   * project instructions coexist. The sentinel pair is the canonical identity
-   * marker; the content between them is ours to replace. EVERY installed skill's
-   * codex contribution is aggregated into this one section (see
-   * {@link buildCodexAggregate}).
-   *
-   * --force with managed-section: replaces the section unconditionally but
-   * NEVER destroys content outside the sentinels. No whole-file .bak is written
-   * for a section-only change — only a whole-file backup makes sense if the
-   * entire file was ours to own (own-file mode). User content is never at risk.
-   */
-  codex: {
-    status: 'experimental',
-    path: pathFor('codex', SKILL_NAME),
-    mode: 'managed-section',
-    // wrap is a no-op for managed-section — content is authored as plain Markdown
-    // with no frontmatter (AGENTS.md is plain prose, not a skill schema).
-    wrap: (_name, _description, body) => body,
+  goose: { displayName: 'Goose', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  'hermes-agent': { displayName: 'Hermes Agent', skillsDir: '.hermes/skills', universal: false },
+  junie: { displayName: 'Junie', skillsDir: '.junie/skills', universal: false },
+  kilo: { displayName: 'Kilo Code', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  'kimi-code-cli': {
+    displayName: 'Kimi Code CLI',
+    skillsDir: CANONICAL_SKILLS_DIR,
+    universal: true,
   },
+  kiro: { displayName: 'Kiro IDE', skillsDir: '.kiro/skills', universal: false },
+  'kiro-cli': { displayName: 'Kiro CLI', skillsDir: '.kiro/skills', universal: false },
+  kode: { displayName: 'Kode', skillsDir: '.kode/skills', universal: false },
+  mcpjam: { displayName: 'MCPJam', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  'mistral-vibe': { displayName: 'Mistral Vibe', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  mux: { displayName: 'Mux', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  neovate: { displayName: 'Neovate', skillsDir: '.neovate/skills', universal: false },
+  ona: { displayName: 'Ona', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  opencode: { displayName: 'OpenCode', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  openclaw: { displayName: 'OpenClaw', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  openhands: { displayName: 'OpenHands', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  pi: { displayName: 'Pi', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  pochi: { displayName: 'Pochi', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  promptscript: { displayName: 'PromptScript', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  qoder: { displayName: 'Qoder', skillsDir: '.qoder/skills', universal: false },
+  'qoder-cli': { displayName: 'Qoder CLI', skillsDir: '.qoder/skills', universal: false },
+  'qoder-cn': { displayName: 'Qoder CN', skillsDir: '.lingma/skills', universal: false },
+  'qoder-cn-cli': { displayName: 'Qoder CN CLI', skillsDir: '.qoder/skills', universal: false },
+  'qwen-code': { displayName: 'Qwen Code', skillsDir: '.qwen/skills', universal: false },
+  reasonix: { displayName: 'Reasonix', skillsDir: '.reasonix/skills', universal: false },
+  replit: { displayName: 'Replit', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  rovodev: { displayName: 'Rovo Dev', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  'tabnine-cli': { displayName: 'Tabnine CLI', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  trae: { displayName: 'Trae', skillsDir: '.trae/skills', universal: false },
+  'trae-cn': { displayName: 'Trae CN', skillsDir: '.trae/skills', universal: false },
+  'trae-cn-cli': { displayName: 'Trae CN CLI', skillsDir: '.traecli/skills', universal: false },
+  vtcode: { displayName: 'VT Code', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  warp: { displayName: 'Warp', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  zed: { displayName: 'Zed', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
+  zencoder: { displayName: 'Zencoder', skillsDir: CANONICAL_SKILLS_DIR, universal: true },
 };
 
-/** Sentinel pair that bounds our managed section in AGENTS.md. */
-export const MANAGED_SECTION_BEGIN =
-  '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install codex) -->';
-export const MANAGED_SECTION_END = '<!-- END TESTSPRITE AGENT SECTION -->';
-
-// ---------------------------------------------------------------------------
-// Install marker (stale-skill detection, issue #123)
-// ---------------------------------------------------------------------------
+/** Agent id type (one per TARGETS key). */
+export type AgentTarget = keyof typeof TARGETS;
 
 /**
- * Hex characters of the canonical body's SHA-256 kept in the install marker.
- * 12 hex chars (48 bits) is ample for drift DETECTION (equality against bodies
- * this CLI ships); the marker is provenance metadata, not a security boundary.
+ * Legacy short target names → canonical ids. These exist ONLY for backwards
+ * compatibility with older scripts/docs that used the short names — prefer the
+ * canonical id. Only mappings where the alias actually differs from the id are
+ * listed: resolveTarget finds canonical ids directly, so an alias identical to
+ * its id would be pointless.
  */
+export const TARGET_ALIASES: Record<string, AgentTarget> = {
+  claude: 'claude-code',
+  copilot: 'github-copilot',
+  windsurf: 'devin-desktop',
+  'gemini-cli': 'antigravity-cli',
+  'iflow-cli': 'qoder-cli',
+  lingma: 'qoder-cn',
+  zenflow: 'zencoder',
+};
+
+/** Resolve a `--target` token (id or alias) to a canonical id, or null if unknown. */
+export function resolveTarget(raw: string): AgentTarget | null {
+  if (Object.prototype.hasOwnProperty.call(TARGETS, raw)) return raw as AgentTarget;
+  // hasOwnProperty avoids inherited keys (constructor, __proto__).
+  return Object.prototype.hasOwnProperty.call(TARGET_ALIASES, raw) ? TARGET_ALIASES[raw]! : null;
+}
+
+/** Every accepted `--target` token (ids + aliases), for help/error text. */
+export function acceptedTargetTokens(): string[] {
+  return [...Object.keys(TARGETS), ...Object.keys(TARGET_ALIASES)];
+}
+
+// ---------------------------------------------------------------------------
+// Paths
+// ---------------------------------------------------------------------------
+
+/** `.agents/skills/<skill>` — the real SKILL.md location every agent path resolves to. */
+export function canonicalSkillDir(skill: string): string {
+  return `${CANONICAL_SKILLS_DIR}/${skill}`;
+}
+
+/** `.agents/skills/<skill>/SKILL.md`. */
+export function canonicalSkillFile(skill: string): string {
+  return `${canonicalSkillDir(skill)}/SKILL.md`;
+}
+
+/** Directory the agent reads the skill from: canonical (universal) or a symlink to it. */
+export function targetLandingDir(target: AgentTarget, skill: string): string {
+  const spec = TARGETS[target]!;
+  return spec.universal ? canonicalSkillDir(skill) : `${spec.skillsDir}/${skill}`;
+}
+
+/** SKILL.md path a given agent reads (canonical, or via the symlink for non-universal agents). */
+export function pathFor(target: AgentTarget, skill: string): string {
+  return `${targetLandingDir(target, skill)}/SKILL.md`;
+}
+
+// ---------------------------------------------------------------------------
+// Install marker — lets `agent status` detect stale/edited installs.
+// ---------------------------------------------------------------------------
+
 const MARKER_HASH_HEX_LENGTH = 12;
 
-/**
- * When one marker covers several skills (the codex managed section aggregates
- * every installed skill), their names are joined with this separator in the
- * marker's skill field. Skill names never contain '+' (see {@link SKILLS} keys).
- */
-export const MARKER_SKILL_SEPARATOR = '+';
-
-/**
- * Marker line shape: `<!-- testsprite-skill: <name> v<version> sha256:<hash> -->`.
- * An HTML comment is inert in every target format (SKILL.md, .mdc, .clinerules
- * markdown, AGENTS.md). Built via `new RegExp` so the hash length stays bound
- * to {@link MARKER_HASH_HEX_LENGTH}.
- */
 const SKILL_MARKER_LINE_RE = new RegExp(
   `^<!-- testsprite-skill: (\\S+) v(\\S+) sha256:([0-9a-f]{${MARKER_HASH_HEX_LENGTH}}) -->$`,
 );
 
-/**
- * First {@link MARKER_HASH_HEX_LENGTH} hex chars of the SHA-256 of a canonical
- * skill body. The hash covers the CANONICAL BODY ONLY (pre-wrap, pre-marker),
- * so writing the marker into the rendered artifact never changes the hash the
- * marker itself carries.
- */
-export function bodyHash12(canonicalBody: string): string {
+/** First 12 hex chars of the SHA-256 of canonical SKILL.md content (the drift fingerprint). */
+export function bodyHash12(canonicalContent: string): string {
   return createHash('sha256')
-    .update(canonicalBody, 'utf8')
+    .update(canonicalContent, 'utf8')
     .digest('hex')
     .slice(0, MARKER_HASH_HEX_LENGTH);
 }
 
-/**
- * Build the provenance marker line for a skill (or a
- * {@link MARKER_SKILL_SEPARATOR}-joined skill set) and its canonical body.
- * `agent status` compares this fingerprint against the bodies the running CLI
- * ships to detect silently stale installs.
- */
-export function buildSkillMarker(skillName: string, canonicalBody: string): string {
-  return `<!-- testsprite-skill: ${skillName} v${VERSION} sha256:${bodyHash12(canonicalBody)} -->`;
+/** Build the provenance marker line embedded in each written SKILL.md. */
+export function buildSkillMarker(skillName: string, canonicalContent: string): string {
+  return `<!-- testsprite-skill: ${skillName} v${VERSION} sha256:${bodyHash12(canonicalContent)} -->`;
 }
 
 /** A marker line parsed back into its fields. */
 export interface ParsedSkillMarker {
-  /** Skill name, or several names joined with {@link MARKER_SKILL_SEPARATOR}. */
   skill: string;
-  /** CLI version that wrote the artifact. */
   version: string;
-  /** First 12 hex chars of the canonical body's SHA-256 at install time. */
   hash12: string;
-  /** The exact marker line (trailing CR/whitespace stripped) as found. */
+  /** The exact marker line as found (trailing CR/whitespace stripped). */
   line: string;
 }
 
-/**
- * Find the first testsprite-skill marker line in `content`, or null when the
- * content carries none (a pre-marker install). Lines are matched whole with
- * trailing CR/whitespace stripped, so CRLF checkouts parse identically.
- */
+/** Find and parse the first testsprite-skill marker line, or null if none. */
 export function parseSkillMarker(content: string): ParsedSkillMarker | null {
   for (const rawLine of content.split('\n')) {
-    const line = rawLine.trimEnd();
-    const matched = SKILL_MARKER_LINE_RE.exec(line);
+    const matched = SKILL_MARKER_LINE_RE.exec(rawLine.trimEnd());
     if (matched) {
-      return { skill: matched[1]!, version: matched[2]!, hash12: matched[3]!, line };
+      return {
+        skill: matched[1]!,
+        version: matched[2]!,
+        hash12: matched[3]!,
+        line: rawLine.trimEnd(),
+      };
     }
   }
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Skill loading and rendering
+// ---------------------------------------------------------------------------
+
 type ReadFn = (url: URL) => string;
 
 const defaultRead: ReadFn = (url: URL) => readFileSync(url, 'utf8');
 
-// ---------------------------------------------------------------------------
-// Asset loaders
-// ---------------------------------------------------------------------------
-
-/**
- * Resolve a `skills/<file>` asset. `../../skills/...` resolves to the repo-root
- * `skills/` directory in BOTH source (vitest: `src/lib/` → `../../skills`) and
- * the built/published package (`dist/lib/` → `../../skills` = package root). The
- * directory ships verbatim via package.json `files`, so no build-time copy step
- * is needed. Injectable `read` keeps unit tests off disk.
- */
+/** Resolve a `skills/<file>` asset (ships verbatim via package.json `files`). */
 function readSkillAsset(file: string, read: ReadFn): string {
   return read(new URL(`../../skills/${file}`, import.meta.url));
 }
 
-/** Load a skill's own-file body by skill name (frontmatter is added by `wrap`). */
-export function loadSkillBodyFor(skill: string, read: ReadFn = defaultRead): string {
-  const spec = SKILLS[skill];
-  if (!spec) throw new Error(`unknown skill: ${skill}`);
-  return readSkillAsset(spec.bodyFile, read);
+/** Parsed SKILL.md: frontmatter metadata plus the body that follows it. */
+export interface ParsedSkill {
+  name: string;
+  description: string;
+  /** Content after the closing `---` fence. */
+  body: string;
+  /** Entire file — the canonical SKILL.md bytes. */
+  full: string;
 }
 
 /**
- * Budget-friendly body for an own-file target whose rule files are size-capped
- * (e.g. windsurf). For a skill that ships a trimmed codex asset (`codex.kind ===
- * 'full'`, e.g. `testsprite-verify` — full body ~22 KB, codex ~5 KB) we render
- * that compact asset so the wrapped file stays under the cap. For skills whose
- * codex contribution is only a one-liner (`'line'`/`'none'`, e.g.
- * `testsprite-onboard`), the one-liner is useless as a standalone rule and the
- * full own-file body (~6.5 KB) already fits the budget — so the full body is
- * used.
+ * Parse a SKILL.md's frontmatter (name + description) and body, without a YAML
+ * dependency. Our descriptions are single-line plain scalars, so a line-oriented
+ * parse suffices.
  */
-export function compactBodyFor(skill: string, read: ReadFn = defaultRead): string {
-  const spec = SKILLS[skill];
-  if (!spec) throw new Error(`unknown skill: ${skill}`);
-  return spec.codex.kind === 'full'
-    ? readSkillAsset(spec.codex.file, read)
-    : loadSkillBodyFor(skill, read);
-}
-
-/**
- * Resolve a skill's codex (AGENTS.md) contribution as a Markdown string.
- * 'full' → read the `*.codex.md` asset; 'line' → the inline one-liner; 'none' → ''.
- */
-export function codexContentFor(skill: string, read: ReadFn = defaultRead): string {
-  const spec = SKILLS[skill];
-  if (!spec) throw new Error(`unknown skill: ${skill}`);
-  const c = spec.codex;
-  if (c.kind === 'full') return readSkillAsset(c.file, read);
-  if (c.kind === 'line') return c.text;
-  return '';
-}
-
-/**
- * Compose the codex managed-section BODY (sans sentinels) from several skills:
- * each skill's codex contribution, trimmed, joined by a blank line, in the given
- * order. A single `['testsprite-verify']` aggregate is byte-identical to the old
- * single-skill codex body, so existing AGENTS.md installs round-trip unchanged.
- */
-export function buildCodexAggregate(skills: readonly string[], read: ReadFn = defaultRead): string {
-  return skills
-    .map(s => codexContentFor(s, read).trimEnd())
-    .filter(Boolean)
-    .join('\n\n');
-}
-
-/**
- * Back-compat: the canonical verify skill body (own-file). Kept so existing
- * importers and the `loadSkillBody(read)` unit-test signature keep working.
- * @deprecated Use {@link loadSkillBodyFor}.
- */
-export function loadSkillBody(read: ReadFn = defaultRead): string {
-  return loadSkillBodyFor(SKILL_NAME, read);
-}
-
-/**
- * Back-compat: the canonical verify skill's trimmed codex body. Kept so existing
- * importers and the `loadCodexSkillBody(read)` unit-test signature keep working.
- * @deprecated Use {@link codexContentFor}.
- */
-export function loadCodexSkillBody(read: ReadFn = defaultRead): string {
-  return codexContentFor(SKILL_NAME, read);
-}
-
-// ---------------------------------------------------------------------------
-// renderForTarget
-// ---------------------------------------------------------------------------
-
-/**
- * Place the marker line inside a wrapped own-file render.
- *
- * - Wraps that emit YAML frontmatter (claude/antigravity/cursor): the marker
- *   lands on the line right after the closing `---` fence, before the body.
- * - Wrapless targets (cline, body verbatim): the marker is appended as the
- *   LAST line instead. Cline surfaces the file's first heading as the rule
- *   title, so a leading comment would displace the body's H1.
- */
-function injectMarkerLine(wrapped: string, markerLine: string): string {
-  if (wrapped.startsWith('---\n')) {
-    // The name/description frontmatter values are single-line, so the first
-    // `\n---\n` after the opening fence is always the closing fence.
-    const closingFence = '\n---\n';
-    const fenceIdx = wrapped.indexOf(closingFence);
-    if (fenceIdx !== -1) {
-      const insertAt = fenceIdx + closingFence.length;
-      return `${wrapped.slice(0, insertAt)}${markerLine}\n${wrapped.slice(insertAt)}`;
-    }
+export function parseSkillFrontmatter(raw: string): {
+  name: string;
+  description: string;
+  body: string;
+} {
+  const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  if (!m) throw new Error('skill asset missing frontmatter (--- ... ---)');
+  const fm = m[1]!;
+  const name = fm.match(/^name:\s*(.*)$/m)?.[1]?.trim() ?? '';
+  const description = fm.match(/^description:\s*(.*)$/m)?.[1]?.trim() ?? '';
+  if (!name || !description) {
+    throw new Error('skill frontmatter missing required name/description');
   }
-  const separator = wrapped.endsWith('\n') ? '' : '\n';
-  return `${wrapped}${separator}${markerLine}\n`;
+  return { name, description, body: m[2] ?? '' };
 }
 
-/**
- * Exact own-file bytes for a skill on a target, carrying the GIVEN marker line.
- * `agent status` uses this to re-render the current canonical body with a
- * file's own (possibly older-versioned) marker: when only the marker's version
- * string lags but the body is unchanged, the artifact still compares pristine.
- */
-export function renderOwnFileWithMarker(
-  target: AgentTarget,
+/** Load and parse a skill. The registry id must match the frontmatter `name`. */
+export function loadSkill(skill: string, read: ReadFn = defaultRead): ParsedSkill {
+  const asset = SKILLS[skill];
+  if (!asset) throw new Error(`unknown skill: ${skill}`);
+  const full = readSkillAsset(asset.file, read);
+  const { name, description, body } = parseSkillFrontmatter(full);
+  if (name !== skill) {
+    throw new Error(
+      `skill id mismatch: registry "${skill}" vs frontmatter "${name}" in ${asset.file}`,
+    );
+  }
+  return { name, description, body, full };
+}
+
+/** Canonical SKILL.md bytes (frontmatter + body), verbatim. */
+export function loadSkillFull(skill: string, read: ReadFn = defaultRead): string {
+  return loadSkill(skill, read).full;
+}
+
+/** Insert the marker line right after the closing `---` fence. */
+function injectMarkerLine(skillMd: string, markerLine: string): string {
+  const closingFence = '\n---\n';
+  const at = skillMd.indexOf(closingFence) + closingFence.length;
+  return `${skillMd.slice(0, at)}${markerLine}\n${skillMd.slice(at)}`;
+}
+
+/** Canonical SKILL.md bytes carrying a specific marker line (used by `agent status`). */
+export function renderCanonicalWithMarker(
   skill: string,
   markerLine: string,
-  body?: string,
+  read: ReadFn = defaultRead,
 ): string {
-  const spec = TARGETS[target];
-  if (spec.mode !== 'own-file') {
-    throw new Error(`renderOwnFileWithMarker: ${target} is not an own-file target`);
-  }
-  const skillSpec = SKILLS[skill];
-  if (!skillSpec) throw new Error(`unknown skill: ${skill}`);
-  const resolvedBody = body !== undefined ? body : loadSkillBodyFor(skill);
-  return injectMarkerLine(
-    spec.wrap(skillSpec.name, skillSpec.description, resolvedBody),
-    markerLine,
+  if (!SKILLS[skill]) throw new Error(`unknown skill: ${skill}`);
+  return injectMarkerLine(loadSkillFull(skill, read), markerLine);
+}
+
+/** Canonical SKILL.md bytes to write: the asset verbatim plus a provenance marker. */
+export function renderCanonical(skill: string, read: ReadFn = defaultRead): string {
+  return renderCanonicalWithMarker(
+    skill,
+    buildSkillMarker(skill, loadSkillFull(skill, read)),
+    read,
   );
 }
 
+// ---------------------------------------------------------------------------
+// Legacy format detection
+// ---------------------------------------------------------------------------
+
 /**
- * The exact bytes to write for one skill on one target.
- *
- * - own-file targets: `body` defaults to the skill's own-file asset, wrapped in
- *   the target's frontmatter/header, and carrying a provenance marker line so
- *   `agent status` can tell fresh, stale, and hand-edited installs apart.
- * - codex (managed-section): returns the skill's codex contribution unwrapped
- *   and marker-free (plain Markdown, no frontmatter). The real install does NOT
- *   call this for codex: it aggregates all skills via
- *   {@link buildCodexAggregate} and writes ONE marker just inside the BEGIN
- *   sentinel. It is kept single-skill here for tests and parity. Pass an
- *   explicit `body` to override.
+ * Legacy `AGENTS.md` sentinel pair for the codex target. The BEGIN line matches
+ * the exact string the old CLI emitted.
  */
-export function renderForTarget(
-  t: AgentTarget,
-  skill: string,
-  body?: string,
-): { path: string; content: string } {
-  const spec = TARGETS[t];
-  const skillSpec = SKILLS[skill];
-  if (!skillSpec) throw new Error(`unknown skill: ${skill}`);
-  const path = pathFor(t, skill);
-  if (spec.mode === 'managed-section') {
-    const resolvedBody = body !== undefined ? body : codexContentFor(skill);
-    return { path, content: spec.wrap(skillSpec.name, skillSpec.description, resolvedBody) };
+export const LEGACY_MANAGED_SECTION_BEGIN =
+  '<!-- BEGIN TESTSPRITE AGENT SECTION (testsprite agent install codex) -->';
+export const LEGACY_MANAGED_SECTION_END = '<!-- END TESTSPRITE AGENT SECTION -->';
+
+/**
+ * Legacy own-file format for one old target (e.g. `.cursor/rules/*.mdc`,
+ * `.claude/skills/<skill>/SKILL.md`). `antigravity` is omitted — it already
+ * lands at `.agents/skills/`.
+ */
+export interface LegacyOwnFileSpec {
+  /** Old target id — for messaging only (not resolved against the new registry). */
+  legacyTarget: string;
+  /** POSIX path template with a `{skill}` placeholder. */
+  pathTemplate: string;
+  /** 'dir' = the artifact is `<dir>/<skill>/SKILL.md` (skill lives in a folder);
+   *  'file' = the artifact is a bare file (e.g. `<dir>/<skill>.mdc`). */
+  kind: 'dir' | 'file';
+  /** New-format target id (e.g. 'claude-code', 'github-copilot'). */
+  newTarget: AgentTarget;
+}
+
+export const LEGACY_OWN_FILE_TARGETS: readonly LegacyOwnFileSpec[] = [
+  {
+    legacyTarget: 'claude',
+    pathTemplate: '.claude/skills/{skill}/SKILL.md',
+    kind: 'dir',
+    newTarget: 'claude-code',
+  },
+  {
+    legacyTarget: 'cursor',
+    pathTemplate: '.cursor/rules/{skill}.mdc',
+    kind: 'file',
+    newTarget: 'cursor',
+  },
+  {
+    legacyTarget: 'cline',
+    pathTemplate: '.clinerules/{skill}.md',
+    kind: 'file',
+    newTarget: 'cline',
+  },
+  {
+    legacyTarget: 'kiro',
+    pathTemplate: '.kiro/skills/{skill}/SKILL.md',
+    kind: 'dir',
+    newTarget: 'kiro',
+  },
+  {
+    legacyTarget: 'windsurf',
+    pathTemplate: '.windsurf/rules/{skill}.md',
+    kind: 'file',
+    newTarget: 'devin-desktop',
+  },
+  {
+    legacyTarget: 'copilot',
+    pathTemplate: '.github/instructions/{skill}.instructions.md',
+    kind: 'file',
+    newTarget: 'github-copilot',
+  },
+];
+
+/** Render a legacy path template for a concrete skill (POSIX, repo-relative). */
+export function legacyOwnFilePath(spec: LegacyOwnFileSpec, skill: string): string {
+  return spec.pathTemplate.replace('{skill}', skill);
+}
+
+/** Outcome of locating the legacy managed section inside an `AGENTS.md`. */
+export type ManagedSectionBounds =
+  | { state: 'absent' }
+  | { state: 'present'; start: number; end: number }
+  | { state: 'corrupt'; reason: string };
+
+/**
+ * Find the byte range `[start, end)` of the legacy managed section in
+ * `AGENTS.md`.  Only standalone BEGIN/END sentinel lines count (exact match
+ * after trim).
+ *
+ * Returns `absent` (no sentinels), `present` (one balanced BEGIN…END pair),
+ * or `corrupt` (unbalanced, duplicate, or misordered).
+ */
+export function findManagedSectionBounds(content: string): ManagedSectionBounds {
+  const lines = content.split('\n');
+  // lineStart[i] = byte offset where lines[i] begins (lines[0] = 0).
+  const lineStart: number[] = [0];
+  for (let i = 0; i < lines.length; i++) {
+    lineStart.push(lineStart[i]! + lines[i]!.length + 1); // +1 for the '\n'
   }
-  const resolvedBody =
-    body !== undefined ? body : spec.compactBody ? compactBodyFor(skill) : loadSkillBodyFor(skill);
-  return {
-    path,
-    content: renderOwnFileWithMarker(t, skill, buildSkillMarker(skill, resolvedBody), resolvedBody),
-  };
+
+  const beginLines: number[] = [];
+  const endLines: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const stripped = lines[i]!.trim();
+    if (stripped === LEGACY_MANAGED_SECTION_BEGIN) beginLines.push(i);
+    else if (stripped === LEGACY_MANAGED_SECTION_END) endLines.push(i);
+  }
+
+  if (beginLines.length === 0 && endLines.length === 0) return { state: 'absent' };
+  if (beginLines.length > 1 || endLines.length > 1) {
+    return { state: 'corrupt', reason: 'found multiple standalone TestSprite sentinel lines' };
+  }
+  if (beginLines.length === 1 && endLines.length === 0) {
+    return { state: 'corrupt', reason: 'BEGIN sentinel without a matching END' };
+  }
+  if (endLines.length === 1 && beginLines.length === 0) {
+    return { state: 'corrupt', reason: 'END sentinel without a matching BEGIN' };
+  }
+
+  const beginLine = beginLines[0]!;
+  const endLine = endLines[0]!;
+  if (endLine < beginLine) {
+    return { state: 'corrupt', reason: 'END sentinel appears before BEGIN' };
+  }
+
+  const start = lineStart[beginLine]!;
+  let end = lineStart[endLine]! + lines[endLine]!.length;
+  if (end < content.length && content[end] === '\n') end += 1;
+  return { state: 'present', start, end };
 }

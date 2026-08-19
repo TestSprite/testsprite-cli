@@ -89,7 +89,7 @@ This is the loop a coding agent runs on its own once you've onboarded it with `t
 
 ```bash
 # (one-time, per project) teach your agent the CLI
-testsprite agent install claude
+testsprite agent install --target claude
 
 # 1 — describe the behavior you want to guarantee, run it, wait
 testsprite test create --project proj_8f0f6 --type frontend \
@@ -109,30 +109,31 @@ Every artifact in the bundle shares one `snapshotId`; the CLI will not mix a fai
 
 ## Agent onboarding (`agent install`)
 
-`testsprite agent install` writes a ready-made skill/instruction file into your project so your coding agent knows the commands, the exit codes, and the failure-bundle layout — no prompt engineering required. It's a pure-local command: no network, no credentials.
+`testsprite agent install` writes the TestSprite skills into your project so your coding agent knows the commands, the exit codes, and the failure-bundle layout — no prompt engineering required. It's a pure-local command: no network, no credentials.
 
 ```bash
-testsprite agent install claude     # install the skill for Claude Code
-testsprite agent install codex      # install into AGENTS.md for Codex (managed-section)
-testsprite agent install cursor     # .cursor/rules/testsprite-verify.mdc
-testsprite agent install cline      # .clinerules/testsprite-verify.md
-testsprite agent install windsurf   # .windsurf/rules/testsprite-verify.md
-testsprite agent install antigravity  # .agents/skills/testsprite-verify/SKILL.md
-testsprite agent install kiro       # .kiro/skills/testsprite-verify/SKILL.md
-testsprite agent install copilot    # .github/instructions/testsprite-verify.instructions.md
-testsprite agent list               # list all 8 targets with status + mode + path
-testsprite agent status             # check installed skills against this CLI version
+testsprite agent install --target claude-code
+testsprite agent install --target codex
+testsprite agent install --target cursor
+testsprite agent install --target kiro-cli
+testsprite agent list
+testsprite agent status
 ```
 
-Supported targets: `claude` (GA), `codex` (experimental), `cursor` (experimental), `cline` (experimental), `antigravity` (experimental), `kiro` (experimental), `windsurf` (experimental), `copilot` (experimental).
+`--target` accepts any agent id from the registry — see [Supported agents](./README.md#supported-agents) in the README for the full list. Omitting `--target` in a non-interactive shell defaults to `claude-code`; in a terminal the CLI prompts.
 
-Omitting `--target` in a non-interactive shell (CI, agent subprocess) defaults to `claude` with an `[info]` note on stderr; in a terminal the CLI prompts (empty answer = `claude`).
+There are two kinds of agent:
 
-`agent status` checks every installed skill file against the current CLI version and reports one of `ok`, `stale`, `modified`, `unmarked`, `absent`, or `corrupt` per target. It exits `1` when anything needs attention, so `testsprite agent status && …` can gate a CI step; `--dir <path>` inspects a different project root.
+- **Universal agents** (Skills folder `.agents/skills`) read the skill directly from the shared folder. Installing for **one** of them makes the skill available to **all** of them — `agent install --target codex` also serves Cursor, Copilot, Amp, and every other universal agent.
+- **Symlinked agents** (every other folder) get a per-skill symlink from their own skills folder back to `.agents/skills/`, so they read the same bytes as the universal ones.
 
-The `codex` target uses **managed-section mode** — it writes only a sentinel-delimited section inside your existing `AGENTS.md`, so your project instructions are never clobbered. Re-running without `--force` replaces the section in-place; user content outside the sentinels is always preserved.
+`.agents/skills/` is the **single source of truth**: it is written on every install, even when you target a symlinked agent — `agent install --target claude-code` lands the skill in `.agents/skills/` (covering every universal agent) **and** links it into `.claude/skills/`. Because each symlink points _into_ `.agents/skills/`, you only ever edit a skill there and every symlinked agent reflects the change automatically (on systems where symlinks are unavailable — e.g. Windows without Developer Mode — a plain copy is written instead, which won't auto-update).
 
-Re-running with `--force` on **own-file targets** (claude, cursor, cline, antigravity, kiro, windsurf, copilot) backs up the existing file to `<path>.bak` first.
+`agent status` checks each installed skill against this CLI version and classifies it as `ok`, `stale`, `modified`, `unmarked`, or `absent`. `absent` means the artifact's file is missing (e.g. a canonical file or symlink landing was deleted); absent artifacts are simply **omitted** from the list — so agents with nothing installed never appear. Symlinked agents appear only when their own landing exists; universal agents share one canonical skill file (`.agents/skills/`), so installing for any one of them serves every universal agent and they all report together. It exits `1` when anything needs attention, so `testsprite agent status && …` can gate a CI step; `--dir <path>` inspects a different project root.
+
+Re-running with `--force` overwrites a canonical file that has drifted, backing up the existing bytes to `<path>.bak` first; for symlinked landings it replaces a link that points elsewhere.
+
+`--force` also **migrates legacy installs** (from before the shared `.agents/skills/` model), scoped to the targets you requested: a legacy per-agent skill file or folder is backed up to its corresponding `.bak` path and replaced by a symlink landing (or a plain copy where symlinks are unavailable), and a legacy managed section in Codex's `AGENTS.md` is removed while the untouched original file is kept as `AGENTS.md.bak` — content outside the managed section is preserved in place. A plain (non-`--force`) install that a legacy artifact would block refuses to run and exits `6`, printing the exact `agent install --force --target <id>` command to migrate it; add `--dry-run` to see the migration plan without writing or removing anything. When everything looks right, the `*.bak` backups can be deleted safely.
 
 ## Plan file format
 

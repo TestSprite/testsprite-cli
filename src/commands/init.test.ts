@@ -14,7 +14,13 @@ import type { MeResponse } from './auth.js';
 import type { AgentFs } from './agent.js';
 import type { InitDeps } from './init.js';
 import { runInit } from './init.js';
-import { TARGETS, DEFAULT_SKILLS, pathFor, type AgentTarget } from '../lib/agent-targets.js';
+import {
+  DEFAULT_SKILLS,
+  TARGETS,
+  canonicalSkillFile,
+  pathFor,
+  type AgentTarget,
+} from '../lib/agent-targets.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -70,11 +76,14 @@ function makeMemFs(): {
   fs: AgentFs;
   writeCalls: string[];
   mkdirCalls: string[];
+  symlinkCalls: { target: string; link: string }[];
 } {
   const store = new Map<string, string>();
+  const symlinks = new Map<string, string>();
   const dirs = new Set<string>();
   const writeCalls: string[] = [];
   const mkdirCalls: string[] = [];
+  const symlinkCalls: { target: string; link: string }[] = [];
 
   const addAncestors = (p: string) => {
     let cur = path.dirname(p);
@@ -87,6 +96,7 @@ function makeMemFs(): {
 
   const agentFs: AgentFs = {
     async lstat(p: string) {
+      if (symlinks.has(p)) return { isFile: false, isSymbolicLink: true };
       if (store.has(p)) return { isFile: true, isSymbolicLink: false };
       if (dirs.has(p)) return { isFile: false, isSymbolicLink: false };
       return null;
@@ -97,7 +107,7 @@ function makeMemFs(): {
       return v;
     },
     async writeFile(p: string, data: string, opts?: { exclusive?: boolean }) {
-      if (opts?.exclusive && (store.has(p) || dirs.has(p))) {
+      if (opts?.exclusive && (store.has(p) || dirs.has(p) || symlinks.has(p))) {
         throw Object.assign(new Error(`EEXIST: ${p}`), { code: 'EEXIST' });
       }
       writeCalls.push(p);
@@ -109,9 +119,47 @@ function makeMemFs(): {
       dirs.add(p);
       addAncestors(p);
     },
+    async readlink(p: string) {
+      return symlinks.get(p) ?? null;
+    },
+    async symlink(target: string, linkPath: string) {
+      symlinkCalls.push({ target, link: linkPath });
+      symlinks.set(linkPath, target);
+      addAncestors(linkPath);
+    },
+    async unlink(p: string) {
+      store.delete(p);
+      symlinks.delete(p);
+    },
+    async rm(p: string) {
+      store.delete(p);
+      symlinks.delete(p);
+      for (const k of [...store.keys()]) {
+        if (k.startsWith(p + path.sep)) store.delete(k);
+      }
+      for (const s of [...symlinks.keys()]) {
+        if (s.startsWith(p + path.sep)) symlinks.delete(s);
+      }
+      for (const d of [...dirs]) {
+        if (d === p || d.startsWith(p + path.sep)) dirs.delete(d);
+      }
+    },
+    async readdir(p: string) {
+      const names = new Set<string>();
+      const prefix = p + path.sep;
+      const direct = (k: string) => {
+        if (!k.startsWith(prefix)) return;
+        const rest = k.slice(prefix.length);
+        if (!rest.includes(path.sep)) names.add(rest);
+      };
+      for (const k of store.keys()) direct(k);
+      for (const s of symlinks.keys()) direct(s);
+      for (const d of dirs) direct(d);
+      return [...names];
+    },
   };
 
-  return { store, fs: agentFs, writeCalls, mkdirCalls };
+  return { store, fs: agentFs, writeCalls, mkdirCalls, symlinkCalls };
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +195,7 @@ function makeBaseOpts(overrides: Partial<Parameters<typeof runInit>[0]> = {}) {
     debug: false,
     dryRun: false,
     fromEnv: false,
-    agent: 'claude' as AgentTarget,
+    agent: 'claude-code' as AgentTarget,
     noAgent: false,
     force: false,
     yes: false,
@@ -386,13 +434,13 @@ describe('runInit — --no-agent', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3b. Default claude target: installs both DEFAULT_SKILLS (2 own-file writes)
+// 3b. Default claude-code target: installs both DEFAULT_SKILLS into .agents/skills
 // ---------------------------------------------------------------------------
 
-describe('runInit — default claude target installs 2 skill files', () => {
-  it('writes both testsprite-verify and testsprite-onboard for claude', async () => {
+describe('runInit — default claude-code target installs the canonical skill files', () => {
+  it('writes both testsprite-verify and testsprite-onboard into .agents/skills', async () => {
     const { deps } = makeCapture();
-    const { fs: agentFs, writeCalls } = makeMemFs();
+    const { fs: agentFs, writeCalls, symlinkCalls } = makeMemFs();
     const fetchMock = makeOkFetch();
 
     await runInit(makeBaseOpts({ apiKey: 'sk-user-test' }), {
@@ -404,13 +452,21 @@ describe('runInit — default claude target installs 2 skill files', () => {
       fs: agentFs,
     });
 
-    const verifyPath = path.resolve(CWD, pathFor('claude', 'testsprite-verify'));
-    const onboardPath = path.resolve(CWD, pathFor('claude', 'testsprite-onboard'));
+    // canonical source of truth: one SKILL.md per skill under .agents/skills
+    const verifyPath = path.resolve(CWD, canonicalSkillFile('testsprite-verify'));
+    const onboardPath = path.resolve(CWD, canonicalSkillFile('testsprite-onboard'));
     expect(writeCalls).toContain(verifyPath);
     expect(writeCalls).toContain(onboardPath);
-    // Exactly 2 skill-file writes (claude is own-file, one file per skill)
-    const skillWrites = writeCalls.filter(p => p === verifyPath || p === onboardPath);
-    expect(skillWrites).toHaveLength(2);
+    // claude-code is a symlinked target: a link back to canonical is created per skill.
+    // path.resolve yields backslashes on Windows — normalize to posix before endsWith
+    // (same toPosix pattern as skill-nudge.test.ts).
+    const toPosix = (p: string) => p.replaceAll('\\', '/');
+    expect(
+      symlinkCalls.some(s => toPosix(s.link).endsWith('.claude/skills/testsprite-verify')),
+    ).toBe(true);
+    expect(
+      symlinkCalls.some(s => toPosix(s.link).endsWith('.claude/skills/testsprite-onboard')),
+    ).toBe(true);
   });
 });
 
@@ -433,14 +489,13 @@ describe('runInit — --agent cursor', () => {
       fs: agentFs,
     });
 
-    // cursor is own-file; DEFAULT_SKILLS installs 2 files (testsprite-verify + testsprite-onboard)
+    // cursor is universal: it reads .agents/skills directly, so the canonical
+    // SKILL.md is written (one per skill) and NO symlink is created.
     const cursorVerifyPath = path.resolve(CWD, pathFor('cursor', 'testsprite-verify'));
     const cursorOnboardPath = path.resolve(CWD, pathFor('cursor', 'testsprite-onboard'));
     expect(writeCalls).toContain(cursorVerifyPath);
     expect(writeCalls).toContain(cursorOnboardPath);
-    // TARGETS[target].path is the verify skill path (back-compat); still written
-    const cursorAbsPath = path.resolve(CWD, TARGETS.cursor.path);
-    expect(writeCalls).toContain(cursorAbsPath);
+    expect(cursorVerifyPath).toBe(path.resolve(CWD, canonicalSkillFile('testsprite-verify')));
 
     const stdout = captured.stdout.join('\n');
     expect(stdout).toContain('cursor');
@@ -782,7 +837,7 @@ describe('runInit — summary JSON shape', () => {
       agent: { target: string; action: string; skills?: string[] } | null;
     };
     expect(parsed.agent).not.toBeNull();
-    expect(parsed.agent?.target).toBe('claude');
+    expect(parsed.agent?.target).toBe('claude-code');
     // aggregateInstallAction maps 'written' → 'installed'; fresh install is 'installed'
     expect(parsed.agent?.action).toBe('installed');
     expect(typeof parsed.agent?.action).toBe('string');
@@ -852,20 +907,13 @@ describe('runInit — all agent targets', () => {
         fs: agentFs,
       });
 
-      // TARGETS[target].path is the testsprite-verify path (back-compat); always written
-      const expectedPath = path.resolve(CWD, TARGETS[target].path);
-      expect(writeCalls).toContain(expectedPath);
-
-      if (TARGETS[target].mode === 'own-file') {
-        // own-file targets: DEFAULT_SKILLS installs 2 separate files (one per skill)
-        const verifyPath = path.resolve(CWD, pathFor(target, 'testsprite-verify'));
-        const onboardPath = path.resolve(CWD, pathFor(target, 'testsprite-onboard'));
-        expect(writeCalls).toContain(verifyPath);
-        expect(writeCalls).toContain(onboardPath);
-      } else {
-        // managed-section (codex): ONE write to AGENTS.md aggregating all skills
-        expect(writeCalls.filter(p => p === expectedPath).length).toBe(1);
-      }
+      // Every target writes the canonical SKILL.md under .agents/skills (the
+      // single source of truth). Universal targets read it directly; symlinked
+      // targets additionally link to it.
+      const verifyPath = path.resolve(CWD, canonicalSkillFile('testsprite-verify'));
+      const onboardPath = path.resolve(CWD, canonicalSkillFile('testsprite-onboard'));
+      expect(writeCalls).toContain(verifyPath);
+      expect(writeCalls).toContain(onboardPath);
     });
   }
 });
@@ -935,8 +983,8 @@ describe('[B-E2E-05] runInit: --no-agent + --agent conflict emits [warn] on stde
     const warnLine = captured.stderr.find(l => l.includes('[warn]') && l.includes('--no-agent'));
     expect(warnLine).toBeDefined();
 
-    // --agent cursor wins → cursor file should be written
-    const cursorPath = path.resolve(CWD, TARGETS.cursor.path);
+    // --agent cursor wins → cursor (universal) canonical file should be written
+    const cursorPath = path.resolve(CWD, canonicalSkillFile('testsprite-verify'));
     expect(writeCalls).toContain(cursorPath);
   });
 
@@ -991,6 +1039,21 @@ describe('[B-E2E-06] runInit: install failure → info message on stderr + re-th
       },
       async mkdir() {
         throw new Error('ENOENT: no such directory');
+      },
+      async readlink() {
+        return null;
+      },
+      async symlink() {
+        throw new Error('ENOENT');
+      },
+      async unlink() {
+        throw new Error('ENOENT');
+      },
+      async rm() {
+        throw new Error('ENOENT');
+      },
+      async readdir() {
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
       },
     };
 

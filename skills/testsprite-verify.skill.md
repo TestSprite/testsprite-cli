@@ -1,3 +1,8 @@
+---
+name: testsprite-verify
+description: TestSprite verification loop — after finishing a feature or fix in a TestSprite-tested repo, use the `testsprite` CLI to run the relevant TestSprite tests against the change and inspect any failure artifacts before reporting the work as done. Use whenever code has changed outside docs/config and is about to be reported complete — by running an existing test that covers the change, or by creating a new TestSprite test (a frontend plan, or a backend Python assertion) and running it to a terminal verdict.
+---
+
 # TestSprite Verification Loop
 
 The verification loop that flies your just-shipped feature through the

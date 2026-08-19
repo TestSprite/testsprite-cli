@@ -70,7 +70,6 @@ export interface DoctorDeps {
   /** Runtime version string (e.g. "22.9.0"). Defaults to `process.versions.node`. */
   nodeVersion?: string;
   existsSync?: (p: string) => boolean;
-  readFileSync?: (p: string) => string;
 }
 
 type CommonOptions = FactoryCommonOptions;
@@ -205,7 +204,6 @@ function checkCredentials(hasKey: boolean, profile: string, dryRun: boolean): Do
 function checkSkill(cwd: string, deps: DoctorDeps): DoctorCheck {
   const installed = isVerifySkillInstalled(cwd, {
     existsSync: deps.existsSync,
-    readFileSync: deps.readFileSync,
   });
   return {
     name: 'Verify skill',

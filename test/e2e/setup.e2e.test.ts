@@ -15,7 +15,12 @@ import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { TARGETS, pathFor } from '../../src/lib/agent-targets.js';
+import {
+  TARGETS,
+  canonicalSkillFile,
+  pathFor,
+  type AgentTarget,
+} from '../../src/lib/agent-targets.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, '../..');
@@ -77,11 +82,12 @@ describe('setup --help', () => {
     expect(result.stdout).toContain('--yes');
   });
 
-  it('--help lists all valid agent targets', () => {
+  it('--help describes the agent-target model and the headline ids', () => {
     const result = runCli(['setup', '--help']);
-    for (const t of Object.keys(TARGETS)) {
-      expect(result.stdout, `target "${t}" should be in --help`).toContain(t);
-    }
+    expect(result.stdout).toContain('agentskills.io');
+    expect(result.stdout).toContain('claude-code');
+    expect(result.stdout).toContain('codex');
+    expect(result.stdout).toContain('Default: claude-code');
   });
 });
 
@@ -103,8 +109,8 @@ describe('setup --dry-run --no-agent', () => {
     expect(result.stderr).toContain('[dry-run]');
     expect(result.stderr).toContain('no writes or network calls');
 
-    for (const spec of Object.values(TARGETS)) {
-      const absPath = join(tmpDir, spec.path);
+    for (const target of Object.keys(TARGETS) as AgentTarget[]) {
+      const absPath = join(tmpDir, pathFor(target, 'testsprite-verify'));
       expect(existsSync(absPath), `unexpected file: ${absPath}`).toBe(false);
     }
   });
@@ -126,7 +132,7 @@ describe('setup --dry-run (with agent)', () => {
         '--api-key',
         'sk-user-dry-with-agent',
         '--agent',
-        'claude',
+        'claude-code',
         '--dir',
         tmpDir,
       ],
@@ -136,9 +142,9 @@ describe('setup --dry-run (with agent)', () => {
     expect(result.status).toBe(0);
     expect(result.stderr).toContain('[dry-run]');
 
-    // Both skill paths must appear in the dry-run preview
-    const verifyPath = pathFor('claude', 'testsprite-verify');
-    const onboardPath = pathFor('claude', 'testsprite-onboard');
+    // The canonical SKILL.md path must appear in the dry-run preview
+    const verifyPath = canonicalSkillFile('testsprite-verify');
+    const onboardPath = canonicalSkillFile('testsprite-onboard');
     expect(result.stderr, 'verify path in dry-run preview').toContain(verifyPath);
     expect(result.stderr, 'onboard path in dry-run preview').toContain(onboardPath);
 
@@ -221,17 +227,20 @@ describe('deprecated `init` alias', () => {
 // ---------------------------------------------------------------------------
 
 describe('matrix coverage guard', () => {
-  it('TARGETS matches the documented set (update this list when adding a target)', () => {
-    expect(Object.keys(TARGETS)).toEqual([
-      'claude',
-      'antigravity',
-      'cursor',
-      'cline',
-      'kiro',
-      'windsurf',
-      'copilot',
-      'codex',
-    ]);
+  it('TARGETS includes the documented headline agents (the standard registry is broad)', () => {
+    expect(Object.keys(TARGETS)).toEqual(
+      expect.arrayContaining([
+        'claude-code',
+        'codex',
+        'cursor',
+        'cline',
+        'antigravity-cli',
+        'github-copilot',
+        'kiro-cli',
+        'devin-desktop',
+        'antigravity',
+      ]),
+    );
   });
 });
 

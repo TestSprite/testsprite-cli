@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MANAGED_SECTION_BEGIN, MANAGED_SECTION_END, TARGETS } from './agent-targets.js';
+import { TARGETS, pathFor, type AgentTarget } from './agent-targets.js';
 import type { OutputMode } from './output.js';
 import {
   SKILL_NUDGE_COMMANDS,
@@ -19,57 +19,21 @@ import {
 const toPosix = (p: string) => p.replaceAll('\\', '/');
 
 describe('isVerifySkillInstalled', () => {
-  it('true when the claude own-file SKILL.md exists', () => {
-    const existsSync = (p: string) =>
-      toPosix(p).endsWith('.claude/skills/testsprite-verify/SKILL.md');
-    expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
-  });
-
-  it('true for the cursor .mdc landing file', () => {
-    const existsSync = (p: string) => toPosix(p).endsWith('.cursor/rules/testsprite-verify.mdc');
-    expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
-  });
-
-  it('true for the cline landing file', () => {
-    const existsSync = (p: string) => toPosix(p).endsWith('.clinerules/testsprite-verify.md');
-    expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
-  });
-
-  it('true for the antigravity landing file', () => {
-    const existsSync = (p: string) =>
-      toPosix(p).endsWith('.agents/skills/testsprite-verify/SKILL.md');
-    expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
-  });
-
-  it('true when AGENTS.md exists AND carries our BEGIN sentinel', () => {
-    const existsSync = (p: string) => p.endsWith('AGENTS.md');
-    const readFileSync = () =>
-      `# project\n${MANAGED_SECTION_BEGIN}\n...skill...\n${MANAGED_SECTION_END}\n`;
-    expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(true);
-  });
-
-  it('false when AGENTS.md has only the BEGIN sentinel without a complete managed section', () => {
-    const existsSync = (p: string) => p.endsWith('AGENTS.md');
-    const readFileSync = () => `# project\n${MANAGED_SECTION_BEGIN}\n...partial skill...\n`;
-    expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(false);
-  });
-
-  it('false when only a bare AGENTS.md (no sentinel) exists', () => {
-    const existsSync = (p: string) => p.endsWith('AGENTS.md');
-    const readFileSync = () => '# my project\nNothing TestSprite here.\n';
-    expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(false);
-  });
-
-  it('false when an unreadable AGENTS.md is the only candidate', () => {
-    const existsSync = (p: string) => p.endsWith('AGENTS.md');
-    const readFileSync = () => {
-      throw new Error('EACCES');
-    };
-    expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(false);
+  it('true when any single target landing exists (checked for every target)', () => {
+    for (const id of Object.keys(TARGETS) as AgentTarget[]) {
+      const landing = toPosix(pathFor(id, 'testsprite-verify'));
+      const existsSync = (p: string) => toPosix(p).endsWith(landing);
+      expect(isVerifySkillInstalled('/proj', { existsSync }), id).toBe(true);
+    }
   });
 
   it('false when nothing is present', () => {
     expect(isVerifySkillInstalled('/proj', { existsSync: () => false })).toBe(false);
+  });
+
+  it('false for an unrelated file', () => {
+    const existsSync = (p: string) => toPosix(p).endsWith('README.md');
+    expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(false);
   });
 
   it('checks paths under the supplied dir', () => {
@@ -80,8 +44,9 @@ describe('isVerifySkillInstalled', () => {
         return false;
       },
     });
+    expect(seen.length).toBeGreaterThan(0);
     expect(seen.every(p => toPosix(p).startsWith('/some/proj'))).toBe(true);
-    // One probe per target landing path.
+    // One probe per supported target landing path.
     expect(seen).toHaveLength(Object.keys(TARGETS).length);
   });
 });

@@ -56,12 +56,21 @@ Pre-decided policies, so proposals don't have to relitigate them:
   runtime dependency needs explicit maintainer sign-off **in the issue,
   before the PR**. Utility modules land only together with the consumer
   that uses them — standalone libraries are declined.
-- **`agent install` targets.** Shipped: `claude`, `antigravity`, `cursor`,
-  `cline`, `codex`, `kiro`, `windsurf`, `copilot`. Accepted and in progress:
-  `gemini`.
-  A proposal for a new target needs (1) the editor's official rules/skill
-  file mechanism, documented, and (2) the proposer prepared to maintain the
-  target going forward.
+- **`agent install` targets.** The CLI supports a registry of agent ids (see
+  the [supported-agents tables](./README.md#supported-agents) in the README for
+  the current set), each classified as **universal** (reads the shared
+  `.agents/skills/` folder directly — Cursor, Codex, Copilot, Amp, …; one
+  install serves all of them) or **symlinked** (keeps skills in its own folder,
+  e.g. `.claude/skills`, with a per-skill symlink back to `.agents/skills/` so
+  every agent reads the same single source of truth). A proposal adding a
+  target must, in the same PR: (1) cite the agent's **current** skills docs
+  proving its skills folder and classification (universal = reads
+  `.agents/skills/` natively; symlinked = installs into its own `<dir>`); (2)
+  add it to the registry (`src/lib/agent-targets.ts` — id, `skillsDir`,
+  `universal` flag, and any alias); (3) update the unit-test target list
+  (`src/lib/agent-targets.test.ts`); and (4) add a row to the matching
+  supported-agents table in the README, with the agent's name and a link to its
+  skills docs.
 - **Outbound network calls.** The CLI talks only to the configured
   TestSprite API endpoint. The one approved exception is an opt-out-able
   npm registry version check (at most once per 24h, carrying nothing but
