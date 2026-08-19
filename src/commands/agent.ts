@@ -199,13 +199,7 @@ export interface AgentDeps {
 }
 
 export type InstallAction =
-  | 'written'
-  | 'skipped'
-  | 'blocked'
-  | 'updated'
-  | 'migrated'
-  | 'dry-run'
-  | 'copy-fallback';
+  'written' | 'skipped' | 'blocked' | 'updated' | 'migrated' | 'dry-run' | 'copy-fallback';
 
 export interface InstallResult {
   target: string;

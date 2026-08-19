@@ -461,8 +461,12 @@ describe('runInit — default claude-code target installs the canonical skill fi
     // path.resolve yields backslashes on Windows — normalize to posix before endsWith
     // (same toPosix pattern as skill-nudge.test.ts).
     const toPosix = (p: string) => p.replaceAll('\\', '/');
-    expect(symlinkCalls.some(s => toPosix(s.link).endsWith('.claude/skills/testsprite-verify'))).toBe(true);
-    expect(symlinkCalls.some(s => toPosix(s.link).endsWith('.claude/skills/testsprite-onboard'))).toBe(true);
+    expect(
+      symlinkCalls.some(s => toPosix(s.link).endsWith('.claude/skills/testsprite-verify')),
+    ).toBe(true);
+    expect(
+      symlinkCalls.some(s => toPosix(s.link).endsWith('.claude/skills/testsprite-onboard')),
+    ).toBe(true);
   });
 });
 

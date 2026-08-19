@@ -939,9 +939,9 @@ describe('createAgentCommand wiring', () => {
 
   it('agent install <unknown> (positional) rejects with exit 5', async () => {
     const program = createAgentCommand(deps(makeMemFs()));
-    await expect(
-      program.parseAsync(['install', 'banana'], { from: 'user' }),
-    ).rejects.toMatchObject({ exitCode: 5 });
+    await expect(program.parseAsync(['install', 'banana'], { from: 'user' })).rejects.toMatchObject(
+      { exitCode: 5 },
+    );
   });
 });
 
