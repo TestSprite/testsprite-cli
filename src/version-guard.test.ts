@@ -1,9 +1,16 @@
+import { createRequire } from 'node:module';
 import { describe, expect, it } from 'vitest';
 import {
   MIN_SUPPORTED_NODE_MAJOR,
+  SUPPORTED_NODE_ENGINE,
   parseMajorVersion,
   shouldRejectNodeVersion,
 } from './version-guard.js';
+
+const require = createRequire(import.meta.url);
+const pkg: { engines: { node: string } } = require('../package.json') as {
+  engines: { node: string };
+};
 
 // These tests exercise the REAL guard functions used by src/index.ts,
 // imported here rather than re-declared, so a regression in the source is
@@ -22,22 +29,32 @@ describe('parseMajorVersion', () => {
 });
 
 describe('shouldRejectNodeVersion', () => {
-  it('rejects majors below the supported floor', () => {
+  it('stays pinned to package.json engines.node', () => {
+    expect(SUPPORTED_NODE_ENGINE).toBe(pkg.engines.node);
+  });
+
+  it('rejects runtimes outside the declared engines range', () => {
     expect(shouldRejectNodeVersion('18.19.1')).toBe(true);
-    expect(shouldRejectNodeVersion('16.20.2')).toBe(true);
-    expect(shouldRejectNodeVersion('14.21.3')).toBe(true);
+    expect(shouldRejectNodeVersion('20.0.0')).toBe(true);
+    expect(shouldRejectNodeVersion('20.18.99')).toBe(true);
+    expect(shouldRejectNodeVersion('21.99.0')).toBe(true);
+    expect(shouldRejectNodeVersion('22.0.0')).toBe(true);
+    expect(shouldRejectNodeVersion('22.12.99')).toBe(true);
+    expect(shouldRejectNodeVersion('23.99.99')).toBe(true);
   });
 
-  it('accepts the supported floor and above', () => {
-    expect(shouldRejectNodeVersion('20.0.0')).toBe(false);
-    expect(shouldRejectNodeVersion('20.11.0')).toBe(false);
-    expect(shouldRejectNodeVersion('21.0.0')).toBe(false);
-    expect(shouldRejectNodeVersion('22.1.0')).toBe(false);
+  it('accepts every supported Node window', () => {
+    expect(shouldRejectNodeVersion('20.19.0')).toBe(false);
+    expect(shouldRejectNodeVersion('20.99.0')).toBe(false);
+    expect(shouldRejectNodeVersion('22.13.0')).toBe(false);
+    expect(shouldRejectNodeVersion('22.99.0')).toBe(false);
+    expect(shouldRejectNodeVersion('24.0.0')).toBe(false);
+    expect(shouldRejectNodeVersion('25.0.0')).toBe(false);
   });
 
-  it(`treats exactly ${MIN_SUPPORTED_NODE_MAJOR} as supported (boundary)`, () => {
-    expect(shouldRejectNodeVersion(`${MIN_SUPPORTED_NODE_MAJOR}.0.0`)).toBe(false);
-    expect(shouldRejectNodeVersion(`${MIN_SUPPORTED_NODE_MAJOR - 1}.9.9`)).toBe(true);
+  it(`keeps the major floor constant at ${MIN_SUPPORTED_NODE_MAJOR}`, () => {
+    expect(shouldRejectNodeVersion(`${MIN_SUPPORTED_NODE_MAJOR}.19.0`)).toBe(false);
+    expect(shouldRejectNodeVersion(`${MIN_SUPPORTED_NODE_MAJOR - 1}.99.99`)).toBe(true);
   });
 
   it('does not reject an unparseable version (guard never blocks on garbage)', () => {

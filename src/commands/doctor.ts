@@ -30,7 +30,7 @@ import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '..
 import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
 import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 import { VERSION } from '../version.js';
-import { MIN_SUPPORTED_NODE_MAJOR, shouldRejectNodeVersion } from '../version-guard.js';
+import { SUPPORTED_NODE_RANGE, shouldRejectNodeVersion } from '../version-guard.js';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -67,7 +67,7 @@ export interface DoctorDeps {
   stderr?: (line: string) => void;
   /** Project dir for the skill check. Defaults to `process.cwd()`. */
   cwd?: string;
-  /** Runtime version string (e.g. "22.9.0"). Defaults to `process.versions.node`. */
+  /** Runtime version string (e.g. "22.13.0"). Defaults to `process.versions.node`. */
   nodeVersion?: string;
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
@@ -156,17 +156,14 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
 }
 
 function checkNodeVersion(nodeVersion: string): DoctorCheck {
-  // Reuse the CLI's own runtime guard so the verdict matches exactly what the
-  // entrypoint enforces at startup, rather than a divergent hardcoded check.
-  // The precise engines floor (20.19+/22.13+/24+) is enforced by npm at install
-  // time via .npmrc engine-strict. sourceRef: src/version-guard.ts.
+  // Reuse the CLI runtime guard so doctor and startup enforce and describe the same range.
   const rejected = shouldRejectNodeVersion(nodeVersion);
   return {
     name: 'Node.js',
     status: rejected ? 'fail' : 'ok',
     detail: rejected
-      ? `v${nodeVersion} is below the required Node ${MIN_SUPPORTED_NODE_MAJOR}; upgrade Node.js`
-      : `v${nodeVersion} (>=${MIN_SUPPORTED_NODE_MAJOR} required)`,
+      ? `v${nodeVersion} is outside the supported Node range ${SUPPORTED_NODE_RANGE}; upgrade Node.js`
+      : `v${nodeVersion} (supported range: ${SUPPORTED_NODE_RANGE})`,
   };
 }
 

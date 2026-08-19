@@ -35,13 +35,13 @@ import {
 } from './lib/telemetry.js';
 import { maybeNotifyUpdate } from './lib/update-check.js';
 import { VERSION } from './version.js';
-import { shouldRejectNodeVersion } from './version-guard.js';
+import { SUPPORTED_NODE_RANGE, shouldRejectNodeVersion } from './version-guard.js';
 
 // Guard: exit early with a clear message on unsupported Node.js versions,
 // rather than failing later with a cryptic ESM/runtime error.
 if (shouldRejectNodeVersion(process.versions.node)) {
   process.stderr.write(
-    `Error: testsprite requires Node.js >= 20 (found ${process.versions.node}).\nInstall the latest LTS from https://nodejs.org\n`,
+    `Error: testsprite requires Node.js ${SUPPORTED_NODE_RANGE} (found ${process.versions.node}).\nInstall a supported Node.js release from https://nodejs.org\n`,
   );
   process.exit(1);
 }
