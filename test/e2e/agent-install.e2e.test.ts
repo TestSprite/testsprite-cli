@@ -515,12 +515,10 @@ describe('full-registry smoke', () => {
         const landing = join(tmpDir, spec.skillsDir, 'testsprite-verify', 'SKILL.md');
         expect(existsSync(landing), `landing SKILL.md for ${target}`).toBe(true);
         // On POSIX the landing is a symlink; on Windows it may be a copy. Either is fine.
-        try {
-          const st = lstatSync(join(tmpDir, spec.skillsDir, 'testsprite-verify'));
-          expect(st.isSymbolicLink() || st.isDirectory()).toBe(true);
-        } catch {
-          // copy-fallback produced a directory; the existsSync above already proved reachability
-        }
+        // (lstatSync runs OUTSIDE the expect so a missing landing fails loudly
+        // instead of being swallowed by a try/catch around the assertion.)
+        const st = lstatSync(join(tmpDir, spec.skillsDir, 'testsprite-verify'));
+        expect(st.isSymbolicLink() || st.isDirectory()).toBe(true);
       }
     });
   }
