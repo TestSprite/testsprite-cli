@@ -82,7 +82,11 @@ const defaultAgentFs: AgentFs = {
     // rights; junctions require an absolute target. Everywhere else, store a portable
     // relative target.
     if (process.platform === 'win32') {
-      await fs.symlink(path.resolve(target), linkPath, 'junction');
+      // `target` is relative to the link's directory (see linkOrCopy), so resolve
+      // it against that directory — path.resolve(target) alone would resolve
+      // against process.cwd() and point the junction at the wrong place
+      // whenever --dir is not the cwd.
+      await fs.symlink(path.resolve(path.dirname(linkPath), target), linkPath, 'junction');
     } else {
       await fs.symlink(target, linkPath);
     }
