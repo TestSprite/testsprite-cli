@@ -1089,6 +1089,7 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
         wait: true,
         targetUrl: 'https://staging.example.com', // matches in-flight
         timeoutSeconds: 60,
+        skipPreflight: true, // this test exercises conflict resolution, not the reachability probe
       },
       {
         credentialsPath,
@@ -1141,6 +1142,7 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
         wait: true,
         targetUrl: 'https://my-staging.example.com', // mismatches in-flight
         timeoutSeconds: 60,
+        skipPreflight: true, // this test exercises conflict resolution, not the reachability probe
       },
       {
         credentialsPath,
@@ -2015,6 +2017,9 @@ describe('runTestRun --wait: Fix 3 — RequestTimeoutError writes partial JSON t
     const stderrBlock = stderrLines.join('\n');
     expect(stderrBlock).toContain(TRIGGER_RESP.runId);
     expect(stderrBlock).toContain('test wait');
+    // Detach-message honesty: a client-side request timeout is still
+    // executing (and billing) server-side, same as every other detach path.
+    expect(stderrBlock).toContain('(and billing)');
   });
 });
 
@@ -2070,7 +2075,14 @@ describe('runTestRun --wait: TimeoutError writes partial JSON to stdout', () => 
             sleep: instantSleep,
           },
         ),
-      ).rejects.toMatchObject({ exitCode: 7 });
+      ).rejects.toMatchObject({
+        exitCode: 7,
+        // Detach-message honesty: a plain --timeout expiry is the most
+        // common of the four detach reasons in practice, and its thrown
+        // error message must say the run is still executing (and billing)
+        // server-side, same as the other three detach paths.
+        message: expect.stringContaining('(and billing)'),
+      });
 
       const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
         runId: string;
@@ -2615,6 +2627,160 @@ describe('runTestRunAll — batch fresh run', () => {
     };
   }
 
+  it('run --all --wait: a NOT_FOUND member poll → exit 4 with error.code (was folded to exit 1 before this PR)', async () => {
+    const { credentialsPath } = makeCreds();
+    let caughtError: unknown;
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: BATCH_FRESH_RESP };
+      const runId = url.split('/runs/')[1]?.split('?')[0] ?? '';
+      // run_fresh_01 passes; run_fresh_02's poll returns NOT_FOUND (404).
+      if (runId === 'run_fresh_01') return { body: makePassedRun(runId, 'test_be_01') };
+      return errorBody('NOT_FOUND');
+    });
+    try {
+      await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => undefined,
+          stderr: () => undefined,
+          env: {} as NodeJS.ProcessEnv,
+          sleep: instantSleep,
+        },
+      );
+    } catch (err) {
+      caughtError = err;
+    }
+    // The operational branch now propagates the real code (exit 4) instead of
+    // the pre-PR generic exit 1, and carries a machine-readable `code`.
+    const e = caughtError as { exitCode?: number; code?: string };
+    expect(e.exitCode).toBe(4);
+    expect(e.code).toBe('NOT_FOUND');
+  });
+
+  it('POLL_RESERVE_MS: the retry loop clamps sleep so it never eats the reserved poll window', async () => {
+    const { credentialsPath } = makeCreds();
+    const baseNow = new Date('2026-06-09T10:00:00.000Z').getTime();
+    let nowMs = baseNow;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
+    const sleeps: number[] = [];
+    const advancingSleep = (ms: number) => {
+      sleeps.push(ms);
+      nowMs += ms; // the sleep really consumes the budget
+      return Promise.resolve();
+    };
+    // A test that stays rate-deferred across every retry, nothing accepted — so the
+    // only sleeps are the D3 retry loop's (no poll fan-out to muddy the count).
+    const fetchImpl = makeFetch(
+      () =>
+        ({
+          body: {
+            accepted: [],
+            conflicts: [],
+            deferred: [{ testId: 'test_be_02' }],
+            skippedFrontend: [],
+            skippedIntegration: [],
+          } as BatchRunFreshResponse,
+        }) as never,
+    );
+    try {
+      await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 180,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => undefined,
+          stderr: () => undefined,
+          env: {} as NodeJS.ProcessEnv,
+          sleep: advancingSleep,
+        },
+      );
+    } catch {
+      // the still-deferred test surfaces exit 7 — expected; we assert the sleep budget.
+    } finally {
+      nowSpy.mockRestore();
+    }
+    // POLL_RESERVE_MS = min(60000, 180000/3) = 60000. The retry loop must leave at
+    // least the reserve, so the total slept never exceeds budget - reserve.
+    // (Reverting POLL_RESERVE_MS to 0 lets the loop sleep to ~180000 and fails this.)
+    const totalSlept = sleeps.reduce((a, b) => a + b, 0);
+    expect(sleeps.length).toBeGreaterThan(0);
+    expect(totalSlept).toBeLessThanOrEqual(180_000 - 60_000);
+  });
+
+  it('run --all --wait auto-resume: fetches the in-flight run for a createdAt floor and names its source', async () => {
+    const { credentialsPath } = makeCreds();
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    const runFetches: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'POST') {
+        // batch fresh: nothing newly accepted, one already-in-flight conflict
+        // carrying a currentRunId → the fan-out auto-resumes it.
+        return {
+          body: {
+            accepted: [],
+            conflicts: [{ testId: 'test_be_01', currentRunId: 'run_inflight' }],
+            deferred: [],
+            skippedFrontend: [],
+            skippedIntegration: [],
+          } as BatchRunFreshResponse,
+        };
+      }
+      const runId = url.split('/runs/')[1]?.split('?')[0] ?? 'run_unknown';
+      runFetches.push(runId);
+      return { body: { ...makePassedRun(runId, 'test_be_01'), source: 'portal' } };
+    });
+
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: l => stdoutLines.push(l),
+        stderr: l => stderrLines.push(l),
+        env: {} as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    );
+
+    const payload = JSON.parse(stdoutLines.join('\n')) as {
+      accepted: Array<{ runId: string; status: string }>;
+    };
+    // finding 2: the in-flight run is fetched (for the createdAt floor that
+    // replaces the epoch sentinel) and its source is named on stderr.
+    expect(runFetches).toContain('run_inflight');
+    expect(stderrLines.join('\n')).toContain('started by portal');
+    // Auto-resumed to the in-flight run's real verdict, not a stale/false one.
+    expect(payload.accepted.find(r => r.runId === 'run_inflight')?.status).toBe('passed');
+  });
+
   it('routes to POST /tests/batch/run with correct body shape (projectId + source)', async () => {
     const { credentialsPath } = makeCreds();
     type Captured = { url: string; method: string; body: unknown };
@@ -2868,7 +3034,7 @@ describe('runTestRunAll — batch fresh run', () => {
     expect(payload.accepted.every(r => r.status === 'passed')).toBe(true);
   });
 
-  it('run --all --wait: does not start a fresh poll for a queued run after the shared deadline expired', async () => {
+  it('run --all --wait: past the shared deadline, a single-shot read resolves an already-terminal run to its verdict instead of a false timeout', async () => {
     const { credentialsPath } = makeCreds();
     const baseNow = new Date('2026-06-09T10:00:00.000Z').getTime();
     let nowMs = baseNow;
@@ -2919,9 +3085,13 @@ describe('runTestRunAll — batch fresh run', () => {
     const payload = JSON.parse(stdoutLines.join('\n')) as {
       accepted: Array<{ runId: string; status: string }>;
     };
-    expect(runFetches).toEqual(['run_fresh_01']);
-    expect(payload.accepted.find(r => r.runId === 'run_fresh_02')?.status).toBe('timeout');
-    expect((caughtError as { exitCode?: number } | undefined)?.exitCode).toBe(7);
+    // finding 1: run_fresh_01's poll pushes now past the 1s deadline; run_fresh_02
+    // is then past budget, but ONE single-shot read (not a full poll loop) finds
+    // it already terminal and resolves it as passed — not a false timeout. Both
+    // pass → exit 0.
+    expect(runFetches).toEqual(['run_fresh_01', 'run_fresh_02']);
+    expect(payload.accepted.find(r => r.runId === 'run_fresh_02')?.status).toBe('passed');
+    expect(caughtError).toBeUndefined();
   });
 
   it('--wait with a failed run → exit 1', async () => {
@@ -3265,7 +3435,7 @@ describe('[codex-P1] run --all deferred-retry: retry-conflicts merged into final
     ).toBe(true);
   });
 
-  it('deferred→partially-conflict on retry: retry-conflicts appear in JSON summary; exit 0 for accepted portion', async () => {
+  it('deferred→partially-conflict on retry: retry-conflicts appear in JSON summary; hard conflict exits 6', async () => {
     const { credentialsPath } = makeCreds();
 
     // Initial dispatch: 2 deferred, 1 accepted.
@@ -3349,24 +3519,30 @@ describe('[codex-P1] run --all deferred-retry: retry-conflicts merged into final
       return errorBody('NOT_FOUND');
     });
 
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 300,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    );
+    // test_deferred_b is a HARD conflict (no currentRunId) → not runnable, not
+    // resumable → the batch exits 6 even though the two accepted runs passed.
+    // The JSON payload is still printed BEFORE the exit-6 gate, so the merge
+    // assertions below hold.
+    await expect(
+      runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 300,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
+          stderr: () => undefined,
+          sleep: instantSleep,
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 6 });
 
     // summary must include the retry-discovered conflict in the conflicts count
     const withSummary = printed.find(p => p.summary);
@@ -3378,6 +3554,291 @@ describe('[codex-P1] run --all deferred-retry: retry-conflicts merged into final
         c => c.testId === 'test_deferred_b',
       ),
     ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D3 deferred-retry is BUDGET-DRIVEN, not capped at a fixed attempt count:
+// a busy pool that keeps deferring for more than 3 tries still drains as long
+// as the --timeout budget remains. Before this fix the loop stopped after
+// MAX_DEFERRED_RETRIES (3) attempts and failed the run (exit 7) even with
+// budget left. instantSleep does not advance the clock, so the deadline never
+// trips here — the run resolves purely because the loop keeps retrying beyond 3.
+// ---------------------------------------------------------------------------
+
+describe('run --all deferred-retry: budget-driven (retries beyond the old fixed cap)', () => {
+  it('a pool that defers for 4 retries still accepts and passes when the timeout budget allows', async () => {
+    const { credentialsPath } = makeCreds();
+
+    const deferredResp: BatchRunFreshResponse = {
+      accepted: [],
+      deferred: [{ testId: 'test_busy' }],
+      conflicts: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const acceptedResp: BatchRunFreshResponse = {
+      accepted: [
+        { testId: 'test_busy', runId: 'run_busy', enqueuedAt: '2026-06-09T10:00:05.000Z' },
+      ],
+      deferred: [],
+      conflicts: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+
+    let batchCallCount = 0;
+    const printed: Array<Record<string, unknown>> = [];
+
+    // Calls 1-4 (initial dispatch + 3 retries) defer; call 5 (the 4th retry —
+    // one past the old MAX_DEFERRED_RETRIES=3 cap) finally accepts.
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') {
+        batchCallCount++;
+        return { body: batchCallCount >= 5 ? acceptedResp : deferredResp };
+      }
+      if (url.includes('/runs/run_busy')) {
+        return {
+          body: {
+            runId: 'run_busy',
+            testId: 'test_busy',
+            projectId: 'project_be',
+            userId: 'u1',
+            status: 'passed',
+            source: 'cli',
+            createdAt: '2026-06-09T10:00:00.000Z',
+            startedAt: '2026-06-09T10:00:05.000Z',
+            finishedAt: '2026-06-09T10:00:30.000Z',
+            codeVersion: 'v1',
+            targetUrl: 'https://api.example.com',
+            createdFrom: 'cli',
+            failedStepIndex: null,
+            failureKind: null,
+            error: null,
+            videoUrl: null,
+            stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
+          } satisfies RunResponse,
+        };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    // Large budget → maxDeferredAttempts = max(3, ceil(600/60)+2) = 12, well
+    // past the 5 calls this test needs. Under the old fixed cap of 3 the loop
+    // would stop after call 4 with test_busy still deferred → exit 7.
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 600,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+
+    // The 5th POST (4th retry) is what accepts — proof the loop retried past 3.
+    expect(batchCallCount).toBe(5);
+    const payload = printed.find(p => p.summary && typeof p.summary === 'object');
+    expect(payload).toBeDefined();
+    expect((payload?.summary as { passed: number }).passed).toBe(1);
+  });
+
+  // NOTE: the deferred-retry dispatch POST is deliberately NOT bound to the
+  // batch deadline via an AbortSignal (aborting a state-creating dispatch
+  // mid-flight leaves the outcome indeterminate and can duplicate runs on the
+  // next invocation — see the comment at the call site). This isn't unit-tested
+  // by signal inspection because the HttpClient's own `--request-timeout` always
+  // attaches a request-scoped AbortSignal, so presence alone can't distinguish
+  // the (removed) deadline signal from the (kept) request-timeout one.
+});
+
+// ---------------------------------------------------------------------------
+// Gap B: `run --all --wait` auto-resumes an already-running case (a conflict
+// carrying `currentRunId`) by polling the existing run to a verdict, instead
+// of failing the batch on the conflict.
+// ---------------------------------------------------------------------------
+
+describe('run --all --wait: auto-resume already-running conflicts (Gap B)', () => {
+  it('polls an in-flight conflict (currentRunId) to a verdict — passes → exit 0, not exit 6', async () => {
+    const { credentialsPath } = makeCreds();
+
+    // The whole batch came back as a conflict, but the case is already running
+    // and the backend told us its run id.
+    const conflictResp: BatchRunFreshResponse = {
+      accepted: [],
+      deferred: [],
+      conflicts: [{ testId: 'test_busy', currentRunId: 'run_inflight' }],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+
+    const printed: Array<Record<string, unknown>> = [];
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: conflictResp };
+      if (url.includes('/runs/run_inflight')) {
+        return {
+          body: {
+            runId: 'run_inflight',
+            testId: 'test_busy',
+            projectId: 'project_be',
+            userId: 'u1',
+            status: 'passed',
+            source: 'cli',
+            createdAt: '2026-06-09T10:00:00.000Z',
+            startedAt: '2026-06-09T10:00:05.000Z',
+            finishedAt: '2026-06-09T10:00:30.000Z',
+            codeVersion: 'v1',
+            targetUrl: 'https://api.example.com',
+            createdFrom: 'cli',
+            failedStepIndex: null,
+            failureKind: null,
+            error: null,
+            videoUrl: null,
+            stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
+          } satisfies RunResponse,
+        };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    // Must NOT throw (the in-flight run passed) — the batch waits for its result.
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+
+    const payload = printed.find(p => p.summary && typeof p.summary === 'object');
+    const summary = payload?.summary as { passed: number; conflicts: number; total: number };
+    // The resumed run is counted as a real (passed) result, not a hard conflict.
+    expect(summary.passed).toBe(1);
+    expect(summary.conflicts).toBe(0);
+    expect(summary.total).toBe(1);
+  });
+
+  it('a hard conflict (no currentRunId) still exits 6 when nothing is pollable', async () => {
+    const { credentialsPath } = makeCreds();
+
+    const conflictResp: BatchRunFreshResponse = {
+      accepted: [],
+      deferred: [],
+      conflicts: [{ testId: 'test_x' }], // no currentRunId → not resumable
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: conflictResp };
+      return errorBody('NOT_FOUND');
+    });
+
+    await expect(
+      runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => {},
+          stderr: () => {},
+          sleep: instantSleep,
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 6 });
+  });
+
+  it('mixed batch: a passing resumable conflict does NOT mask a hard conflict — exits 6', async () => {
+    const { credentialsPath } = makeCreds();
+
+    // One test is auto-resumable (running, has a runId) and passes; another is a
+    // HARD conflict (no runId) that never ran. The batch must still exit 6 —
+    // the passing resume must not green a batch with an unresolved test.
+    const conflictResp: BatchRunFreshResponse = {
+      accepted: [],
+      deferred: [],
+      conflicts: [
+        { testId: 'hard_x' }, // no currentRunId → hard, never ran
+        { testId: 'resumable_y', currentRunId: 'run_y' }, // in flight → resumable
+      ],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: conflictResp };
+      if (url.includes('/runs/run_y')) {
+        return {
+          body: {
+            runId: 'run_y',
+            testId: 'resumable_y',
+            projectId: 'project_be',
+            userId: 'u1',
+            status: 'passed',
+            source: 'cli',
+            createdAt: '2026-06-09T10:00:00.000Z',
+            startedAt: '2026-06-09T10:00:05.000Z',
+            finishedAt: '2026-06-09T10:00:30.000Z',
+            codeVersion: 'v1',
+            targetUrl: 'https://api.example.com',
+            createdFrom: 'cli',
+            failedStepIndex: null,
+            failureKind: null,
+            error: null,
+            videoUrl: null,
+            stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
+          } satisfies RunResponse,
+        };
+      }
+      return errorBody('NOT_FOUND');
+    });
+
+    await expect(
+      runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => {},
+          stderr: () => {},
+          sleep: instantSleep,
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 6 });
   });
 });
 
@@ -4262,32 +4723,81 @@ describe('gh-output integration on run --all --wait (issue #99 reshape)', () => 
     // Forced annotations (off-Actions) land on the text stdout, not the file.
     expect(stdoutLines.some(line => line.startsWith('::error'))).toBe(true);
   });
+
+  it('all-conflict --wait: emits annotations + summary before exiting 6 (not a silent CI exit)', async () => {
+    const { credentialsPath } = makeCreds();
+    const respAllConflict: BatchRunFreshResponse = {
+      accepted: [],
+      conflicts: [{ testId: 'test_be_01' }],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { body: { items: [], nextToken: null } };
+      return { body: respAllConflict };
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'cli-gh-conflict-'));
+    const summaryFile = join(dir, 'summary.json');
+    const stdoutLines: string[] = [];
+    const err = await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+        ghOutput: true,
+        summaryFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
+        env: {} as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    // The all-conflict batch still exits 6, but now surfaces it in CI first.
+    expect(err).toMatchObject({ exitCode: 6 });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
+      total: number;
+      passed: number;
+      failed: number;
+      runs: { testId: string; status: string }[];
+    };
+    expect(artifact).toMatchObject({ total: 1, passed: 0, failed: 1 });
+    expect(artifact.runs.some(r => r.testId === 'test_be_01' && r.status === 'conflict')).toBe(
+      true,
+    );
+    expect(
+      stdoutLines.some(line => line.startsWith('::error') && line.includes('test_be_01')),
+    ).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
-// DEV-749 (client half) — --target-url advisory when the caller is V3-routed
+// --target-url advisory: response-driven, not assumption-driven.
+//
+// Redesigned to drop the `GET /me` + `v3Enabled` probe entirely: the backend
+// is the ground truth for whether an override was applied (V3 returns
+// `targetUrl: ''` rather than echo one it never used; V2 echoes the real
+// applied value), so the advisory now fires purely from comparing what was
+// requested against what the trigger response reports. All fixtures below
+// set `skipPreflight: true` — this block is about the mismatch advisory,
+// not the reachability preflight (covered separately further down).
 // ---------------------------------------------------------------------------
 
-describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
-  /** Routes GET /me to `me`, everything else to `rest`. */
-  function fetchWithMe(
-    me: { v3Enabled?: boolean } | (() => never),
-    rest: (url: string) => { status?: number; body: unknown },
-  ): typeof globalThis.fetch {
-    return makeFetch(url => {
-      if (url.endsWith('/me')) {
-        if (typeof me === 'function') me();
-        return { body: me };
-      }
-      return rest(url);
-    });
-  }
-
-  it('v3Enabled:true → prints the advisory on stderr, not stdout; exit code unaffected', async () => {
+describe('runTestRun — --target-url mismatch advisory (response-driven)', () => {
+  it('response targetUrl differs from requested → prints exactly one advisory on stderr; stdout stays clean JSON', async () => {
     const { credentialsPath } = makeCreds();
     const stdoutLines: string[] = [];
     const stderrLines: string[] = [];
-    const fetchImpl = fetchWithMe({ v3Enabled: true }, () => ({ body: TRIGGER_RESP }));
+    const fetchImpl = makeFetch(() => ({ body: { ...TRIGGER_RESP, targetUrl: '' } }));
     const result = await runTestRun(
       {
         profile: 'default',
@@ -4298,6 +4808,7 @@ describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
         wait: false,
         timeoutSeconds: 60,
         targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
       },
       {
         credentialsPath,
@@ -4308,55 +4819,21 @@ describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
       },
     );
     expect(result).toMatchObject({ runId: 'run_abc' });
-    expect(stderrLines.some(l => l.includes('--target-url') && l.includes('[advisory]'))).toBe(
-      true,
+    const advisoryLines = stderrLines.filter(
+      l => l.includes('[advisory]') && l.includes('--target-url'),
     );
+    expect(advisoryLines).toHaveLength(1);
     // stdout must stay pure JSON — no advisory text, and it must still parse.
     expect(() => JSON.parse(stdoutLines.join(''))).not.toThrow();
     expect(stdoutLines.join('')).not.toContain('[advisory]');
   });
 
-  it('tags the v3Enabled probe GET /me with X-CLI-Command: run-target-url-probe, and NOT the trigger POST', async () => {
-    const { credentialsPath } = makeCreds();
-    const meHeaders: Array<Record<string, string> | undefined> = [];
-    const triggerHeaders: Array<Record<string, string> | undefined> = [];
-    const fetchImpl = makeFetch((url, init) => {
-      if (url.endsWith('/me')) {
-        meHeaders.push(init.headers as Record<string, string> | undefined);
-        return { body: { v3Enabled: true } };
-      }
-      triggerHeaders.push(init.headers as Record<string, string> | undefined);
-      return { body: TRIGGER_RESP };
-    });
-    await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: 'https://staging.example.com',
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-    expect(meHeaders).toHaveLength(1);
-    expect(meHeaders[0]?.['x-cli-command']).toBe('run-target-url-probe');
-    expect(triggerHeaders).toHaveLength(1);
-    expect(triggerHeaders[0]?.['x-cli-command']).toBeUndefined();
-  });
-
-  it('v3Enabled:false → no advisory', async () => {
+  it('response echoes the requested targetUrl → silent, no advisory', async () => {
     const { credentialsPath } = makeCreds();
     const stderrLines: string[] = [];
-    const fetchImpl = fetchWithMe({ v3Enabled: false }, () => ({ body: TRIGGER_RESP }));
+    const fetchImpl = makeFetch(() => ({
+      body: { ...TRIGGER_RESP, targetUrl: 'https://staging.example.com' },
+    }));
     await runTestRun(
       {
         profile: 'default',
@@ -4367,6 +4844,7 @@ describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
         wait: false,
         timeoutSeconds: 60,
         targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
       },
       {
         credentialsPath,
@@ -4379,10 +4857,12 @@ describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
     expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
   });
 
-  it('v3Enabled absent (older backend) → no advisory', async () => {
+  it('backend test type: a mismatching response is silent (a BE trigger response unconditionally echoes body.targetUrl, so this guards a case that cannot occur live)', async () => {
     const { credentialsPath } = makeCreds();
     const stderrLines: string[] = [];
-    const fetchImpl = fetchWithMe({}, () => ({ body: TRIGGER_RESP }));
+    // Simulate the theoretical mismatch anyway — the `opts.type` gate must
+    // suppress the advisory regardless of what the response reports.
+    const fetchImpl = makeFetch(() => ({ body: { ...TRIGGER_RESP, targetUrl: '' } }));
     await runTestRun(
       {
         profile: 'default',
@@ -4393,6 +4873,8 @@ describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
         wait: false,
         timeoutSeconds: 60,
         targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
+        type: 'backend',
       },
       {
         credentialsPath,
@@ -4405,16 +4887,10 @@ describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
     expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
   });
 
-  it('no --target-url → GET /me is never called', async () => {
+  it('no --target-url → the trigger response has nothing to compare against, no advisory', async () => {
     const { credentialsPath } = makeCreds();
-    const meCalls: string[] = [];
-    const fetchImpl = fetchWithMe(
-      () => {
-        meCalls.push('called');
-        throw new Error('unreachable');
-      },
-      () => ({ body: TRIGGER_RESP }),
-    );
+    const stderrLines: string[] = [];
+    const fetchImpl = makeFetch(() => ({ body: TRIGGER_RESP }));
     await runTestRun(
       {
         profile: 'default',
@@ -4429,17 +4905,17 @@ describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
         credentialsPath,
         fetchImpl,
         stdout: () => {},
-        stderr: () => {},
+        stderr: line => stderrLines.push(line),
         sleep: instantSleep,
       },
     );
-    expect(meCalls).toHaveLength(0);
+    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
   });
 
-  it('fires in --output text mode too (matches the C1 backend-test advisory: unconditional across modes)', async () => {
+  it('fires in --output text mode too (unconditional across modes)', async () => {
     const { credentialsPath } = makeCreds();
     const stderrLines: string[] = [];
-    const fetchImpl = fetchWithMe({ v3Enabled: true }, () => ({ body: TRIGGER_RESP }));
+    const fetchImpl = makeFetch(() => ({ body: { ...TRIGGER_RESP, targetUrl: '' } }));
     await runTestRun(
       {
         profile: 'default',
@@ -4450,6 +4926,7 @@ describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
         wait: false,
         timeoutSeconds: 60,
         targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
       },
       {
         credentialsPath,
@@ -4464,42 +4941,10 @@ describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
     );
   });
 
-  it('/me lookup failure is swallowed — the run still succeeds and no advisory prints', async () => {
-    const { credentialsPath } = makeCreds();
-    const stderrLines: string[] = [];
-    const fetchImpl = makeFetch(url => {
-      if (url.endsWith('/me')) throw new Error('network blip');
-      return { body: TRIGGER_RESP };
-    });
-    const result = await runTestRun(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: false,
-        timeoutSeconds: 60,
-        targetUrl: 'https://staging.example.com',
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => {},
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-    expect(result).toMatchObject({ runId: 'run_abc' });
-    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
-  });
-
-  it('--dry-run --target-url: the canned /me sample (v3Enabled:true) still demonstrates the advisory', async () => {
+  it('--dry-run --target-url: no trigger response exists yet, so no advisory prints', async () => {
     const { credentialsPath } = makeCreds();
     const stderrLines: string[] = [];
     const stdoutLines: string[] = [];
-    // No custom fetchImpl override: the dry-run client's own canned fetch
-    // answers GET /me with the real `me` sample (v3Enabled: true).
     await runTestRun(
       {
         profile: 'default',
@@ -4519,51 +4964,18 @@ describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
       },
     );
     expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('--target-url'))).toBe(
-      true,
+      false,
     );
-    expect(stdoutLines.join('')).not.toContain('[advisory]');
   });
 
-  // Finding 1 (dogfood 2026-08-09): `HttpClient.sleepBeforeRetry` (src/lib/http.ts)
-  // observes only the process-lifetime shutdown signal, never a per-request
-  // `AbortSignal` — so this probe's own 5s deadline could not interrupt a
-  // retry sleep. A retryable 429 carrying a real `Retry-After` (e.g. the
-  // production `inflight_cap` response) would previously stall the probe —
-  // and the run trigger behind it — for up to a minute. Fixed via
-  // `retryOnRateLimit: false` on the probe's `GET /me` call.
-  it('a 429 with a long Retry-After on the /me probe cannot delay the run trigger', async () => {
+  it('never probes GET /me — the assumption-driven probe was removed', async () => {
     const { credentialsPath } = makeCreds();
-    const stderrLines: string[] = [];
-    let meCallCount = 0;
-    const fetchImpl = (async (input: FetchInput) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : (input as { url: string }).url;
-      if (url.endsWith('/me')) {
-        meCallCount++;
-        return new Response(
-          JSON.stringify({
-            error: {
-              code: 'RATE_LIMITED',
-              message: 'Too many requests',
-              nextAction: 'Wait Retry-After seconds and retry.',
-              requestId: 'req_probe',
-            },
-          }),
-          { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '60' } },
-        );
-      }
-      return new Response(JSON.stringify(TRIGGER_RESP), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }) as typeof globalThis.fetch;
-
-    const startedAt = Date.now();
-    const result = await runTestRun(
+    const urlsFetched: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      urlsFetched.push(url);
+      return { body: { ...TRIGGER_RESP, targetUrl: '' } };
+    });
+    await runTestRun(
       {
         profile: 'default',
         output: 'json',
@@ -4573,6 +4985,84 @@ describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
         wait: false,
         timeoutSeconds: 60,
         targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    expect(urlsFetched.some(u => u.endsWith('/me'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pre-charge --target-url reachability preflight wiring (the rule table
+// itself — every refuse/warn classification — is covered in
+// `src/lib/target-url-preflight.test.ts`; this block only pins that
+// `runTestRun` wires the probe correctly: before the trigger POST, and
+// opt-outable).
+// ---------------------------------------------------------------------------
+
+describe('runTestRun — --target-url reachability preflight wiring', () => {
+  // A literal IP skips the DNS step inside the probe entirely, so these
+  // tests are governed purely by the injected `fetchImpl` mock — no real
+  // DNS lookups, no network flakiness.
+  const LITERAL_IP_TARGET = 'http://203.0.113.10';
+
+  it('a gateway-error response (502) refuses before the trigger POST — exit 5, no run row', async () => {
+    const { credentialsPath } = makeCreds();
+    const postedUrls: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url === LITERAL_IP_TARGET) return { status: 502, body: {} };
+      postedUrls.push(url);
+      return { body: TRIGGER_RESP };
+    });
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+        targetUrl: LITERAL_IP_TARGET,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('VALIDATION_ERROR');
+    expect((err as ApiError).exitCode).toBe(5);
+    expect(postedUrls).toHaveLength(0);
+  });
+
+  it('an ambiguous negative (404) warns and lets the run proceed', async () => {
+    const { credentialsPath } = makeCreds();
+    const stderrLines: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url === LITERAL_IP_TARGET) return { status: 404, body: {} };
+      return { body: TRIGGER_RESP };
+    });
+    const result = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+        targetUrl: LITERAL_IP_TARGET,
       },
       {
         credentialsPath,
@@ -4582,21 +5072,44 @@ describe('runTestRun — DEV-749 --target-url V3 advisory', () => {
         sleep: instantSleep,
       },
     );
-    const elapsedMs = Date.now() - startedAt;
-
-    // The run still triggers promptly — the probe's failure must never
-    // block or delay it.
     expect(result).toMatchObject({ runId: 'run_abc' });
-    // Exactly one attempt: `retryOnRateLimit: false` makes the HTTP layer
-    // throw on the first 429 instead of sleeping out the (would-be) 60s
-    // Retry-After — proving the probe never entered a retry sleep at all.
-    // (Without the fix, HttpClient's real `setTimeout`-backed default sleep
-    // would block here for up to 60s per retry attempt.)
-    expect(meCallCount).toBe(1);
-    expect(elapsedMs).toBeLessThan(2_000);
-    // v3Enabled was never learned (the probe failed) — swallow-on-error
-    // still holds, no advisory printed either way.
-    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
+    expect(
+      stderrLines.some(l => l.includes('[advisory]') && l.includes('may not be reachable')),
+    ).toBe(true);
+  });
+
+  it('--skip-preflight makes the probe a zero-network-call no-op', async () => {
+    const { credentialsPath } = makeCreds();
+    const probedUrls: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url === LITERAL_IP_TARGET) {
+        probedUrls.push(url);
+        return { status: 502, body: {} }; // would refuse if the probe ran at all
+      }
+      return { body: TRIGGER_RESP };
+    });
+    const result = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 60,
+        targetUrl: LITERAL_IP_TARGET,
+        skipPreflight: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    expect(result).toMatchObject({ runId: 'run_abc' });
+    expect(probedUrls).toHaveLength(0);
   });
 });
 

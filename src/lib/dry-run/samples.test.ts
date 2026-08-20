@@ -355,6 +355,28 @@ describe('findSample', () => {
             deletedAt: expect.any(String),
           });
           break;
+        case 'listSchedules':
+          expect(body).toMatchObject({ schedules: expect.any(Array) });
+          break;
+        case 'getSchedule':
+        case 'updateSchedule':
+          expect(body).toMatchObject({
+            scheduleId: expect.any(String),
+            name: expect.any(String),
+            enabled: expect.any(Boolean),
+            targetType: expect.any(String),
+            cron: expect.any(String),
+            createdAt: expect.any(String),
+            updatedAt: expect.any(String),
+          });
+          break;
+        case 'createSchedule':
+        case 'deleteSchedule':
+          expect(body).toMatchObject({ scheduleId: expect.any(String) });
+          break;
+        case 'listScheduleRuns':
+          expect(body).toMatchObject({ runs: expect.any(Array) });
+          break;
         default:
           throw new Error(`Unexpected operationId in samples: ${e.operationId}`);
       }
@@ -734,5 +756,58 @@ describe('findSample', () => {
       expect(body.summary.created).toBe(2);
       expect(body.summary.failed).toBe(1);
     });
+  });
+});
+
+describe('schedule samples', () => {
+  it('resolves every schedule route', () => {
+    expect(findSample('GET', '/schedules')?.operationId).toBe('listSchedules');
+    expect(findSample('POST', '/schedules')?.operationId).toBe('createSchedule');
+    expect(findSample('GET', '/schedules/sch_1')?.operationId).toBe('getSchedule');
+    expect(findSample('PATCH', '/schedules/sch_1')?.operationId).toBe('updateSchedule');
+    expect(findSample('DELETE', '/schedules/sch_1')?.operationId).toBe('deleteSchedule');
+  });
+
+  it('matches the runs sub-path ahead of the single-schedule pattern', () => {
+    // First-match-wins: if the entries were ordered the other way, this would
+    // resolve to getSchedule and the run list would render the wrong shape.
+    expect(findSample('GET', '/schedules/sch_1/runs')?.operationId).toBe('listScheduleRuns');
+  });
+
+  it('wraps the list and run-list bodies in their named keys', () => {
+    const list = findSample('GET', '/schedules')?.body() as { schedules?: unknown[] };
+    expect(Array.isArray(list.schedules)).toBe(true);
+    const runs = findSample('GET', '/schedules/sch_1/runs')?.body() as { runs?: unknown[] };
+    expect(Array.isArray(runs.runs)).toBe(true);
+  });
+
+  it('echoes the update patch so a caller can confirm their flags landed', () => {
+    // The request body goes to `findSample`, not to `body()` — the returned
+    // entry's `body` is a zero-arity closure over it.
+    const body = findSample('PATCH', '/schedules/sch_1', {
+      enabled: false,
+      name: 'Renamed',
+    })?.body() as { enabled?: boolean; name?: string };
+    expect(body.enabled).toBe(false);
+    expect(body.name).toBe('Renamed');
+  });
+
+  it('leaves fields the patch did not mention at their sample values', () => {
+    const body = findSample('PATCH', '/schedules/sch_1', { enabled: false })?.body() as {
+      name?: string;
+      cron?: string;
+    };
+    expect(body.name).toBe('Nightly checkout');
+    expect(body.cron).toBe('0 3 * * *');
+  });
+
+  it('reports a run status consistent with its own counts', () => {
+    // The sample shows one failure, so `status` must be failed — a sample that
+    // contradicted itself would teach the wrong contract.
+    const runs = findSample('GET', '/schedules/sch_1/runs')?.body() as {
+      runs: Array<{ status: string; stats: { failed: number } }>;
+    };
+    expect(runs.runs[0]?.stats.failed).toBeGreaterThan(0);
+    expect(runs.runs[0]?.status).toBe('failed');
   });
 });

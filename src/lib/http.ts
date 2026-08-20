@@ -9,8 +9,10 @@ import {
   LIST_RUNS_RESPONSE_SCHEMA,
   RERUN_RESPONSE_SCHEMA,
   RUN_RESPONSE_SCHEMA,
+  TESTLIST_RUN_RESPONSE_SCHEMA,
   TRIGGER_RUN_RESPONSE_SCHEMA,
 } from './response-schemas.js';
+import type { CliTestListRunResponse } from './testlist.types.js';
 import type {
   TriggerRunBody,
   TriggerRunResponse,
@@ -433,6 +435,32 @@ export class HttpClient {
       schema: BATCH_RUN_FRESH_RESPONSE_SCHEMA,
       retryOnConflict: false,
     }).then(r => r.body);
+  }
+
+  /**
+   * POST /api/cli/v1/testlist/{listId}/run
+   * Dispatch a test list's cases (optionally a `testIds` subset) per project
+   * with their configured environments; returns pollable runIds. `--wait` polls
+   * each `accepted[].runId`.
+   *
+   * `retryOnConflict: false` — a 409 here (every dispatched project is an
+   * MCP-mirrored view-only mirror) is a permanent condition, not a transient one.
+   */
+  async triggerTestListRun(
+    listId: string,
+    body: { testIds?: string[] },
+    options: { idempotencyKey: string; signal?: AbortSignal },
+  ): Promise<CliTestListRunResponse> {
+    return this.postWithMeta<CliTestListRunResponse>(
+      `/testlist/${encodeURIComponent(listId)}/run`,
+      {
+        body,
+        headers: { 'idempotency-key': options.idempotencyKey },
+        signal: options.signal,
+        schema: TESTLIST_RUN_RESPONSE_SCHEMA,
+        retryOnConflict: false,
+      },
+    ).then(r => r.body);
   }
 
   /**

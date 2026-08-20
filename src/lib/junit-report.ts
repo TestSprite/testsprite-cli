@@ -14,6 +14,40 @@ export interface JUnitTestResult {
   /** Observed on polled runs; used for classname when --project is omitted. */
   projectId?: string;
   error?: { code: string; message: string; exitCode?: number };
+  /**
+   * Human-readable test name for the `testcase name` attribute. Falls back to
+   * `testId` when absent (older data / a run whose name could not be resolved).
+   * A CI test tab renders this, not the UUID.
+   */
+  name?: string;
+  /**
+   * Wall-clock duration of the run in seconds, for `testcase time`. Derived from
+   * the poll result's `startedAt`/`finishedAt`; omitted when timing is absent
+   * (rendered as `0`, the pre-fix behaviour).
+   */
+  durationSeconds?: number;
+}
+
+/**
+ * Duration in seconds between two ISO timestamps, or `undefined` when either is
+ * missing / unparseable / negative (clock skew). Kept ≥ 0.
+ */
+export function durationSecondsBetween(
+  startedAt: string | null | undefined,
+  finishedAt: string | null | undefined,
+): number | undefined {
+  if (!startedAt || !finishedAt) return undefined;
+  const start = Date.parse(startedAt);
+  const end = Date.parse(finishedAt);
+  if (Number.isNaN(start) || Number.isNaN(end)) return undefined;
+  const seconds = (end - start) / 1000;
+  return seconds >= 0 ? seconds : undefined;
+}
+
+/** Format a duration for the JUnit `time` attribute (3 dp; absent → `0`). */
+function formatTime(seconds: number | undefined): string {
+  if (seconds === undefined || Number.isNaN(seconds)) return '0';
+  return (Math.round(seconds * 1000) / 1000).toString();
 }
 
 export interface JUnitReportBuildOptions {
@@ -123,9 +157,17 @@ function failureMessage(result: JUnitTestResult): string {
 
 function renderTestcase(result: JUnitTestResult, classname: string): string {
   const outcome = classifyJUnitOutcome(result.status, result.error);
-  const name = escapeXml(result.testId);
+  // A readable CI test tab keys on `name`: prefer the human test name, fall back
+  // to the id. The UUID is preserved as a `testId` attribute (ignored by
+  // renderers, read by machine consumers) so the switch loses no information.
+  const name = escapeXml(result.name?.trim() || result.testId);
   const cls = escapeXml(classname);
-  const lines = [`    <testcase classname="${cls}" name="${name}" time="0">`];
+  const time = formatTime(result.durationSeconds);
+  const idAttr = ` testId="${escapeXml(result.testId)}"`;
+  const runAttr = result.runId ? ` runId="${escapeXml(result.runId)}"` : '';
+  const lines = [
+    `    <testcase classname="${cls}" name="${name}"${idAttr}${runAttr} time="${time}">`,
+  ];
 
   if (outcome === 'failure') {
     const message = escapeXml(failureMessage(result));
@@ -163,20 +205,25 @@ function renderTestcase(result: JUnitTestResult, classname: string): string {
 }
 
 /**
- * Build a JUnit XML document from batch poll results. Duration is `0` in v1
- * because batch poll envelopes do not carry per-run timing.
+ * Build a JUnit XML document from batch poll results. Per-`testcase` `time` is
+ * the run's wall-clock duration (from `startedAt`/`finishedAt`); the `testsuite`
+ * `time` is their sum. `time` falls back to `0` for a run with no timing.
  */
 export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
   const results = opts.results;
   let failures = 0;
   let errors = 0;
   let skipped = 0;
+  let totalSeconds = 0;
 
   for (const result of results) {
     const outcome = classifyJUnitOutcome(result.status, result.error);
     if (outcome === 'failure') failures++;
     else if (outcome === 'error') errors++;
     else if (outcome === 'skipped') skipped++;
+    if (typeof result.durationSeconds === 'number' && result.durationSeconds >= 0) {
+      totalSeconds += result.durationSeconds;
+    }
   }
 
   const suiteName = escapeXml(opts.suiteName);
@@ -185,7 +232,7 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
   return [
     XML_DECL,
     '<testsuites>',
-    `  <testsuite name="${suiteName}" tests="${results.length}" failures="${failures}" errors="${errors}" skipped="${skipped}" time="0">`,
+    `  <testsuite name="${suiteName}" tests="${results.length}" failures="${failures}" errors="${errors}" skipped="${skipped}" time="${formatTime(totalSeconds)}">`,
     testcases,
     '  </testsuite>',
     '</testsuites>',

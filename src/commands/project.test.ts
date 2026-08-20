@@ -1672,6 +1672,7 @@ describe('#79 — an unreadable --password-file is a validation error, not a cra
     const { credentialsPath } = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-p79-'));
     const passwordFile = join(dir, 'pw.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (dir), not user input.
     writeFileSync(passwordFile, 'from-file\n');
 
     const sentBodies: unknown[] = [];

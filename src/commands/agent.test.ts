@@ -10,6 +10,7 @@ import {
   ONBOARD_CODEX_LINE,
   SKILLS,
   buildSkillMarker,
+  loadSkillBodyFor,
   pathFor,
   renderForTarget,
   renderOwnFileWithMarker,
@@ -2606,7 +2607,10 @@ describe('runStatus — agent status (issue #123)', () => {
     expect(rows.every(row => row.state === 'absent')).toBe(true);
   });
 
-  it('fresh installs read ok (own-file and codex managed section), exit 0', async () => {
+  // Sweeps every target rather than a sample: the compactBody ones (windsurf,
+  // copilot) read `stale` on a pristine install until DEV-672, and a future
+  // compactBody target is covered the day it is added.
+  it('fresh installs read ok — every target, own-file and codex managed section', async () => {
     const { fs: agentFs } = makeMemFs();
     const { deps } = makeCapture();
     await runInstall(
@@ -2615,7 +2619,7 @@ describe('runStatus — agent status (issue #123)', () => {
         output: 'text',
         debug: false,
         dryRun: false,
-        target: ['claude', 'codex'],
+        target: Object.keys(TARGETS) as AgentTarget[],
         skills: [...DEFAULT_SKILLS],
         force: false,
       },
@@ -2623,50 +2627,126 @@ describe('runStatus — agent status (issue #123)', () => {
     );
 
     const { rows, thrown } = await statusRows(agentFs);
+    const notOk = rows.filter(row => row.state !== 'ok');
+    expect(
+      notOk,
+      `every freshly installed row must read ok, got: ${JSON.stringify(notOk)}`,
+    ).toEqual([]);
+    expect(rows).toHaveLength(Object.keys(TARGETS).length * DEFAULT_SKILLS.length);
     expect(thrown).toBeUndefined();
-    for (const skill of DEFAULT_SKILLS) {
-      expect(rows.find(r => r.target === 'claude' && r.skill === skill)?.state).toBe('ok');
-      expect(rows.find(r => r.target === 'codex' && r.skill === skill)?.state).toBe('ok');
-      expect(rows.find(r => r.target === 'cursor' && r.skill === skill)?.state).toBe('absent');
-    }
   });
 
-  it('stale: a marker whose hash matches an OLDER body reads stale and exits 1', async () => {
+  // Inverse of the sweep above: on a compactBody target the FULL body is not
+  // canonical, so an artifact carrying its hash must still read stale.
+  it('compact-body target: an artifact rendered from the FULL body still reads stale (DEV-672)', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const fullBody = loadSkillBodyFor('testsprite-verify');
+    seedFile(
+      path.resolve(CWD, pathFor('windsurf', 'testsprite-verify')),
+      renderOwnFileWithMarker(
+        'windsurf',
+        'testsprite-verify',
+        buildSkillMarker('testsprite-verify', fullBody),
+        fullBody,
+      ),
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(rows.find(r => r.target === 'windsurf' && r.skill === 'testsprite-verify')?.state).toBe(
+      'stale',
+    );
+    expect((thrown as CLIError).exitCode).toBe(1);
+  });
+
+  // Both non-ok states run against a full-body target AND a compactBody one:
+  // windsurf is the shape DEV-672 broke, and the field case is an outdated
+  // COMPACT body on disk, not the full-body artifact the guard above seeds.
+  const NON_OK_TARGETS: AgentTarget[] = ['claude', 'windsurf'];
+
+  it.each(NON_OK_TARGETS)(
+    'stale: a marker whose hash matches an OLDER body reads stale and exits 1 (%s)',
+    async target => {
+      const { fs: agentFs, seedFile } = makeMemFs();
+      const oldBody = '# TestSprite Verification Loop\n\nold body from a previous CLI release\n';
+      seedFile(
+        path.resolve(CWD, pathFor(target, 'testsprite-verify')),
+        renderOwnFileWithMarker(
+          target,
+          'testsprite-verify',
+          buildSkillMarker('testsprite-verify', oldBody),
+          oldBody,
+        ),
+      );
+
+      const { rows, thrown } = await statusRows(agentFs);
+      expect(rows.find(r => r.target === target && r.skill === 'testsprite-verify')?.state).toBe(
+        'stale',
+      );
+      expect(thrown).toBeInstanceOf(CLIError);
+      expect((thrown as CLIError).exitCode).toBe(1);
+      expect((thrown as CLIError).message).toContain('need attention');
+    },
+  );
+
+  // `agent status`'s error line sends the user to `agent install --force`. On a
+  // compact target under DEV-672 that was a dead end — install saw the file as
+  // current and skipped it, status still said stale — so pin that the remedy
+  // now clears the state it is printed for.
+  it('stale on a compact target: install --force clears it (DEV-672)', async () => {
     const { fs: agentFs, seedFile } = makeMemFs();
     const oldBody = '# TestSprite Verification Loop\n\nold body from a previous CLI release\n';
+    const windsurfVerify = (rows: StatusResult[]): string | undefined =>
+      rows.find(r => r.target === 'windsurf' && r.skill === 'testsprite-verify')?.state;
+
     seedFile(
-      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
+      path.resolve(CWD, pathFor('windsurf', 'testsprite-verify')),
       renderOwnFileWithMarker(
-        'claude',
+        'windsurf',
         'testsprite-verify',
         buildSkillMarker('testsprite-verify', oldBody),
         oldBody,
       ),
     );
+    expect(windsurfVerify((await statusRows(agentFs)).rows)).toBe('stale');
 
-    const { rows, thrown } = await statusRows(agentFs);
-    expect(rows.find(r => r.target === 'claude' && r.skill === 'testsprite-verify')?.state).toBe(
-      'stale',
-    );
-    expect(thrown).toBeInstanceOf(CLIError);
-    expect((thrown as CLIError).exitCode).toBe(1);
-    expect((thrown as CLIError).message).toContain('need attention');
-  });
-
-  it('modified: current hash but edited bytes reads modified and exits 1', async () => {
-    const { fs: agentFs, seedFile } = makeMemFs();
-    const canonical = renderForTarget('claude', 'testsprite-verify').content;
-    seedFile(
-      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
-      `${canonical}\n<!-- my local tweak -->\n`,
+    const { deps } = makeCapture();
+    await runInstall(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        target: ['windsurf'],
+        skills: [...DEFAULT_SKILLS],
+        force: true,
+      },
+      { cwd: CWD, fs: agentFs, ...deps },
     );
 
     const { rows, thrown } = await statusRows(agentFs);
-    expect(rows.find(r => r.target === 'claude' && r.skill === 'testsprite-verify')?.state).toBe(
-      'modified',
-    );
-    expect((thrown as CLIError).exitCode).toBe(1);
+    expect(windsurfVerify(rows)).toBe('ok');
+    // Every other row is `absent`, which is not an attention state — so the
+    // remedy leaves the command green, not merely less red.
+    expect(thrown).toBeUndefined();
   });
+
+  it.each(NON_OK_TARGETS)(
+    'modified: current hash but edited bytes reads modified and exits 1 (%s)',
+    async target => {
+      const { fs: agentFs, seedFile } = makeMemFs();
+      const canonical = renderForTarget(target, 'testsprite-verify').content;
+      seedFile(
+        path.resolve(CWD, pathFor(target, 'testsprite-verify')),
+        `${canonical}\n<!-- my local tweak -->\n`,
+      );
+
+      const { rows, thrown } = await statusRows(agentFs);
+      expect(rows.find(r => r.target === target && r.skill === 'testsprite-verify')?.state).toBe(
+        'modified',
+      );
+      expect((thrown as CLIError).exitCode).toBe(1);
+    },
+  );
 
   it('unmarked: an artifact without a marker line reads unmarked and exits 1', async () => {
     const { fs: agentFs, seedFile } = makeMemFs();

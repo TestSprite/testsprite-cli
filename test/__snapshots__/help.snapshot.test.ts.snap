@@ -452,7 +452,19 @@ Options:
   --wait                     with --run, poll until terminal status (default:
                              false)
   --timeout <s>              with --run --wait, max seconds to wait
-  --target-url <url>         with --run, override the project default env URL
+  --target-url <url>         with --run, override the project default env URL.
+                             Before triggering, a reachability preflight
+                             refuses obviously-dead targets (DNS failure,
+                             connection refused, a 502/503/504 gateway error)
+                             so a doomed run never gets billed — see
+                             --skip-preflight.
+  --skip-preflight           skip the pre-charge --target-url reachability
+                             probe. The probe runs from this machine, not from
+                             the Lambda that executes the test, so it can
+                             occasionally be wrong (e.g. an IP allowlist that
+                             permits the Lambda but not this machine); use this
+                             flag when you know better. Zero network calls when
+                             set. (default: false)
   --idempotency-key <token>  opaque idempotency token (1-256 ASCII chars).
                              Defaults to a UUIDv4 minted per invocation; pin
                              one yourself for safe retries.
@@ -470,7 +482,7 @@ Options:
 Plan file format (--plan-from <file>) — minimal valid example:
 
 {
-  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.6.0/schemas/plan.schema.json",
+  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.7.0/schemas/plan.schema.json",
   "projectId": "prj_abc123",
   "type": "frontend",
   "name": "Login rejects an empty password",
@@ -526,7 +538,18 @@ Options:
   --timeout <s>              with --run --wait, per-run max seconds to wait
                              (1-3600, default 600)
   --target-url <url>         with --run, override the project default env URL
-                             for each run
+                             for each run. Before the fan-out, a reachability
+                             preflight refuses an obviously-dead target ONCE
+                             for the whole batch (DNS failure, connection
+                             refused, a 502/503/504 gateway error) — see
+                             --skip-preflight.
+  --skip-preflight           skip the pre-charge --target-url reachability
+                             probe. The probe runs from this machine, not from
+                             the Lambda that executes the test, so it can
+                             occasionally be wrong (e.g. an IP allowlist that
+                             permits the Lambda but not this machine); use this
+                             flag when you know better. Zero network calls when
+                             set. (default: false)
   --idempotency-key <token>  opaque idempotency token for the batch create
                              (1-256 ASCII chars). Defaults to a UUIDv4 minted
                              per invocation; pin one yourself for safe retries.
@@ -775,7 +798,27 @@ stop it for real with: testsprite test cancel <run-id>
 
 Options:
   --target-url <url>          override the project default env URL for this run
-                              (http/https only, no localhost/private IPs)
+                              (http/https only, no localhost/private IPs).
+                              Before triggering, a reachability preflight
+                              refuses an obviously-dead target (DNS failure,
+                              connection refused, a 502/503/504 gateway error)
+                              so a doomed run never gets billed. This CLI
+                              probes from wherever it runs, not from the Lambda
+                              that executes the test, so it is a heuristic, not
+                              a guarantee — see --skip-preflight. Note: for a
+                              backend test, --target-url itself is inert (its
+                              base URL is baked into its code) — but this bare
+                              \`run\` command has no way to know a test's type
+                              before triggering it, so the preflight still runs
+                              and can still refuse; use --skip-preflight if
+                              that surprises you.
+  --skip-preflight            skip the pre-charge --target-url reachability
+                              probe. The probe runs from this machine, not from
+                              the Lambda that executes the test, so it can
+                              occasionally be wrong (e.g. an IP allowlist that
+                              permits the Lambda but not this machine); use
+                              this flag when you know better. Zero network
+                              calls when set. (default: false)
   --wait                      poll until terminal status or --timeout elapses
                               (default: false)
   --timeout <s>               with --wait, max seconds to wait (1–3600, default
@@ -850,6 +893,168 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 "
 `;
 
+exports[`--help snapshots > testlist 1`] = `
+"Usage: testsprite testlist [options] [command]
+
+Manage test lists (groups of tests)
+
+Options:
+  -h, --help                               display help for command
+
+Commands:
+  list [options]                           List test lists visible to the API key
+  get <list-id>                            Get a test list with its cases
+  create [options]                         Create a test list
+  update [options] <list-id>               Update a test list (name and/or environments)
+  delete [options] <list-id>               Delete a test list and its schedules (requires --confirm)
+  add [options] <list-id> <test-id...>     Add one or more tests to a test list
+  remove [options] <list-id> <test-id...>  Remove one or more tests from a test list
+  run [options] <list-id>                  Run a test list (dispatch its cases and return pollable run ids)
+  help [command]                           display help for command
+"
+`;
+
+exports[`--help snapshots > testlist add 1`] = `
+"Usage: testsprite testlist add [options] <list-id> <test-id...>
+
+Add one or more tests to a test list
+
+Options:
+  --idempotency-key <key>  caller-supplied idempotency key (1-256 chars)
+  -h, --help               display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > testlist create 1`] = `
+"Usage: testsprite testlist create [options]
+
+Create a test list
+
+Options:
+  --name <name>                  test-list name (required)
+  --project-env <projectId:env>  project+environment pair the list runs against
+                                 (repeatable) (default: [])
+  --idempotency-key <key>        caller-supplied idempotency key (1-256 chars)
+  -h, --help                     display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > testlist delete 1`] = `
+"Usage: testsprite testlist delete [options] <list-id>
+
+Delete a test list and its schedules (requires --confirm)
+
+Options:
+  --confirm                confirm the destructive delete (required unless
+                           --dry-run)
+  --idempotency-key <key>  caller-supplied idempotency key (1-256 chars)
+  -h, --help               display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > testlist get 1`] = `
+"Usage: testsprite testlist get [options] <list-id>
+
+Get a test list with its cases
+
+Options:
+  -h, --help  display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > testlist list 1`] = `
+"Usage: testsprite testlist list [options]
+
+List test lists visible to the API key
+
+Options:
+  --columns <list>  select/reorder text table columns (comma-separated keys)
+  --no-header       suppress the text table header row
+  -h, --help        display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > testlist remove 1`] = `
+"Usage: testsprite testlist remove [options] <list-id> <test-id...>
+
+Remove one or more tests from a test list
+
+Options:
+  --idempotency-key <key>  caller-supplied idempotency key (1-256 chars)
+  -h, --help               display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > testlist run 1`] = `
+"Usage: testsprite testlist run [options] <list-id>
+
+Run a test list (dispatch its cases and return pollable run ids)
+
+Options:
+  --case <test-id>            run only this case (repeatable; default: every
+                              case in the list) (default: [])
+  --wait                      poll every dispatched run until terminal or
+                              --timeout (default: false)
+  --timeout <s>               with --wait, max seconds to wait (1–3600, default
+                              600)
+  --max-concurrency <n>       with --wait, max in-flight polls at once (1-50,
+                              default 10)
+  --idempotency-key <key>     caller-supplied idempotency key (1-256 chars)
+  --report <format>           with --wait: write a JUnit XML sidecar after
+                              polling (accepted: junit)
+  --report-file <path>        output path for --report (atomic write)
+  --report-suite-name <name>  JUnit <testsuite name=...> override (default:
+                              testsprite:testlist:<listId>)
+  --gh-output                 with --wait: emit GitHub-native output (::error::
+                              annotations per non-passed member; job-summary
+                              table when $GITHUB_STEP_SUMMARY is set).
+                              Auto-enabled when GITHUB_ACTIONS=true
+  --summary-file <path>       with --wait: also write the reduced machine
+                              summary JSON {total, passed, failed, timedOut,
+                              runs[]} to this file
+  -h, --help                  display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > testlist update 1`] = `
+"Usage: testsprite testlist update [options] <list-id>
+
+Update a test list (name and/or environments)
+
+Options:
+  --name <name>                  new name
+  --project-env <projectId:env>  replace the env mapping with these pairs
+                                 (repeatable) (default: [])
+  --clear-project-env            remove all environment mappings from the list
+  --idempotency-key <key>        caller-supplied idempotency key (1-256 chars)
+  -h, --help                     display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
 exports[`--help snapshots > top 1`] = `
 "Usage: testsprite [options] [command]
 
@@ -889,6 +1094,8 @@ Commands:
   auth                         Manage TestSprite credentials
   project                      Manage TestSprite projects
   test                         Inspect TestSprite tests
+  testlist                     Manage test lists (groups of tests)
+  schedule                     Manage TestSprite schedules
   agent                        Install TestSprite guidance into coding-agent
                                config (Claude Code, Cursor, Cline, Antigravity,
                                Kiro, Windsurf, Copilot, Codex)

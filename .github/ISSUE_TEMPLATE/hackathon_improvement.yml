@@ -12,6 +12,31 @@ body:
         [existing issues](https://github.com/TestSprite/testsprite-cli/issues)
         first to avoid duplicates. Questions? Join us on
         [Discord](https://discord.gg/W4JDrZfdB).
+
+        **What happens after you submit:** a maintainer triages this like any
+        other issue — first response is best-effort within 5 business days
+        (see [CONTRIBUTING.md](https://github.com/TestSprite/testsprite-cli/blob/main/CONTRIBUTING.md)).
+        If it's a real, reproducible improvement, we'll confirm it, label it,
+        and follow up about the reward via the Discord identity below.
+        `hackathon` issues are exempt from our stale-issue bot, so this won't
+        get auto-closed if it sits — but that also means it won't self-resolve;
+        if you haven't heard anything past that window, ping us on Discord
+        rather than assume it's in progress.
+  - type: input
+    id: verified-against
+    attributes:
+      label: Verified against (commit SHA or released version)
+      description: >-
+        This public repo is a periodic snapshot of our internal source —
+        `main` here can be ahead of the last version published to npm, and a
+        commit can already contain a fix that hasn't been released yet.
+        State the exact commit SHA you read/tested against, or the released
+        version (output of `testsprite --version`) if you installed and ran
+        the CLI. This lets us catch "already fixed" reports before anyone
+        spends time on a PR against a shipped fix.
+      placeholder: e.g. commit a1b2c3d, or v0.6.0 (from `testsprite --version`)
+    validations:
+      required: true
   - type: input
     id: discord
     attributes:

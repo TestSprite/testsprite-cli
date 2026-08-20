@@ -27,12 +27,23 @@ const BIN_PATH = join(REPO_ROOT, 'dist', 'index.js');
 
 const RUN_ID = 'run_sig_e2e_01';
 
+/**
+ * Windows has no POSIX signal delivery. `child.kill('SIGINT')` there terminates
+ * the process outright, so the graceful-detach handler never runs and the exit
+ * code comes back `null` instead of 130/143. Every assertion below is about
+ * that handler, so the suite is POSIX-only by nature rather than by neglect —
+ * the handler itself is platform-shared and covered by the unit tests.
+ */
+const isWindows = process.platform === 'win32';
+
 let server: Server;
 let baseUrl = '';
 /** Resolvers waiting for the next hanging /runs request to arrive. */
 const runRequestWaiters: Array<() => void> = [];
 
 beforeAll(async () => {
+  // Nothing below runs on Windows, so don't stand up the stub server there.
+  if (isWindows) return;
   if (!existsSync(BIN_PATH)) {
     throw new Error('dist/index.js not found — run `npm run test:e2e` which builds first.');
   }
@@ -51,6 +62,8 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  // `server` is only assigned when beforeAll ran its body.
+  if (!server) return;
   await new Promise<void>(resolveClose => {
     server.close(() => resolveClose());
     server.closeAllConnections();
@@ -111,7 +124,7 @@ async function waitAndInterrupt(
   return { code, signal: exitSignal, stdout, stderr };
 }
 
-describe('signal e2e — graceful detach during test wait (DEV-331)', () => {
+describe.skipIf(isWindows)('signal e2e — graceful detach during test wait (DEV-331)', () => {
   it('SIG-1/SIG-2: SIGINT → exit 130, partial JSON on stdout, honest stderr hint', async () => {
     const result = await waitAndInterrupt('SIGINT', ['--output', 'json']);
     expect(result.code).toBe(130);

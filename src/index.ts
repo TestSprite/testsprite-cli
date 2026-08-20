@@ -13,7 +13,9 @@ import {
   type SetupCmdOpts,
 } from './commands/init.js';
 import { createProjectCommand } from './commands/project.js';
+import { createScheduleCommand } from './commands/schedule.js';
 import { createTestCommand } from './commands/test.js';
+import { createTestListCommand } from './commands/testlist.js';
 import { createUsageCommand } from './commands/usage.js';
 import { TARGETS, type AgentTarget } from './lib/agent-targets.js';
 import { ApiError, CLIError, InterruptError, RequestTimeoutError } from './lib/errors.js';
@@ -106,6 +108,8 @@ program.addCommand(authCommand);
 
 program.addCommand(createProjectCommand({}));
 program.addCommand(createTestCommand());
+program.addCommand(createTestListCommand());
+program.addCommand(createScheduleCommand({}));
 program.addCommand(createAgentCommand({}));
 program.addCommand(createUsageCommand());
 program.addCommand(createDoctorCommand());

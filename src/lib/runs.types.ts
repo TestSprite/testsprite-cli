@@ -5,6 +5,8 @@
 
  */
 
+import type { RunConflict } from './conflict-reason.js';
+
 /** Literal body sent to `POST /api/cli/v1/tests/{testId}/runs`. */
 export interface TriggerRunBody {
   /** Fixed source literal for CLI-triggered runs. */
@@ -444,7 +446,13 @@ export interface BatchRunFreshAccepted {
  */
 export interface BatchRunFreshResponse {
   accepted: BatchRunFreshAccepted[];
-  conflicts: Array<{ testId: string }>;
+  /**
+   * A run-slot conflict. `currentRunId`, when present, is the id of the run
+   * ALREADY in flight for this test — under `--wait` the CLI polls it to a
+   * verdict (auto-resume) instead of failing the batch. Absent ⇒ a hard
+   * conflict with no resolvable in-flight run (still fails the batch).
+   */
+  conflicts: RunConflict[];
   deferred: Array<{ testId: string }>;
   skippedFrontend: string[];
   skippedIntegration: Array<{ testId: string }>;

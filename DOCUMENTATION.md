@@ -16,6 +16,8 @@ The full reference for the TestSprite CLI: install verification, manual setup, e
   - [Read commands](#read-commands)
   - [Write commands](#write-commands)
   - [Run commands](#run-commands)
+  - [Test lists (`testlist`)](#test-lists-testlist)
+  - [Schedules (`schedule`)](#schedules-schedule)
   - [Account & diagnostics](#account--diagnostics)
 - [Configuration](#configuration)
 - [Output & scripting](#output--scripting)
@@ -512,9 +514,15 @@ testsprite test run test_xxxxxxxx --wait --summary-file ./summary.json --output 
 
 Batch `--report` flags apply only to `test run --all --wait` (and batch `test rerun --wait`). `--report junit --report-file <path>` writes a JUnit XML sidecar after polling completes (atomic write); `--output json` is unchanged. Optional `--report-suite-name <name>` overrides the default `testsprite:<projectId>` suite name.
 
-**GitHub-native CI output** (contributed in [#264](https://github.com/TestSprite/testsprite-cli/pull/264)): when `GITHUB_ACTIONS=true`, any `test run --wait` (single test or `--all`) and any batch `test rerun --wait` additionally emit one `::error::` workflow-command line per non-passed run (annotating the PR checks tab) and append a Markdown results table to the job summary (`$GITHUB_STEP_SUMMARY`). Pass `--gh-output` to force the annotations outside Actions (previewable locally), and `--summary-file <path>` to also write the reduced machine summary JSON (`{total, passed, failed, timedOut, runs[]}`). Everything is written even when the command exits non-zero, and every write is best-effort — a failed write never changes the exit code. Tests that never dispatched (rate-deferred, conflicted, not found) appear as non-passed rows, so a partial batch cannot read as all-passed. Annotation and table content is escaped, so run-error text cannot inject workflow commands or break the table.
+**GitHub-native CI output** (contributed in [#264](https://github.com/TestSprite/testsprite-cli/pull/264)): when `GITHUB_ACTIONS=true`, any `test run --wait` (single test or `--all`), any batch `test rerun --wait`, and `testlist run --wait` additionally emit one `::error::` workflow-command line per non-passed run (annotating the PR checks tab) and append a Markdown results table to the job summary (`$GITHUB_STEP_SUMMARY`). Pass `--gh-output` to force the annotations outside Actions (previewable locally), and `--summary-file <path>` to also write the reduced machine summary JSON (`{total, passed, failed, timedOut, runs[]}`). Everything is written even when the command exits non-zero — including a batch where nothing dispatched at all (every test already in flight → exit 6, or every test rate-deferred → exit 7), which still surfaces its verdict in CI rather than failing silently. Every write is best-effort — a failed write never changes the exit code. Tests that never dispatched (rate-deferred, conflicted, not found) appear as non-passed rows, so a partial batch cannot read as all-passed. Annotation and table content is escaped, so run-error text cannot inject workflow commands or break the table.
 
-`--target-url` must be a publicly reachable URL — the CLI pre-flights it against local addresses (`localhost`, `127.x`, `::1`, `0.0.0.0`, `169.254.x`, RFC1918) and the backend resolves it via DNS. For testing against localhost, use the [TestSprite MCP plugin](https://www.testsprite.com/docs), which handles the local tunnel. On a V3-routed account (`testsprite auth status` shows `routing: v3`), `--target-url` is currently **not applied** — V3 resolves the run's environment from the project configuration at execution time, so the run executes against the configured URL and the CLI prints an `[advisory]` on stderr saying so. The CLI auto-mints an idempotency key (printed to stderr under `--output json`, `--verbose`, or `--debug`); pass `--idempotency-key <uuid>` to control it explicitly.
+`--target-url` must be a publicly reachable URL — the CLI pre-flights it against local addresses (`localhost`, `127.x`, `::1`, `0.0.0.0`, `169.254.x`, RFC1918) and the backend resolves it via DNS. For testing against localhost, use the [TestSprite MCP plugin](https://www.testsprite.com/docs), which handles the local tunnel.
+
+**Reachability preflight (refuse before charge).** Beyond the literal local-address check, the CLI now probes the target **before dispatching** (and before anything is billed): a DNS resolve plus a lightweight HTTP request. A confirmed-dead target — DNS `NXDOMAIN`, connection refused, or a `502`/`503`/`504` gateway error (the signature of a tunnel that has gone away) — is refused with a validation error (exit 5) instead of dispatching a run that can only fail against a URL nobody is serving. A resolved address that lands in private/loopback/link-local space is always refused (the hostname passed the literal check but actually points somewhere unreachable from the runner). Ambiguous signals — a timeout, a TLS error, an odd status — only produce a stderr warning and never block; behind a configured HTTP(S) proxy, a local DNS failure is also downgraded to a warning, since resolution really happens at the proxy. `--skip-preflight` (on `test run`, `test create`, and `test create-batch`) opts out entirely — no extra network calls. Note: for a backend test the probe is a heuristic (the test's own base URL is baked into its code) — reach for `--skip-preflight` if a refusal surprises you there.
+
+The `[advisory]` about `--target-url` on V3-routed accounts is now **response-driven**: the CLI reads the run's actual trigger response rather than guessing from account flags, so it fires only when the override genuinely did not take effect (newer backends apply `--target-url` to fresh frontend runs on V3; older ones ignore it and the advisory says so). The CLI auto-mints an idempotency key (printed to stderr under `--output json`, `--verbose`, or `--debug`); pass `--idempotency-key <uuid>` to control it explicitly.
+
+**`--wait` exit-code precedence (shared across `test run --all`, batch `test rerun`, and `testlist run`).** When a fan-out poll ends with a mix of outcomes, the process exit code is resolved through one shared precedence table — batch-wide non-retriable first: auth (3) and client-too-old (14), then per-run non-retriable (12 insufficient credits, 13 feature-gated), then per-run errors (4/5/6), then transient (11 rate-limited, 10 unavailable), then timeout (7), then the generic failure (1). A per-member poll error now surfaces its real code instead of folding into 7/1. Batch conflicts are **reason-aware**: a `run_in_flight` conflict with a known `runId` is auto-resumed under `--wait` (the CLI polls the in-flight run to its verdict instead of exiting 6), and other causes — a view-only mirror project, an un-runnable/local environment, an unknown id, a dispatch error — are named individually rather than reported as a blanket "already in flight". Rate-deferred tests are retried on a time budget: retries continue until `--timeout` minus a reserved final poll window (60 s, or a third of the timeout for short timeouts), rather than a fixed attempt count.
 
 #### `testsprite test rerun [test-id...]`
 
@@ -623,6 +631,99 @@ testsprite test artifact get run_01hx3z9p8q4k2y7a --dry-run --output json
 ```
 
 Returns 404 (CLI exit 4) when the run passed (`details.reason: "no_failing_run"`), is still in flight (`run_not_ready`), was cancelled (`cancelled_no_artifacts`), or its test was deleted (`no_code`).
+
+### Test lists (`testlist`)
+
+A **test list** is a saved, named collection of tests — the CLI surface for the portal's `Tools → Test Lists`. A list can span multiple projects, and each project in it can be pinned to a specific environment (`--project-env <projectId>:<envName>`) so `testlist run` executes every case against the environment the list configured. **Test lists are V3-only**: a non-V3 account gets `UNSUPPORTED` (exit 7). `testId` on the wire is the logical test id (the same id `test list` / `test get` return); no translation is needed.
+
+```bash
+# Read
+testsprite testlist list                                  # all lists visible to the key
+testsprite testlist list --output text                    # aligned table (ID / NAME / CASES / LAST_EXEC / UPDATED)
+testsprite testlist get <list-id>                         # the list with its cases + pass/fail stats
+
+# Write (each mutation takes an auto-minted Idempotency-Key; pass --idempotency-key to control it)
+testsprite testlist create --name "Checkout smoke" \
+  --project-env proj_aaaa:staging --project-env proj_bbbb:prod
+testsprite testlist update <list-id> --name "Renamed"     # rename
+testsprite testlist update <list-id> --project-env proj_aaaa:prod   # replace the env mapping
+testsprite testlist update <list-id> --clear-project-env  # remove all env mappings (distinct from omitting the flag)
+testsprite testlist add <list-id> <test-id...>            # add tests
+testsprite testlist remove <list-id> <test-id...>         # remove tests
+testsprite testlist delete <list-id> --confirm            # destructive — requires --confirm
+
+# Run — dispatch the list's cases and return pollable run ids
+testsprite testlist run <list-id>                         # fire-and-return; prints accepted runIds, exit 0
+testsprite testlist run <list-id> --case <test-id> --case <test-id>   # run only a subset
+testsprite testlist run <list-id> --wait --timeout 600 --output json  # poll every run to a verdict
+testsprite testlist run <list-id> --wait --report junit --report-file ./results.xml
+```
+
+**`testlist run`** dispatches each case through its project's configured environment and returns a pollable `runId` per case (the same id `test wait` / `runs` accept). Without `--wait` it exits 0 once every case is accepted (a fire-and-return, like `test run` without `--wait`). With `--wait` it polls every run to terminal and the exit code reflects the batch: **0** all passed, **1** any failed, **4** a partial `--case` miss — some requested ids are not members of the list (checked after the poll, so a genuine failure or timeout on the matched subset is reported first; the missed ids are warned to stderr at dispatch and carried on `notFound` in the JSON), **6** nothing new was dispatched because every targeted case conflicted — causes are named individually (already in flight, view-only mirror project, un-runnable environment, unknown id, dispatch error), and this exits 6 on the non-`--wait` path too, **7** any run timed out (against `--timeout`, default 600 s) or was rate-deferred (also on the non-`--wait` path — a partial dispatch never passes CI silently). A per-member poll error surfaces its real exit code through the shared `--wait` precedence table (see `test run`). `--case <test-id>` (repeatable) runs a subset; an empty match (no accepted, no conflicts) returns a `reason` and exits 0. `--report junit --report-file <path>` writes a JUnit sidecar after polling (suite name defaults to `testsprite:testlist:<listId>`; override with `--report-suite-name`; unlike `test run --all` / `test rerun` reports, `<testcase>` rows currently carry the test id as the name and no duration). Under `GITHUB_ACTIONS=true` (or `--gh-output` to force it locally) a `--wait` run also emits `::error::` annotations + a job-summary table, and `--summary-file <path>` writes the reduced machine summary JSON (`{total, passed, failed, timedOut, runs[]}`); both require `--wait`, and non-dispatched members (conflicted, not-found) fold into the summary as non-passed rows so a partial run cannot read as all-passed.
+
+Every mutation (`create`/`update`/`delete`/`add`/`remove`) is refused with a billing-hold envelope on a **paused** team workspace (matching the portal's read-only wall); `delete` also removes the list's schedules and their triggers, so it requires `--confirm`. All commands accept the global `--output json|text` and `--dry-run` (offline shape-accurate sample).
+
+### Schedules (`schedule`)
+
+A **schedule** runs a project or a test list on a cron, unattended — the CLI surface for the portal's Monitoring view. Every firing is a full test run, billed like any other, so the CLI states how often a cron works out to **before** it sends the request. Schedules are **entitlement-gated**: a plan that does not include them gets `FEATURE_GATED` (exit 13), and an account or backend that does not serve schedules at all gets `UNSUPPORTED` (exit 7).
+
+```bash
+# Read
+testsprite schedule list                       # table: ID / NAME / STATUS / TARGET / CRON / TZ / LAST RUN
+testsprite schedule list --columns id,name,cron --no-header   # pick + reorder columns for scripts
+testsprite schedule get <schedule-id>          # one schedule, one field per line
+testsprite schedule run list <schedule-id>     # past runs: RUN ID / STATUS / TOTAL / PASS / FAIL / BLOCK / STARTED
+
+# Create (each mutation sends an auto-minted Idempotency-Key; pass --idempotency-key to control it)
+testsprite schedule create --name "Nightly checkout" \
+  --target-type testList --target-id tl_aaaa \
+  --cron "0 3 * * *" --timezone America/New_York \
+  --send-to oncall@example.com,qa@example.com
+
+# Update, pause, resume
+testsprite schedule update <schedule-id> --name "Renamed"
+testsprite schedule update <schedule-id> --cron "0 6 * * 1"   # re-states the new frequency first
+testsprite schedule update <schedule-id> --pause              # stop it firing, keep the schedule
+testsprite schedule update <schedule-id> --resume
+
+# Delete — removes the schedule AND its run history, and stops future triggers
+testsprite schedule delete <schedule-id> --confirm
+```
+
+**Target.** `--target-type project` runs the project's **entire live suite** on every tick — there is no way to schedule a subset of a project's tests, so use a test list for that. `--target-type testList` runs the list's cases, each through its project's configured environment (see [Test lists](#test-lists-testlist)). `--target-id` is the matching project id or test-list id, and a target that does not resolve is a `404` (exit 4). Deleting a test list also deletes its schedules.
+
+**What a project tick dispatches.** The project's own type decides how its cases run: a **frontend** project's cases go through a shared rolling pool, so a nightly cannot open the whole suite's browser sessions against your site at once — the same cap a portal-triggered run gets; a **backend** project's cases are dispatched together as one fan-out — a scheduled tick does not currently order them producers-before-consumers the way `test run --all` does. Integration cases are not dispatched as targets: a full run re-assembles them from the units they compose once those have run, which is also why the per-run cost counts only the non-integration cases.
+
+**Cron.** `--cron` is a standard 5-field expression — `minute hour day-of-month month day-of-week` — where day-of-week is `0-7`, with both `0` and `7` meaning Sunday. Constrain day-of-month **or** day-of-week, not both. `--timezone` takes an IANA zone and defaults to `UTC`. `--start` (default: a few minutes from now) and `--end` (default: open-ended) take ISO 8601 instants.
+
+**The frequency is stated before the request, the cost as soon as the server prices it.** `create` — and `update --cron`, since retiming an existing schedule is the same order-of-magnitude mistake as creating one badly — print the frequency to stderr before sending, so a `*/5` typo is visible before it bills. The cost line follows the response, because the price comes from the API — except under `--dry-run`, which prints both offline against a canned figure:
+
+```console
+$ testsprite schedule create --name Nightly --target-type project --target-id proj_aaaa \
+    --cron "0 3 * * *" --dry-run
+This schedule will run ~30 time(s)/month (daily at 03:00). Each run is a full test run. Check your balance with `testsprite usage`.
+[dry-run] sample response — not from the server
+Estimated cost: ~5 credits/run, ~152 credits/month, based on the target's current case count.
+id: sch_dryrun_2026
+```
+
+Both lines also appear under `--dry-run`, so that is reproducible offline with no key exactly as shown — the id and the per-run figure are the canned dry-run sample; a real create prices the run from the API. Compare a mistyped `--cron "* * * * *"`, which reads `~43800 time(s)/month` and `~219000 credits/month` before anything is created.
+
+Outside `--dry-run` the cost line appears only when the API priced the run — no rate is invented locally. The per-run figure keeps up to two decimals, trailing zeros trimmed (rounding it to whole credits would stop the monthly total beside it from multiplying out); the monthly total is that price times the cron's frequency, rounded to whole credits, and is omitted for an expression the CLI cannot read. A cron it cannot read still gets the frequency advisory, naming the expression in place of a frequency.
+
+**Status: `ENABLED` / `PAUSED` / `AUTO_PAUSED`.** `PAUSED` is what `update --pause` produces. `AUTO_PAUSED` means the platform disabled the schedule itself after repeated failures — currently 10 consecutive finished runs in which no test passed — reported as its own status precisely so it is not read as someone having paused it, and `schedule get` adds an `autoPaused:` timestamp line. `update --resume` re-enables either, and clears that failure streak.
+
+**A tick with nothing to run reads as `failed` with a total of `0`.** Three things end a tick without dispatching anything: the target was deleted, it holds no live cases, or the previous tick is still running because the interval is shorter than a run takes. Each is recorded as a finished run — the history stays honest about the tick having happened — and `schedule run list` reports it as `failed` with `TOTAL 0`, deliberately: calling "nothing ran" a pass is the one answer that would let a dead schedule look healthy. So a `failed` row with `TOTAL 0` means nothing ran, not that tests failed. A tick skipped because the balance ran out records no row at all and resumes on its own once the balance recovers.
+
+**`update` sends only the flags you passed.** With no field, no `--pause` and no `--resume` it exits 5 (`nothing to update`) rather than issuing an empty request; `--pause` together with `--resume` is refused (exit 5) rather than silently resolved to one of them. `--send-to` replaces the recipient list rather than adding to it.
+
+**`delete` requires `--confirm`** (exit 5 without it), matching every other destructive verb: it removes the schedule and its run history and stops it firing, with no restore window — recreating it starts a fresh schedule. `--dry-run` works without `--confirm`.
+
+**Idempotency.** `create`, `update`, and `delete` each send an auto-minted `Idempotency-Key`, so a retried command cannot double-apply; `--idempotency-key <key>` sets it yourself (reuse the same key to retry safely). An auto-minted key is echoed to stderr under `--output json`, `--verbose`, or `--debug`.
+
+**Neither list is paginated.** `schedule list` and `schedule run list` return the full set — there is no cursor flag. Both take `--columns <keys>` and `--no-header` for scripting, and every subcommand accepts the global `--output json|text` and `--dry-run`.
+
+Exit codes on top of the [shared set](#exit-codes): **7** schedules are not available on this account, **13** not available on your plan (`create` also uses 13 when the plan limit is reached), **4** schedule — or, for `create`, the target — not found, **6** idempotency conflict. Every subcommand's `--help` embeds its own list.
 
 ### Account & diagnostics
 

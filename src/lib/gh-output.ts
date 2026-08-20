@@ -1,3 +1,5 @@
+import { appendFileSync, writeFileSync } from 'node:fs';
+
 /**
  * CI-native output layer for the run path (issue #99, reshaped from
  * the withdrawn top-level `ci` command per the #264 review). Covers both a
@@ -68,7 +70,10 @@ function bucketRows(bucket: unknown, status: string, note: string): CiRunRow[] {
  * with no annotation. (`skippedFrontend` / `skippedIntegration` are NOT folded
  * in — they exit 0 and are the Action layer's allow-partial concern.)
  */
-export function summarizeAcceptedPayload(capturedJson: string): CiSummary {
+export function summarizeAcceptedPayload(
+  capturedJson: string,
+  opts: { notFoundNote?: string } = {},
+): CiSummary {
   let parsed: unknown;
   try {
     parsed = JSON.parse(capturedJson);
@@ -107,7 +112,15 @@ export function summarizeAcceptedPayload(capturedJson: string): CiSummary {
     ...acceptedRows,
     ...bucketRows(payload.deferred, 'deferred', 'rate-deferred (not dispatched)'),
     ...bucketRows(payload.conflicts, 'conflict', 'already in flight (not dispatched)'),
-    ...bucketRows(payload.notFound, 'not_found', 'no replayable run (not dispatched)'),
+    // Default note is `test rerun`'s cause (a not-found id has no replayable
+    // run). `testlist run` passes its own — a not-found `--case` id is one that
+    // is not a member of the list — so the annotation/artifact don't state the
+    // wrong reason on the surface this whole layer exists to serve.
+    ...bucketRows(
+      payload.notFound,
+      'not_found',
+      opts.notFoundNote ?? 'no replayable run (not dispatched)',
+    ),
   ];
   const passed = rows.filter(row => row.status === 'passed').length;
   const timedOut = rows.filter(row => row.status === 'timeout').length;
@@ -228,14 +241,15 @@ export function emitGithubOutputs(
      */
     annotations?: (line: string) => void;
   },
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean; label?: string } = {},
 ): void {
+  const label = opts.label ?? 'run';
   const summaryPath = env.GITHUB_STEP_SUMMARY;
   if (typeof summaryPath === 'string' && summaryPath.length > 0) {
     try {
       sinks.appendFile(summaryPath, renderJobSummaryMarkdown(summary));
     } catch {
-      sinks.stderr('[run] could not append to GITHUB_STEP_SUMMARY; continuing');
+      sinks.stderr(`[${label}] could not append to GITHUB_STEP_SUMMARY; continuing`);
     }
   }
   if (env.GITHUB_ACTIONS === 'true' || opts.force === true) {
@@ -250,5 +264,52 @@ export function emitGithubOutputs(
       const message = escapeCommandData(`status=${row.status}${detail}${link}`);
       annotate(`::error title=${title}::${message}`);
     }
+  }
+}
+
+/**
+ * Emit the CI artifacts for a `--wait` run: the machine summary file (when
+ * `--summary-file` is set) and the GitHub-native annotations + job-summary table
+ * (when `--gh-output` or `GITHUB_ACTIONS=true`). One shared implementation for
+ * every `--wait` command — `test run` (single + `--all`), `test rerun`, and
+ * `testlist run` — so the four copies of this block can no longer drift (a
+ * per-copy fix like the `notFound` fold reaching only one of them is what this
+ * consolidates away). The caller reduces its own envelope to a `CiSummary` first
+ * (`summarizeAcceptedPayload` for a batch, `summarizeSingleRun` for one run);
+ * this owns only the two sinks and their best-effort writes. `label` names the
+ * command in the failure messages (`[run]` / `[rerun]` / `[testlist run]`).
+ * Both writes are best-effort — a sink throwing must never change the exit code.
+ */
+export function emitCiArtifacts(
+  summary: CiSummary,
+  opts: { ghOutput?: boolean; summaryFile?: string; output?: string },
+  io: { env: NodeJS.ProcessEnv; stdout: (line: string) => void; stderr: (line: string) => void },
+  label: string,
+): void {
+  const ghEnabled = opts.ghOutput === true || io.env.GITHUB_ACTIONS === 'true';
+  if (!ghEnabled && opts.summaryFile === undefined) return;
+  if (opts.summaryFile !== undefined) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `--summary-file` is an explicit operator-supplied CI-artifact output path; best-effort in try/catch.
+      writeFileSync(opts.summaryFile, `${JSON.stringify(summary, null, 2)}\n`, 'utf8');
+    } catch {
+      io.stderr(`[${label}] could not write --summary-file ${opts.summaryFile}; continuing`);
+    }
+  }
+  if (ghEnabled) {
+    emitGithubOutputs(
+      summary,
+      io.env,
+      {
+        stdout: io.stdout,
+        stderr: io.stderr,
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- `path` is the CI-provided `$GITHUB_STEP_SUMMARY` env path, never external input.
+        appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf8'),
+        // Under --output json the run envelope owns stdout; workflow commands go
+        // to stderr instead (the Actions runner parses both streams).
+        annotations: opts.output === 'json' ? io.stderr : io.stdout,
+      },
+      { force: opts.ghOutput === true, label },
+    );
   }
 }

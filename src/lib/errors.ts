@@ -108,6 +108,18 @@ export function exitCodeFor(code: ErrorCode): number {
   }
 }
 
+/**
+ * Whether an error code is an authentication failure. DERIVED from the single
+ * `exitCodeFor` mapping (auth === exit 3) rather than a second hand-maintained
+ * list of code strings: a future `AUTH_*` code gets classified as auth the
+ * moment it is given an exit-3 row, so it can never be present in one place and
+ * missing in the other. The `ERROR_CODES` membership check keeps `exitCodeFor`
+ * off unknown/out-of-contract strings (its switch has no default).
+ */
+export function isAuthCode(code: string): boolean {
+  return (ERROR_CODES as readonly string[]).includes(code) && exitCodeFor(code as ErrorCode) === 3;
+}
+
 export class CLIError extends Error {
   readonly exitCode: number;
 

@@ -11,7 +11,7 @@
 
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -26,6 +26,26 @@ beforeAll(() => {
     throw new Error(`dist/index.js not found — run \`npm run test:e2e\` which builds first.`);
   }
 });
+
+/**
+ * `pathFor` returns POSIX-separated paths, but the CLI prints native ones, so a
+ * substring match against its output fails on Windows. Use this whenever a
+ * `pathFor` result is compared against CLI output; it is a no-op on POSIX.
+ * `join` needs no such treatment — it accepts POSIX input on every platform.
+ */
+function nativePath(p: string): string {
+  return p.split('/').join(sep);
+}
+
+/**
+ * Redirect the child's home directory. `os.homedir()` — which is how the CLI
+ * locates the credentials file — reads `HOME` on POSIX but `USERPROFILE` on
+ * Windows, so setting only `HOME` leaves a Windows child reading the real
+ * user's credentials instead of the fixture's. Same rule as `hermetic-env.ts`.
+ */
+function homeEnv(dir: string): Record<string, string> {
+  return { HOME: dir, USERPROFILE: dir };
+}
 
 let currentTmpDir: string | null = null;
 
@@ -96,7 +116,7 @@ describe('setup --dry-run --no-agent', () => {
 
     const result = runCli(
       ['--dry-run', 'setup', '--api-key', 'sk-user-dry-no-agent', '--no-agent', '--dir', tmpDir],
-      { HOME: credsTmpDir },
+      homeEnv(credsTmpDir),
     );
 
     expect(result.status).toBe(0);
@@ -130,7 +150,7 @@ describe('setup --dry-run (with agent)', () => {
         '--dir',
         tmpDir,
       ],
-      { HOME: credsTmpDir },
+      homeEnv(credsTmpDir),
     );
 
     expect(result.status).toBe(0);
@@ -139,8 +159,8 @@ describe('setup --dry-run (with agent)', () => {
     // Both skill paths must appear in the dry-run preview
     const verifyPath = pathFor('claude', 'testsprite-verify');
     const onboardPath = pathFor('claude', 'testsprite-onboard');
-    expect(result.stderr, 'verify path in dry-run preview').toContain(verifyPath);
-    expect(result.stderr, 'onboard path in dry-run preview').toContain(onboardPath);
+    expect(result.stderr, 'verify path in dry-run preview').toContain(nativePath(verifyPath));
+    expect(result.stderr, 'onboard path in dry-run preview').toContain(nativePath(onboardPath));
 
     // No files written under dry-run
     expect(existsSync(join(tmpDir, verifyPath))).toBe(false);
@@ -157,9 +177,7 @@ describe('setup — non-interactive, no key', () => {
     const tmpDir = freshTmpDir();
     const credsTmpDir = freshTmpDir();
 
-    const result = runCli(['setup', '--yes', '--no-agent', '--dir', tmpDir], {
-      HOME: credsTmpDir,
-    });
+    const result = runCli(['setup', '--yes', '--no-agent', '--dir', tmpDir], homeEnv(credsTmpDir));
 
     expect(result.status).toBe(5);
     expect(result.stderr).toContain('--api-key');
@@ -199,7 +217,7 @@ describe('deprecated `init` alias', () => {
 
     const result = runCli(
       ['--dry-run', 'init', '--api-key', 'sk-user-dep-init', '--no-agent', '--dir', tmpDir],
-      { HOME: credsTmpDir },
+      homeEnv(credsTmpDir),
     );
 
     expect(result.status).toBe(0);
@@ -256,7 +274,7 @@ describe('setup --agent <t> --no-agent conflict warn fires through real binary',
         '--dir',
         tmpDir,
       ],
-      { HOME: credsTmpDir },
+      homeEnv(credsTmpDir),
     );
 
     expect(result.status).toBe(0);

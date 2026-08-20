@@ -7,8 +7,12 @@
  * forced).
  */
 
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  emitCiArtifacts,
   emitGithubOutputs,
   renderJobSummaryMarkdown,
   summarizeAcceptedPayload,
@@ -227,6 +231,24 @@ describe('emitGithubOutputs', () => {
       },
     );
     expect(broken.stderr.join('\n')).toContain('could not append');
+    // The failure message names the command via the `label` opt (default 'run').
+    // Pin BOTH directions so reverting the `[${label}]` template to a hardcoded
+    // `[run]` can't pass silently: default is `[run]`, and a caller-supplied
+    // label appears verbatim.
+    expect(broken.stderr.join('\n')).toContain('[run]');
+    const labeled = makeSinks();
+    emitGithubOutputs(
+      summary,
+      { GITHUB_STEP_SUMMARY: '/gh/summary.md' },
+      {
+        ...labeled.sinks,
+        appendFile: () => {
+          throw new Error('EROFS');
+        },
+      },
+      { label: 'testlist run' },
+    );
+    expect(labeled.stderr.join('\n')).toContain('[testlist run]');
   });
 
   it('force (--gh-output) emits annotations off-Actions; the step summary still needs its env path', () => {
@@ -278,5 +300,67 @@ describe('emitGithubOutputs', () => {
     );
     expect(stdout).toHaveLength(0);
     expect(diverted.filter(line => line.startsWith('::error'))).toHaveLength(2);
+  });
+});
+
+// The shared chokepoint four commands funnel through. Its two guard branches
+// (summary-file-without-gh-output, and the complete no-op) are otherwise pinned
+// by no command's suite, so exercise them directly against real temp files.
+describe('emitCiArtifacts', () => {
+  const summary: CiSummary = summarizeAcceptedPayload(PAYLOAD);
+
+  it('--summary-file only (no --gh-output, off Actions): writes the file, emits no annotations', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-emitci-file-'));
+    const summaryFile = join(dir, 'summary.json');
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    emitCiArtifacts(
+      summary,
+      { summaryFile },
+      { env: {}, stdout: l => stdout.push(l), stderr: l => stderr.push(l) },
+      'run',
+    );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as CiSummary;
+    expect(artifact.total).toBe(summary.total);
+    // Off Actions and no --gh-output ⇒ the machine artifact is written but no
+    // ::error:: annotations are emitted.
+    expect(stdout.some(l => l.startsWith('::error'))).toBe(false);
+    expect(stderr).toHaveLength(0);
+  });
+
+  it('neither --gh-output nor --summary-file, off Actions: complete no-op', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-emitci-noop-'));
+    const summaryFile = join(dir, 'should-not-exist.json');
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    emitCiArtifacts(
+      summary,
+      {},
+      { env: {}, stdout: l => stdout.push(l), stderr: l => stderr.push(l) },
+      'run',
+    );
+    expect(stdout).toHaveLength(0);
+    expect(stderr).toHaveLength(0);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own mkdtempSync temp path, never user input.
+    expect(existsSync(summaryFile)).toBe(false);
+  });
+
+  it('the label names the command in BOTH failure messages (summary-file write + step-summary append)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-emitci-label-'));
+    // A path whose parent directory does not exist makes the real writeFileSync /
+    // appendFileSync throw synchronously, exercising both best-effort catch paths.
+    const badSummary = join(dir, 'missing', 'summary.json');
+    const badStep = join(dir, 'missing', 'step-summary.md');
+    const stderr: string[] = [];
+    emitCiArtifacts(
+      summary,
+      { ghOutput: true, summaryFile: badSummary },
+      { env: { GITHUB_STEP_SUMMARY: badStep }, stdout: () => {}, stderr: l => stderr.push(l) },
+      'testlist run',
+    );
+    const out = stderr.join('\n');
+    expect(out).toContain('[testlist run] could not write --summary-file');
+    expect(out).toContain('[testlist run] could not append');
   });
 });

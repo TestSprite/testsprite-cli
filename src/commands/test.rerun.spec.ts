@@ -5861,6 +5861,66 @@ describe('gh-output integration on batch rerun --wait (Gap B)', () => {
     expect(annotations).toHaveLength(1);
     expect(annotations[0]).toContain('test_2');
   });
+
+  it('all-conflict --wait: emits annotations + summary before exiting 6 (not a silent CI exit)', async () => {
+    const creds = makeCreds();
+    const allConflictResp: BatchRerunResponse = {
+      accepted: [],
+      deferred: [],
+      conflicts: [
+        { testId: 'test_1', currentRunId: 'run_inflight_1' },
+        { testId: 'test_2', currentRunId: 'run_inflight_2' },
+      ],
+      closure: { byProject: [] },
+    };
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/rerun')) return { status: 202, body: allConflictResp };
+      return errorBody('NOT_FOUND');
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'cli-gh-rerun-conflict-'));
+    const summaryFile = join(dir, 'summary.json');
+    const stdoutLines: string[] = [];
+    const err = await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 10,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'text',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        ghOutput: true,
+        summaryFile,
+      },
+      {
+        ...creds,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
+        env: {} as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    // The all-conflict rerun still exits 6, but now surfaces it in CI first.
+    expect(err).toMatchObject({ exitCode: 6 });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
+      total: number;
+      passed: number;
+      failed: number;
+      runs: { testId: string; status: string }[];
+    };
+    expect(artifact).toMatchObject({ total: 2, passed: 0, failed: 2 });
+    expect(artifact.runs.every(r => r.status === 'conflict')).toBe(true);
+    const annotations = stdoutLines.filter(line => line.startsWith('::error'));
+    expect(annotations).toHaveLength(2);
+  });
 });
 
 describe('rerun --gh-output / --summary-file require a batch --wait (Gap B guard)', () => {

@@ -50,6 +50,15 @@ const cases: Array<[string, string[]]> = [
   ['test run', ['test', 'run', '--help']],
   // DEV-331 piece 3
   ['test cancel', ['test', 'cancel', '--help']],
+  ['testlist', ['testlist', '--help']],
+  ['testlist list', ['testlist', 'list', '--help']],
+  ['testlist get', ['testlist', 'get', '--help']],
+  ['testlist create', ['testlist', 'create', '--help']],
+  ['testlist update', ['testlist', 'update', '--help']],
+  ['testlist delete', ['testlist', 'delete', '--help']],
+  ['testlist add', ['testlist', 'add', '--help']],
+  ['testlist remove', ['testlist', 'remove', '--help']],
+  ['testlist run', ['testlist', 'run', '--help']],
 ];
 
 describe('--help snapshots', () => {

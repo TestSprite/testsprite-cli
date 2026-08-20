@@ -48,8 +48,30 @@ body:
     id: cli-version
     attributes:
       label: CLI version
-      description: Output of `testsprite --version`.
+      description: >-
+        The version of the CLI you ran (output of `testsprite --version`).
+        This is what you ran — see "Verified against" below for what the
+        report is actually about.
       placeholder: e.g. 0.1.2
+    validations:
+      required: true
+  - type: input
+    id: verified-against
+    attributes:
+      label: Verified against (commit SHA or released version)
+      description: >-
+        A different question from "CLI version" above: that one is what you
+        ran, this one is what code the report is actually about. If you
+        installed and ran the CLI, the two happen to be the same value —
+        fill in the same version again. If instead this report is based on
+        reading the source rather than running an installed CLI, put the
+        exact commit SHA you read. We ask separately because this public
+        repo is a periodic snapshot of our internal source — `main` here can
+        be ahead of the last version published to npm, and a commit can
+        already contain a fix that hasn't been released yet. This field
+        lets us catch an "already fixed" report before anyone spends time
+        on it.
+      placeholder: e.g. commit a1b2c3d, or v0.6.0 (same as CLI version above)
     validations:
       required: true
   - type: input

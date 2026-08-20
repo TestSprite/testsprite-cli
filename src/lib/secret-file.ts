@@ -42,6 +42,7 @@ export function readSecretFileGuarded(flag: string, path: string): string {
 
   let stat;
   try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- this is the guard itself: `absolute` is the user-supplied `--*-file` path after isAbsolute()/resolve() normalization, and this statSync().isFile() check (below) plus the try/catch mapping every errno to a typed VALIDATION_ERROR is exactly the mitigation for a non-literal fs path here.
     stat = statSync(absolute);
   } catch (err) {
     throw secretFileError(flag, path, err, 'stat');
@@ -55,6 +56,7 @@ export function readSecretFileGuarded(flag: string, path: string): string {
   }
 
   try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same guarded path as the statSync() above: `absolute` already passed the isFile() regular-file check, so this read is the guard's intended purpose (reading a user-supplied secret path), not an unvalidated pass-through.
     return readFileSync(absolute, 'utf8').trim();
   } catch (err) {
     throw secretFileError(flag, path, err, 'read');

@@ -7,6 +7,7 @@ import {
   RequestTimeoutError,
   TransportError,
   exitCodeFor,
+  isAuthCode,
   isErrorCode,
   localValidationError,
 } from './errors.js';
@@ -65,6 +66,32 @@ describe('exitCodeFor', () => {
     ['INTERNAL', 1],
   ] as const)('%s → exit %d', (code, expected) => {
     expect(exitCodeFor(code)).toBe(expected);
+  });
+});
+
+describe('isAuthCode', () => {
+  it('is true exactly for the auth codes', () => {
+    expect(isAuthCode('AUTH_REQUIRED')).toBe(true);
+    expect(isAuthCode('AUTH_INVALID')).toBe(true);
+    expect(isAuthCode('AUTH_FORBIDDEN')).toBe(true);
+  });
+
+  it('is false for non-auth and unknown codes (never calls exitCodeFor off-contract)', () => {
+    expect(isAuthCode('NOT_FOUND')).toBe(false);
+    expect(isAuthCode('RATE_LIMITED')).toBe(false);
+    expect(isAuthCode('INTERNAL')).toBe(false);
+    expect(isAuthCode('timeout')).toBe(false);
+    expect(isAuthCode('NONSENSE_CODE')).toBe(false);
+    expect(isAuthCode('')).toBe(false);
+  });
+
+  // The single-source guarantee: auth-ness is DERIVED from exitCodeFor (exit 3),
+  // so the two can't drift. If a future AUTH_* code is given an exit-3 row it is
+  // auth automatically; if a code is added to exit 3 it must be auth by intent.
+  it('agrees with exitCodeFor for every ERROR_CODE (auth ⟺ exit 3)', () => {
+    for (const code of ERROR_CODES) {
+      expect(isAuthCode(code)).toBe(exitCodeFor(code) === 3);
+    }
   });
 });
 

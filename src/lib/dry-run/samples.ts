@@ -32,6 +32,7 @@ import type {
   CliTestStep,
 } from '../../commands/test.js';
 import type { MeResponse } from '../../commands/auth.js';
+import type { CliSchedule, CliScheduleRun } from '../../commands/schedule.js';
 import { buildJUnitReport } from '../junit-report.js';
 import type { Page } from '../pagination.js';
 import type {
@@ -53,6 +54,8 @@ const SAMPLE_TEST_ID_FAILED = 'test_8f2a4d10';
 const SAMPLE_TEST_ID_PASSED = 'test_3a91bb02';
 const SAMPLE_TEST_ID_BLOCKED = 'test_blocked_4f7a';
 export const SAMPLE_RUN_ID = 'run_abc';
+const SAMPLE_SCHEDULE_ID = 'sch_7d21ac48';
+const SAMPLE_SCHEDULE_RUN_ID = 'exec_5c08f1b2';
 // Documented sentinel for `test steps --run-id run_failed_sample --dry-run`:
 // keeps wait flows on the default passed sample while still demonstrating a
 // run-scoped failed step offline.
@@ -144,6 +147,36 @@ const projects: CliProject[] = [
     updatedAt: '2026-05-04T19:30:00.000Z',
   },
 ];
+
+const schedule: CliSchedule = {
+  scheduleId: SAMPLE_SCHEDULE_ID,
+  name: 'Nightly checkout',
+  enabled: true,
+  targetType: 'project',
+  targetId: SAMPLE_PROJECT_ID,
+  cron: '0 3 * * *',
+  timezone: 'UTC',
+  startAt: '2026-05-01T00:00:00.000Z',
+  endAt: null,
+  sendTo: null,
+  autoPausedAt: null,
+  lastRunId: SAMPLE_SCHEDULE_RUN_ID,
+  createdAt: '2026-05-01T00:00:00.000Z',
+  updatedAt: '2026-05-02T00:00:00.000Z',
+};
+
+// A finished run with one failure — more instructive for a dry-run learner than
+// an all-green one, since it shows how the per-status counts relate to `status`.
+const scheduleRun: CliScheduleRun = {
+  runId: SAMPLE_SCHEDULE_RUN_ID,
+  scheduleId: SAMPLE_SCHEDULE_ID,
+  status: 'failed',
+  projectId: SAMPLE_PROJECT_ID,
+  testListId: null,
+  stats: { total: 4, passed: 3, failed: 1, blocked: 0, running: 0, cancelled: 0 },
+  createdAt: '2026-05-02T03:00:00.000Z',
+  updatedAt: '2026-05-02T03:06:41.000Z',
+};
 
 const tests: CliTest[] = [
   {
@@ -870,6 +903,35 @@ const ENTRIES: DryRunSampleEntry[] = [
     },
     alreadyCancelled: false,
   } satisfies CancelRunResponse),
+  // Schedules. The `/schedules/{id}/runs` entry MUST come before the
+  // `/schedules/{id}` entries so the more specific path wins the regex match
+  // (first-match-wins).
+  entry('listScheduleRuns', 'GET', '/schedules/{scheduleId}/runs', {
+    runs: [scheduleRun],
+  }),
+  entry('listSchedules', 'GET', '/schedules', { schedules: [schedule] }),
+  // `schedule create --dry-run` exits before the HTTP client is built, so this
+  // sample is not fetched. Registered as a shape-guard only, same as
+  // `deleteBatch` above.
+  entry('createSchedule', 'POST', '/schedules', { scheduleId: 'sch_dryrun_2026' }),
+  entry('getSchedule', 'GET', '/schedules/{scheduleId}', schedule),
+  // Echoes the requested change so a caller can confirm the flags they passed
+  // reached the body, rather than showing an unrelated canned schedule.
+  entry('updateSchedule', 'PATCH', '/schedules/{scheduleId}', (req?: unknown) => {
+    const patch = req != null && typeof req === 'object' ? (req as Record<string, unknown>) : {};
+    return {
+      ...schedule,
+      ...(typeof patch.name === 'string' ? { name: patch.name } : {}),
+      ...(typeof patch.enabled === 'boolean' ? { enabled: patch.enabled } : {}),
+      ...(typeof patch.cron === 'string' ? { cron: patch.cron } : {}),
+      ...(typeof patch.timezone === 'string' ? { timezone: patch.timezone } : {}),
+      ...(typeof patch.sendTo === 'string' ? { sendTo: patch.sendTo } : {}),
+      updatedAt: '2026-05-16T00:00:00.000Z',
+    };
+  }),
+  entry('deleteSchedule', 'DELETE', '/schedules/{scheduleId}', {
+    scheduleId: SAMPLE_SCHEDULE_ID,
+  }),
 ];
 
 function entry(

@@ -18,10 +18,12 @@ import {
   loadCodexSkillBody,
   loadSkillBody,
   loadSkillBodyFor,
+  ownFileBodyFor,
   parseSkillMarker,
   pathFor,
   renderForTarget,
   renderOwnFileWithMarker,
+  type AgentTarget,
 } from './agent-targets.js';
 
 // ---------------------------------------------------------------------------
@@ -383,6 +385,29 @@ describe('renderForTarget("copilot")', () => {
     expect(copilot.content.length).toBeLessThan(claude.content.length);
     expect(copilot.content).not.toContain('The verification loop that flies');
     expect(copilot.content).toContain('testsprite test run');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ownFileBodyFor — the single per-target canonical-body rule (DEV-672)
+// ---------------------------------------------------------------------------
+
+describe('ownFileBodyFor', () => {
+  // Pins the rule itself: compactBody targets get the trimmed codex asset for a
+  // skill that ships one, everything else the full body. The install→status round
+  // trip in agent.test.ts covers the two commands agreeing on it.
+  it('resolves the trimmed body only for compactBody targets that ship one', () => {
+    for (const target of Object.keys(TARGETS) as AgentTarget[]) {
+      const compact = TARGETS[target].compactBody === true;
+      // verify ships a trimmed codex asset; onboard's is a one-liner, so it falls
+      // back to the full body even on a compact target.
+      expect(ownFileBodyFor(target, 'testsprite-verify')).toBe(
+        compact ? codexContentFor('testsprite-verify') : loadSkillBodyFor('testsprite-verify'),
+      );
+      expect(ownFileBodyFor(target, 'testsprite-onboard')).toBe(
+        loadSkillBodyFor('testsprite-onboard'),
+      );
+    }
   });
 });
 

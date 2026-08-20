@@ -44,6 +44,8 @@ import type {
   RunStatus,
   TriggerRunResponse,
 } from './runs.types.js';
+import type { CliTestListRunResponse } from './testlist.types.js';
+import type { ConflictReason } from './conflict-reason.js';
 
 /**
  * Compile-time literal union, runtime open string.
@@ -257,10 +259,40 @@ export const BATCH_RUN_FRESH_RESPONSE_SCHEMA: v.GenericSchema<unknown, BatchRunF
         dashboardUrl: v.optional(v.string()),
       }),
     ),
-    conflicts: v.array(v.looseObject({ testId: v.string() })),
+    conflicts: v.array(
+      v.looseObject({
+        testId: v.string(),
+        currentRunId: v.optional(v.string()),
+        reason: v.optional(v.string()) as v.GenericSchema<unknown, ConflictReason | undefined>,
+        message: v.optional(v.string()),
+      }),
+    ),
     deferred: v.array(v.looseObject({ testId: v.string() })),
     skippedFrontend: v.array(v.string()),
     skippedIntegration: v.array(v.looseObject({ testId: v.string() })),
+  });
+
+/**
+ * `POST /api/cli/v1/testlist/{listId}/run`. Mirrors the batch-run-fresh shape so
+ * the `--wait` fan-out reuses the same poll tail; `conflicts[]` additionally
+ * carry the in-flight `currentRunId`, and `reason` marks a nothing-dispatched run.
+ */
+export const TESTLIST_RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, CliTestListRunResponse> =
+  v.looseObject({
+    accepted: v.array(
+      v.looseObject({ testId: v.string(), runId: v.string(), enqueuedAt: v.string() }),
+    ),
+    conflicts: v.array(
+      v.looseObject({
+        testId: v.string(),
+        currentRunId: v.optional(v.string()),
+        reason: v.optional(v.string()) as v.GenericSchema<unknown, ConflictReason | undefined>,
+        message: v.optional(v.string()),
+      }),
+    ),
+    deferred: v.array(v.looseObject({ testId: v.string() })),
+    notFound: v.optional(v.array(v.string())),
+    reason: v.optional(v.string()) as v.GenericSchema<unknown, CliTestListRunResponse['reason']>,
   });
 
 // ---------------------------------------------------------------------------

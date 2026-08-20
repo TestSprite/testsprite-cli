@@ -13,9 +13,8 @@ import {
   DEFAULT_SKILLS,
   MARKER_SKILL_SEPARATOR,
   pathFor,
-  loadSkillBodyFor,
+  ownFileBodyFor,
   bodyHash12,
-  compactBodyFor,
   buildCodexAggregate,
   buildSkillMarker,
   parseSkillMarker,
@@ -352,6 +351,33 @@ interface InstallOptions extends CommonOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Shared canonical-body resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-invocation cache in front of {@link ownFileBodyFor}, so each (target, skill)
+ * pair reads its asset once. `agent install` (which stamps the body's hash into the
+ * marker) and `agent status` (which re-derives it) share this rather than keeping
+ * private copies — they didn't, hence DEV-672.
+ */
+function makeOwnFileBodyResolver(): (target: AgentTarget, skill: string) => string {
+  // Keyed on the pair: the same skill resolves to different bytes per target.
+  // NUL separates them because no target or skill name can contain one; written
+  // as an escape, since a raw NUL in the source makes grep treat this file as
+  // binary and skip it.
+  const cache = new Map<string, string>();
+  return (target, skill) => {
+    const key = `${target}\u0000${skill}`;
+    let body = cache.get(key);
+    if (body === undefined) {
+      body = ownFileBodyFor(target, skill);
+      cache.set(key, body);
+    }
+    return body;
+  };
+}
+
+// ---------------------------------------------------------------------------
 // runInstall
 // ---------------------------------------------------------------------------
 
@@ -434,32 +460,9 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
   const root = path.resolve(dir);
 
   // 4. Lazy asset loaders — only touch disk if a target actually needs it.
-  // own-file bodies are per-skill (cached); the codex section aggregates EVERY
-  // installed skill's contribution into ONE managed section.
-  const skillBodyCache = new Map<string, string>();
-  const bodyForSkill = (skill: string): string => {
-    let b = skillBodyCache.get(skill);
-    if (b === undefined) {
-      b = loadSkillBodyFor(skill);
-      skillBodyCache.set(skill, b);
-    }
-    return b;
-  };
-  // Budget-capped own-file targets (e.g. windsurf) render the compact per-skill
-  // body so the rule file isn't truncated by the agent. Cached separately; must
-  // match renderForTarget's default selection so written bytes equal the asserted
-  // render.
-  const compactBodyCache = new Map<string, string>();
-  const compactBodyForSkill = (skill: string): string => {
-    let b = compactBodyCache.get(skill);
-    if (b === undefined) {
-      b = compactBodyFor(skill);
-      compactBodyCache.set(skill, b);
-    }
-    return b;
-  };
-  const ownFileBodyFor = (t: AgentTarget, skill: string): string =>
-    TARGETS[t].compactBody ? compactBodyForSkill(skill) : bodyForSkill(skill);
+  // own-file bodies come from the shared per-target resolver; the codex section
+  // aggregates EVERY installed skill's contribution into ONE managed section.
+  const ownFileBodyFor = makeOwnFileBodyResolver();
   let codexSectionCache: string | undefined;
   const getCodexSection = (): string => {
     if (codexSectionCache === undefined) {
@@ -869,13 +872,18 @@ interface StatusOptions extends CommonOptions {
  * Classify one own-file artifact per the {@link SkillArtifactState} contract.
  * Comparisons are byte-exact, matching the installer's own skipped/blocked
  * comparison for own-file targets.
+ *
+ * `canonicalBody` is already bound to THIS target by the caller and takes no
+ * arguments, so the per-skill-only lookup that caused DEV-672 cannot be expressed
+ * here. It is called only once an artifact is known to exist and carry a marker,
+ * so a row with nothing installed never touches the skill assets.
  */
 async function classifyOwnFileState(
   agentFs: AgentFs,
   abs: string,
   target: AgentTarget,
   skill: string,
-  bodyForSkill: (skill: string) => string,
+  canonicalBody: () => string,
 ): Promise<SkillArtifactState> {
   const stat = await agentFs.lstat(abs);
   if (stat === null) return 'absent';
@@ -887,13 +895,13 @@ async function classifyOwnFileState(
   const marker = parseSkillMarker(existing);
   if (marker === null) return 'unmarked';
 
-  const canonicalBody = bodyForSkill(skill);
-  if (marker.hash12 !== bodyHash12(canonicalBody)) return 'stale';
+  const body = canonicalBody();
+  if (marker.hash12 !== bodyHash12(body)) return 'stale';
 
   // Hash matches the current body: pristine iff the file equals the canonical
   // render carrying its own marker line, so a marker whose version string lags
   // behind an unchanged body still reads ok.
-  const reRender = renderOwnFileWithMarker(target, skill, marker.line, canonicalBody);
+  const reRender = renderOwnFileWithMarker(target, skill, marker.line, body);
   return existing === reRender ? 'ok' : 'modified';
 }
 
@@ -991,22 +999,13 @@ export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Prom
   const dir = opts.dir !== undefined ? opts.dir.trim() : (deps.cwd ?? process.cwd());
   const root = path.resolve(dir);
 
-  // Canonical own-file bodies, read once per skill (same lazy caching pattern
-  // as runInstall's bodyForSkill).
-  const skillBodyCache = new Map<string, string>();
-  const bodyForSkill = (skill: string): string => {
-    let cachedBody = skillBodyCache.get(skill);
-    if (cachedBody === undefined) {
-      cachedBody = loadSkillBodyFor(skill);
-      skillBodyCache.set(skill, cachedBody);
-    }
-    return cachedBody;
-  };
+  // The SAME resolver the installer stamps its marker hashes from (DEV-672).
+  const ownFileBodyFor = makeOwnFileBodyResolver();
 
   const results: StatusResult[] = [];
   for (const [target, spec] of Object.entries(TARGETS) as [
     AgentTarget,
-    { mode: string; path: string },
+    (typeof TARGETS)[AgentTarget],
   ][]) {
     if (spec.mode === 'managed-section') {
       const stateFor = await classifyManagedSectionStates(agentFs, path.resolve(root, spec.path));
@@ -1026,7 +1025,9 @@ export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Prom
           path.resolve(root, relPath),
           target,
           skill,
-          bodyForSkill,
+          // Deferred, not resolved here: an absent artifact must not need the
+          // skill assets at all, as it didn't before DEV-672.
+          () => ownFileBodyFor(target, skill),
         ),
       });
     }

@@ -80,7 +80,11 @@ function runCli(args: string[], opts: { cwd: string; home: string }): CliResult 
       ...process.env,
       FORCE_COLOR: '0',
       NO_COLOR: '1',
+      // `os.homedir()` — how the CLI locates the credentials file — reads HOME
+      // on POSIX but USERPROFILE on Windows. Setting only HOME leaves a Windows
+      // child reading the real user's credentials instead of the fixture's.
       HOME: opts.home,
+      USERPROFILE: opts.home,
       // Neutralize any opt-out inherited from the developer's shell (empty is
       // NOT treated as opted-out by the warning).
       TESTSPRITE_NO_SKILL_WARNING: '',

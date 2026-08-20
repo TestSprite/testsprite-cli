@@ -20,6 +20,7 @@ import {
   type CliTestCode,
   type CliTestStep,
   type TestDeps,
+  backendResultIsForThisRun,
   createTestCommand,
   isPresignedCodeUrl,
   PLAN_SCHEMA_URL,
@@ -1241,6 +1242,51 @@ const RESULT_PASSED: CliLatestResult = {
   executionStatus: 'completed',
   summary: 'Test passed.',
 };
+
+describe('backendResultIsForThisRun — auto-resume stale-verdict floor (finding 2)', () => {
+  // The orphaned-row case the whole fallback exists for: a terminal result for
+  // the test that carries NO runIdIfAvailable, so the createdAt floor is the only
+  // guard against resolving the auto-resume to a PRIOR run's verdict.
+  const staleResult: CliLatestResult = {
+    ...RESULT_PASSED,
+    runIdIfAvailable: null,
+    finishedAt: '2026-01-01T00:00:00.000Z', // a prior run, long before the in-flight one
+  };
+  const inFlightCreatedAt = '2026-06-01T00:00:00.000Z'; // the run we're resuming
+
+  it('rejects a stale result whose finishedAt predates the in-flight createdAt floor', () => {
+    // Under the real createdAt floor it must be rejected — this is the false green.
+    expect(backendResultIsForThisRun(staleResult, 'run_inflight', inFlightCreatedAt)).toBe(false);
+  });
+
+  it('the pre-fix epoch sentinel would ACCEPT that same stale result (the bug this guards)', () => {
+    // Restoring notBefore='1970…' makes finishedAt >= floor for any real result,
+    // resolving the resume to the previous run's verdict — the exact regression.
+    expect(backendResultIsForThisRun(staleResult, 'run_inflight', '1970-01-01T00:00:00.000Z')).toBe(
+      true,
+    );
+  });
+
+  it("accepts this run's own verdict (finishedAt at/after the floor)", () => {
+    expect(
+      backendResultIsForThisRun(
+        { ...staleResult, finishedAt: '2026-06-01T00:00:30.000Z' },
+        'run_inflight',
+        inFlightCreatedAt,
+      ),
+    ).toBe(true);
+  });
+
+  it('a matching runIdIfAvailable accepts regardless of the floor', () => {
+    expect(
+      backendResultIsForThisRun(
+        { ...staleResult, runIdIfAvailable: 'run_inflight' },
+        'run_inflight',
+        inFlightCreatedAt,
+      ),
+    ).toBe(true);
+  });
+});
 
 describe('isPresignedCodeUrl', () => {
   it('treats https:// as presigned and source-looking strings as inline', () => {
@@ -10764,13 +10810,13 @@ describe('[finding-3] test create --run text mode prints the authoritative Dashb
 });
 
 // ---------------------------------------------------------------------------
-// Finding 2 (dogfood 2026-08-09) — create-batch --run --target-url must still
-// warn a V3-routed caller once, up front, even though this fan-out calls
-// `triggerRunWithMeta` directly and bypasses `runTestRun` (where the
-// `--target-url` V3 advisory normally lives).
+// create-batch --run --target-url: the response-driven mismatch advisory
+// must fire at most ONCE for the whole batch, not once per member — even
+// though this fan-out calls `triggerRunWithMeta` directly per item rather
+// than delegating to `runTestRun` (where the advisory normally lives).
 // ---------------------------------------------------------------------------
 
-describe('[finding-2] create-batch --run --target-url V3 advisory fires once, not per item', () => {
+describe('create-batch --run --target-url mismatch advisory fires once, not per item', () => {
   function writeTwoSpecPlansFinding2(): string {
     const dir = mkdtempSync(join(tmpdir(), 'cli-finding2-batch-run-'));
     const path = join(dir, 'plans.jsonl');
@@ -10790,16 +10836,10 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
     return path;
   }
 
-  /** Routes GET /me to `me`; POST /tests/batch to a 2-item created response; everything else to the run trigger. */
-  function makeFinding2Fetch(
-    me: { v3Enabled?: boolean } | undefined,
-    meCalls: string[],
-  ): typeof globalThis.fetch {
+  /** Routes POST /tests/batch to a 2-item created response; every other call is a run trigger. */
+  function makeFinding2Fetch(triggerTargetUrl: string): typeof globalThis.fetch {
+    let triggerCount = 0;
     return makeFetch(url => {
-      if (url.endsWith('/me')) {
-        meCalls.push('called');
-        return { status: 200, body: me ?? {} };
-      }
       if (url.includes('/tests/batch')) {
         return {
           status: 200,
@@ -10813,23 +10853,23 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
         };
       }
       // POST /tests/{id}/runs — trigger, once per created item.
+      triggerCount += 1;
       return {
         status: 200,
         body: {
-          runId: `run_f2_${meCalls.length}`,
+          runId: `run_f2_${triggerCount}`,
           status: 'queued',
           enqueuedAt: '2026-08-09T10:00:01.000Z',
           codeVersion: 'v1',
-          targetUrl: '',
+          targetUrl: triggerTargetUrl,
         },
       };
     });
   }
 
-  it('fires exactly once for the whole batch (not once per item) when V3-routed', async () => {
+  it('fires exactly once for the whole batch (not once per item) when the response mismatches', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const plansFile = writeTwoSpecPlansFinding2();
-    const meCalls: string[] = [];
     const stderrLines: string[] = [];
     await runCreateBatch(
       {
@@ -10841,28 +10881,28 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
         wait: false,
         dryRun: false,
         targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
       },
       {
         credentialsPath,
-        fetchImpl: makeFinding2Fetch({ v3Enabled: true }, meCalls),
+        // Every member's trigger response reports '' — the V3 "didn't
+        // apply the override" shape — so every member mismatches, and the
+        // advisory must still print only once for the whole invocation.
+        fetchImpl: makeFinding2Fetch(''),
         stdout: () => undefined,
         stderr: line => stderrLines.push(line),
         sleep: () => Promise.resolve(),
       },
     );
-    // Exactly one /me probe for the whole batch, regardless of how many
-    // items are in it (two created + triggered here).
-    expect(meCalls).toHaveLength(1);
     const advisoryLines = stderrLines.filter(
       l => l.includes('[advisory]') && l.includes('--target-url'),
     );
     expect(advisoryLines).toHaveLength(1);
   });
 
-  it('does not fire when --target-url is absent, even for a V3-routed caller', async () => {
+  it('does not fire when --target-url is absent', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const plansFile = writeTwoSpecPlansFinding2();
-    const meCalls: string[] = [];
     const stderrLines: string[] = [];
     await runCreateBatch(
       {
@@ -10876,23 +10916,18 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
       },
       {
         credentialsPath,
-        fetchImpl: makeFinding2Fetch({ v3Enabled: true }, meCalls),
+        fetchImpl: makeFinding2Fetch(''),
         stdout: () => undefined,
         stderr: line => stderrLines.push(line),
         sleep: () => Promise.resolve(),
       },
     );
-    // No --target-url supplied: the probe must not even fire (mirrors
-    // single `test run`'s "only pay the extra /me round trip when
-    // --target-url was actually supplied" gating).
-    expect(meCalls).toHaveLength(0);
     expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
   });
 
-  it('v3Enabled:false → no advisory even with --target-url set', async () => {
+  it('response echoes the requested targetUrl for every member → no advisory', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const plansFile = writeTwoSpecPlansFinding2();
-    const meCalls: string[] = [];
     const stderrLines: string[] = [];
     await runCreateBatch(
       {
@@ -10904,23 +10939,22 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
         wait: false,
         dryRun: false,
         targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
       },
       {
         credentialsPath,
-        fetchImpl: makeFinding2Fetch({ v3Enabled: false }, meCalls),
+        fetchImpl: makeFinding2Fetch('https://staging.example.com'),
         stdout: () => undefined,
         stderr: line => stderrLines.push(line),
         sleep: () => Promise.resolve(),
       },
     );
-    expect(meCalls).toHaveLength(1);
     expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
   });
 
   it('--output json: the advisory stays on stderr only — stdout parses clean with no [advisory] text', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const plansFile = writeTwoSpecPlansFinding2();
-    const meCalls: string[] = [];
     const stdoutLines: string[] = [];
     const stderrLines: string[] = [];
     await runCreateBatch(
@@ -10933,10 +10967,11 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
         wait: false,
         dryRun: false,
         targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
       },
       {
         credentialsPath,
-        fetchImpl: makeFinding2Fetch({ v3Enabled: true }, meCalls),
+        fetchImpl: makeFinding2Fetch(''),
         stdout: line => stdoutLines.push(line),
         stderr: line => stderrLines.push(line),
         sleep: () => Promise.resolve(),
@@ -10947,5 +10982,406 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
     );
     expect(() => JSON.parse(stdoutLines.join(''))).not.toThrow();
     expect(stdoutLines.join('')).not.toContain('[advisory]');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runCreate / runCreateFromPlan --run --target-url: pre-charge reachability
+// preflight wiring. The rule table itself (every refuse/warn classification)
+// is covered in `src/lib/target-url-preflight.test.ts`; these two blocks only
+// pin that each command wires the probe correctly — before the create POST,
+// and opt-outable — mirroring the `runTestRun` and create-batch preflight
+// wiring pairs above. Both call sites were previously undefended: deleting
+// either preflight block in test.ts leaves the full suite green.
+// ---------------------------------------------------------------------------
+
+describe('runCreate — --target-url reachability preflight wiring', () => {
+  function writeCodeFile(contents: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-preflight-create-'));
+    const path = join(dir, 'test.py');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- code fixture written into this test's own mkdtempSync-created temp dir, never user input.
+    writeFileSync(path, contents, 'utf8');
+    return path;
+  }
+
+  // A literal IP skips the probe's DNS step, so these tests are governed
+  // purely by the injected fetchImpl — no real DNS lookups.
+  const LITERAL_IP_TARGET = 'http://203.0.113.30';
+
+  it('a gateway-error response (503) refuses before the create POST — exit 5, no create POST', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('def test_smoke():\n    pass\n');
+    let createPosted = false;
+    const fetchImpl = makeFetch((url, init) => {
+      if (url === LITERAL_IP_TARGET) return { status: 503, body: {} };
+      if ((init.method ?? 'GET') === 'POST') createPosted = true;
+      return { status: 200, body: { items: [] } };
+    });
+    const err = await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'preflight guard',
+        codeFile,
+        targetUrl: LITERAL_IP_TARGET,
+        run: true,
+        wait: false,
+        dryRun: false,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('VALIDATION_ERROR');
+    expect((err as ApiError).exitCode).toBe(5);
+    expect(createPosted).toBe(false);
+  });
+
+  it('--skip-preflight makes the probe a zero-network-call no-op — create still proceeds', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('def test_smoke():\n    pass\n');
+    const probeHits: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      if (url === LITERAL_IP_TARGET) {
+        probeHits.push(url);
+        return { status: 503, body: {} }; // would refuse if the probe ran at all
+      }
+      const method = init.method ?? 'GET';
+      if (url.includes('/runs')) {
+        return {
+          status: 200,
+          body: {
+            runId: 'run_pf_create',
+            status: 'queued',
+            enqueuedAt: '2026-08-14T00:00:00.000Z',
+            codeVersion: 'v1',
+            targetUrl: LITERAL_IP_TARGET,
+          },
+        };
+      }
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_pf_create',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-14T00:00:00.000Z',
+        },
+      };
+    });
+    const res = await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'preflight skip',
+        codeFile,
+        targetUrl: LITERAL_IP_TARGET,
+        run: true,
+        wait: false,
+        dryRun: false,
+        skipPreflight: true,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    );
+    expect(probeHits).toHaveLength(0);
+    expect(res).toMatchObject({ testId: 'test_pf_create' });
+  });
+});
+
+describe('runCreateFromPlan — --target-url reachability preflight wiring', () => {
+  function writePlanFile(plan: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-preflight-plan-'));
+    const path = join(dir, 'plan.json');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- plan fixture written into this test's own mkdtempSync-created temp dir, never user input.
+    writeFileSync(path, JSON.stringify(plan), 'utf8');
+    return path;
+  }
+
+  const FE_PLAN = {
+    projectId: 'project_alice',
+    type: 'frontend' as const,
+    name: 'preflight plan test',
+    planSteps: [{ type: 'action', description: 'navigate' }],
+  };
+
+  // A literal IP skips the probe's DNS step, so these tests are governed
+  // purely by the injected fetchImpl — no real DNS lookups.
+  const LITERAL_IP_TARGET = 'http://203.0.113.40';
+
+  it('a gateway-error response (502) refuses before the create POST — exit 5, no create POST', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile(FE_PLAN);
+    let createPosted = false;
+    const fetchImpl = makeFetch((url, init) => {
+      if (url === LITERAL_IP_TARGET) return { status: 502, body: {} };
+      if ((init.method ?? 'GET') === 'POST') createPosted = true;
+      return { status: 200, body: {} };
+    });
+    const err = await runCreateFromPlan(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        planFrom: planFile,
+        targetUrl: LITERAL_IP_TARGET,
+        run: true,
+        wait: false,
+        dryRun: false,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('VALIDATION_ERROR');
+    expect((err as ApiError).exitCode).toBe(5);
+    expect(createPosted).toBe(false);
+  });
+
+  it('--skip-preflight makes the probe a zero-network-call no-op — create still proceeds', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile(FE_PLAN);
+    const probeHits: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      if (url === LITERAL_IP_TARGET) {
+        probeHits.push(url);
+        return { status: 502, body: {} }; // would refuse if the probe ran at all
+      }
+      const method = init.method ?? 'GET';
+      if (url.includes('/runs')) {
+        return {
+          status: 200,
+          body: {
+            runId: 'run_pf_plan',
+            status: 'queued',
+            enqueuedAt: '2026-08-14T00:00:00.000Z',
+            codeVersion: 'v1',
+            targetUrl: LITERAL_IP_TARGET,
+          },
+        };
+      }
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_pf_plan',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-14T00:00:00.000Z',
+        },
+      };
+    });
+    const res = await runCreateFromPlan(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        planFrom: planFile,
+        targetUrl: LITERAL_IP_TARGET,
+        run: true,
+        wait: false,
+        dryRun: false,
+        skipPreflight: true,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    );
+    expect(probeHits).toHaveLength(0);
+    expect(res).toMatchObject({ testId: 'test_pf_plan' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// create-batch --run --target-url: pre-charge reachability preflight fires
+// ONCE for the whole batch (mirrors the advisory dedup above), not once per
+// member, and --skip-preflight is a true zero-network-call opt-out.
+// ---------------------------------------------------------------------------
+
+describe('create-batch --run --target-url reachability preflight wiring', () => {
+  function writeTwoSpecPlansPreflight(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-preflight-batch-run-'));
+    const path = join(dir, 'plans.jsonl');
+    const specA = {
+      projectId: 'proj_pf_a',
+      type: 'frontend' as const,
+      name: 'preflight spec a',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    const specB = {
+      projectId: 'proj_pf_b',
+      type: 'frontend' as const,
+      name: 'preflight spec b',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- plan-batch fixture written into this test's own mkdtempSync-created temp dir, never user input.
+    writeFileSync(path, [specA, specB].map(p => JSON.stringify(p)).join('\n') + '\n', 'utf8');
+    return path;
+  }
+
+  // A literal IP skips the probe's DNS step, so these tests are governed
+  // purely by the injected fetchImpl — no real DNS lookups.
+  const LITERAL_IP_TARGET = 'http://203.0.113.20';
+
+  it('probes the target exactly once for the whole batch, before the create POST', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansPreflight();
+    const probeHits: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url === LITERAL_IP_TARGET) {
+        probeHits.push(url);
+        return { status: 200, body: {} };
+      }
+      if (url.includes('/tests/batch')) {
+        return {
+          status: 200,
+          body: {
+            results: [
+              { specIndex: 0, status: 'created', testId: 'test_pf_a' },
+              { specIndex: 1, status: 'created', testId: 'test_pf_b' },
+            ],
+            summary: { total: 2, created: 2, failed: 0 },
+          },
+        };
+      }
+      return {
+        status: 200,
+        body: {
+          runId: 'run_pf',
+          status: 'queued',
+          enqueuedAt: '2026-08-09T10:00:01.000Z',
+          codeVersion: 'v1',
+          targetUrl: LITERAL_IP_TARGET,
+        },
+      };
+    });
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: LITERAL_IP_TARGET,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    );
+    expect(probeHits).toHaveLength(1);
+  });
+
+  it('a gateway-error response (503) refuses before any per-member run trigger — exit 5, zero triggers', async () => {
+    // The batch CREATE (`POST /tests/batch`) is a single request for the
+    // whole batch and always runs first; the preflight sits before the
+    // per-member RUN trigger fan-out, not before the create. So a refused
+    // target still leaves the batch's created-test rows behind — it only
+    // guarantees no run row and no charge, mirroring the other three call
+    // sites' "no trigger POST" contract.
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansPreflight();
+    let triggerPosted = false;
+    const fetchImpl = makeFetch(url => {
+      if (url === LITERAL_IP_TARGET) return { status: 503, body: {} };
+      if (url.includes('/tests/batch')) {
+        return {
+          status: 200,
+          body: {
+            results: [
+              { specIndex: 0, status: 'created', testId: 'test_pf_a' },
+              { specIndex: 1, status: 'created', testId: 'test_pf_b' },
+            ],
+            summary: { total: 2, created: 2, failed: 0 },
+          },
+        };
+      }
+      // Any `POST /tests/{id}/runs` reaching here would mean the preflight
+      // failed to gate the fan-out.
+      triggerPosted = true;
+      return { status: 200, body: {} };
+    });
+    const err = await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: LITERAL_IP_TARGET,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('VALIDATION_ERROR');
+    expect((err as ApiError).exitCode).toBe(5);
+    expect(triggerPosted).toBe(false);
+  });
+
+  it('--skip-preflight makes the probe a zero-network-call no-op', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansPreflight();
+    const probeHits: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url === LITERAL_IP_TARGET) {
+        probeHits.push(url);
+        return { status: 503, body: {} }; // would refuse if the probe ran at all
+      }
+      if (url.includes('/tests/batch')) {
+        return {
+          status: 200,
+          body: {
+            results: [{ specIndex: 0, status: 'created', testId: 'test_pf_a' }],
+            summary: { total: 1, created: 1, failed: 0 },
+          },
+        };
+      }
+      return {
+        status: 200,
+        body: {
+          runId: 'run_pf',
+          status: 'queued',
+          enqueuedAt: '2026-08-09T10:00:01.000Z',
+          codeVersion: 'v1',
+          targetUrl: LITERAL_IP_TARGET,
+        },
+      };
+    });
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: LITERAL_IP_TARGET,
+        skipPreflight: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    );
+    expect(probeHits).toHaveLength(0);
   });
 });

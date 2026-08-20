@@ -1,11 +1,9 @@
 import {
-  appendFileSync,
   createWriteStream,
   existsSync,
   readFileSync,
   readdirSync,
   statSync,
-  writeFileSync,
   type WriteStream,
 } from 'node:fs';
 import { rename, stat, unlink } from 'node:fs/promises';
@@ -33,6 +31,7 @@ import { findSample, sampleJUnitReportXml } from '../lib/dry-run/samples.js';
 import {
   assertJUnitReportOptions,
   buildJUnitReport,
+  durationSecondsBetween,
   resolveBatchReportProjectId,
   writeJUnitReportFile,
   type JUnitReportFormat,
@@ -45,6 +44,7 @@ import {
   InterruptError,
   RequestTimeoutError,
   TransportError,
+  isAuthCode,
   localValidationError,
 } from '../lib/errors.js';
 import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
@@ -67,6 +67,7 @@ import {
   type PaginationFlags,
 } from '../lib/pagination.js';
 import { pollRunUntilTerminal, TimeoutError } from '../lib/poll.js';
+import { resolveWaitFailure } from '../lib/wait-exit.js';
 import type {
   RunResponse,
   RunStatus,
@@ -86,7 +87,10 @@ import type {
   CancelRunResponse,
 } from '../lib/runs.types.js';
 import { RUN_SOURCES } from '../lib/runs.types.js';
+import { summarizeConflicts } from '../lib/conflict-reason.js';
+import { isProxyAgentActive } from '../lib/proxy.js';
 import { assertNotLocal } from '../lib/target-url.js';
+import { assertTargetUrlReachable } from '../lib/target-url-preflight.js';
 import {
   formatTextTableRow,
   measureTextColumns,
@@ -97,12 +101,8 @@ import {
 import { createTicker } from '../lib/ticker.js';
 import { RateThrottle } from '../lib/rate-throttle.js';
 import { resolvePortalBase, resolvePortalUrl } from '../lib/facade.js';
-import { emitTargetUrlV3Advisory } from '../lib/v3-advisory.js';
-import {
-  emitGithubOutputs,
-  summarizeAcceptedPayload,
-  summarizeSingleRun,
-} from '../lib/gh-output.js';
+import { emitTargetUrlMismatchAdvisory } from '../lib/v3-advisory.js';
+import { emitCiArtifacts, summarizeAcceptedPayload, summarizeSingleRun } from '../lib/gh-output.js';
 import { loadConfig } from '../lib/config.js';
 import {
   flakyExitCode,
@@ -515,6 +515,26 @@ function rateLimitedDetachMessage(err: ApiError, runIds: string[]): string {
   );
 }
 
+/**
+ * The same honest "keeps running (and billing)" subject sentence
+ * `interruptDetachMessage`/`rateLimitedDetachMessage` already use, for the
+ * two detach paths that build their own text inline instead of going
+ * through one of those two helpers: a plain `--timeout` expiry
+ * (`TimeoutError`) and a client-side `RequestTimeoutError`. Both used to
+ * omit "(and billing)" — the honesty gap this closes — even though a
+ * `--timeout` expiry is the single most common of the four detach reasons
+ * in practice. Kept as a standalone string helper (not a shared code path
+ * for all four branches) deliberately: the four branches differ in how
+ * they render the partial envelope and in their exit code, and unifying
+ * that shape is out of scope here — see the PR notes.
+ */
+function stillRunningAndBillingSubject(runIds: string | string[]): string {
+  const ids = Array.isArray(runIds) ? runIds : [runIds];
+  return ids.length === 1
+    ? `Run ${ids[0]} is still executing on the server and will keep running (and billing) until it finishes.`
+    : `${ids.length} runs are still executing on the server and will keep running (and billing) until they finish.`;
+}
+
 type CommonOptions = FactoryCommonOptions;
 
 interface ListOptions extends CommonOptions {
@@ -725,6 +745,8 @@ interface CreateOptions extends CommonOptions {
   timeoutIsDefault?: boolean;
   /** M3.3 chain: per-run target URL override. */
   targetUrl?: string;
+  /** Skip the pre-charge --target-url reachability preflight (zero network calls). */
+  skipPreflight?: boolean;
 }
 
 /**
@@ -965,6 +987,31 @@ export async function runCreate(
     );
   }
 
+  // Pre-charge reachability preflight — deliberately BEFORE the
+  // create POST below (not after), so a doomed --target-url refuses before
+  // this leaves behind a created-but-never-run orphan test row (the same
+  // "fail before I/O" idiom `assertChainedRunKeyFits` above already applies
+  // to the run idempotency key). Only meaningful when it will actually
+  // reach a trigger: skipped for a known-backend test (the advisory just
+  // above already covers why --target-url is inert there) and skipped
+  // entirely under --dry-run (zero network calls). The delegated
+  // `runTestRun` call in the --run chain below sets `skipPreflight: true`
+  // so this exact URL is never probed twice.
+  if (
+    opts.type !== 'backend' &&
+    opts.targetUrl !== undefined &&
+    opts.run === true &&
+    !opts.dryRun
+  ) {
+    const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    await assertTargetUrlReachable(
+      opts.targetUrl,
+      { skipPreflight: opts.skipPreflight },
+      { fetchImpl: deps.fetchImpl, proxyActive: isProxyAgentActive() },
+      stderrFn,
+    );
+  }
+
   const client = makeClient(opts, deps);
   const out = makeOutput(opts.output, deps);
 
@@ -1039,6 +1086,10 @@ export async function runCreate(
         // Thread the known type so fast BE runs (terminal on first poll, where
         // beFallbackUsed would be false) still render `steps: n/a (backend)`.
         type: opts.type,
+        // The preflight above (or its explicit --skip-preflight opt-out)
+        // already ran against this exact URL before the create POST — never
+        // probe it a second time here.
+        skipPreflight: true,
       },
       deps,
     );
@@ -2415,6 +2466,8 @@ interface CreateFromPlanOptions extends CommonOptions {
   timeoutIsDefault?: boolean;
   /** Reserved for the M3.3 chain. Per-run target URL override. */
   targetUrl?: string;
+  /** Skip the pre-charge --target-url reachability preflight (zero network calls). */
+  skipPreflight?: boolean;
   /**
    * Names of `test create` flags the caller supplied that `--plan-from`
    * ignores (identity lives in the JSON). Surfaced as a stderr advisory
@@ -2554,6 +2607,21 @@ export async function runCreateFromPlan(
     planSteps: plan.planSteps,
   };
 
+  // Pre-charge reachability preflight — before the create POST
+  // (same "fail before I/O, not after an orphan row" placement as
+  // runCreate). `plan.type` is unconditionally 'frontend' here (backend
+  // plans already threw above), so no type gate is needed. The delegated
+  // `runTestRun` call in the --run chain below sets `skipPreflight: true`
+  // so this exact URL is never probed twice.
+  if (opts.targetUrl !== undefined && opts.run === true && !opts.dryRun) {
+    await assertTargetUrlReachable(
+      opts.targetUrl,
+      { skipPreflight: opts.skipPreflight },
+      { fetchImpl: deps.fetchImpl, proxyActive: isProxyAgentActive() },
+      stderrFn,
+    );
+  }
+
   const client = makeClient(opts, deps);
   const out = makeOutput(opts.output, deps);
 
@@ -2605,6 +2673,9 @@ export async function runCreateFromPlan(
         timeoutIsDefault: opts.timeoutIsDefault ?? false,
         wait: opts.wait === true,
         createContext: responseWithDashboardUrl,
+        // Already preflighted above (or explicitly skipped) — don't probe
+        // the same URL twice.
+        skipPreflight: true,
       },
       deps,
     ).then(() => response);
@@ -2939,6 +3010,8 @@ interface CreateBatchOptions extends CommonOptions {
   timeoutSeconds?: number;
   /** With `--run`, override the project default env URL for each triggered run. */
   targetUrl?: string;
+  /** Skip the pre-charge --target-url reachability preflight (zero network calls). */
+  skipPreflight?: boolean;
 }
 
 /**
@@ -3255,21 +3328,6 @@ async function runBatchRun(
     return;
   }
 
-  // Finding 2 (dogfood 2026-08-09): this fan-out calls `triggerRunWithMeta`
-  // directly (below), bypassing `runTestRun` entirely — so `runTestRun`'s own
-  // `--target-url` V3 advisory (`emitTargetUrlV3AdvisoryIfNeeded`) never fired
-  // here, even though every triggered run in the batch ignores `--target-url`
-  // exactly like a single V3-routed `test run` does. Reuses the same helper
-  // and advisory text (no duplicated probe logic or copy) and fires exactly
-  // ONCE for the whole batch, before the fan-out — not per item. Mirrors
-  // `runTestRun`'s own gating (only pay the extra `/me` round trip when
-  // `--target-url` was actually supplied) and its "fires under --dry-run too"
-  // behavior (the dry-run client's canned `/me` sample demonstrates the same
-  // advisory at zero real-network cost).
-  if (opts.targetUrl !== undefined) {
-    await emitTargetUrlV3AdvisoryIfNeeded(client, stderrFn);
-  }
-
   // Dry-run: print a descriptor envelope and return without real triggers.
   if (opts.dryRun) {
     const dryRunResults: CliBatchRunResult[] = testIds.map(testId => ({
@@ -3293,8 +3351,31 @@ async function runBatchRun(
     return;
   }
 
+  // Pre-charge reachability preflight, ONCE for the whole batch
+  // before the fan-out — not once per item (mirrors the "fire once per
+  // invocation" contract Finding 2 already established for the target-url
+  // advisory below). Real path only (dry-run already returned above); no
+  // type gate is needed here — batch specs are FE-only by construction (a
+  // `type: "backend"` spec always fails create-time server validation, so
+  // it never reaches this fan-out at all — see the `beIndexes` warning in
+  // `runCreateBatch`).
+  if (opts.targetUrl !== undefined) {
+    await assertTargetUrlReachable(
+      opts.targetUrl,
+      { skipPreflight: opts.skipPreflight },
+      { fetchImpl: deps.fetchImpl, proxyActive: isProxyAgentActive() },
+      stderrFn,
+    );
+  }
+
   const batchRunResults: CliBatchRunResult[] = [];
   const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+  // Response-driven --target-url advisory, fired at most ONCE for the whole
+  // batch (Finding 2's contract) the first time any member's trigger
+  // response reports a target different from what was requested — see the
+  // matching comment in `runTestRun` for why this replaced the old
+  // `v3Enabled`-assumption probe.
+  let targetUrlAdvisoryPrinted = false;
 
   /**
    * Client-side sliding-window throttle: caps outgoing triggers at
@@ -3412,6 +3493,18 @@ async function runBatchRun(
           { idempotencyKey: runIdempotencyKey, retryOnRateLimit: false },
         );
         triggerResponse = result.body;
+        // Fire the response-driven mismatch advisory at most once for the
+        // whole batch. Synchronous check-and-set (no `await` between the
+        // two) so two members whose triggers resolve in the same tick
+        // can't both slip past the flag and print twice.
+        if (
+          !targetUrlAdvisoryPrinted &&
+          opts.targetUrl !== undefined &&
+          triggerResponse.targetUrl !== opts.targetUrl
+        ) {
+          targetUrlAdvisoryPrinted = true;
+          emitTargetUrlMismatchAdvisory(stderrFn, opts.targetUrl, triggerResponse.targetUrl);
+        }
         break; // success — exit the outer retry loop
       } catch (err) {
         // Interrupt must reject the fan-out (the collect point prints the
@@ -5683,6 +5776,14 @@ const MAX_RUN_TIMEOUT_SECONDS = 3600;
 interface RunTestRunOptions extends CommonOptions {
   testId: string;
   targetUrl?: string;
+  /**
+   * Skip the pre-charge --target-url reachability preflight (zero
+   * network calls). Also set by a delegating caller (`runCreate`/
+   * `runCreateFromPlan` chaining `--run`) that already ran the same probe
+   * against the same URL before its own create POST, so this run doesn't
+   * probe twice.
+   */
+  skipPreflight?: boolean;
   wait: boolean;
   timeoutSeconds: number;
   /**
@@ -6221,82 +6322,6 @@ function parseTimeoutFlag(raw: string | undefined, flagName: string): number {
 }
 
 /**
- * Short deadline for the best-effort `v3Enabled` lookup behind the
- * `--target-url` advisory (DEV-749). Mirrors `DUP_NAME_ADVISORY_TIMEOUT_MS`
- * — a stalled `/me` must never meaningfully delay a run trigger.
- */
-const TARGET_URL_ADVISORY_TIMEOUT_MS = 5_000;
-
-/**
- * DEV-749 (client half): `--target-url` is silently dropped on the V3
- * execution path — the backend validates it (SSRF guard, defence in depth)
- * and then discards it, because V3 resolves the run's environment from
- * `test_environment` at execution time; there is no injection point for a
- * per-run override. This is a client-side advisory only — the real fix
- * (an actual per-run override on V3) needs a product decision and is out
- * of scope here.
- *
- * Gated on `v3Enabled`, the same authoritative per-user routing bit
- * `auth status`/`doctor` already render (`GET /me`, `src/lib/v3-advisory.ts`).
- * Best-effort: a single bounded lookup (mirrors `emitDupNameAdvisoryIfNeeded`'s
- * `AbortController` + 5 s deadline), swallows every error, and must never
- * block or fail the actual run trigger — a broken/slow `/me` degrades to
- * "no advisory printed", not a failed `test run`.
- */
-/**
- * `X-CLI-Command` tag for this probe's `GET /me` — same advisory-header
- * mechanism `runInit` uses (`toAuthDeps`'s `commandTag: 'init'` in
- * `commands/init.ts`, sent via `AuthDeps.commandTag` in `auth.ts`), reused
- * directly here rather than invented fresh. The backend's CLI-audit
- * allowlist (`KNOWN_CLI_COMMANDS` + `resolveCliEvent`'s `/me` branch) maps this
- * exact string to `null` — no PostHog event at all, not `cli.session_started`
- * and not `cli.initialized` (init's tag would be a MORE specific, and equally
- * wrong, misattribution of a probe that is neither a session start nor an
- * onboarding run).
- *
- * Forward-compatible by construction: an unlisted `X-CLI-Command` value is
- * dropped by the backend before event selection (see
- * `capturePostHogEvent`/`KNOWN_CLI_COMMANDS` in the interceptor above), so
- * against a backend that predates this allowlist entry the header is a no-op
- * and behavior is exactly what it was before this fix — the CLI can ship
- * this independently of backend deploy order in either direction.
- */
-const TARGET_URL_ADVISORY_CLI_COMMAND = 'run-target-url-probe';
-
-async function emitTargetUrlV3AdvisoryIfNeeded(
-  client: HttpClient,
-  stderrFn: (line: string) => void,
-): Promise<void> {
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), TARGET_URL_ADVISORY_TIMEOUT_MS);
-  try {
-    const me = await client.get<{ v3Enabled?: boolean }>('/me', {
-      signal: ac.signal,
-      headers: { 'x-cli-command': TARGET_URL_ADVISORY_CLI_COMMAND },
-      // Finding 1 (dogfood 2026-08-09): `HttpClient.sleepBeforeRetry` (src/lib/http.ts)
-      // only observes the process-lifetime shutdown signal, never a per-request
-      // `options.signal` — the abort controller above bounds the FETCH itself but
-      // not a post-response retry sleep. A retryable 429 carrying a real
-      // `Retry-After` (e.g. 60s, a live `inflight_cap` response) would put this
-      // best-effort probe into a retry sleep this 5s deadline cannot interrupt,
-      // stalling the real run trigger behind it. `retryOnRateLimit: false` makes
-      // the HTTP layer throw on the first 429 instead of sleeping — the existing,
-      // already-used-elsewhere knob (see the batch-run trigger site above) rather
-      // than changing `sleepBeforeRetry` itself, which every other caller (e.g.
-      // the polling path) relies on to keep sleeping through a caller signal.
-      retryOnRateLimit: false,
-    });
-    if (me.v3Enabled === true) {
-      emitTargetUrlV3Advisory(stderrFn);
-    }
-  } catch {
-    // Swallow — this is best-effort; must not block or fail the run trigger.
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
  * `test run <test-id>` — M3.3 piece-3.
  *
  * Triggers a run via `POST /api/cli/v1/tests/{testId}/runs`. With
@@ -6311,16 +6336,6 @@ export async function runTestRun(
   assertIdempotencyKey(opts.idempotencyKey);
   if (opts.targetUrl !== undefined) {
     assertNotLocal(opts.targetUrl);
-  }
-
-  // DEV-749: only spend the extra `/me` round trip when --target-url was
-  // actually supplied — the common case (no override) pays nothing. Fires
-  // in both the dry-run and real paths below (the dry-run `/me` sample sets
-  // `v3Enabled: true`, so `--dry-run --target-url` demonstrates the same
-  // advisory a real V3-routed caller would see, at zero real-network cost).
-  if (opts.targetUrl !== undefined) {
-    const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-    await emitTargetUrlV3AdvisoryIfNeeded(makeClient(opts, deps), stderrFn);
   }
 
   if (opts.dryRun) {
@@ -6368,6 +6383,22 @@ export async function runTestRun(
   const client = makeClient({ ...opts, requestTimeoutMs: resolveWaitRequestTimeoutMs(opts) }, deps);
   const out = makeOutput(opts.output, deps);
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+
+  // Pre-charge reachability preflight — real path only (dry-run
+  // makes zero network calls by convention), after `assertNotLocal` and
+  // before the trigger POST so a doomed run never gets a run row or charge.
+  // `opts.skipPreflight` is threaded straight to a zero-network no-op; a
+  // delegating caller (`runCreate`/`runCreateFromPlan` chaining `--run`)
+  // already ran this exact check against the same URL before its own
+  // create POST and sets `skipPreflight: true` here to avoid probing twice.
+  if (opts.targetUrl !== undefined) {
+    await assertTargetUrlReachable(
+      opts.targetUrl,
+      { skipPreflight: opts.skipPreflight },
+      { fetchImpl: deps.fetchImpl, proxyActive: isProxyAgentActive() },
+      stderrFn,
+    );
+  }
 
   let triggerResponse: TriggerRunResponse;
   let triggerRequestId: string | undefined;
@@ -6489,6 +6520,28 @@ export async function runTestRun(
     }
   }
 
+  // Response-driven, not assumption-driven: the backend is the ground
+  // truth for whether --target-url was actually applied — V3
+  // deliberately returns `targetUrl: ''` rather than echoing an override it
+  // did not apply ("so the response doesn't claim a target we didn't use"),
+  // while V2 echoes the real applied value. Comparing what we asked for
+  // against what the trigger response reports self-corrects the day the
+  // backend applies the override, with no `v3Enabled` assumption at all.
+  // Skipped for a known-backend caller (`opts.type` threaded from the
+  // `test create --run` chain): a backend trigger response's `targetUrl`
+  // is an unconditional echo of the request body (verified against
+  // backend-v2.0's `CliTestsController.createRun` — `targetUrl: body.targetUrl
+  // ?? ''` on both the V2 and V3 backend branches), so it can never mismatch
+  // and the existing, more specific C1 advisory ("--target-url has no effect
+  // for backend tests") already covers this case at create time.
+  if (
+    opts.targetUrl !== undefined &&
+    opts.type !== 'backend' &&
+    triggerResponse.targetUrl !== opts.targetUrl
+  ) {
+    emitTargetUrlMismatchAdvisory(stderrFn, opts.targetUrl, triggerResponse.targetUrl);
+  }
+
   if (!opts.wait) {
     printRunOrChain(out, triggerResponse, opts.createContext, data =>
       renderTriggerRunText(data as TriggerRunResponse),
@@ -6575,7 +6628,9 @@ export async function runTestRun(
       throw ApiError.fromEnvelope({
         error: {
           code: 'UNSUPPORTED', // exit 7 per errors.md
-          message: `Timed out after ${opts.timeoutSeconds}s waiting for run ${triggerResponse.runId}.`,
+          message:
+            `Timed out after ${opts.timeoutSeconds}s waiting for run ${triggerResponse.runId}. ` +
+            stillRunningAndBillingSubject(triggerResponse.runId),
           nextAction: `Resume polling: testsprite test wait ${triggerResponse.runId}, or cancel it: testsprite test cancel ${triggerResponse.runId}`,
           requestId: 'local',
           details: { runId: triggerResponse.runId, timeoutSeconds: opts.timeoutSeconds },
@@ -6607,7 +6662,7 @@ export async function runTestRun(
         return lines.join('\n');
       });
       stderrFn(
-        `Run ${triggerResponse.runId} is still in progress (request timed out). ` +
+        `Request timed out. ${stillRunningAndBillingSubject(triggerResponse.runId)} ` +
           `Re-attach with: testsprite test wait ${triggerResponse.runId}, or cancel with: testsprite test cancel ${triggerResponse.runId}`,
       );
       throw err;
@@ -6717,32 +6772,16 @@ export async function runTestRun(
   // Best-effort: a sink write throwing (e.g. EPIPE) must never skip the
   // exit-code gate below or change the command's exit status.
   try {
-    const env = deps.env ?? process.env;
-    const ghEnabled = opts.ghOutput === true || env.GITHUB_ACTIONS === 'true';
-    if (ghEnabled || opts.summaryFile !== undefined) {
-      const ciSummary = summarizeSingleRun(finalRunWithUrl);
-      if (opts.summaryFile !== undefined) {
-        try {
-          writeFileSync(opts.summaryFile, `${JSON.stringify(ciSummary, null, 2)}\n`, 'utf8');
-        } catch {
-          stderrFn(`[run] could not write --summary-file ${opts.summaryFile}; continuing`);
-        }
-      }
-      if (ghEnabled) {
-        const stdoutFn = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
-        emitGithubOutputs(
-          ciSummary,
-          env,
-          {
-            stdout: stdoutFn,
-            stderr: stderrFn,
-            appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf8'),
-            annotations: opts.output === 'json' ? stderrFn : stdoutFn,
-          },
-          { force: opts.ghOutput === true },
-        );
-      }
-    }
+    emitCiArtifacts(
+      summarizeSingleRun(finalRunWithUrl),
+      opts,
+      {
+        env: deps.env ?? process.env,
+        stdout: deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`)),
+        stderr: stderrFn,
+      },
+      'run',
+    );
   } catch (ciErr) {
     stderrFn(`[run] CI output emission failed; continuing: ${(ciErr as Error).message}`);
   }
@@ -6964,7 +7003,8 @@ export async function runTestWaitMany(
           stderrFn(interruptDetachMessage(fanOutErr, unfinished));
         } else {
           stderrFn(
-            `Re-attach with: testsprite test wait ${unfinished.join(' ')}, or cancel with: testsprite test cancel ${unfinished.join(' ')}`,
+            `Request timed out. ${stillRunningAndBillingSubject(unfinished)} ` +
+              `Re-attach with: testsprite test wait ${unfinished.join(' ')}, or cancel with: testsprite test cancel ${unfinished.join(' ')}`,
           );
         }
       }
@@ -7336,7 +7376,9 @@ export async function runTestWait(
       throw ApiError.fromEnvelope({
         error: {
           code: 'UNSUPPORTED', // exit 7 per errors.md
-          message: `Timed out after ${opts.timeoutSeconds}s waiting for run ${opts.runId}.`,
+          message:
+            `Timed out after ${opts.timeoutSeconds}s waiting for run ${opts.runId}. ` +
+            stillRunningAndBillingSubject(opts.runId),
           nextAction: `Resume polling: testsprite test wait ${opts.runId}, or cancel it: testsprite test cancel ${opts.runId}`,
           requestId: 'local',
           details: { runId: opts.runId, timeoutSeconds: opts.timeoutSeconds },
@@ -7359,7 +7401,7 @@ export async function runTestWait(
         ].join('\n');
       });
       stderrFn(
-        `Run ${opts.runId} is still in progress (request timed out). ` +
+        `Request timed out. ${stillRunningAndBillingSubject(opts.runId)} ` +
           `Re-attach with: testsprite test wait ${opts.runId}, or cancel with: testsprite test cancel ${opts.runId}`,
       );
       throw err;
@@ -7470,6 +7512,40 @@ interface RunTestRunAllOptions extends CommonOptions {
   summaryFile?: string;
 }
 
+/**
+ * Best-effort `testId → test name` map for the JUnit report, so a CI test tab
+ * shows names instead of UUIDs. One paginated `GET /tests?projectId=` sweep,
+ * bounded by a 5 s deadline and swallowed on any error — a missing/partial map
+ * just falls back to ids, never blocks or fails the report.
+ */
+async function buildTestNameMap(
+  client: HttpClient,
+  projectId: string | undefined,
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  if (!projectId) return map;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), DUP_NAME_ADVISORY_TIMEOUT_MS);
+  try {
+    let cursor: string | undefined;
+    for (let pageN = 0; pageN < 20; pageN++) {
+      const page = await client.get<Page<CliTest>>('/tests', {
+        query: { projectId, pageSize: 100, ...(cursor ? { cursor } : {}) },
+        signal: ac.signal,
+        retryOnRateLimit: false,
+      });
+      for (const t of page.items ?? []) map.set(t.id, t.name);
+      cursor = page.nextToken ?? undefined;
+      if (!cursor) break;
+    }
+  } catch {
+    // best-effort — a partial/empty map simply falls back to ids in the report.
+  } finally {
+    clearTimeout(timer);
+  }
+  return map;
+}
+
 async function writeBatchJUnitReportIfRequested(
   opts: {
     report?: JUnitReportFormat;
@@ -7477,15 +7553,23 @@ async function writeBatchJUnitReportIfRequested(
     reportSuiteName?: string;
     projectId?: string;
   },
-  results: readonly JUnitTestResult[],
+  results: readonly (JUnitTestResult & { startedAt?: string | null; finishedAt?: string | null })[],
+  nameByTestId?: ReadonlyMap<string, string>,
 ): Promise<void> {
   if (opts.report !== 'junit' || opts.reportFile === undefined) return;
   const projectId = resolveBatchReportProjectId(opts, results);
   const suiteName = opts.reportSuiteName ?? `testsprite:${projectId}`;
+  // Enrich each row with the human name (from the map) and the run duration
+  // (from poll timing) — the two fields whose absence made the report unreadable.
+  const enriched: JUnitTestResult[] = results.map(r => ({
+    ...r,
+    name: nameByTestId?.get(r.testId) ?? r.name,
+    durationSeconds: r.durationSeconds ?? durationSecondsBetween(r.startedAt, r.finishedAt),
+  }));
   const xml = buildJUnitReport({
     suiteName,
     classname: projectId,
-    results,
+    results: enriched,
   });
   await writeJUnitReportFile(opts.reportFile, xml);
 }
@@ -7502,6 +7586,9 @@ interface CliBatchRunFreshResult {
   error?: { code: string; message: string; exitCode: number };
   /** CLIENT-synthesized Portal deep link (projectId from opts, testId per item). */
   dashboardUrl?: string;
+  /** Poll-observed run timing → JUnit `testcase time`. Absent on timeout/error. */
+  startedAt?: string | null;
+  finishedAt?: string | null;
 }
 
 /**
@@ -7658,8 +7745,10 @@ export async function runTestRunAll(
     );
   }
   if (conflicts.length > 0) {
+    // Reason-aware advisory: a view-only / un-runnable / not-found case is not
+    // "already in flight" — summarizeConflicts names the actual causes.
     stderrFn(
-      `[advisory] ${conflicts.length} test${conflicts.length !== 1 ? 's' : ''} already in flight, skipped: ${conflicts.map(c => c.testId).join(' ')}`,
+      `[advisory] ${conflicts.length} test${conflicts.length !== 1 ? 's' : ''} not dispatched (${summarizeConflicts(conflicts)}), skipped: ${conflicts.map(c => c.testId).join(' ')}`,
     );
   }
   if (deferred.length > 0) {
@@ -7669,7 +7758,7 @@ export async function runTestRunAll(
   stderrFn(
     `Dispatched ${accepted.length} test${accepted.length !== 1 ? 's' : ''}` +
       `${skippedFrontend.length > 0 ? ` (${skippedFrontend.length} FE skipped)` : ''}` +
-      `${conflicts.length > 0 ? ` (${conflicts.length} in flight)` : ''}` +
+      `${conflicts.length > 0 ? ` (${conflicts.length} conflict${conflicts.length !== 1 ? 's' : ''})` : ''}` +
       `${deferred.length > 0 ? ` (${deferred.length} rate-deferred)` : ''}.`,
   );
 
@@ -7685,7 +7774,7 @@ export async function runTestRunAll(
       const r = data as BatchRunFreshResponse;
       const lines: string[] = [`accepted      ${r.accepted.length}`];
       if (r.conflicts.length > 0)
-        lines.push(`conflicts     ${r.conflicts.length} (already in flight)`);
+        lines.push(`conflicts     ${r.conflicts.length} (${summarizeConflicts(r.conflicts)})`);
       if (r.deferred.length > 0)
         lines.push(`deferred      ${r.deferred.length} (rate-limited — retry)`);
       if (r.skippedFrontend.length > 0) {
@@ -7729,33 +7818,49 @@ export async function runTestRunAll(
     return { ...batchResp, accepted, deferred, conflicts };
   }
 
-  // D3: bounded deferred-retry loop (only under --wait).
-  // Up to MAX_DEFERRED_RETRIES attempts to re-dispatch still-deferred tests.
-  // Each attempt sleeps for Retry-After (if server provided it) or the default
-  // 61s, clamped to the remaining --timeout budget. Newly-accepted runs are
-  // merged into `accepted`; if still deferred after all attempts, fall through
-  // to the existing exit-7 path.
+  // D3: budget-driven deferred-retry loop (only under --wait).
+  // Re-dispatches still-deferred tests until they all clear OR the --timeout
+  // budget is exhausted — a busy pool (the in-flight concurrency cap folds
+  // overflow into `deferred[]`) drains within the user's own timeout instead of
+  // giving up after a fixed few tries and failing the run. Each attempt sleeps
+  // 61s (clamped to the remaining budget); newly-accepted runs merge into
+  // `accepted`; if still deferred when the budget runs out, fall through to the
+  // existing exit-7 path. `maxDeferredAttempts` is a pure runaway backstop (the
+  // deadline check below is the real stop), scaled to the timeout so it never
+  // caps a legitimate long wait.
   const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
   const batchDeadlineMs = Date.now() + opts.timeoutSeconds * 1000;
+  // finding 1: reserve a poll window so the deferred-retry loop can't consume the
+  // ENTIRE --timeout and leave the fan-out poll with nothing — which would report
+  // already-finished runs as timeouts (exit 7) instead of their real verdicts
+  // (a genuine failure is exit 1, not 7). One third of the budget, capped at 60s.
+  const POLL_RESERVE_MS = Math.min(60_000, Math.floor((opts.timeoutSeconds * 1000) / 3));
+  const maxDeferredAttempts = Math.max(
+    MAX_DEFERRED_RETRIES,
+    Math.ceil(opts.timeoutSeconds / 60) + 2,
+  );
 
-  for (let attempt = 1; attempt <= MAX_DEFERRED_RETRIES && deferred.length > 0; attempt++) {
+  for (let attempt = 1; attempt <= maxDeferredAttempts && deferred.length > 0; attempt++) {
     const remainingMs = batchDeadlineMs - Date.now();
-    if (remainingMs <= 0) {
+    if (remainingMs <= POLL_RESERVE_MS) {
       stderrFn(
-        `[deferred-retry] timeout budget exhausted before attempt ${attempt}/${MAX_DEFERRED_RETRIES} — ${deferred.length} test${deferred.length !== 1 ? 's' : ''} still deferred.`,
+        `[deferred-retry] reserving the remaining budget to poll dispatched runs — ${deferred.length} test${deferred.length !== 1 ? 's' : ''} still deferred.`,
       );
       break;
     }
-    const sleepMs = Math.min(DEFERRED_RETRY_DEFAULT_SLEEP_MS, remainingMs);
+    // §1: clamp to what's left ABOVE the reserve so the sleep itself can't run
+    // the budget to zero (the loop only reaches here when remainingMs >
+    // POLL_RESERVE_MS, so the difference is always positive).
+    const sleepMs = Math.min(DEFERRED_RETRY_DEFAULT_SLEEP_MS, remainingMs - POLL_RESERVE_MS);
     stderrFn(
-      `[deferred-retry] attempt ${attempt}/${MAX_DEFERRED_RETRIES} — retrying ${deferred.length} deferred test${deferred.length !== 1 ? 's' : ''} in ${Math.round(sleepMs / 1000)}s`,
+      `[deferred-retry] attempt ${attempt} — retrying ${deferred.length} deferred test${deferred.length !== 1 ? 's' : ''} in ${Math.round(sleepMs / 1000)}s`,
     );
     await sleepFn(sleepMs);
 
     const remainingAfterSleep = batchDeadlineMs - Date.now();
-    if (remainingAfterSleep <= 0) {
+    if (remainingAfterSleep <= POLL_RESERVE_MS) {
       stderrFn(
-        `[deferred-retry] timeout budget exhausted during sleep — ${deferred.length} test${deferred.length !== 1 ? 's' : ''} still deferred.`,
+        `[deferred-retry] reserving the remaining budget to poll dispatched runs — ${deferred.length} test${deferred.length !== 1 ? 's' : ''} still deferred.`,
       );
       break;
     }
@@ -7773,6 +7878,16 @@ export async function runTestRunAll(
     const retryKey = `${retryBase}${retrySuffix}`;
     let retryResp: BatchRunFreshResponse;
     try {
+      // The retry dispatch POST is deliberately NOT bound to the batch deadline
+      // via an AbortSignal. It is a state-CREATING call (it seeds runs); if the
+      // deadline fired mid-flight the abort would only cancel the CLIENT wait,
+      // leaving the server having possibly created the runs while this loop
+      // reports them as still-deferred — the user then retries with a fresh
+      // idempotency key and DUPLICATES the execution + charge. The per-request
+      // timeout (`--request-timeout`, default 120s) still bounds the call, and
+      // the sleeps + fan-out poll below remain deadline-aware; only this single
+      // dispatch may overrun the budget slightly, which is strictly safer than
+      // an indeterminate aborted-but-maybe-dispatched batch.
       retryResp = await client.triggerBatchRunFresh(
         {
           projectId,
@@ -7782,7 +7897,7 @@ export async function runTestRunAll(
         { idempotencyKey: retryKey },
       );
     } catch (err) {
-      // If the retry itself errors, surface the error and stop retrying.
+      // If the retry itself errors, surface it and stop retrying.
       stderrFn(
         `[deferred-retry] attempt ${attempt} failed with error: ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -7815,11 +7930,57 @@ export async function runTestRunAll(
     }
   }
 
-  // --wait: fan-out poll each accepted run by its runId. Every accepted entry
-  // carries a real runId (the backend routes slot-claim failures to conflicts[]),
-  // so there is no "draft, no runId" subset to silently skip — polling all of
-  // them is the only way `--wait` can report a faithful (not false-green) verdict.
-  const pollable = accepted;
+  // Gap B: an already-running case is not a dead end under --wait. A conflict
+  // carrying `currentRunId` has an EXISTING run we can poll to a verdict
+  // (auto-resume) — the "concurrent job already started this test" case should
+  // wait for that run's result, not fail the batch. Conflicts without a
+  // resolvable in-flight run stay hard (nothing to wait on).
+  const resumableConflicts = conflicts.filter(c => c.currentRunId);
+  const hardConflicts = conflicts.filter(c => !c.currentRunId);
+  // Only hard conflicts remain "conflicts" for the final accounting/exit; the
+  // resumable ones become polled results below.
+  conflicts = hardConflicts;
+
+  // finding 2: resolve each in-flight run's createdAt to floor the BE wait
+  // fallback's "not before" filter. An epoch sentinel let the fallback accept
+  // ANY terminal result for the test — including the PREVIOUS run's — whenever
+  // the row lacks `runIdIfAvailable` (the orphaned-row case the fallback exists
+  // for, and the EXPECTED path for MCP-backend-triggered runs whose TestRun rows
+  // never leave `queued`). Flooring to the run's own createdAt stops an
+  // auto-resume from resolving to a stale prior verdict (a false green). The
+  // fetch also yields source/createdFrom so we can name who started the run.
+  // §5: resolve the in-flight runs' createdAt in PARALLEL, bounded by a signal
+  // capped at the remaining batch budget. This runs in exactly the busy-pool /
+  // many-in-flight-conflicts scenario finding 1 is about, so a serial N round-trip
+  // fetch (with no deadline bound) would eat the budget finding 1's fix protects.
+  const resolveSignal = AbortSignal.timeout(Math.max(1, batchDeadlineMs - Date.now()));
+  const resumableEntries: BatchRunFreshAccepted[] = await Promise.all(
+    resumableConflicts.map(async c => {
+      const inFlightRunId = c.currentRunId as string;
+      // Conservative default if the run can't be read: floor at NOW (never the
+      // epoch) so the fallback still can't accept an older run's result.
+      let notBefore = new Date().toISOString();
+      let startedBy: string | undefined;
+      try {
+        const inFlight = await client.getRun(inFlightRunId, { signal: resolveSignal });
+        if (inFlight.createdAt) notBefore = inFlight.createdAt;
+        startedBy = inFlight.source || inFlight.createdFrom || undefined;
+      } catch {
+        // keep the conservative now() floor (fetch failed or the signal aborted)
+      }
+      stderrFn(
+        `[auto-resume] ${c.testId} — polling in-flight run ${inFlightRunId}${startedBy ? ` (started by ${startedBy})` : ''} to a verdict instead of failing`,
+      );
+      return { testId: c.testId, runId: inFlightRunId, enqueuedAt: notBefore };
+    }),
+  );
+
+  // --wait: fan-out poll each accepted run by its runId, PLUS each auto-resumed
+  // in-flight run. Every accepted entry carries a real runId (the backend routes
+  // slot-claim failures to conflicts[]); the resumed entries reuse the existing
+  // run's id with a real createdAt floor. Polling all of them is the only way
+  // `--wait` reports a faithful (not false-green) verdict.
+  const pollable: BatchRunFreshAccepted[] = [...accepted, ...resumableEntries];
 
   if (pollable.length === 0) {
     // Build final response with potentially-updated accepted/deferred from D3 retry loop.
@@ -7831,6 +7992,20 @@ export async function runTestRunAll(
       skippedIntegration,
     };
     out.print(finalResp);
+    // Nothing was dispatched, but a --wait CI run still needs the exit-6/7 to be
+    // visible: emit annotations + summary before the throw below (conflicts /
+    // deferred fold into the summary as non-passed rows; skipped* are not folded).
+    // Without this an all-in-flight or all-deferred batch fails CI silently.
+    emitCiArtifacts(
+      summarizeAcceptedPayload(JSON.stringify(finalResp)),
+      opts,
+      {
+        env: deps.env ?? process.env,
+        stdout: deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`)),
+        stderr: stderrFn,
+      },
+      'run',
+    );
     // Nothing to poll: surface deferred (rate-limit → exit 7) or all-conflict (exit 6),
     // mirroring the non-wait path so `--wait` never silently exits 0 on a no-op batch.
     if (deferred.length > 0) {
@@ -7869,6 +8044,36 @@ export async function runTestRunAll(
     const runId = entry.runId;
     const remainingMs = batchDeadlineMs - Date.now();
     if (remainingMs <= 0) {
+      // §1/§4: the retry loop reserves POLL_RESERVE_MS, but a slow fan-out can
+      // still land here past the deadline. Do ONE bounded poll (1s) THROUGH the
+      // backend wait-fallback before declaring timeout — a run that already
+      // reached a verdict resolves for ~one request instead of a false timeout
+      // (exit 7 when the platform already produced its result; a failure is exit
+      // 1). Going through pollRunUntilTerminal + resolveAlternate — not a bare
+      // getRun — also covers the orphaned-row class finding 2 is about: a backend
+      // TestRun row stuck in `queued` whose verdict only the fallback resolves.
+      const lastResortAlternate = makeBackendWaitFallback({
+        client,
+        resolveTestId: () => entry.testId,
+        resolveNotBefore: () => entry.enqueuedAt,
+        onResolved: () => undefined,
+      });
+      try {
+        const finalRun = await pollRunUntilTerminal(client, runId, {
+          timeoutSeconds: 1,
+          sleep: deps.sleep,
+          shutdown: shutdownOf(deps),
+          resolveAlternate: lastResortAlternate,
+        });
+        return {
+          testId: entry.testId,
+          runId,
+          projectId: finalRun.projectId,
+          status: finalRun.status,
+        };
+      } catch {
+        // fall through to the timeout result below
+      }
       return {
         testId: entry.testId,
         runId,
@@ -7907,6 +8112,8 @@ export async function runTestRunAll(
         runId,
         projectId: finalRun.projectId,
         status: finalRun.status,
+        startedAt: finalRun.startedAt,
+        finishedAt: finalRun.finishedAt,
       };
     } catch (err) {
       if (err instanceof TimeoutError) {
@@ -8030,43 +8237,26 @@ export async function runTestRunAll(
       total: pollable.length,
     },
   };
-  await writeBatchJUnitReportIfRequested(opts, freshRunResults);
+  const freshNameMap =
+    opts.report === 'junit' && opts.reportFile !== undefined
+      ? await buildTestNameMap(client, opts.projectId)
+      : undefined;
+  await writeBatchJUnitReportIfRequested(opts, freshRunResults, freshNameMap);
   out.print(jsonPayload);
   // CI-native output layer (issue #99): emitted before the gate throws below so
   // the artifacts land even when the batch exits non-zero. The summary file is a
   // machine artifact written regardless of --output mode; stdout stays owned by
   // the envelope above (plus Actions workflow commands, which Actions parses).
-  {
-    const env = deps.env ?? process.env;
-    const ghEnabled = opts.ghOutput === true || env.GITHUB_ACTIONS === 'true';
-    if (ghEnabled || opts.summaryFile !== undefined) {
-      const ciSummary = summarizeAcceptedPayload(JSON.stringify(jsonPayload));
-      if (opts.summaryFile !== undefined) {
-        try {
-          writeFileSync(opts.summaryFile, `${JSON.stringify(ciSummary, null, 2)}\n`, 'utf8');
-        } catch {
-          stderrFn(`[run] could not write --summary-file ${opts.summaryFile}; continuing`);
-        }
-      }
-      if (ghEnabled) {
-        const stdoutFn = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
-        emitGithubOutputs(
-          ciSummary,
-          env,
-          {
-            stdout: stdoutFn,
-            stderr: stderrFn,
-            appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf8'),
-            // Under --output json the envelope above owns stdout; workflow
-            // commands go to stderr instead (the Actions runner parses both
-            // streams), keeping the documented machine output parseable.
-            annotations: opts.output === 'json' ? stderrFn : stdoutFn,
-          },
-          { force: opts.ghOutput === true },
-        );
-      }
-    }
-  }
+  emitCiArtifacts(
+    summarizeAcceptedPayload(JSON.stringify(jsonPayload)),
+    opts,
+    {
+      env: deps.env ?? process.env,
+      stdout: deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`)),
+      stderr: stderrFn,
+    },
+    'run',
+  );
 
   // Rate-deferred tests were never dispatched → the batch is incomplete (exit 7),
   // mirroring `test rerun --all`. Checked before the failed-run throw so the
@@ -8078,38 +8268,32 @@ export async function runTestRunAll(
     );
   }
 
-  if (timedOut > 0) {
-    const timedOutRunIds = freshRunResults
-      .filter(r => r.status === 'timeout')
-      .map(r => r.runId)
-      .filter(Boolean) as string[];
+  // Shared exit-code precedence (auth 3 → typed operational ApiError → timeout 7
+  // → generic fail 1) so `test run` and `testlist run` can't drift. This
+  // supersedes the previous "fold every non-auth poll error into exit 1"
+  // behaviour: a NOT_FOUND/RATE_LIMITED/… poll now propagates its real code.
+  const failure = resolveWaitFailure(freshRunResults, { timeoutSeconds: opts.timeoutSeconds });
+  if (failure) throw failure;
+
+  // Hard conflicts (a run already in flight for the test that we could NOT
+  // auto-resume — no `currentRunId` to poll) mean those tests never ran. In a
+  // MIXED batch, the accepted/resumed runs above already made `pollable`
+  // non-empty, so the all-conflict early-exit-6 branch didn't fire — without
+  // this gate a passing resumable run would mask an unresolved hard conflict and
+  // exit 0. Checked AFTER the failed gate (a real failure is the more actionable
+  // headline; a batch with both still exits 1), matching the exit-6 the
+  // all-conflict path returns. `conflicts` here holds only the hard ones —
+  // resumable conflicts were split into the poll set above.
+  if (conflicts.length > 0) {
     throw ApiError.fromEnvelope({
       error: {
-        code: 'UNSUPPORTED',
-        message: `${timedOut} run${timedOut !== 1 ? 's' : ''} timed out.`,
-        nextAction: [
-          ...timedOutRunIds.map(rid => `Resume: testsprite test wait ${rid}`),
-          ...timedOutRunIds.map(rid => `Cancel: testsprite test cancel ${rid}`),
-        ].join('\n'),
+        code: 'CONFLICT',
+        message: `${conflicts.length} test${conflicts.length !== 1 ? 's' : ''} already in flight and could not be resumed — not run.`,
+        nextAction: `Wait for the in-flight run(s) to finish, then retry: ${conflicts.map(c => c.testId).join(' ')}`,
         requestId: 'local',
-        details: { timedOutRunIds, timeoutSeconds: opts.timeoutSeconds },
+        details: { conflicts: conflicts.map(c => c.testId) },
       },
     });
-  }
-
-  if (failed > 0) {
-    // An auth failure on any member is a batch-wide condition (the credential is
-    // bad, not the test) — propagate exit 3 so the operator fixes auth rather
-    // than chasing a "test failed" (exit 1). Other operational codes stay folded
-    // into the generic batch-failure exit 1; their per-member envelope is in JSON.
-    const authErr = freshRunResults.find(r => r.error?.exitCode === 3);
-    if (authErr) {
-      throw new CLIError(
-        `${failed} run${failed !== 1 ? 's' : ''} failed — auth error (${authErr.error?.code}): ${authErr.error?.message}`,
-        3,
-      );
-    }
-    throw new CLIError(`${failed} run${failed !== 1 ? 's' : ''} failed.`, 1);
   }
 
   // [P2] Return object reconstructed from post-retry mutable state (accepted,
@@ -8639,7 +8823,8 @@ export async function runTestRerun(
             .map(m => `testsprite test cancel ${m.runId}`)
             .join('\n');
           stderrFn(
-            `Closure members are still in progress (request timed out). Re-attach with:\n${reattachHints}\n` +
+            `Request timed out. ${stillRunningAndBillingSubject(closureMembers.map(m => m.runId))} ` +
+              `Re-attach with:\n${reattachHints}\n` +
               `Or cancel with:\n${cancelHints}`,
           );
           throw fanOutErr;
@@ -8770,6 +8955,18 @@ export async function runTestRerun(
       // never confirmed would let --wait exit 0. Observed-failed members are not
       // included; that's the future --fail-on-closure decision.
       const unobservedMembers = closureFailures.filter(f => f.unobserved);
+      // §5 (unify with the batch fan-outs): an auth failure on an unobserved
+      // closure member is batch-wide (a bad credential, not a bad test) and
+      // non-retriable, so it must exit 3 — not be masked as the generic
+      // unobserved-timeout 7. A poll-errored member's `status` holds the error
+      // code; a timed-out member's is `'timeout'` (never an auth code).
+      const authMember = unobservedMembers.find(m => isAuthCode(m.status));
+      if (authMember) {
+        throw new CLIError(
+          `Closure member ${authMember.runId} hit an auth error (${authMember.status}) — the credential is bad, not the test.`,
+          3,
+        );
+      }
       if (unobservedMembers.length > 0) {
         const unobservedIds = unobservedMembers.map(f => f.runId);
         const resumeHints =
@@ -8841,7 +9038,9 @@ export async function runTestRerun(
         throw ApiError.fromEnvelope({
           error: {
             code: 'UNSUPPORTED',
-            message: `Timed out after ${opts.timeoutSeconds}s waiting for rerun ${rerunResp.runId}.`,
+            message:
+              `Timed out after ${opts.timeoutSeconds}s waiting for rerun ${rerunResp.runId}. ` +
+              stillRunningAndBillingSubject(rerunResp.runId),
             nextAction: `Resume polling: testsprite test wait ${rerunResp.runId}, or cancel it: testsprite test cancel ${rerunResp.runId}`,
             requestId: 'local',
             details: { runId: rerunResp.runId, timeoutSeconds: opts.timeoutSeconds },
@@ -8863,7 +9062,7 @@ export async function runTestRerun(
           ].join('\n');
         });
         stderrFn(
-          `Run ${rerunResp.runId} is still in progress (request timed out). ` +
+          `Request timed out. ${stillRunningAndBillingSubject(rerunResp.runId)} ` +
             `Re-attach with: testsprite test wait ${rerunResp.runId}, or cancel with: testsprite test cancel ${rerunResp.runId}`,
         );
         throw err;
@@ -9171,34 +9370,48 @@ export async function runTestRerun(
     stderrFn(`nextAction: testsprite test rerun ${deferredIds}`);
   }
 
-  // D3: bounded deferred-retry loop for rerun --all (only under --wait).
-  // Up to MAX_DEFERRED_RETRIES attempts to re-dispatch still-deferred tests.
-  // Each attempt sleeps for Retry-After (if server provided it) or the default
-  // 61s, clamped to the remaining --timeout budget. Newly-accepted runs are
-  // merged into `accepted`; if still deferred after all attempts, fall through
-  // to the existing exit-7 path.
+  // D3: budget-driven deferred-retry loop for rerun --all (only under --wait).
+  // Re-dispatches still-deferred tests until they all clear OR the --timeout
+  // budget is exhausted — a busy pool drains within the user's own timeout
+  // instead of giving up after a fixed few tries and failing the run. Each
+  // attempt sleeps 61s (clamped to the remaining budget); newly-accepted runs
+  // merge into `accepted`; if still deferred when the budget runs out, fall
+  // through to the existing exit-7 path. `maxDeferredAttempts` is a pure runaway
+  // backstop (the deadline check below is the real stop), scaled to the timeout.
   const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
   const batchDeadlineMs = Date.now() + opts.timeoutSeconds * 1000;
+  // finding 1: reserve a poll window so the deferred-retry loop can't consume the
+  // ENTIRE --timeout and leave the fan-out poll with nothing — which would report
+  // already-finished runs as timeouts (exit 7) instead of their real verdicts
+  // (a genuine failure is exit 1, not 7). One third of the budget, capped at 60s.
+  const POLL_RESERVE_MS = Math.min(60_000, Math.floor((opts.timeoutSeconds * 1000) / 3));
+  const maxDeferredAttempts = Math.max(
+    MAX_DEFERRED_RETRIES,
+    Math.ceil(opts.timeoutSeconds / 60) + 2,
+  );
 
   if (opts.wait) {
-    for (let attempt = 1; attempt <= MAX_DEFERRED_RETRIES && deferred.length > 0; attempt++) {
+    for (let attempt = 1; attempt <= maxDeferredAttempts && deferred.length > 0; attempt++) {
       const remainingMs = batchDeadlineMs - Date.now();
-      if (remainingMs <= 0) {
+      if (remainingMs <= POLL_RESERVE_MS) {
         stderrFn(
-          `[deferred-retry] timeout budget exhausted before attempt ${attempt}/${MAX_DEFERRED_RETRIES} — ${deferred.length} test${deferred.length !== 1 ? 's' : ''} still deferred.`,
+          `[deferred-retry] reserving the remaining budget to poll dispatched runs — ${deferred.length} test${deferred.length !== 1 ? 's' : ''} still deferred.`,
         );
         break;
       }
-      const sleepMs = Math.min(DEFERRED_RETRY_DEFAULT_SLEEP_MS, remainingMs);
+      // §1: clamp to what's left ABOVE the reserve so the sleep itself can't run
+      // the budget to zero (the loop only reaches here when remainingMs >
+      // POLL_RESERVE_MS, so the difference is always positive).
+      const sleepMs = Math.min(DEFERRED_RETRY_DEFAULT_SLEEP_MS, remainingMs - POLL_RESERVE_MS);
       stderrFn(
-        `[deferred-retry] attempt ${attempt}/${MAX_DEFERRED_RETRIES} — retrying ${deferred.length} deferred test${deferred.length !== 1 ? 's' : ''} in ${Math.round(sleepMs / 1000)}s`,
+        `[deferred-retry] attempt ${attempt} — retrying ${deferred.length} deferred test${deferred.length !== 1 ? 's' : ''} in ${Math.round(sleepMs / 1000)}s`,
       );
       await sleepFn(sleepMs);
 
       const remainingAfterSleep = batchDeadlineMs - Date.now();
-      if (remainingAfterSleep <= 0) {
+      if (remainingAfterSleep <= POLL_RESERVE_MS) {
         stderrFn(
-          `[deferred-retry] timeout budget exhausted during sleep — ${deferred.length} test${deferred.length !== 1 ? 's' : ''} still deferred.`,
+          `[deferred-retry] reserving the remaining budget to poll dispatched runs — ${deferred.length} test${deferred.length !== 1 ? 's' : ''} still deferred.`,
         );
         break;
       }
@@ -9231,6 +9444,13 @@ export async function runTestRerun(
               ? idempotencyKey.slice(0, 256 - retrySuffix.length)
               : idempotencyKey;
           const retryKey = `${retryBase}${retrySuffix}`;
+          // The retry chunk POST is deliberately NOT bound to the batch
+          // deadline via an AbortSignal — same reasoning as the fresh-run retry
+          // above: it seeds runs, so a mid-flight abort would leave the server
+          // possibly having dispatched while this loop reports the chunk as
+          // still-deferred, inviting a duplicate rerun on the user's next
+          // invocation. The per-request timeout still bounds it; the sleeps +
+          // poll stay deadline-aware.
           const retryChunkResp = await client.triggerBatchRerun(
             {
               source: 'cli',
@@ -9349,6 +9569,21 @@ export async function runTestRerun(
   if (accepted.length === 0) {
     // [P2] Build output from post-retry mutable state including merged notFound.
     out.print({ ...batchResp, accepted, deferred, conflicts, notFound, advisories });
+    // Nothing dispatched, but a --wait CI run still needs the exit-6/7 visible:
+    // emit annotations + summary before the throw below (conflicts / deferred /
+    // notFound fold in as non-passed rows). Without this an all-conflict or
+    // all-deferred rerun fails CI silently. (Default notFound note is correct
+    // here — a rerun not-found id genuinely has no run to replay.)
+    emitCiArtifacts(
+      summarizeAcceptedPayload(JSON.stringify({ accepted: [], deferred, conflicts, notFound })),
+      opts,
+      {
+        env: deps.env ?? process.env,
+        stdout: deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`)),
+        stderr: stderrFn,
+      },
+      'rerun',
+    );
     if (deferred.length > 0) {
       throw new CLIError(
         `Batch rerun: no tests were accepted (${deferred.length} deferred). ` +
@@ -9549,40 +9784,35 @@ export async function runTestRerun(
       total: accepted.length,
     },
   };
-  await writeBatchJUnitReportIfRequested(opts, rerunResults);
+  const rerunNameMap =
+    opts.report === 'junit' && opts.reportFile !== undefined
+      ? await buildTestNameMap(client, opts.projectId)
+      : undefined;
+  await writeBatchJUnitReportIfRequested(opts, rerunResults, rerunNameMap);
   out.print(jsonPayload);
   // CI-native output layer (issue #99): batch-rerun parity with `run --all`.
   // Emitted before the exit-code gates below so the summary file / annotations
   // land even when the batch exits non-zero. Summary-file is a machine artifact
   // written regardless of --output mode; under --output json the envelope above
   // owns stdout, so ::error:: workflow commands go to stderr instead.
-  {
-    const env = deps.env ?? process.env;
-    const ghEnabled = opts.ghOutput === true || env.GITHUB_ACTIONS === 'true';
-    if (ghEnabled || opts.summaryFile !== undefined) {
-      const ciSummary = summarizeAcceptedPayload(JSON.stringify(jsonPayload));
-      if (opts.summaryFile !== undefined) {
-        try {
-          writeFileSync(opts.summaryFile, `${JSON.stringify(ciSummary, null, 2)}\n`, 'utf8');
-        } catch {
-          stderrFn(`[rerun] could not write --summary-file ${opts.summaryFile}; continuing`);
-        }
-      }
-      if (ghEnabled) {
-        const stdoutFn = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
-        emitGithubOutputs(
-          ciSummary,
-          env,
-          {
-            stdout: stdoutFn,
-            stderr: stderrFn,
-            appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf8'),
-            annotations: opts.output === 'json' ? stderrFn : stdoutFn,
-          },
-          { force: opts.ghOutput === true },
-        );
-      }
-    }
+  emitCiArtifacts(
+    summarizeAcceptedPayload(JSON.stringify(jsonPayload)),
+    opts,
+    {
+      env: deps.env ?? process.env,
+      stdout: deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`)),
+      stderr: stderrFn,
+    },
+    'rerun',
+  );
+
+  // §5 (unify rerun with run --all / testlist run): auth is batch-wide — a bad
+  // credential, not a bad test — and non-retriable, so it must win even over a
+  // concurrent deferred/timeout. Run the shared helper's auth check BEFORE the
+  // combined gate below, which would otherwise mask it as exit 7.
+  if (rerunResults.some(r => r.error?.exitCode === 3)) {
+    const authFailure = resolveWaitFailure(rerunResults, { timeoutSeconds: opts.timeoutSeconds });
+    if (authFailure) throw authFailure;
   }
 
   // Determine exit code: timeout (deferred or any timeout) → 7; any fail → 1; all pass → 0
@@ -9615,20 +9845,13 @@ export async function runTestRerun(
     });
   }
 
-  if (failed > 0) {
-    // Auth failure on any member is a batch-wide condition — the credential is
-    // bad, not the test. Propagate exit 3 so the operator fixes auth rather than
-    // chasing a "rerun failed" (exit 1). Mirrors the identical logic already
-    // applied to runTestRunAll lines 5462-5468.
-    const authErr = rerunResults.find(r => r.error?.exitCode === 3);
-    if (authErr) {
-      throw new CLIError(
-        `${failed} rerun${failed !== 1 ? 's' : ''} failed — auth error (${authErr.error?.code}): ${authErr.error?.message}`,
-        3,
-      );
-    }
-    throw new CLIError(`${failed} rerun${failed !== 1 ? 's' : ''} failed.`, 1);
-  }
+  // Shared exit-code precedence for the failure tail. The combined
+  // deferred/timeout gate above already fired for those, so only auth (3) →
+  // typed operational ApiError → generic fail (1) remain — a NOT_FOUND /
+  // RATE_LIMITED / … poll error now propagates its real code instead of folding
+  // into exit 1 (matches `test run --all` / `testlist run`).
+  const failure = resolveWaitFailure(rerunResults, { timeoutSeconds: opts.timeoutSeconds });
+  if (failure) throw failure;
 
   // [P2] Return post-retry state including merged notFound so callers see the
   // final accounting (accepted = original BatchRerunAccepted[] dispatch list
@@ -9879,6 +10102,20 @@ function renderArtifactGetWrittenText(data: {
   ].join('\n');
 }
 
+/**
+ * Shared `--skip-preflight` help text across the three commands
+ * that trigger a run with a `--target-url` override (`create`,
+ * `create-batch`, `run`). States the honest limitation up front: this CLI
+ * probes from wherever it runs, not from the Lambda that executes the
+ * test, so the probe is a heuristic, not a guarantee — hence the full
+ * opt-out.
+ */
+const SKIP_PREFLIGHT_HELP =
+  'skip the pre-charge --target-url reachability probe. The probe runs from this machine, not ' +
+  'from the Lambda that executes the test, so it can occasionally be wrong (e.g. an IP allowlist ' +
+  'that permits the Lambda but not this machine); use this flag when you know better. Zero network ' +
+  'calls when set.';
+
 export function createTestCommand(deps: TestDeps = {}): Command {
   const test = new Command('test').description('Inspect TestSprite tests');
 
@@ -9971,7 +10208,13 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option('--wait', 'with --run, poll until terminal status', false)
     .option('--timeout <s>', 'with --run --wait, max seconds to wait')
-    .option('--target-url <url>', 'with --run, override the project default env URL')
+    .option(
+      '--target-url <url>',
+      'with --run, override the project default env URL. Before triggering, a reachability ' +
+        'preflight refuses obviously-dead targets (DNS failure, connection refused, a 502/503/504 ' +
+        'gateway error) so a doomed run never gets billed — see --skip-preflight.',
+    )
+    .option('--skip-preflight', SKIP_PREFLIGHT_HELP, false)
     .option(
       '--idempotency-key <token>',
       'opaque idempotency token (1-256 ASCII chars). Defaults to a UUIDv4 minted per invocation; pin one yourself for safe retries.',
@@ -10059,6 +10302,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             // B2(c): capture before parseTimeoutFlag converts undefined → default.
             timeoutIsDefault: cmdOpts.timeout === undefined,
             targetUrl: cmdOpts.targetUrl,
+            skipPreflight: cmdOpts.skipPreflight === true,
             idempotencyKey: cmdOpts.idempotencyKey,
             ignoredFlags: ignored,
           },
@@ -10084,6 +10328,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           // B2(c): capture before parseTimeoutFlag converts undefined → default.
           timeoutIsDefault: cmdOpts.timeout === undefined,
           targetUrl: cmdOpts.targetUrl,
+          skipPreflight: cmdOpts.skipPreflight === true,
           // M4 piece-2: BE dependency authoring flags.
           // Commander variadic collectors initialise to [] — treat empty array as undefined
           // so we don't send an empty array on the wire when no flags were passed.
@@ -10110,7 +10355,13 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option('--wait', 'with --run, poll each run until terminal status', false)
     .option('--timeout <s>', 'with --run --wait, per-run max seconds to wait (1-3600, default 600)')
-    .option('--target-url <url>', 'with --run, override the project default env URL for each run')
+    .option(
+      '--target-url <url>',
+      'with --run, override the project default env URL for each run. Before the fan-out, a ' +
+        'reachability preflight refuses an obviously-dead target ONCE for the whole batch (DNS ' +
+        'failure, connection refused, a 502/503/504 gateway error) — see --skip-preflight.',
+    )
+    .option('--skip-preflight', SKIP_PREFLIGHT_HELP, false)
     .option(
       '--idempotency-key <token>',
       'opaque idempotency token for the batch create (1-256 ASCII chars). Defaults to a UUIDv4 minted per invocation; pin one yourself for safe retries.',
@@ -10127,6 +10378,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           wait: cmdOpts.wait === true,
           timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
           targetUrl: cmdOpts.targetUrl,
+          skipPreflight: cmdOpts.skipPreflight === true,
           idempotencyKey: cmdOpts.idempotencyKey,
         },
         deps,
@@ -10441,8 +10693,16 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--target-url <url>',
-      'override the project default env URL for this run (http/https only, no localhost/private IPs)',
+      'override the project default env URL for this run (http/https only, no localhost/private ' +
+        'IPs). Before triggering, a reachability preflight refuses an obviously-dead target (DNS ' +
+        'failure, connection refused, a 502/503/504 gateway error) so a doomed run never gets ' +
+        'billed. This CLI probes from wherever it runs, not from the Lambda that executes the ' +
+        'test, so it is a heuristic, not a guarantee — see --skip-preflight. Note: for a backend ' +
+        'test, --target-url itself is inert (its base URL is baked into its code) — but this bare ' +
+        "`run` command has no way to know a test's type before triggering it, so the preflight " +
+        'still runs and can still refuse; use --skip-preflight if that surprises you.',
     )
+    .option('--skip-preflight', SKIP_PREFLIGHT_HELP, false)
     .option('--wait', 'poll until terminal status or --timeout elapses', false)
     .option(
       '--timeout <s>',
@@ -10599,6 +10859,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           ...resolveCommonOptions(command),
           testId: testIdArg!,
           targetUrl: cmdOpts.targetUrl,
+          skipPreflight: cmdOpts.skipPreflight === true,
           wait: cmdOpts.wait === true,
           timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
           // B2(c): tell runTestRun whether --timeout was explicitly provided.
@@ -11121,6 +11382,7 @@ export async function runFlaky(
 
 interface RunFlagOpts {
   targetUrl?: string;
+  skipPreflight?: boolean;
   wait?: boolean;
   timeout?: string;
   idempotencyKey?: string;
@@ -11212,6 +11474,7 @@ interface CreateFlagOpts {
   wait?: boolean;
   timeout?: string;
   targetUrl?: string;
+  skipPreflight?: boolean;
   priority?: string;
   codeFile: string;
   idempotencyKey?: string;
@@ -11229,6 +11492,7 @@ interface CreateBatchFlagOpts {
   wait?: boolean;
   timeout?: string;
   targetUrl?: string;
+  skipPreflight?: boolean;
   idempotencyKey?: string;
 }
 

@@ -26,9 +26,15 @@ Discussions**, so the issue tracker stays a clean, actionable list.
 - **Features and behavior changes** (new commands or flags, changed output,
   new dependencies, refactors) follow **issue-first**:
   1. Find an existing issue, or open a new one describing the change.
-  2. Claim it by commenting `/assign` on the issue — the literal slash
-     command on its own line. The triage bot assigns you automatically;
-     free-text requests ("can I take this?") are **not** detected.
+  2. Claim it by commenting `/assign` — the whole comment, on its own line.
+     That's the one form the triage bot reliably recognizes. Don't paste
+     the literal command anywhere you don't mean it: a mention inside
+     prose, a code sample, or a quoted reply may still be picked up as a
+     claim, so leave `/assign` out of your comment unless you intend to
+     take the issue. A few natural-language phrasings also work (e.g.
+     "I'd like to work on this", "can I take this?", "I'll take this").
+     Either way, the bot assigns you automatically and replies with how
+     many open issues you currently hold.
   3. If the issue is new, wait for triage — we check proposals against
      [VISION.md](./VISION.md) and the [standing policies](#standing-scope-policies)
      below before any code is written, so you don't invest in something
@@ -37,9 +43,10 @@ Discussions**, so the issue tracker stays a clean, actionable list.
      description.
 - **PR gate:** a bot checks every non-docs community PR for a closing-linked
   issue that is **assigned to the PR author**. PRs that don't meet this get
-  the `needs-issue` label and a failing `PR triage` check, and **are not
-  reviewed** until it's fixed — file or claim the issue, add the closing
-  link, then edit the PR description (or push a commit) to re-run the check.
+  the `needs-issue` label and a failing `gate` check (from the PR-triage
+  workflow), and **are not reviewed** until it's fixed — file or claim the
+  issue, add the closing link, then edit the PR description (or push a
+  commit) to re-run the check.
 - Suspected **security vulnerabilities** are the exception to "file an
   issue": report them privately per [SECURITY.md](./SECURITY.md) instead.
 - We **do** accept community code contributions — this is an actively maintained
@@ -115,7 +122,7 @@ Native Windows (no WSL, no Git Bash required) is a fully supported dev
 environment — you only need **git** and **Node ≥ 20**. `npm ci`, `npm run
 build`, `npm test`, `npm run lint`, and `npm run typecheck` all run the same
 way as on macOS/Linux, and CI runs the unit suite on `windows-latest` as the
-reference environment (see [CI gates](#ci-gates-required-for-merge) below) —
+reference environment (see [CI checks](#ci-checks) below) —
 if it's green there, it's green on your machine.
 
 A couple of things worth knowing:
@@ -134,7 +141,12 @@ Hit something that doesn't work on Windows? Please file it — see
 `good first issue` if it looks like an isolated fix; we'd rather know than
 have you route around it silently.
 
-## CI gates (required for merge)
+## CI checks
+
+These run on every PR and are required by review policy — a maintainer will
+not merge a PR with a red check — but nothing at the platform level blocks
+the merge button on this repo, so treat them as "must be green before
+review," not as an automatic gate:
 
 - ESLint + Prettier clean
 - TypeScript type-check clean
@@ -143,6 +155,20 @@ have you route around it silently.
 - Build + smoke test of the CLI binary
 
 Fork pull requests run CI with a **read-only token and no secrets** by design.
+
+### First PR here? CI needs a maintainer click first
+
+GitHub requires a maintainer to approve a first-time contributor's workflow
+run before it starts. If this is your first PR in this repo, your checks tab
+will show only a couple of lightweight items (a `gate` check and CodeRabbit)
+— the checks listed above will be **absent, not failing**. That's expected
+and says nothing about your code: it means the run is queued waiting for
+someone to click "Approve and run workflows," not that anything broke.
+
+We don't get an automated signal when a run is stuck in that state, so if
+it's been a while (see the response-time note above), ping us on
+[Discord](https://discord.gg/W4JDrZfdB) or leave a comment on the PR and
+we'll approve the run.
 
 ## How we review
 
