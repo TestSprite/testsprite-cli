@@ -145,9 +145,15 @@ export function runsPerMonth(cron: string): number | null {
 export function describeCron(cron: string): string {
   const f = fields(cron);
   if (f.length !== FIELD_COUNT) return cron.trim();
-  const [minute, hour, dayOfMonth, , dayOfWeek] = f;
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = f;
 
   if (!isPinned(minute) || !isPinned(hour)) return cron.trim();
+  // A restricted month makes every phrasing below wrong, because none of them
+  // can say "except in the months this cron skips": `0 3 * 6 *` is not "daily
+  // at 03:00", it is daily *during June*. runsPerMonth already divides by the
+  // month count, so describing it as daily contradicts the frequency printed
+  // beside it in the same sentence.
+  if (!isWildcard(month)) return cron.trim();
   const at = `${hour!.padStart(2, '0')}:${minute!.padStart(2, '0')}`;
 
   if (isWildcard(dayOfMonth) && isWildcard(dayOfWeek)) return `daily at ${at}`;
