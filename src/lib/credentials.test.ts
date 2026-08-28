@@ -205,49 +205,121 @@ describe('ensureRestrictiveMode', () => {
     expect(() => ensureRestrictiveMode(credentialsPath)).not.toThrow();
   });
 
-  it('tightens the Windows ACL with icacls instead of POSIX chmod', () => {
+  it('tightens the Windows ACL with icacls using /reset then /inheritance:r /grant:r *S-1-3-4:F', () => {
     mkdirSync(tmpRoot, { recursive: true });
     writeFileSync(credentialsPath, 'data', { mode: 0o666 });
     const spawn = vi.fn(() => ({ status: 0, signal: null, output: [], pid: 123 })) as never;
 
     ensureRestrictiveMode(credentialsPath, {
       platform: 'win32',
-      env: { USERNAME: 'alice' } as NodeJS.ProcessEnv,
       spawnSync: spawn,
     });
 
-    // First call: /reset re-enables inheritance from the parent directory so the
-    // owner can always access the file (fixes EPERM on Microsoft Account / domain
-    // account machines where USERNAME does not resolve to the file-owner SID).
+    // Step 1: /reset clears broken inheritance state.
     expect(spawn).toHaveBeenNthCalledWith(1, 'icacls', [credentialsPath, '/reset'], {
       shell: false,
       stdio: 'ignore',
       windowsHide: true,
     });
-    // Second call: /grant:r adds an explicit Full Control entry as belt-and-suspenders.
-    expect(spawn).toHaveBeenNthCalledWith(2, 'icacls', [credentialsPath, '/grant:r', 'alice:F'], {
-      shell: false,
-      stdio: 'ignore',
-      windowsHide: true,
-    });
+    // Step 2: /inheritance:r removes inherited ACEs and /grant:r grants Full Control
+    // to the OWNER RIGHTS SID (*S-1-3-4), avoiding dependency on USERNAME resolution.
+    expect(spawn).toHaveBeenNthCalledWith(
+      2,
+      'icacls',
+      [credentialsPath, '/inheritance:r', '/grant:r', '*S-1-3-4:F'],
+      {
+        shell: false,
+        stdio: 'ignore',
+        windowsHide: true,
+      },
+    );
     expect(spawn).toHaveBeenCalledTimes(2);
   });
 
-  it('warns on Windows when credentials ACL tightening cannot run', () => {
+  it('warns on Windows when icacls /reset fails with an error', () => {
     mkdirSync(tmpRoot, { recursive: true });
     writeFileSync(credentialsPath, 'data');
     const warnings: string[] = [];
-    const spawn = vi.fn(() => ({ status: 0, signal: null, output: [], pid: 123 })) as never;
+    const spawn = vi.fn(() => ({
+      error: new Error('spawnSync icacls ENOENT'),
+      status: null,
+      signal: null,
+      output: [],
+      pid: 123,
+    })) as never;
 
     ensureRestrictiveMode(credentialsPath, {
       platform: 'win32',
-      env: {} as NodeJS.ProcessEnv,
       spawnSync: spawn,
       warn: line => warnings.push(line),
     });
 
-    expect(spawn).not.toHaveBeenCalled();
-    expect(warnings.join('\n')).toContain('credentials file permissions were not tightened');
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(warnings.join('\n')).toContain(
+      'icacls failed while resetting credentials file permissions',
+    );
+  });
+
+  it('warns on Windows when icacls /reset exits non-zero', () => {
+    mkdirSync(tmpRoot, { recursive: true });
+    writeFileSync(credentialsPath, 'data');
+    const warnings: string[] = [];
+    const spawn = vi.fn(() => ({ status: 1, signal: null, output: [], pid: 123 })) as never;
+
+    ensureRestrictiveMode(credentialsPath, {
+      platform: 'win32',
+      spawnSync: spawn,
+      warn: line => warnings.push(line),
+    });
+
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(warnings.join('\n')).toContain('icacls /reset exited with status 1');
+  });
+
+  it('warns on Windows when /reset succeeds but /grant:r fails with an error', () => {
+    mkdirSync(tmpRoot, { recursive: true });
+    writeFileSync(credentialsPath, 'data');
+    const warnings: string[] = [];
+    const spawn = vi
+      .fn()
+      .mockReturnValueOnce({ status: 0, signal: null, output: [], pid: 123 })
+      .mockReturnValueOnce({
+        error: new Error('permission denied'),
+        status: null,
+        signal: null,
+        output: [],
+        pid: 123,
+      }) as never;
+
+    ensureRestrictiveMode(credentialsPath, {
+      platform: 'win32',
+      spawnSync: spawn,
+      warn: line => warnings.push(line),
+    });
+
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(warnings.join('\n')).toContain(
+      'icacls failed while tightening credentials file permissions',
+    );
+  });
+
+  it('warns on Windows when /reset succeeds but /grant:r exits non-zero', () => {
+    mkdirSync(tmpRoot, { recursive: true });
+    writeFileSync(credentialsPath, 'data');
+    const warnings: string[] = [];
+    const spawn = vi
+      .fn()
+      .mockReturnValueOnce({ status: 0, signal: null, output: [], pid: 123 })
+      .mockReturnValueOnce({ status: 5, signal: null, output: [], pid: 123 }) as never;
+
+    ensureRestrictiveMode(credentialsPath, {
+      platform: 'win32',
+      spawnSync: spawn,
+      warn: line => warnings.push(line),
+    });
+
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(warnings.join('\n')).toContain('icacls exited with status 5');
   });
 
   // POSIX-only premise: Windows has no 0644/0600 distinction to downgrade.

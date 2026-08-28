@@ -77,7 +77,6 @@ interface CredentialsLock {
 
 interface RestrictiveModeOptions {
   platform?: NodeJS.Platform;
-  env?: NodeJS.ProcessEnv;
   spawnSync?: (
     command: string,
     args: readonly string[],
@@ -217,50 +216,54 @@ export function ensureRestrictiveMode(path: string, options: RestrictiveModeOpti
 }
 
 /**
- * Restrict a Windows credentials file to the current user using icacls.
+ * Restrict a Windows credentials file to the file owner using icacls.
  * The command is invoked with an args array so credential paths are never shell-interpreted.
+ *
+ * Uses /reset to clear any broken inheritance state, followed by
+ * /inheritance:r /grant:r *S-1-3-4:F which decouples the file from parent ACLs
+ * and grants Full Control to the OWNER RIGHTS SID (S-1-3-4). This avoids
+ * dependency on resolving %USERNAME% (which fails on Microsoft Account or
+ * domain-joined machines).
  */
 function ensureWindowsRestrictiveAcl(path: string, options: RestrictiveModeOptions): void {
-  const username = (options.env ?? process.env).USERNAME?.trim();
-  if (!username) {
-    warnWindowsAcl(
-      'could not determine the Windows username; credentials file permissions were not tightened',
-      options,
-    );
-    return;
-  }
-
   const run = options.spawnSync ?? spawnSync;
+  const icaclsOptions = {
+    shell: false as const,
+    stdio: 'ignore' as const,
+    windowsHide: true as const,
+  };
 
-  // Reset to re-enable inheritance from the parent directory first.
-  // Using /inheritance:r (the previous approach) strips all inherited ACEs and
-  // relies solely on the USERNAME-based grant — on Windows the env USERNAME may
-  // not resolve to the same SID that owns the file (e.g. Microsoft Account /
-  // domain account mismatches), which leaves the file unreadable by anyone.
-  // /reset restores inherited ACEs so the owner can always access the file, then
-  // the explicit /grant:r adds a belt-and-suspenders Full-Control entry.
-  run('icacls', [path, '/reset'], {
-    shell: false,
-    stdio: 'ignore',
-    windowsHide: true,
-  });
-
-  const result = run('icacls', [path, '/grant:r', `${username}:F`], {
-    shell: false,
-    stdio: 'ignore',
-    windowsHide: true,
-  });
-
-  if (result.error) {
+  const resetResult = run('icacls', [path, '/reset'], icaclsOptions);
+  if (resetResult.error) {
     warnWindowsAcl(
-      `icacls failed while tightening credentials file permissions: ${result.error.message}`,
+      `icacls failed while resetting credentials file permissions: ${resetResult.error.message}`,
       options,
     );
     return;
   }
-  if (result.status !== 0) {
+  if (resetResult.status !== 0) {
     warnWindowsAcl(
-      `icacls exited with status ${result.status ?? 'unknown'}; credentials file permissions may be too broad`,
+      `icacls /reset exited with status ${resetResult.status ?? 'unknown'}; credentials file permissions may be too broad`,
+      options,
+    );
+    return;
+  }
+
+  const grantResult = run(
+    'icacls',
+    [path, '/inheritance:r', '/grant:r', '*S-1-3-4:F'],
+    icaclsOptions,
+  );
+  if (grantResult.error) {
+    warnWindowsAcl(
+      `icacls failed while tightening credentials file permissions: ${grantResult.error.message}`,
+      options,
+    );
+    return;
+  }
+  if (grantResult.status !== 0) {
+    warnWindowsAcl(
+      `icacls exited with status ${grantResult.status ?? 'unknown'}; credentials file permissions may be too broad`,
       options,
     );
   }
