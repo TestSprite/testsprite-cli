@@ -201,6 +201,63 @@ describe('runTestRun — no-wait (fire and return)', () => {
     expect(stdout.join('')).toContain('run_abc');
   });
 
+  it('honours TESTSPRITE_REQUEST_TIMEOUT_MS for an ordinary non-wait trigger', async () => {
+    vi.useFakeTimers();
+    try {
+      const { credentialsPath } = makeCreds();
+      let abortedAt1250Ms = false;
+      const fetchImpl = (async (_input: FetchInput, init: RequestInit = {}) =>
+        new Promise<Response>((resolve, reject) => {
+          const signal = init.signal;
+          setTimeout(() => {
+            abortedAt1250Ms = signal?.aborted === true;
+            resolve(
+              new Response(JSON.stringify(TRIGGER_RESP), {
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+              }),
+            );
+          }, 1_250);
+          const rejectOnAbort = (): void =>
+            reject(signal?.reason ?? new DOMException('aborted', 'AbortError'));
+          if (signal?.aborted) rejectOnAbort();
+          else signal?.addEventListener('abort', rejectOnAbort, { once: true });
+        })) as typeof globalThis.fetch;
+
+      const outcomePromise = runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_xyz',
+          wait: false,
+          timeoutSeconds: 60,
+        },
+        {
+          credentialsPath,
+          env: { TESTSPRITE_REQUEST_TIMEOUT_MS: '1000' },
+          fetchImpl,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ).then(
+        value => ({ status: 'resolved' as const, value }),
+        error => ({ status: 'rejected' as const, error: error as unknown }),
+      );
+
+      await vi.advanceTimersByTimeAsync(1_250);
+      const outcome = await outcomePromise;
+      expect(outcome.status).toBe('rejected');
+      if (outcome.status === 'rejected') {
+        expect(outcome.error).toBeInstanceOf(RequestTimeoutError);
+        expect(outcome.error).toMatchObject({ timeoutMs: 1_000, exitCode: 7 });
+      }
+      expect(abortedAt1250Ms).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('no-wait path sends POST to /tests/{testId}/runs', async () => {
     const { credentialsPath } = makeCreds();
     const seenUrls: string[] = [];
@@ -4170,6 +4227,9 @@ describe('runTestRunAll — --max-concurrency validation', () => {
           wait: false,
           timeoutSeconds: 600,
           maxConcurrency: 100,
+          // This case only asserts --max-concurrency=100 is accepted; the empty
+          // batch would otherwise trip the DEV-1046 zero-dispatch failure.
+          allowEmpty: true,
         },
         {
           credentialsPath,
@@ -4180,6 +4240,222 @@ describe('runTestRunAll — --max-concurrency validation', () => {
         },
       ),
     ).resolves.toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEV-1046: `test run --all` that dispatches ZERO tests must not exit 0 (a CI
+// false-green). It fails with exit 5 and still emits summary / annotation /
+// JUnit, unless --allow-empty is set.
+// ---------------------------------------------------------------------------
+
+describe('runTestRunAll — zero-dispatch fails the CI gate (DEV-1046)', () => {
+  const EMPTY_BATCH: BatchRunFreshResponse = {
+    accepted: [],
+    conflicts: [],
+    deferred: [],
+    skippedFrontend: [],
+    skippedIntegration: [],
+  };
+
+  function baseOpts(over: Record<string, unknown> = {}) {
+    return {
+      profile: 'default',
+      output: 'json' as const,
+      debug: false,
+      projectId: 'project_be',
+      wait: false,
+      timeoutSeconds: 600,
+      maxConcurrency: 5,
+      ...over,
+    };
+  }
+
+  it('empty batch (nothing runnable) → rejects with exit 5', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    await expect(
+      runTestRunAll(baseOpts() as never, {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      }),
+    ).rejects.toMatchObject({ exitCode: 5 });
+  });
+
+  it('--allow-empty makes the same empty batch resolve (exit 0)', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    await expect(
+      runTestRunAll(baseOpts({ allowEmpty: true }) as never, {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      }),
+    ).resolves.toBeDefined();
+  });
+
+  it('all frontend tests skipped → rejects with exit 5, reason names the FE skip', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { ...EMPTY_BATCH, skippedFrontend: ['fe_1', 'fe_2'] },
+    }));
+    await expect(
+      runTestRunAll(baseOpts() as never, {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      }),
+    ).rejects.toMatchObject({ exitCode: 5, message: expect.stringContaining('frontend test') });
+  });
+
+  it('--filter that matches nothing → rejects with exit 5 before the batch call', async () => {
+    const { credentialsPath } = makeCreds();
+    let batchCalled = false;
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/run')) {
+        batchCalled = true;
+        return { body: EMPTY_BATCH };
+      }
+      // GET /tests: a test whose name does NOT contain the filter.
+      return {
+        body: {
+          items: [
+            {
+              id: 't1',
+              projectId: 'project_be',
+              name: 'Login flow',
+              type: 'backend',
+              createdFrom: 'portal',
+              status: 'passed',
+              createdAt: '2026-01-01T00:00:00.000Z',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+            },
+          ],
+          nextToken: null,
+        },
+      };
+    });
+    await expect(
+      runTestRunAll(baseOpts({ nameFilter: 'zzz-no-match' }) as never, {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      }),
+    ).rejects.toMatchObject({ exitCode: 5 });
+    expect(batchCalled).toBe(false);
+  });
+
+  it('still writes the JUnit sidecar on a zero-dispatch (skipped testcases)', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-dev1046-'));
+    const reportFile = join(dir, 'junit.xml');
+    const fetchImpl = makeFetch(() => ({
+      body: { ...EMPTY_BATCH, skippedFrontend: ['fe_1'] },
+    }));
+    await expect(
+      runTestRunAll(
+        // JUnit sidecar is a --wait feature → exercises the wait zero-dispatch path.
+        baseOpts({ report: 'junit', reportFile, wait: true }) as never,
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => undefined,
+          stderr: () => undefined,
+          sleep: () => Promise.resolve(),
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 5 });
+    // The artifact exists (previously NO report was written on this path).
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reportFile is a mkdtempSync path in this test's own temp dir.
+    const xml = readFileSync(reportFile, 'utf8');
+    expect(xml).toContain('<skipped');
+    expect(xml).toContain('fe_1');
+  });
+
+  it('emits the summary + ::error:: annotation on a zero-dispatch (shows WHY, not a bare exit)', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-dev1046-'));
+    const summaryFile = join(dir, 'summary.json');
+    const out: string[] = [];
+    const fetchImpl = makeFetch(() => ({ body: { ...EMPTY_BATCH, skippedFrontend: ['fe_1'] } }));
+    await expect(
+      runTestRunAll(baseOpts({ ghOutput: true, summaryFile }) as never, {
+        credentialsPath,
+        fetchImpl,
+        stdout: (l: string) => out.push(l),
+        stderr: (l: string) => out.push(l),
+        sleep: () => Promise.resolve(),
+      }),
+    ).rejects.toMatchObject({ exitCode: 5 });
+    // The `::error::` annotation lands (the "show WHY" half), on either stream.
+    expect(out.some(l => l.startsWith('::error'))).toBe(true);
+    // The machine summary is written and gate-red (0 passed, ≥1 non-passed row).
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- summaryFile is a mkdtempSync path in this test's own temp dir.
+    const summary = JSON.parse(readFileSync(summaryFile, 'utf8'));
+    expect(summary.passed).toBe(0);
+    expect(summary.runs.length).toBeGreaterThan(0);
+  });
+
+  it('an unwritable --report-file still fails with exit 5 (not the I/O exit), summary still emitted', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-dev1046-'));
+    // Parent dir does not exist → the JUnit write throws; it must be swallowed
+    // so the zero-dispatch exit-5 gate (and the summary) survive.
+    const reportFile = join(dir, 'no-such-subdir', 'junit.xml');
+    const summaryFile = join(dir, 'summary.json');
+    const fetchImpl = makeFetch(() => ({ body: { ...EMPTY_BATCH, skippedFrontend: ['fe_1'] } }));
+    await expect(
+      runTestRunAll(baseOpts({ report: 'junit', reportFile, summaryFile, wait: true }) as never, {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      }),
+    ).rejects.toMatchObject({ exitCode: 5 });
+    // The in-memory summary was emitted BEFORE the failed JUnit write.
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- summaryFile is a mkdtempSync path in this test's own temp dir.
+    expect(JSON.parse(readFileSync(summaryFile, 'utf8')).passed).toBe(0);
+  });
+
+  it('--allow-empty does NOT green a dispatched-but-failed run', async () => {
+    const { credentialsPath } = makeCreds();
+    const acceptedBatch: BatchRunFreshResponse = {
+      accepted: [{ testId: 'be_1', runId: 'run_1', enqueuedAt: '2026-01-01T00:00:00.000Z' }],
+      conflicts: [],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const failedRun = {
+      ...makeFailedRun(),
+      runId: 'run_1',
+      testId: 'be_1',
+      projectId: 'project_be',
+    };
+    const fetchImpl = makeFetch(url =>
+      url.includes('/tests/batch/run') ? { body: acceptedBatch } : { body: failedRun },
+    );
+    // A real failure must still fail even with --allow-empty (the flag only
+    // covers ZERO dispatch; it can't suppress a dispatched run's verdict).
+    await expect(
+      runTestRunAll(baseOpts({ wait: true, allowEmpty: true }) as never, {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      }),
+    ).rejects.toMatchObject({ exitCode: 1 });
   });
 });
 

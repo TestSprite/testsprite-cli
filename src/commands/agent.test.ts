@@ -750,7 +750,7 @@ describe('runInstall — empty target', () => {
 // ---------------------------------------------------------------------------
 
 describe('runList', () => {
-  it('returns all five targets with correct status', async () => {
+  it('lists every target, tagging experimental ones with (exp.)', async () => {
     const { capture, deps } = makeCapture();
 
     await runList({ profile: 'default', output: 'text', debug: false, dryRun: false }, deps);
@@ -762,8 +762,11 @@ describe('runList', () => {
     expect(out).toContain('antigravity');
     expect(out).toContain('kiro');
     expect(out).toContain('codex');
-    expect(out).toContain('ga');
-    expect(out).toContain('experimental');
+    // DEV-279: maturity is a name tag now, not a STATUS/MODE column.
+    expect(out).toContain('cursor (exp.)');
+    expect(out).not.toContain('claude (exp.)'); // claude is GA — untagged
+    expect(out).not.toContain('own-file');
+    expect(out).not.toContain('managed-section');
     // All matrix paths present
     expect(out).toContain(TARGETS.claude.path);
     expect(out).toContain(TARGETS.cursor.path);
@@ -771,6 +774,22 @@ describe('runList', () => {
     expect(out).toContain(TARGETS.antigravity.path);
     expect(out).toContain(TARGETS.kiro.path);
     expect(out).toContain(TARGETS.codex.path);
+  });
+
+  it('prints a footer pointing at `agent status` (text mode)', async () => {
+    const { capture, deps } = makeCapture();
+
+    await runList({ profile: 'default', output: 'text', debug: false, dryRun: false }, deps);
+
+    expect(capture.stderr.join('\n')).toContain('testsprite agent status');
+  });
+
+  it('does NOT print the footer in --output json', async () => {
+    const { capture, deps } = makeCapture();
+
+    await runList({ profile: 'default', output: 'json', debug: false, dryRun: false }, deps);
+
+    expect(capture.stderr.join('\n')).not.toContain('testsprite agent status');
   });
 
   it('JSON mode emits array of {target, skill, status, path, mode}', async () => {
@@ -803,16 +822,17 @@ describe('runList', () => {
     expect(codexEntry?.mode).toBe('managed-section');
   });
 
-  it('text mode has a header row', async () => {
+  it('text mode has an AGENT / SKILL / PATH header row (no STATUS/MODE)', async () => {
     const { capture, deps } = makeCapture();
 
     await runList({ profile: 'default', output: 'text', debug: false, dryRun: false }, deps);
 
     const lines = capture.stdout.join('\n').split('\n');
-    expect(lines[0]).toMatch(/TARGET/i);
+    expect(lines[0]).toMatch(/AGENT/i);
     expect(lines[0]).toMatch(/SKILL/i);
-    expect(lines[0]).toMatch(/STATUS/i);
     expect(lines[0]).toMatch(/PATH/i);
+    expect(lines[0]).not.toMatch(/STATUS/i);
+    expect(lines[0]).not.toMatch(/MODE/i);
   });
 });
 
@@ -870,6 +890,166 @@ describe('runInstall — output modes', () => {
     expect(line).toContain('claude');
     expect(line).toContain('written');
     expect(line).toContain(TARGETS.claude.path);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runInstall — reload hint (DEV-279)
+// ---------------------------------------------------------------------------
+
+describe('runInstall — reload hint', () => {
+  const base = {
+    profile: 'default' as const,
+    debug: false,
+    force: false,
+    skills: ['testsprite-verify'],
+  };
+
+  it('emits a [hint] to reopen the agent on a fresh write (text mode)', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      { ...base, output: 'text', dryRun: false, target: ['claude'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const err = capture.stderr.join('\n');
+    expect(err).toContain('[hint] Reopen');
+    expect(err).toContain('claude');
+  });
+
+  it('names each changed target once, even across multiple skills', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      { ...base, skills: [...DEFAULT_SKILLS], output: 'text', dryRun: false, target: ['claude'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const hintLine = capture.stderr
+      .join('\n')
+      .split('\n')
+      .find(l => l.includes('[hint] Reopen'));
+    expect(hintLine).toBeDefined();
+    // "claude" appears once despite two skills being written.
+    expect(hintLine!.match(/claude/g)).toHaveLength(1);
+  });
+
+  it('emits the hint for the codex managed-section target (section-installed)', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      { ...base, output: 'text', dryRun: false, target: ['codex'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    expect(capture.stdout.join('\n')).toContain('section-installed');
+    const err = capture.stderr.join('\n');
+    expect(err).toContain('[hint] Reopen');
+    expect(err).toContain('codex');
+  });
+
+  it('emits the hint when an existing codex section is replaced (section-updated)', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    const agentsAbs = path.resolve(CWD, TARGETS.codex.path);
+    seedFile(agentsAbs, `${MANAGED_SECTION_BEGIN}\nOLD CONTENT\n${MANAGED_SECTION_END}\n`);
+
+    await runInstall(
+      { ...base, output: 'text', dryRun: false, target: ['codex'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    expect(capture.stdout.join('\n')).toContain('section-updated');
+    expect(capture.stderr.join('\n')).toContain('[hint] Reopen');
+  });
+
+  it('does NOT emit the hint when the codex section is byte-identical (section-unchanged)', async () => {
+    const { store, fs: agentFs, seedFile } = makeMemFs();
+    const { deps: deps1 } = makeCapture();
+
+    const agentsAbs = path.resolve(CWD, TARGETS.codex.path);
+    await runInstall(
+      { ...base, output: 'text', dryRun: false, target: ['codex'] },
+      { cwd: CWD, fs: agentFs, ...deps1 },
+    );
+    seedFile(agentsAbs, store.get(agentsAbs)!);
+
+    const { capture, deps } = makeCapture();
+    await runInstall(
+      { ...base, output: 'text', dryRun: false, target: ['codex'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    expect(capture.stdout.join('\n')).toContain('section-unchanged');
+    expect(capture.stderr.join('\n')).not.toContain('[hint] Reopen');
+  });
+
+  it('names only the written target when another target is blocked', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    // cursor already has a conflicting file → blocked; claude is untouched → written.
+    const cursorAbs = path.resolve(CWD, TARGETS.cursor.path);
+    seedFile(cursorAbs, 'DIFFERENT CONTENT');
+
+    await expect(
+      runInstall(
+        { ...base, output: 'text', dryRun: false, target: ['claude', 'cursor'] },
+        { cwd: CWD, fs: agentFs, ...deps },
+      ),
+    ).rejects.toThrow(CLIError);
+
+    const hintLine = capture.stderr
+      .join('\n')
+      .split('\n')
+      .find(l => l.includes('[hint] Reopen'));
+    expect(hintLine).toBeDefined();
+    expect(hintLine).toContain('claude');
+    expect(hintLine).not.toContain('cursor');
+  });
+
+  it('does NOT emit the reload hint on a byte-identical re-run (skipped)', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const claudeAbs = path.resolve(CWD, TARGETS.claude.path);
+    seedFile(claudeAbs, renderForTarget('claude', 'testsprite-verify').content);
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      { ...base, output: 'text', dryRun: false, target: ['claude'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    expect(capture.stdout.join('\n')).toContain('skipped');
+    expect(capture.stderr.join('\n')).not.toContain('[hint] Reopen');
+  });
+
+  it('does NOT emit the reload hint under --dry-run', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      { ...base, output: 'text', dryRun: true, target: ['claude'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    expect(capture.stderr.join('\n')).not.toContain('[hint] Reopen');
+  });
+
+  it('does NOT emit the reload hint in --output json', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      { ...base, output: 'json', dryRun: false, target: ['claude'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    expect(capture.stderr.join('\n')).not.toContain('[hint] Reopen');
   });
 });
 

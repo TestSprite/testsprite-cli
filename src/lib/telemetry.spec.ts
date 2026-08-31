@@ -151,6 +151,24 @@ describe('buildTelemetryEvent', () => {
     expect(event.ci).toBe(true);
     expect(event).not.toHaveProperty('errorCode');
   });
+
+  it('emits local: true for a --local invocation', () => {
+    const event = buildTelemetryEvent(
+      { command: 'test run', outcome: 'success', exitCode: 0, durationMs: 1, local: true },
+      {},
+      false,
+    );
+    expect(event.local).toBe(true);
+  });
+
+  it('omits the local key entirely for an ordinary invocation', () => {
+    const event = buildTelemetryEvent(
+      { command: 'test list', outcome: 'success', exitCode: 0, durationMs: 1 },
+      {},
+      false,
+    );
+    expect(event).not.toHaveProperty('local');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -177,6 +195,48 @@ describe('recordOutcome', () => {
     expect(body.outcome).toBe('success');
     expect(body.ci).toBe(false);
     expect(body).not.toHaveProperty('endpointUrl');
+  });
+
+  it('POST body carries local: true for a --local invocation', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(okResponse());
+    await recordOutcome(
+      { ...base, local: true },
+      { env: {}, credentialsPath: writeCreds(true), fetchImpl },
+    );
+    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(body.local).toBe(true);
+  });
+
+  it('POST body has no local key for an ordinary (non --local) invocation', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(okResponse());
+    await recordOutcome(base, { env: {}, credentialsPath: writeCreds(true), fetchImpl });
+    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(body).not.toHaveProperty('local');
+  });
+
+  // The whole point of this field: a --local invocation that never reached
+  // the network (a client-side, pre-mint refusal) must still report
+  // local: true — those are exactly the attempts a backend-side
+  // mint/attach event can never see.
+  it('POST body carries local: true even for an outcome the network never saw', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(okResponse());
+    await recordOutcome(
+      {
+        command: 'test run',
+        outcome: 'error',
+        exitCode: 5,
+        errorCode: 'VALIDATION_ERROR',
+        durationMs: 3,
+        local: true,
+      },
+      { env: {}, credentialsPath: writeCreds(true), fetchImpl },
+    );
+    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(body.local).toBe(true);
+    expect(body.errorCode).toBe('VALIDATION_ERROR');
   });
 
   it('skips when opted out (DO_NOT_TRACK)', async () => {

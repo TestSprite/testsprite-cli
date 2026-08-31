@@ -434,6 +434,16 @@ function renderInitText(data: unknown): string {
     lines.push('  agent:    skipped (--no-agent)');
   }
   lines.push('');
+  // DEV-279: an agent session already open when the skills landed won't re-read
+  // them. `agent install` emits the same line on stderr; setup owns its summary,
+  // so it goes here. Only when bytes actually changed — `aggregateInstallAction`
+  // reports 'installed'/'updated' for that, 'dry-run'/'skipped' otherwise.
+  if (s.agent && (s.agent.action === 'installed' || s.agent.action === 'updated')) {
+    lines.push(
+      `  [hint] Reopen (or restart) your coding agent (${s.agent.target}) so it picks up the newly installed TestSprite skill(s).`,
+    );
+    lines.push('');
+  }
   lines.push('Next steps:');
   lines.push('  # 1. Create your first project (frontend example) — prints a projectId');
   lines.push(

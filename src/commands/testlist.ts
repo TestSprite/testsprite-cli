@@ -23,6 +23,7 @@ import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '..
 import { pollRunUntilTerminal, TimeoutError } from '../lib/poll.js';
 import { emitCiArtifacts, summarizeAcceptedPayload } from '../lib/gh-output.js';
 import { describeConflict, summarizeConflicts } from '../lib/conflict-reason.js';
+import { formatRunProgressLine } from '../lib/run-progress.js';
 import { createTicker } from '../lib/ticker.js';
 import {
   buildJUnitReport,
@@ -412,7 +413,11 @@ export interface RunTestlistRunOptions extends CommonOptions {
  * the run's dashboard link so the CI annotations / summary table are clickable
  * (the JUnit report ignores the extra field).
  */
-type TestlistRunMemberResult = JUnitTestResult & { dashboardUrl?: string };
+type TestlistRunMemberResult = JUnitTestResult & {
+  dashboardUrl?: string;
+  executionUrl?: string;
+  testTitle?: string | null;
+};
 
 /**
  * Rate-deferred members were never dispatched → the batch is incomplete (exit 7),
@@ -618,25 +623,29 @@ export async function runTestlistRun(
         timeoutSeconds: Math.ceil(remainingMs / 1000),
         sleep: deps.sleep,
         onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
-        onTick: (run, elapsedMs) => {
-          const s = run.stepSummary ?? { total: 0, completed: 0, passedCount: 0, failedCount: 0 };
-          ticker.update(
-            `Run ${run.runId} (${entry.testId}) — ${run.status} (${s.completed}/${s.total} steps elapsed=${Math.round(elapsedMs / 1000)}s)`,
-          );
-        },
+        onTick: (run, elapsedMs) =>
+          ticker.update(formatRunProgressLine(run, elapsedMs, `(${entry.testId})`)),
       });
       return {
         testId: entry.testId,
+        testTitle: finalRun.testTitle ?? null,
+        // Give the JUnit `<testcase name>` the human title too (testlist has no
+        // separate name sweep like `test run --all`, so this is its only source;
+        // renderTestcase falls back to the id when name is absent).
+        ...(finalRun.testTitle ? { name: finalRun.testTitle } : {}),
         runId: entry.runId,
         projectId: finalRun.projectId,
         status: finalRun.status,
-        // Carry the run's dashboard link so the ::error:: annotations and the
-        // job-summary Run column are clickable (parity with `test run --all`).
-        // Use the SERVER's dashboardUrl, not a client-built resolvePortalUrl:
-        // testlist run is V3-only, and the client helper emits the V2 route
-        // shape (`/dashboard/tests/...`) which 404s for a V3 project.
+        // Carry both SERVER-built links so the ::error:: annotations and the
+        // job-summary are clickable (parity with `test run --all`): the test-case
+        // page anchors the Test column title, the execution-result page anchors
+        // the Run column. Never a client-built resolvePortalUrl — testlist run is
+        // V3-only and the client helper emits the V2 route shape which 404s.
         ...(typeof finalRun.dashboardUrl === 'string'
           ? { dashboardUrl: finalRun.dashboardUrl }
+          : {}),
+        ...(typeof finalRun.executionUrl === 'string'
+          ? { executionUrl: finalRun.executionUrl }
           : {}),
       };
     } catch (err) {

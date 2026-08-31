@@ -11,6 +11,8 @@ import {
   RUN_RESPONSE_SCHEMA,
   TESTLIST_RUN_RESPONSE_SCHEMA,
   TRIGGER_RUN_RESPONSE_SCHEMA,
+  TUNNEL_MINT_RESPONSE_SCHEMA,
+  TUNNEL_STATUS_RESPONSE_SCHEMA,
 } from './response-schemas.js';
 import type { CliTestListRunResponse } from './testlist.types.js';
 import type {
@@ -27,6 +29,12 @@ import type {
   ListRunsResponse,
   CancelRunResponse,
 } from './runs.types.js';
+import type {
+  CliAcceptPlansResponse,
+  CliGeneratePlansResponse,
+  CliGetPlansResponse,
+} from './plans.types.js';
+import type { MintTunnelBody, TunnelMintResponse, TunnelStatusResponse } from './tunnel.types.js';
 
 export type FetchImpl = typeof globalThis.fetch;
 
@@ -131,6 +139,15 @@ export interface RequestOptions<T = unknown> {
   query?: Record<string, string | number | boolean | undefined>;
   signal?: AbortSignal;
   requestId?: string;
+  /**
+   * Accept an HTTP 204 as a successful response with no body.
+   *
+   * This is deliberately opt-in: the CLI's established response contract is
+   * JSON even for schema-less generic callers, so silently returning
+   * `undefined` would turn a server-side body regression into apparent
+   * success. Use only for endpoints whose documented success response is 204.
+   */
+  allowNoContent?: boolean;
   /**
    * Optional valibot schema for the parsed 2xx response body (issue #102).
    *
@@ -252,6 +269,14 @@ export class HttpClient {
     this.onServerVersion = options.onServerVersion;
     this.requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_DEFAULT_MS;
     this.maxResponseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES_DEFAULT;
+  }
+
+  /** The resolved facade base URL (trailing slash trimmed). Read-only —
+   *  callers that bypass the client for a side-channel request (e.g. the
+   *  presigned S3 PUT) use it to reason about the facade's locality
+   *  (DEV-384 review F3). */
+  get resolvedBaseUrl(): string {
+    return this.baseUrl;
   }
 
   /**
@@ -515,6 +540,65 @@ export class HttpClient {
   }
 
   /**
+   * POST /api/cli/v1/tunnel — mint a tunnel client for `test run --local`.
+   *
+   * The ONLY response on this surface that carries a secret. Deliberately NOT
+   * sent with an `Idempotency-Key`: the interceptor persists the response body
+   * for the whole replay window, so an idempotent mint would put a live
+   * credential in the idempotency store — the exact copy the server-side
+   * binding exists to avoid. The server rate-limits this route instead.
+   *
+   * `retryOnConflict: false` for the same reason `triggerRun` opts out: a 409
+   * here means the per-principal live-binding cap is reached, which is a
+   * standing condition, not a transient snapshot conflict.
+   */
+  async mintTunnel(
+    body: MintTunnelBody,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<TunnelMintResponse> {
+    return this.postWithMeta<TunnelMintResponse>('/tunnel', {
+      body,
+      signal: options.signal,
+      schema: TUNNEL_MINT_RESPONSE_SCHEMA,
+      retryOnConflict: false,
+    }).then(r => r.body);
+  }
+
+  /**
+   * GET /api/cli/v1/tunnel/{clientId} — is this binding's client connected?
+   *
+   * A 404 covers unknown, another tenant's, and expired alike; the surface is
+   * deliberately not an existence oracle for client ids. Callers must not
+   * translate a transport failure or a non-200 into `offline` — "the tunnel is
+   * down" and "we could not reach TestSprite to ask" are different answers,
+   * and collapsing them is what DEV-1005 was.
+   */
+  async getTunnelStatus(
+    clientId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<TunnelStatusResponse> {
+    return this.get<TunnelStatusResponse>(`/tunnel/${encodeURIComponent(clientId)}`, {
+      signal: options.signal,
+      schema: TUNNEL_STATUS_RESPONSE_SCHEMA,
+    });
+  }
+
+  /**
+   * DELETE /api/cli/v1/tunnel/{clientId} — destroy a binding. 204, idempotent.
+   *
+   * No body, no `Idempotency-Key`: the operation is idempotent by definition
+   * and this is the call made from a `finally` block, including after a
+   * signal, where there is least room for extra ceremony.
+   */
+  async deleteTunnel(clientId: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    await this.deleteWithMeta<unknown>(`/tunnel/${encodeURIComponent(clientId)}`, {
+      signal: options.signal,
+      allowNoContent: true,
+      retryOnConflict: false,
+    });
+  }
+
+  /**
    * POST /api/cli/v1/runs/{runId}/cancel
    * User-initiated cancel of a queued/running run (DEV-331 piece 3). No
    * body, no `Idempotency-Key` — the endpoint is naturally idempotent (D10):
@@ -530,6 +614,75 @@ export class HttpClient {
       signal: options?.signal,
       retryOnConflict: false,
     });
+  }
+
+  /**
+   * POST /api/cli/v1/projects/{projectId}/plans/generate  (DEV-384 V3-B)
+   * Start whichever generation stage the project is missing next. The body
+   * is empty by contract — the server decides which rung fires. 202 both
+   * for `accepted` (a stage started) and `nothing_to_start` (proposals are
+   * already staged; the facade's no-restart guard refuses a duplicate
+   * append because it would wipe the batch and re-bill 2 credits).
+   *
+   * `retryOnConflict: false` — a 409 here is `stage_in_flight`, a flow
+   * signal the ladder answers by attaching and polling, never a transient
+   * snapshot conflict to paper over with a retry.
+   */
+  async generatePlans(
+    projectId: string,
+    options: { idempotencyKey: string; signal?: AbortSignal },
+  ): Promise<CliGeneratePlansResponse> {
+    return this.post<CliGeneratePlansResponse>(
+      `/projects/${encodeURIComponent(projectId)}/plans/generate`,
+      {
+        body: {},
+        headers: { 'idempotency-key': options.idempotencyKey },
+        signal: options.signal,
+        retryOnConflict: false,
+      },
+    );
+  }
+
+  /**
+   * GET /api/cli/v1/projects/{projectId}/plans  (DEV-384 V3-B)
+   * Pure read: the facade-synthesized generation status, the staged
+   * proposal list (stable proposalIds — what `accept --only` consumes),
+   * and a best-effort credits block. When `waitSeconds` (1–25) is
+   * provided the server long-polls: one request per window, answered
+   * early on any change.
+   */
+  async getPlans(
+    projectId: string,
+    options?: { waitSeconds?: number; signal?: AbortSignal },
+  ): Promise<CliGetPlansResponse> {
+    return this.get<CliGetPlansResponse>(`/projects/${encodeURIComponent(projectId)}/plans`, {
+      query: options?.waitSeconds !== undefined ? { waitSeconds: options.waitSeconds } : undefined,
+      signal: options?.signal,
+    });
+  }
+
+  /**
+   * POST /api/cli/v1/projects/{projectId}/plans/accept  (DEV-384 V3-B)
+   * Convert staged proposals into real test cases. `only` is ALWAYS an
+   * explicit, non-empty id list — the caller enforces the two §3.3 safety
+   * rules (full list when the user didn't subset; an empty selection is a
+   * client-side validation error because `[]` is server-destructive:
+   * it means "reject everything" and clears the staged batch).
+   */
+  async acceptPlans(
+    projectId: string,
+    only: string[],
+    options: { idempotencyKey: string; signal?: AbortSignal },
+  ): Promise<CliAcceptPlansResponse> {
+    return this.post<CliAcceptPlansResponse>(
+      `/projects/${encodeURIComponent(projectId)}/plans/accept`,
+      {
+        body: { only },
+        headers: { 'idempotency-key': options.idempotencyKey },
+        signal: options.signal,
+        retryOnConflict: false,
+      },
+    );
   }
 
   /**
@@ -696,10 +849,17 @@ export class HttpClient {
           });
           let raw: unknown;
           try {
-            // Bounded read, then parse — assigning to `raw` rather than returning
-            // here keeps the schema validation below on the success path.
-            const text = await readBoundedText(response, this.maxResponseBytes, requestId);
-            raw = JSON.parse(text);
+            if (response.status === 204 && options.allowNoContent === true) {
+              // Only explicitly bodyless endpoints may bypass the historical
+              // JSON-envelope contract. Every other 204 still falls through
+              // to JSON.parse('') and becomes a typed malformed-response error.
+              raw = undefined;
+            } else {
+              // Bounded read, then parse — assigning to `raw` rather than returning
+              // here keeps the schema validation below on the success path.
+              const text = await readBoundedText(response, this.maxResponseBytes, requestId);
+              raw = JSON.parse(text);
+            }
           } catch (err) {
             // Interrupt passthrough (see the fetch catch above).
             if (err instanceof InterruptError) throw err;

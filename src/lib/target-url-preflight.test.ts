@@ -248,15 +248,23 @@ describe('probeTargetUrl — DNS-resolved address blocklist (rebinding guard)', 
   });
 
   it.each([
-    ['127.0.0.1', 'loopback'],
-    ['10.1.2.3', 'RFC1918 (10/8)'],
-    ['192.168.1.1', 'RFC1918 (192.168/16)'],
-    ['172.20.0.5', 'RFC1918 (172.16/12)'],
-    ['169.254.1.1', 'link-local'],
-    ['0.0.0.0', 'unspecified'],
-  ])('hostname resolves to %s (%s) -> refuse', async address => {
+    ['127.0.0.1', 4, 'loopback'],
+    ['10.1.2.3', 4, 'RFC1918 (10/8)'],
+    ['192.168.1.1', 4, 'RFC1918 (192.168/16)'],
+    ['172.20.0.5', 4, 'RFC1918 (172.16/12)'],
+    ['169.254.1.1', 4, 'link-local'],
+    ['0.0.0.0', 4, 'unspecified'],
+    ['0.1.2.3', 4, 'this-network 0/8'],
+    ['100.64.0.1', 4, 'carrier-grade NAT'],
+    ['224.0.0.1', 4, 'multicast'],
+    ['240.0.0.1', 4, 'class E'],
+    ['255.255.255.255', 4, 'limited broadcast'],
+    ['fec0::1', 6, 'deprecated IPv6 site-local'],
+    ['::ffff:169.254.169.254', 6, 'mapped metadata, dotted tail'],
+    ['::ffff:a9fe:a9fe', 6, 'mapped metadata, hex tail'],
+  ] as const)('hostname resolves to %s (%s, %s) -> refuse', async (address, family, _label) => {
     const outcome = await probeTargetUrl('https://looks-public.example.com', {
-      dnsLookup: dnsResolvingTo(address),
+      dnsLookup: dnsResolvingTo(address, family),
       proxyActive: false,
     });
     expect(outcome.verdict).toBe('refuse');
@@ -311,6 +319,25 @@ describe('probeTargetUrl — DNS-resolved address blocklist (rebinding guard)', 
     });
     expect(outcome).toEqual({ verdict: 'ok' });
   });
+
+  it.each([
+    ['8.8.8.8', 4, 'ordinary public IPv4'],
+    ['::ffff:8.8.8.8', 6, 'mapped public IPv4, dotted tail'],
+    ['::ffff:808:808', 6, 'mapped public IPv4, hex tail'],
+    ['64:ff9b::808:808', 6, 'NAT64 to public IPv4'],
+    ['2001:db8::a9fe:a9fe', 6, 'ordinary IPv6 interface bits'],
+    ['2001:4860:4860::8888', 6, 'ordinary public IPv6'],
+  ] as const)(
+    'hostname resolution to %s (%s, %s) proceeds to HTTP probe',
+    async (address, family, _label) => {
+      const outcome = await probeTargetUrl('https://looks-public.example.com', {
+        dnsLookup: dnsResolvingTo(address, family),
+        fetchImpl: fetchResolving(200),
+        proxyActive: false,
+      });
+      expect(outcome).toEqual({ verdict: 'ok' });
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

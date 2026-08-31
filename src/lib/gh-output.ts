@@ -20,9 +20,14 @@ import { appendFileSync, writeFileSync } from 'node:fs';
 
 export interface CiRunRow {
   testId: string;
+  /** Human title for the Test column; falls back to `testId` when absent. */
+  title?: string;
   runId?: string;
   status: string;
+  /** Test-case page link — anchors the Test column title. */
   dashboardUrl?: string;
+  /** This run's execution-result page link — anchors the Run column. */
+  executionUrl?: string;
   error?: string;
 }
 
@@ -101,9 +106,11 @@ export function summarizeAcceptedPayload(
               : undefined;
           return {
             testId: String(row.testId ?? ''),
+            ...(typeof row.testTitle === 'string' ? { title: row.testTitle } : {}),
             ...(typeof row.runId === 'string' ? { runId: row.runId } : {}),
             status: String(row.status ?? 'unknown'),
             ...(typeof row.dashboardUrl === 'string' ? { dashboardUrl: row.dashboardUrl } : {}),
+            ...(typeof row.executionUrl === 'string' ? { executionUrl: row.executionUrl } : {}),
             ...(typeof errorMessage === 'string' ? { error: errorMessage } : {}),
           };
         })
@@ -137,16 +144,20 @@ export function summarizeAcceptedPayload(
  */
 export function summarizeSingleRun(run: {
   testId?: string;
+  testTitle?: string | null;
   runId?: string;
   status?: string;
   dashboardUrl?: string | null;
+  executionUrl?: string | null;
   error?: string | null;
 }): CiSummary {
   const row: CiRunRow = {
     testId: String(run.testId ?? ''),
+    ...(typeof run.testTitle === 'string' ? { title: run.testTitle } : {}),
     ...(typeof run.runId === 'string' ? { runId: run.runId } : {}),
     status: String(run.status ?? 'unknown'),
     ...(typeof run.dashboardUrl === 'string' ? { dashboardUrl: run.dashboardUrl } : {}),
+    ...(typeof run.executionUrl === 'string' ? { executionUrl: run.executionUrl } : {}),
     ...(typeof run.error === 'string' && run.error.length > 0 ? { error: run.error } : {}),
   };
   const passed = row.status === 'passed' ? 1 : 0;
@@ -160,9 +171,31 @@ export function summarizeSingleRun(run: {
  * layout and a CR/LF would inject extra Markdown lines (rows are newline-joined)
  * — the same injection class the annotation escaping guards against, on the
  * step-summary surface.
+ *
+ * Backslashes are escaped FIRST: GFM reads `\\` as a literal backslash, so a
+ * title's own trailing `\` would otherwise consume the `\` we insert before `|`
+ * (turning `\|` back into an unescaped column break). Doubling the value's own
+ * backslashes up front keeps every later insert a real escape.
  */
 function escapeTableCell(value: string): string {
-  return value.replace(/\|/g, '\\|').replace(/[\r\n]+/g, ' ');
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/\|/g, '\\|')
+    .replace(/[\r\n]+/g, ' ');
+}
+
+/**
+ * Escape a value used as the TEXT half of a Markdown `[text](url)` link inside a
+ * table cell. On top of the cell escaping (backslashes, `|`, CR/LF), an unescaped
+ * `]` closes the link early — so a bracketed title like `x](https://evil) y` would
+ * retarget the visible link at the injected URL. Titles are workspace-authored and
+ * often LLM-generated, so brackets are realistic; escape `[` and `]` (backslash).
+ * `escapeTableCell` has already doubled the value's own backslashes, so the escape
+ * we insert before a bracket can't be consumed by a preceding `\`. Plain (unlinked)
+ * cells keep `escapeTableCell`.
+ */
+function escapeMarkdownLinkText(value: string): string {
+  return escapeTableCell(value).replace(/([[\]])/g, '\\$1');
 }
 
 /**
@@ -188,10 +221,25 @@ export function renderJobSummaryMarkdown(summary: CiSummary): string {
     '| Test | Status | Run |',
     '| --- | --- | --- |',
     ...summary.runs.map(row => {
-      const run = row.dashboardUrl
-        ? `[dashboard](${escapeMarkdownUrl(row.dashboardUrl)})`
-        : escapeTableCell(row.runId ?? '');
-      return `| ${escapeTableCell(row.testId)} | ${escapeTableCell(row.status)} | ${run} |`;
+      // `|| ` not `?? `: an empty / whitespace-only title must fall back to the
+      // id (a blank Test cell is useless), matching JUnit's `name?.trim() || id`.
+      const label = row.title?.trim() || row.testId;
+      const runId = row.runId ?? '';
+      // Test cell links the human label to the TEST-CASE page (`dashboardUrl`);
+      // Run cell links to THIS RUN's result page (`executionUrl`). The two are
+      // distinct destinations — the run link is absent for a V2 run (no execution
+      // page), where the run cell degrades to the raw runId. The label sits in
+      // link-text position, so it uses the bracket-aware escaper.
+      const test = row.dashboardUrl
+        ? `[${escapeMarkdownLinkText(label)}](${escapeMarkdownUrl(row.dashboardUrl)})`
+        : escapeTableCell(label);
+      // Keep the run id as the link text (not a constant "result") so it stays
+      // scannable while being clickable.
+      const run =
+        row.executionUrl && runId
+          ? `[${escapeMarkdownLinkText(runId)}](${escapeMarkdownUrl(row.executionUrl)})`
+          : escapeTableCell(runId);
+      return `| ${test} | ${escapeTableCell(row.status)} | ${run} |`;
     }),
     '',
   ].join('\n');
@@ -257,10 +305,14 @@ export function emitGithubOutputs(
     for (const row of summary.runs) {
       if (row.status === 'passed') continue;
       const detail = row.error !== undefined ? ` ${row.error}` : '';
-      const link = row.dashboardUrl !== undefined ? ` ${row.dashboardUrl}` : '';
+      // Prefer this run's result page over the test-case page — on a failure the
+      // result is what the reviewer wants to open. Falls back to the test-case
+      // link (V2 runs, which have no execution page), then to nothing.
+      const linkUrl = row.executionUrl ?? row.dashboardUrl;
+      const link = linkUrl !== undefined ? ` ${linkUrl}` : '';
       // Escape both halves: a raw multiline run error (or a testId) must not be
       // able to smuggle a second workflow command into the Actions stream.
-      const title = `TestSprite ${escapeCommandProperty(row.testId)}`;
+      const title = `TestSprite ${escapeCommandProperty(row.title?.trim() || row.testId)}`;
       const message = escapeCommandData(`status=${row.status}${detail}${link}`);
       annotate(`::error title=${title}::${message}`);
     }

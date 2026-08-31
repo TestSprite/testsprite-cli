@@ -22,7 +22,7 @@ import {
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { loadConfig } from '../lib/config.js';
-import { ApiError, CLIError, localValidationError } from '../lib/errors.js';
+import { ApiError, CLIError, RequestTimeoutError, localValidationError } from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { CliOrgBinding, CliOrgSummary } from '../lib/org-render.js';
 import { formatOrgBinding, formatOrgsSummary, formatPersonalScopeHint } from '../lib/org-render.js';
@@ -133,6 +133,13 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   if (personalScopeHint) {
     checks.push({ name: 'Workspace scope', status: 'warn', detail: personalScopeHint });
   }
+
+  checks.push(
+    await checkLocalTunnel(opts, deps, {
+      hasKey,
+      endpointOk: endpointCheck.status === 'ok',
+    }),
+  );
 
   checks.push(checkSkill(cwd, deps));
 
@@ -265,6 +272,108 @@ async function checkConnectivity(
     };
   }
 }
+
+/**
+ * Can this key open a tunnel to this machine (`test run --local`)?
+ *
+ * A READ, not a mint. `GET /tunnel/<random-uuid>` runs the same scope guard
+ * and the same environment-configured check as the mint, and answers 404 for
+ * an id nobody owns — so it proves everything that matters without consuming
+ * one of the caller's few concurrent live bindings or any rate-limit budget on
+ * a diagnostic.
+ *
+ * The case this exists for: `run:tunnel` is the first scope deliberately kept
+ * OUT of the grandfather grant, so a key minted before it — most keys in the
+ * wild — gets a 403 the first time someone tries `--local`, and the remedy is
+ * to mint a NEW key rather than to re-authenticate. Nothing else in the CLI
+ * says that until a run has already been refused.
+ *
+ * Never `fail`: a caller who does not use `--local` should not see `doctor`
+ * exit 1 over a surface that is not even configured in their environment.
+ */
+async function checkLocalTunnel(
+  opts: CommonOptions,
+  deps: DoctorDeps,
+  ctx: { hasKey: boolean; endpointOk: boolean },
+): Promise<DoctorCheck> {
+  const name = 'Local tunnel';
+  if (opts.dryRun) return { name, status: 'warn', detail: 'skipped under --dry-run' };
+  if (!ctx.hasKey) return { name, status: 'warn', detail: 'skipped; no API key to test with' };
+  if (!ctx.endpointOk) return { name, status: 'warn', detail: 'skipped; endpoint URL is invalid' };
+
+  const controller = new AbortController();
+  const probeTimer = setTimeout(() => {
+    controller.abort(new RequestTimeoutError(DOCTOR_TUNNEL_PROBE_TIMEOUT_MS));
+  }, DOCTOR_TUNNEL_PROBE_TIMEOUT_MS);
+  probeTimer.unref();
+  try {
+    const client = makeHttpClient(
+      { ...opts, requestTimeoutMs: DOCTOR_TUNNEL_PROBE_TIMEOUT_MS },
+      {
+        env: deps.env,
+        credentialsPath: deps.credentialsPath,
+        fetchImpl: deps.fetchImpl,
+        stderr: deps.stderr,
+        // The retry sleeper listens to the client shutdown signal, so using
+        // the probe deadline here bounds attempts and Retry-After sleeps as
+        // one operation rather than timing each fetch independently.
+        shutdownSignal: controller.signal,
+      },
+    );
+    // A well-formed id that cannot name anyone's binding. A 200 here would
+    // mean the server handed us someone else's client, so it is reported as
+    // the anomaly it would be rather than quietly passing.
+    await client.getTunnelStatus(TUNNEL_PROBE_CLIENT_ID);
+    return {
+      name,
+      status: 'warn',
+      detail: 'unexpected: the server resolved a probe id that should belong to nobody',
+    };
+  } catch (error) {
+    if (!(error instanceof ApiError)) {
+      return {
+        name,
+        status: 'warn',
+        detail: `could not check (${error instanceof Error ? error.message : String(error)})`,
+      };
+    }
+    if (error.code === 'NOT_FOUND') {
+      return { name, status: 'ok', detail: 'available; this key can open a tunnel (--local)' };
+    }
+    if (error.code === 'AUTH_FORBIDDEN') {
+      return {
+        name,
+        status: 'warn',
+        detail:
+          'this API key cannot open a tunnel — it predates the `run:tunnel` scope. ' +
+          'Mint a new API key in the dashboard to use `test run --local`.',
+      };
+    }
+    if (error.code === 'UNAVAILABLE') {
+      return {
+        name,
+        status: 'warn',
+        detail: '`test run --local` is not available on this endpoint',
+      };
+    }
+    return { name, status: 'warn', detail: `could not check (${error.code})` };
+  } finally {
+    clearTimeout(probeTimer);
+  }
+}
+
+/**
+ * A syntactically valid UUID that the mint route can never produce for anyone:
+ * it is fixed, so it belongs to nobody, and the surface collapses unknown /
+ * other-tenant / expired into one 404 by design.
+ */
+const TUNNEL_PROBE_CLIENT_ID = '00000000-0000-4000-8000-000000000000';
+
+// A diagnostic status read should complete quickly; three seconds allows
+// ordinary DNS/TLS latency while keeping `doctor` useful when this optional,
+// warn-only surface is hung. This stays independent of the 120–600s business
+// request deadline because waiting longer cannot change the check's outcome.
+const DOCTOR_TUNNEL_PROBE_TIMEOUT_MS = 3_000;
 
 const STATUS_LABEL: Record<DoctorStatus, string> = {
   ok: '[OK]  ',

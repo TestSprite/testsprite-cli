@@ -16,21 +16,22 @@ project's TestSprite suite; before writing a new one, check `testsprite test lis
 for an existing test that already covers the behavior and extend it instead of
 duplicating.
 
-The CLI tests a **deployed** URL — it doesn't build or host your environment.
-Run the loop only once the change is live somewhere reachable (e.g. open the PR,
-let CI deploy the preview/staging environment) and pass that URL as
-`--target-url`. Running earlier verifies the previous build, not your change.
+The CLI tests either a **deployed** URL or a frontend test running on this
+machine — it doesn't build or host your environment either way. For a deployed
+change, wait until it's live somewhere reachable (e.g. open the PR, let CI
+deploy the preview/staging environment) and pass that URL as `--target-url`.
+Running earlier verifies the previous build, not your change.
 
-This CLI only tests a reachable deployed URL (it rejects localhost). If the
-change is only running locally and isn't deployed anywhere reachable yet:
+For a change that is only running locally, don't wait for a deployment: run
+`testsprite test run <test-id> --local <port>` instead. It tunnels this
+machine's own loopback address (`localhost` / `127.0.0.1` / `::1` — not a LAN
+or RFC1918 address, and not a general local-network escape hatch) to the test
+runner. Two constraints: frontend tests only (a backend test's target is baked
+into its generated code, so run it normally), and it needs an API key with the
+`run:tunnel` scope — a 403 there means mint a new key.
 
-- if the TestSprite MCP is available in this environment, hand off to it — it
-  tunnels your local server and tests the running app;
-- otherwise report the change as unverified-because-undeployed and stop — don't
-  run against a stale deployment to manufacture a verdict.
-
-If the user explicitly named a tool (the CLI or the MCP), honor that over this
-reachability heuristic.
+If the user explicitly named a tool (the CLI or the MCP), honor that choice
+regardless of which one the change's reachability would otherwise suggest.
 
 ## When to skip
 
@@ -58,6 +59,11 @@ counts:
 
 What does **not** count: unit tests / typecheck / lint; drafting a plan without
 `--run`; asking the user to run it for you.
+
+If the project has **no tests at all**, that's the `testsprite-onboard` skill's
+job, not this one — seed a suite first (it can generate the proposals for you
+with `testsprite test plan generate` / `test plan accept`, or author them by
+hand). Seeding is a deliberate setup pass, not part of the verify loop.
 
 If you can't satisfy this — no creds, no valid target URL, repo not linked —
 **say so explicitly**: "Feature shipped but I could not run any TestSprite test
@@ -380,13 +386,16 @@ testsprite test run <test-id> --target-url <env-url> --wait --timeout 600
 Key behaviors:
 
 - `--target-url` must be an allowed project/environment URL. The CLI rejects
-  `localhost` / RFC1918 / link-local — local-only changes can't be run here. If
-  the feature is deployed only locally, say so and skip the run.
+  `localhost` / RFC1918 / link-local there. If the feature is only running
+  locally, use `--local <port>` instead of `--target-url` (frontend tests
+  only, see "When to run" above) — don't skip the run over this.
 - `--wait` long-polls until terminal and handles its own backoff — don't wrap it
   in a retry loop.
 - Exit codes: `0` = passed; `1` = failed / blocked / cancelled; `7` = timeout.
   Treat `7` as inconclusive (resume with `testsprite test wait <run-id>`), not a
-  regression.
+  regression — except a `--local` run: its exit 7 already cancelled the run
+  (the tunnel closes with the process, so there is nothing to resume), so
+  don't suggest `test wait` there; re-run with `--local` again instead.
 - Batch: `create-batch --run --wait` creates the tests (FE-only) and fans
   out triggers in one call (bounded by `--max-concurrency`), emitting
   `{ results: [...] }` that mirrors the single-test `test run --wait`

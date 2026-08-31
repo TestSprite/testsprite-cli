@@ -147,7 +147,9 @@ describe('renderJobSummaryMarkdown', () => {
   it('renders the counts headline and one table row per run', () => {
     const md = renderJobSummaryMarkdown(summarizeAcceptedPayload(PAYLOAD));
     expect(md).toContain('**1/3 passed** (1 failed, 1 timed out)');
-    expect(md).toContain('| test_a | passed | [dashboard](https://portal.example.com/a) |');
+    // test_a has dashboardUrl but no executionUrl: the title (id fallback) links
+    // to the test-case page; the Run cell shows the raw runId (no execution link).
+    expect(md).toContain('| [test_a](https://portal.example.com/a) | passed | run_a |');
     expect(md).toContain('| test_c | timeout | run_c |');
   });
 
@@ -362,5 +364,272 @@ describe('emitCiArtifacts', () => {
     const out = stderr.join('\n');
     expect(out).toContain('[testlist run] could not write --summary-file');
     expect(out).toContain('[testlist run] could not append');
+  });
+});
+
+describe('test title in CI output', () => {
+  it('summarizeAcceptedPayload maps testTitle → row.title (batch)', () => {
+    const s = summarizeAcceptedPayload(
+      JSON.stringify({
+        accepted: [
+          {
+            testId: 't-1',
+            testTitle: 'Sign in from the login page',
+            runId: 'r-1',
+            status: 'passed',
+          },
+        ],
+      }),
+    );
+    expect(s.runs[0]).toMatchObject({ testId: 't-1', title: 'Sign in from the login page' });
+  });
+
+  it('summarizeSingleRun maps testTitle → row.title, and null leaves it absent', () => {
+    expect(
+      summarizeSingleRun({ testId: 't', testTitle: 'Login', status: 'passed' }).runs[0],
+    ).toMatchObject({
+      title: 'Login',
+    });
+    // A null title (older server) → no title key → renderer falls back to the id.
+    expect(
+      summarizeSingleRun({ testId: 't', testTitle: null, status: 'passed' }).runs[0]!.title,
+    ).toBeUndefined();
+  });
+
+  it('renderJobSummaryMarkdown shows the title in the Test column, falling back to the id', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 2,
+      passed: 2,
+      failed: 0,
+      timedOut: 0,
+      runs: [
+        { testId: 't-1', title: 'Sign in from the login page', status: 'passed', runId: 'r-1' },
+        { testId: 't-2', status: 'passed', runId: 'r-2' }, // no title → id
+      ],
+    });
+    expect(md).toContain('| Sign in from the login page | passed | r-1 |');
+    expect(md).toContain('| t-2 | passed | r-2 |');
+  });
+
+  it('a title with a pipe / newline cannot break the table row', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 1,
+      passed: 0,
+      failed: 1,
+      timedOut: 0,
+      runs: [{ testId: 't', title: 'evil|title\nfake', status: 'failed', runId: 'r' }],
+    });
+    const rows = md.split('\n').filter(l => l.startsWith('| ') && !l.startsWith('| ---'));
+    expect(rows).toHaveLength(2); // header + one data row, no injected line
+    expect(rows[1]!).toContain('evil\\|title'); // pipe escaped
+  });
+
+  it('an empty / whitespace-only title falls back to the id (parity with JUnit)', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 2,
+      passed: 2,
+      failed: 0,
+      timedOut: 0,
+      runs: [
+        { testId: 't-1', title: '', status: 'passed', runId: 'r-1' },
+        { testId: 't-2', title: '   ', status: 'passed', runId: 'r-2' },
+      ],
+    });
+    expect(md).toContain('| t-1 | passed | r-1 |');
+    expect(md).toContain('| t-2 | passed | r-2 |');
+  });
+
+  it('renders the title into the ::error annotation, escaped, id fallback when empty', () => {
+    const stdout: string[] = [];
+    const sinks = { stdout: (l: string) => stdout.push(l), stderr: () => {}, appendFile: () => {} };
+    emitGithubOutputs(
+      {
+        total: 2,
+        passed: 0,
+        failed: 2,
+        timedOut: 0,
+        runs: [
+          { testId: 't-1', title: 'Sign in\nnow', status: 'failed', runId: 'r-1' },
+          { testId: 't-2', title: '  ', status: 'failed', runId: 'r-2' },
+        ],
+      },
+      {},
+      sinks,
+      { force: true },
+    );
+    const anns = stdout.filter(l => l.startsWith('::error'));
+    // Title used (not the id), and its newline is escaped — can't inject a command.
+    expect(anns[0]).toContain('TestSprite Sign in%0Anow');
+    expect(anns[0]).not.toContain('\n:: ');
+    // Empty title → id fallback in the annotation too.
+    expect(anns[1]).toContain('TestSprite t-2');
+  });
+});
+
+describe('run-scoped execution link in CI output', () => {
+  it('summarizeAcceptedPayload maps executionUrl → row.executionUrl (batch)', () => {
+    const summary = summarizeAcceptedPayload(
+      JSON.stringify({
+        accepted: [
+          {
+            testId: 't1',
+            runId: 'r1',
+            status: 'passed',
+            dashboardUrl: 'https://portal.example.com/case/t1',
+            executionUrl: 'https://portal.example.com/exec/e1',
+          },
+        ],
+        conflicts: [],
+      }),
+    );
+    expect(summary.runs[0]!.executionUrl).toBe('https://portal.example.com/exec/e1');
+  });
+
+  it('summarizeSingleRun maps executionUrl → row.executionUrl (absent when null)', () => {
+    expect(
+      summarizeSingleRun({ testId: 't1', status: 'passed', executionUrl: 'https://x/exec/e1' })
+        .runs[0]!.executionUrl,
+    ).toBe('https://x/exec/e1');
+    expect(
+      summarizeSingleRun({ testId: 't1', status: 'passed', executionUrl: null }).runs[0]!
+        .executionUrl,
+    ).toBeUndefined();
+  });
+
+  it('renders two distinct links: title → test-case page, Run → execution result page', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 1,
+      passed: 1,
+      failed: 0,
+      timedOut: 0,
+      runs: [
+        {
+          testId: 't1',
+          title: 'Sign in',
+          status: 'passed',
+          runId: 'r1',
+          dashboardUrl: 'https://portal.example.com/case/t1',
+          executionUrl: 'https://portal.example.com/exec/e1',
+        },
+      ],
+    });
+    expect(md).toContain(
+      '| [Sign in](https://portal.example.com/case/t1) | passed | [r1](https://portal.example.com/exec/e1) |',
+    );
+  });
+
+  it('a bracketed title in link position cannot retarget the link (]/[ escaped)', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 1,
+      passed: 1,
+      failed: 0,
+      timedOut: 0,
+      runs: [
+        {
+          testId: 't1',
+          // A `]` would close the markdown link early and point the visible title
+          // at the injected URL — realistic for an LLM-authored title.
+          title: 'x](https://evil.example) y',
+          status: 'passed',
+          runId: 'r1',
+          dashboardUrl: 'https://portal.example.com/case/t1',
+        },
+      ],
+    });
+    const dataRow = md.split('\n').find(l => l.startsWith('| ['))!;
+    // The `]` is backslash-escaped, so GFM treats it as literal text: the link
+    // text runs to the REAL closing `](portal-url)`, not the injected one. (The
+    // link-text escaper touches brackets only — parens stay as inert text.)
+    expect(dataRow).toContain('[x\\](https://evil.example) y](https://portal.example.com/case/t1)');
+  });
+
+  it('a backslash before the bracket cannot defeat the escape (backslash escaped first)', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 1,
+      passed: 1,
+      failed: 0,
+      timedOut: 0,
+      runs: [
+        {
+          testId: 't1',
+          // The title's own `\` would consume the escape we insert before `]`,
+          // re-exposing the bracket — unless backslashes are doubled first.
+          title: 'a\\](https://evil.example) y',
+          status: 'passed',
+          runId: 'r1',
+          dashboardUrl: 'https://portal.example.com/case/t1',
+        },
+      ],
+    });
+    const dataRow = md.split('\n').find(l => l.startsWith('| ['))!;
+    // Value's `\` doubled → `\\` (literal backslash) then `\]` (literal bracket):
+    // the link text survives to the REAL portal close, evil URL is inert text.
+    expect(dataRow).toContain(
+      '[a\\\\\\](https://evil.example) y](https://portal.example.com/case/t1)',
+    );
+  });
+
+  it('a backslash before a pipe cannot break the column (plain cell, backslash escaped first)', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 1,
+      passed: 1,
+      failed: 0,
+      timedOut: 0,
+      // Plain (unlinked) cell — no dashboardUrl — exercises escapeTableCell alone.
+      runs: [{ testId: 'a\\|b', status: 'passed', runId: 'r1' }],
+    });
+    const rows = md.split('\n').filter(l => l.startsWith('| ') && !l.startsWith('| ---'));
+    // Header + exactly one data row: the `\|` did NOT open a fourth column.
+    expect(rows).toHaveLength(2);
+    // `\\` (literal backslash) + `\|` (literal pipe), not an unescaped separator.
+    expect(rows[1]!).toContain('a\\\\\\|b');
+  });
+
+  it('no executionUrl (V2 run): Run cell degrades to the raw runId, title still links', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 1,
+      passed: 1,
+      failed: 0,
+      timedOut: 0,
+      runs: [
+        {
+          testId: 't1',
+          title: 'Sign in',
+          status: 'passed',
+          runId: 'r1',
+          dashboardUrl: 'https://portal.example.com/case/t1',
+        },
+      ],
+    });
+    expect(md).toContain('| [Sign in](https://portal.example.com/case/t1) | passed | r1 |');
+  });
+
+  it('annotation link prefers the execution result page over the test-case page', () => {
+    const stdout: string[] = [];
+    const sinks = { stdout: (l: string) => stdout.push(l), stderr: () => {}, appendFile: () => {} };
+    emitGithubOutputs(
+      {
+        total: 1,
+        passed: 0,
+        failed: 1,
+        timedOut: 0,
+        runs: [
+          {
+            testId: 't1',
+            title: 'Sign in',
+            status: 'failed',
+            runId: 'r1',
+            dashboardUrl: 'https://portal.example.com/case/t1',
+            executionUrl: 'https://portal.example.com/exec/e1',
+          },
+        ],
+      },
+      {},
+      sinks,
+      { force: true },
+    );
+    const ann = stdout.find(l => l.startsWith('::error'))!;
+    expect(ann).toContain('https://portal.example.com/exec/e1');
+    expect(ann).not.toContain('/case/t1');
   });
 });

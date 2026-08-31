@@ -1,6 +1,6 @@
 {
   "name": "@testsprite/testsprite-cli",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Official TestSprite command-line interface",
   "type": "module",
   "main": "dist/index.js",
@@ -59,6 +59,7 @@
   "author": "TestSprite team",
   "license": "Apache-2.0",
   "dependencies": {
+    "@llmcode/yamux-ts": "0.0.2",
     "commander": "^12.1.0",
     "undici": "^7.16.0",
     "valibot": "^1.4.1"

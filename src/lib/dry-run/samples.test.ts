@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { DRY_RUN_SAMPLE_ENTRIES, findSample, sampleJUnitReportXml } from './samples.js';
+import { ApiError } from '../errors.js';
+import {
+  DRY_RUN_SAMPLE_ENTRIES,
+  findSample,
+  findSampleOrThrow,
+  sampleJUnitReportXml,
+} from './samples.js';
 
 describe('sampleJUnitReportXml', () => {
   it('returns well-formed JUnit XML with canned batch ids', () => {
@@ -37,6 +43,98 @@ describe('findSample', () => {
   it('resolves /projects/{id}', () => {
     const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/projects/proj_anything');
     expect(e?.operationId).toBe('getProject');
+  });
+
+  it('GET /projects/{id}/plans resolves getPlans, NOT getProject (DEV-384 ordering)', () => {
+    // The plans entries are registered BEFORE getProject (first-match-wins);
+    // this proves both directions of the non-shadowing contract.
+    const plans = findSample('GET', 'https://api.testsprite.com/api/cli/v1/projects/p_x/plans');
+    expect(plans?.operationId).toBe('getPlans');
+    const project = findSample('GET', 'https://api.testsprite.com/api/cli/v1/projects/p_x');
+    expect(project?.operationId).toBe('getProject');
+  });
+
+  it('POST /projects/{id}/plans/generate resolves generatePlans (DEV-384)', () => {
+    const e = findSample(
+      'POST',
+      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans/generate',
+    );
+    expect(e?.operationId).toBe('generatePlans');
+    const body = e?.body() as { status: string; stage: string | null };
+    expect(body.status).toBe('accepted');
+  });
+
+  it('getPlans sample stages two proposals WITH stable proposalIds (FE + BE shapes)', () => {
+    const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/projects/p_x/plans');
+    const body = e?.body() as {
+      generation: { status: string };
+      proposals: Array<{
+        proposalId: string;
+        type: string;
+        steps?: unknown[];
+        endpointPath?: string | null;
+        captures?: string[];
+        consumes?: string[];
+      }>;
+      credits: { charged: Array<{ action: string; amount: number }>; balance: number | null };
+    };
+    expect(body.generation.status).toBe('idle');
+    expect(body.proposals.map(p => p.proposalId)).toEqual(['prop_1', 'prop_2']);
+    const fe = body.proposals[0]!;
+    expect(fe.type).toBe('frontend');
+    expect(Array.isArray(fe.steps)).toBe(true);
+    const be = body.proposals[1]!;
+    expect(be.type).toBe('backend');
+    expect(be.endpointPath).toBe('/v1/orders');
+    expect(be.captures).toEqual(['orderId']);
+    expect(be.consumes).toEqual(['authToken']);
+    expect(body.credits.balance).not.toBeNull();
+  });
+
+  it('POST /projects/{id}/plans/accept is input-derived: echoes the explicit only list', () => {
+    const subset = findSample(
+      'POST',
+      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans/accept',
+      { only: ['prop_2'] },
+    );
+    expect(subset?.operationId).toBe('acceptPlans');
+    const subsetBody = subset?.body() as { acceptedCount: number; caseKeys: string[] };
+    expect(subsetBody.acceptedCount).toBe(1);
+    expect(subsetBody.caseKeys).toEqual(['case_dryrun_prop_2']);
+    // No body context → the illustrative two-proposal shape.
+    const bare = findSample(
+      'POST',
+      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans/accept',
+    );
+    const bareBody = bare?.body() as { acceptedCount: number };
+    expect(bareBody.acceptedCount).toBe(2);
+  });
+
+  it('GET /projects/{id}/plans/generate has no sample (trigger is POST-only)', () => {
+    const e = findSample(
+      'GET',
+      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans/generate',
+    );
+    expect(e).toBeUndefined();
+  });
+
+  it('findSampleOrThrow returns the entry when matched, throws INTERNAL when not (F6)', () => {
+    const hit = findSampleOrThrow(
+      'GET',
+      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans',
+    );
+    expect(hit.operationId).toBe('getPlans');
+    // A registry entry lost in a merge must fail loudly with a typed error,
+    // not surface as a TypeError in a renderer.
+    let thrown: unknown;
+    try {
+      findSampleOrThrow('GET', 'https://api.testsprite.com/api/cli/v1/projects/p_x/no-such-route');
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(ApiError);
+    expect((thrown as ApiError).code).toBe('INTERNAL');
+    expect((thrown as ApiError).message).toContain('/projects/p_x/no-such-route');
   });
 
   it('resolves /tests (list) — must not collide with /tests/{id}', () => {
@@ -111,6 +209,23 @@ describe('findSample', () => {
           break;
         case 'getProject':
           expect(body).toMatchObject({ id: expect.any(String), name: expect.any(String) });
+          break;
+        case 'docsUploadUrl':
+          // DEV-384 V3-D — CliDocsUploadUrlResponse wire shape.
+          expect(body).toMatchObject({
+            uploadUrl: expect.any(String),
+            s3Key: expect.any(String),
+            expiresInSeconds: expect.any(Number),
+          });
+          break;
+        case 'docsRegister':
+          // DEV-384 V3-D — CliDocsRegisterResponse wire shape.
+          expect(body).toMatchObject({
+            resourceId: expect.any(String),
+            displayName: expect.any(String),
+            docRole: expect.any(String),
+            processStatus: expect.any(String),
+          });
           break;
         case 'getTest':
           // G1a — priority must be present (truthy string or null).
@@ -353,6 +468,46 @@ describe('findSample', () => {
           expect(body).toMatchObject({
             projectId: expect.any(String),
             deletedAt: expect.any(String),
+          });
+          break;
+        case 'generatePlans':
+          // DEV-384 V3-B — POST /projects/{id}/plans/generate →
+          // CliGeneratePlansResponse (202 trigger ack).
+          expect(body).toMatchObject({
+            status: 'accepted',
+            projectId: expect.any(String),
+            stagesRemaining: expect.any(Array),
+            enqueuedAt: expect.any(String),
+          });
+          expect('stage' in body).toBe(true);
+          break;
+        case 'getPlans': {
+          // DEV-384 V3-B — GET /projects/{id}/plans → CliGetPlansResponse.
+          // Every staged proposal must carry its stable proposalId (that id
+          // is what `accept --only` consumes).
+          expect(body).toMatchObject({
+            generation: expect.objectContaining({ status: expect.any(String) }),
+            proposals: expect.any(Array),
+            credits: expect.objectContaining({ charged: expect.any(Array) }),
+          });
+          const proposals = (body as { proposals: Array<Record<string, unknown>> }).proposals;
+          expect(proposals.length).toBeGreaterThan(0);
+          for (const p of proposals) {
+            expect(p).toMatchObject({
+              proposalId: expect.any(String),
+              title: expect.any(String),
+              priority: expect.any(String),
+              type: expect.any(String),
+            });
+          }
+          break;
+        }
+        case 'acceptPlans':
+          // DEV-384 V3-B — POST /projects/{id}/plans/accept → the server's
+          // real `{acceptedCount, caseKeys}` shape (DR-29: no codegen field).
+          expect(body).toMatchObject({
+            acceptedCount: expect.any(Number),
+            caseKeys: expect.any(Array),
           });
           break;
         case 'listSchedules':
@@ -620,6 +775,36 @@ describe('findSample', () => {
     const body = e?.body() as { results: unknown[]; summary: Record<string, number> };
     expect(Array.isArray(body.results)).toBe(true);
     expect(body.summary.total).toBeGreaterThanOrEqual(1);
+  });
+
+  // DEV-384 piece V3-D: `project docs upload` dry-runs via an inline
+  // early-exit (zero network, stat only — the presigned PUT leg cannot be
+  // expressed through canned fetch samples). These two entries are
+  // documentation/shape-guards, same family as `deleteBatch`.
+  it('POST /projects/{id}/docs/upload-url resolves docsUploadUrl (V3-A wire shape)', () => {
+    const e = findSample(
+      'POST',
+      'https://api.testsprite.com/api/cli/v1/projects/p_x/docs/upload-url',
+    );
+    expect(e?.operationId).toBe('docsUploadUrl');
+    const body = e?.body() as { uploadUrl: string; s3Key: string; expiresInSeconds: number };
+    expect(body.uploadUrl).toMatch(/^https:/);
+    expect(body.s3Key).toBeTruthy();
+    expect(body.expiresInSeconds).toBe(3600);
+  });
+
+  it('POST /projects/{id}/docs resolves docsRegister (not shadowed by upload-url)', () => {
+    const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/projects/p_x/docs');
+    expect(e?.operationId).toBe('docsRegister');
+    const body = e?.body() as {
+      resourceId: string;
+      displayName: string;
+      docRole: string;
+      processStatus: string;
+    };
+    expect(body.resourceId).toBeTruthy();
+    expect(body.docRole).toBe('API_DOC');
+    expect(body.processStatus).toBeTruthy();
   });
 
   it('keeps the failed run sentinel before generic getRun while retaining cancelRun', () => {

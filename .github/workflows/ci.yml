@@ -94,6 +94,18 @@ jobs:
       - run: npm test
         env:
           CI: true
+      # DEV-673: keep the exit-code contract checked on Windows, the OS where
+      # the underlying crash (libuv assert on forced process.exit during TLS
+      # teardown) bites. This job cannot REPRODUCE that crash (it pins Node 22;
+      # the crash needs Node >=23 + a real-network TLS socket) — the spec's
+      # beforeExit drain-marker guards the drain-vs-forced-exit mechanism,
+      # which is OS/version-independent. Only this spec: the rest of the e2e
+      # suite has pre-existing Windows incompatibilities (signal delivery via
+      # child.kill is emulated on win32; path-format assertions) tracked
+      # separately.
+      - run: npx vitest run -c vitest.e2e.config.ts test/e2e/exit-code.e2e.test.ts
+        env:
+          CI: true
 
   build:
     name: Build (Node ${{ matrix.node-version }})

@@ -1,15 +1,18 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { createReadStream, readFileSync, statSync, type Stats } from 'node:fs';
+import { basename, extname } from 'node:path';
+import { Readable } from 'node:stream';
 import { Command } from 'commander';
 import {
   emitDryRunBanner,
   makeHttpClient,
   parseRequestTimeoutFlag,
+  resolveRequestTimeoutMs,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
-import { ApiError } from '../lib/errors.js';
-import type { FetchImpl } from '../lib/http.js';
-import type { HttpClient } from '../lib/http.js';
+import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
+import type { FetchImpl, HttpClient } from '../lib/http.js';
+import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { readSecretFileGuarded } from '../lib/secret-file.js';
 import { assertNotLocal } from '../lib/target-url.js';
@@ -70,6 +73,8 @@ export interface ProjectDeps {
   fetchImpl?: FetchImpl;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
+  /** Graceful-detach coordinator (DEV-331); tests inject their own. */
+  shutdown?: ShutdownHandle;
 }
 
 type CommonOptions = FactoryCommonOptions;
@@ -801,6 +806,461 @@ function renderAutoAuthText(r: CliProjectAutoAuthResponse): string {
   return lines.join('\n');
 }
 
+// ---------------------------------------------------------------------------
+// project docs upload — DEV-384 piece V3-D
+// ---------------------------------------------------------------------------
+
+/**
+ * CLI-facing role flags → wire enum. Default is `api-doc` (stated in help);
+ * no inference from project type in v1 (design §3.4).
+ */
+const DOC_ROLES = { 'api-doc': 'API_DOC', prd: 'PRD' } as const;
+type DocRoleFlag = keyof typeof DOC_ROLES;
+type DocRoleWire = (typeof DOC_ROLES)[DocRoleFlag];
+
+/**
+ * MIME type sent in step 1 and echoed on the step-2 PUT. The backend signs
+ * `ContentType` into the presigned URL when supplied, so the PUT's
+ * `Content-Type` header must be byte-identical to what step 1 declared —
+ * both come from this one lookup, so they cannot drift.
+ */
+const DOC_CONTENT_TYPES: Record<string, string> = {
+  '.json': 'application/json',
+  '.yaml': 'application/yaml',
+  '.yml': 'application/yaml',
+  '.md': 'text/markdown',
+  '.markdown': 'text/markdown',
+  '.txt': 'text/plain',
+  '.pdf': 'application/pdf',
+};
+const DEFAULT_DOC_CONTENT_TYPE = 'application/octet-stream';
+
+/** `POST /projects/{id}/docs/upload-url` response (V3-A facade). */
+export interface CliDocsUploadUrlResponse {
+  uploadUrl: string;
+  s3Key: string;
+  expiresInSeconds: number;
+}
+
+/** `POST /projects/{id}/docs` (register) response (V3-A facade). */
+export interface CliDocsRegisterResponse {
+  resourceId: string;
+  displayName: string;
+  docRole: DocRoleWire | null;
+  processStatus: string;
+}
+
+/** Success result — the JSON-mode stdout shape (piece V3-D scope item 3). */
+export interface CliDocsUploadResult {
+  resourceId: string;
+  displayName: string;
+  role: DocRoleWire | null;
+  size: number;
+  processStatus: string;
+}
+
+/** Dry-run result: the would-be plan. Zero network, nothing read beyond a stat. */
+export interface CliDocsUploadPlan {
+  dryRun: true;
+  projectId: string;
+  file: string;
+  fileName: string;
+  displayName: string;
+  role: DocRoleWire;
+  contentType: string;
+  size: number;
+  steps: string[];
+}
+
+interface DocsUploadOptions extends CommonOptions {
+  file: string;
+  projectId?: string;
+  role?: string;
+  name?: string;
+  idempotencyKey?: string;
+}
+
+/**
+ * `project docs upload <file>` — upload an API spec or PRD as a project
+ * source so plan generation has inputs to feed on (closes the API-project
+ * cold start at `no_processed_inputs`).
+ *
+ * Three-step flow against the V3-A facade routes:
+ *
+ *   1. `POST /projects/{id}/docs/upload-url` — mints a one-hour presigned
+ *      S3 PUT URL plus the S3 key to register afterwards.
+ *   2. HTTP PUT of the file bytes to the presigned URL — **streamed**
+ *      (`createReadStream` → web stream), never buffering the whole file.
+ *      This request goes straight to S3: no facade base URL, no API key.
+ *   3. `POST /projects/{id}/docs` — registers the S3 object with its role
+ *      and display name, which starts processing + embedding.
+ *
+ * Reading the local file as INPUT is allowed by DR-21 (the no-local-OUTPUTS
+ * rule); nothing is ever written back to disk.
+ *
+ * Failure modes are deliberately distinguished (design non-negotiable): a
+ * step-2 failure names the presigned PUT and the fix (re-running mints a
+ * fresh URL — they expire); a step-3 failure preserves the server envelope
+ * and says the upload already succeeded (re-running is safe: the server
+ * upserts the document by S3 key, so no duplicate is created).
+ */
+export async function runDocsUpload(
+  opts: DocsUploadOptions,
+  deps: ProjectDeps = {},
+): Promise<CliDocsUploadResult | CliDocsUploadPlan> {
+  const out = makeOutput(opts.output, deps);
+  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+
+  assertIdempotencyKey(opts.idempotencyKey);
+
+  const projectId = requireDocsProjectId(opts.projectId, deps);
+  const roleFlag = opts.role ?? 'api-doc';
+  if (!(roleFlag in DOC_ROLES)) {
+    throw localValidationError(
+      '--role must be api-doc (API spec, the default) or prd (product requirements document)',
+    );
+  }
+  const role: DocRoleWire = DOC_ROLES[roleFlag as DocRoleFlag];
+
+  if (opts.name !== undefined && opts.name.trim().length === 0) {
+    throw localValidationError('--name must not be empty or whitespace-only');
+  }
+  if (opts.name !== undefined && opts.name.length > 255) {
+    throw localValidationError('--name must be at most 255 characters');
+  }
+
+  if (opts.file === undefined || opts.file.trim().length === 0) {
+    throw localValidationError('<file> is required');
+  }
+  // Size + existence sanity via stat only — the dry-run contract is "nothing
+  // read beyond a stat", and the real path opens the file exactly once, in
+  // the streamed PUT below.
+  let stat: Stats;
+  try {
+    stat = statSync(opts.file);
+  } catch (cause) {
+    const code = (cause as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      throw localValidationError(`file does not exist: ${opts.file}`);
+    }
+    throw localValidationError(
+      `cannot stat file ${opts.file}: ${(cause as Error).message ?? String(cause)}`,
+    );
+  }
+  if (!stat.isFile()) {
+    throw localValidationError(`${opts.file} is not a regular file (is it a directory?)`);
+  }
+  if (stat.size === 0) {
+    throw localValidationError(`file is empty (0 bytes), nothing to upload: ${opts.file}`);
+  }
+
+  const fileName = basename(opts.file);
+  if (fileName.length > 255) {
+    throw localValidationError(
+      'the file name (basename) must be at most 255 characters — rename the file ' +
+        '(--name only changes the display name, not the stored file name)',
+    );
+  }
+  const displayName = opts.name ?? fileName;
+  const contentType =
+    DOC_CONTENT_TYPES[extname(fileName).toLowerCase()] ?? DEFAULT_DOC_CONTENT_TYPE;
+  const projectPath = encodeURIComponent(projectId);
+
+  if (opts.dryRun) {
+    // Same inline early-exit family as `test delete-batch --dry-run`: the
+    // command's dry-run contract (zero network, stat only, print the plan)
+    // cannot be expressed through canned fetch samples — step 2 would have
+    // to PUT somewhere. The `docsUploadUrl`/`docsRegister` entries in
+    // `samples.ts` are shape-guards/documentation, not consumed here.
+    emitDryRunBanner(stderr);
+    const plan: CliDocsUploadPlan = {
+      dryRun: true,
+      projectId,
+      file: opts.file,
+      fileName,
+      displayName,
+      role,
+      contentType,
+      size: stat.size,
+      steps: [
+        `POST /projects/${projectId}/docs/upload-url — mint a presigned S3 PUT URL for ${fileName} (${contentType})`,
+        `PUT ${stat.size} bytes to the presigned URL (streamed from disk, never buffered)`,
+        `POST /projects/${projectId}/docs — register ${displayName} as ${role}; starts processing + embedding`,
+      ],
+    };
+    out.print(plan, data => renderDocsUploadPlanText(data as CliDocsUploadPlan));
+    return plan;
+  }
+
+  const idempotencyKey = opts.idempotencyKey ?? `cli-docs-upload-${randomUUID()}`;
+  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
+    stderr(`idempotency-key: ${idempotencyKey}`);
+  }
+
+  const client = makeClient(opts, deps);
+
+  // ── Step 1 of 3: mint the presigned upload URL ────────────────────────────
+  const minted = await client.post<CliDocsUploadUrlResponse>(
+    `/projects/${projectPath}/docs/upload-url`,
+    { body: { fileName, contentType } },
+  );
+
+  // ── Step 2 of 3: stream the file bytes to S3 ──────────────────────────────
+  // Straight to the presigned host with the raw fetch impl — NOT through
+  // HttpClient, which would attach the facade base URL and leak the API key
+  // to S3. Content-Length comes from the stat: S3 rejects chunked
+  // transfer-encoding on presigned PUTs, and Node's fetch uses the explicit
+  // header to keep identity framing with a streamed body.
+  const fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
+  // DEV-384 review F3: a remote facade must mint a non-local https URL.
+  assertSafePresignedUploadUrl(minted.uploadUrl, client.resolvedBaseUrl);
+  // Same flag > TESTSPRITE_REQUEST_TIMEOUT_MS > default resolution (and 1-600s
+  // clamp) as makeHttpClient — this leg bypasses HttpClient, so resolve here.
+  const requestTimeoutMs = resolveRequestTimeoutMs(opts, deps.env ?? process.env);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  // DEV-384 review F14b: compose the shutdown signal into the PUT abort
+  // (manual listeners, house style — no AbortSignal.any) and arm the
+  // graceful scope for the upload's duration, so Ctrl-C during a long PUT
+  // takes the honest DEV-331 detach path instead of being unabortable.
+  const shutdown = deps.shutdown ?? globalShutdown;
+  const shutdownSignal = shutdown.signal;
+  const onShutdownAbort = (): void => controller.abort(shutdownSignal.reason);
+  const disarm = shutdown.arm();
+  if (shutdownSignal.aborted) onShutdownAbort();
+  else shutdownSignal.addEventListener('abort', onShutdownAbort, { once: true });
+  let putResponse: Response;
+  try {
+    putResponse = await fetchImpl(minted.uploadUrl, {
+      method: 'PUT',
+      headers: { 'content-type': contentType, 'content-length': String(stat.size) },
+      body: Readable.toWeb(createReadStream(opts.file)) as unknown as RequestInit['body'],
+      duplex: 'half',
+      // #342 review: assertSafePresignedUploadUrl vets the MINTED url, but a
+      // default `redirect: 'follow'` would let a 3xx from that host resend
+      // the request to an unvetted Location (e.g. a 303 → 169.254.169.254) —
+      // an SSRF-shaped hop the guard never sees. A real S3 presigned PUT never
+      // redirects, so refuse: the thrown TypeError falls through to the catch
+      // below as a normal `presigned_put_failed` (no new error reason).
+      redirect: 'error',
+      signal: controller.signal,
+    } as RequestInit);
+  } catch (cause) {
+    // Interrupt outranks the timeout mapping: a Ctrl-C-aborted fetch must
+    // surface as InterruptError (exit 130/143), never as a timeout.
+    if (cause instanceof InterruptError) throw cause;
+    if (shutdownSignal.aborted) throw shutdownSignal.reason;
+    // Any other abort here is ours (the per-request timer): map to the CLI's
+    // typed exit-7 timeout, same contract as HttpClient's per-request timeout.
+    if (isAbortError(cause)) {
+      throw new RequestTimeoutError(requestTimeoutMs);
+    }
+    throw presignedPutError(
+      `network error before S3 responded: ${describeCause(cause)}`,
+      minted.expiresInSeconds,
+    );
+  } finally {
+    clearTimeout(timer);
+    shutdownSignal.removeEventListener('abort', onShutdownAbort);
+    disarm();
+  }
+  if (!putResponse.ok) {
+    const snippet = (await putResponse.text().catch(() => '')).slice(0, 300);
+    throw presignedPutError(
+      `S3 returned HTTP ${putResponse.status}${snippet ? ` — ${snippet}` : ''}`,
+      minted.expiresInSeconds,
+    );
+  }
+
+  // ── Step 3 of 3: register the uploaded object ─────────────────────────────
+  let registered: CliDocsRegisterResponse;
+  try {
+    registered = await client.post<CliDocsRegisterResponse>(`/projects/${projectPath}/docs`, {
+      body: { s3Key: minted.s3Key, displayName, docRole: role },
+      headers: { 'idempotency-key': idempotencyKey },
+    });
+  } catch (cause) {
+    if (cause instanceof ApiError) throw registerStepError(cause);
+    // DEV-384 review F4: a register timeout needs the same step-3 context —
+    // it is precisely the case where the caller can't tell whether the
+    // register landed. Class and exit 7 are preserved; only the text gains
+    // the upload-succeeded / safe-to-re-run explanation.
+    if (cause instanceof RequestTimeoutError) {
+      cause.message =
+        `Document register timed out (step 3 of 3) — the S3 upload succeeded, and the ` +
+        `register may or may not have landed. ${cause.message} Re-running the whole command ` +
+        `is safe: the server upserts the document by its S3 key (no duplicate is created; a PRD re-register re-runs the embedding compute, but the embedding charge is idempotent per document — never billed twice).`;
+      throw cause;
+    }
+    throw cause;
+  }
+
+  const result: CliDocsUploadResult = {
+    resourceId: registered.resourceId,
+    displayName: registered.displayName ?? displayName,
+    role: registered.docRole ?? role,
+    size: stat.size,
+    processStatus: registered.processStatus,
+  };
+  out.print(result, data => renderDocsUploadText(data as CliDocsUploadResult));
+  return result;
+}
+
+function isAbortError(cause: unknown): boolean {
+  return cause instanceof Error && cause.name === 'AbortError';
+}
+
+function describeCause(cause: unknown): string {
+  if (!(cause instanceof Error)) return String(cause);
+  // undici wraps network failures as `TypeError: fetch failed` with the
+  // useful detail on `.cause` — surface both.
+  const nested = (cause as { cause?: unknown }).cause;
+  const nestedMsg = nested instanceof Error ? ` (${nested.message})` : '';
+  return `${cause.message}${nestedMsg}`;
+}
+
+/**
+ * DEV-384 review F3 — defense-in-depth on the server-minted presigned URL.
+ *
+ * A REMOTE facade must mint a non-local `https:` URL; a localhost/private or
+ * plain-http mint from a remote facade is exactly the anomaly to reject
+ * (compromised/misconfigured facade or an active MITM) — the PUT would
+ * otherwise send the user's file wherever that URL points, before any bytes
+ * leave the machine. A facade that is ITSELF loopback (dev rig, localhost
+ * e2e) is a deliberate operator configuration and is trusted to mint local
+ * URLs — and ONLY loopback qualifies (#342 review): the gate is a positive,
+ * fail-closed check, because gating on "anything `assertNotLocal` dislikes"
+ * would silently disable the guard for an unparsable base URL or a
+ * user-settable private-range endpoint (`--endpoint-url https://10.1.2.3`).
+ * Literal checks only (same scope as `assertNotLocal`); no host
+ * allow-listing by design.
+ *
+ * Known residual (#342 review): a loopback facade that is really a TUNNEL to a
+ * remote backend (`ssh -L`, a localhost corporate proxy) is trusted here even
+ * though the real conversation is remote and MITM-able upstream. This is
+ * inherent to "loopback facade = trusted dev rig" and accepted — the CLI
+ * cannot tell a dev rig from a tunnel by the base URL alone.
+ */
+function assertSafePresignedUploadUrl(uploadUrl: string, facadeBaseUrl: string): void {
+  if (isLoopbackFacade(facadeBaseUrl)) return;
+  const reject = (reason: string): never => {
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: `Refusing the presigned upload URL the server returned: ${reason}.`,
+        nextAction:
+          'No bytes were uploaded. This can indicate a misconfigured or intercepted API ' +
+          'endpoint — verify --endpoint-url / TESTSPRITE_API_URL and retry.',
+        requestId: 'local',
+        details: { field: 'uploadUrl', reason: 'unsafe_presigned_url' },
+      },
+    });
+  };
+  let parsed: URL;
+  try {
+    parsed = new URL(uploadUrl);
+  } catch {
+    return reject('it is not a valid URL');
+  }
+  if (parsed.protocol !== 'https:') return reject('it is not https');
+  if (isLocalUrl(uploadUrl)) return reject('it points at a local/private address');
+}
+
+/** True when `assertNotLocal` rejects the URL (localhost, RFC1918, link-local,
+ *  metadata, non-http(s), unparsable). Fail-closed in the REJECTION direction
+ *  only — used to refuse a suspicious mint, never to grant trust (that side
+ *  is `isLoopbackFacade`). */
+function isLocalUrl(url: string): boolean {
+  try {
+    assertNotLocal(url);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * #342 review: the facade-trust gate for `assertSafePresignedUploadUrl`.
+ * Positive and narrow — only an explicitly-loopback facade (`localhost`,
+ * a `127.0.0.0/8` literal, or `[::1]`) is trusted to mint local upload URLs.
+ * Anything else — including an unparsable base URL or a private-range
+ * endpoint — leaves the guard ON.
+ */
+function isLoopbackFacade(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  // `localhost.` is the fully-qualified form of `localhost` (RFC 6761).
+  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  if (host === 'localhost') return true;
+  if (/^127\.\d+\.\d+\.\d+$/.test(host)) return true;
+  return host === '[::1]';
+}
+
+/**
+ * Step-2 failure: the presigned PUT to S3. Distinguished from a register
+ * failure per the design non-negotiable — the fix is different (re-running
+ * re-mints the URL; nothing was registered, so nothing is half-done).
+ */
+function presignedPutError(detail: string, expiresInSeconds: number): ApiError {
+  return new ApiError({
+    code: 'UNAVAILABLE',
+    message: `Presigned S3 upload failed (step 2 of 3): ${detail}`,
+    nextAction:
+      'The document was NOT registered. Re-run the command — each run mints a fresh ' +
+      `upload URL (presigned URLs expire, this one after ${Math.round(expiresInSeconds / 60)} minutes).`,
+    requestId: 'local',
+    details: { reason: 'presigned_put_failed' },
+  });
+}
+
+/**
+ * Step-3 failure: register. The server envelope (code, exit, requestId,
+ * details) passes through unchanged; only the text gains step context so
+ * the caller knows the upload itself already landed and a re-run is safe
+ * (the server upserts the document by S3 key — no duplicate).
+ */
+function registerStepError(cause: ApiError): ApiError {
+  return new ApiError(
+    {
+      code: cause.code,
+      message: `Document register failed (step 3 of 3) — the S3 upload succeeded, but the document is not registered yet. ${cause.message}`,
+      nextAction:
+        `${cause.nextAction ? `${cause.nextAction} ` : ''}` +
+        'Re-running the whole command is safe: the same file re-uploads and the server ' +
+        'upserts the document by its S3 key (no duplicate is created; a PRD re-register re-runs the embedding compute, but the embedding charge is idempotent per document — never billed twice).',
+      requestId: cause.requestId,
+      details: cause.details,
+    },
+    cause.httpStatus,
+    cause.retryAfterMs,
+  );
+}
+
+function formatDocSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function renderDocsUploadText(r: CliDocsUploadResult): string {
+  return [
+    `uploaded ${r.displayName} (${formatDocSize(r.size)}) — processing started`,
+    'note: generation can use this source once processing and embedding finish',
+    '      (check with `testsprite test plan generate` — it says if inputs are still processing)',
+  ].join('\n');
+}
+
+function renderDocsUploadPlanText(p: CliDocsUploadPlan): string {
+  return [
+    `would upload ${p.file} (${formatDocSize(p.size)}) to project ${p.projectId} as ${p.role}:`,
+    ...p.steps.map((step, i) => `  ${i + 1}. ${step}`),
+  ].join('\n');
+}
+
 export function createProjectCommand(deps: ProjectDeps = {}): Command {
   const project = new Command('project').description('Manage TestSprite projects');
 
@@ -1050,7 +1510,55 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       );
     });
 
+  const docs = new Command('docs').description(
+    'Manage project documents — the sources plan generation feeds on',
+  );
+  docs
+    .command('upload <file>')
+    .description(
+      'Upload an API spec or PRD as a project source (DEV-384). Three steps:\n' +
+        'mint a presigned S3 URL, stream the file bytes to it, register the\n' +
+        'document — which starts processing + embedding. The local file is\n' +
+        'only read; nothing is written back to disk.\n' +
+        '\nExit codes:\n' +
+        '  0  upload registered (processing started)\n' +
+        '  3  auth error\n' +
+        '  4  project not found (or not accessible in this workspace)\n' +
+        '  5  validation error (missing/empty file, bad --role)\n' +
+        '  7  request timeout (also: backend predates the docs routes)\n' +
+        ' 10  presigned S3 PUT failed — re-run to mint a fresh URL',
+    )
+    .option('--project <id>', 'project id the document belongs to (required)')
+    .option('--role <role>', 'document role: api-doc (API spec, default) | prd')
+    .option('--name <display-name>', 'display name for the document (default: file basename)')
+    .option(
+      '--idempotency-key <token>',
+      'opaque idempotency token. Defaults to a UUIDv4 minted per invocation.',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (file: string, cmdOpts: DocsUploadFlagOpts, command: Command) => {
+      await runDocsUpload(
+        {
+          ...resolveCommonOptions(command),
+          file,
+          projectId: cmdOpts.project,
+          role: cmdOpts.role,
+          name: cmdOpts.name,
+          idempotencyKey: cmdOpts.idempotencyKey,
+        },
+        deps,
+      );
+    });
+  project.addCommand(docs);
+
   return project;
+}
+
+interface DocsUploadFlagOpts {
+  project?: string;
+  role?: string;
+  name?: string;
+  idempotencyKey?: string;
 }
 
 interface ListFlagOpts {
@@ -1289,6 +1797,21 @@ function renderUpdateText(r: CliUpdateProjectResponse): string {
 
 function renderDeleteText(r: CliDeleteProjectResponse): string {
   return [`projectId ${r.projectId}`, `deletedAt ${r.deletedAt}`].join('\n');
+}
+
+/**
+ * `--project` resolution for `project docs upload` — mirrors test.ts's
+ * resolveProjectId/requireProjectId so `TESTSPRITE_PROJECT_ID` works here the
+ * same as on every other command (DEV-384 review F5). Flag wins over env.
+ */
+function requireDocsProjectId(projectId: string | undefined, deps: ProjectDeps): string {
+  const explicit = projectId?.trim();
+  if (explicit && explicit.length > 0) return explicit;
+  const envValue = (deps.env ?? process.env).TESTSPRITE_PROJECT_ID?.trim();
+  if (envValue && envValue.length > 0) return envValue;
+  throw localValidationError(
+    '--project <id> is required; pass --project <id> or set TESTSPRITE_PROJECT_ID',
+  );
 }
 
 function localValidationError(message: string): ApiError {

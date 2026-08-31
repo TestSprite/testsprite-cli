@@ -77,10 +77,19 @@ describe('createProjectCommand', () => {
     errorSpy.mockRestore();
   });
 
-  it('exposes list, get, create, update, delete, credential and auto-auth subcommands', () => {
+  it('exposes list, get, create, update, delete, credential, auto-auth and docs subcommands', () => {
     const project = createProjectCommand();
     const names = project.commands.map(c => c.name()).sort();
-    expect(names).toEqual(['auto-auth', 'create', 'credential', 'delete', 'get', 'list', 'update']);
+    expect(names).toEqual([
+      'auto-auth',
+      'create',
+      'credential',
+      'delete',
+      'docs',
+      'get',
+      'list',
+      'update',
+    ]);
   });
 
   it('list exposes the pagination flags from the design contract', () => {

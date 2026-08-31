@@ -13,6 +13,17 @@ export interface TriggerRunBody {
   source: 'cli';
   /** Optional override for the project's configured target URL. */
   targetUrl?: string;
+  /**
+   * DEV-747: id of a tunnel client minted through `POST /api/cli/v1/tunnel`.
+   *
+   * An ID, never a proxy string — the caller does not choose the proxy host.
+   * The server loads the binding, checks it belongs to the calling principal
+   * and that the tunnel is connected, and only then builds the proxy string
+   * from its own configuration. Sent ONLY alongside a loopback `targetUrl`;
+   * the server refuses the pairing in every other combination rather than
+   * dropping the field.
+   */
+  tunnelClientId?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +226,11 @@ export interface RunStepDto {
 export interface RunResponse {
   runId: string;
   testId: string;
+  /**
+   * The test's human title, for CI output. `null`/absent on older servers or
+   * when it can't be resolved — consumers fall back to `testId`.
+   */
+  testTitle?: string | null;
   projectId: string;
   userId: string;
   status: RunStatus;
@@ -260,6 +276,14 @@ export interface RunResponse {
    * `withRunDashboardUrl` in `commands/test.ts`.
    */
   dashboardUrl?: string | null;
+  /**
+   * Portal deep link to THIS RUN's result page (`…/projects/{pid}/execution/{eid}`),
+   * the run-scoped companion to `dashboardUrl` (which opens the test case). Same
+   * server-built / omit-not-null contract as `dashboardUrl`: **V3-served runs
+   * only** — a V2 run has no execution page, so the field is absent there and the
+   * CLI keeps `dashboardUrl` (the test-case link) for the run cell.
+   */
+  executionUrl?: string | null;
   /**
    * Full ordered step list. Only present when the request includes
    * `?includeSteps=true`. Absent (undefined) when the flag was not sent.

@@ -34,6 +34,8 @@ const cases: Array<[string, string[]]> = [
   ['project', ['project', '--help']],
   ['project list', ['project', 'list', '--help']],
   ['project get', ['project', 'get', '--help']],
+  // DEV-384 piece V3-D
+  ['project docs upload', ['project', 'docs', 'upload', '--help']],
   ['test', ['test', '--help']],
   ['test list', ['test', 'list', '--help']],
   ['test get', ['test', 'get', '--help']],
@@ -50,6 +52,13 @@ const cases: Array<[string, string[]]> = [
   ['test run', ['test', 'run', '--help']],
   // DEV-331 piece 3
   ['test cancel', ['test', 'cancel', '--help']],
+  // DEV-384 V3-B — plan generation surface (group + both new leaves). Locks
+  // the no-price spend-reporting wording in the generate help (spend is
+  // reported on the result line, never quoted up front) and the --only
+  // safety wording in the accept help.
+  ['test plan', ['test', 'plan', '--help']],
+  ['test plan generate', ['test', 'plan', 'generate', '--help']],
+  ['test plan accept', ['test', 'plan', 'accept', '--help']],
   ['testlist', ['testlist', '--help']],
   ['testlist list', ['testlist', 'list', '--help']],
   ['testlist get', ['testlist', 'get', '--help']],
@@ -59,6 +68,8 @@ const cases: Array<[string, string[]]> = [
   ['testlist add', ['testlist', 'add', '--help']],
   ['testlist remove', ['testlist', 'remove', '--help']],
   ['testlist run', ['testlist', 'run', '--help']],
+  ['ci', ['ci', '--help']],
+  ['ci init', ['ci', 'init', '--help']],
 ];
 
 describe('--help snapshots', () => {

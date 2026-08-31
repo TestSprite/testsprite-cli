@@ -448,6 +448,110 @@ describe('runInit — --agent cursor', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 4b. Reload hint in the setup summary (DEV-279)
+// ---------------------------------------------------------------------------
+
+describe('runInit — reload hint', () => {
+  it('text mode: summary tells the user to reopen the agent after a real install', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-hint' }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    const stdout = captured.stdout.join('\n');
+    expect(stdout).toContain('Reopen (or restart) your coding agent');
+    expect(stdout).toContain('claude');
+  });
+
+  it('does NOT show the reload hint with --no-agent (nothing was installed)', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-hint', noAgent: true }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    expect(captured.stdout.join('\n')).not.toContain('Reopen (or restart)');
+  });
+
+  it('does NOT show the reload hint when re-running setup with skills already current', async () => {
+    const { fs: agentFs } = makeMemFs();
+
+    // First setup writes both skill files.
+    const { deps: firstDeps } = makeCapture();
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-hint' }), {
+      ...firstDeps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    // Second setup finds them byte-identical → aggregate action 'skipped'.
+    const { captured, deps } = makeCapture();
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-hint' }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    const stdout = captured.stdout.join('\n');
+    expect(stdout).toContain('(skipped)');
+    expect(stdout).not.toContain('Reopen (or restart)');
+  });
+
+  it('does NOT show the reload hint under --dry-run (nothing landed on disk)', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+
+    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-user-hint' }), {
+      ...deps,
+      fetchImpl: vi.fn(async () => new Response('{}')) as unknown as InitDeps['fetchImpl'],
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    expect(captured.stdout.join('\n')).not.toContain('Reopen (or restart)');
+  });
+
+  it('does NOT show the reload hint in --output json (stdout stays pure JSON)', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-hint', output: 'json' }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    const stdout = captured.stdout.join('\n');
+    expect(stdout).not.toContain('Reopen (or restart)');
+    expect(() => JSON.parse(stdout)).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 5. --dry-run: zero fetch calls, zero fs writes
 // ---------------------------------------------------------------------------
 

@@ -1710,3 +1710,65 @@ describe('runTestWait — InterruptError graceful detach (DEV-331)', () => {
     expect(shutdown.isArmed).toBe(false); // disarmed after the poll completes
   });
 });
+
+// ---------------------------------------------------------------------------
+// Progress line shape at the call site (TTY + NO_COLOR, so the ticker writes
+// plain lines through the injectable `stderr` and the 1s refresher — which
+// only makes sense for an in-place redraw — must stay unarmed)
+// ---------------------------------------------------------------------------
+
+describe('test wait — stderr progress line', () => {
+  it('shows the recorded step count with no denominator, and arms no refresher under NO_COLOR', async () => {
+    const isTTYDescriptor = Object.getOwnPropertyDescriptor(process.stderr, 'isTTY');
+    const priorNoColor = process.env.NO_COLOR;
+    Object.defineProperty(process.stderr, 'isTTY', { value: true, configurable: true });
+    process.env.NO_COLOR = '1';
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval');
+    try {
+      const { credentialsPath } = makeCreds();
+      const stderrLines: string[] = [];
+      let polls = 0;
+      const fetchImpl = makeFetch(() => {
+        polls++;
+        if (polls === 1) {
+          return {
+            body: {
+              ...makeRun('running'),
+              stepSummary: { total: 2, completed: 2, passedCount: 2, failedCount: 0 },
+            },
+          };
+        }
+        return { body: makeRun('passed') };
+      });
+      await runTestWait(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          dryRun: false,
+          runId: 'run_abc',
+          timeoutSeconds: 60,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => {},
+          stderr: line => stderrLines.push(line),
+          sleep: instantSleep,
+        },
+      );
+      const progress = stderrLines.filter(l => l.includes('Run run_abc —'));
+      expect(progress.length).toBeGreaterThanOrEqual(2);
+      expect(progress[0]).toMatch(/Run run_abc — running · 2 steps · \d+s$/);
+      expect(progress.at(-1)).toMatch(/Run run_abc — passed · 5 steps · \d+s$/);
+      expect(progress.every(l => !/\d+\/\d+ step/.test(l))).toBe(true);
+      expect(setIntervalSpy).not.toHaveBeenCalled();
+    } finally {
+      setIntervalSpy.mockRestore();
+      if (priorNoColor === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = priorNoColor;
+      if (isTTYDescriptor) Object.defineProperty(process.stderr, 'isTTY', isTTYDescriptor);
+      else delete (process.stderr as { isTTY?: boolean }).isTTY;
+    }
+  });
+});

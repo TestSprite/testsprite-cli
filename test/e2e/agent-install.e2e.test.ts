@@ -788,13 +788,16 @@ describe('--skill flag', () => {
 // ---------------------------------------------------------------------------
 
 describe('agent list', () => {
-  it('output includes TARGET, SKILL column header and both default skill names', () => {
+  it('output includes AGENT, SKILL column header and both default skill names', () => {
     const result = runCli(['agent', 'list']);
     expect(result.status).toBe(0);
 
-    // Header must include TARGET and SKILL columns
-    expect(result.stdout).toContain('TARGET');
+    // Header must include AGENT and SKILL columns; STATUS/MODE were dropped from
+    // the text table in DEV-279 (still present in --output json).
+    expect(result.stdout).toContain('AGENT');
     expect(result.stdout).toContain('SKILL');
+    expect(result.stdout).not.toContain('STATUS');
+    expect(result.stdout).not.toContain('MODE');
 
     // Both default skills must appear in the output
     for (const skill of DEFAULT_SKILLS) {

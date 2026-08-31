@@ -16,8 +16,10 @@ Commands:
                                   may be given positionally (e.g. \`agent
                                   install cursor codex\`) and/or via --target;
                                   the two are merged.
-  list                            List supported agent targets and skills,
-                                  their status, and landing paths
+  list                            List the agent targets and skills this CLI
+                                  can install and where each lands (run
+                                  \`testsprite agent status\` to see what is
+                                  installed here)
   status [options]                Check installed TestSprite skill files
                                   against this CLI version: ok, stale,
                                   modified, unmarked, absent, or corrupt (exits
@@ -55,7 +57,8 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > agent list 1`] = `
 "Usage: testsprite agent list [options]
 
-List supported agent targets and skills, their status, and landing paths
+List the agent targets and skills this CLI can install and where each lands
+(run \`testsprite agent status\` to see what is installed here)
 
 Options:
   -h, --help  display help for command
@@ -126,6 +129,48 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 "
 `;
 
+exports[`--help snapshots > ci 1`] = `
+"Usage: testsprite ci [options] [command]
+
+Scaffold CI integration for TestSprite
+
+Options:
+  -h, --help                 display help for command
+
+Commands:
+  init [options] <platform>  Write a CI workflow that runs your TestSprite
+                             tests (platform: github)
+  help [command]             display help for command
+"
+`;
+
+exports[`--help snapshots > ci init 1`] = `
+"Usage: testsprite ci init [options] <platform>
+
+Write a CI workflow that runs your TestSprite tests (platform: github)
+
+Options:
+  --project <id>       project id to run (auto-detected if you have exactly
+                       one)
+  --filter <substr>    only run tests whose name contains this substring
+  --timeout <s>        max seconds to wait for a terminal verdict (1-3600)
+                       (default: "600")
+  --path <file>        output path for the workflow (default:
+                       ".github/workflows/testsprite.yml")
+  --force              overwrite an existing workflow (a .bak backup is kept)
+                       (default: false)
+  --set-secret         set the TESTSPRITE_API_KEY repo secret via gh (if
+                       installed + authenticated); OVERWRITES an existing
+                       secret of that name (default: false)
+  --repo <owner/name>  target repo for --set-secret (gh infers from the cwd if
+                       omitted)
+  -h, --help           display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
 exports[`--help snapshots > init 1`] = `
 "Usage: testsprite init [options]
 
@@ -187,7 +232,39 @@ Commands:
                                      (Pro).
                                      A fresh token is fetched on each run and
                                      injected into every backend test.
+  docs                               Manage project documents — the sources
+                                     plan generation feeds on
   help [command]                     display help for command
+"
+`;
+
+exports[`--help snapshots > project docs upload 1`] = `
+"Usage: testsprite project docs upload [options] <file>
+
+Upload an API spec or PRD as a project source (DEV-384). Three steps:
+mint a presigned S3 URL, stream the file bytes to it, register the
+document — which starts processing + embedding. The local file is
+only read; nothing is written back to disk.
+
+Exit codes:
+  0  upload registered (processing started)
+  3  auth error
+  4  project not found (or not accessible in this workspace)
+  5  validation error (missing/empty file, bad --role)
+  7  request timeout (also: backend predates the docs routes)
+ 10  presigned S3 PUT failed — re-run to mint a fresh URL
+
+Options:
+  --project <id>             project id the document belongs to (required)
+  --role <role>              document role: api-doc (API spec, default) | prd
+  --name <display-name>      display name for the document (default: file
+                             basename)
+  --idempotency-key <token>  opaque idempotency token. Defaults to a UUIDv4
+                             minted per invocation.
+  -h, --help                 display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
 "
 `;
 
@@ -275,7 +352,7 @@ Commands:
   Per-run detail: testsprite test wait <run-id>
   Failure bundle:  testsprite test artifact get <run-id>
   update [options] <test-id>            Update test metadata — name,
-                                        description, priority
+                                        description, priority, step timeout
   delete [options] <test-id>            Permanently delete a test. Requires
                                         --confirm. (M3.2 piece-3)
   delete-batch [options] [test-ids...]  Permanently delete multiple tests in one command. Requires --confirm.
@@ -358,7 +435,8 @@ Commands:
     4  test not found (no replayable run — trigger \`testsprite test run <id>\` first)
     5  validation error
   code                                  Inspect and edit generated test code
-  plan                                  Manage FE test plan-steps (FE-only)
+  plan                                  Generate + accept AI test plans (V3),
+                                        and manage FE plan-steps
   failure                               Export the latest-failure agent bundle
   artifact                              Download run-scoped artifact bundles
                                         (M3.3 piece-4)
@@ -435,12 +513,15 @@ Options:
                              storage)
   --description <text>       optional human description (≤ 2000 chars)
   --priority <prio>          optional priority — one of: p0, p1, p2, p3
+  --step-timeout <ms>        per-test step timeout in milliseconds (1-60000);
+                             applied by the execution engine to every step of
+                             this test
   --code-file <path>         file containing the test code (≤ 350 KB)
   --plan-from <path>         JSON file with the full FE test definition —
                              projectId, type, name, planSteps[] all live in the
                              file (≤ 256 KB; mutually exclusive with
                              --code-file). In this mode
-                             --project/--type/--name/--description/--priority
+                             --project/--type/--name/--description/--priority/--step-timeout
                              are ignored.
   --plan-template            print a minimal valid plan-file skeleton to stdout
                              and exit (pure-local: no network, no credentials,
@@ -482,7 +563,7 @@ Options:
 Plan file format (--plan-from <file>) — minimal valid example:
 
 {
-  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.7.0/schemas/plan.schema.json",
+  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.8.0/schemas/plan.schema.json",
   "projectId": "prj_abc123",
   "type": "frontend",
   "name": "Login rejects an empty password",
@@ -654,6 +735,96 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 "
 `;
 
+exports[`--help snapshots > test plan 1`] = `
+"Usage: testsprite test plan [options] [command]
+
+Generate + accept AI test plans (V3), and manage FE plan-steps
+
+Options:
+  -h, --help               display help for command
+
+Commands:
+  put [options] <test-id>  Replace an FE test's planSteps[] (BE tests return
+                           400 → use 'test code put')
+  generate [options]       Generate AI test-case proposals for a project — runs
+                           only the missing pipeline stages and stages the
+                           results server-side for review (nothing is written
+                           locally)
+  accept [options]         Convert staged proposals into real test cases (free)
+                           — all of them, or a subset with --only
+  help [command]           display help for command
+"
+`;
+
+exports[`--help snapshots > test plan accept 1`] = `
+"Usage: testsprite test plan accept [options]
+
+Convert staged proposals into real test cases (free) — all of them, or a subset
+with --only
+
+Options:
+  --project <id>             project id (V3-native; V2 ids resolve through the
+                             migration bridge)
+  --only <ids...>            accept only these proposal ids (space- or
+                             comma-separated; the ids come from the \`test plan
+                             generate\` table). Accepting a subset discards the
+                             rest. ANY id that matches no staged proposal is a
+                             validation error — the request is never sent.
+  --idempotency-key <token>  opaque idempotency token (1-256 ASCII chars).
+                             Defaults to a UUIDv4 minted per invocation; pin
+                             one yourself for safe retries.
+  -h, --help                 display help for command
+
+Notes:
+  - Accepting adds no charge of its own; generation already did the work.
+  - API test code is generated when the tests first run, not at accept.
+  - Accepting a subset discards the remaining staged proposals (the staging
+    area is cleared either way) — the output says how many were discarded.
+  - Nothing staged → exit 6 with a pointer at \`test plan generate\`.
+
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > test plan generate 1`] = `
+"Usage: testsprite test plan generate [options]
+
+Generate AI test-case proposals for a project — runs only the missing pipeline
+stages and stages the results server-side for review (nothing is written
+locally)
+
+Options:
+  --project <id>             project id (V3-native; V2 ids resolve through the
+                             migration bridge)
+  --timeout <seconds>        total wait budget in seconds (1-3600, default
+                             1800; exploration takes minutes on a fresh
+                             frontend project)
+  --idempotency-key <token>  opaque idempotency token (1-256 ASCII chars).
+                             Defaults to a UUIDv4 minted per invocation; pin
+                             one yourself for safe retries.
+  -h, --help                 display help for command
+
+Behavior:
+  - Only the stages the project is missing actually run; a second call
+    resumes rather than starting over.
+  - Proposals are STAGED on the server for review; nothing is written to disk.
+  - Re-running the command re-attaches to an in-flight stage (409 attaches).
+  - Ctrl-C detaches locally; server-side work and charges continue.
+  - Exit 7 on --timeout: re-run the same command to re-attach.
+  - Workspace credits are spent per stage that runs; the result line reports
+    what THIS run charged (omitted when nothing new was charged).
+    \`testsprite usage\` shows your balance.
+
+Next step: review the printed table, then \`testsprite test plan accept\`.
+
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
 exports[`--help snapshots > test rerun 1`] = `
 "Usage: testsprite test rerun [options] [test-ids...]
 
@@ -819,6 +990,32 @@ Options:
                               permits the Lambda but not this machine); use
                               this flag when you know better. Zero network
                               calls when set. (default: false)
+  --local <port>              run against an app on THIS machine, reached
+                              through a TestSprite tunnel. The test runner
+                              navigates to http://127.0.0.1:<port> and its
+                              traffic is proxied back to you for as long as
+                              this command runs. Implies --wait (the tunnel
+                              closes when the command exits, so a detached run
+                              could not finish) and cannot be combined with
+                              --target-url. Frontend tests only. Before
+                              anything is minted or billed, the port is probed
+                              and a dead one is refused.
+  --local-host <host>         with --local, which loopback address to name in
+                              the run's target URL — one of localhost,
+                              127.0.0.1, ::1 (default 127.0.0.1). Use localhost
+                              if your app only answers on that name, or ::1 for
+                              an IPv6-only listener.
+  --tunnel-client <id>        with --local, attach to a tunnel already running
+                              under \`testsprite tunnel start\` instead of
+                              opening a new one. The id is the non-secret
+                              handle that command prints; the tunnel stays
+                              owned by that process and is not closed when this
+                              run finishes.
+  --no-cancel-on-interrupt    with --local, leave the run executing (and
+                              billing) when this command stops waiting. By
+                              default a --local run is cancelled at that point,
+                              because its tunnel closes with this process and
+                              the run could then only fail.
   --wait                      poll until terminal status or --timeout elapses
                               (default: false)
   --timeout <s>               with --wait, max seconds to wait (1–3600, default
@@ -849,6 +1046,10 @@ Options:
   --summary-file <path>       with --wait (single test or --all): also write
                               the reduced machine summary JSON {total, passed,
                               failed, timedOut, runs[]} to this file
+  --allow-empty               with --all: exit 0 when the run dispatches ZERO
+                              tests (all skipped / empty project / --filter
+                              matched nothing). Default: fail with exit 5 — a
+                              zero-dispatch run is a CI false-green
   -h, --help                  display help for command
 
 Dependency-aware fresh run (M4):
@@ -1095,7 +1296,10 @@ Commands:
   project                      Manage TestSprite projects
   test                         Inspect TestSprite tests
   testlist                     Manage test lists (groups of tests)
+  ci                           Scaffold CI integration for TestSprite
   schedule                     Manage TestSprite schedules
+  tunnel                       Open a tunnel so TestSprite can reach an app on
+                               this machine
   agent                        Install TestSprite guidance into coding-agent
                                config (Claude Code, Cursor, Cline, Antigravity,
                                Kiro, Windsurf, Copilot, Codex)

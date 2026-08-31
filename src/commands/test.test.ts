@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Command } from 'commander';
+import type { RunResponse } from '../lib/runs.types.js';
 import { ApiError, InterruptError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT } from '../lib/output.js';
 import { ShutdownController } from '../lib/interrupt.js';
@@ -21,6 +22,8 @@ import {
   type CliTestStep,
   type TestDeps,
   backendResultIsForThisRun,
+  backendResultToRunResponse,
+  makeBackendWaitFallback,
   createTestCommand,
   isPresignedCodeUrl,
   PLAN_SCHEMA_URL,
@@ -46,6 +49,7 @@ import {
   runSteps,
   runTestWaitMany,
   runUpdate,
+  writeBatchJUnitReportIfRequested,
 } from './test.js';
 
 function disableExits(cmd: Command): void {
@@ -228,6 +232,16 @@ describe('createTestCommand — surface', () => {
       '--columns',
       '--no-header',
     ]);
+  });
+
+  it('create/update expose the per-test step-timeout flags', () => {
+    const test = createTestCommand();
+    const create = test.commands.find(c => c.name() === 'create')!;
+    const update = test.commands.find(c => c.name() === 'update')!;
+    expect(create.options.map(o => o.long)).toContain('--step-timeout');
+    expect(update.options.map(o => o.long)).toEqual(
+      expect.arrayContaining(['--step-timeout', '--clear-step-timeout']),
+    );
   });
 
   it('code get exposes --out as its only option', () => {
@@ -988,6 +1002,33 @@ describe('runGet', () => {
     expect(out.join('\n')).not.toContain('planSteps:');
   });
 
+  it('renders the per-test step timeout when the facade ships a number', async () => {
+    const withStepTimeout: CliTest = { ...FE_TEST, stepTimeoutMs: 45_000 };
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: withStepTimeout }));
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    expect(out.join('\n')).toContain('stepTimeout: 45000 ms (applies to every step)');
+  });
+
+  it.each([undefined, null])(
+    'omits the step-timeout line when stepTimeoutMs is %s',
+    async stepTimeoutMs => {
+      const withoutStepTimeout: CliTest = { ...FE_TEST, stepTimeoutMs };
+      const { credentialsPath } = makeCreds();
+      const fetchImpl = makeFetch(() => ({ body: withoutStepTimeout }));
+      const out: string[] = [];
+      await runGet(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+        { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+      );
+      expect(out.join('\n')).not.toContain('stepTimeout:');
+    },
+  );
+
   it('renders produces/consumes/category when the facade ships them', async () => {
     const withDeps: CliTest = {
       ...FE_TEST,
@@ -1285,6 +1326,145 @@ describe('backendResultIsForThisRun — auto-resume stale-verdict floor (finding
         inFlightCreatedAt,
       ),
     ).toBe(true);
+  });
+});
+
+describe('backend wait fallback — testTitle overlay (DEV-1032 CI title)', () => {
+  // The non-terminal poll shape the fallback synthesizes FROM: the backend only
+  // resolves `testTitle` on a TERMINAL run read, so a running poll carries null.
+  const NON_TERMINAL_RUN: RunResponse = {
+    runId: 'run_be',
+    testId: 'test_be',
+    projectId: 'project_alice',
+    userId: 'u1',
+    status: 'running',
+    source: 'cli',
+    createdAt: '2026-06-01T10:00:00.000Z',
+    startedAt: '2026-06-01T10:00:01.000Z',
+    finishedAt: null,
+    codeVersion: null,
+    targetUrl: null,
+    createdFrom: null,
+    failedStepIndex: null,
+    failureKind: null,
+    error: null,
+    videoUrl: null,
+    testTitle: null,
+    stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
+  } as unknown as RunResponse;
+
+  describe('backendResultToRunResponse — overlay', () => {
+    it('overlays the probe-cached name onto the synthesized terminal response', () => {
+      const out = backendResultToRunResponse(
+        RESULT_PASSED,
+        NON_TERMINAL_RUN,
+        'Smoke — health check',
+      );
+      expect(out.status).toBe('passed');
+      expect(out.testTitle).toBe('Smoke — health check');
+    });
+
+    it('a blank/whitespace title falls back to the run row (null), never renders empty', () => {
+      expect(
+        backendResultToRunResponse(RESULT_PASSED, NON_TERMINAL_RUN, '   ').testTitle,
+      ).toBeNull();
+      expect(backendResultToRunResponse(RESULT_PASSED, NON_TERMINAL_RUN, '').testTitle).toBeNull();
+    });
+
+    it('no title arg keeps the run row value (byte-identical to pre-DEV-1032)', () => {
+      expect(backendResultToRunResponse(RESULT_PASSED, NON_TERMINAL_RUN).testTitle).toBeNull();
+    });
+  });
+
+  describe('makeBackendWaitFallback — wiring: probe name flows into testTitle', () => {
+    const makeClient = (
+      test: CliTest,
+      result: CliLatestResult,
+    ): { get: ReturnType<typeof vi.fn> } => ({
+      get: vi.fn(async (path: string) => {
+        if (path === `/tests/${test.id}`) return test;
+        if (path === `/tests/${test.id}/result`) return result;
+        throw new Error(`unexpected path ${path}`);
+      }),
+    });
+
+    it('BE run: synthesized terminal response carries the title from the one-time type-probe', async () => {
+      const result: CliLatestResult = {
+        ...RESULT_PASSED,
+        testId: 'test_be',
+        runIdIfAvailable: 'run_be',
+      };
+      const client = makeClient(BE_TEST, result);
+      const fallback = makeBackendWaitFallback({
+        client: client as never,
+        resolveTestId: r => r.testId,
+        resolveNotBefore: () => undefined,
+      });
+
+      const out = await fallback(NON_TERMINAL_RUN, 1000, new AbortController().signal);
+      expect(out?.status).toBe('passed');
+      expect(out?.testTitle).toBe('Smoke — health check'); // BE_TEST.name, overlaid
+      // One probe + one result read — no extra request to learn the title.
+      expect(client.get).toHaveBeenCalledWith('/tests/test_be', expect.anything());
+    });
+
+    it('FE run: no-op (fallback returns null, title path untouched)', async () => {
+      const client = makeClient(FE_TEST, RESULT_PASSED);
+      const fallback = makeBackendWaitFallback({
+        client: client as never,
+        resolveTestId: r => r.testId,
+        resolveNotBefore: () => undefined,
+      });
+      const feRun = { ...NON_TERMINAL_RUN, testId: 'test_fe' } as RunResponse;
+      expect(await fallback(feRun, 1000, new AbortController().signal)).toBeNull();
+    });
+  });
+});
+
+describe('writeBatchJUnitReportIfRequested — testcase name precedence (DEV-1032)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ts-junit-'));
+  });
+
+  const nameInReport = async (
+    row: { testId: string; status: string; name?: string; testTitle?: string | null },
+    nameMap?: ReadonlyMap<string, string>,
+  ): Promise<string> => {
+    const file = join(dir, 'report.xml');
+    await writeBatchJUnitReportIfRequested(
+      { report: 'junit', reportFile: file, projectId: 'project_alice' },
+      [row] as never,
+      nameMap,
+    );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- report path is join(dir, ...) inside this test's own mkdtempSync temp dir, never user input.
+    const xml = readFileSync(file, 'utf8');
+    const m = /<testcase[^>]*\bname="([^"]*)"/.exec(xml);
+    return m?.[1] ?? '';
+  };
+
+  it('sweep map wins over testTitle and the row name', async () => {
+    const name = await nameInReport(
+      { testId: 't1', status: 'passed', name: 'row-name', testTitle: 'poll-title' },
+      new Map([['t1', 'sweep-name']]),
+    );
+    expect(name).toBe('sweep-name');
+  });
+
+  it('falls back to testTitle when the sweep map misses (same source as the summary table)', async () => {
+    const name = await nameInReport(
+      { testId: 't1', status: 'passed', name: 'row-name', testTitle: 'poll-title' },
+      new Map(), // sweep over-paged / timed out → empty
+    );
+    expect(name).toBe('poll-title');
+  });
+
+  it('a blank testTitle does not shadow the row name', async () => {
+    const name = await nameInReport(
+      { testId: 't1', status: 'passed', name: 'row-name', testTitle: '   ' },
+      new Map(),
+    );
+    expect(name).toBe('row-name');
   });
 });
 
@@ -5564,6 +5744,48 @@ describe('runCreate', () => {
     expect(sent.headers.get('x-api-key')).toBe('sk-user-test');
   });
 
+  it('includes stepTimeoutMs in the create body and warns once after success', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('def test_smoke():\n    assert True\n');
+    let seenBody: Record<string, unknown> | undefined;
+    const fetchImpl = makeFetch((_url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { body: { items: [] } };
+      seenBody = JSON.parse(init.body as string) as Record<string, unknown>;
+      return { body: SAMPLE_RESPONSE };
+    });
+    const stderrLines: string[] = [];
+
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'step timeout create',
+        codeFile,
+        stepTimeoutMs: 45_000,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+
+    expect(seenBody).toMatchObject({ stepTimeoutMs: 45_000 });
+    const timeoutWarnings = stderrLines.filter(
+      line => line.includes('[warn]') && line.includes('per-step timeout'),
+    );
+    expect(timeoutWarnings).toHaveLength(1);
+    expect(timeoutWarnings[0]).toContain('test run --wait');
+    expect(timeoutWarnings[0]).toContain('600s');
+    expect(timeoutWarnings[0]).toContain('--timeout <s>');
+    expect(timeoutWarnings[0]).toContain('never stops the server-side run');
+  });
+
   it('emits backend warnings[] to stderr without polluting stdout JSON', async () => {
     const { credentialsPath } = makeCreds();
     const codeFile = writeCodeFile('BEARER = "eyJhbGciOi.eyJzdWIiOiJ4In0.sig"\n');
@@ -7364,6 +7586,89 @@ describe('runUpdate', () => {
     expect(seenBody).toEqual({ priority: 'p2' });
   });
 
+  it('accepts a step-timeout-only update, sends the number, and warns once', async () => {
+    const { credentialsPath } = makeCreds();
+    let seenBody: unknown;
+    const fetchImpl = makeFetch((_url, init) => {
+      seenBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { body: { ...SAMPLE_RESPONSE, updatedFields: ['stepTimeoutMs'] } };
+    });
+    const stderrLines: string[] = [];
+
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_alpha',
+        stepTimeoutMs: 30_000,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+
+    expect(seenBody).toEqual({ stepTimeoutMs: 30_000 });
+    expect(
+      stderrLines.filter(line => line.includes('[warn]') && line.includes('per-step timeout')),
+    ).toHaveLength(1);
+  });
+
+  it('--clear-step-timeout sends null and does not print the run-duration warning', async () => {
+    const { credentialsPath } = makeCreds();
+    let seenBody: unknown;
+    const fetchImpl = makeFetch((_url, init) => {
+      seenBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { body: { ...SAMPLE_RESPONSE, updatedFields: ['stepTimeoutMs'] } };
+    });
+    const stderrLines: string[] = [];
+
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_alpha',
+        clearStepTimeout: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+
+    expect(seenBody).toEqual({ stepTimeoutMs: null });
+    expect(stderrLines.some(line => line.includes('per-step timeout'))).toBe(false);
+  });
+
+  it('rejects --step-timeout with --clear-step-timeout before sending', async () => {
+    const fetchImpl = vi.fn();
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_alpha',
+          stepTimeoutMs: 30_000,
+          clearStepTimeout: true,
+        },
+        { fetchImpl: fetchImpl as never, stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      nextAction: expect.stringContaining(
+        '--step-timeout and --clear-step-timeout are mutually exclusive',
+      ),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('threads --produces/--needs/--category into the PUT body with wire names', async () => {
     const { credentialsPath } = makeCreds();
     let seenBody: unknown;
@@ -7675,6 +7980,106 @@ describe('runUpdate', () => {
     );
     expect(res.updatedFields).toEqual(expect.arrayContaining(['name', 'description']));
     expect(res.updatedFields).toHaveLength(2);
+  });
+});
+
+describe('--step-timeout command validation', () => {
+  it.each(['0', '-1', '60001', '1.5', 'abc'])(
+    'create and update reject %s with the millisecond bounds in VALIDATION_ERROR',
+    async raw => {
+      for (const args of [
+        [
+          'create',
+          '--project',
+          'project_alice',
+          '--type',
+          'frontend',
+          '--name',
+          'bounded timeout',
+          '--code-file',
+          '/tmp/not-read-because-validation-runs-first.py',
+          '--step-timeout',
+          raw,
+        ],
+        ['update', 'test_alpha', '--step-timeout', raw],
+      ]) {
+        const test = createTestCommand();
+        disableExits(test);
+        await expect(test.parseAsync(args, { from: 'user' })).rejects.toMatchObject({
+          code: 'VALIDATION_ERROR',
+          details: expect.objectContaining({ field: 'step-timeout' }),
+          nextAction: expect.stringContaining(
+            'must be an integer between 1 and 60000 milliseconds',
+          ),
+        });
+      }
+    },
+  );
+
+  it.each([1, 60_000])('create and update accept the boundary value %i', async boundary => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-step-timeout-'));
+    const codeFile = join(dir, 'test.py');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- code fixture written into this test's own mkdtempSync-created temp dir, never user input.
+    writeFileSync(codeFile, 'def test_smoke():\n    assert True\n', 'utf8');
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchImpl = makeFetch((_url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { body: { items: [] } };
+      bodies.push(JSON.parse(init.body as string) as Record<string, unknown>);
+      if (method === 'POST') {
+        return {
+          body: {
+            testId: 'test_step_timeout',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-08-27T00:00:00.000Z',
+          },
+        };
+      }
+      return {
+        body: {
+          testId: 'test_step_timeout',
+          updatedFields: ['stepTimeoutMs'],
+          updatedAt: '2026-08-27T00:01:00.000Z',
+        },
+      };
+    });
+    const deps = {
+      credentialsPath,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: () => undefined,
+    };
+
+    const create = createTestCommand(deps);
+    disableExits(create);
+    await create.parseAsync(
+      [
+        'create',
+        '--project',
+        'project_alice',
+        '--type',
+        'frontend',
+        '--name',
+        'boundary timeout',
+        '--code-file',
+        codeFile,
+        '--step-timeout',
+        String(boundary),
+      ],
+      { from: 'user' },
+    );
+
+    const update = createTestCommand(deps);
+    disableExits(update);
+    await update.parseAsync(['update', 'test_step_timeout', '--step-timeout', String(boundary)], {
+      from: 'user',
+    });
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toMatchObject({ stepTimeoutMs: boundary });
+    expect(bodies[1]).toEqual({ stepTimeoutMs: boundary });
   });
 });
 
@@ -8355,6 +8760,37 @@ describe('runCreateFromPlan', () => {
     expect(errText).toContain('warning: --plan-from supplies the test definition');
     expect(errText).toContain('--project');
     expect(errText).toContain('--name');
+  });
+
+  it('--plan-from warns that --step-timeout is ignored and omits it from the body', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile(FE_PLAN);
+    let postBody: Record<string, unknown> | undefined;
+    const fetchImpl = makeFetch((_url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { body: { items: [] } };
+      postBody = JSON.parse(init.body as string) as Record<string, unknown>;
+      return { body: SAMPLE_RESPONSE };
+    });
+    const stderrLines: string[] = [];
+    const test = createTestCommand({
+      credentialsPath,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: line => stderrLines.push(line),
+    });
+    disableExits(test);
+
+    await test.parseAsync(['create', '--plan-from', planFile, '--step-timeout', '45000'], {
+      from: 'user',
+    });
+
+    expect(stderrLines.join(' ')).toContain(
+      'warning: --plan-from supplies the test definition; ignoring --step-timeout',
+    );
+    expect(postBody).toBeDefined();
+    expect(postBody).not.toHaveProperty('stepTimeoutMs');
+    expect(stderrLines.some(line => line.includes('per-step timeout'))).toBe(false);
   });
 
   // ---------------------------------------------------------------------------

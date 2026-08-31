@@ -324,6 +324,18 @@ export type InstallAction =
   | 'section-updated'
   | 'section-unchanged';
 
+/**
+ * Actions that mean bytes actually changed on disk — the trigger set for the
+ * post-install reload hint (DEV-279). Covers both write modes: own-file
+ * (`written`/`updated`) and codex managed-section (`section-*`).
+ */
+const CHANGED_ACTIONS: ReadonlySet<InstallAction> = new Set([
+  'written',
+  'updated',
+  'section-installed',
+  'section-updated',
+]);
+
 export interface InstallResult {
   target: AgentTarget;
   path: string; // repo-relative matrix path
@@ -770,6 +782,22 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
     return items.map(r => `${r.target.padEnd(12)} ${r.action.padEnd(12)} ${r.path}`).join('\n');
   });
 
+  // 8b. Reload hint (DEV-279). A coding agent reads its skill/rule files at
+  // session start, so a session already open when we wrote the file won't pick
+  // it up. Fire only when something actually changed on disk — silent on
+  // skipped/unchanged/blocked/dry-run and in --output json. Targets are
+  // de-duplicated (own-file targets produce one result per skill).
+  if (opts.output === 'text') {
+    const changedTargets = [
+      ...new Set(results.filter(r => CHANGED_ACTIONS.has(r.action)).map(r => r.target)),
+    ];
+    if (changedTargets.length > 0) {
+      stderrFn(
+        `[hint] Reopen (or restart) your coding agent (${changedTargets.join(', ')}) so it picks up the newly installed TestSprite skill(s).`,
+      );
+    }
+  }
+
   // 9. Exit with 6 if any blocked
   if (results.some(r => r.action === 'blocked')) {
     throw new CLIError(
@@ -791,8 +819,19 @@ export interface ListResult {
   path: string;
 }
 
+/**
+ * Display name for the AGENT column. Experimental targets get an "(exp.)" tag so
+ * support maturity stays visible without a dedicated STATUS column — a bare
+ * `ga`/`experimental` column reads like install state, which is `agent status`'s
+ * job, not this catalog's (DEV-279).
+ */
+function agentDisplayName(target: AgentTarget, status: string): string {
+  return status === 'experimental' ? `${target} (exp.)` : target;
+}
+
 export async function runList(opts: CommonOptions, deps: AgentDeps = {}): Promise<void> {
   const out = makeOutput(opts.output, deps);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   // One row per (target × default skill). Own-file targets land each skill at a
   // distinct path; the codex managed-section target merges all skills into the
@@ -814,15 +853,27 @@ export async function runList(opts: CommonOptions, deps: AgentDeps = {}): Promis
     }
   }
 
+  // The text table shows only what someone choosing an agent needs: the agent
+  // (with an "(exp.)" maturity tag), the skill, and where it lands. STATUS and
+  // MODE stay in the JSON shape for back-compat but are dropped from the human
+  // table — MODE is an internal write strategy, and STATUS (ga/experimental)
+  // reads like install state, which lives in `agent status` (DEV-279).
   out.print(results, data => {
     const items = data as ListResult[];
-    const header = `${'TARGET'.padEnd(14)} ${'SKILL'.padEnd(20)} ${'STATUS'.padEnd(12)} ${'MODE'.padEnd(18)} PATH`;
+    const header = `${'AGENT'.padEnd(20)} ${'SKILL'.padEnd(20)} PATH`;
     const rows = items.map(
-      r =>
-        `${r.target.padEnd(14)} ${r.skill.padEnd(20)} ${r.status.padEnd(12)} ${r.mode.padEnd(18)} ${r.path}`,
+      r => `${agentDisplayName(r.target, r.status).padEnd(20)} ${r.skill.padEnd(20)} ${r.path}`,
     );
     return [header, ...rows].join('\n');
   });
+
+  // Point at the command that answers "is it installed here?" (text mode only —
+  // never pollute the JSON stream).
+  if (opts.output === 'text') {
+    stderrFn(
+      'Run `testsprite agent status` to see which of these skills are installed in this project.',
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,7 +1172,9 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
 
   agent
     .command('list')
-    .description('List supported agent targets and skills, their status, and landing paths')
+    .description(
+      'List the agent targets and skills this CLI can install and where each lands (run `testsprite agent status` to see what is installed here)',
+    )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_o, command: Command) => {
       await runList(resolveCommonOptions(command), deps);

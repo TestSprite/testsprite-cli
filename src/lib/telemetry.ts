@@ -52,6 +52,15 @@ export interface TelemetryOutcomeInput {
   endpointUrl?: string;
   output?: string;
   dryRun?: boolean;
+  /**
+   * True when the invocation requested a local tunnel target (`test run
+   * --local <port>`) — the flag's mere presence, never its port number or
+   * host. Reported regardless of outcome, including a zero-network refusal
+   * (dead port, `--local` combined with an incompatible flag): those are
+   * exactly the attempts nothing server-side ever sees, which is why this
+   * field is not redundant with a backend-side mint/attach analytics event.
+   */
+  local?: boolean;
 }
 
 export interface TelemetryDeps {
@@ -87,6 +96,8 @@ export interface TelemetryEvent {
   nodeVersion?: string;
   output?: string;
   ci?: boolean;
+  /** Present (always `true`) only for a `test run --local` invocation; absent otherwise. */
+  local?: boolean;
 }
 
 /**
@@ -154,6 +165,7 @@ export function buildTelemetryEvent(
     nodeVersion: process.versions.node,
     ...(input.output === 'json' || input.output === 'text' ? { output: input.output } : {}),
     ci: isTruthyEnv(env.CI) || !isTTY,
+    ...(input.local ? { local: true } : {}),
   };
 }
 

@@ -6,7 +6,22 @@ import security from 'eslint-plugin-security';
 
 export default tseslint.config(
   {
-    ignores: ['dist/**', 'coverage/**', 'node_modules/**', 'perf/**', '.claude/worktrees/**'],
+    ignores: [
+      'dist/**',
+      'coverage/**',
+      'node_modules/**',
+      'perf/**',
+      '.claude/worktrees/**',
+      // Byte copies of the tunnel repo's Node client (see
+      // src/vendor/tunnel-client/VENDOR.md). Reformatting or restyling them
+      // would turn every upstream re-sync into an unreadable diff, which is
+      // the exact drift the vendoring exists to prevent. Our own delta files
+      // in that directory (ws-compat / lodash-lite / config / index) are NOT
+      // exempt and are linted normally.
+      'src/vendor/tunnel-client/client.ts',
+      'src/vendor/tunnel-client/protocol.ts',
+      'src/vendor/tunnel-client/types.ts',
+    ],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,

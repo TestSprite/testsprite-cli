@@ -32,6 +32,7 @@ import type {
   CliTestStep,
 } from '../../commands/test.js';
 import type { MeResponse } from '../../commands/auth.js';
+import { ApiError } from '../errors.js';
 import type { CliSchedule, CliScheduleRun } from '../../commands/schedule.js';
 import { buildJUnitReport } from '../junit-report.js';
 import type { Page } from '../pagination.js';
@@ -44,6 +45,11 @@ import type {
   ListRunsResponse,
   CancelRunResponse,
 } from '../runs.types.js';
+import type {
+  CliAcceptPlansResponse,
+  CliGeneratePlansResponse,
+  CliGetPlansResponse,
+} from '../plans.types.js';
 
 const SAMPLE_USER_ID = '11111111-1111-4111-8111-111111111111';
 const SAMPLE_KEY_ID = 'key_dryrun_2026';
@@ -545,6 +551,98 @@ const PATH_PREFIX = '/api/cli/v1';
 const ENTRIES: DryRunSampleEntry[] = [
   entry('whoami', 'GET', '/me', me),
   entry('listProjects', 'GET', '/projects', pageOf(projects)),
+  // DEV-384 V3-B — plan-generation surface. All three MUST be registered
+  // BEFORE `getProject`: findSample is first-match-wins and the projects/*
+  // family shares the `/projects/…` prefix, so the more specific plans
+  // paths are listed first (same defensive convention as `/tests/{id}/runs`
+  // before the `/tests/{id}` catch-all; `samples.test.ts` proves the
+  // ordering with shadowing tests).
+  //
+  // The trigger sample reports the PROPOSALS rung starting
+  // (`stagesRemaining: []`) and the plans sample shows the settled result
+  // (idle + two staged proposals), so a dry-run learner sees a coherent
+  // story: trigger → stage runs → staged batch with stable proposalIds.
+  entry('generatePlans', 'POST', '/projects/{projectId}/plans/generate', {
+    status: 'accepted',
+    projectId: SAMPLE_PROJECT_ID,
+    stage: 'proposals',
+    stagesRemaining: [],
+    enqueuedAt: '2026-07-28T09:00:00.000Z',
+  } satisfies CliGeneratePlansResponse),
+  // One frontend proposal (with action/assertion steps) and one backend
+  // proposal (with endpointPath/captures/consumes) so both wire shapes are
+  // learnable offline. `credits` shows the charged-actions breakdown the
+  // real facade fills best-effort.
+  entry('getPlans', 'GET', '/projects/{projectId}/plans', {
+    generation: { status: 'idle', errorCode: null, errorMessage: null },
+    proposals: [
+      {
+        proposalId: 'prop_1',
+        title: 'Login happy path',
+        description: 'Sign in with valid credentials and land on the dashboard.',
+        priority: 'p1',
+        category: 'auth',
+        feature: 'login',
+        type: 'frontend',
+        steps: [
+          { type: 'action', description: 'Enter valid credentials and submit the login form' },
+          { type: 'assertion', description: 'Dashboard heading is visible' },
+        ],
+      },
+      {
+        proposalId: 'prop_2',
+        title: 'Create order — success',
+        description: 'POST a valid order and capture its id for downstream tests.',
+        priority: 'p2',
+        category: 'orders',
+        feature: 'create-order',
+        type: 'backend',
+        endpointPath: '/v1/orders',
+        captures: ['orderId'],
+        consumes: ['authToken'],
+      },
+    ],
+    credits: {
+      charged: [
+        { action: 'strategy', amount: 1 },
+        { action: 'proposals', amount: 2 },
+      ],
+      balance: 147,
+    },
+  } satisfies CliGetPlansResponse),
+  // Input-derived: echoes the explicit id list the CLI always sends (never
+  // the omitted or empty forms — §3.3 safety rules), so `accept --only
+  // prop_2 --dry-run` shows acceptedCount: 1 rather than a canned 2.
+  entry('acceptPlans', 'POST', '/projects/{projectId}/plans/accept', (req?: unknown) => {
+    const body = req != null && typeof req === 'object' ? (req as Record<string, unknown>) : {};
+    const only = Array.isArray(body.only)
+      ? body.only.filter((id): id is string => typeof id === 'string')
+      : null;
+    const ids = only !== null && only.length > 0 ? only : ['prop_1', 'prop_2'];
+    return {
+      acceptedCount: ids.length,
+      caseKeys: ids.map(id => `case_dryrun_${id}`),
+    } satisfies CliAcceptPlansResponse;
+  }),
+  // DEV-384 piece V3-D — `project docs upload` two-step facade routes.
+  // Registered BEFORE the broader project patterns (design doc §7 ordering
+  // rule; findSample is first-match-wins) and with `/docs/upload-url` before
+  // `/docs`. NOT consumed by the command's dry-run path: `project docs
+  // upload --dry-run` is an inline early-exit (zero network, stat only —
+  // the presigned S3 PUT leg cannot be expressed as a canned fetch sample).
+  // These are documentation/shape-guards, same family as `deleteBatch`.
+  entry('docsUploadUrl', 'POST', '/projects/{projectId}/docs/upload-url', {
+    uploadUrl:
+      'https://s3.dry-run.invalid/testsprite-usercontent/u_dryrun/p_dryrun_2026/openapi.yaml?X-Amz-Signature=dryrun',
+    s3Key: 'u_dryrun/p_dryrun_2026/openapi.yaml',
+    expiresInSeconds: 3600,
+  }),
+  entry('docsRegister', 'POST', '/projects/{projectId}/docs', {
+    resourceId: 'res_dryrun_2026',
+    displayName: 'openapi.yaml',
+    docRole: 'API_DOC',
+    processStatus: 'Pending',
+  }),
   entry('getProject', 'GET', '/projects/{projectId}', projects[0]),
   // P6 — POST /projects (create project). The id uses a stable dry-run
   // sentinel so agents can see a coherent field shape without a real key.
@@ -974,6 +1072,36 @@ function pageOf<T>(items: T[]): Page<T> {
  * `putPlanSteps`, `createTestBatch`) so their responses reflect the
  * user's actual flags rather than static canned values.
  */
+/**
+ * Like {@link findSample}, but a missing sample throws instead of returning
+ * `undefined`. For dry-run paths that resolve samples DIRECTLY (bypassing the
+ * dry-run fetch impl, which has its own loud INTERNAL envelope for this):
+ * without the throw, a lost registry entry surfaces as a raw TypeError deep
+ * in a renderer (DEV-384 review F6 — `samples.ts` is a real merge-conflict
+ * hotspot, so a silently dropped entry is a live hazard, not a hypothetical).
+ */
+export function findSampleOrThrow(
+  method: string,
+  url: string,
+  requestBody?: unknown,
+): DryRunSampleEntry {
+  const entry = findSample(method, url, requestBody);
+  if (entry === undefined) {
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'INTERNAL',
+        message:
+          `dry-run sample registry has no entry for ${method.toUpperCase()} ${extractPath(url)} — ` +
+          'a sample was removed or shadowed in src/lib/dry-run/samples.ts (internal CLI bug).',
+        nextAction: 'Please report this to support@testsprite.com.',
+        requestId: SAMPLE_DRY_RUN_REQUEST_ID,
+        details: { method: method.toUpperCase(), path: extractPath(url) },
+      },
+    });
+  }
+  return entry;
+}
+
 export function findSample(
   method: string,
   url: string,

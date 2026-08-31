@@ -12,8 +12,11 @@ Your job is to take a repo that has **no TestSprite tests yet** and leave it wit
 A new user who can immediately run a real, passing test is an activated user; an empty
 project is the #1 drop-off.
 
-This skill only uses shipped CLI commands. It works the same whether the user is on the V2
-or V3 backend — the CLI routes internally. Do **not** call backend APIs directly.
+This skill only uses shipped CLI commands. Do **not** call backend APIs directly.
+
+Step 3 offers two paths to a suite, tried in order: let TestSprite **generate** the tests
+(fastest; needs a V3-platform account and a recent CLI), or **author** them by hand
+(always works). Everything else here is identical either way.
 
 ## When to use
 
@@ -64,7 +67,53 @@ Capture the returned `projectId`.
 > `No environment URL configured` — the suite goes all-red. Always pass `--url`. If flows need
 > login, pass `--username/--password-file` now so authenticated pages are reachable.
 
-### 3. Author the tests (quality over quantity)
+### 3. Get the tests — try generation first, author by hand if it isn't available
+
+#### 3a. Preferred: generate → review → accept
+
+TestSprite proposes the cases; proposals stage **on the server** (nothing lands in the
+repo) and you accept the ones worth keeping.
+
+**API projects need an API spec first** — with none, generation stops at
+`no_processed_inputs`. Upload the spec (the file is only read). A PRD is optional and goes
+**alongside** the spec, not instead of it: endpoints are read from the spec, and the PRD
+shapes the feature map (`--role prd`, 0.5 credits). A PRD alone can charge the strategy
+stage and then fail with no endpoints found. Frontend projects skip this, since exploring
+the live app creates their inputs.
+
+```bash
+testsprite project docs upload ./openapi.yaml --project <projectId> --role api-doc
+testsprite project docs upload ./prd.md --project <projectId> --role prd   # optional, with the spec
+```
+
+```bash
+testsprite test plan generate --project <projectId>
+```
+
+It runs only the stages the project is missing and prints proposals with stable ids. A
+fresh frontend project takes minutes (browser agents visit the app) — that's normal;
+Ctrl-C only detaches, the work continues. If it says inputs are still processing, wait
+and re-run.
+
+**Review the table before accepting — that's the quality gate, and it's your job.** Check
+titles and steps against what you learned in step 1; drop anything testing a flow the repo
+doesn't have, duplicating another, or asserting something vague.
+
+```bash
+testsprite test plan accept --project <projectId>                       # all of them
+testsprite test plan accept --project <projectId> --only prop_2 prop_5  # or a subset
+```
+
+A subset accept **discards the rest**, so name every proposal you want in that one call.
+Then `testsprite test list --project <projectId>` for the ids, and go to step 5
+(**skip step 4** — that's the hand-authoring path).
+
+**If generation isn't available, fall back to 3b — don't stall.** That means an unknown
+`test plan generate` command (older CLI), an account not on the V3 platform (exit 6), or
+no reachable URL and no source to read. Say which happened, then author the tests
+yourself; don't ask the user to upgrade or migrate first.
+
+#### 3b. Fallback: author the tests by hand (quality over quantity)
 
 **Frontend** — one JSON plan file per flow, in a directory (e.g. `./testsprite-plans/`).
 Each file is a COMPLETE plan and must include `projectId` (from step 2), `type: "frontend"`,
@@ -119,7 +168,7 @@ rubber-stamp. Vague assertions are how false-PASS sneaks in.
 
 Aim for ~8–15 tests covering the core flows. Don't pad.
 
-### 4. Batch-create
+### 4. Batch-create (hand-authored path only — skip if you accepted generated proposals)
 
 Frontend (one call, up to 50 plans from the directory — `create-batch` is FE-only and has
 **no `--project` flag**; the project comes from each plan file's `projectId`):
@@ -163,6 +212,9 @@ Tell the user, plainly:
 ## Quality checklist (self-check before reporting done)
 
 - [ ] FE project has a real `--url`; login configured if the app needs it.
+- [ ] API project: an API spec uploaded before generating (a PRD is optional, alongside it) — or you used path 3b.
+- [ ] If you generated: you **read the proposals** and dropped the ones that don't fit,
+      rather than accepting the batch unseen.
 - [ ] Every FE assertion names a concrete, observable outcome (no "verify it works").
 - [ ] Tests cover the core flows you found in the code, not just one page.
 - [ ] Smoke-ran 2–3 happy-path tests, not the whole suite.
@@ -175,6 +227,10 @@ Tell the user, plainly:
 - Don't call backend endpoints directly — only the `testsprite` CLI.
 - Don't create a FE project without a URL.
 - Don't re-seed a project that already has tests — that's not this skill's job.
+- Don't accept a generated batch unread — reviewing it is the point of the staging step.
+- Don't stall when generation isn't available — say so and hand-author instead.
+- Don't re-run `test plan generate` hoping for a different batch: with proposals already
+  staged it starts nothing, and regenerating is a Portal action today.
 
 ## Hand off to verify
 

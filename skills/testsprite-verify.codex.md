@@ -10,11 +10,11 @@ docs/config and is about to be reported complete.
 Run after a feature or fix lands. Skip only for: docs-only edits, pure
 build/config changes, or when the repo has no TestSprite project linked.
 
-The CLI only tests a reachable deployed URL (it rejects localhost). If the
-change is only running locally, hand off to the TestSprite MCP when it's
-available — it tunnels your local server; otherwise report the change as
-unverified-because-undeployed and stop. If the user explicitly named a tool
-(the CLI or the MCP), honor that over this reachability heuristic.
+The CLI tests a deployed URL via `--target-url`, or a frontend test on this
+machine via `--local <port>` (tunnels `localhost`/`127.0.0.1`/`::1` only; needs
+a key with the `run:tunnel` scope — 403 there means mint a new key; a backend
+test's target is baked into its code, so it can't use `--local`). If the user
+named a tool (the CLI or the MCP), honor that even when both could apply.
 
 ## Core loop
 
@@ -67,23 +67,25 @@ testsprite test run --all --project <id> [--filter <substr>] \
 **Key behaviors:**
 
 - `--target-url` must be publicly reachable (no localhost / RFC1918) and must
-  already have the change deployed (e.g. a CI preview deploy) — the CLI tests a
-  deployed URL, it doesn't host your environment. Running earlier verifies the
-  previous build.
+  already have the change deployed (e.g. a CI preview deploy) — running earlier
+  verifies the previous build, not your change. For a local-only change use
+  `--local <port>` instead (frontend tests only).
 - Backend `--code-file`: the runner executes the file top-to-bottom (not `pytest`), so **call your `test_*` function(s) at the end of the file** — a defined-but-uncalled test silently passes.
 - Backend sandbox has only stdlib + `requests` + `pytest` + `numpy` + `scipy`. Test the API over HTTP with `requests`; do **not** `import` the project's own source modules or other packages (e.g. `torch`) — they aren't installed and the test won't run.
-- `--wait` long-polls until terminal. Do not wrap it in a retry loop.
+- `--wait` long-polls until terminal; don't wrap it in a retry loop. A
+  `--local` timeout has nothing to resume — re-run with `--local`.
 - Exit `0` = passed; `1` = failed/blocked; `7` = timeout (resume with `test wait <run-id>`).
-- BE dependency flags (`--produces`/`--needs`/`--category`) are backend-only and
-  **create-only** — they can't be read back or edited later (delete + recreate to
-  change the graph). Don't hand-sequence `test run` calls to fake ordering; use
-  `test run --all` so the engine passes captured variables between waves.
+- BE dependency flags (`--produces`/`--needs`/`--category`) are backend-only,
+  repeatable, and **editable** — `test update` amends them, so never delete and
+  recreate a test to change the graph. Don't hand-sequence `test run` calls to
+  fake ordering; use `test run --all` so the engine passes captured variables
+  between waves.
 - A BE `test rerun` dispatches the whole producer/teardown closure, side effects
   included; `--skip-dependencies` reruns only the named test. If a producer failed
   in the same closure, the consumer's failure is starvation (missing token/fixture)
   — triage the producer first; it does not implicate your change.
-- `create` and `--wait` output include a `dashboardUrl` — if the user wants to
-  inspect a test or run themselves, point them there.
+- `create` and `--wait` output a `dashboardUrl` — point the user there to
+  inspect a test or run.
 
 ### 4. On failure — download the artifact
 
@@ -94,7 +96,7 @@ testsprite test artifact get <run-id> --out ./.testsprite/runs/<run-id>/
 Inspect the bundle (failing step, screenshots, root-cause hypothesis) before
 deciding whether your change caused the failure.
 
-### 5. One more tool — dry-run for learning
+### 5. Dry-run for learning
 
 Every command works without credentials under `--dry-run`:
 
@@ -125,3 +127,7 @@ testsprite setup         # configure + verify + install agent skill in one shot
 ```
 
 Verify your setup anytime: `testsprite auth status`.
+
+Project with **no tests at all**? Seed a suite first — that's setup, not verification.
+`testsprite test plan generate --project <id>` proposes cases and `test plan accept`
+promotes them; or author plans by hand.

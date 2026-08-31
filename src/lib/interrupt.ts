@@ -12,8 +12,10 @@
  * Broken pipe: when output is piped to a reader that closes early
  * (`testsprite ... | head`), the kernel raises `EPIPE` on the next stdout write.
  * Node turns an `'error'` with no listener into an uncaughtException and dumps a
- * raw `write EPIPE` stack (exit 1). The guard swallows it and exits 0, the
- * conventional SIGPIPE-equivalent result for "the reader went away".
+ * raw `write EPIPE` stack (exit 1). Outside an armed lifetime the guard exits
+ * 0 immediately, the conventional SIGPIPE-equivalent result. While armed it
+ * first requests coordinated shutdown so tunnel cleanup can finish, then the
+ * same synthetic interrupt reason preserves exit 0.
  *
  * `process` and the streams are injectable so the wiring is unit-testable
  * without spawning a subprocess or sending a real signal.
@@ -34,10 +36,12 @@ export const SIGINT_EXIT_CODE = TERMINATION_EXIT_CODES.SIGINT;
  * only these members, and tests can supply a lightweight fake.
  */
 export interface ShutdownHandle {
-  /** Aborts (reason: `InterruptError`) when a termination signal arrives while armed. */
+  /** Aborts with the graceful-stop reason when a signal/EPIPE arrives while armed. */
   readonly signal: AbortSignal;
   /** Enter a graceful-detach scope. Returns the disposer that leaves it. */
   arm(): () => void;
+  /** Run and track cleanup that a repeated signal may briefly wait for. */
+  runCriticalOperation<T>(operation: () => Promise<T>): Promise<T>;
 }
 
 /**
@@ -47,7 +51,7 @@ export interface ShutdownHandle {
  * Two modes, chosen by whether a graceful-detach scope is armed when the
  * signal arrives:
  *
- * - **Armed** (inside `pollRunUntilTerminal`): the handler only aborts
+ * - **Armed** (inside `pollRunUntilTerminal` or a tunnel lifetime): the handler only aborts
  *   `signal` with an `InterruptError` — no I/O, no exit. The in-flight fetch
  *   and every backoff sleep bail immediately; the `--wait` catch blocks own
  *   the cleanup (finalize the ticker, print the honest partial envelope +
@@ -57,13 +61,14 @@ export interface ShutdownHandle {
  *   immediately, preserving the pre-DEV-331 behavior. An abort nobody
  *   observes must never leave the process hanging at e.g. a readline prompt.
  *
- * A second signal while the armed cleanup is in flight is the documented
- * escape hatch: immediate hard exit.
+ * A repeated signal still provides a bounded escape hatch: the second waits
+ * briefly only when critical cleanup is in flight, and the third exits at once.
  */
 export class ShutdownController {
   private readonly controller = new AbortController();
+  private readonly criticalOperations = new Set<Promise<unknown>>();
   private armedCount = 0;
-  private receivedSignal: TerminationSignal | null = null;
+  private receivedCause: TerminationSignal | 'EPIPE' | null = null;
 
   constructor() {
     // Every fetch and every poll iteration composes this signal via
@@ -76,9 +81,9 @@ export class ShutdownController {
     return this.controller.signal;
   }
 
-  /** The first termination signal received, or null if none yet. */
-  get received(): TerminationSignal | null {
-    return this.receivedSignal;
+  /** The first graceful-shutdown cause received, or null if none yet. */
+  get received(): TerminationSignal | 'EPIPE' | null {
+    return this.receivedCause;
   }
 
   get isArmed(): boolean {
@@ -99,10 +104,60 @@ export class ShutdownController {
     };
   }
 
+  /** Whether teardown currently has work whose abrupt loss is security-sensitive. */
+  get hasCriticalOperations(): boolean {
+    return this.criticalOperations.size > 0;
+  }
+
+  /**
+   * Register cleanup before it starts and remove it automatically when it
+   * settles. Rejections retain their original semantics for the caller.
+   */
+  runCriticalOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const started = Promise.resolve().then(operation);
+    const tracked = started.finally(() => {
+      this.criticalOperations.delete(tracked);
+    });
+    this.criticalOperations.add(tracked);
+    return tracked;
+  }
+
+  /** Wait until all current and directly chained critical cleanup settles. */
+  async waitForCriticalOperations(): Promise<void> {
+    while (this.criticalOperations.size > 0) {
+      await Promise.allSettled([...this.criticalOperations]);
+    }
+  }
+
   /** Record the signal and abort with an `InterruptError` carrying it. */
   interrupt(signal: TerminationSignal): void {
-    this.receivedSignal = signal;
+    this.receivedCause = signal;
     this.controller.abort(new InterruptError(signal));
+  }
+
+  /**
+   * Abort an armed lifetime after stdout's reader closes. The InterruptError
+   * subtype deliberately keeps the existing graceful-detach catch paths in
+   * play (including tunnel cancellation), while its exit code stays the
+   * SIGPIPE-equivalent success code 0.
+   */
+  brokenPipe(): void {
+    if (this.receivedCause !== null) return;
+    this.receivedCause = 'EPIPE';
+    this.controller.abort(new BrokenPipeInterruptError());
+  }
+}
+
+class BrokenPipeInterruptError extends InterruptError {
+  override readonly exitCode = 0;
+
+  constructor() {
+    // Existing graceful-detach consumers read `.signal` to render their
+    // partial status. The distinct name/message and exitCode carry the real
+    // cause without widening the OS-signal contract in errors.ts.
+    super('SIGINT');
+    this.name = 'BrokenPipeInterruptError';
+    this.message = 'Output pipe closed.';
   }
 }
 
@@ -132,6 +187,40 @@ export interface InterruptDeps {
   shutdown?: ShutdownController;
 }
 
+const CRITICAL_OPERATION_GRACE_MS = 2_000;
+/** How often the grace period re-checks whether teardown is still running. */
+const CRITICAL_OPERATION_POLL_MS = 10;
+
+function afterDelay(ms: number): Promise<void> {
+  return new Promise(resolve => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
+async function waitForCriticalOperationsWithGrace(shutdown: ShutdownController): Promise<void> {
+  const graceExpired = afterDelay(CRITICAL_OPERATION_GRACE_MS);
+  const teardownFinished = (async () => {
+    // An armed scope is the honest signal that teardown has not finished. On a
+    // tunnel run it spans the whole unwind — cancel, then close, then the
+    // credential delete — and those register one at a time with gaps between
+    // them, so "no critical operation right now" does not mean "done". A fixed
+    // settle window is the wrong shape: measured against the real command, the
+    // first registration lands well after any window short enough to keep the
+    // escape hatch snappy. Waiting for the scope to close instead tracks the
+    // actual work, and the caller's overall cap keeps it bounded.
+    while (shutdown.isArmed) {
+      if (shutdown.hasCriticalOperations) {
+        await shutdown.waitForCriticalOperations();
+      } else {
+        await afterDelay(CRITICAL_OPERATION_POLL_MS);
+      }
+    }
+    await shutdown.waitForCriticalOperations();
+  })();
+  await Promise.race([graceExpired, teardownFinished]);
+}
+
 /**
  * Register handlers for SIGINT, SIGTERM and SIGHUP. Idempotent enough for a
  * single top-level call in `index.ts`; not designed to be installed twice.
@@ -139,8 +228,9 @@ export interface InterruptDeps {
  * First signal, armed scope: abort-only — the `--wait` catch paths own the
  * honest-detach UX and the exit (DEV-331 D1: Ctrl-C = detach, never cancel).
  * First signal, disarmed: print the generic explanation + exit `128+signum`.
- * Second signal (any mode): immediate hard exit — the escape hatch when the
- * graceful cleanup itself wedges.
+ * Second signal: exit immediately unless critical cleanup is registered; when
+ * it is, wait at most two seconds before exiting. Third signal: always exit
+ * immediately, including while that grace period is active.
  */
 export function installSignalHandlers(deps: InterruptDeps = {}): void {
   const on =
@@ -162,12 +252,36 @@ export function installSignalHandlers(deps: InterruptDeps = {}): void {
     });
   const exit = deps.exit ?? ((code: number) => process.exit(code));
   const shutdown = deps.shutdown ?? globalShutdown;
+  let signalCount = 0;
+  let graceGeneration = 0;
 
   for (const signal of Object.keys(TERMINATION_EXIT_CODES) as TerminationSignal[]) {
     on(signal, () => {
-      if (shutdown.received !== null) {
-        // Second signal while graceful cleanup is in flight: hard exit now.
+      signalCount += 1;
+      if (signalCount >= 3) {
+        // Invalidate any second-signal grace continuation before hard exit.
+        graceGeneration += 1;
         exit(TERMINATION_EXIT_CODES[signal]);
+        return;
+      }
+      if (signalCount === 2) {
+        // `isArmed` matters as much as an already-registered operation: on a
+        // tunnel run the lifecycle scope stays armed across teardown, and the
+        // credential delete is registered only after the poll loop unwinds. A
+        // second signal that arrives in between — which is what a reflexive
+        // double Ctrl-C actually does — would otherwise hard-exit and strand a
+        // live inbound credential until its TTL, the exact outcome the grace
+        // period exists to prevent.
+        if (!shutdown.hasCriticalOperations && !shutdown.isArmed) {
+          exit(TERMINATION_EXIT_CODES[signal]);
+          return;
+        }
+        const generation = ++graceGeneration;
+        void waitForCriticalOperationsWithGrace(shutdown).then(() => {
+          // A third signal already took the immediate path.
+          if (graceGeneration !== generation) return;
+          exit(TERMINATION_EXIT_CODES[signal]);
+        });
         return;
       }
       if (shutdown.isArmed) {
@@ -198,24 +312,35 @@ export interface BrokenPipeDeps {
   stderr?: NodeJS.EventEmitter;
   /** Process exit. Defaults to `process.exit`. */
   exit?: (code: number) => void;
+  /** Shutdown coordinator. Defaults to {@link globalShutdown}. */
+  shutdown?: ShutdownController;
 }
 
 /**
  * Guard against `EPIPE` on stdout/stderr so piping to a reader that closes
  * early (`testsprite ... | head`) exits cleanly instead of crashing with an
- * unhandled `write EPIPE` stack. Only `EPIPE` is swallowed; any other stream
- * error is left to surface normally.
+ * unhandled `write EPIPE` stack. An armed stdout path requests graceful
+ * shutdown before exiting 0; a disarmed one exits 0 immediately. Only `EPIPE`
+ * is swallowed; any other stream error is left to surface normally.
  */
 export function installBrokenPipeGuard(deps: BrokenPipeDeps = {}): void {
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
   const exit = deps.exit ?? ((code: number) => process.exit(code));
+  const shutdown = deps.shutdown ?? globalShutdown;
 
   stdout.on('error', (error: NodeJS.ErrnoException) => {
     // Reader went away (`| head`, `| less` then q): exit cleanly like SIGPIPE
     // rather than dumping an unhandled `write EPIPE` stack. Any other stdout
     // error is a genuine, actionable failure, so re-throw it (Node's default).
     if (error.code === 'EPIPE') {
+      if (shutdown.isArmed) {
+        // A tunnel lifetime owns credential teardown in its `finally`. Abort
+        // through the same coordinator as the first signal and let that
+        // cleanup finish; the synthetic reason exits 0 once it propagates.
+        shutdown.brokenPipe();
+        return;
+      }
       exit(0);
       return;
     }

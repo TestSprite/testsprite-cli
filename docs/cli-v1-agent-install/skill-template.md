@@ -239,8 +239,10 @@ testsprite test run <test-id> --target-url <env-url> --wait --timeout 600
 Key behaviors:
 
 - `--target-url` must be an allowed project/environment URL. The CLI rejects
-  `localhost` / RFC1918 / link-local — local-only changes can't be run here. If
-  the feature is deployed only locally, say so and skip the run.
+  `localhost` / RFC1918 / link-local there. If the feature is only running
+  locally, use `--local <port>` instead of `--target-url` (frontend tests
+  only; needs an API key with the `run:tunnel` scope — a 403 there means mint
+  a new key) — don't skip the run over this.
 - `--wait` long-polls until terminal and handles its own backoff — don't wrap it
   in a retry loop.
 - Exit codes: `0` = passed; `1` = failed / blocked / cancelled; `7` = timeout.

@@ -10,3 +10,10 @@ eslint-suppressions.security.json
 .claude/worktrees/
 
 # Internal design docs (dropped wholesale from the public snapshot) — not Prettier-governed
+
+# Byte copies of the tunnel repo's Node client — keep them diffable against
+# upstream (src/vendor/tunnel-client/VENDOR.md). The delta files beside them
+# are Prettier-governed as usual.
+src/vendor/tunnel-client/client.ts
+src/vendor/tunnel-client/protocol.ts
+src/vendor/tunnel-client/types.ts

@@ -32,15 +32,43 @@ function makeCapture(): { capture: CapturedOutput; deps: Pick<DoctorDeps, 'stdou
   };
 }
 
-function makeFetch(body: unknown, status = 200): DoctorDeps['fetchImpl'] {
-  return vi.fn(
-    async () =>
-      new Response(JSON.stringify(body), {
-        status,
+/**
+ * `doctor` makes TWO calls now: `GET /me` and the read-only `GET
+ * /tunnel/<probe-id>` behind the Local-tunnel check. The tunnel probe expects
+ * a 404 (nobody owns the probe id) and reports anything else as a warning, so
+ * a stub that answered `/me`'s body to every URL would turn every "all checks
+ * passed" assertion in this file into a warning. `body`/`status` still shape
+ * the `/me` answer only; the tunnel route gets its healthy 404 unless a test
+ * overrides it via `tunnel`.
+ */
+function makeFetch(
+  body: unknown,
+  status = 200,
+  tunnel: { status: number; body: unknown } = { status: 404, body: NOT_FOUND_ENVELOPE },
+): DoctorDeps['fetchImpl'] {
+  return vi.fn(async (input: unknown) => {
+    if (String(input).includes('/tunnel/')) {
+      return new Response(JSON.stringify(tunnel.body), {
+        status: tunnel.status,
         headers: { 'content-type': 'application/json' },
-      }),
-  ) as unknown as DoctorDeps['fetchImpl'];
+      });
+    }
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as unknown as DoctorDeps['fetchImpl'];
 }
+
+const NOT_FOUND_ENVELOPE = {
+  error: {
+    code: 'NOT_FOUND',
+    message: 'no such tunnel',
+    nextAction: 'x',
+    requestId: 'r1',
+    details: {},
+  },
+};
 
 const OK_ME = { userId: 'u-doc', keyId: 'k-doc' };
 
@@ -90,13 +118,19 @@ describe('runDoctor — healthy environment', () => {
   // Confirms `doctor` never sends X-CLI-Command — it must stay a plain,
   // untagged /me call (only `runInit`'s configure-validate step and
   // `test run --target-url`'s v3Enabled probe tag this header).
-  it('sends no X-CLI-Command header on its GET /me check', async () => {
+  it('sends no X-CLI-Command header on either of its checks', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { deps } = makeCapture();
-    const sentHeaders: Array<Record<string, string> | undefined> = [];
+    const sent: Array<{ url: string; headers?: Record<string, string> }> = [];
     const capturingFetch = vi.fn(
-      async (_url: string, init: { headers?: Record<string, string> }) => {
-        sentHeaders.push(init?.headers);
+      async (url: string, init: { headers?: Record<string, string> }) => {
+        sent.push({ url: String(url), headers: init?.headers });
+        if (String(url).includes('/tunnel/')) {
+          return new Response(JSON.stringify(NOT_FOUND_ENVELOPE), {
+            status: 404,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
         return new Response(JSON.stringify(OK_ME), {
           status: 200,
           headers: { 'content-type': 'application/json' },
@@ -107,8 +141,15 @@ describe('runDoctor — healthy environment', () => {
       { profile: 'default', output: 'text', debug: false },
       { ...healthyDeps(credentialsPath, { fetchImpl: capturingFetch }), ...deps },
     );
-    expect(sentHeaders).toHaveLength(1);
-    expect(sentHeaders[0]?.['x-cli-command']).toBeUndefined();
+    // `doctor` makes exactly two calls: GET /me and the Local-tunnel read.
+    // Pinning the count (not just "at least one") is what keeps a future
+    // check from quietly adding a third round-trip to a diagnostic command.
+    expect(sent).toHaveLength(2);
+    expect(sent.map(s => s.url.replace(/^.*\/api\/cli\/v1/, ''))).toEqual([
+      '/me',
+      '/tunnel/00000000-0000-4000-8000-000000000000',
+    ]);
+    for (const call of sent) expect(call.headers?.['x-cli-command']).toBeUndefined();
   });
 
   it('adds a Routing check (v3) and the gap advisory when /me reports v3Enabled', async () => {

@@ -182,11 +182,11 @@ export async function probeTargetUrl(
     // "can't tell from here" result, and a false positive has a documented
     // escape hatch (`--skip-preflight`) rather than a broken workflow.
     for (const address of resolvedAddresses(lookupResult)) {
-      const blockedReason = disallowedIpReason(address);
-      if (blockedReason !== undefined) {
+      const blocked = disallowedIpReason(address);
+      if (blocked !== undefined) {
         return {
           verdict: 'refuse',
-          reason: `--target-url host "${host}" resolves to ${address} (${blockedReason})`,
+          reason: `--target-url host "${host}" resolves to ${address} (${blocked.reason})`,
         };
       }
     }

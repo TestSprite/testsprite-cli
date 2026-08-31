@@ -220,6 +220,7 @@ describe('HttpClient.getRun', () => {
   const SAMPLE_RUN: RunResponse = {
     runId: 'run_1',
     testId: 'test_abc',
+    testTitle: null,
     projectId: 'project_xyz',
     userId: 'user_1',
     status: 'running',

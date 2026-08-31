@@ -45,6 +45,7 @@ import type {
   TriggerRunResponse,
 } from './runs.types.js';
 import type { CliTestListRunResponse } from './testlist.types.js';
+import type { TunnelMintResponse, TunnelStatusResponse } from './tunnel.types.js';
 import type { ConflictReason } from './conflict-reason.js';
 
 /**
@@ -88,6 +89,9 @@ const RUN_STEP_DTO_SCHEMA = v.looseObject({
 export const RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, RunResponse> = v.looseObject({
   runId: v.string(),
   testId: v.string(),
+  // The test's human title (for CI output). Absent on older servers; the type
+  // keeps it optional and renderers fall back to `testId`.
+  testTitle: v.nullish(v.string(), null),
   projectId: v.string(),
   userId: v.string(),
   status: openWireLiteral<RunStatus>(),
@@ -140,6 +144,10 @@ export const RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, RunResponse> = v.loos
   // through untouched) and normalized at the consumer, not in the schema.
   // Locked by tests in response-schemas.test.ts.
   dashboardUrl: v.nullish(v.string(), undefined),
+  // Same absent-key-preserving contract as `dashboardUrl` (see the note above):
+  // the run-scoped execution-result link is present only for a V3-served run
+  // with the server flag on, absent otherwise, and never materialized as null.
+  executionUrl: v.nullish(v.string(), undefined),
   // Absence means "steps not requested" and drives command branching, so no
   // default is applied (rule 3, optional branch).
   steps: v.optional(v.nullable(v.array(RUN_STEP_DTO_SCHEMA))),
@@ -384,3 +392,33 @@ export const ME_IDENTITY_SCHEMA: v.GenericSchema<unknown, MeIdentityWire> = v.lo
   organizations: v.optional(v.array(ORG_SUMMARY_SCHEMA)),
   org: v.optional(ORG_BINDING_SCHEMA),
 });
+
+// ---------------------------------------------------------------------------
+// /tunnel — DEV-747 piece 1 facade
+// ---------------------------------------------------------------------------
+
+/**
+ * Mirrors `TunnelMintResponse` (tunnel.types.ts): `POST /tunnel`.
+ *
+ * Every field is required rather than nullish-defaulted, and that is
+ * deliberate on this one surface: a mint response missing `controlUrl` or
+ * `tunnelAddr` cannot be used for anything, and the client's failure mode
+ * for a bad endpoint (a control socket that closes) is indistinguishable
+ * from an auth failure. Refusing the response here names the real problem.
+ */
+export const TUNNEL_MINT_RESPONSE_SCHEMA: v.GenericSchema<unknown, TunnelMintResponse> =
+  v.looseObject({
+    clientId: v.pipe(v.string(), v.minLength(1)),
+    secret: v.pipe(v.string(), v.minLength(1)),
+    controlUrl: v.pipe(v.string(), v.minLength(1)),
+    tunnelAddr: v.pipe(v.string(), v.minLength(1)),
+    expiresAt: v.string(),
+  });
+
+/** Mirrors `TunnelStatusResponse` (tunnel.types.ts): `GET /tunnel/{clientId}`. */
+export const TUNNEL_STATUS_RESPONSE_SCHEMA: v.GenericSchema<unknown, TunnelStatusResponse> =
+  v.looseObject({
+    clientId: v.string(),
+    status: openWireLiteral<'online' | 'offline'>(),
+    expiresAt: v.string(),
+  });

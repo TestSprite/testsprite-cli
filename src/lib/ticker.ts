@@ -26,6 +26,14 @@ export interface Ticker {
    * doesn't run into the result block). No-op on non-TTY.
    */
   finalize(line?: string): void;
+  /**
+   * True only when `update()` redraws the SAME terminal line (TTY, ANSI
+   * allowed). False on a non-TTY (updates are no-ops) and under NO_COLOR
+   * (every update prints a new line). The one signal a between-polls
+   * refresher may key on — re-deriving it from process globals elsewhere
+   * is how the two decisions drift apart.
+   */
+  readonly redrawsInPlace: boolean;
 }
 
 /**
@@ -69,6 +77,7 @@ export function createTicker(
   if (!tty) {
     // Non-TTY: completely silent.
     return {
+      redrawsInPlace: false,
       update: () => undefined,
       finalize: () => undefined,
     };
@@ -77,6 +86,7 @@ export function createTicker(
   if (suppressAnsi) {
     // TTY but NO_COLOR: emit plain-text lines without ANSI escape sequences.
     return {
+      redrawsInPlace: false,
       update(line: string): void {
         const stamped = `${new Date().toISOString()} ${line}`;
         stderrWrite(stamped);
@@ -94,6 +104,7 @@ export function createTicker(
   }
 
   return {
+    redrawsInPlace: true,
     update(line: string): void {
       // ANSI ESC[2K clears the entire line; \r moves to column 0.
       const stamped = `${new Date().toISOString()} ${line}`;
