@@ -262,6 +262,7 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     profile?: string;
     endpointUrl?: string;
     dryRun?: boolean;
+    debug?: boolean;
     planTemplate?: boolean;
     local?: string;
   };
@@ -295,6 +296,7 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
       profile: globals.profile ?? 'default',
       cwd: process.cwd(),
       env: process.env,
+      debug: globals.debug ?? false,
     });
   }
 

@@ -61,6 +61,8 @@ export function isPlanTemplateInvocation(
 export interface SkillPresenceDeps {
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
+  /** Best-effort diagnostic hook for an unreadable managed-section target. */
+  onReadError?: (path: string, error: unknown) => void;
 }
 
 /**
@@ -83,7 +85,14 @@ export function isVerifySkillInstalled(dir: string, deps: SkillPresenceDeps = {}
     if (spec.mode === 'managed-section') {
       try {
         if (hasCompleteManagedSection(read(full))) return true;
-      } catch {
+      } catch (error) {
+        // A diagnostic callback must not change this best-effort probe's
+        // behavior, even if the caller's stderr sink itself is unavailable.
+        try {
+          deps.onReadError?.(full, error);
+        } catch {
+          // ignore diagnostic delivery failures
+        }
         // unreadable AGENTS.md → treat this target as absent, keep checking
       }
       continue;
@@ -115,6 +124,8 @@ export interface SkillNudgeContext {
   readProfileImpl?: (profile: string, opts: { path: string }) => { apiKey?: string } | undefined;
   /** Sink for the hint line; defaults to `process.stderr`. */
   stderr?: (line: string) => void;
+  /** Emit best-effort diagnostics for swallowed nudge errors. */
+  debug?: boolean;
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
 }
@@ -129,9 +140,11 @@ export interface SkillNudgeContext {
  * not `--dry-run`, the command is in {@link SKILL_NUDGE_COMMANDS}, the opt-out
  * env is unset, the active profile has an api key (un-configured callers hit an
  * auth error that already points at setup), and the skill is not already
- * installed. Never throws and never blocks the command — any error is swallowed.
+ * installed. Never throws and never blocks the command — any error is swallowed;
+ * `--debug` callers receive the swallowed reason on stderr.
  */
 export function maybeEmitSkillNudge(ctx: SkillNudgeContext): void {
+  const write = ctx.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   try {
     if (ctx.output !== 'text') return;
     if (ctx.dryRun) return;
@@ -147,20 +160,38 @@ export function maybeEmitSkillNudge(ctx: SkillNudgeContext): void {
       isVerifySkillInstalled(ctx.cwd, {
         existsSync: ctx.existsSync,
         readFileSync: ctx.readFileSync,
+        onReadError: ctx.debug
+          ? (path, error) =>
+              emitDebug(
+                write,
+                `skill nudge could not read ${path}; treating target as absent`,
+                error,
+              )
+          : undefined,
       })
     ) {
       return;
     }
 
-    const write = ctx.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
     write(
       '[warn] No TestSprite verification skill is installed in this project — your coding ' +
         'agent will not verify its changes against TestSprite. Run `testsprite setup` (or ' +
         `\`testsprite agent install\`) to set it up. Silence: ${SKILL_NUDGE_OPT_OUT_ENV}=1`,
     );
-  } catch {
+  } catch (error) {
     // A nudge must never break, delay, or alter the exit status of a real
     // command. Swallow everything (missing creds file, fs races, etc.).
+    if (ctx.debug) emitDebug(write, 'skill nudge skipped', error);
+  }
+}
+
+/** Emit a diagnostic without letting the diagnostic path break the command. */
+function emitDebug(write: (line: string) => void, context: string, error: unknown): void {
+  try {
+    const reason = error instanceof Error ? error.message : String(error);
+    write(`[debug] ${context}: ${reason}`);
+  } catch {
+    // A broken stderr sink must not turn a best-effort nudge into a failure.
   }
 }
 

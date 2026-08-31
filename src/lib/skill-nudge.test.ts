@@ -68,6 +68,42 @@ describe('isVerifySkillInstalled', () => {
     expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(false);
   });
 
+  it('reports an unreadable managed target through the optional diagnostic callback', () => {
+    const errors: Array<{ path: string; error: unknown }> = [];
+    const existsSync = (p: string) => p.endsWith('AGENTS.md');
+    const readFileSync = () => {
+      throw new Error('EACCES');
+    };
+
+    expect(
+      isVerifySkillInstalled('/proj', {
+        existsSync,
+        readFileSync,
+        onReadError: (path, error) => errors.push({ path, error }),
+      }),
+    ).toBe(false);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.path).toContain('AGENTS.md');
+    expect(errors[0]?.error).toBeInstanceOf(Error);
+  });
+
+  it('never lets a failing diagnostic callback break the presence probe', () => {
+    const existsSync = (p: string) => p.endsWith('AGENTS.md');
+    const readFileSync = () => {
+      throw new Error('EACCES');
+    };
+
+    expect(() =>
+      isVerifySkillInstalled('/proj', {
+        existsSync,
+        readFileSync,
+        onReadError: () => {
+          throw new Error('diagnostic sink failed');
+        },
+      }),
+    ).not.toThrow();
+  });
+
   it('false when nothing is present', () => {
     expect(isVerifySkillInstalled('/proj', { existsSync: () => false })).toBe(false);
   });
@@ -130,8 +166,8 @@ describe('maybeEmitSkillNudge', () => {
     }
   });
 
-  it('is silent in JSON mode (never pollutes a machine-readable stream)', () => {
-    const { ctx, lines } = makeCtx({ output: 'json' as OutputMode });
+  it('is silent in JSON mode even with debug enabled', () => {
+    const { ctx, lines } = makeCtx({ output: 'json' as OutputMode, debug: true });
     maybeEmitSkillNudge(ctx);
     expect(lines).toHaveLength(0);
   });
@@ -192,6 +228,66 @@ describe('maybeEmitSkillNudge', () => {
     });
     expect(() => maybeEmitSkillNudge(ctx)).not.toThrow();
     expect(lines).toHaveLength(0);
+  });
+
+  it('reports a swallowed profile lookup error only in debug mode', () => {
+    const { ctx, lines } = makeCtx({
+      debug: true,
+      readProfileImpl: () => {
+        throw new Error('credentials unavailable');
+      },
+    });
+
+    maybeEmitSkillNudge(ctx);
+
+    expect(lines).toEqual(['[debug] skill nudge skipped: credentials unavailable']);
+  });
+
+  it('keeps an unreadable managed target byte-identical without debug', () => {
+    const normal = makeCtx();
+    maybeEmitSkillNudge(normal.ctx);
+
+    const unreadable = makeCtx({
+      existsSync: p => p.endsWith('AGENTS.md'),
+      readFileSync: () => {
+        throw new Error('EACCES');
+      },
+    });
+    maybeEmitSkillNudge(unreadable.ctx);
+
+    expect(unreadable.lines).toEqual(normal.lines);
+  });
+
+  it('reports an unreadable managed target only in debug mode, then preserves the warning', () => {
+    const { ctx, lines } = makeCtx({
+      debug: true,
+      existsSync: p => p.endsWith('AGENTS.md'),
+      readFileSync: () => {
+        throw new Error('EACCES');
+      },
+    });
+
+    maybeEmitSkillNudge(ctx);
+
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('[debug] skill nudge could not read');
+    expect(lines[0]).toContain('AGENTS.md');
+    expect(lines[0]).toContain('EACCES');
+    expect(lines[1]).toContain('[warn] No TestSprite verification skill is installed');
+  });
+
+  it('never lets a failing debug stderr sink break the command', () => {
+    const { ctx } = makeCtx({
+      debug: true,
+      stderr: () => {
+        throw new Error('stderr unavailable');
+      },
+      readProfileImpl: () => {
+        throw new Error('credentials unavailable');
+      },
+    });
+
+    expect(() => maybeEmitSkillNudge(ctx)).not.toThrow();
   });
 
   it('passes the cwd through to the presence check', () => {
