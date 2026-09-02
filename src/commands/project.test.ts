@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../lib/errors.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
+import { MAX_SECRET_FILE_BYTES } from '../lib/secret-file.js';
 import {
   type CliProject,
   type CliCreateProjectResponse,
@@ -1706,6 +1707,127 @@ describe('#79 — an unreadable --password-file is a validation error, not a cra
     );
 
     expect((sentBodies[0] as Record<string, unknown>).password).toBe('from-file');
+  });
+});
+
+describe('#58 — an oversize --password-file never reaches the API server', () => {
+  /** A file too big to be a credential, e.g. the flag aimed at a log or a dump. */
+  function writeOversizeFile(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-i58-'));
+    const path = join(dir, 'not-a-secret.log');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture: `path` is a literal basename joined onto this test's own mkdtempSync() directory, never user input.
+    writeFileSync(path, 'a'.repeat(MAX_SECRET_FILE_BYTES + 1));
+    return path;
+  }
+
+  it('runCreate rejects with PAYLOAD_TOO_LARGE (exit 5) before the network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'backend',
+          name: 'Guarded',
+          passwordFile: writeOversizeFile(),
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'PAYLOAD_TOO_LARGE', exitCode: 5 });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('runUpdate rejects with PAYLOAD_TOO_LARGE (exit 5) before the network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network');
+    });
+
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_guarded',
+          passwordFile: writeOversizeFile(),
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'PAYLOAD_TOO_LARGE', exitCode: 5 });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('tells the operator which flag and how big the file was', async () => {
+    const { credentialsPath } = makeCreds();
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'backend',
+          name: 'Guarded',
+          passwordFile: writeOversizeFile(),
+        },
+        {
+          credentialsPath,
+          fetchImpl: (async () => {
+            throw new Error('should not hit network');
+          }) as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({
+      nextAction: expect.stringContaining('--password-file') as unknown as string,
+      details: { sizeBytes: MAX_SECRET_FILE_BYTES + 1, maxBytes: MAX_SECRET_FILE_BYTES },
+    });
+  });
+
+  it('dry-run never stats the file, so the cap cannot block a plan-only run', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network');
+    });
+
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        type: 'backend',
+        name: 'Guarded',
+        passwordFile: writeOversizeFile(),
+      },
+      {
+        credentialsPath,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
 
