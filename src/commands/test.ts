@@ -5114,6 +5114,42 @@ export interface CliLintReport {
   checked: number;
   valid: number;
   issues: CliLintIssue[];
+  /** Non-fatal plan-quality findings; omitted when there are none. */
+  warnings?: CliLintIssue[];
+}
+
+/**
+ * Conditional and multi-branch assertion wording makes the frontend agent
+ * explore several outcomes and can exhaust its step budget before it emits a
+ * verdict. This is deliberately a narrow heuristic: only assertion steps are
+ * considered, and the finding stays non-fatal because the plan is structurally
+ * valid and may still be intentional.
+ */
+const CONDITIONAL_ASSERTION_PATTERN =
+  /\b(?:either|or|otherwise|unless|whether)\b|\bif\b[^.!?]*\bthen\b/i;
+
+function collectAssertionComplexityWarnings(
+  parsed: unknown,
+  prefix = '',
+): Array<{ field: string; reason: string }> {
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return [];
+  const obj = parsed as Record<string, unknown>;
+  if (obj.type !== undefined && obj.type !== 'frontend') return [];
+  if (!Array.isArray(obj.planSteps)) return [];
+
+  const warnings: Array<{ field: string; reason: string }> = [];
+  obj.planSteps.forEach((step, index) => {
+    if (typeof step !== 'object' || step === null || Array.isArray(step)) return;
+    const candidate = step as Record<string, unknown>;
+    if (candidate.type !== 'assertion' || typeof candidate.description !== 'string') return;
+    if (!CONDITIONAL_ASSERTION_PATTERN.test(candidate.description)) return;
+    warnings.push({
+      field: `${prefix}planSteps[${index}].description`,
+      reason:
+        'uses conditional or multi-branch wording; choose one observable outcome and write a single, decisive assertion to avoid exhausting the frontend run budget',
+    });
+  });
+  return warnings;
 }
 
 /**
@@ -5167,6 +5203,7 @@ export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<C
   }
 
   const issues: CliLintIssue[] = [];
+  const warnings: CliLintIssue[] = [];
   let checked = 0;
 
   const lintPlanFile = (file: string, path: string, specIndex?: number): void => {
@@ -5181,6 +5218,10 @@ export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<C
     for (const issue of collectPlanIssues(parsed, { specIndex })) {
       issues.push({ file, ...issue });
     }
+    const prefix = specIndex === undefined ? '' : `specs[${specIndex}].`;
+    for (const warning of collectAssertionComplexityWarnings(parsed, prefix)) {
+      warnings.push({ file, ...warning });
+    }
   };
 
   const lintStepsFile = (file: string, path: string): void => {
@@ -5194,6 +5235,9 @@ export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<C
     }
     for (const issue of collectPlanStepsIssues(parsed)) {
       issues.push({ file, ...issue });
+    }
+    for (const warning of collectAssertionComplexityWarnings(parsed)) {
+      warnings.push({ file, ...warning });
     }
   };
 
@@ -5255,11 +5299,26 @@ export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<C
       for (const issue of collectPlanIssues(parsed, { specIndex: lineNo - 1 })) {
         issues.push({ file, ...issue });
       }
+      for (const warning of collectAssertionComplexityWarnings(parsed, `specs[${lineNo - 1}].`)) {
+        warnings.push({ file, ...warning });
+      }
     }
   }
 
   const filesWithIssues = new Set(issues.map(issue => issue.file)).size;
-  const report: CliLintReport = { checked, valid: checked - filesWithIssues, issues };
+  const report: CliLintReport = {
+    checked,
+    valid: checked - filesWithIssues,
+    issues,
+    ...(warnings.length > 0 ? { warnings } : {}),
+  };
+  if (opts.output === 'text' && warnings.length > 0) {
+    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    for (const warning of warnings) {
+      stderr(`[warning] ${warning.file}: ${warning.field}: ${warning.reason}`);
+    }
+    stderr(`${warnings.length} warning(s)`);
+  }
   out.print(report, () =>
     [
       ...issues.map(issue => `${issue.file}: ${issue.field}: ${issue.reason}`),
