@@ -27,7 +27,7 @@ AI ships code in minutes — verifying it hasn't. `testsprite` opens your live a
   <a href="https://www.testsprite.com/docs"><img src="https://img.shields.io/badge/Docs-0A0A0A?style=for-the-badge" alt="Docs"></a>
   <a href="https://x.com/Test_Sprite"><img src="https://img.shields.io/badge/Follow%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow on X"></a>
   <a href="https://www.linkedin.com/company/testsprite"><img src="https://img.shields.io/badge/LinkedIn-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white" alt="LinkedIn"></a>
-  <a href="https://discord.gg/W4JDrZfdB"><img src="https://img.shields.io/badge/Join%20our%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join our Discord"></a>
+  <a href="https://discord.gg/GXWFjCe4an"><img src="https://img.shields.io/badge/Join%20our%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join our Discord"></a>
 </p>
 
 ⭐ _Help us reach more developers and grow the TestSprite community. Star this repo!_
@@ -224,7 +224,7 @@ That's the point of all of this: you no longer need the biggest, most expensive 
 - 📚 **CLI reference** — [DOCUMENTATION.md](./DOCUMENTATION.md)
 - 🌐 **Platform docs** — [testsprite.com/docs](https://www.testsprite.com/docs)
 - 🐛 **Issues & feature requests** — [GitHub issues](https://github.com/TestSprite/testsprite-cli/issues)
-- 💬 **Quick questions** — [Discord](https://discord.gg/W4JDrZfdB), or `testsprite --help` / `testsprite test run --help` right in your terminal
+- 💬 **Quick questions** — [Discord](https://discord.gg/GXWFjCe4an), or `testsprite --help` / `testsprite test run --help` right in your terminal
 - 📝 **Changelog** — [CHANGELOG.md](./CHANGELOG.md)
 
 ## Contributing
@@ -242,7 +242,7 @@ npm run typecheck   # tsc --noEmit
 
 Pull requests target the `main` branch. The full guide — build from source, test tiers, CI checks, branches, project layout — is in [CONTRIBUTING.md](./CONTRIBUTING.md).
 
-**Support** — if you need any help, we're responsive on [Discord](https://discord.gg/W4JDrZfdB), and feel free to email us at [contact@testsprite.com](mailto:contact@testsprite.com) too.
+**Support** — if you need any help, we're responsive on [Discord](https://discord.gg/GXWFjCe4an), and feel free to email us at [contact@testsprite.com](mailto:contact@testsprite.com) too.
 
 ## License
 

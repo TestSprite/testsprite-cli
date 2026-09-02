@@ -10,7 +10,7 @@ approach before you invest time.
 This project is young — if anything is confusing or broken, please tell us:
 
 - 💬 [GitHub Discussions](https://github.com/TestSprite/testsprite-cli/discussions) — questions, ideas, and usage help
-- 🗨️ [Discord](https://discord.gg/W4JDrZfdB) — fastest way to reach the team
+- 🗨️ [Discord](https://discord.gg/GXWFjCe4an) — fastest way to reach the team
 - 🐛 [GitHub Issues](https://github.com/TestSprite/testsprite-cli/issues) — bug reports and feature requests only
 - 🔒 Security reports — **do not** open a public issue; see [SECURITY.md](./SECURITY.md)
 - 📧 [contact@testsprite.com](mailto:contact@testsprite.com) — email works too
@@ -167,7 +167,7 @@ someone to click "Approve and run workflows," not that anything broke.
 
 We don't get an automated signal when a run is stuck in that state, so if
 it's been a while (see the response-time note above), ping us on
-[Discord](https://discord.gg/W4JDrZfdB) or leave a comment on the PR and
+[Discord](https://discord.gg/GXWFjCe4an) or leave a comment on the PR and
 we'll approve the run.
 
 ## How we review
