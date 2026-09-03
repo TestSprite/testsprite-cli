@@ -434,11 +434,14 @@ testsprite test plan put test_xxxxxxxx --steps ./refined.plan.json --dry-run --o
 
 #### `testsprite project create` / `project update`
 
-Manage projects from the CLI. Both pre-flight `--url` against local addresses for fast feedback. Projects have **no description field** — `--description` is rejected client-side with a validation error (descriptions live on tests: `test create --description`). `project update` accepts `--name`, `--url`, `--username`, `--password`, `--password-file`, and `--instruction`.
+Manage projects from the CLI. Both pre-flight `--url` against local addresses for fast feedback. Projects have **no description field** — `--description` is rejected client-side with a validation error (descriptions live on tests: `test create --description`). `project update` accepts `--name`, `--url`, `--username`, `--password`, `--password-file`, `--instruction`, `--test-id-attributes`, and `--clear-test-id-attributes`.
+
+`--test-id-attributes <list>` (also on `project create`) is the project's locator attribute priority list: a comma-separated, ordered set of DOM attributes your app uses as stable test hooks (e.g. `data-element,data-testid`). The execution engine tries them in that order before any other locator strategy when it exports test code, so a tagged element is exported as `page.locator('[data-element="nav.team-selector.trigger-btn"]')`; an attribute whose value is not unique on the page is skipped. `--clear-test-id-attributes` removes the list (engine default: `data-testid`). V3-native projects only — on a V2-mirrored project the backend answers `PRECONDITION_FAILED` (`test_id_attributes_native_only`).
 
 ```bash
 testsprite project create --type frontend --name "Checkout" --url https://staging.example.com
 testsprite project update proj_xxxxxxxx --name "Checkout v2"
+testsprite project update proj_xxxxxxxx --test-id-attributes data-element,data-testid
 ```
 
 #### `testsprite project delete <project-id>`

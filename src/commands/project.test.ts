@@ -17,6 +17,7 @@ import {
   runGet,
   runList,
   runUpdate,
+  parseTestIdAttributesFlag,
 } from './project.js';
 
 const PROJECT_FIXTURE: CliProject = {
@@ -1344,6 +1345,60 @@ describe('runUpdate', () => {
     expect(stderrLines.some(l => l.includes('idem-upd-001'))).toBe(false);
   });
 
+  it('sends testIdAttributes as an ordered list; --clear sends null', async () => {
+    const { credentialsPath } = makeCreds();
+    const sentBodies: unknown[] = [];
+    const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      if (init.body) sentBodies.push(JSON.parse(init.body as string) as unknown);
+      return new Response(
+        JSON.stringify({ projectId: 'proj_abc', updatedFields: ['testIdAttributes'] }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        },
+      );
+    }) as typeof fetch;
+    const deps = { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} };
+    const base = {
+      profile: 'default',
+      output: 'json' as const,
+      debug: false,
+      projectId: 'proj_abc',
+    };
+
+    await runUpdate({ ...base, testIdAttributes: ['data-element', 'data-testid'] }, deps);
+    expect(sentBodies[0]).toEqual({ testIdAttributes: ['data-element', 'data-testid'] });
+
+    await runUpdate({ ...base, clearTestIdAttributes: true }, deps);
+    expect(sentBodies[1]).toEqual({ testIdAttributes: null });
+  });
+
+  it('rejects --test-id-attributes together with --clear-test-id-attributes before any request', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not be called');
+    });
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          testIdAttributes: ['data-element'],
+          clearTestIdAttributes: true,
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('P7 — exits 5 VALIDATION_ERROR when no mutable flag is supplied', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn(async () => {
@@ -2122,5 +2177,21 @@ describe('dogfood 2026-06-30 — whitespace-only --name is rejected (parity with
         { credentialsPath, fetchImpl: makeFetch(noNetwork), stdout: () => {}, stderr: () => {} },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+});
+
+describe('parseTestIdAttributesFlag', () => {
+  it('splits, trims, de-duplicates and keeps priority order', () => {
+    expect(
+      parseTestIdAttributesFlag(' data-element, data-testid ,data-element', 'test-id-attributes'),
+    ).toEqual(['data-element', 'data-testid']);
+  });
+
+  it('rejects invalid attribute names and empty lists with a VALIDATION_ERROR', () => {
+    for (const raw of ['bad name', '[data-element]', '', ' , ']) {
+      expect(() => parseTestIdAttributesFlag(raw, 'test-id-attributes')).toThrowError(
+        expect.objectContaining({ code: 'VALIDATION_ERROR' }),
+      );
+    }
   });
 });
