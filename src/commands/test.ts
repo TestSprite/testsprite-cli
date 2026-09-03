@@ -193,6 +193,12 @@ export interface CliTest {
    */
   planStepCount?: number | null;
   /**
+   * Full FE plan steps when the single-test read endpoint provides them.
+   * Optional/nullable for older backends and test types without plan steps;
+   * JSON output preserves the wire objects unchanged.
+   */
+  planSteps?: CliPlanStep[] | null;
+  /**
    * M2.1: structured `processingStatus` / `testStatus` pair plus the
    * deprecated `rawStatus` mirror. Pre-M2.1 servers may still emit
    * `{ rawStatus }` only — keep the structured fields optional on
@@ -584,7 +590,7 @@ function stillRunningAndBillingSubject(runIds: string | string[]): string {
  * `tunnel-lost` is the one that is not a detach at all — it is the tunnel
  * dying under a run that is otherwise fine.
  */
-type TunnelDetachReason =
+export type TunnelDetachReason =
   'interrupt' | 'timeout' | 'request-timeout' | 'rate-limited' | 'tunnel-lost' | 'poll-error';
 
 /** What happened when we tried to stop a doomed tunnel run. */
@@ -596,11 +602,71 @@ interface TunnelCancelResult {
   terminalStatus?: RunStatus;
 }
 
-interface TunnelDetach {
+export interface TunnelDetach {
   runId: string;
+  testId: string;
+  localPort: number;
   reason: TunnelDetachReason;
   cancel: TunnelCancelOutcome;
   terminalStatus?: RunStatus;
+}
+
+const TUNNEL_INTERRUPT_OPT_OUT_CONSEQUENCE =
+  'Passing --no-cancel-on-interrupt keeps the run executing without its tunnel; it cannot ' +
+  'reach your app and is still billed.';
+
+function tunnelRerunCommand(detach: TunnelDetach): string {
+  return `testsprite test run ${detach.testId} --local ${detach.localPort}`;
+}
+
+/** Minimum wall-clock gap between adopted-client liveness reads. */
+const BORROWED_TUNNEL_LIVENESS_INTERVAL_MS = 15_000;
+
+/**
+ * Build the adopted-tunnel liveness observation that runs on non-terminal
+ * poll ticks. The first tick reads immediately; later ticks share one
+ * wall-clock cadence regardless of how hot the run-poll loop is.
+ *
+ * Only two observations are conclusive: an explicit offline response and a
+ * 404. Every inability to read the state is unknown rather than dead, because
+ * declaring a borrowed tunnel lost on our own network/backend failure would
+ * turn an observation outage into a false run failure.
+ */
+function makeBorrowedTunnelLivenessCheck(args: {
+  client: HttpClient;
+  clientId: string;
+  runId: string;
+}): (signal: AbortSignal) => Promise<void> {
+  let lastCheckAtMs: number | undefined;
+
+  return async (signal: AbortSignal): Promise<void> => {
+    const now = Date.now();
+    if (lastCheckAtMs !== undefined && now - lastCheckAtMs < BORROWED_TUNNEL_LIVENESS_INTERVAL_MS) {
+      return;
+    }
+    // Record the attempt before awaiting it so retries belong to the next
+    // interval even when this read fails or stalls until its deadline.
+    lastCheckAtMs = now;
+
+    let dead: boolean;
+    try {
+      const observed = await args.client.getTunnelStatus(args.clientId, {
+        signal,
+        // This observation owns its 15-second cadence. A 5xx, 429, timeout,
+        // or network failure is unknown and must wait for the next interval.
+        retry: false,
+      });
+      // The Rust service has emitted title-cased values (notably "Online")
+      // in production before; status comparisons must therefore ignore case.
+      dead = observed.status.toLowerCase() === 'offline';
+    } catch (err) {
+      // The HTTP observation is authoritative here. Even a malformed 5xx
+      // envelope carrying NOT_FOUND is still an unknown server-side read.
+      dead = err instanceof ApiError && err.httpStatus === 404;
+    }
+
+    if (dead) throw new TunnelLostError('owner-gone', args.runId);
+  };
 }
 
 /** Tunnel-specific interrupt outcome consumed by the top-level JSON renderer. */
@@ -617,9 +683,9 @@ export interface TunnelInterruptDetach {
  * non-terminal. Unlike an ordinary run — where DEV-331 deliberately decided a
  * Ctrl-C detaches and leaves the run to finish — a tunnel run's target lives
  * behind a tunnel this process is holding open, so the moment we exit the
- * Lambda's browser starts getting connection failures. Leaving it running
- * bills the user for a guaranteed failure, which is exactly the case
- * `--cancel-on-interrupt` was scoped for.
+ * Lambda's browser can start getting connection failures. The run may already
+ * have completed or been billed, so the cancellation message states only the
+ * observed cancel outcome and the cancelled-verdict semantics.
  *
  * The cancel is issued through a DETACHED client: the normal one composes the
  * process shutdown signal into every fetch, and on the interrupt path that
@@ -662,10 +728,19 @@ async function cancelDoomedTunnelRun(args: {
  * is true for an ordinary run and false here, and the whole point of D1 (a)
  * is that the four detach paths stop telling a tunnel user something untrue.
  */
-function tunnelDetachMessage(detach: TunnelDetach): string {
+export function tunnelDetachMessage(detach: TunnelDetach, interrupt?: InterruptError): string {
   const { runId, reason, cancel } = detach;
+  if (reason === 'interrupt' && cancel === 'cancelled') {
+    return (
+      `Interrupted${interrupt ? ` by ${interrupt.signal}` : ''}. Run ${runId} was reaching your ` +
+      `machine through a tunnel that closes with this process, so it was cancelled (exit ` +
+      `${interrupt?.exitCode ?? 130}). The run may already have been billed; a cancelled run's ` +
+      `verdict is discarded. Start a new run with: ${tunnelRerunCommand(detach)}. ` +
+      TUNNEL_INTERRUPT_OPT_OUT_CONSEQUENCE
+    );
+  }
   const cause: Record<TunnelDetachReason, string> = {
-    interrupt: 'Interrupted',
+    interrupt: `Interrupted${interrupt ? ` by ${interrupt.signal}` : ''}`,
     timeout: `Timed out waiting for run ${runId}`,
     'request-timeout': 'Request timed out',
     'rate-limited': 'Rate limited by the server (HTTP 429)',
@@ -676,19 +751,21 @@ function tunnelDetachMessage(detach: TunnelDetach): string {
     reason === 'tunnel-lost'
       ? `Run ${runId} was reaching your machine through that tunnel, and the run's proxy credential ` +
         `names the client that just went away, so it cannot be restored for this run.`
-      : `Run ${runId} was reaching your machine through a tunnel that closes with this process, so ` +
-        `it cannot finish.`;
+      : `Run ${runId} was reaching your machine through a tunnel that closes with this process.`;
   const outcome: Record<TunnelCancelOutcome, string> = {
-    cancelled: '  Cancelled it, so no further credits are spent on a guaranteed failure.',
+    cancelled:
+      "  Cancelled it. The run may already have been billed; a cancelled run's verdict is discarded.",
     'already-terminal': '  It had already finished server-side; there was nothing to cancel.',
     failed: `  Could NOT cancel it from here — stop it with: testsprite test cancel ${runId}`,
-    skipped: `  Left it running (--no-cancel-on-interrupt); stop it with: testsprite test cancel ${runId}`,
+    skipped: `  It was not cancelled — stop it now with: testsprite test cancel ${runId}`,
   };
-  return (
+  const message =
     `${cause[reason]}. ${doom}\n` +
     `${outcome[cancel]}\n` +
-    `  Start it again with --local when you're ready; a retry mints a fresh tunnel.`
-  );
+    `  Start a new run with: ${tunnelRerunCommand(detach)}.`;
+  return cancel === 'cancelled' || cancel === 'skipped'
+    ? `${message}\n  ${TUNNEL_INTERRUPT_OPT_OUT_CONSEQUENCE}`
+    : message;
 }
 
 /**
@@ -718,29 +795,33 @@ function detachPartialStatus(detach: TunnelDetach | undefined): string {
   return detach.terminalStatus ?? 'running';
 }
 
-function tunnelInterruptNextAction(detach: TunnelDetach): string {
+export function tunnelInterruptNextAction(detach: TunnelDetach, err: InterruptError): string {
+  const rerun = tunnelRerunCommand(detach);
   if (detach.cancel === 'cancelled') {
     return (
-      `Run ${detach.runId} was cancelled and its tunnel was closed. ` +
-      'Start it again with --local when you are ready.'
+      `Run ${detach.runId} was cancelled after ${err.signal} (exit ${err.exitCode}) and its ` +
+      `tunnel was closed. ` +
+      "The run may already have been billed; a cancelled run's verdict is discarded. " +
+      `Start a new run with: ${rerun}. ${TUNNEL_INTERRUPT_OPT_OUT_CONSEQUENCE}`
     );
   }
   if (detach.cancel === 'already-terminal') {
     return (
       `Run ${detach.runId} had already finished` +
       (detach.terminalStatus ? ` with status ${detach.terminalStatus}` : '') +
-      '; its tunnel was closed. Start a new --local run if you need to test again.'
+      ` when ${err.signal} interrupted the wait; its tunnel was closed. Start a new run with: ` +
+      `${rerun}.`
     );
   }
   if (detach.cancel === 'skipped') {
     return (
-      `The tunnel for run ${detach.runId} was closed, but cancellation was disabled. ` +
-      `Stop the run with: testsprite test cancel ${detach.runId}; then start it again with --local.`
+      `Start a new run with: ${rerun}, after stopping run ${detach.runId} with: testsprite test ` +
+      `cancel ${detach.runId}. ${TUNNEL_INTERRUPT_OPT_OUT_CONSEQUENCE}`
     );
   }
   return (
-    `The tunnel for run ${detach.runId} was closed and automatic cancellation failed. ` +
-    `Stop the run with: testsprite test cancel ${detach.runId}; then start it again with --local.`
+    `Start a new run with: ${rerun}, after stopping run ${detach.runId} with: testsprite test ` +
+    `cancel ${detach.runId}; automatic cancellation after ${err.signal} failed.`
   );
 }
 
@@ -752,7 +833,7 @@ function attachTunnelInterruptDetach(err: InterruptError, detach: TunnelDetach):
   ).tunnelDetach = {
     runId: detach.runId,
     cancel: detach.cancel,
-    nextAction: tunnelInterruptNextAction(detach),
+    nextAction: tunnelInterruptNextAction(detach, err),
   };
 }
 
@@ -1197,7 +1278,11 @@ export async function runCreate(
   }
 
   if (opts.targetUrl !== undefined) {
-    assertNotLocal(opts.targetUrl);
+    assertNotLocal(opts.targetUrl, {
+      field: 'target-url',
+      helpCommand: 'testsprite test create',
+      hintContext: 'bootstrap',
+    });
   }
 
   // C1: --target-url is inert for backend tests (base URL is baked into the
@@ -2831,7 +2916,11 @@ export async function runCreateFromPlan(
   requireNonEmpty('plan-from', opts.planFrom);
 
   if (opts.targetUrl !== undefined) {
-    assertNotLocal(opts.targetUrl);
+    assertNotLocal(opts.targetUrl, {
+      field: 'target-url',
+      helpCommand: 'testsprite test create',
+      hintContext: 'bootstrap',
+    });
   }
 
   const plan = readPlanFromGuarded(opts.planFrom, { ignoredFlags: opts.ignoredFlags });
@@ -3350,7 +3439,11 @@ export async function runCreateBatch(
     throw localValidationError('max-concurrency', 'must be an integer between 1 and 100');
   }
   if (opts.targetUrl !== undefined) {
-    assertNotLocal(opts.targetUrl);
+    assertNotLocal(opts.targetUrl, {
+      field: 'target-url',
+      helpCommand: 'testsprite test create-batch',
+      hintContext: 'bootstrap',
+    });
   }
 
   const stderrFnEarly = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
@@ -6622,6 +6715,10 @@ function renderTriggerRunText(r: TriggerRunResponse): string {
   ];
   if (r.codeVersion !== null) lines.push(`codeVersion ${r.codeVersion}`);
   if (r.targetUrl !== null) lines.push(`targetUrl   ${r.targetUrl}`);
+  // Same line the run card prints after `--wait` (`renderRunResponseText`), so a
+  // bare `test run <id>` shows where to look without a second command. Only
+  // when the server sent one — absent means it had no correct link to give.
+  if (r.dashboardUrl) lines.push(`dashboard   ${r.dashboardUrl}`);
   return lines.join('\n');
 }
 
@@ -6692,7 +6789,11 @@ export async function runTestRun(
     );
   }
   if (opts.targetUrl !== undefined) {
-    assertNotLocal(opts.targetUrl);
+    assertNotLocal(opts.targetUrl, {
+      field: 'target-url',
+      helpCommand: 'testsprite test run',
+      hintContext: 'runtime',
+    });
   }
   const localHost: LoopbackHost = opts.localHost ?? DEFAULT_LOCAL_HOST;
   const localTargetUrl =
@@ -7044,7 +7145,7 @@ export async function runTestRun(
     // Backend-test fallback (dogfood L1888): BE run rows never finalize, so
     // resolve the verdict from the testId record once it's terminal.
     let beFallbackUsed = false;
-    const resolveAlternate = makeBackendWaitFallback({
+    const resolveBackendAlternate = makeBackendWaitFallback({
       client,
       resolveTestId: () => opts.testId,
       resolveNotBefore: () => triggerResponse.enqueuedAt,
@@ -7057,6 +7158,30 @@ export async function runTestRun(
         );
       },
     });
+    const checkBorrowedTunnelLiveness = tunnelSession?.adopted
+      ? makeBorrowedTunnelLivenessCheck({
+          // Liveness failures are deliberately silent even under --verbose or
+          // --debug: they are unknown observations, not user-facing events.
+          client: makeClient(
+            { ...clientOpts, debug: false, verbose: false },
+            { ...deps, stderr: () => {} },
+          ),
+          clientId: tunnelSession.clientId,
+          runId: triggerResponse.runId,
+        })
+      : undefined;
+    // `resolveAlternate` is called only after a non-terminal run tick. Keeping
+    // the async borrowed-client read here prevents terminal runs from paying an
+    // extra GET and ensures any conclusive loss is caught by this command's
+    // normal detach/teardown path. Owned runs receive the original callback
+    // object unchanged and issue no liveness request.
+    const resolveAlternate =
+      checkBorrowedTunnelLiveness === undefined
+        ? resolveBackendAlternate
+        : async (run: RunResponse, elapsedMs: number, signal: AbortSignal) => {
+            await checkBorrowedTunnelLiveness(signal);
+            return resolveBackendAlternate(run, elapsedMs, signal);
+          };
 
     // Keeps the elapsed counter moving between long-poll returns (~25s apart).
     // Armed only when the ticker redraws in place (its own TTY / NO_COLOR call).
@@ -7102,6 +7227,8 @@ export async function runTestRun(
         });
         return {
           runId: triggerResponse.runId,
+          testId: opts.testId,
+          localPort: opts.localPort as number,
           reason,
           cancel: cancel.outcome,
           ...(cancel.terminalStatus !== undefined ? { terminalStatus: cancel.terminalStatus } : {}),
@@ -7265,7 +7392,7 @@ export async function runTestRun(
         });
         stderrFn(
           detach
-            ? tunnelDetachMessage(detach)
+            ? tunnelDetachMessage(detach, err)
             : interruptDetachMessage(err, [triggerResponse.runId]),
         );
         if (detach !== undefined) attachTunnelInterruptDetach(err, detach);
@@ -8364,7 +8491,10 @@ export async function runTestRunAll(
   // Both stay undefined for unknown API hosts (resolvePortalBase contract).
   const batchApiUrl = resolveApiUrl(opts, deps);
   const batchPortalBase = resolvePortalBase(batchApiUrl);
-  const projectDashboardUrl =
+  // The project-level closing link is resolved AFTER the trigger (below): the
+  // server now carries it for a V3-served batch, and `resolveDashboardUrl`'s
+  // absent-vs-present rule decides whether this legacy template still applies.
+  const legacyProjectDashboardUrl = (): string | undefined =>
     batchPortalBase === undefined
       ? undefined
       : `${batchPortalBase}/dashboard/tests/${encodeURIComponent(projectId)}`;
@@ -8448,6 +8578,17 @@ export async function runTestRunAll(
       source: 'cli',
     },
     { idempotencyKey },
+  );
+
+  // Project-level "watch it here" link. A V3 backend sends it (string, or
+  // `null` when no single page exists — e.g. a `--all` that fanned out over
+  // several sibling projects); an older backend / the V2 engine omits the key,
+  // and only then does the client's legacy `/dashboard/tests/{projectId}`
+  // template apply — for a V3 reader that shape bounced onto a route that does
+  // not exist, which is why the server took it over.
+  const { dashboardUrl: projectDashboardUrl } = resolveDashboardUrl(
+    batchResp,
+    legacyProjectDashboardUrl,
   );
 
   // Mutable: D3 deferred-retry loop may append to `accepted`, drain `deferred`,
@@ -9410,6 +9551,7 @@ export async function runTestRerun(
             `closure     ${r.closure.members.length} members (${r.closure.addedProducers.length} producers added)`,
           );
         }
+        if (r.dashboardUrl) lines.push(`dashboard   ${r.dashboardUrl}`);
         return lines.join('\n');
       });
       return rerunResp;
@@ -12956,8 +13098,20 @@ function renderTestText(t: CliTest): string {
   // M3.4: surface plan-step count when the facade ships it (FE tests).
   // Lets an operator read the current count — e.g. to recover after a
   // `test plan put --expected-step-count` 412 — without a JSON round-trip.
-  if (typeof t.planStepCount === 'number') {
-    lines.push(`planSteps:   ${t.planStepCount}`);
+  const planSteps = Array.isArray(t.planSteps) ? (t.planSteps as unknown[]) : undefined;
+  const planStepCount = typeof t.planStepCount === 'number' ? t.planStepCount : planSteps?.length;
+  if (typeof planStepCount === 'number') {
+    lines.push(`planSteps:   ${planStepCount}`);
+  }
+  if (planSteps) {
+    planSteps.forEach((step, index) => {
+      if (typeof step !== 'object' || step === null) return;
+      const fields = step as Record<string, unknown>;
+      const type = typeof fields.type === 'string' ? fields.type : 'step';
+      const description =
+        typeof fields.description === 'string' ? fields.description : '(no description)';
+      lines.push(`  ${index + 1}. [${type}] ${description}`);
+    });
   }
   if (typeof t.stepTimeoutMs === 'number') {
     lines.push(`stepTimeout: ${t.stepTimeoutMs} ms (applies to every step)`);

@@ -61,7 +61,15 @@ export const TUNNEL_CLIENT_STOP_TIMEOUT_MS = 2_000;
 const TUNNEL_SECRET_REDACTION = '[REDACTED]';
 
 /** Why a tunnel stopped being usable for the run that was attached to it. */
-export type TunnelFatalReason = 'auth-failed';
+export type TunnelFatalReason =
+  /** The server refused or dropped a client WE minted and connected. */
+  | 'auth-failed'
+  /**
+   * A BORROWED client (`--tunnel-client`) is no longer registered. Different
+   * cause and different remedy from `auth-failed`: nobody disconnected us,
+   * the process that minted the tunnel stopped owning it.
+   */
+  | 'owner-gone';
 
 export interface TunnelSession {
   readonly clientId: string;
@@ -119,19 +127,34 @@ export interface TunnelSessionDeps {
 
 /**
  * Thrown when the tunnel a run depends on dies mid-run. `UNAVAILABLE` (exit
- * 10, "retry the command") rather than a run failure: the test did not fail,
- * the transport under it did, and re-running is the right next action.
+ * 10 rather than a run failure: the test did not fail, the transport under it
+ * did. An owned run can retry with a fresh tunnel; a borrowed run must inspect
+ * the already-started server-side run before deciding whether to retry.
  */
 export class TunnelLostError extends ApiError {
   constructor(reason: TunnelFatalReason, runId: string) {
+    // Two different things go wrong here and they do NOT share a remedy.
+    // Telling a borrower to "run again" both hides the already-started billed
+    // run and is false about the tunnel — `--tunnel-client <id>` re-attaches
+    // to the same dead id and mints nothing. Naming the wrong cause is the
+    // failure mode this whole area keeps repeating, so each reason carries its
+    // own copy.
+    const ownerGone = reason === 'owner-gone';
     super({
       code: 'UNAVAILABLE',
-      message:
-        `The tunnel carrying run ${runId} was disconnected by the server and cannot be ` +
-        `restored for this run (${reason}).`,
-      nextAction:
-        'This usually means the tunnel service was redeployed mid-run. Start the run again: ' +
-        'the retry mints a fresh tunnel.',
+      message: ownerGone
+        ? `The borrowed tunnel for run ${runId} is no longer registered. It was minted by ` +
+          `another process (\`testsprite tunnel start\`), and that process has stopped or its ` +
+          `credential expired. Run ${runId} was left executing server-side and may still ` +
+          `finish; if it is cancelled, its verdict is discarded.`
+        : `The tunnel carrying run ${runId} was disconnected by the server and cannot be ` +
+          `restored for this run (${reason}).`,
+      nextAction: ownerGone
+        ? `Run ${runId} has lost its tunnel and cannot reach your app any more. Stop it now ` +
+          `with: testsprite test cancel ${runId} (idempotent). To watch it instead: ` +
+          `testsprite test wait ${runId} --timeout <s>.`
+        : 'This usually means the tunnel service was redeployed mid-run. Start the run again: ' +
+          'the retry mints a fresh tunnel.',
       requestId: 'local',
       details: { reason, runId },
     });

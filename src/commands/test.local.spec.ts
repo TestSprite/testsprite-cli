@@ -15,10 +15,19 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import type { JUnitReportFlagOptions } from '../lib/junit-report.js';
+import { TunnelLostError } from '../lib/tunnel-session.js';
 import type { TunnelClientOptions } from '../vendor/tunnel-client/index.js';
 import { ErrCode } from '../vendor/tunnel-client/index.js';
 import type { RunResponse, TriggerRunResponse } from '../lib/runs.types.js';
-import { createTestCommand, runTestRun } from './test.js';
+import {
+  createTestCommand,
+  runTestRun,
+  tunnelDetachMessage,
+  tunnelInterruptNextAction,
+  type TunnelCancelOutcome,
+  type TunnelDetach,
+  type TunnelDetachReason,
+} from './test.js';
 
 type FetchInput = Parameters<typeof globalThis.fetch>[0];
 
@@ -31,7 +40,9 @@ interface Call {
 function makeCreds(apiKey = 'sk-user-test'): { credentialsPath: string } {
   const dir = mkdtempSync(join(tmpdir(), 'cli-dev747-'));
   const credentialsPath = join(dir, 'credentials');
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- creates this suite's own mkdtempSync temp dir, never user input
   mkdirSync(dir, { recursive: true });
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes the fixture credentials body into this suite's own mkdtempSync temp dir, never user input
   writeFileSync(
     credentialsPath,
     `[default]\napi_url = http://localhost:13502\napi_key = ${apiKey}\n`,
@@ -478,7 +489,9 @@ describe('test run --local — happy path', () => {
     );
 
     expect(calls.some(call => call.method === 'POST' && call.url.includes('/runs'))).toBe(true);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks the summary file this test told the CLI to write into its own mkdtempSync temp dir, never user input
     expect(existsSync(summaryFile)).toBe(true);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads the summary file this test told the CLI to write into its own mkdtempSync temp dir, never user input
     expect(JSON.parse(readFileSync(summaryFile, 'utf8'))).toMatchObject({
       total: 1,
       passed: 1,
@@ -852,6 +865,10 @@ describe('test run --local — teardown', () => {
 // ---------------------------------------------------------------------------
 
 describe('test run --local — detaching from a tunnel run tells the truth', () => {
+  const optOutConsequence =
+    'Passing --no-cancel-on-interrupt keeps the run executing without its tunnel; it cannot ' +
+    'reach your app and is still billed.';
+
   async function interruptRun(overrides: Partial<Parameters<typeof runTestRun>[0]> = {}) {
     const port = 5173;
     const calls: Call[] = [];
@@ -908,18 +925,86 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
     expect(lines.join('\n')).not.toMatch(/testsprite test wait/);
   });
 
-  it('cancels the run by default rather than paying for a guaranteed failure', async () => {
-    const { calls, thrown } = await interruptRun();
+  it('cancels by default and states billing/verdict facts plus the escape hatch', async () => {
+    const { calls, lines, thrown } = await interruptRun();
     expect(calls.some(c => c.method === 'POST' && c.url.includes('/cancel'))).toBe(true);
     expect(thrown).toMatchObject({ signal: 'SIGINT', exitCode: 130 });
+    const text = lines.join('\n');
+    expect(text).toContain(
+      'Interrupted by SIGINT. Run run_abc was reaching your machine through a tunnel that ' +
+        'closes with ' +
+        'this process, so it was cancelled (exit 130). The run may already have been billed; a ' +
+        "cancelled run's verdict is discarded. Start a new run with: testsprite test run " +
+        `test_xyz --local 5173. ${optOutConsequence}`,
+    );
+    expect(text).not.toMatch(/guaranteed failure|no further credits are spent/i);
     const tunnelDetach = (
       thrown as InterruptError & {
         tunnelDetach?: { cancel: string; nextAction: string; runId: string };
       }
     ).tunnelDetach;
     expect(tunnelDetach).toMatchObject({ cancel: 'cancelled', runId: 'run_abc' });
-    expect(tunnelDetach?.nextAction).not.toMatch(/keeps executing|billing|test wait/i);
-    expect(tunnelDetach?.nextAction).toMatch(/cancelled|--local/i);
+    expect(tunnelDetach?.nextAction).not.toMatch(/test wait/i);
+    expect(tunnelDetach?.nextAction).toBe(
+      'Run run_abc was cancelled after SIGINT (exit 130) and its tunnel was closed. The run ' +
+        "may already have been billed; a cancelled run's verdict is discarded. Start a new " +
+        `run with: testsprite test run test_xyz --local 5173. ${optOutConsequence}`,
+    );
+  });
+
+  describe('detach reason × cancellation outcome message matrix', () => {
+    const reasons: TunnelDetachReason[] = [
+      'interrupt',
+      'timeout',
+      'request-timeout',
+      'rate-limited',
+      'tunnel-lost',
+      'poll-error',
+    ];
+    const outcomes: Array<{ cancel: TunnelCancelOutcome; label: string }> = [
+      { cancel: 'cancelled', label: 'cancelled' },
+      { cancel: 'already-terminal', label: 'already-terminal' },
+      { cancel: 'failed', label: 'cancel-failed' },
+      { cancel: 'skipped', label: 'not-attempted' },
+    ];
+
+    it.each(reasons.flatMap(reason => outcomes.map(outcome => ({ reason, ...outcome }))))(
+      '$reason × $label is factual and gives a concrete recovery path',
+      ({ reason, cancel }) => {
+        const detach: TunnelDetach = {
+          runId: 'run_matrix',
+          testId: 'test_matrix',
+          localPort: 4173,
+          reason,
+          cancel,
+        };
+        const interrupt = new InterruptError('SIGINT');
+        const message = tunnelDetachMessage(detach, reason === 'interrupt' ? interrupt : undefined);
+
+        expect(message).not.toMatch(/guaranteed|Ctrl-C/i);
+        expect(message).toContain('testsprite test run test_matrix --local 4173');
+        if (cancel === 'cancelled') {
+          expect(message).toContain(optOutConsequence);
+        }
+      },
+    );
+
+    it.each(outcomes)('interrupt nextAction with $label is factual', ({ cancel }) => {
+      const detach: TunnelDetach = {
+        runId: 'run_matrix',
+        testId: 'test_matrix',
+        localPort: 4173,
+        reason: 'interrupt' as const,
+        cancel,
+      };
+      const nextAction = tunnelInterruptNextAction(detach, new InterruptError('SIGTERM'));
+
+      expect(nextAction).not.toMatch(/guaranteed|Ctrl-C/i);
+      expect(nextAction).toContain('testsprite test run test_matrix --local 4173');
+      if (cancel === 'cancelled') {
+        expect(nextAction).toContain(optOutConsequence);
+      }
+    });
   });
 
   it('honours --no-cancel-on-interrupt', async () => {
@@ -1430,6 +1515,336 @@ describe('test run --local — the tunnel dying mid-run', () => {
     expect(calls.some(c => c.method === 'POST' && c.url.includes('/cancel'))).toBe(true);
     expect(lines.join('\n')).toMatch(/redeploy|disconnected/i);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Borrowed-tunnel liveness
+// ---------------------------------------------------------------------------
+
+type LivenessReply =
+  | { kind: 'status'; value: string }
+  | { kind: 'error'; status: number; code: string; message: string }
+  | { kind: 'network'; message: string };
+
+interface LivenessScenarioOptions {
+  adopted?: boolean;
+  livenessReplies: LivenessReply[];
+  runTicks: Array<{ elapsedMs: number; status: 'running' | 'passed' }>;
+}
+
+async function runLivenessScenario(options: LivenessScenarioOptions): Promise<{
+  calls: Call[];
+  error: unknown;
+  livenessReads: number;
+  result: RunResponse | undefined;
+  shutdownArmed: boolean;
+  stderr: string;
+}> {
+  const baseMs = new Date('2026-08-31T12:00:00.000Z').getTime();
+  vi.setSystemTime(baseMs);
+  const calls: Call[] = [];
+  const stderr: string[] = [];
+  const targetUrl = 'http://127.0.0.1:5173';
+  let runReads = 0;
+  let livenessReads = 0;
+  const shutdown = new ShutdownController();
+
+  const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+    const url =
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : (input as { url: string }).url;
+    const method = (init.method ?? 'GET').toUpperCase();
+    const body =
+      init.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+    calls.push({ method, url, body });
+
+    if (method === 'POST' && url.endsWith('/tunnel')) {
+      return new Response(JSON.stringify(MINT_BODY), {
+        status: 201,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (method === 'DELETE' && url.includes('/tunnel/')) {
+      return new Response(null, { status: 204 });
+    }
+    if (method === 'POST' && url.endsWith('/tests/test_xyz/runs')) {
+      return new Response(
+        JSON.stringify({
+          runId: 'run_abc',
+          status: 'queued',
+          enqueuedAt: '2026-08-31T12:00:00.000Z',
+          codeVersion: 'v1',
+          targetUrl,
+        } satisfies TriggerRunResponse),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (method === 'POST' && url.endsWith('/runs/run_abc/cancel')) {
+      return new Response(
+        JSON.stringify({ ...passedRun(targetUrl), status: 'cancelled', alreadyCancelled: false }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (method === 'GET' && url.includes('/runs/run_abc')) {
+      const tick = options.runTicks[runReads];
+      runReads += 1;
+      if (tick === undefined) {
+        throw new Error('poll kept going after the borrowed tunnel should have been observed dead');
+      }
+      vi.setSystemTime(baseMs + tick.elapsedMs);
+      return new Response(
+        JSON.stringify({
+          ...passedRun(targetUrl),
+          status: tick.status,
+          finishedAt: tick.status === 'passed' ? '2026-08-31T12:00:30.000Z' : null,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (method === 'GET' && url.includes('/tunnel/adopted-client-id')) {
+      const reply = options.livenessReplies[livenessReads] ?? {
+        kind: 'status',
+        value: 'Online',
+      };
+      livenessReads += 1;
+      if (reply.kind === 'network') throw new Error(reply.message);
+      if (reply.kind === 'error') {
+        return apiErrorResponse(reply.status, reply.code, reply.message);
+      }
+      return new Response(
+        JSON.stringify({
+          clientId: 'adopted-client-id',
+          status: reply.value,
+          expiresAt: '2026-08-31T14:00:00.000Z',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (method === 'GET' && url.endsWith('/tests/test_xyz')) {
+      return new Response(
+        JSON.stringify({
+          id: 'test_xyz',
+          projectId: 'project_1',
+          name: 'Local frontend test',
+          type: 'frontend',
+          status: 'ready',
+          createdFrom: 'cli',
+          createdAt: '2026-08-31T10:00:00.000Z',
+          updatedAt: '2026-08-31T10:00:00.000Z',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    return apiErrorResponse(404, 'NOT_FOUND', `Unexpected test request: ${method} ${url}`);
+  }) as typeof globalThis.fetch;
+
+  let result: RunResponse | undefined;
+  let error: unknown;
+  try {
+    result = (await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: true,
+        verbose: true,
+        testId: 'test_xyz',
+        localPort: 5173,
+        localHost: '127.0.0.1',
+        ...(options.adopted === false ? {} : { tunnelClientId: 'adopted-client-id' }),
+        wait: true,
+        timeoutSeconds: 600,
+        skipPreflight: true,
+      },
+      {
+        ...makeCreds(),
+        fetchImpl,
+        stderr: line => stderr.push(line),
+        stdout: () => {},
+        sleep: async () => {},
+        shutdown,
+        createTunnelClient: fakeTunnel().factory,
+      },
+    )) as RunResponse;
+  } catch (caught) {
+    error = caught;
+  }
+
+  return {
+    calls,
+    error,
+    livenessReads,
+    result,
+    shutdownArmed: shutdown.isArmed,
+    stderr: stderr.join('\n'),
+  };
+}
+
+describe('test run --local — borrowed-tunnel liveness', () => {
+  it('surfaces a borrowed tunnel that goes offline mid-run as the owned-path TunnelLostError', async () => {
+    vi.useFakeTimers();
+    const pending = runLivenessScenario({
+      livenessReplies: [
+        { kind: 'status', value: 'Online' },
+        { kind: 'status', value: 'offline' },
+      ],
+      runTicks: [
+        { elapsedMs: 0, status: 'running' },
+        { elapsedMs: 15_001, status: 'running' },
+      ],
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    const observed = await pending;
+
+    // Same class and same exit code as the owned path — but NOT the same copy.
+    // The owned message blames a server-side disconnect and tells the caller a
+    // retry mints a fresh tunnel; for a borrowed client that remedy is simply
+    // false, because `--tunnel-client <id>` re-attaches to the same dead id.
+    const ownedPathError = new TunnelLostError('auth-failed', 'run_abc');
+    expect(observed.error).toBeInstanceOf(TunnelLostError);
+    expect(observed.error).toMatchObject({
+      code: ownedPathError.code,
+      exitCode: 10,
+    });
+    const borrowed = observed.error as TunnelLostError;
+    expect(borrowed.message).not.toBe(ownedPathError.message);
+    expect(borrowed.message).toContain('Run run_abc was left executing server-side');
+    expect(borrowed.message).toContain('may still finish');
+    expect(borrowed.nextAction).toBe(
+      'Run run_abc has lost its tunnel and cannot reach your app any more. Stop it now with: ' +
+        'testsprite test cancel run_abc (idempotent). To watch it instead: testsprite test wait ' +
+        'run_abc --timeout <s>.',
+    );
+    expect(borrowed.nextAction).not.toMatch(/restart|run again/i);
+    expect((borrowed.details as { reason?: string } | undefined)?.reason).toBe('owner-gone');
+    expect(observed.calls.some(call => call.url.includes('/cancel'))).toBe(false);
+    expect(
+      observed.calls.some(call => call.method === 'DELETE' && call.url.includes('/tunnel/')),
+    ).toBe(false);
+    expect(observed.shutdownArmed).toBe(false);
+  }, 5_000);
+
+  it('treats a 404 liveness response as the same lost-tunnel verdict without cancelling or deleting', async () => {
+    vi.useFakeTimers();
+    const pending = runLivenessScenario({
+      livenessReplies: [
+        { kind: 'error', status: 404, code: 'NOT_FOUND', message: 'binding is gone' },
+      ],
+      runTicks: [{ elapsedMs: 0, status: 'running' }],
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    const observed = await pending;
+
+    expect(observed.error).toBeInstanceOf(TunnelLostError);
+    expect(observed.error).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
+    expect(observed.calls.some(call => call.url.includes('/cancel'))).toBe(false);
+    expect(
+      observed.calls.some(call => call.method === 'DELETE' && call.url.includes('/tunnel/')),
+    ).toBe(false);
+    expect(observed.shutdownArmed).toBe(false);
+  }, 5_000);
+
+  it.each([
+    {
+      label: 'network failure',
+      reply: { kind: 'network', message: 'liveness network sentinel' } satisfies LivenessReply,
+    },
+    {
+      label: 'HTTP 500',
+      reply: {
+        kind: 'error',
+        status: 500,
+        code: 'INTERNAL',
+        message: 'liveness 500 sentinel',
+      } satisfies LivenessReply,
+    },
+    {
+      label: 'HTTP 429',
+      reply: {
+        kind: 'error',
+        status: 429,
+        code: 'RATE_LIMITED',
+        message: 'liveness 429 sentinel',
+      } satisfies LivenessReply,
+    },
+  ])(
+    'treats $label as unknown, then stays alive after the next-interval healthy read',
+    async ({ reply }) => {
+      vi.useFakeTimers();
+      const pending = runLivenessScenario({
+        livenessReplies: [reply, { kind: 'status', value: 'Online' }],
+        runTicks: [
+          { elapsedMs: 0, status: 'running' },
+          { elapsedMs: 14_999, status: 'running' },
+          { elapsedMs: 15_001, status: 'running' },
+          { elapsedMs: 30_002, status: 'passed' },
+        ],
+      });
+      // Drive any accidental HTTP retry timers without sleeping in real time.
+      // A correct liveness read has retries disabled and settles before these
+      // five seconds; an implementation that retries is caught by the request count.
+      await vi.advanceTimersByTimeAsync(5_000);
+      const observed = await pending;
+
+      expect(observed.error).toBeUndefined();
+      expect(observed.result?.status).toBe('passed');
+      expect(observed.livenessReads).toBe(2);
+      expect(observed.calls.some(call => call.url.includes('/cancel'))).toBe(false);
+      expect(observed.stderr).not.toMatch(
+        /liveness (?:network|500|429) sentinel|Network error|Server error|Rate limited|\/tunnel\/adopted-client-id/i,
+      );
+    },
+    5_000,
+  );
+
+  it('checks an adopted client once per 15-second window, never on a terminal tick or an owned run', async () => {
+    vi.useFakeTimers();
+    const adopted = await runLivenessScenario({
+      livenessReplies: [
+        { kind: 'status', value: 'Online' },
+        { kind: 'status', value: 'Online' },
+      ],
+      runTicks: [
+        { elapsedMs: 0, status: 'running' },
+        { elapsedMs: 1_000, status: 'running' },
+        { elapsedMs: 14_999, status: 'running' },
+        { elapsedMs: 15_001, status: 'running' },
+        { elapsedMs: 30_002, status: 'passed' },
+      ],
+    });
+    const owned = await runLivenessScenario({
+      adopted: false,
+      livenessReplies: [{ kind: 'status', value: 'offline' }],
+      runTicks: [
+        { elapsedMs: 0, status: 'running' },
+        { elapsedMs: 15_001, status: 'running' },
+        { elapsedMs: 30_002, status: 'passed' },
+      ],
+    });
+
+    expect(adopted.error).toBeUndefined();
+    expect(adopted.result?.status).toBe('passed');
+    expect(adopted.livenessReads).toBe(2);
+    expect(owned.error).toBeUndefined();
+    expect(owned.result?.status).toBe('passed');
+    expect(owned.livenessReads).toBe(0);
+  }, 5_000);
+
+  it('recognises a differently-cased "Offline" wire status as dead', async () => {
+    vi.useFakeTimers();
+    const pending = runLivenessScenario({
+      livenessReplies: [{ kind: 'status', value: 'Offline' }],
+      runTicks: [{ elapsedMs: 0, status: 'running' }],
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    const observed = await pending;
+
+    expect(observed.livenessReads).toBe(1);
+    expect(observed.error).toBeInstanceOf(TunnelLostError);
+    expect(observed.error).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
+  }, 5_000);
 });
 
 // ---------------------------------------------------------------------------

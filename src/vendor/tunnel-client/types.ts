@@ -26,6 +26,11 @@ export interface TunnelClientOptions {
   controlUrl: string;
   /** VENDOR DELTA: required. `host:port` of the tunnel DATA plane. */
   tunnelAddr: string;
+  /**
+   * VENDOR DELTA: maximum time `start()` waits for the current control
+   * connection's first Ack, which is the server's authentication acknowledgement.
+   */
+  authTimeoutMs?: number;
   heartbeatMs?: number;
   reconnectMs?: number;
   logLevel?: LogLevel;

@@ -13,6 +13,7 @@ import { encodeFrame, readTypedFrame } from "./protocol.js";
 // response. See ./config.ts.
 import {
   DEFAULT_ALLOW_PRIVATE_NETWORK_TARGET,
+  DEFAULT_AUTH_TIMEOUT_MS,
   DEFAULT_HEARTBEAT_MS,
   DEFAULT_LOG_LEVEL,
   DEFAULT_RECONNECT_MS,
@@ -45,6 +46,7 @@ const LEVEL_ORDER: Record<LogLevel, number> = {
 };
 
 const STREAM_CLOSE_TIMEOUT_MS = 1_500;
+const CONTROL_AUTHENTICATION_FAILED = Symbol("control-authentication-failed");
 
 export class TunnelClient extends EventEmitter {
   private readonly options: Required<Omit<TunnelClientOptions, "clientId" | "secret">> &
@@ -54,6 +56,10 @@ export class TunnelClient extends EventEmitter {
   private controlConnected = false;
   private controlWs?: WebSocket;
   private controlLoopTask?: Promise<void>;
+  // VENDOR DELTA: monotonically scopes authentication readiness to one
+  // control socket. A reconnect gets a new generation, so an Ack emitted by
+  // an older socket cannot satisfy a later start() wait. See VENDOR.md #14.
+  private controlConnectionGeneration = 0;
   private allowTunnelReconnect = true;
   private readonly tunnelRuntimes = new Map<string, TunnelRuntime>();
   // VENDOR DELTA: reconnect backoffs are tied to this lifecycle controller so stop() cancels
@@ -82,6 +88,7 @@ export class TunnelClient extends EventEmitter {
       secret: options.secret,
       controlUrl: options.controlUrl,
       tunnelAddr: options.tunnelAddr,
+      authTimeoutMs: options.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS,
       heartbeatMs: options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS,
       reconnectMs: options.reconnectMs ?? DEFAULT_RECONNECT_MS,
       logLevel: options.logLevel ?? DEFAULT_LOG_LEVEL,
@@ -108,15 +115,55 @@ export class TunnelClient extends EventEmitter {
     }
     this.running = true;
 
+    const expectedConnectionGeneration = this.controlConnectionGeneration + 1;
     this.controlLoopTask = this.runControlLoop();
 
     await new Promise<void>((resolve, reject) => {
-      const onLoopEnd = () => {
-          reject(new Error("Control loop ended before connecting"));
+      let settled = false;
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+        this.off("control-authenticated", onAuthenticated);
+        this.off(CONTROL_AUTHENTICATION_FAILED, onAuthenticationFailed);
       };
 
-      this.once("control-connected", resolve);
+      const settle = (callback: () => void) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanup();
+        callback();
+      };
+
+      const onAuthenticated = (connectionGeneration: number) => {
+        if (connectionGeneration === expectedConnectionGeneration) {
+          settle(resolve);
+        }
+      };
+
+      const onAuthenticationFailed = (connectionGeneration: number, error: Error) => {
+        if (connectionGeneration === expectedConnectionGeneration) {
+          settle(() => reject(error));
+        }
+      };
+
+      const onLoopEnd = () => {
+        settle(() => reject(new Error("Control loop ended before connecting")));
+      };
+
+      this.on("control-authenticated", onAuthenticated);
+      this.on(CONTROL_AUTHENTICATION_FAILED, onAuthenticationFailed);
       this.controlLoopTask?.then(onLoopEnd);
+      const timeout = setTimeout(() => {
+        settle(() =>
+          reject(
+            new Error(
+              `The tunnel server accepted the connection but never acknowledged authentication within ${this.options.authTimeoutMs}ms`,
+            ),
+          ),
+        );
+      }, this.options.authTimeoutMs);
     });
 
     this.log("info", "Tunnel client started");
@@ -207,6 +254,7 @@ export class TunnelClient extends EventEmitter {
 
   private connectControl(): Promise<void> {
     return new Promise((resolve, reject) => {
+      const connectionGeneration = ++this.controlConnectionGeneration;
       const controlUrl = new URL(this.options.controlUrl);
       controlUrl.searchParams.set("client_id", this.options.clientId);
 
@@ -215,6 +263,15 @@ export class TunnelClient extends EventEmitter {
 
       let heartbeatTimer: NodeJS.Timeout | undefined;
       let opened = false;
+      let authenticationSettled = false;
+
+      const failAuthentication = (error: Error) => {
+        if (authenticationSettled) {
+          return;
+        }
+        authenticationSettled = true;
+        this.emit(CONTROL_AUTHENTICATION_FAILED, connectionGeneration, error);
+      };
 
       const cleanup = () => {
         if (heartbeatTimer) {
@@ -264,6 +321,14 @@ export class TunnelClient extends EventEmitter {
           return;
         }
 
+        if (message.type === "Ack") {
+          if (!authenticationSettled) {
+            authenticationSettled = true;
+            this.emit("control-authenticated", connectionGeneration);
+          }
+          return;
+        }
+
         if (message.type === "RequestTunnel") {
           this.log("debug", `RequestTunnel received: ${message.payload.tunnel_connection_id}`);
           this.allowTunnelReconnect = true;
@@ -280,6 +345,11 @@ export class TunnelClient extends EventEmitter {
 
       ws.on("error", (err) => {
         cleanup();
+        failAuthentication(
+          new Error(
+            `Control websocket errored before authentication was acknowledged: ${toErrorMessage(err)}`,
+          ),
+        );
         if (!opened) {
           this.controlConnected = false;
           this.stopAllTunnelRuntimes();
@@ -296,6 +366,11 @@ export class TunnelClient extends EventEmitter {
         this.emit("control-disconnected");
 
         const reason = reasonBuffer.toString("utf8");
+        failAuthentication(
+          new Error(
+            `Control websocket closed before authentication was acknowledged (code=${code}, reason=${reason || "<empty>"})`,
+          ),
+        );
         this.log("warn", `Control websocket closed (code=${code}, reason=${reason || "<empty>"})`);
         if (isAuthFailureClose(code, reason)) {
           reject(new ControlAuthFailureError(code, reason));
@@ -1039,9 +1114,7 @@ class TargetConnectError extends Error {
 
 /**
  * Thrown by {@link ensureTargetAllowed} when a proxied target resolves into a blocked
- * (private/internal) range and the client has not opted in via `allowPrivateNetworkTarget` /
- * `TS_TUNNEL_ALLOW_PRIVATE_NETWORK_TARGET`. Mirrors the Rust client's
- * `ensure_candidates_allowed` error.
+ * (private/internal) range. Mirrors the Rust client's `ensure_candidates_allowed` error.
  */
 export class BlockedTargetError extends Error {
   constructor(host: string, port: number, address?: string, reason?: string) {
@@ -1049,7 +1122,9 @@ export class BlockedTargetError extends Error {
       address === undefined
         ? `target ${host}:${port} did not resolve to any address`
         : `target ${host}:${port} resolves to ${address} (${reason}); refusing to dial. `
-          + "Set TS_TUNNEL_ALLOW_PRIVATE_NETWORK_TARGET=true (or allowPrivateNetworkTarget: true) to override.",
+          + "This run can reach localhost, 127.0.0.1, or ::1 on this machine and the public internet; "
+          + "private/LAN/VPN addresses are deliberately blocked. Make the dependency reachable through "
+          + "loopback or a public address, then retry.",
     );
     this.name = "BlockedTargetError";
   }

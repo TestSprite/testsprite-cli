@@ -35,8 +35,34 @@ import { ApiError } from './errors.js';
 // on `127.0.0.1`/`::1`, so `--local`'s default dial reaches it) — NOT for
 // the rest of `127.0.0.0/8`, which `--local` cannot dial by name at all. See
 // `'loopback-other'` below for that distinction.
-const LOCAL_DEV_HINT =
+const LOCAL_DEV_RUNTIME_HINT =
   "This looks like a local-dev target. Run it with `testsprite test run <test-id> --local <port>` instead — it tunnels this machine's loopback address to the test runner (frontend tests only; requires an API key with the `run:tunnel` scope).";
+
+// Project/test creation happens before the caller necessarily has a test id
+// (and project create happens before they have a project at all). Lead those
+// callers through the required public project URL first, then name the per-run
+// loopback tunnel only after the test exists.
+const LOCAL_DEV_BOOTSTRAP_HINT =
+  "TestSprite executes tests from the cloud, so a project's URL must be an internet-reachable address the runner can use. " +
+  'Set the project to its deployed or staging URL. ' +
+  'After a test exists, target an app on this machine for an individual run with ' +
+  "`testsprite test run <test-id> --local <port>`; that tunnel is per-run and does not make localhost the project's URL.";
+
+type TargetUrlHintContext = 'runtime' | 'bootstrap';
+
+export interface TargetUrlCaller {
+  /** CLI flag name without the leading `--`, used in the error envelope. */
+  field: string;
+  /** Command prefix without `--help`, for example `testsprite project create`. */
+  helpCommand: string;
+  hintContext?: TargetUrlHintContext;
+}
+
+const DEFAULT_TARGET_URL_CALLER: TargetUrlCaller = {
+  field: 'target-url',
+  helpCommand: 'testsprite test run',
+  hintContext: 'runtime',
+};
 
 // Private, reserved, link-local, and metadata addresses are network-reachable from
 // the caller's own machine in general (a LAN or VPN address usually answers)
@@ -57,17 +83,21 @@ const PRIVATE_NETWORK_HINT =
  *
  * Silently returns on allowed URLs.
  */
-export function assertNotLocal(rawUrl: string): void {
+export function assertNotLocal(
+  rawUrl: string,
+  caller: TargetUrlCaller = DEFAULT_TARGET_URL_CALLER,
+): void {
+  const { field, helpCommand, hintContext = 'runtime' } = caller;
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw localTargetError('target-url', 'must be a valid URL');
+    throw localTargetError(field, 'must be a valid URL', helpCommand);
   }
 
   // Scheme check.
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw localTargetError('target-url', 'must use http or https scheme');
+    throw localTargetError(field, 'must use http or https scheme', helpCommand);
   }
 
   // Normalize a single trailing dot in the hostname. `localhost.` is the
@@ -83,13 +113,27 @@ export function assertNotLocal(rawUrl: string): void {
   // `disallowedIpReason` below (which classifies IPv4/IPv6 address forms).
   // It is also always loopback — the same class `--local` can reach.
   if (host === 'localhost') {
-    throw localTargetError('target-url', 'localhost targets are not allowed', LOCAL_DEV_HINT);
+    throw localTargetError(
+      field,
+      'localhost targets are not allowed',
+      helpCommand,
+      localDevHintFor(hintContext),
+    );
   }
 
   const disallowed = disallowedIpReason(host);
   if (disallowed !== undefined) {
-    throw localTargetError('target-url', disallowed.reason, hintFor(disallowed.hintKind));
+    throw localTargetError(
+      field,
+      disallowed.reason,
+      helpCommand,
+      hintFor(disallowed.hintKind, hintContext),
+    );
   }
+}
+
+function localDevHintFor(hintContext: TargetUrlHintContext): string {
+  return hintContext === 'bootstrap' ? LOCAL_DEV_BOOTSTRAP_HINT : LOCAL_DEV_RUNTIME_HINT;
 }
 
 /**
@@ -99,10 +143,13 @@ export function assertNotLocal(rawUrl: string): void {
  * spot rather than a nested ternary repeated wherever a classification is
  * consumed.
  */
-function hintFor(hintKind: DisallowedIpClassification['hintKind']): string | undefined {
+function hintFor(
+  hintKind: DisallowedIpClassification['hintKind'],
+  hintContext: TargetUrlHintContext,
+): string | undefined {
   switch (hintKind) {
     case 'loopback':
-      return LOCAL_DEV_HINT;
+      return localDevHintFor(hintContext);
     case 'loopback-other':
       return undefined;
     case 'private':
@@ -402,14 +449,19 @@ function disallowedIpv6Reason(inner: string): DisallowedIpClassification | undef
   return undefined;
 }
 
-function localTargetError(field: string, reason: string, hint?: string): ApiError {
+function localTargetError(
+  field: string,
+  reason: string,
+  helpCommand: string,
+  hint?: string,
+): ApiError {
   return ApiError.fromEnvelope({
     error: {
       code: 'VALIDATION_ERROR',
       message: `Field \`${field}\` is invalid: ${reason}.`,
       nextAction: hint
-        ? hint + ' See `testsprite test run --help` for accepted values.'
-        : `See \`testsprite test run --help\` for accepted values.`,
+        ? hint + ` See \`${helpCommand} --help\` for accepted values.`
+        : `See \`${helpCommand} --help\` for accepted values.`,
       requestId: 'local',
       details: { field, reason, ...(hint ? { hint } : {}) },
     },

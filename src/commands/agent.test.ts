@@ -662,7 +662,14 @@ describe('runInstall — multi-target', () => {
 // ---------------------------------------------------------------------------
 
 describe('runInstall — empty target', () => {
-  it('non-TTY with no target defaults to claude and installs the skill file', async () => {
+  /**
+   * Detection reads the real environment by default, so an agent variable set
+   * by whoever runs the suite would pick these targets. Nothing set, nothing on
+   * disk: the fallback is the only outcome under test here.
+   */
+  const detectsNothing = { env: {}, existsSync: () => false, readdirSync: () => [] };
+
+  it('non-TTY with no target falls back to claude and installs the skill file', async () => {
     const { store, fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -675,12 +682,12 @@ describe('runInstall — empty target', () => {
         target: [],
         force: false,
       },
-      { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
+      { cwd: CWD, fs: agentFs, isTTY: false, detect: detectsNothing, ...deps },
     );
 
     const claudeAbs = path.resolve(CWD, TARGETS.claude.path);
     expect(store.has(claudeAbs)).toBe(true);
-    expect(capture.stderr.join('\n')).toContain('defaulting to claude');
+    expect(capture.stderr.join('\n')).toContain('no coding agent detected');
   });
 
   it('non-TTY default writes the canonical claude content', async () => {
@@ -689,7 +696,7 @@ describe('runInstall — empty target', () => {
 
     await runInstall(
       { profile: 'default', output: 'text', debug: false, dryRun: false, target: [], force: false },
-      { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
+      { cwd: CWD, fs: agentFs, isTTY: false, detect: detectsNothing, ...deps },
     );
 
     const { path: relPath, content } = renderForTarget('claude', 'testsprite-verify');
@@ -742,6 +749,92 @@ describe('runInstall — empty target', () => {
 
     const claudeAbs = path.resolve(CWD, TARGETS.claude.path);
     expect(store.has(claudeAbs)).toBe(true);
+  });
+
+  // `setup`'s prompt already accepts this; the two must not disagree about
+  // whether the shift key makes an answer a typo.
+  it('TTY prompt accepts a target name in any case', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    const promptFn = vi.fn().mockResolvedValue('Claude');
+
+    await runInstall(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        target: [],
+        skills: ['testsprite-verify'],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, isTTY: true, prompt: promptFn, ...deps },
+    );
+
+    expect(store.has(path.resolve(CWD, TARGETS.claude.path))).toBe(true);
+  });
+
+  // The caller passed no flag, so a refusal naming `--target` points them at
+  // something they never typed.
+  it('an unrecognised prompt answer is refused without blaming --target', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    const promptFn = vi.fn().mockResolvedValue('clyde');
+
+    let thrown: unknown;
+    try {
+      await runInstall(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          dryRun: false,
+          target: [],
+          skills: ['testsprite-verify'],
+          force: false,
+        },
+        { cwd: CWD, fs: agentFs, isTTY: true, prompt: promptFn, ...deps },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(CLIError);
+    expect((thrown as CLIError).exitCode).toBe(5);
+    // The whole detail is in the message, not tucked into a flag's nextAction.
+    expect((thrown as CLIError).message).toContain('unknown target "clyde"');
+    expect((thrown as CLIError).message).not.toBe('Invalid request.');
+    expect(store.size).toBe(0);
+  });
+
+  // The flag path keeps the flag-shaped refusal — there the field really is
+  // `--target`, and that message is a documented contract.
+  it('an unrecognised --target value still reports as a flag error', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    let thrown: unknown;
+    try {
+      await runInstall(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          dryRun: false,
+          target: ['clyde'],
+          skills: ['testsprite-verify'],
+          force: false,
+        },
+        { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect((thrown as ApiError).message).toBe('Invalid request.');
+    expect((thrown as ApiError).nextAction).toContain('clyde');
   });
 });
 

@@ -72,6 +72,34 @@ describe('isVerifySkillInstalled', () => {
     expect(isVerifySkillInstalled('/proj', { existsSync: () => false })).toBe(false);
   });
 
+  it('false when the skill is installed only for an agent other than the required one', () => {
+    // The silent miss this narrowing exists for: skills landed for claude, the
+    // caller is cursor, and "installed" would be a lie from cursor's view.
+    const existsSync = (p: string) =>
+      toPosix(p).endsWith('.claude/skills/testsprite-verify/SKILL.md');
+    expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
+    expect(isVerifySkillInstalled('/proj', { existsSync, requiredTargets: ['cursor'] })).toBe(
+      false,
+    );
+  });
+
+  it('true when the skill is installed for the required agent', () => {
+    const existsSync = (p: string) => toPosix(p).endsWith('.cursor/rules/testsprite-verify.mdc');
+    expect(isVerifySkillInstalled('/proj', { existsSync, requiredTargets: ['cursor'] })).toBe(true);
+  });
+
+  it('probes only the required targets', () => {
+    const seen: string[] = [];
+    isVerifySkillInstalled('/proj', {
+      existsSync: (p: string) => {
+        seen.push(p);
+        return false;
+      },
+      requiredTargets: ['cursor', 'codex'],
+    });
+    expect(seen).toHaveLength(2);
+  });
+
   it('checks paths under the supplied dir', () => {
     const seen: string[] = [];
     isVerifySkillInstalled('/some/proj', {
@@ -206,6 +234,83 @@ describe('maybeEmitSkillNudge', () => {
     maybeEmitSkillNudge(ctx);
     expect(probed.length).toBeGreaterThan(0);
     expect(probed.every(p => toPosix(p).startsWith('/work/here'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// maybeEmitSkillNudge — the calling agent narrows what counts as installed
+// ---------------------------------------------------------------------------
+
+describe('maybeEmitSkillNudge — when the environment names the caller', () => {
+  const claudeInstalled = (p: string) =>
+    toPosix(p).endsWith('.claude/skills/testsprite-verify/SKILL.md');
+  const cursorInstalled = (p: string) => toPosix(p).endsWith('.cursor/rules/testsprite-verify.mdc');
+
+  it('warns a cursor caller about a claude-only install, and says so', () => {
+    const { ctx, lines } = makeCtx({
+      env: { CURSOR_AGENT: '1' } as NodeJS.ProcessEnv,
+      existsSync: claudeInstalled,
+    });
+    maybeEmitSkillNudge(ctx);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('not for cursor');
+  });
+
+  it('stays silent when the skill is installed for the calling agent', () => {
+    const { ctx, lines } = makeCtx({
+      env: { CURSOR_AGENT: '1' } as NodeJS.ProcessEnv,
+      existsSync: cursorInstalled,
+    });
+    maybeEmitSkillNudge(ctx);
+    expect(lines).toHaveLength(0);
+  });
+
+  it('keeps the any-agent answer when no environment signal names a caller', () => {
+    const { ctx, lines } = makeCtx({ existsSync: claudeInstalled });
+    maybeEmitSkillNudge(ctx);
+    expect(lines).toHaveLength(0);
+  });
+
+  it('reports nothing-installed rather than installed-elsewhere when the project is bare', () => {
+    const { ctx, lines } = makeCtx({
+      env: { CURSOR_AGENT: '1' } as NodeJS.ProcessEnv,
+      existsSync: () => false,
+    });
+    maybeEmitSkillNudge(ctx);
+    expect(lines[0]).toContain('No TestSprite verification skill is installed');
+  });
+
+  // Two agents' variables can both be present — a shell that still carries the
+  // outer agent's variable. The presence check is per caller and ANDed, so one
+  // satisfied caller must not answer for the other.
+  it('still warns when only one of two named callers has a skill', () => {
+    const { ctx, lines } = makeCtx({
+      env: { CLAUDECODE: '1', CURSOR_AGENT: '1' } as NodeJS.ProcessEnv,
+      existsSync: claudeInstalled,
+    });
+    maybeEmitSkillNudge(ctx);
+    expect(lines).toHaveLength(1);
+    // Names only the caller that is actually missing one.
+    expect(lines[0]).toContain('not for cursor');
+    expect(lines[0]).not.toContain('claude');
+  });
+
+  it('stays silent only when every named caller has its own skill', () => {
+    const { ctx, lines } = makeCtx({
+      env: { CLAUDECODE: '1', CURSOR_AGENT: '1' } as NodeJS.ProcessEnv,
+      existsSync: (p: string) => claudeInstalled(p) || cursorInstalled(p),
+    });
+    maybeEmitSkillNudge(ctx);
+    expect(lines).toHaveLength(0);
+  });
+
+  it('names both callers when neither has a skill', () => {
+    const { ctx, lines } = makeCtx({
+      env: { CLAUDECODE: '1', CURSOR_AGENT: '1' } as NodeJS.ProcessEnv,
+      existsSync: () => false,
+    });
+    maybeEmitSkillNudge(ctx);
+    expect(lines[0]).toContain('No TestSprite verification skill is installed');
   });
 });
 

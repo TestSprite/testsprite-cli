@@ -165,6 +165,12 @@ export const TRIGGER_RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, TriggerRunRes
     enqueuedAt: v.string(),
     codeVersion: v.string(),
     targetUrl: v.string(),
+    // Server-built portal links (backend ≥ the run-links change). Optional
+    // with no default (rule 3): an older backend omits them, and a V3 run
+    // the server could not link stays ABSENT — the renderer prints a
+    // `dashboard` line only when the key is present.
+    dashboardUrl: v.optional(v.string()),
+    executionUrl: v.optional(v.string()),
   });
 
 // ---------------------------------------------------------------------------
@@ -213,6 +219,9 @@ export const RERUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, RerunResponse> = v.
   // survives validation byte-identically). Older backends that predate the
   // field simply omit it — never fails validation.
   advisories: v.optional(v.array(RERUN_ADVISORY_SCHEMA)),
+  // Same present-or-absent portal links as TRIGGER_RUN_RESPONSE_SCHEMA.
+  dashboardUrl: v.optional(v.string()),
+  executionUrl: v.optional(v.string()),
 });
 
 // ---------------------------------------------------------------------------
@@ -278,6 +287,11 @@ export const BATCH_RUN_FRESH_RESPONSE_SCHEMA: v.GenericSchema<unknown, BatchRunF
     deferred: v.array(v.looseObject({ testId: v.string() })),
     skippedFrontend: v.array(v.string()),
     skippedIntegration: v.array(v.looseObject({ testId: v.string() })),
+    // Project-level closing link. Absent-key-preserving like `RUN_RESPONSE_SCHEMA`'s
+    // `dashboardUrl` (see the note there): omitted stays ABSENT so the client
+    // keeps computing its legacy template for an older backend / the V2 engine;
+    // `null` passes through as a present key meaning "no correct page".
+    dashboardUrl: v.nullish(v.string(), undefined),
   });
 
 /**

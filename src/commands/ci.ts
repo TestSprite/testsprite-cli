@@ -422,7 +422,10 @@ export async function runCiInit(opts: CiInitOptions, deps: CiDeps = {}): Promise
   let endpointWarning: string | null = null;
   if (endpointUrl) {
     try {
-      assertNotLocal(endpointUrl);
+      assertNotLocal(endpointUrl, {
+        field: 'endpoint-url',
+        helpCommand: 'testsprite ci init',
+      });
     } catch {
       endpointWarning = `the workflow pins ${endpointUrl}, which a GitHub-hosted runner cannot reach — pass --endpoint-url <public-url>, or run this workflow on a self-hosted runner.`;
       stderr(`[warn] ${endpointWarning}`);

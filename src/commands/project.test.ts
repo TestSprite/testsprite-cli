@@ -762,6 +762,42 @@ describe('runGet', () => {
 // ---------------------------------------------------------------------------
 
 describe('runCreate', () => {
+  it('names --url and project create help when rejecting a localhost project URL', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network — validation must fire client-side');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: true,
+          type: 'frontend',
+          name: 'Local App',
+          targetUrl: 'http://localhost:3123',
+        },
+        {
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      message: 'Field `url` is invalid: localhost targets are not allowed.',
+      nextAction: expect.stringContaining('See `testsprite project create --help`'),
+      details: {
+        field: 'url',
+        reason: 'localhost targets are not allowed',
+        hint: expect.any(String),
+      },
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('P6 FE happy — POSTs /projects with type=frontend + name + idempotency header', async () => {
     const { credentialsPath } = makeCreds();
     const sentBodies: unknown[] = [];

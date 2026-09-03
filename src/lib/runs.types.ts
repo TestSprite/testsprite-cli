@@ -100,6 +100,10 @@ export interface RerunResponse {
    * on every other response, including older backends that predate the field.
    */
   advisories?: RerunAdvisory[];
+  /** See `TriggerRunResponse.dashboardUrl` — same present-or-absent contract. */
+  dashboardUrl?: string;
+  /** See `TriggerRunResponse.executionUrl` — same present-or-absent contract. */
+  executionUrl?: string;
 }
 
 /**
@@ -181,6 +185,18 @@ export interface TriggerRunResponse {
   codeVersion: string;
   /** Resolved target URL (project default when --target-url absent). */
   targetUrl: string;
+  /**
+   * Portal deep link for the run's test, built by the server for the store
+   * that dispatched it. Present-or-absent (never null): an older backend, a
+   * V3 run while the server's org-link flag is off, or one with no resolvable
+   * workspace all OMIT it, and the CLI prints nothing rather than guessing.
+   */
+  dashboardUrl?: string;
+  /**
+   * Portal deep link to THIS run's result page — V3-served runs only (a V2
+   * run has no execution page). Same present-or-absent contract.
+   */
+  executionUrl?: string;
 }
 
 /**
@@ -480,4 +496,14 @@ export interface BatchRunFreshResponse {
   deferred: Array<{ testId: string }>;
   skippedFrontend: string[];
   skippedIntegration: Array<{ testId: string }>;
+  /**
+   * Project-level portal link the batch closes with ("watch it here"). Same
+   * absent-vs-present contract as the per-run `dashboardUrl`: ABSENT ⇒ an older
+   * backend (or the V2 engine, whose live page is the CLI's own
+   * `/dashboard/tests/{projectId}` template) — compute the legacy link
+   * client-side; a string ⇒ print it verbatim; `null` ⇒ the server knows no
+   * correct page exists (several sibling projects, no owning org) — print
+   * nothing rather than a dead link.
+   */
+  dashboardUrl?: string | null;
 }

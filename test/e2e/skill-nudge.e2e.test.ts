@@ -71,7 +71,10 @@ interface CliResult {
   stderr: string;
 }
 
-function runCli(args: string[], opts: { cwd: string; home: string }): CliResult {
+function runCli(
+  args: string[],
+  opts: { cwd: string; home: string; env?: Record<string, string> },
+): CliResult {
   const result = spawnSync('node', [BIN_PATH, ...args], {
     encoding: 'utf8',
     cwd: opts.cwd,
@@ -88,6 +91,14 @@ function runCli(args: string[], opts: { cwd: string; home: string }): CliResult 
       // Neutralize any opt-out inherited from the developer's shell (empty is
       // NOT treated as opted-out by the warning).
       TESTSPRITE_NO_SKILL_WARNING: '',
+      // The warning narrows to the calling agent when the environment names
+      // one, so an agent variable inherited from whoever runs the suite would
+      // decide these assertions. Cleared by default; a case that wants a
+      // caller sets it explicitly.
+      CLAUDECODE: '',
+      CLAUDE_CODE_ENTRYPOINT: '',
+      CURSOR_AGENT: '',
+      ...opts.env,
     },
   });
   return {
@@ -155,4 +166,66 @@ describe('skill nudge — suppression gates', () => {
     expect(result.stderr).not.toContain(WARN_SUBSTR);
     expect(result.stdout).toContain('"planSteps"');
   });
+});
+
+describe('skill nudge — the calling agent decides what counts as installed', () => {
+  /** Install one target's verify skill into the project. */
+  function installSkill(proj: string, target: keyof typeof TARGETS): void {
+    const p = join(proj, TARGETS[target].path);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, '---\nname: testsprite-verify\n---\nbody\n', 'utf8');
+  }
+
+  it(
+    'warns on `test run` when only a different agent has the skill',
+    () => {
+      const proj = freshDir('ts-nudge-proj-');
+      const home = homeWithCreds();
+      installSkill(proj, 'claude');
+
+      const result = runCli(
+        ['test', 'run', 'test_abc123', '--endpoint-url', DEAD_ENDPOINT, '--request-timeout', '1'],
+        { cwd: proj, home, env: { CURSOR_AGENT: '1' } },
+      );
+
+      expect(result.stderr).toContain('not for cursor');
+      expect(result.stderr).toContain('testsprite setup');
+    },
+    NETWORK_TIMEOUT_MS,
+  );
+
+  it(
+    'stays silent on `test run` when the calling agent has the skill',
+    () => {
+      const proj = freshDir('ts-nudge-proj-');
+      const home = homeWithCreds();
+      installSkill(proj, 'cursor');
+
+      const result = runCli(
+        ['test', 'run', 'test_abc123', '--endpoint-url', DEAD_ENDPOINT, '--request-timeout', '1'],
+        { cwd: proj, home, env: { CURSOR_AGENT: '1' } },
+      );
+
+      expect(result.stderr).not.toContain(WARN_SUBSTR);
+      expect(result.stderr).not.toContain('not for cursor');
+    },
+    NETWORK_TIMEOUT_MS,
+  );
+
+  it(
+    'keeps the any-agent answer when the environment names no caller',
+    () => {
+      const proj = freshDir('ts-nudge-proj-');
+      const home = homeWithCreds();
+      installSkill(proj, 'claude');
+
+      const result = runCli(
+        ['test', 'run', 'test_abc123', '--endpoint-url', DEAD_ENDPOINT, '--request-timeout', '1'],
+        { cwd: proj, home },
+      );
+
+      expect(result.stderr).not.toContain(WARN_SUBSTR);
+    },
+    NETWORK_TIMEOUT_MS,
+  );
 });

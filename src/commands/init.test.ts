@@ -14,7 +14,13 @@ import type { MeResponse } from './auth.js';
 import type { AgentFs } from './agent.js';
 import type { InitDeps } from './init.js';
 import { runInit } from './init.js';
-import { TARGETS, DEFAULT_SKILLS, pathFor, type AgentTarget } from '../lib/agent-targets.js';
+import {
+  TARGETS,
+  DEFAULT_SKILLS,
+  MANAGED_SECTION_BEGIN,
+  pathFor,
+  type AgentTarget,
+} from '../lib/agent-targets.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -411,6 +417,511 @@ describe('runInit — default claude target installs 2 skill files', () => {
     // Exactly 2 skill-file writes (claude is own-file, one file per skill)
     const skillWrites = writeCalls.filter(p => p === verifyPath || p === onboardPath);
     expect(skillWrites).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3c. Caller detection: setup installs for the agents this repo shows
+// ---------------------------------------------------------------------------
+
+/** A fake repo for the detection step, keyed the way detection joins paths. */
+function detectRepo(
+  rels: string[],
+  env: NodeJS.ProcessEnv = {},
+  fileBody = '# Contributing\n',
+): NonNullable<InitDeps['detect']> {
+  const norm = (p: string) => p.replace(/\\/g, '/');
+  const files = new Set(rels.map(r => norm(path.join(CWD, r))));
+  const dirs = new Set<string>();
+  for (const f of files) {
+    const parts = f.split('/');
+    for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join('/'));
+  }
+
+  return {
+    env,
+    existsSync: p => files.has(norm(p)) || dirs.has(norm(p)),
+    isDirectory: p => dirs.has(norm(p)),
+    readdirSync: p => {
+      const base = norm(p);
+      const kids = new Set<string>();
+      for (const f of [...files, ...dirs]) {
+        if (!f.startsWith(`${base}/`)) continue;
+        kids.add(f.slice(base.length + 1).split('/')[0]!);
+      }
+      return [...kids];
+    },
+    readFileSync: () => fileBody,
+  };
+}
+
+/** Base opts with NO --agent — the shape a caller who never passed the flag produces. */
+function makeDetectOpts(overrides: Partial<Parameters<typeof runInit>[0]> = {}) {
+  const opts = makeBaseOpts({ apiKey: 'sk-user-test', ...overrides });
+  delete (opts as { agent?: unknown }).agent;
+  return opts;
+}
+
+describe('runInit — installs for the agents this project shows', () => {
+  it('installs for a detected agent instead of the fallback', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(['.cursor/rules/team-style.mdc']),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cursor', 'testsprite-verify')));
+    expect(writeCalls).not.toContain(path.resolve(CWD, pathFor('claude', 'testsprite-verify')));
+    expect(captured.stderr.join('\n')).toContain('detected cursor');
+  });
+
+  it('installs the codex managed section, not a claude skill, in a codex-only repo', async () => {
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls, store } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(['AGENTS.md']),
+    });
+
+    const agentsMd = path.resolve(CWD, TARGETS.codex.path);
+    expect(writeCalls).toContain(agentsMd);
+    expect(store.get(agentsMd)).toContain(MANAGED_SECTION_BEGIN);
+    // The claude fallback must not also fire once codex is the detected target.
+    expect(writeCalls.some(p => p.includes('.claude'))).toBe(false);
+  });
+
+  it('installs for every detected agent, not just the first', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts({ output: 'json' as const }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cline', 'testsprite-verify')));
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('kiro', 'testsprite-verify')));
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as {
+      agent: {
+        target: string;
+        targets: string[];
+        detectedBy: string;
+        detections: Array<{ target: string; source: string; signal: string }>;
+      };
+    };
+    expect(parsed.agent.targets.sort()).toEqual(['cline', 'kiro']);
+    // `detectedBy` says HOW the set was arrived at, not which signal won — the
+    // set is a union, so one word cannot attribute it.
+    expect(parsed.agent.detectedBy).toBe('detected');
+    // Per-target provenance is what a consumer needs to tell env from trace.
+    expect(parsed.agent.detections.map(d => `${d.target}:${d.source}`).sort()).toEqual([
+      'cline:trace',
+      'kiro:trace',
+    ]);
+  });
+
+  it('reports mixed provenance per target when env and traces both fire', async () => {
+    // The case a single `detectedBy` word misrepresented: the caller is named
+    // by the environment while the repo carries other agents' configs.
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+
+    await runInit(makeDetectOpts({ output: 'json' as const }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(['.clinerules/team-style.md'], { CLAUDECODE: '1' }),
+    });
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as {
+      agent: {
+        detectedBy: string;
+        detections: Array<{ target: string; source: string; signal: string }>;
+      };
+    };
+    expect(parsed.agent.detectedBy).toBe('detected');
+    expect(parsed.agent.detections.map(d => `${d.target}:${d.source}`).sort()).toEqual([
+      'claude:env',
+      'cline:trace',
+    ]);
+  });
+
+  it('on a terminal, confirms the detected set and installs only what was chosen', async () => {
+    // Detection is a union, so an ordinary multi-agent repo resolves to a set
+    // large enough to be worth seeing before it is written.
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+    const asked: string[] = [];
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async (q: string) => {
+        asked.push(q);
+        return 'cline';
+      },
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(asked[0]).toContain('cline,kiro');
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cline', 'testsprite-verify')));
+    expect(writeCalls.some(p => p.includes('.kiro'))).toBe(false);
+  });
+
+  it('accepts the detected set when the prompt is answered empty', async () => {
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => '',
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cline', 'testsprite-verify')));
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('kiro', 'testsprite-verify')));
+  });
+
+  it('accepts a target typed in the wrong case, as "none" already did', async () => {
+    // The prompt lower-cased `none` but not the target names, so `NONE` skipped
+    // while `Cline` was refused as unknown — an inconsistency the user has no
+    // way to predict from a pre-filled, all-lower-case suggestion.
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => 'Cline',
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cline', 'testsprite-verify')));
+    expect(writeCalls.some(p => p.includes('.kiro'))).toBe(false);
+  });
+
+  it('skips the install for an upper-case NONE', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => 'NONE',
+      detect: detectRepo(['.clinerules/team-style.md']),
+    });
+
+    expect(writeCalls).toEqual([]);
+    expect(captured.stdout.join('\n')).toContain('skipped');
+  });
+
+  it('treats a separators-only answer as the empty answer it is', async () => {
+    // ", ," parses to no names at all; installing for nothing there would
+    // report success over an empty set.
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => ', ,',
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cline', 'testsprite-verify')));
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('kiro', 'testsprite-verify')));
+  });
+
+  it('re-asks on an unrecognised target instead of failing after credentials are written', async () => {
+    // A typo at the prompt used to surface only inside runInstall — exit 5
+    // with the key already saved. The prompt validates before anything lands.
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+    const answers = ['clien', 'cline'];
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => answers.shift() ?? '',
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(answers).toHaveLength(0);
+    const stderr = captured.stderr.join('\n');
+    expect(stderr).toContain('unknown target "clien"');
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cline', 'testsprite-verify')));
+    expect(writeCalls.some(p => p.includes('.kiro'))).toBe(false);
+  });
+
+  it('gives up after three unrecognised answers with exit 5, before any credential or skill write', async () => {
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+    const fetchImpl = vi.fn(makeOkFetch()!);
+    let asked = 0;
+
+    let thrown: unknown;
+    try {
+      await runInit(makeDetectOpts(), {
+        ...deps,
+        fetchImpl,
+        credentialsPath,
+        isTTY: true,
+        cwd: CWD,
+        fs: agentFs,
+        agentPrompt: async () => {
+          asked += 1;
+          return 'nope';
+        },
+        detect: detectRepo(['.clinerules/team-style.md']),
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(asked).toBe(3);
+    expect((thrown as CLIError).exitCode).toBe(5);
+    // The hint names the supported targets, not the unusable answer.
+    expect((thrown as CLIError).message).not.toContain('nope');
+    expect((thrown as CLIError).message).toContain('--no-agent');
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(writeCalls).toHaveLength(0);
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+  });
+
+  it('answering "none" skips the skill install the way --no-agent does', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => 'none',
+      detect: detectRepo(['.clinerules/team-style.md']),
+    });
+
+    expect(writeCalls).toHaveLength(0);
+    // Credentials still land — only the skill step was declined.
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBeTruthy();
+    const stderr = captured.stderr.join('\n');
+    expect(stderr).toContain('skipping the agent skill install');
+  });
+
+  it('announces the detected set before the prompt and the chosen set after it', async () => {
+    // Before the answer nothing is decided, so the pre-prompt line must not
+    // claim an install; the post-answer line carries the narrowed set.
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    let stderrAtPrompt = '';
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => {
+        stderrAtPrompt = captured.stderr.join('\n');
+        return 'cline';
+      },
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(stderrAtPrompt).toContain('[info] detected cline (.clinerules), kiro (.kiro)');
+    expect(stderrAtPrompt).not.toContain('installing skills for');
+    expect(captured.stderr.join('\n')).toContain('[info] installing skills for cline');
+  });
+
+  it('does not prompt under --yes, and installs the whole detected set', async () => {
+    // --yes means "stop asking me"; the union is still what gets installed.
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+    let asked = 0;
+
+    await runInit(makeDetectOpts({ yes: true }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => {
+        asked += 1;
+        return 'cline';
+      },
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(asked).toBe(0);
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('kiro', 'testsprite-verify')));
+  });
+
+  it('refuses an unknown --agent up front, naming --agent, before credentials are written', async () => {
+    // Left to runInstall this read "Flag `--target` is invalid" — a flag setup
+    // does not have — after the key was saved, with a hint echoing "AGENT".
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+    const fetchImpl = vi.fn(makeOkFetch()!);
+
+    let thrown: unknown;
+    try {
+      const bogus = 'AGENT' as unknown as Parameters<typeof runInit>[0]['agent'];
+      await runInit(makeBaseOpts({ apiKey: 'sk-user-test', agent: bogus }), {
+        ...deps,
+        fetchImpl,
+        credentialsPath,
+        isTTY: false,
+        cwd: CWD,
+        fs: agentFs,
+        detect: detectRepo([]),
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect((thrown as CLIError).exitCode).toBe(5);
+    // localValidationError puts the detail in nextAction; message is always 'Invalid request.'
+    const nextAction = (thrown as ApiError).nextAction ?? '';
+    expect(nextAction).toContain('Flag `--agent` is invalid');
+    expect(nextAction).not.toContain('--target');
+    expect(nextAction).toContain('supported:');
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(writeCalls).toHaveLength(0);
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(captured.stderr.join('\n')).not.toContain('credentials saved');
+  });
+
+  it('does not prompt when --agent named the target', async () => {
+    // Already explicit — there is nothing to confirm.
+    const { deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    let asked = 0;
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test', agent: 'cursor' }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => {
+        asked += 1;
+        return 'cline';
+      },
+      detect: detectRepo(['.clinerules/team-style.md']),
+    });
+
+    expect(asked).toBe(0);
+  });
+
+  it('names the fallback on stderr when nothing is detected', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo([]),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('claude', 'testsprite-verify')));
+    const stderr = captured.stderr.join('\n');
+    expect(stderr).toContain('no coding agent detected');
+    expect(stderr).toContain('claude');
+    expect(stderr).toContain('--agent');
+  });
+
+  it('does not treat its own previously-installed skills as a detected agent', async () => {
+    // A second setup run in a repo we already wrote to must still say "nothing
+    // detected", or the first run's guess silently becomes the answer forever.
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(DEFAULT_SKILLS.map(s => pathFor('claude', s))),
+    });
+
+    expect(captured.stderr.join('\n')).toContain('no coding agent detected');
+  });
+
+  it('an explicit --agent wins over both the environment and the repo', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test', agent: 'kiro' as AgentTarget }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(['.cursor/rules/team-style.mdc'], { CLAUDECODE: '1' }),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('kiro', 'testsprite-verify')));
+    expect(writeCalls).not.toContain(path.resolve(CWD, pathFor('cursor', 'testsprite-verify')));
+    expect(captured.stderr.join('\n')).not.toContain('detected');
   });
 });
 

@@ -491,6 +491,26 @@ describe('assertNotLocal — allowed public URLs', () => {
 });
 
 describe('assertNotLocal — error details', () => {
+  it('uses the caller-provided field and help command in the rejection envelope', () => {
+    try {
+      assertNotLocal('http://localhost:3000', {
+        field: 'url',
+        helpCommand: 'testsprite project create',
+        hintContext: 'bootstrap',
+      });
+      throw new Error('expected assertNotLocal to throw');
+    } catch (err) {
+      const apiErr = err as ApiError;
+      expect(apiErr.message).toBe('Field `url` is invalid: localhost targets are not allowed.');
+      expect(apiErr.nextAction).toContain('See `testsprite project create --help`');
+      expect(apiErr.nextAction).not.toContain('testsprite test run --help');
+      expect(apiErr.details).toMatchObject({
+        field: 'url',
+        reason: 'localhost targets are not allowed',
+      });
+    }
+  });
+
   it('includes a --local hint for localhost block', () => {
     try {
       assertNotLocal('http://localhost:3000');

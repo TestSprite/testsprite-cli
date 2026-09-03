@@ -2,6 +2,8 @@
  * `testsprite init` — one-shot onboarding orchestrator.
  *
  * Chains, in order:
+ *   0. Agent-target resolution + confirmation prompt — the chosen install
+ *      targets are settled here, before anything is written
  *   1. runConfigure  — writes the API-key profile (validates via GET /me first)
  *   2. runWhoami     — fetches identity for the post-configure banner
  *   3. runInstall    — installs the TestSprite verification-loop skill (unless --no-agent)
@@ -17,13 +19,21 @@ import {
 } from '../lib/client-factory.js';
 import { normalizeEnvVar } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
-import { CLIError } from '../lib/errors.js';
+import { CLIError, localValidationError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import type { AuthDeps, MeResponse } from './auth.js';
 import { runConfigure, runWhoami } from './auth.js';
 import type { AgentDeps, AgentFs, InstallResult } from './agent.js';
 import { runInstall } from './agent.js';
 import { TARGETS, DEFAULT_SKILLS, type AgentTarget } from '../lib/agent-targets.js';
+import {
+  FALLBACK_TARGET,
+  resolveAgentTargets,
+  type AgentDetection,
+  type AgentResolution,
+  type DetectAgentDeps,
+} from '../lib/agent-detect.js';
+import { promptText } from '../lib/prompt.js';
 import type { FetchImpl } from '../lib/http.js';
 import { readProfile } from '../lib/credentials.js';
 
@@ -80,12 +90,20 @@ export interface InitDeps {
   isTTY?: boolean;
   /** Injected for agent install prompt (plain function, not {secret: fn}) */
   agentPrompt?: (question: string) => Promise<string>;
+
+  /** Injected fs/env for caller detection; defaults to the real repo under `cwd`. */
+  detect?: DetectAgentDeps;
 }
 
 interface InitOptions extends CommonOptions {
   apiKey?: string;
   fromEnv: boolean;
-  agent: string;
+  /**
+   * The target the caller explicitly chose. Absent means "decide from what this
+   * repo shows", so it must stay unset unless `--agent` was really passed —
+   * a default filled in here would suppress detection for every run.
+   */
+  agent?: AgentTarget;
   noAgent: boolean;
   force: boolean;
   dir?: string;
@@ -110,9 +128,56 @@ export interface InitSummary {
    * Agent skill install outcome. `action` is an AGGREGATE across the installed
    * skills (setup installs {@link DEFAULT_SKILLS}); `skills` lists which skills
    * landed. `null` when --no-agent.
+   *
+   * `targets` holds every agent installed for; `target` repeats the first so a
+   * reader of the single-target field keeps working.
    */
-  agent: { target: string; action: string; skills?: string[] } | null;
+  agent: {
+    target: string;
+    targets: string[];
+    /**
+     * How the SET was arrived at: `flag` when `--agent` named it, `fallback`
+     * when nothing was found, otherwise `detected`.
+     *
+     * Deliberately not `'env' | 'trace'`: resolution is a UNION of both
+     * signals, so a single word would label a five-target set by whichever
+     * signal happened to fire first. Per-target provenance lives in
+     * `detections` below.
+     */
+    detectedBy: 'flag' | 'detected' | 'fallback';
+    /**
+     * One row per detected target, so a JSON consumer can tell which signal
+     * produced which install. Empty for `flag` and `fallback`.
+     */
+    detections: Array<{ target: string; source: AgentDetection['source']; signal: string }>;
+    action: string;
+    skills?: string[];
+  } | null;
+  /**
+   * Why `agent` is null: `flag` for `--no-agent`, `prompt` when the
+   * confirmation prompt was answered `none`. Absent when skills were installed.
+   */
+  agentSkippedBy?: 'flag' | 'prompt';
   status: 'initialized';
+}
+
+/**
+ * Provenance for the summary. `env` and `trace` both collapse to `detected`
+ * because resolution is a union of the two signals — one word cannot honestly
+ * label a set whose members came from different ones. The split is carried
+ * per target in `detections`.
+ */
+function agentProvenance(
+  r: AgentResolution,
+): Pick<NonNullable<InitSummary['agent']>, 'detectedBy' | 'detections'> {
+  return {
+    detectedBy: r.source === 'flag' || r.source === 'fallback' ? r.source : 'detected',
+    detections: r.detections.map(d => ({
+      target: d.target,
+      source: d.source,
+      signal: d.signal,
+    })),
+  };
 }
 
 /**
@@ -179,6 +244,118 @@ function _suppressedStdout(_line: string): void {
   // intentionally empty
 }
 
+/**
+ * Say which agents the install covers and why. Silent when `--agent` named one
+ * (the caller already knows), and always says the fallback out loud — an
+ * unannounced fallback is how skills land where the calling agent cannot read
+ * them while the command still reports success.
+ */
+function emitAgentResolutionNotice(
+  resolution: AgentResolution,
+  stderrFn: (line: string) => void,
+  willPrompt = false,
+): void {
+  if (resolution.source === 'flag') return;
+
+  if (resolution.source === 'fallback') {
+    stderrFn(
+      `[info] no coding agent detected in this project; installing for ${FALLBACK_TARGET}. ` +
+        `Pass --agent <target> to choose (${Object.keys(TARGETS).join(', ')}).`,
+    );
+    return;
+  }
+
+  const evidence = resolution.detections.map(d => `${d.target} (${d.signal})`).join(', ');
+  // When a prompt follows, the install set is not decided yet — saying
+  // "installing for X" here would read as a decision already taken.
+  if (willPrompt) {
+    stderrFn(`[info] detected ${evidence}`);
+    return;
+  }
+  stderrFn(`[info] detected ${evidence}; installing skills for ${resolution.targets.join(', ')}`);
+}
+
+/** Whether `confirmDetectedTargets` will actually ask. */
+function shouldConfirmTargets(
+  resolution: AgentResolution,
+  opts: { output?: string; yes?: boolean; dryRun?: boolean },
+  isTTY: boolean,
+): boolean {
+  const fromDetection = resolution.source === 'env' || resolution.source === 'trace';
+  return fromDetection && isTTY && !opts.yes && !opts.dryRun && opts.output !== 'json';
+}
+
+const CONFIRM_TARGETS_MAX_ATTEMPTS = 3;
+
+/**
+ * Let an operator see and edit the detected set before anything is written.
+ *
+ * Detection is a UNION of env and repo signals, so an ordinary repo carrying
+ * `AGENTS.md` plus a couple of agent config roots resolves to five targets and
+ * nine files — two of them shared, always-on rule files. `agent install`
+ * already asks when it has to choose; setup asking too keeps the two commands
+ * telling the same story.
+ *
+ * Returns the set to install, or `null` when the answer was `none` — the
+ * prompt's equivalent of `--no-agent`. Asks nothing when `--agent` named it
+ * (already explicit), on the fallback (one target, and the notice says so),
+ * under `--yes`, under `--dry-run` (nothing is written), off a TTY, or in JSON
+ * mode — a prompt there would corrupt the single-object stdout contract, the
+ * same reason the API-key prompt is refused in that mode.
+ *
+ * An unrecognised name is refused here and asked again, a bounded number of
+ * times. This runs before credentials are written, so a typo costs a retry
+ * rather than a half-finished setup that exits 5 after the key was saved.
+ */
+async function confirmDetectedTargets(
+  resolution: AgentResolution,
+  opts: { output?: string; yes?: boolean; dryRun?: boolean },
+  isTTY: boolean,
+  stderrFn: (line: string) => void,
+  promptFn?: (question: string) => Promise<string>,
+): Promise<AgentTarget[] | null> {
+  if (!shouldConfirmTargets(resolution, opts, isTTY)) {
+    return [...resolution.targets];
+  }
+
+  const suggestion = resolution.targets.join(',');
+  const validTargets = Object.keys(TARGETS) as AgentTarget[];
+  const ask = promptFn ?? ((q: string) => promptText(q));
+
+  for (let attempt = 1; attempt <= CONFIRM_TARGETS_MAX_ATTEMPTS; attempt++) {
+    const answer = (
+      await ask(`Install skills for (comma-separated, or "none" to skip) [${suggestion}]: `)
+    ).trim();
+    if (answer.toLowerCase() === 'none') return null;
+
+    // Lower-cased for the same reason `none` is: every target name is lower
+    // case, so `Claude` is a typo only in the sense that the shift key was
+    // down. Refusing it while accepting `NONE` would be an inconsistency the
+    // user has no way to predict.
+    const chosen = (answer || suggestion)
+      .split(',')
+      .map((s: string) => s.trim().toLowerCase())
+      .filter(Boolean);
+    // An answer of only separators ("," / ", ,") parses to nothing. Treat it as
+    // the empty answer it effectively is rather than installing for no target.
+    if (chosen.length === 0) return [...resolution.targets];
+
+    const unknown = chosen.filter(t => !validTargets.includes(t as AgentTarget));
+    if (unknown.length === 0) return [...new Set(chosen)] as AgentTarget[];
+
+    stderrFn(
+      `[warn] unknown target ${unknown.map(t => `"${t}"`).join(', ')}; ` +
+        `supported: ${validTargets.join(', ')} (or "none" to skip)`,
+    );
+  }
+
+  throw new CLIError(
+    `No recognised agent target after ${CONFIRM_TARGETS_MAX_ATTEMPTS} attempts. ` +
+      `Re-run with --agent <target> (${validTargets.join(', ')}) or --no-agent.`,
+    5,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // runInit
 // ---------------------------------------------------------------------------
@@ -187,11 +364,37 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const out = new Output(opts.output, { stdout: deps.stdout, stderr: deps.stderr });
 
+  // An unknown --agent is refused here, before credentials are written. Left
+  // to runInstall it surfaced as a `--target` error — a flag this command does
+  // not have — after the key was already saved, with a hint echoing the bad
+  // value back.
+  const validTargets = Object.keys(TARGETS) as AgentTarget[];
+  if (opts.agent !== undefined && !opts.noAgent && !validTargets.includes(opts.agent)) {
+    throw localValidationError(
+      'agent',
+      `unknown target "${opts.agent}"; supported: ${validTargets.join(', ')}`,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Which agents to install for: an explicit --agent, else whatever this repo
+  // shows, else the fallback. Resolved before any output so every branch below
+  // (conflict warning, dry-run preview, real install) reports the same set.
+  // -------------------------------------------------------------------------
+  let resolution: AgentResolution | null = opts.noAgent
+    ? null
+    : resolveAgentTargets(opts.agent, opts.dir ?? deps.cwd ?? process.cwd(), {
+        env: deps.env,
+        ...deps.detect,
+      });
+
   // -------------------------------------------------------------------------
   // Fix 5: emit conflict warning when both --agent and --no-agent were given
   // -------------------------------------------------------------------------
   if (opts.rawArgConflict) {
-    const effectiveLabel = opts.noAgent ? '--no-agent' : `--agent ${opts.agent}`;
+    const effectiveLabel = opts.noAgent
+      ? '--no-agent'
+      : `--agent ${opts.agent ?? resolution?.targets.join(',')}`;
     stderrFn(
       `[warn] both --no-agent and --agent supplied; using ${effectiveLabel} (last flag wins)`,
     );
@@ -229,6 +432,34 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     );
   }
 
+  // Announced only once the guards above have passed — otherwise a `--yes` with
+  // no key source printed "detected …" and then exited 5, describing an install
+  // that was never going to happen.
+  let agentSkippedBy: InitSummary['agentSkippedBy'] = opts.noAgent ? 'flag' : undefined;
+  if (resolution) {
+    const willPrompt = shouldConfirmTargets(resolution, opts, isTTY);
+    emitAgentResolutionNotice(resolution, stderrFn, willPrompt);
+
+    // A detected set is confirmable before it lands; every other case passes
+    // through untouched. Narrowed here so every downstream reader — the install
+    // call, the summary, the failure hint — sees the set actually chosen.
+    const confirmed = await confirmDetectedTargets(
+      resolution,
+      opts,
+      isTTY,
+      stderrFn,
+      deps.agentPrompt,
+    );
+    if (confirmed === null) {
+      stderrFn('[info] skipping the agent skill install (answered "none")');
+      resolution = null;
+      agentSkippedBy = 'prompt';
+    } else {
+      resolution = { ...resolution, targets: confirmed };
+      if (willPrompt) stderrFn(`[info] installing skills for ${confirmed.join(', ')}`);
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Dry-run: zero network + zero FS writes; print preview only
   // -------------------------------------------------------------------------
@@ -246,15 +477,13 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
       })`,
     );
 
-    const agentTarget = opts.noAgent ? null : opts.agent;
-
-    if (!opts.noAgent) {
+    if (resolution) {
       // Delegate to runInstall's own dry-run for the file-listing preview.
       // runInstall prints the would-write lines itself under dryRun.
       await runInstall(
         {
           ...opts,
-          target: [agentTarget!],
+          target: resolution.targets,
           force: opts.force,
           dir: opts.dir,
         },
@@ -267,8 +496,14 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
       apiUrl: resolveReportedEndpoint(opts, deps),
       env: 'development',
       scopes: [],
-      agent: agentTarget
-        ? { target: agentTarget, action: 'dry-run', skills: [...DEFAULT_SKILLS] }
+      agent: resolution
+        ? {
+            target: resolution.targets[0]!,
+            targets: [...resolution.targets],
+            ...agentProvenance(resolution),
+            action: 'dry-run',
+            skills: [...DEFAULT_SKILLS],
+          }
         : null,
       status: 'initialized',
     };
@@ -328,11 +563,11 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   // -------------------------------------------------------------------------
   // Step 3: Agent skill install (unless --no-agent)
   // -------------------------------------------------------------------------
-  let installedTarget: string | null = null;
+  let installedTargets: AgentTarget[] | null = null;
   let installedAction: string | null = null;
   let installedSkills: string[] = [];
 
-  if (!opts.noAgent) {
+  if (resolution) {
     // Run install in JSON mode internally so we can reliably parse the result
     // regardless of the outer --output flag. The stdout is captured here and
     // NOT forwarded — runInit owns the output surface. setup installs the full
@@ -355,7 +590,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
         {
           ...opts,
           output: 'json', // parse the result; final summary is ours to print
-          target: [opts.agent],
+          target: resolution.targets,
           // skills omitted → runInstall installs DEFAULT_SKILLS (verify + onboard)
           force: opts.force,
           dir: opts.dir,
@@ -363,7 +598,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
         toAgentDeps(deps, captureStdout),
       );
 
-      installedTarget = opts.agent;
+      installedTargets = [...resolution.targets];
       installedAction =
         capturedInstallResults.length > 0
           ? aggregateInstallAction(capturedInstallResults.map(r => r.action))
@@ -376,7 +611,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
       // API key was persisted — only the agent skill step failed (Fix 6).
       stderrFn(
         `[info] credentials saved for profile "${opts.profile}"; only the agent skill install failed — ` +
-          `re-run 'testsprite agent install --target ${opts.agent}' after fixing the path`,
+          `re-run 'testsprite agent install --target ${resolution.targets.join(',')}' after fixing the path`,
       );
       throw installErr;
     }
@@ -386,10 +621,12 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   // Step 4: Summary
   // -------------------------------------------------------------------------
   const agentSummary: InitSummary['agent'] =
-    opts.noAgent || installedTarget === null
+    resolution === null || installedTargets === null
       ? null
       : {
-          target: installedTarget,
+          target: installedTargets[0]!,
+          targets: installedTargets,
+          ...agentProvenance(resolution),
           action: installedAction ?? 'installed',
           skills: installedSkills.length > 0 ? installedSkills : [...DEFAULT_SKILLS],
         };
@@ -403,6 +640,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     email: me.email,
     scopes: me.scopes,
     agent: agentSummary,
+    ...(agentSummary === null && agentSkippedBy ? { agentSkippedBy } : {}),
     status: 'initialized',
   };
 
@@ -426,12 +664,17 @@ function renderInitText(data: unknown): string {
   if (s.scopes.length > 0) lines.push(`  scopes:   ${s.scopes.join(', ')}`);
   lines.push('');
   if (s.agent) {
-    lines.push(`  agent:    ${s.agent.target} (${s.agent.action})`);
+    const targets = s.agent.targets.length > 0 ? s.agent.targets : [s.agent.target];
+    lines.push(`  agent:    ${targets.join(', ')} (${s.agent.action})`);
     if (s.agent.skills && s.agent.skills.length > 0) {
       lines.push(`  skills:   ${s.agent.skills.join(', ')}`);
     }
   } else {
-    lines.push('  agent:    skipped (--no-agent)');
+    lines.push(
+      s.agentSkippedBy === 'prompt'
+        ? '  agent:    skipped (answered "none" at the prompt)'
+        : '  agent:    skipped (--no-agent)',
+    );
   }
   lines.push('');
   // DEV-279: an agent session already open when the skills landed won't re-read
@@ -516,7 +759,12 @@ export interface SetupCmdOpts {
   skipIfConfigured?: boolean;
 }
 
-/** Attach the onboarding flags shared by `setup` and the `init`/`auth configure` aliases. */
+/**
+ * Attach the onboarding flags shared by `setup` and the `init`/`auth configure`
+ * aliases. `--agent` deliberately carries NO default: its absence is the signal
+ * that setup should detect the agent, and a default value here is
+ * indistinguishable from the caller naming that same target.
+ */
 export function addSetupOptions(
   cmd: Command,
   validTargets: AgentTarget[],
@@ -531,8 +779,8 @@ export function addSetupOptions(
     )
     .option(
       '--agent <target>',
-      `Coding-agent target to install: ${validTargets.join(', ')} (default: ${defaultAgent})`,
-      defaultAgent,
+      `Coding-agent target to install: ${validTargets.join(', ')} ` +
+        `(default: every agent detected in this project, or ${defaultAgent} if none)`,
     )
     .option('--no-agent', 'Skip the agent skill install (configure credentials only)')
     .option('--force', 'Overwrite an existing skill file (a .bak backup is kept)')
@@ -545,19 +793,11 @@ export function addSetupOptions(
 }
 
 /** Build {@link InitOptions} from raw Commander opts + globals. */
-function buildSetupOptions(
-  cmdOpts: SetupCmdOpts,
-  command: Command,
-  defaultAgent: AgentTarget,
-): InitOptions {
+function buildSetupOptions(cmdOpts: SetupCmdOpts, command: Command): InitOptions {
   const common = resolveCommonOptions(command);
 
   // Commander sets `agent: false` (boolean) when `--no-agent` is passed,
-  // because `--no-agent` is the negation of `--agent <target>`. Guard against
-  // this: if agent is falsy (false or empty string) default to the CLI default
-  // so runInstall never receives a non-string target.
-  const resolvedAgent =
-    cmdOpts.agent && typeof cmdOpts.agent === 'string' ? cmdOpts.agent : defaultAgent;
+  // because `--no-agent` is the negation of `--agent <target>`.
   const isNoAgent = cmdOpts.noAgent === true || cmdOpts.agent === false;
 
   // Detect conflict when both --no-agent and --agent <target> appear in the raw
@@ -573,11 +813,16 @@ function buildSetupOptions(
     rawArgs.some((a: string) => a === '--no-agent') &&
     rawArgs.some((a: string) => a === '--agent' || a.startsWith('--agent='));
 
+  // Only a real `--agent <target>` reaches runInit. Left undefined otherwise, so
+  // setup detects instead of installing for a target nobody asked for.
+  const chosenAgent =
+    typeof cmdOpts.agent === 'string' && cmdOpts.agent ? (cmdOpts.agent as AgentTarget) : undefined;
+
   return {
     ...common,
     apiKey: cmdOpts.apiKey,
     fromEnv: Boolean(cmdOpts.fromEnv),
-    agent: resolvedAgent,
+    agent: chosenAgent,
     noAgent: isNoAgent,
     force: Boolean(cmdOpts.force),
     dir: cmdOpts.dir,
@@ -592,9 +837,8 @@ async function runSetupAction(
   cmdOpts: SetupCmdOpts,
   command: Command,
   deps: InitDeps,
-  defaultAgent: AgentTarget,
 ): Promise<void> {
-  const opts = buildSetupOptions(cmdOpts, command, defaultAgent);
+  const opts = buildSetupOptions(cmdOpts, command);
 
   // When --yes is supplied without a key source, force isTTY=false so runInit
   // emits exit 5 with a clear message rather than hanging on a prompt in a
@@ -615,7 +859,7 @@ export function createSetupCommand(deps: InitDeps = {}): Command {
     .description(SETUP_DESCRIPTION)
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts: SetupCmdOpts, command: Command) => {
-      await runSetupAction(cmdOpts, command, deps, defaultAgent);
+      await runSetupAction(cmdOpts, command, deps);
     });
 }
 
@@ -633,7 +877,7 @@ export function createDeprecatedInitCommand(deps: InitDeps = {}): Command {
     .description('(deprecated) alias for `setup`')
     .action(async (cmdOpts: SetupCmdOpts, command: Command) => {
       emitDeprecationNotice('init', 'setup', deps.stderr);
-      await runSetupAction(cmdOpts, command, deps, defaultAgent);
+      await runSetupAction(cmdOpts, command, deps);
     });
 }
 
@@ -654,5 +898,5 @@ export async function runConfigureViaSetup(
   deps: InitDeps,
   cmdOpts: SetupCmdOpts,
 ): Promise<void> {
-  await runSetupAction(cmdOpts, command, deps, 'claude');
+  await runSetupAction(cmdOpts, command, deps);
 }

@@ -201,6 +201,15 @@ export interface RequestOptions<T = unknown> {
    * other callers.
    */
   retryOnRateLimit?: boolean;
+  /**
+   * Disable every automatic retry for a read whose caller owns its cadence.
+   *
+   * The borrowed-tunnel liveness probe is one such read: a failed observation
+   * is "unknown", and its next attempt belongs to the 15-second wall-clock
+   * schedule rather than an HTTP-layer retry burst. Defaults to `true` so all
+   * existing request paths retain their retry behaviour.
+   */
+  retry?: boolean;
 }
 
 const RETRY_BASE_MS = 250;
@@ -575,10 +584,11 @@ export class HttpClient {
    */
   async getTunnelStatus(
     clientId: string,
-    options: { signal?: AbortSignal } = {},
+    options: { signal?: AbortSignal; retry?: boolean } = {},
   ): Promise<TunnelStatusResponse> {
     return this.get<TunnelStatusResponse>(`/tunnel/${encodeURIComponent(clientId)}`, {
       signal: options.signal,
+      retry: options.retry,
       schema: TUNNEL_STATUS_RESPONSE_SCHEMA,
     });
   }
@@ -730,7 +740,8 @@ export class HttpClient {
 
     const url = buildUrl(this.baseUrl, path, options.query);
     const requestId = options.requestId ?? newRequestId();
-    const allowTransportRetry = canRetryTransport(method, options);
+    const allowRetry = options.retry !== false;
+    const allowTransportRetry = allowRetry && canRetryTransport(method, options);
 
     let attempt = 0;
     while (true) {
@@ -985,14 +996,16 @@ export class HttpClient {
         });
         const retryOnConflict = options.retryOnConflict !== false;
         const retryOnRateLimit = options.retryOnRateLimit !== false;
-        const decision = apiRetryDecision(
-          apiError.code,
-          attempt,
-          retryAfterSec,
-          this.random,
-          retryOnConflict,
-          retryOnRateLimit,
-        );
+        const decision = allowRetry
+          ? apiRetryDecision(
+              apiError.code,
+              attempt,
+              retryAfterSec,
+              this.random,
+              retryOnConflict,
+              retryOnRateLimit,
+            )
+          : { retry: false, delayMs: 0 };
         if (!decision.retry) throw apiError;
         const delaySec = Math.round(decision.delayMs / 1000);
         if (apiError.code === 'RATE_LIMITED') {

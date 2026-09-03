@@ -128,6 +128,27 @@ upstream.
     control socket, this closes the data-plane target sockets — a distinct leak
     the control-socket fix exposed rather than covered. Upstream candidate
     (DEV-1030): the Rust client has the same shape.
+14. **`start()` waits for the current control socket's authentication Ack**
+    (`client.ts`, `types.ts`, `config.ts`). Upstream resolves `start()` from
+    `control-connected`, emitted in the WebSocket `open` handler before the
+    `Auth` frame is sent, so callers can trigger a run while the server still
+    reports the client offline. This copy keeps that transport event in place
+    and adds `control-authenticated`, emitted only for the first `Ack` on each
+    socket. A monotonically increasing connection generation scopes the wait;
+    reconnects re-arm the first-Ack state and an older socket cannot satisfy a
+    newer `start()`. A pre-Ack socket close/error rejects immediately, while
+    `authTimeoutMs` (10 seconds by default, matching the existing heartbeat and
+    target-connect windows) bounds a server that accepts the socket but never
+    acknowledges authentication. None of those rejection paths bypasses the
+    existing `stop()` handling for `CONNECTING` or `OPEN` sockets.
+15. **Blocked-target advice names only supported remedies** (`client.ts`).
+    Upstream's `BlockedTargetError` tells callers to set
+    `TS_TUNNEL_ALLOW_PRIVATE_NETWORK_TARGET` or enable the corresponding client
+    option. This CLI reads no such environment variable and hard-codes the
+    option `false`, so that advice named a switch its users cannot flip. The
+    message now states the actual reachability policy (this machine's loopback
+    plus the public internet) and tells the user to make the dependency
+    reachable through one of those routes. The guard itself is unchanged.
 
 ## Re-syncing
 

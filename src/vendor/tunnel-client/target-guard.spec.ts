@@ -1,5 +1,8 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
-import { blockedTargetReason } from './client.js';
+import { BlockedTargetError, blockedTargetReason } from './client.js';
 
 const EMBEDDED_IPV4_REASON = 'IPv4 address embedded in an IPv6 literal';
 
@@ -79,3 +82,62 @@ describe('blockedTargetReason', () => {
     ).toBe(true);
   });
 });
+
+describe('BlockedTargetError guidance', () => {
+  it('states the reachable target policy without naming a nonexistent override', () => {
+    const error = new BlockedTargetError(
+      'dependency.internal',
+      443,
+      '10.0.0.8',
+      'private IPv4 address',
+    );
+
+    expect(error.message).toBe(
+      'target dependency.internal:443 resolves to 10.0.0.8 (private IPv4 address); refusing to dial. ' +
+        'This run can reach localhost, 127.0.0.1, or ::1 on this machine and the public internet; ' +
+        'private/LAN/VPN addresses are deliberately blocked. Make the dependency reachable through ' +
+        'loopback or a public address, then retry.',
+    );
+    expect(error.message).not.toContain('TS_TUNNEL_ALLOW_PRIVATE_NETWORK_TARGET');
+  });
+
+  it('has no executable CLI source reference to the unused environment variable', () => {
+    const references: string[] = [];
+    for (const file of productionTypeScriptFiles(resolve('src'))) {
+      const scanner = ts.createScanner(
+        ts.ScriptTarget.Latest,
+        true,
+        ts.LanguageVariant.Standard,
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- `file` comes from walking this repository's own `src` tree below, never from input
+        readFileSync(file, 'utf8'),
+      );
+      while (scanner.scan() !== ts.SyntaxKind.EndOfFileToken) {
+        if (scanner.getTokenText().includes('TS_TUNNEL_ALLOW_PRIVATE_NETWORK_TARGET')) {
+          references.push(file);
+        }
+      }
+    }
+
+    expect(references).toEqual([]);
+  });
+});
+
+function productionTypeScriptFiles(directory: string): string[] {
+  const files: string[] = [];
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- `directory` starts at resolve('src') and only ever descends into directories found there
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = resolve(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...productionTypeScriptFiles(path));
+    } else if (
+      entry.isFile() &&
+      path.endsWith('.ts') &&
+      !path.endsWith('.test.ts') &&
+      !path.endsWith('.spec.ts') &&
+      !path.endsWith('.d.ts')
+    ) {
+      files.push(path);
+    }
+  }
+  return files;
+}

@@ -34,6 +34,10 @@ import { TunnelClient } from './client.js';
 import { connectEventMatchesTarget } from './ws-compat.js';
 
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+const AUTH_ACK_FRAME = Buffer.concat([
+  Buffer.from([0x81, 0x0e]),
+  Buffer.from('{"type":"Ack"}', 'utf8'),
+]);
 
 /** A real WS-upgrade stub: completes the handshake, then ignores everything
  * — never answers a Close frame, never destroys/ends the socket. This is the
@@ -54,9 +58,16 @@ async function startUncooperativeStub(): Promise<{ server: Server; port: number 
         'Connection: Upgrade\r\n' +
         `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
     );
-    // Deliberately nothing else: swallow all further bytes (including a
-    // Close frame), never reply, never destroy/end this socket.
-    socket.on('data', () => {});
+    let authAcknowledged = false;
+    // Acknowledge the first client frame (Auth), then deliberately swallow
+    // all later bytes (including a Close frame), never reply again, and never
+    // destroy/end this socket.
+    socket.on('data', () => {
+      if (!authAcknowledged) {
+        authAcknowledged = true;
+        socket.write(AUTH_ACK_FRAME);
+      }
+    });
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()));
   const address = server.address();
@@ -222,7 +233,12 @@ describe('TunnelClient.stop against an uncooperative control peer', () => {
           'Connection: Upgrade\r\n' +
           `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
       );
+      let authAcknowledged = false;
       socket.on('data', (chunk: Buffer) => {
+        if (!authAcknowledged) {
+          authAcknowledged = true;
+          socket.write(AUTH_ACK_FRAME);
+        }
         // client.ts sends its Auth text frame immediately on open, so the
         // Close frame this test is watching for may arrive in a later chunk
         // — or coalesced into the same one. Scanning the whole chunk for the

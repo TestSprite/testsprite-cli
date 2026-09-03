@@ -22,6 +22,15 @@
 /** Heartbeat cadence on the control WebSocket. Upstream default. */
 export const DEFAULT_HEARTBEAT_MS = 10_000;
 
+/**
+ * Maximum time `start()` waits for the server's authentication Ack.
+ *
+ * VENDOR DELTA: matches the existing 10-second heartbeat and target-connect
+ * windows, so a control socket cannot look ready indefinitely when the server
+ * accepted the transport but never authenticated it.
+ */
+export const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
+
 /** Delay between control/tunnel reconnect attempts. Upstream default. */
 export const DEFAULT_RECONNECT_MS = 3_000;
 

@@ -1,6 +1,12 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { MANAGED_SECTION_BEGIN, MANAGED_SECTION_END, TARGETS } from './agent-targets.js';
+import {
+  MANAGED_SECTION_BEGIN,
+  MANAGED_SECTION_END,
+  TARGETS,
+  type AgentTarget,
+} from './agent-targets.js';
+import { detectCallerFromEnv } from './agent-detect.js';
 import { defaultCredentialsPath, readProfile } from './credentials.js';
 import type { OutputMode } from './output.js';
 
@@ -61,14 +67,21 @@ export function isPlanTemplateInvocation(
 export interface SkillPresenceDeps {
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
+  /**
+   * Narrow the check to specific agents. Pass the agents actually calling: a
+   * skill installed for some OTHER agent is not one this caller can read, and
+   * treating it as installed is what makes the miss silent. Empty or omitted
+   * keeps the any-target answer, which is all an unidentified caller supports.
+   */
+  requiredTargets?: readonly AgentTarget[];
 }
 
 /**
- * True if the `testsprite-verify` skill is installed for ANY supported agent in
- * `dir`. own-file targets (claude/cursor/cline/antigravity): the landing file
- * exists. managed-section target (codex / AGENTS.md): the file exists AND
- * carries one complete managed section — a user-authored AGENTS.md without the
- * sentinels, or with a truncated section, does NOT count as our skill.
+ * True if the `testsprite-verify` skill is installed in `dir` — for any
+ * supported agent, or only for `deps.requiredTargets` when given. own-file
+ * targets: the landing file exists. managed-section target (codex / AGENTS.md):
+ * the file exists AND carries one complete managed section — a user-authored
+ * AGENTS.md without the sentinels, or with a truncated section, does NOT count.
  *
  * The TARGETS table is the single source of truth for landing paths, so this
  * stays in lockstep with `agent install` without re-listing paths. Best-effort:
@@ -77,7 +90,12 @@ export interface SkillPresenceDeps {
 export function isVerifySkillInstalled(dir: string, deps: SkillPresenceDeps = {}): boolean {
   const exists = deps.existsSync ?? existsSync;
   const read = deps.readFileSync ?? ((p: string) => readFileSync(p, 'utf8'));
-  for (const spec of Object.values(TARGETS)) {
+  const wanted = new Set<string>(deps.requiredTargets ?? []);
+  const specs = Object.entries(TARGETS)
+    .filter(([target]) => wanted.size === 0 || wanted.has(target))
+    .map(([, spec]) => spec);
+
+  for (const spec of specs) {
     const full = join(dir, spec.path);
     if (!exists(full)) continue;
     if (spec.mode === 'managed-section') {
@@ -143,20 +161,39 @@ export function maybeEmitSkillNudge(ctx: SkillNudgeContext): void {
     const profile = lookup(ctx.profile, { path: credsPath });
     if (!profile?.apiKey) return;
 
-    if (
-      isVerifySkillInstalled(ctx.cwd, {
-        existsSync: ctx.existsSync,
-        readFileSync: ctx.readFileSync,
-      })
-    ) {
+    const presence = { existsSync: ctx.existsSync, readFileSync: ctx.readFileSync };
+    // When the environment names the calling agent, only that agent's skill
+    // counts — an install for a different agent is one this caller cannot read.
+    //
+    // Checked PER caller and ANDed, never as one set. `isVerifySkillInstalled`
+    // answers "any of these targets", so handing it the whole set lets one
+    // satisfied caller hide another's miss: with both CLAUDECODE and
+    // CURSOR_AGENT present — a nested shell that still carries the outer
+    // agent's variable — a project wired only for claude would fall silent for
+    // cursor, which is the exact silent miss this check exists to remove.
+    const callers = detectCallerFromEnv(ctx.env).map(d => d.target);
+    const missing = callers.filter(
+      target => !isVerifySkillInstalled(ctx.cwd, { ...presence, requiredTargets: [target] }),
+    );
+    if (callers.length > 0) {
+      if (missing.length === 0) return;
+    } else if (isVerifySkillInstalled(ctx.cwd, presence)) {
+      // No identified caller: the any-target answer is all this can support.
       return;
     }
 
     const write = ctx.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    // Names the callers actually missing a skill, not every caller detected —
+    // with one of two satisfied, "not for cursor" is the actionable half and
+    // "not for claude or cursor" would be wrong about claude.
+    const forOtherAgent = missing.length > 0 && isVerifySkillInstalled(ctx.cwd, presence);
+    const subject = forOtherAgent
+      ? `The TestSprite verification skill is installed, but not for ${missing.join(' or ')}`
+      : 'No TestSprite verification skill is installed in this project';
     write(
-      '[warn] No TestSprite verification skill is installed in this project — your coding ' +
-        'agent will not verify its changes against TestSprite. Run `testsprite setup` (or ' +
-        `\`testsprite agent install\`) to set it up. Silence: ${SKILL_NUDGE_OPT_OUT_ENV}=1`,
+      `[warn] ${subject} — your coding agent will not verify its changes against ` +
+        'TestSprite. Run `testsprite setup` (or `testsprite agent install`) to set it up. ' +
+        `Silence: ${SKILL_NUDGE_OPT_OUT_ENV}=1`,
     );
   } catch {
     // A nudge must never break, delay, or alter the exit status of a real

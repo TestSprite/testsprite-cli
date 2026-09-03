@@ -6,6 +6,7 @@ import { CLIError, localValidationError } from '../lib/errors.js';
 import type { OutputMode } from '../lib/output.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptText } from '../lib/prompt.js';
+import { FALLBACK_TARGET, resolveAgentTargets, type DetectAgentDeps } from '../lib/agent-detect.js';
 import {
   type AgentTarget,
   TARGETS,
@@ -308,6 +309,8 @@ export interface AgentDeps {
   stderr?: (line: string) => void;
   isTTY?: boolean;
   prompt?: (question: string) => Promise<string>;
+  /** Injected fs/env for detecting which agents the project uses. */
+  detect?: DetectAgentDeps;
 }
 
 // ---------------------------------------------------------------------------
@@ -405,21 +408,43 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
     .filter(Boolean);
 
   let resolvedTargetStrings: string[];
+  // Whether the target came from the interactive prompt rather than a flag.
+  // Decides which of the two the refusal below names — telling someone their
+  // `--target` is invalid when they never typed one sends them to the wrong
+  // place.
+  let fromPrompt = false;
+
+  // Where the install lands, and so where detection looks (reused at step 3).
+  const dir = opts.dir ?? deps.cwd ?? process.cwd();
 
   if (rawTargets.length === 0) {
+    // No target named: install for the agents this project shows rather than a
+    // fixed one, so an unnamed install cannot land where the caller cannot read.
+    const detected = resolveAgentTargets(undefined, dir, { ...deps.detect });
+    const suggestion = detected.targets.join(',');
     const isTTY = deps.isTTY ?? Boolean(process.stdin.isTTY);
     if (!isTTY) {
       stderrFn(
-        '[info] --target not specified; defaulting to claude. Pass --target=<target> to select a different agent.',
+        detected.source === 'fallback'
+          ? `[info] no coding agent detected; installing for ${FALLBACK_TARGET}. Pass --target=<target> to select a different agent.`
+          : `[info] --target not specified; installing for ${suggestion}.`,
       );
-      resolvedTargetStrings = ['claude'];
+      resolvedTargetStrings = [...detected.targets];
     } else {
+      fromPrompt = true;
       const promptFn = deps.prompt ?? ((q: string) => promptText(q));
-      const answer = (await promptFn('Targets to install (comma-separated) [claude]: ')).trim();
-      const defaulted = answer || 'claude';
+      const answer = (
+        await promptFn(`Targets to install (comma-separated) [${suggestion}]: `)
+      ).trim();
+      const defaulted = answer || suggestion;
+      // Lower-cased for the same reason `setup`'s prompt does it: every target
+      // name is lower case, so `Cursor` is a typo only in the sense that the
+      // shift key was down. Accepting it in one prompt and refusing it in the
+      // other is an inconsistency the user has no way to predict. A `--target`
+      // value is left alone on both sides — that is a flag, not an answer.
       resolvedTargetStrings = defaulted
         .split(',')
-        .map(s => s.trim())
+        .map(s => s.trim().toLowerCase())
         .filter(Boolean);
     }
   } else {
@@ -430,6 +455,15 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
   const validTargets = Object.keys(TARGETS) as AgentTarget[];
   for (const t of resolvedTargetStrings) {
     if (!validTargets.includes(t as AgentTarget)) {
+      if (fromPrompt) {
+        // Not `localValidationError('target', …)`: that renders as "Flag
+        // --target is invalid", and on this path the caller passed no flag.
+        throw new CLIError(
+          `unknown target "${t}"; supported: ${validTargets.join(', ')}. ` +
+            'Re-run and answer with one of those, or pass --target <target>.',
+          5,
+        );
+      }
       throw localValidationError(
         'target',
         `unknown target "${t}"; supported: ${validTargets.join(', ')}`,
@@ -467,8 +501,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
     return true;
   });
 
-  // 3. Resolve dir
-  const dir = opts.dir ?? deps.cwd ?? process.cwd();
+  // 3. Resolve dir (computed above, where detection also needed it)
   const root = path.resolve(dir);
 
   // 4. Lazy asset loaders — only touch disk if a target actually needs it.

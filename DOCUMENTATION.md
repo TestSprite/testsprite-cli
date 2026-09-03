@@ -94,7 +94,7 @@ This is the loop a coding agent runs on its own once you've onboarded it with `t
 
 ```bash
 # (one-time, per project) teach your agent the CLI
-testsprite agent install claude
+testsprite setup
 
 # 1 — describe the behavior you want to guarantee, run it, wait
 testsprite test create --project proj_8f0f6 --type frontend \
@@ -131,7 +131,9 @@ testsprite agent status             # check installed skills against this CLI ve
 
 Supported targets: `claude` (GA), `codex` (experimental), `cursor` (experimental), `cline` (experimental), `antigravity` (experimental), `kiro` (experimental), `windsurf` (experimental), `copilot` (experimental).
 
-Omitting `--target` in a non-interactive shell (CI, agent subprocess) defaults to `claude` with an `[info]` note on stderr; in a terminal the CLI prompts (empty answer = `claude`).
+Omitting `--target` installs for the agents the project shows it uses — the calling agent when the environment names one, together with every agent whose own configuration is already in the repo. Both kinds of evidence count, so being called by one agent does not limit the install to that agent. A non-interactive shell (CI, agent subprocess) installs that set with an `[info]` note on stderr naming it; a terminal prompts with it pre-filled — press enter to accept, or give a comma-separated list to narrow it. An unrecognised name is refused outright (exit 5) and nothing is written; re-run to try again. With nothing detected it falls back to `claude` and says so.
+
+`setup`'s prompt is deliberately more forgiving than this one — it re-asks on an unrecognised name and takes `none` to skip. Neither command writes anything before its prompt, so the difference is not about what a refusal would leave behind: `setup` is the onboarding command, usually run once and often by an agent, where a re-run costs a whole round trip; `agent install` is a repair command already being run by hand, where re-running it is the obvious next thing to do. Both prompts accept a name in any case (`Cursor` and `cursor` are the same answer).
 
 `agent status` checks every installed skill file against the current CLI version and reports one of `ok`, `stale`, `modified`, `unmarked`, `absent`, or `corrupt` per target. It exits `1` when anything needs attention, so `testsprite agent status && …` can gate a CI step; `--dir <path>` inspects a different project root.
 

@@ -50,6 +50,9 @@ import {
   runTestWaitMany,
   runUpdate,
   writeBatchJUnitReportIfRequested,
+  runTestRunAll,
+  runTestRun,
+  runTestRerun,
 } from './test.js';
 
 function disableExits(cmd: Command): void {
@@ -988,6 +991,72 @@ describe('runGet', () => {
       { credentialsPath, fetchImpl, stdout: line => out.push(line) },
     );
     expect(out.join('\n')).toContain('planSteps:   3');
+  });
+
+  describe('planSteps rendering tolerates malformed wire elements', () => {
+    const cases: Array<{ name: string; planSteps: unknown[]; renderedSteps: string[] }> = [
+      { name: 'null', planSteps: [null], renderedSteps: [] },
+      { name: 'number', planSteps: [42], renderedSteps: [] },
+      { name: 'empty object', planSteps: [{}], renderedSteps: ['  1. [step] (no description)'] },
+      {
+        name: 'type only',
+        planSteps: [{ type: 'action' }],
+        renderedSteps: ['  1. [action] (no description)'],
+      },
+      {
+        name: 'description only',
+        planSteps: [{ description: 'x' }],
+        renderedSteps: ['  1. [step] x'],
+      },
+      {
+        name: 'well-formed pair',
+        planSteps: [
+          { type: 'action', description: 'Open the checkout page' },
+          { type: 'assertion', description: 'Confirm the order total is visible' },
+        ],
+        renderedSteps: [
+          '  1. [action] Open the checkout page',
+          '  2. [assertion] Confirm the order total is visible',
+        ],
+      },
+    ];
+
+    it.each(cases)('$name renders text exactly and preserves JSON verbatim', async testCase => {
+      const wireTest = {
+        ...FE_TEST,
+        planSteps: testCase.planSteps,
+      };
+      const { credentialsPath } = makeCreds();
+      const fetchImpl = makeFetch(() => ({ body: wireTest }));
+      const jsonOut: string[] = [];
+      const textOut: string[] = [];
+
+      const jsonResult = await runGet(
+        { profile: 'default', output: 'json', debug: false, testId: 'test_fe' },
+        { credentialsPath, fetchImpl, stdout: line => jsonOut.push(line) },
+      );
+      await runGet(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+        { credentialsPath, fetchImpl, stdout: line => textOut.push(line) },
+      );
+
+      expect(jsonResult.planSteps).toEqual(testCase.planSteps);
+      expect(JSON.parse(jsonOut.join('\n')).planSteps).toEqual(testCase.planSteps);
+      expect(textOut.join('\n')).toBe(
+        [
+          'id:          test_fe',
+          'projectId:   project_alice',
+          'name:        Checkout happy path',
+          'type:        frontend',
+          'createdFrom: portal',
+          'status:      failed',
+          `planSteps:   ${testCase.planSteps.length}`,
+          ...testCase.renderedSteps,
+          'createdAt:   2026-04-20T11:00:00.000Z',
+          'updatedAt:   2026-05-05T12:34:56.000Z',
+        ].join('\n'),
+      );
+    });
   });
 
   it('omits the planSteps line when planStepCount is null or absent (M3.4)', async () => {
@@ -11819,5 +11888,207 @@ describe('create-batch --run --target-url reachability preflight wiring', () => 
       },
     );
     expect(probeHits).toHaveLength(0);
+  });
+});
+
+describe('test run --all — the project-level closing link prefers the server field', () => {
+  const BATCH_OK = {
+    accepted: [{ testId: 't1', runId: 'r1', enqueuedAt: '2026-09-02T00:00:00.000Z' }],
+    conflicts: [],
+    deferred: [],
+    skippedFrontend: [],
+    skippedIntegration: [],
+  };
+  const SERVER_LINK = 'https://portal.example.com/dashboard-v3/o/org-1/projects/proj_1';
+
+  async function runAll(batchBody: Record<string, unknown>, apiUrl?: string) {
+    const { credentialsPath } = makeCreds('sk-user-test', apiUrl);
+    const fetchImpl = makeFetch((url, init) =>
+      (init.method ?? 'GET') === 'POST' && url.includes('/tests/batch/run')
+        ? { status: 202, body: batchBody }
+        : { body: {} },
+    );
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_1',
+        wait: false,
+        timeoutSeconds: 60,
+        maxConcurrency: 1,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    return { stdout: stdoutLines.join('\n'), stderr: stderrLines.join('\n') };
+  }
+
+  it('server dashboardUrl (string) → printed verbatim, never the legacy /dashboard/tests template', async () => {
+    const { stdout } = await runAll(
+      { ...BATCH_OK, dashboardUrl: SERVER_LINK },
+      'https://api.testsprite.com',
+    );
+    expect(stdout).toContain(`dashboard     ${SERVER_LINK}`);
+    expect(stdout).not.toContain('/dashboard/tests/');
+  });
+
+  it('server dashboardUrl: null → no dashboard line at all (no dead legacy guess)', async () => {
+    const { stdout } = await runAll(
+      { ...BATCH_OK, dashboardUrl: null },
+      'https://api.testsprite.com',
+    );
+    expect(stdout).not.toContain('dashboard     ');
+  });
+
+  it('field absent (older backend / V2 engine) on the prod API → the legacy client template, unchanged', async () => {
+    const { stdout } = await runAll(BATCH_OK, 'https://api.testsprite.com');
+    expect(stdout).toContain('dashboard     https://www.testsprite.com/dashboard/tests/proj_1');
+  });
+
+  it('field absent on an unknown API host → still no line (resolvePortalBase contract)', async () => {
+    const { stdout } = await runAll(BATCH_OK);
+    expect(stdout).not.toContain('dashboard     ');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// test run / test rerun (no --wait): the server-built dashboard link
+// ---------------------------------------------------------------------------
+
+describe('runTestRun / runTestRerun — dashboard line on the queued-run output', () => {
+  const QUEUED = {
+    runId: 'run_link_1',
+    status: 'queued',
+    enqueuedAt: '2026-09-02T00:00:00.000Z',
+    codeVersion: 'v1',
+    targetUrl: 'https://example.com',
+  };
+  const LINK = 'https://portal.example.com/dashboard-v3/o/org-1/projects/p/test-cases/test_1';
+
+  it('test run <id>: prints the dashboard line when the server supplies the link', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url =>
+      url.includes('/runs') ? { body: { ...QUEUED, dashboardUrl: LINK } } : { body: FE_TEST },
+    );
+    const out: string[] = [];
+    const resp = await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        testId: 'test_1',
+        wait: false,
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => {} },
+    );
+    const block = out.join('\n');
+    expect(block).toContain('runId       run_link_1');
+    expect(block).toContain(`dashboard   ${LINK}`);
+    expect((resp as { dashboardUrl?: string }).dashboardUrl).toBe(LINK);
+  });
+
+  it('test run <id>: an absent link prints nothing — never a guessed URL, never "undefined"', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url =>
+      url.includes('/runs') ? { body: QUEUED } : { body: FE_TEST },
+    );
+    const out: string[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        testId: 'test_1',
+        wait: false,
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => {} },
+    );
+    const block = out.join('\n');
+    expect(block).toContain('targetUrl   https://example.com');
+    expect(block).not.toContain('dashboard');
+    expect(block).not.toContain('undefined');
+  });
+
+  it('test run <id> --output json: the envelope carries dashboardUrl and executionUrl verbatim', async () => {
+    const { credentialsPath } = makeCreds();
+    const EXEC = 'https://portal.example.com/dashboard-v3/o/org-1/projects/p/execution/e';
+    const fetchImpl = makeFetch(url =>
+      url.includes('/runs')
+        ? { body: { ...QUEUED, dashboardUrl: LINK, executionUrl: EXEC } }
+        : { body: FE_TEST },
+    );
+    const out: string[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_1',
+        wait: false,
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => {} },
+    );
+    const parsed = JSON.parse(out.join('\n')) as { dashboardUrl?: string; executionUrl?: string };
+    expect(parsed.dashboardUrl).toBe(LINK);
+    expect(parsed.executionUrl).toBe(EXEC);
+  });
+
+  it('test rerun <id>: prints the dashboard line when supplied, nothing when absent', async () => {
+    const { credentialsPath } = makeCreds();
+    const RERUN = {
+      runId: 'run_rerun_1',
+      status: 'queued',
+      enqueuedAt: '2026-09-02T00:00:00.000Z',
+      codeVersion: 'v1',
+      autoHeal: false,
+      closure: null,
+    };
+    const rerunOpts = {
+      profile: 'default',
+      output: 'text' as const,
+      debug: false,
+      testIds: ['test_1'],
+      all: false,
+      wait: false,
+      timeoutSeconds: 600,
+      autoHeal: false,
+      autoHealExplicit: false,
+      skipDependencies: false,
+      maxConcurrency: 1,
+    };
+    const linked: string[] = [];
+    await runTestRerun(rerunOpts, {
+      credentialsPath,
+      fetchImpl: makeFetch(url =>
+        url.includes('/runs/rerun')
+          ? { body: { ...RERUN, dashboardUrl: LINK } }
+          : { body: FE_TEST },
+      ),
+      stdout: line => linked.push(line),
+      stderr: () => {},
+    });
+    expect(linked.join('\n')).toContain(`dashboard   ${LINK}`);
+
+    const bare: string[] = [];
+    await runTestRerun(rerunOpts, {
+      credentialsPath,
+      fetchImpl: makeFetch(url =>
+        url.includes('/runs/rerun') ? { body: RERUN } : { body: FE_TEST },
+      ),
+      stdout: line => bare.push(line),
+      stderr: () => {},
+    });
+    expect(bare.join('\n')).toContain('autoHeal    false');
+    expect(bare.join('\n')).not.toContain('dashboard');
   });
 });

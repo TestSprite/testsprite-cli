@@ -345,4 +345,24 @@ describe('TunnelLostError', () => {
     expect(err.code).toBe('UNAVAILABLE');
     expect(err.message).toMatch(/tunnel/i);
   });
+
+  it('tells a borrower to cancel the still-executing run before optionally watching it', () => {
+    const err = new TunnelLostError('owner-gone', 'run-borrowed-1');
+
+    expect(err).toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+      message:
+        'The borrowed tunnel for run run-borrowed-1 is no longer registered. It was minted ' +
+        'by another process (`testsprite tunnel start`), and that process has stopped or its ' +
+        'credential expired. Run run-borrowed-1 was left executing server-side and may still ' +
+        'finish; if it is cancelled, its verdict is discarded.',
+      nextAction:
+        'Run run-borrowed-1 has lost its tunnel and cannot reach your app any more. Stop it ' +
+        'now with: testsprite test cancel run-borrowed-1 (idempotent). To watch it instead: ' +
+        'testsprite test wait run-borrowed-1 --timeout <s>.',
+      details: { reason: 'owner-gone', runId: 'run-borrowed-1' },
+    });
+    expect(err.nextAction.indexOf('test cancel')).toBeLessThan(err.nextAction.indexOf('test wait'));
+  });
 });

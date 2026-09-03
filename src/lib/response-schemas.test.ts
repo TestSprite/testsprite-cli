@@ -9,6 +9,7 @@ import * as v from 'valibot';
 import { HttpClient } from './http.js';
 import {
   BATCH_RERUN_RESPONSE_SCHEMA,
+  BATCH_RUN_FRESH_RESPONSE_SCHEMA,
   LIST_RUNS_RESPONSE_SCHEMA,
   ME_IDENTITY_SCHEMA,
   RERUN_RESPONSE_SCHEMA,
@@ -177,15 +178,73 @@ describe('HttpClient schema hook', () => {
 });
 
 describe('TRIGGER_RUN_RESPONSE_SCHEMA', () => {
+  const QUEUED = {
+    runId: 'run_1',
+    status: 'queued',
+    enqueuedAt: '2026-06-01T10:00:00.000Z',
+    codeVersion: 'v1',
+    targetUrl: 'https://example.com',
+  };
+
   it('accepts the queued-run envelope', () => {
+    const parsed = v.safeParse(TRIGGER_RUN_RESPONSE_SCHEMA, QUEUED);
+    expect(parsed.success).toBe(true);
+  });
+
+  it('carries the server-built portal links through, typed', () => {
     const parsed = v.safeParse(TRIGGER_RUN_RESPONSE_SCHEMA, {
-      runId: 'run_1',
-      status: 'queued',
-      enqueuedAt: '2026-06-01T10:00:00.000Z',
-      codeVersion: 'v1',
-      targetUrl: 'https://example.com',
+      ...QUEUED,
+      dashboardUrl: 'https://portal.example.com/dashboard-v3/o/org/projects/p/test-cases/c',
+      executionUrl: 'https://portal.example.com/dashboard-v3/o/org/projects/p/execution/e',
     });
     expect(parsed.success).toBe(true);
+    if (!parsed.success) return;
+    expect(parsed.output.dashboardUrl).toBe(
+      'https://portal.example.com/dashboard-v3/o/org/projects/p/test-cases/c',
+    );
+    expect(parsed.output.executionUrl).toBe(
+      'https://portal.example.com/dashboard-v3/o/org/projects/p/execution/e',
+    );
+  });
+
+  it('an omitted link stays ABSENT after validation (rule 3: no default), and null is rejected', () => {
+    const absent = v.safeParse(TRIGGER_RUN_RESPONSE_SCHEMA, QUEUED);
+    expect(absent.success).toBe(true);
+    if (absent.success) {
+      expect('dashboardUrl' in absent.output).toBe(false);
+      expect('executionUrl' in absent.output).toBe(false);
+    }
+    // The server contract is omit-not-null; a null would be a server bug and
+    // must not slip through as "no link".
+    const nulled = v.safeParse(TRIGGER_RUN_RESPONSE_SCHEMA, { ...QUEUED, dashboardUrl: null });
+    expect(nulled.success).toBe(false);
+  });
+});
+
+describe('RERUN_RESPONSE_SCHEMA — portal links', () => {
+  const base = {
+    runId: 'run_1',
+    status: 'queued',
+    enqueuedAt: '2026-06-01T10:00:00.000Z',
+    codeVersion: 'v1',
+    autoHeal: false,
+  };
+
+  it('carries the portal links through and keeps an omitted one absent', () => {
+    const linked = v.safeParse(RERUN_RESPONSE_SCHEMA, {
+      ...base,
+      dashboardUrl: 'https://portal.example.com/dashboard-v3/o/org/projects/p/test-cases/c',
+    });
+    expect(linked.success).toBe(true);
+    if (linked.success) {
+      expect(linked.output.dashboardUrl).toBe(
+        'https://portal.example.com/dashboard-v3/o/org/projects/p/test-cases/c',
+      );
+      expect('executionUrl' in linked.output).toBe(false);
+    }
+    const bare = v.safeParse(RERUN_RESPONSE_SCHEMA, base);
+    expect(bare.success).toBe(true);
+    if (bare.success) expect('dashboardUrl' in bare.output).toBe(false);
   });
 });
 
@@ -349,5 +408,42 @@ describe('ME_IDENTITY_SCHEMA', () => {
       organizations: [{ id: 'org_1', name: 'Acme Corp', isPersonal: false }],
     });
     expect(parsed.success).toBe(false);
+  });
+});
+
+describe('BATCH_RUN_FRESH_RESPONSE_SCHEMA — project-level dashboardUrl contract', () => {
+  const VALID_BATCH = {
+    accepted: [{ testId: 't1', runId: 'r1', enqueuedAt: '2026-09-02T00:00:00.000Z' }],
+    conflicts: [],
+    deferred: [],
+    skippedFrontend: [],
+    skippedIntegration: [],
+  };
+
+  it('leaves an omitted dashboardUrl as an ABSENT key (older backend / V2 engine → client template)', () => {
+    const parsed = v.safeParse(BATCH_RUN_FRESH_RESPONSE_SCHEMA, VALID_BATCH);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect('dashboardUrl' in parsed.output).toBe(false);
+  });
+
+  it('keeps dashboardUrl: null as a PRESENT key (server says: no correct page)', () => {
+    const parsed = v.safeParse(BATCH_RUN_FRESH_RESPONSE_SCHEMA, {
+      ...VALID_BATCH,
+      dashboardUrl: null,
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect('dashboardUrl' in parsed.output).toBe(true);
+  });
+
+  it('passes a string dashboardUrl through verbatim', () => {
+    const parsed = v.safeParse(BATCH_RUN_FRESH_RESPONSE_SCHEMA, {
+      ...VALID_BATCH,
+      dashboardUrl: 'https://portal.example.com/dashboard-v3/o/org-1/projects/p1',
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success)
+      expect(parsed.output.dashboardUrl).toBe(
+        'https://portal.example.com/dashboard-v3/o/org-1/projects/p1',
+      );
   });
 });

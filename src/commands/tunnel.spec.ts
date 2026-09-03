@@ -13,7 +13,9 @@ type FetchInput = Parameters<typeof globalThis.fetch>[0];
 function makeCreds(): { credentialsPath: string } {
   const dir = mkdtempSync(join(tmpdir(), 'cli-tunnel-cmd-'));
   const credentialsPath = join(dir, 'credentials');
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- creates this suite's own mkdtempSync temp dir, never user input
   mkdirSync(dir, { recursive: true });
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes the fixture credentials body into this suite's own mkdtempSync temp dir, never user input
   writeFileSync(
     credentialsPath,
     '[default]\napi_url = http://localhost:13502\napi_key = sk-user-test\n',

@@ -232,11 +232,25 @@ beforeAll(async () => {
         'Connection: Upgrade\r\n' +
         `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
     );
-    // The real bug's shape: complete the handshake (OPEN), then go
-    // completely quiet — never answer a Close frame, never destroy/end this
-    // socket. This is what the ws-compat.ts fix's grace-timeout + unref
-    // exists for. Tracked in openControlSockets so the suite's OWN teardown
-    // doesn't hang on it — see that Set's docstring.
+    // Acknowledge authentication, exactly once, the way the real control
+    // plane does: it answers the client's `Auth` frame with `{"type":"Ack"}`,
+    // and `TunnelClient.start()` waits for that rather than for socket open
+    // (DEV-1007). A stub that stayed silent from the very first byte would no
+    // longer get past startup, and this suite would be exercising a startup
+    // timeout instead of the thing it is about.
+    //
+    // One unmasked text frame, hand-built because this stub speaks the
+    // handshake itself rather than pulling in a WebSocket library: 0x81 =
+    // FIN + text opcode, then the payload length (< 126, so a single byte).
+    const ack = Buffer.from('{"type":"Ack"}');
+    socket.write(Buffer.concat([Buffer.from([0x81, ack.length]), ack]));
+
+    // From here the real bug's shape: go completely quiet — never answer a
+    // Close frame, never destroy/end this socket. This is what the
+    // ws-compat.ts fix's grace-timeout + unref exists for. The Ack above is
+    // orthogonal: it gets the client to "started", and the hang under test is
+    // what happens at CLOSE. Tracked in openControlSockets so the suite's OWN
+    // teardown doesn't hang on it — see that Set's docstring.
     openControlSockets.add(socket);
     socket.on('close', () => openControlSockets.delete(socket));
     socket.on('data', () => {});
@@ -356,7 +370,12 @@ describe.skipIf(isWindows)('local-tunnel teardown e2e — the process must exit 
     // cannot revive a closed tunnel) rather than the ordinary non-tunnel
     // detach message.
     expect(outcome.stderr).toContain('Interrupted by SIGINT');
-    expect(outcome.stderr).toContain('Cancelled it');
+    // The interrupt message states the observed outcome, not a promise about
+    // credits: the run was cancelled with this exit code and its verdict is
+    // discarded.
+    expect(outcome.stderr).toMatch(/so it was cancelled \(exit 130\)/);
+    expect(outcome.stderr).toContain("a cancelled run's verdict is discarded");
+    expect(outcome.stderr).not.toMatch(/guaranteed failure|no further credits/i);
     expect(outcome.stderr).not.toContain('keeps running (and billing)');
     expect(outcome.stderr).not.toContain('testsprite test wait');
   }, 15_000);

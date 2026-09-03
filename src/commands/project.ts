@@ -241,7 +241,11 @@ export async function runCreate(
   // P2-7: guard --url against localhost/RFC1918/non-http(s) (same rules as
   // `test create --target-url`). Applies to both FE (required) and BE (optional).
   if (opts.targetUrl !== undefined) {
-    assertNotLocal(opts.targetUrl);
+    assertNotLocal(opts.targetUrl, {
+      field: 'url',
+      helpCommand: 'testsprite project create',
+      hintContext: 'bootstrap',
+    });
   }
 
   if (opts.type === 'frontend' && !opts.targetUrl) {
@@ -422,7 +426,11 @@ export async function runUpdate(
   }
   // P2-7: guard --url against localhost/RFC1918/non-http(s).
   if (opts.targetUrl !== undefined) {
-    assertNotLocal(opts.targetUrl);
+    assertNotLocal(opts.targetUrl, {
+      field: 'url',
+      helpCommand: 'testsprite project update',
+      hintContext: 'bootstrap',
+    });
   }
 
   const passwordSupplied = opts.password !== undefined || opts.passwordFile !== undefined;
@@ -1172,7 +1180,10 @@ function assertSafePresignedUploadUrl(uploadUrl: string, facadeBaseUrl: string):
  *  is `isLoopbackFacade`). */
 function isLocalUrl(url: string): boolean {
   try {
-    assertNotLocal(url);
+    assertNotLocal(url, {
+      field: 'upload-url',
+      helpCommand: 'testsprite project docs upload',
+    });
     return false;
   } catch {
     return true;
