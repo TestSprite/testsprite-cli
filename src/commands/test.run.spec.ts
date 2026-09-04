@@ -1692,6 +1692,74 @@ describe('C2 — backend run renders steps: n/a (backend) in text mode', () => {
     expect(out).not.toContain('n/a (backend)');
   });
 
+  it('FE run with an all-zero stepSummary renders n/a, not 0/0 (#335)', async () => {
+    // A passing frontend run whose summary comes back zeroed. Rendering it
+    // verbatim prints `steps 0/0 (passed=0, failed=0)` beside `status passed`,
+    // which reads as "nothing executed, and it passed" — the same no-op wording
+    // the backend branch already guards against. The zeros are not a breakdown
+    // of zero steps; they are an absent breakdown.
+    const { credentialsPath } = makeCreds();
+    const feRun: RunResponse = {
+      runId: 'run_fe_zero',
+      testId: 'test_fe_zero',
+      projectId: 'p1',
+      userId: 'u1',
+      status: 'passed',
+      source: 'cli',
+      createdAt: '2026-05-15T10:00:00.000Z',
+      startedAt: '2026-05-15T10:00:01.000Z',
+      finishedAt: '2026-05-15T10:00:30.000Z',
+      codeVersion: 'v1',
+      targetUrl: 'https://example.com',
+      createdFrom: null,
+      failedStepIndex: null,
+      failureKind: null,
+      error: null,
+      videoUrl: null,
+      stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
+    };
+    const handler = (url: string) => {
+      if (url.includes('/tests/test_fe_zero/runs')) {
+        return {
+          body: {
+            runId: 'run_fe_zero',
+            status: 'queued',
+            enqueuedAt: '2026-05-15T10:00:00.000Z',
+            codeVersion: 'v1',
+            targetUrl: 'https://example.com',
+          },
+        };
+      }
+      if (url.includes('/runs/run_fe_zero')) return { body: feRun };
+      return { status: 404, body: {} };
+    };
+    const stdoutLines: string[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        testId: 'test_fe_zero',
+        wait: true,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(handler),
+        stdout: line => stdoutLines.push(line),
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    const out = stdoutLines.join('\n');
+    expect(out).toContain('steps       n/a (no per-step breakdown reported)');
+    // The string the backend branch exists to avoid must not appear here either.
+    expect(out).not.toContain('0/0');
+    // It is a frontend run, so it must not claim to be a backend one.
+    expect(out).not.toContain('n/a (backend)');
+  });
+
   it('BE run terminal on first poll (opts.type=backend) renders steps: n/a via type hint (Fix 2)', async () => {
     // Simulates a fast backend run that is already terminal on the FIRST poll,
     // so `beFallbackUsed` is false (resolveAlternate is never called).

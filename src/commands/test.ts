@@ -6662,10 +6662,18 @@ function renderRunResponseText(
     // BE tests are atomic — no per-step breakdown. Show n/a instead of
     // confusing "0/0 (passed=0, failed=0)" which reads like a broken no-op.
     lines.push(`steps       n/a (backend)`);
-  } else if (run.stepSummary) {
+  } else if (run.stepSummary && run.stepSummary.total > 0) {
     lines.push(
       `steps       ${run.stepSummary.completed}/${run.stepSummary.total} (passed=${run.stepSummary.passedCount}, failed=${run.stepSummary.failedCount})`,
     );
+  } else if (run.stepSummary) {
+    // Same reasoning as the backend branch above, for the case the type check
+    // cannot catch: a frontend run whose summary comes back with `total: 0`.
+    // Rendering it verbatim prints `0/0 (passed=0, failed=0)` beside a
+    // `passed` status, which reads as "nothing executed, and it passed" — the
+    // exact no-op wording the backend branch exists to avoid. A zeroed summary
+    // is an absent breakdown, not a breakdown of zero steps, so say that.
+    lines.push(`steps       n/a (no per-step breakdown reported)`);
   }
   // Closing pointer: where to inspect this run in the Portal (video, steps,
   // screenshots). Present only when withRunDashboardUrl could resolve it.
