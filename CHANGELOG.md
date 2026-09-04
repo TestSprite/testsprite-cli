@@ -2,6 +2,12 @@
 
 All notable changes to `@testsprite/testsprite-cli` are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-09-03
+
+### Added
+
+- **`project create` / `project update --test-id-attributes <list>`.** Apps that tag their UI with their own attribute (`data-element`, `data-cy`, …) had no way to tell TestSprite, so exported test code located those elements by text chains or absolute xpath and broke on rerun. The new flag registers the project's test-hook attributes, highest priority first (`--test-id-attributes data-element,data-testid`); an element carrying one of them with a page-unique value is exported as `page.locator('[data-element="…"]')`, untagged elements keep the default role/label/text locators, and `data-testid` stays the built-in fallback. `project update --clear-test-id-attributes` reverts to the default (the two flags are mutually exclusive); `project get` prints the list as `testIdAttrs:` when the backend reports it. Names are validated client-side (bare attribute names only, max 10). V3-native projects only — a V2-mirrored project answers `PRECONDITION_FAILED` (`test_id_attributes_native_only`), and against a backend that predates the field the CLI answers `UNSUPPORTED` (exit 7, `test_id_attributes_unsupported_backend`) naming the fields the server did accept, rather than passing through the server's misleading "at least one field must be provided" 400. The onboarding skill now checks the app's source for its test-hook attribute and sets this during project setup.
+
 ## [0.9.0] - 2026-09-03
 
 ### Added

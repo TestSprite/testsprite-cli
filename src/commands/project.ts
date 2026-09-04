@@ -65,6 +65,53 @@ export interface CliProject {
    * (see the `project create --type backend` note in CLAUDE.md).
    */
   targetUrl?: string | null;
+  /**
+   * Project-level test-id attribute priority list (e.g. `['data-element',
+   * 'data-testid']`). The execution engine tries these DOM attributes, in
+   * order, before any other locator strategy when it exports test code, so
+   * customers who tag their UI with their own attribute get
+   * `page.locator('[data-element="…"]')` locators. Absent on older backends;
+   * `null`/empty means "not configured" (engine default: `data-testid`).
+   */
+  testIdAttributes?: string[] | null;
+}
+
+/** Attribute names are interpolated into CSS selectors by the engine — keep them plain. */
+const TEST_ID_ATTRIBUTE_NAME = /^[A-Za-z_][\w.:-]*$/;
+const TEST_ID_ATTRIBUTES_MAX = 10;
+
+/**
+ * Parse `--test-id-attributes <list>`: a comma-separated, ordered list of DOM
+ * attribute names. Trims, drops empties and duplicates (first occurrence
+ * wins — order is the priority), rejects invalid names. Exported for tests.
+ */
+export function parseTestIdAttributesFlag(raw: string, flagName: string): string[] {
+  const seen = new Set<string>();
+  const attrs: string[] = [];
+  for (const part of raw.split(',')) {
+    const name = part.trim();
+    if (!name) continue;
+    if (name.length > 64 || !TEST_ID_ATTRIBUTE_NAME.test(name)) {
+      throw localValidationError(
+        `--${flagName}: '${name}' is not a valid attribute name (letters, digits, '_', '-', '.', ':'; must not start with a digit).`,
+      );
+    }
+    if (!seen.has(name)) {
+      seen.add(name);
+      attrs.push(name);
+    }
+  }
+  if (attrs.length === 0) {
+    throw localValidationError(
+      `--${flagName} needs at least one attribute name, e.g. --${flagName} data-element,data-testid`,
+    );
+  }
+  if (attrs.length > TEST_ID_ATTRIBUTES_MAX) {
+    throw localValidationError(
+      `--${flagName} accepts at most ${TEST_ID_ATTRIBUTES_MAX} attribute names.`,
+    );
+  }
+  return attrs;
 }
 
 export interface ProjectDeps {
@@ -159,6 +206,8 @@ export interface CliCreateProjectRequest {
   username?: string;
   password?: string;
   instruction?: string;
+  /** Ordered test-id attribute list — see `CliProject.testIdAttributes`. */
+  testIdAttributes?: string[];
 }
 
 /**
@@ -198,6 +247,7 @@ interface CreateOptions extends CommonOptions {
   name: string;
   targetUrl?: string;
   description?: string;
+  testIdAttributes?: string[];
   username?: string;
   password?: string;
   passwordFile?: string;
@@ -301,13 +351,19 @@ export async function runCreate(
     ...(opts.username !== undefined ? { username: opts.username } : {}),
     ...(password !== undefined ? { password } : {}),
     ...(opts.instruction !== undefined ? { instruction: opts.instruction } : {}),
+    ...(opts.testIdAttributes !== undefined ? { testIdAttributes: opts.testIdAttributes } : {}),
   };
 
   const client = makeClient(opts, deps);
-  const rawCreated = await client.post<CliCreateProjectResponse>('/projects', {
-    body,
-    headers: { 'idempotency-key': idempotencyKey },
-  });
+  let rawCreated: CliCreateProjectResponse;
+  try {
+    rawCreated = await client.post<CliCreateProjectResponse>('/projects', {
+      body,
+      headers: { 'idempotency-key': idempotencyKey },
+    });
+  } catch (err) {
+    throw translateUnsupportedTestIdAttributes(err, body.testIdAttributes !== undefined);
+  }
   // Normalize whichever id field name the backend actually
   // sent onto BOTH `projectId` and `id`, so JSON consumers keyed on either
   // name keep working regardless of which one the live response used.
@@ -399,6 +455,9 @@ interface UpdateOptions extends CommonOptions {
   password?: string;
   passwordFile?: string;
   instruction?: string;
+  /** Ordered test-id attribute list; `clearTestIdAttributes` sends `null` to unset. */
+  testIdAttributes?: string[];
+  clearTestIdAttributes?: boolean;
   idempotencyKey?: string;
 }
 
@@ -433,6 +492,11 @@ export async function runUpdate(
     });
   }
 
+  if (opts.testIdAttributes !== undefined && opts.clearTestIdAttributes) {
+    throw localValidationError(
+      '--test-id-attributes and --clear-test-id-attributes are mutually exclusive.',
+    );
+  }
   const passwordSupplied = opts.password !== undefined || opts.passwordFile !== undefined;
   const mutableFields: Record<string, boolean> = {
     name: opts.name !== undefined,
@@ -440,13 +504,15 @@ export async function runUpdate(
     username: opts.username !== undefined,
     password: passwordSupplied,
     instruction: opts.instruction !== undefined,
+    testIdAttributes: opts.testIdAttributes !== undefined || opts.clearTestIdAttributes === true,
   };
   const presentFieldNames = Object.entries(mutableFields)
     .filter(([, present]) => present)
     .map(([field]) => field);
   if (presentFieldNames.length === 0) {
     throw localValidationError(
-      'At least one mutable flag is required: --name, --url, --username, --password/--password-file, or --instruction.',
+      'At least one mutable flag is required: --name, --url, --username, --password/--password-file, ' +
+        '--instruction, --test-id-attributes, or --clear-test-id-attributes.',
     );
   }
 
@@ -485,24 +551,31 @@ export async function runUpdate(
     stderr(`idempotency-key: ${idempotencyKey}`);
   }
 
-  const bodyFields: Record<string, string | undefined> = {
+  const bodyFields: Record<string, string | string[] | null | undefined> = {
     name: opts.name,
     targetUrl: opts.targetUrl,
     username: opts.username,
     password,
     instruction: opts.instruction,
+    // `null` clears the list server-side (same convention as `test update --clear-step-timeout`).
+    testIdAttributes: opts.clearTestIdAttributes ? null : opts.testIdAttributes,
   };
   const body = Object.fromEntries(
     Object.entries(bodyFields).filter(([, v]) => v !== undefined),
-  ) as Record<string, string>;
+  ) as Record<string, string | string[] | null>;
   const client = makeClient(opts, deps);
-  const rawUpdated = await client.patch<CliUpdateProjectResponse>(
-    `/projects/${encodeURIComponent(opts.projectId)}`,
-    {
-      body,
-      headers: { 'idempotency-key': idempotencyKey },
-    },
-  );
+  let rawUpdated: CliUpdateProjectResponse;
+  try {
+    rawUpdated = await client.patch<CliUpdateProjectResponse>(
+      `/projects/${encodeURIComponent(opts.projectId)}`,
+      {
+        body,
+        headers: { 'idempotency-key': idempotencyKey },
+      },
+    );
+  } catch (err) {
+    throw translateUnsupportedTestIdAttributes(err, 'testIdAttributes' in body);
+  }
   // Normalize whichever id field name the backend actually
   // sent onto BOTH `projectId` and `id`, so JSON consumers keyed on either
   // name keep working regardless of which one the live response used.
@@ -1337,6 +1410,11 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .option('--password-file <path>', 'read password from file instead of inline flag')
     .option('--instruction <text>', 'optional FE plan-gen instruction hint')
     .option(
+      '--test-id-attributes <list>',
+      'comma-separated DOM attributes the engine should prefer as locators, highest priority first ' +
+        '(e.g. data-element,data-testid). Unique values are exported as page.locator(\'[attr="…"]\').',
+    )
+    .option(
       '--idempotency-key <token>',
       'opaque idempotency token. Defaults to a UUIDv4 minted per invocation.',
     )
@@ -1362,6 +1440,10 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
           password: cmdOpts.password,
           passwordFile: cmdOpts.passwordFile,
           instruction: cmdOpts.instruction,
+          testIdAttributes:
+            cmdOpts.testIdAttributes !== undefined
+              ? parseTestIdAttributesFlag(cmdOpts.testIdAttributes, 'test-id-attributes')
+              : undefined,
           idempotencyKey: cmdOpts.idempotencyKey,
         },
         deps,
@@ -1378,6 +1460,16 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .option('--password-file <path>', 'read new password from file')
     .option('--instruction <text>', 'new FE plan-gen instruction hint')
     .option(
+      '--test-id-attributes <list>',
+      'comma-separated DOM attributes the engine should prefer as locators, highest priority first ' +
+        '(e.g. data-element,data-testid); replaces the current list',
+    )
+    .option(
+      '--clear-test-id-attributes',
+      'remove the test-id attribute list (engine falls back to data-testid)',
+      false,
+    )
+    .option(
       '--idempotency-key <token>',
       'opaque idempotency token. Defaults to a UUIDv4 minted per invocation.',
     )
@@ -1393,6 +1485,11 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
           password: cmdOpts.password,
           passwordFile: cmdOpts.passwordFile,
           instruction: cmdOpts.instruction,
+          testIdAttributes:
+            cmdOpts.testIdAttributes !== undefined
+              ? parseTestIdAttributesFlag(cmdOpts.testIdAttributes, 'test-id-attributes')
+              : undefined,
+          clearTestIdAttributes: cmdOpts.clearTestIdAttributes,
           idempotencyKey: cmdOpts.idempotencyKey,
         },
         deps,
@@ -1589,6 +1686,7 @@ interface CreateFlagOpts {
   password?: string;
   passwordFile?: string;
   instruction?: string;
+  testIdAttributes?: string;
   idempotencyKey?: string;
 }
 
@@ -1599,6 +1697,8 @@ interface UpdateFlagOpts {
   password?: string;
   passwordFile?: string;
   instruction?: string;
+  testIdAttributes?: string;
+  clearTestIdAttributes?: boolean;
   idempotencyKey?: string;
 }
 
@@ -1776,6 +1876,14 @@ function renderProjectText(p: CliProject): string {
         : `targetUrl:   (not set — set one with: testsprite project update ${p.id} --url <url>)`,
     );
   }
+  // Presence-keyed like targetUrl: older backends don't report the field at all.
+  if ('testIdAttributes' in p) {
+    lines.push(
+      p.testIdAttributes && p.testIdAttributes.length > 0
+        ? `testIdAttrs: ${p.testIdAttributes.join(', ')}  (locator priority, highest first)`
+        : `testIdAttrs: (not set — engine default data-testid; set with: testsprite project update ${p.id} --test-id-attributes <list>)`,
+    );
+  }
   return lines.join('\n');
 }
 
@@ -1823,6 +1931,36 @@ function requireDocsProjectId(projectId: string | undefined, deps: ProjectDeps):
   throw localValidationError(
     '--project <id> is required; pass --project <id> or set TESTSPRITE_PROJECT_ID',
   );
+}
+
+/**
+ * A backend that predates the testIdAttributes field answers a PATCH/POST that
+ * carries it with a generic 400 whose `details.accepted` list omits the field
+ * ("at least one field must be provided …" — misleading, since a field WAS
+ * provided). Translate that into an honest UNSUPPORTED so the user learns the
+ * real cause instead of re-reading their own command.
+ */
+function translateUnsupportedTestIdAttributes(
+  err: unknown,
+  sentTestIdAttributes: boolean,
+): unknown {
+  if (!sentTestIdAttributes || !(err instanceof ApiError) || err.code !== 'VALIDATION_ERROR')
+    return err;
+  const accepted = err.details?.accepted;
+  if (!Array.isArray(accepted) || accepted.includes('testIdAttributes')) return err;
+  return ApiError.fromEnvelope({
+    error: {
+      code: 'UNSUPPORTED',
+      message: 'This backend does not support test-id attributes yet.',
+      nextAction:
+        'The server accepted fields: ' +
+        accepted.join(', ') +
+        '. `--test-id-attributes` / `--clear-test-id-attributes` need a backend that knows the ' +
+        '`testIdAttributes` field; retry once it is deployed, or drop the flag.',
+      requestId: err.requestId,
+      details: { reason: 'test_id_attributes_unsupported_backend', accepted },
+    },
+  });
 }
 
 function localValidationError(message: string): ApiError {

@@ -135,15 +135,17 @@ const me: MeResponse = {
   },
 };
 
+const checkoutProject: CliProject = {
+  id: SAMPLE_PROJECT_ID,
+  name: 'Checkout',
+  type: 'frontend',
+  createdFrom: 'portal',
+  createdAt: '2026-04-15T10:23:00.000Z',
+  updatedAt: '2026-05-05T08:12:00.000Z',
+};
+
 const projects: CliProject[] = [
-  {
-    id: SAMPLE_PROJECT_ID,
-    name: 'Checkout',
-    type: 'frontend',
-    createdFrom: 'portal',
-    createdAt: '2026-04-15T10:23:00.000Z',
-    updatedAt: '2026-05-05T08:12:00.000Z',
-  },
+  checkoutProject,
   {
     id: SAMPLE_PROJECT_ID_BACKEND,
     name: 'Internal API',
@@ -643,7 +645,13 @@ const ENTRIES: DryRunSampleEntry[] = [
     docRole: 'API_DOC',
     processStatus: 'Pending',
   }),
-  entry('getProject', 'GET', '/projects/{projectId}', projects[0]),
+  // The single-project read carries the project-level test-id attribute list
+  // (present-and-null contract, see `CliProject.testIdAttributes`); the list
+  // row above deliberately omits it, like `targetUrl`.
+  entry('getProject', 'GET', '/projects/{projectId}', {
+    ...checkoutProject,
+    testIdAttributes: ['data-element', 'data-testid'],
+  } satisfies CliProject),
   // P6 — POST /projects (create project). The id uses a stable dry-run
   // sentinel so agents can see a coherent field shape without a real key.
   // Both `projectId` (the live field) and `id` (legacy/

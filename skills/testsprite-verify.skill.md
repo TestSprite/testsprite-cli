@@ -261,7 +261,11 @@ confidently-wrong `passed` (bare visibility assertions) or a thrashing
 - **Describe outcomes, not selectors.** The testing agent locates targets
   semantically — describe the intent and the match stays robust across copy
   changes; a guessed literal label defeats that. E.g. write `"Submit the form"`,
-  not `"Click the blue 'Submit' button"`.
+  not `"Click the blue 'Submit' button"`. If the app tags elements with its own
+  attribute (`data-element`, `data-cy`, …), make sure the project knows —
+  `testsprite project get <projectId>` shows `testIdAttrs:`; set it once with
+  `project update <projectId> --test-id-attributes <attr>,data-testid` — and the
+  exported code will locate tagged elements by that attribute instead of text.
 - **`Navigate to` only on step 1** (or a login page). Use clicks for every later
   transition — direct URLs break SPA routing.
 - **FE plans narrate a user journey through their actions.** Each action is

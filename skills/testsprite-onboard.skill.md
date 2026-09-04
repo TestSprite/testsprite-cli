@@ -67,6 +67,12 @@ Capture the returned `projectId`.
 > `No environment URL configured` — the suite goes all-red. Always pass `--url`. If flows need
 > login, pass `--username/--password-file` now so authenticated pages are reachable.
 
+#### 2b. FE: register the app's test-hook attribute
+
+If the source tags elements with something other than `data-testid` (e.g. `data-element`),
+run `testsprite project update <projectId> --test-id-attributes data-element,data-testid`
+once; exported locators then use the tag (check: `project get` → `testIdAttrs:`).
+
 ### 3. Get the tests — try generation first, author by hand if it isn't available
 
 #### 3a. Preferred: generate → review → accept
