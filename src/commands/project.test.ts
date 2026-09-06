@@ -631,6 +631,79 @@ describe('createProjectCommand --page-size option parser', () => {
   });
 });
 
+describe('project read response validation', () => {
+  it.each([
+    ['missing name', { ...PROJECT_FIXTURE, name: undefined }],
+    ['invalid attribute list', { ...PROJECT_FIXTURE, testIdAttributes: 'data-testid' }],
+    ['invalid nullable URL', { ...PROJECT_FIXTURE, targetUrl: false }],
+  ])('rejects %s before printing a successful result', async (_label, body) => {
+    const out: string[] = [];
+    await expect(
+      runGet(
+        { profile: 'default', output: 'json', debug: false, projectId: PROJECT_FIXTURE.id },
+        { ...makeCreds(), fetchImpl: makeFetch(() => ({ body })), stdout: line => out.push(line) },
+      ),
+    ).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+    expect(out).toEqual([]);
+  });
+
+  it.each([false, true])('validates list rows before output (single page: %s)', async single => {
+    const out: string[] = [];
+    let calls = 0;
+    const fetchImpl = makeFetch(() => {
+      calls += 1;
+      return {
+        body:
+          !single && calls === 1
+            ? { items: [PROJECT_FIXTURE], nextToken: 'second-page' }
+            : { items: [{ ...PROJECT_FIXTURE, id: null }], nextToken: null },
+      };
+    });
+    await expect(
+      runList(
+        { profile: 'default', output: 'text', debug: false, ...(single ? { pageSize: 1 } : {}) },
+        { ...makeCreds(), fetchImpl, stdout: line => out.push(line) },
+      ),
+    ).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+    expect(calls).toBe(single ? 1 : 2);
+    expect(out).toEqual([]);
+  });
+
+  it('rejects a malformed cursor instead of returning it as a usable next page', async () => {
+    const out: string[] = [];
+    await expect(
+      runList(
+        { profile: 'default', output: 'json', debug: false, pageSize: 1 },
+        {
+          ...makeCreds(),
+          fetchImpl: makeFetch(() => ({ body: { items: [PROJECT_FIXTURE], nextToken: 17 } })),
+          stdout: line => out.push(line),
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+    expect(out).toEqual([]);
+  });
+
+  it('preserves new server fields and enum values without inventing absent optional fields', async () => {
+    const body = {
+      ...PROJECT_FIXTURE,
+      type: 'mobile',
+      createdFrom: 'import',
+      owner: { name: 'Team' },
+    };
+    const out: string[] = [];
+    const result = await runGet(
+      { profile: 'default', output: 'json', debug: false, projectId: PROJECT_FIXTURE.id },
+      { ...makeCreds(), fetchImpl: makeFetch(() => ({ body })), stdout: line => out.push(line) },
+    );
+    expect(result).toEqual(body);
+    expect(JSON.parse(out[0]!)).toEqual(body);
+    expect(result).not.toHaveProperty('targetUrl');
+    expect(result).not.toHaveProperty('testIdAttributes');
+    expect(result).not.toHaveProperty('orgName');
+  });
+});
+
 describe('runGet', () => {
   it('GETs /projects/{id} and prints the §6.1 fields in text mode', async () => {
     const { credentialsPath } = makeCreds();

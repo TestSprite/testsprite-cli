@@ -1547,6 +1547,101 @@ describe('isPresignedCodeUrl', () => {
 });
 
 describe('runCodeGet', () => {
+  it.each(['json', 'text'] as const)(
+    '%s mode rejects malformed test-code responses before writing output',
+    async output => {
+      const { credentialsPath } = makeCreds();
+      const stdout: string[] = [];
+      const fetchImpl = makeFetch(() => ({
+        body: { ...TEST_CODE_INLINE, code: { unexpected: 'do not emit this body' } },
+      }));
+      await expect(
+        runCodeGet(
+          { profile: 'default', output, debug: false, testId: 'test_fe' },
+          {
+            credentialsPath,
+            fetchImpl,
+            stdout: line => stdout.push(line),
+            rawStdout: chunk => {
+              stdout.push(chunk);
+            },
+          },
+        ),
+      ).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+      expect(stdout).toEqual([]);
+    },
+  );
+
+  it('rejects a missing code field without replacing an existing --out file', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-shape-'));
+    const target = join(dir, 'existing.json');
+    writeFileSync(target, 'keep the original');
+    const withoutCode: Record<string, unknown> = { ...TEST_CODE_INLINE };
+    delete withoutCode.code;
+    const fetchImpl = makeFetch(() => ({ body: withoutCode }));
+    await expect(
+      runCodeGet(
+        { profile: 'default', output: 'json', debug: false, testId: 'test_fe', out: target },
+        { credentialsPath, fetchImpl },
+      ),
+    ).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+    expect(readFileSync(target, 'utf8')).toBe('keep the original');
+    expect(readdirSync(dir)).toEqual(['existing.json']);
+  });
+
+  it('preserves additive fields and future code language/framework strings', async () => {
+    const { credentialsPath } = makeCreds();
+    const body = {
+      ...TEST_CODE_INLINE,
+      language: 'ruby',
+      framework: 'rspec',
+      provenance: { source: 'future-server' },
+    };
+    const lines: string[] = [];
+    await runCodeGet(
+      { profile: 'default', output: 'json', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl: makeFetch(() => ({ body })), stdout: line => lines.push(line) },
+    );
+    expect(JSON.parse(lines.join(''))).toEqual(body);
+  });
+
+  it('routes null code to the no-code response without dereferencing it', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    await runCodeGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: { ...TEST_CODE_INLINE, code: null } })),
+        stderr: line => lines.push(line),
+        rawStdout: () => {
+          throw new Error('must not write an absent source body');
+        },
+      },
+    );
+    expect(lines).toContain('(no code generated yet — run the test first)');
+  });
+
+  it('rejects an invalid auto-fetched codeVersion before sending code put', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-version-'));
+    const codeFile = join(dir, 'replacement.py');
+    writeFileSync(codeFile, 'print("replacement")');
+    const methods: string[] = [];
+    const fetchImpl = makeFetch((_url, init) => {
+      methods.push(init.method ?? 'GET');
+      return { body: { ...TEST_CODE_INLINE, codeVersion: { unexpected: true } } };
+    });
+    await expect(
+      runCodePut(
+        { profile: 'default', output: 'json', debug: false, testId: 'test_fe', codeFile },
+        { credentialsPath, fetchImpl, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+    expect(methods).toEqual(['GET']);
+  });
+
   it('JSON mode prints the §6.3 wire shape verbatim and skips the URL fetch', async () => {
     const { credentialsPath } = makeCreds();
     const seen: string[] = [];
