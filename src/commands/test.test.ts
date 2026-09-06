@@ -8,7 +8,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import type { Command } from 'commander';
 import type { RunResponse } from '../lib/runs.types.js';
 import { ApiError, InterruptError } from '../lib/errors.js';
@@ -1599,10 +1599,13 @@ describe('runCodeGet', () => {
       provenance: { source: 'future-server' },
     };
     const lines: string[] = [];
-    await runCodeGet(
+    const result = await runCodeGet(
       { profile: 'default', output: 'json', debug: false, testId: 'test_fe' },
       { credentialsPath, fetchImpl: makeFetch(() => ({ body })), stdout: line => lines.push(line) },
     );
+    expectTypeOf(result.language).toEqualTypeOf<string>();
+    expectTypeOf(result.framework).toEqualTypeOf<string | undefined>();
+    expect(result).toEqual(body);
     expect(JSON.parse(lines.join(''))).toEqual(body);
   });
 

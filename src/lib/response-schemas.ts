@@ -70,8 +70,8 @@ function openWireLiteral<TLiteral extends string>(): v.GenericSchema<unknown, TL
  */
 export const CLI_TEST_CODE_SCHEMA: v.GenericSchema<unknown, CliTestCodeRead> = v.looseObject({
   testId: v.string(),
-  language: openWireLiteral<CliTestCodeRead['language']>(),
-  framework: v.optional(openWireLiteral<NonNullable<CliTestCodeRead['framework']>>()),
+  language: v.string(),
+  framework: v.optional(v.string()),
   code: v.nullable(v.string()),
   codeVersion: v.nullish(v.string(), null),
   etag: v.optional(v.nullable(v.string())),

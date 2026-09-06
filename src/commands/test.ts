@@ -254,9 +254,10 @@ export interface CliTestCode {
   etag?: string | null;
 }
 
-/** The standalone code endpoint also serves draft and legacy rows. */
-export type CliTestCodeRead = Omit<CliTestCode, 'framework' | 'code'> & {
-  framework?: CliTestCode['framework'];
+/** The standalone code endpoint also serves draft, legacy, and newer server values. */
+export type CliTestCodeRead = Omit<CliTestCode, 'language' | 'framework' | 'code'> & {
+  language: string;
+  framework?: string;
   code: string | null;
 };
 
