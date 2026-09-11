@@ -107,6 +107,15 @@ describe('describeCron', () => {
     }
   });
 
+  it('returns the raw expression when the month is restricted', () => {
+    // Every phrasing describeCron can produce names a cadence, and none of them
+    // can carry "only in these months". Saying "daily at 03:00" for a June-only
+    // cron contradicts the ~3 times/month printed next to it by the advisory.
+    for (const cron of ['0 3 * 6 *', '0 3 * 1,7 *', '0 3 * */6 *', '0 3 1 3 *', '0 3 * 6 1']) {
+      expect(describeCron(cron), cron).toBe(cron);
+    }
+  });
+
   it('returns the raw expression when the field count is not 5', () => {
     // A 6-field Quartz cron shifts every index, so reading f[1] as the hour
     // would describe a time the schedule never runs at.
@@ -143,6 +152,16 @@ describe('formatScheduleFrequencyAdvisory', () => {
     const out = formatScheduleFrequencyAdvisory('0 3 1 1 *');
     expect(out).toContain('less than once a month');
     expect(out).not.toContain('~0 time');
+  });
+
+  it('does not call a month-restricted schedule daily', () => {
+    // Regression: describeCron used to skip the month field entirely, so this
+    // rendered as "~3 time(s)/month (daily at 03:00)" -- two claims that cannot
+    // both be true, in one sentence.
+    const out = formatScheduleFrequencyAdvisory('0 3 * 6 *');
+    expect(out).toContain('~3 time(s)/month');
+    expect(out).not.toContain('daily');
+    expect(out).toContain('0 3 * 6 *');
   });
 
   it('still advises, without a frequency, for an expression it cannot read', () => {
