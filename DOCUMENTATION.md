@@ -64,13 +64,13 @@ The CLI uses API keys. Create one from your [TestSprite dashboard](https://www.t
 
 ```bash
 # Interactive — prompts for your API key (input is masked); endpoint defaults to prod
-testsprite auth configure
+testsprite setup --no-agent
 
 # Non-interactive — reads TESTSPRITE_API_KEY from the environment (CI / scripts)
-TESTSPRITE_API_KEY=sk-... testsprite setup --from-env
+TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --no-agent
 
 # Verify
-testsprite auth whoami
+testsprite auth status
 ```
 
 Credentials are normally stored at `~/.testsprite/credentials` (INI-style, mode `0600`). With `setup --from-env`, an unwritable or read-only HOME (`EACCES`, `EPERM`, or `EROFS` while saving credentials) produces a stderr warning and setup continues using `TESTSPRITE_API_KEY` for this session. Its JSON summary includes `credentials: { persisted: false, source: "env" }`; successful authentication does not mean the key was saved. Keep `TESTSPRITE_API_KEY` available in every shell/process that invokes the CLI. Agent installation still needs a writable destination; use `--no-agent` when only session authentication is needed. Other setup errors still fail. See [Configuration](#configuration) for profiles, environment overrides, and scopes.
