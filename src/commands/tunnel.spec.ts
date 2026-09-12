@@ -1,12 +1,14 @@
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../lib/errors.js';
+import { writeProfile } from '../lib/credentials.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import { ErrCode } from '../vendor/tunnel-client/index.js';
 import type { TunnelClientOptions } from '../vendor/tunnel-client/index.js';
-import { runTunnelStart, runTunnelStatus, runTunnelStop } from './tunnel.js';
+import { createTunnelCommand, runTunnelStart, runTunnelStatus, runTunnelStop } from './tunnel.js';
 
 type FetchInput = Parameters<typeof globalThis.fetch>[0];
 
@@ -29,8 +31,19 @@ const MINT_BODY = {
   secret: 'secret-never-printed-4a7b',
   controlUrl: 'ws://tunnel.example:7300/ws',
   tunnelAddr: 'tunnel.example:7400',
+  tunnelTlsAddr: 'data.tun.testsprite.com:443',
   expiresAt: '2026-08-24T18:00:00.000Z',
 };
+const PLAINTEXT_MINT_BODY = {
+  clientId: MINT_BODY.clientId,
+  secret: MINT_BODY.secret,
+  controlUrl: MINT_BODY.controlUrl,
+  tunnelAddr: MINT_BODY.tunnelAddr,
+  expiresAt: MINT_BODY.expiresAt,
+};
+const VALID_CLIENT_ID = 'cf6e0843-9166-4eaa-918e-f085407eaca5';
+const INVALID_CLIENT_ID_MESSAGE =
+  "Tunnel client id must be a UUID (see 'testsprite tunnel status'/'tunnel start' output).";
 
 function makeFetch(
   handler: (
@@ -55,8 +68,11 @@ function fakeTunnel() {
   const calls = { start: 0, stop: 0 };
   return {
     calls,
-    emitAuthFailure: () =>
-      captured?.onError?.({ code: ErrCode.AuthFailed, message: 'auth failed' }),
+    emitAuthFailure: (message = 'auth failed') =>
+      captured?.onError?.({ code: ErrCode.AuthFailed, message }),
+    emitDataPlaneFailure: (message: string) =>
+      captured?.onError?.({ code: ErrCode.DataPlaneUnreachable, message }),
+    seen: () => captured,
     factory: (options: TunnelClientOptions) => {
       captured = options;
       return {
@@ -72,6 +88,40 @@ function fakeTunnel() {
 }
 
 describe('tunnel start', () => {
+  it('reports a credential revoked during authentication as exit 10', async () => {
+    const methods: string[] = [];
+    const stdout: string[] = [];
+    const stopped = vi.fn(async () => {});
+    const error = await runTunnelStart(
+      { profile: 'default', output: 'json', debug: false },
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch(method => {
+          methods.push(method);
+          return method === 'POST' ? { status: 201, body: MINT_BODY } : { status: 204 };
+        }),
+        shutdown: new ShutdownController(),
+        stdout: line => stdout.push(line),
+        stderr: () => {},
+        createTunnelClient: options => ({
+          start: async () => {
+            options.onError?.({ code: ErrCode.AuthFailed, message: 'tunnel credential revoked' });
+            throw new Error('Control websocket closed before authentication was acknowledged');
+          },
+          stop: stopped,
+        }),
+      },
+    ).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      exitCode: 10,
+      message: 'Tunnel credential c-1111 was revoked, expired, or taken over by another process.',
+      details: { reason: 'credential-revoked' },
+    });
+    expect(stdout).toEqual([]);
+    expect(methods).toEqual(['POST', 'DELETE']);
+    expect(stopped).toHaveBeenCalledOnce();
+  });
+
   it('is armed before mint and treats Ctrl-C during connect as a clean stop', async () => {
     const shutdown = new ShutdownController();
     const armedStates: Array<{ phase: string; armed: boolean; critical: boolean }> = [];
@@ -161,9 +211,43 @@ describe('tunnel start', () => {
 
     const text = lines.join('\n');
     expect(text).toContain('c-1111');
+    expect(text).toContain('transport   tls');
+    expect(text).toContain(
+      "Stop it: press Ctrl-C here, or run 'testsprite tunnel stop c-1111' from another terminal",
+    );
     expect(text).not.toContain(MINT_BODY.secret);
     expect(seen.some(call => call.startsWith('DELETE'))).toBe(true);
     expect(tunnel.calls.stop).toBe(1);
+  });
+
+  it('reports plaintext in the JSON receipt for an old backend', async () => {
+    const stdout: string[] = [];
+    const shutdown = new ShutdownController();
+    const tunnel = fakeTunnel();
+    const promise = runTunnelStart(
+      { profile: 'default', output: 'json', debug: false },
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch(method =>
+          method === 'POST' ? { status: 201, body: PLAINTEXT_MINT_BODY } : { status: 204 },
+        ),
+        stdout: line => stdout.push(line),
+        stderr: () => {},
+        shutdown,
+        createTunnelClient: tunnel.factory,
+      },
+    );
+    await new Promise(resolve => setTimeout(resolve, 5));
+    shutdown.interrupt('SIGINT');
+    await promise;
+
+    expect(stdout).toHaveLength(1);
+    expect(JSON.parse(stdout[0]!)).toEqual({
+      clientId: PLAINTEXT_MINT_BODY.clientId,
+      expiresAt: PLAINTEXT_MINT_BODY.expiresAt,
+      status: 'online',
+      transport: 'plaintext',
+    });
   });
 
   it('retries one transient rate-limited cleanup DELETE and removes the binding', async () => {
@@ -323,17 +407,463 @@ describe('tunnel start', () => {
     await expect(promise).rejects.toMatchObject({ code: 'UNAVAILABLE' });
     expect(tunnel.calls.stop).toBe(1);
   });
+
+  it('exits 10 with TLS remediation after the data plane retry window expires', async () => {
+    const shutdown = new ShutdownController();
+    const tunnel = fakeTunnel();
+    const promise = runTunnelStart(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch(method =>
+          method === 'POST' ? { status: 201, body: MINT_BODY } : { status: 204 },
+        ),
+        stdout: () => {},
+        stderr: () => {},
+        shutdown,
+        createTunnelClient: tunnel.factory,
+      },
+    );
+    await new Promise(resolve => setTimeout(resolve, 5));
+    tunnel.emitDataPlaneFailure(
+      'Data plane tls at data.tun.testsprite.com:443 is unreachable after 60000ms: ' +
+        'unable to verify the first certificate',
+    );
+
+    let settled = false;
+    void promise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await new Promise(resolve => setTimeout(resolve, 20));
+    if (!settled) shutdown.interrupt('SIGINT');
+    const error = await promise.catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+      details: { reason: 'data-plane-unreachable', clientId: MINT_BODY.clientId },
+    });
+    expect((error as Error).message).toContain('data.tun.testsprite.com:443');
+    expect((error as Error).message).toContain('could not be established for 60s');
+    expect((error as Error).message).toContain(
+      'last error: unable to verify the first certificate',
+    );
+    expect((error as Error).message).toContain('NODE_EXTRA_CA_CERTS');
+    expect((error as ApiError).nextAction).toMatch(/network.*fixed|fix.*network/i);
+    expect(tunnel.seen()?.dataPlaneRetryDeadlineMs).toBe(60_000);
+    expect(tunnel.calls.stop).toBe(1);
+  });
+
+  it('exits 10 with plaintext self-hosted remediation and no TLS advice', async () => {
+    const shutdown = new ShutdownController();
+    const tunnel = fakeTunnel();
+    const promise = runTunnelStart(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch(method =>
+          method === 'POST' ? { status: 201, body: PLAINTEXT_MINT_BODY } : { status: 204 },
+        ),
+        stdout: () => {},
+        stderr: () => {},
+        shutdown,
+        createTunnelClient: tunnel.factory,
+      },
+    );
+    await new Promise(resolve => setTimeout(resolve, 5));
+    tunnel.emitDataPlaneFailure(
+      'Data plane plaintext at tunnel.example:7400 is unreachable after 60000ms: ECONNREFUSED',
+    );
+
+    let settled = false;
+    void promise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await new Promise(resolve => setTimeout(resolve, 20));
+    if (!settled) shutdown.interrupt('SIGINT');
+    const error = await promise.catch((caught: unknown) => caught);
+    expect(error).toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+      details: { reason: 'data-plane-unreachable', clientId: PLAINTEXT_MINT_BODY.clientId },
+    });
+    expect((error as Error).message).toContain('tunnel.example:7400');
+    expect((error as Error).message).toMatch(/self-hosted tunnel service/i);
+    expect((error as Error).message).toMatch(/egress firewall/i);
+    expect((error as Error).message).not.toContain('NODE_EXTRA_CA_CERTS');
+    expect((error as Error).message).not.toContain('port 443');
+    expect((error as ApiError).nextAction).toContain('tunnel.example:7400');
+    expect((error as ApiError).nextAction).toMatch(/self-hosted tunnel service/i);
+    expect((error as ApiError).nextAction).toMatch(/egress firewall/i);
+    expect((error as ApiError).nextAction).not.toContain('TLS');
+    expect((error as ApiError).nextAction).not.toContain('NODE_EXTRA_CA_CERTS');
+    expect(tunnel.calls.stop).toBe(1);
+  });
+});
+
+describe('tunnel start credential observation', () => {
+  it.each(['poll', 'cleanup'] as const)(
+    'uses the original profile endpoint and API key for %s after a profile change during connect',
+    async phase => {
+      vi.useFakeTimers();
+      const shutdown = new ShutdownController();
+      const { credentialsPath } = makeCreds();
+      const requests: Array<{ method: string; url: string; apiKey: string | null }> = [];
+      const stderr: string[] = [];
+      let settled = false;
+      let error: unknown;
+      const stop = vi.fn(async () => {});
+      const done = runTunnelStart(
+        { profile: 'default', output: 'json', debug: false },
+        {
+          credentialsPath,
+          env: {},
+          shutdown,
+          stdout: () => {},
+          stderr: line => stderr.push(line),
+          fetchImpl: async (input, init = {}) => {
+            const request = {
+              method: init.method ?? 'GET',
+              url: String(input),
+              apiKey: new Headers(init.headers).get('x-api-key'),
+            };
+            requests.push(request);
+            if (request.method === 'POST')
+              return new Response(JSON.stringify(MINT_BODY), { status: 201 });
+            if (request.method === 'DELETE') return new Response(null, { status: 204 });
+            return request.apiKey === 'sk-user-test' &&
+              request.url.startsWith('http://localhost:13502/')
+              ? new Response(JSON.stringify({ ...MINT_BODY, status: 'online' }))
+              : new Response(JSON.stringify({ error: { code: 'NOT_FOUND' } }), { status: 404 });
+          },
+          createTunnelClient: () => ({
+            start: async () => {
+              // Another setup replaces this profile while the tunnel is connecting.
+              writeProfile(
+                'default',
+                { apiKey: 'sk-user-other-owner', apiUrl: 'https://other-api.example.com' },
+                { path: credentialsPath },
+              );
+            },
+            stop,
+          }),
+        },
+      ).then(
+        () => {
+          settled = true;
+        },
+        caught => {
+          settled = true;
+          error = caught;
+        },
+      );
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect(requests).toEqual([
+          {
+            method: 'POST',
+            url: 'http://localhost:13502/api/cli/v1/tunnel',
+            apiKey: 'sk-user-test',
+          },
+        ]);
+        if (phase === 'poll') {
+          await vi.advanceTimersByTimeAsync(15_000);
+          expect(requests.filter(request => request.method === 'GET')).toEqual([
+            {
+              method: 'GET',
+              url: `http://localhost:13502/api/cli/v1/tunnel/${MINT_BODY.clientId}`,
+              apiKey: 'sk-user-test',
+            },
+          ]);
+          expect(settled).toBe(false);
+          expect(stop).not.toHaveBeenCalled();
+          expect(stderr.join('\n')).not.toContain('revoked');
+        }
+        shutdown.interrupt('SIGINT');
+        await vi.advanceTimersByTimeAsync(0);
+        await done;
+        expect(error).toBeUndefined();
+        expect(requests.filter(request => request.method === 'DELETE')).toEqual([
+          {
+            method: 'DELETE',
+            url: `http://localhost:13502/api/cli/v1/tunnel/${MINT_BODY.clientId}`,
+            apiKey: 'sk-user-test',
+          },
+        ]);
+        expect(stop).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        shutdown.interrupt('SIGINT');
+        await vi.advanceTimersByTimeAsync(0);
+        await done;
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  function holdTunnel(observe: typeof globalThis.fetch) {
+    const shutdown = new ShutdownController();
+    const tunnel = fakeTunnel();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const reads: number[] = [];
+    let deletes = 0;
+    let settled = false;
+    let error: unknown;
+    const fetchImpl: typeof globalThis.fetch = async (input, init = {}) => {
+      if (init.method === 'POST') {
+        return new Response(JSON.stringify(MINT_BODY), { status: 201 });
+      }
+      expect(String(input)).toBe(`http://localhost:13502/api/cli/v1/tunnel/${MINT_BODY.clientId}`);
+      if (init.method === 'DELETE') {
+        deletes += 1;
+        return new Response(null, { status: 204 });
+      }
+      expect(init.method).toBe('GET');
+      reads.push(Date.now());
+      return observe(input, init);
+    };
+    const done = runTunnelStart(
+      { profile: 'default', output: 'json', debug: false },
+      {
+        ...makeCreds(),
+        shutdown,
+        createTunnelClient: tunnel.factory,
+        fetchImpl,
+        stdout: line => stdout.push(line),
+        stderr: line => stderr.push(line),
+      },
+    ).then(
+      () => {
+        settled = true;
+      },
+      caught => {
+        settled = true;
+        error = caught;
+      },
+    );
+    return {
+      shutdown,
+      tunnel,
+      stdout,
+      stderr,
+      reads,
+      done,
+      get deletes() {
+        return deletes;
+      },
+      get settled() {
+        return settled;
+      },
+      get error() {
+        return error;
+      },
+      async cleanup() {
+        shutdown.interrupt('SIGINT');
+        await vi.advanceTimersByTimeAsync(0);
+        await done;
+        vi.useRealTimers();
+      },
+    };
+  }
+
+  it.each(['tunnel credential revoked', 'tunnel connection superseded or credential revoked'])(
+    'exits 10 immediately on %s without waiting for the poll',
+    async message => {
+      vi.useFakeTimers();
+      const held = holdTunnel(makeFetch(() => ({ body: { ...MINT_BODY, status: 'online' } })));
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        held.tunnel.emitAuthFailure(message);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(held.settled).toBe(true);
+        expect(held.error).toMatchObject({
+          code: 'UNAVAILABLE',
+          exitCode: 10,
+          message:
+            'Tunnel credential c-1111 was revoked, expired, or taken over by another process.',
+          details: { reason: 'credential-revoked' },
+        });
+        expect(held.stderr).toContain(
+          'Tunnel credential c-1111 was revoked, expired, or taken over by another process.',
+        );
+        expect(held.stdout).toHaveLength(1);
+        expect(JSON.parse(held.stdout[0]!)).toEqual({
+          clientId: MINT_BODY.clientId,
+          expiresAt: MINT_BODY.expiresAt,
+          status: 'online',
+          transport: 'tls',
+        });
+        expect(held.deletes).toBe(1);
+        expect(held.tunnel.calls.stop).toBe(1);
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(held.reads).toHaveLength(0);
+        expect(held.deletes).toBe(1);
+      } finally {
+        await held.cleanup();
+      }
+    },
+  );
+
+  it('exits 10 after external deletion with one teardown and a revocation message', async () => {
+    vi.useFakeTimers();
+    const held = holdTunnel(makeFetch(() => ({ status: 404 })));
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(held.stdout).toHaveLength(1);
+      expect(JSON.parse(held.stdout[0]!)).toEqual({
+        clientId: MINT_BODY.clientId,
+        expiresAt: MINT_BODY.expiresAt,
+        status: 'online',
+        transport: 'tls',
+      });
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(held.reads).toHaveLength(0);
+      expect(held.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(held.settled).toBe(true);
+      expect(held.error).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
+      expect(held.stderr).toContain(
+        'Tunnel credential c-1111 was revoked, expired, or taken over by another process.',
+      );
+      expect(held.tunnel.calls.stop).toBe(1);
+      expect(held.deletes).toBe(1);
+      expect(held.shutdown.isArmed).toBe(false);
+      held.tunnel.emitAuthFailure();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(held.reads).toHaveLength(1);
+      expect(held.deletes).toBe(1);
+      expect(held.tunnel.calls.stop).toBe(1);
+    } finally {
+      await held.cleanup();
+    }
+  });
+
+  it.each(['503', '429', 'network', '503 with NOT_FOUND'])(
+    'keeps holding through %s with one warning per outage and no retry burst',
+    async failure => {
+      vi.useFakeTimers();
+      let recovered = false;
+      const held = holdTunnel(
+        makeFetch(() => {
+          if (recovered) return { body: { ...MINT_BODY, status: 'online' } };
+          if (failure === 'network') throw new TypeError('fetch failed');
+          return {
+            status: failure === '429' ? 429 : 503,
+            body: {
+              error: { code: failure === '503 with NOT_FOUND' ? 'NOT_FOUND' : 'UNAVAILABLE' },
+            },
+          };
+        }),
+      );
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        const startedAt = Date.now();
+        await vi.advanceTimersByTimeAsync(45_000);
+        expect(held.reads).toEqual([startedAt + 15_000, startedAt + 30_000, startedAt + 45_000]);
+        expect(held.settled).toBe(false);
+        expect(held.tunnel.calls.stop).toBe(0);
+        expect(held.deletes).toBe(0);
+        expect(held.stderr).toHaveLength(1);
+        expect(held.stderr[0]).toMatch(/could not check.*credential.*continuing/i);
+        recovered = true;
+        await vi.advanceTimersByTimeAsync(15_000);
+        recovered = false;
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(held.stderr).toHaveLength(2);
+        expect(held.settled).toBe(false);
+      } finally {
+        await held.cleanup();
+      }
+    },
+  );
+
+  it('keeps an offline credential and preserves clean Ctrl-C without further reads', async () => {
+    vi.useFakeTimers();
+    const held = holdTunnel(makeFetch(() => ({ body: { ...MINT_BODY, status: 'offline' } })));
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(held.reads).toHaveLength(2);
+      expect(held.settled).toBe(false);
+      expect(held.stderr).toEqual([]);
+      held.shutdown.interrupt('SIGINT');
+      await vi.advanceTimersByTimeAsync(0);
+      await held.done;
+      expect(held.error).toBeUndefined();
+      expect(held.tunnel.calls.stop).toBe(1);
+      expect(held.deletes).toBe(1);
+      expect(held.stderr).toContain('Tunnel c-1111 closed.');
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(held.reads).toHaveLength(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await held.cleanup();
+    }
+  });
+
+  it.each(['interrupt', 'auth failure'])('aborts an in-flight observation on %s', async cause => {
+    vi.useFakeTimers();
+    let aborted = false;
+    const held = holdTunnel(
+      (_input, init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => {
+              aborted = true;
+              reject(init.signal?.reason);
+            },
+            { once: true },
+          );
+        }),
+    );
+    try {
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(held.reads).toHaveLength(1);
+      if (cause === 'interrupt') held.shutdown.interrupt('SIGINT');
+      else held.tunnel.emitAuthFailure();
+      await vi.advanceTimersByTimeAsync(0);
+      await held.done;
+      expect(aborted).toBe(true);
+      if (cause === 'interrupt') expect(held.error).toBeUndefined();
+      else expect(held.error).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
+      expect(held.tunnel.calls.stop).toBe(1);
+      expect(held.deletes).toBe(1);
+      expect(held.stderr.join('\n')).not.toMatch(/could not check|revoked/i);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await held.cleanup();
+    }
+  });
+
+  it('explains that credential revocation stops the foreground owner', () => {
+    const command = createTunnelCommand().commands.find(command => command.name() === 'stop');
+    const lines: string[] = [];
+    command?.configureOutput({ writeOut: line => lines.push(line) });
+    command?.outputHelp();
+    expect(lines.join('')).toContain('also makes a running `tunnel start` exit within ~15 s');
+  });
 });
 
 describe('tunnel status', () => {
   it('reports online for a live client', async () => {
     const lines: string[] = [];
     const result = await runTunnelStatus(
-      { profile: 'default', output: 'text', debug: false, clientId: 'c-1111' },
+      { profile: 'default', output: 'text', debug: false, clientId: VALID_CLIENT_ID },
       {
         ...makeCreds(),
         fetchImpl: makeFetch(() => ({
-          body: { clientId: 'c-1111', status: 'online', expiresAt: MINT_BODY.expiresAt },
+          body: { clientId: VALID_CLIENT_ID, status: 'online', expiresAt: MINT_BODY.expiresAt },
         })),
         stdout: line => lines.push(line),
         stderr: () => {},
@@ -354,7 +884,7 @@ describe('tunnel status', () => {
     let thrown: unknown;
     try {
       await runTunnelStatus(
-        { profile: 'default', output: 'text', debug: false, clientId: 'c-1111' },
+        { profile: 'default', output: 'text', debug: false, clientId: VALID_CLIENT_ID },
         {
           ...makeCreds(),
           fetchImpl: makeFetch(() => ({
@@ -384,7 +914,7 @@ describe('tunnel status', () => {
   it('surfaces an unknown or other-tenant id as NOT_FOUND, not as offline', async () => {
     await expect(
       runTunnelStatus(
-        { profile: 'default', output: 'text', debug: false, clientId: 'nope' },
+        { profile: 'default', output: 'text', debug: false, clientId: VALID_CLIENT_ID },
         {
           ...makeCreds(),
           fetchImpl: makeFetch(() => ({
@@ -403,7 +933,7 @@ describe('tunnel status', () => {
           stderr: () => {},
         },
       ),
-    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    ).rejects.toMatchObject({ code: 'NOT_FOUND', exitCode: 4, httpStatus: 404 });
   });
 });
 
@@ -416,15 +946,116 @@ describe('tunnel stop', () => {
     });
     const lines: string[] = [];
     await runTunnelStop(
-      { profile: 'default', output: 'text', debug: false, clientId: 'c-1111' },
+      { profile: 'default', output: 'text', debug: false, clientId: VALID_CLIENT_ID },
       { ...makeCreds(), fetchImpl, stdout: line => lines.push(line), stderr: () => {} },
     );
     await runTunnelStop(
-      { profile: 'default', output: 'text', debug: false, clientId: 'c-1111' },
+      { profile: 'default', output: 'text', debug: false, clientId: VALID_CLIENT_ID },
       { ...makeCreds(), fetchImpl, stdout: () => {}, stderr: () => {} },
     );
     expect(seen.filter(c => c.startsWith('DELETE')).length).toBe(2);
-    expect(lines.join('\n')).toContain('c-1111');
+    expect(lines).toEqual([`Tunnel credential ${VALID_CLIENT_ID} revoked (or already absent).`]);
+  });
+
+  it('preserves the idempotent JSON result for an uppercase UUID', async () => {
+    const clientId = 'CF6E0843-9166-4EAA-918E-F085407EACA5';
+    const lines: string[] = [];
+    const requests: string[] = [];
+    const deps = {
+      ...makeCreds(),
+      fetchImpl: makeFetch((method, url) => {
+        requests.push(`${method} ${url}`);
+        return { status: 204 };
+      }),
+      stdout: (line: string) => lines.push(line),
+      stderr: () => {},
+    };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await runTunnelStop({ profile: 'default', output: 'json', debug: false, clientId }, deps);
+    }
+    expect(lines.map(line => JSON.parse(line))).toEqual([
+      { clientId, deleted: true },
+      { clientId, deleted: true },
+    ]);
+    expect(requests).toEqual([
+      `DELETE http://localhost:13502/api/cli/v1/tunnel/${clientId}`,
+      `DELETE http://localhost:13502/api/cli/v1/tunnel/${clientId}`,
+    ]);
+  });
+});
+
+describe.each([
+  { name: 'status', run: runTunnelStatus },
+  { name: 'stop', run: runTunnelStop },
+])('tunnel $name UUID validation', ({ name, run }) => {
+  describe.each(['text', 'json'] as const)('%s output', output => {
+    it.each([
+      '',
+      'c-1111',
+      'not-a-uuid',
+      'cf6e084391664eaa918ef085407eaca5',
+      'cf6e0843-9166-4eaa-918e-f085407eacaZ',
+      'cf6e0843-9166-4eaa-918e-f085407eaca',
+      'cf6e0843-9166-4eaa-918e-f085407eaca5 ',
+      '{cf6e0843-9166-4eaa-918e-f085407eaca5}',
+    ])('rejects malformed id %j before any request', async clientId => {
+      const fetchImpl = vi.fn(
+        makeFetch(method =>
+          method === 'DELETE'
+            ? { status: 204 }
+            : { body: { clientId, status: 'online', expiresAt: MINT_BODY.expiresAt } },
+        ),
+      );
+      const stdout = vi.fn();
+      await expect(
+        run(
+          { profile: 'default', output, debug: false, clientId },
+          { ...makeCreds(), fetchImpl, stdout, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        message: INVALID_CLIENT_ID_MESSAGE,
+      });
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(stdout).not.toHaveBeenCalled();
+    });
+
+    it('validates before credentials are required', async () => {
+      const fetchImpl = vi.fn(makeFetch(() => ({ status: 204 })));
+      await expect(
+        run(
+          { profile: 'default', output, debug: false, clientId: 'bad-id' },
+          { env: {}, credentialsPath: '/nonexistent/tunnel-validation-credentials', fetchImpl },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        message: INVALID_CLIENT_ID_MESSAGE,
+      });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it('renders the local error and exits 5 in the built CLI, including dry run', () => {
+      const result = spawnSync(
+        process.execPath,
+        ['dist/index.js', '--dry-run', '--output', output, 'tunnel', name, 'bad-id'],
+        { encoding: 'utf8', env: { ...process.env, TESTSPRITE_TELEMETRY: 'off' } },
+      );
+      expect(result.status).toBe(5);
+      expect(result.stdout).toBe('');
+      if (output === 'json') {
+        expect(JSON.parse(result.stderr)).toMatchObject({
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: INVALID_CLIENT_ID_MESSAGE,
+            requestId: 'local',
+          },
+        });
+      } else {
+        expect(result.stderr).toContain(`Error: ${INVALID_CLIENT_ID_MESSAGE}`);
+      }
+    });
   });
 });
 

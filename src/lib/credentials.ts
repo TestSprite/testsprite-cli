@@ -64,6 +64,30 @@ export interface CredentialsOptions {
   path?: string;
 }
 
+type CredentialsWritePermissionError = NodeJS.ErrnoException & {
+  code: 'EPERM' | 'EACCES' | 'EROFS';
+};
+
+// Keep the original errno object and distinguish write permissions from errors
+// while reading profiles, recovering locks, or tightening file permissions.
+const writePermissionErrors = new WeakSet<Error>();
+
+export function isCredentialsWritePermissionError(
+  error: unknown,
+): error is CredentialsWritePermissionError {
+  return error instanceof Error && writePermissionErrors.has(error);
+}
+
+function rethrowCredentialsWriteError(error: unknown): never {
+  if (
+    isErrnoException(error) &&
+    (error.code === 'EPERM' || error.code === 'EACCES' || error.code === 'EROFS')
+  ) {
+    writePermissionErrors.add(error);
+  }
+  throw error;
+}
+
 interface CredentialsLockInfo {
   pid?: number;
   createdAt?: number;
@@ -266,7 +290,12 @@ function mutateCredentialsFile(
   path: string,
   mutate: (file: CredentialsFile) => CredentialsFile | undefined,
 ): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `path` is the credentials-file path this module already operates on (default `~/.testsprite/credentials`, or the caller-supplied `CredentialsOptions.path`), not new external input; same risk profile as the baselined fs calls in this file.
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  } catch (error) {
+    rethrowCredentialsWriteError(error);
+  }
   const lock = acquireCredentialsLock(path);
   try {
     const file = readCredentialsFile({ path });
@@ -281,8 +310,26 @@ function mutateCredentialsFile(
 
 function writeCredentialsAtomic(path: string, file: CredentialsFile): void {
   const tmp = `${path}.tmp.${process.pid}`;
-  writeFileSync(tmp, serializeCredentials(file), { mode: 0o600, encoding: 'utf8' });
-  renameSync(tmp, path);
+  try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmp` is `${path}.tmp.${pid}`, derived from the same internal credentials-file path; same baselined risk profile as the other fs calls in this file.
+    writeFileSync(tmp, serializeCredentials(file), { mode: 0o600, encoding: 'utf8' });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- both operands derive from the internal credentials-file path (see above).
+    renameSync(tmp, path);
+  } catch (error) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- best-effort cleanup of the temp file this function just created; same internal path.
+      unlinkSync(tmp);
+    } catch (cleanupError) {
+      if (!isErrnoException(cleanupError) || cleanupError.code !== 'ENOENT') {
+        // Do not mark this as a permission error eligible for session-only setup:
+        // the temporary file can still contain the API key.
+        throw new Error(`Temporary credentials could not be cleaned up at ${tmp}.`, {
+          cause: cleanupError,
+        });
+      }
+    }
+    rethrowCredentialsWriteError(error);
+  }
   ensureRestrictiveMode(path);
 }
 
@@ -309,7 +356,7 @@ function acquireCredentialsLock(path: string): CredentialsLock {
       };
     } catch (error) {
       if (!isErrnoException(error) || error.code !== 'EEXIST') {
-        throw error;
+        rethrowCredentialsWriteError(error);
       }
 
       reclaimStaleCredentialsLock(lockPath);

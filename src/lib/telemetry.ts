@@ -39,7 +39,12 @@ export const TELEMETRY_TIMEOUT_MS = 1000;
 
 export type TelemetryOutcome = 'success' | 'error' | 'abort';
 
-export interface TelemetryOutcomeInput {
+export interface WaitTimeoutTelemetry {
+  reason: 'wait_timeout';
+  cancelOutcome?: 'cancelled' | 'already_terminal' | 'failed' | 'skipped';
+}
+
+export interface TelemetryOutcomeInput extends Partial<WaitTimeoutTelemetry> {
   /** Leaf command path that ran, e.g. `test run`. Empty → skip (no command). */
   command: string;
   outcome: TelemetryOutcome;
@@ -85,7 +90,7 @@ export interface ResolvedTelemetryAuth {
 }
 
 /** The exact wire body — a flat allowlist mirroring the backend DTO. */
-export interface TelemetryEvent {
+export interface TelemetryEvent extends Partial<WaitTimeoutTelemetry> {
   command: string;
   outcome: TelemetryOutcome;
   exitCode?: number;
@@ -166,6 +171,18 @@ export function buildTelemetryEvent(
     ...(input.output === 'json' || input.output === 'text' ? { output: input.output } : {}),
     ci: isTruthyEnv(env.CI) || !isTTY,
     ...(input.local ? { local: true } : {}),
+    ...(input.outcome === 'error' && input.reason === 'wait_timeout'
+      ? {
+          reason: 'wait_timeout',
+          ...(input.local &&
+          (input.cancelOutcome === 'cancelled' ||
+            input.cancelOutcome === 'already_terminal' ||
+            input.cancelOutcome === 'failed' ||
+            input.cancelOutcome === 'skipped')
+            ? { cancelOutcome: input.cancelOutcome }
+            : {}),
+        }
+      : {}),
   };
 }
 

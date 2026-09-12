@@ -1,7 +1,13 @@
+// VENDOR DELTA: terminal 1008 auth closes distinguish revocation and
+// post-Ack takeover from initial authentication failure. See ./VENDOR.md #16.
 import { EventEmitter, once } from "node:events";
 import dns from "node:dns";
+import { readFileSync } from "node:fs";
 import net, { Socket } from "node:net";
+import { performance } from "node:perf_hooks";
 import { Duplex } from "node:stream";
+import tls from "node:tls";
+import { domainToASCII } from "node:url";
 // VENDOR DELTA: `ws` -> undici-backed facade. See ./ws-compat.ts.
 import WebSocket from "./ws-compat.js";
 // VENDOR DELTA: `lodash` -> three local predicates. See ./lodash-lite.ts.
@@ -14,6 +20,10 @@ import { encodeFrame, readTypedFrame } from "./protocol.js";
 import {
   DEFAULT_ALLOW_PRIVATE_NETWORK_TARGET,
   DEFAULT_AUTH_TIMEOUT_MS,
+  DEFAULT_CONNECT_TIMEOUT_MS,
+  DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
+  DEFAULT_DATA_PLANE_RETRY_DEADLINE_MS,
+  DEFAULT_DATA_PLANE_SETTLE_MS,
   DEFAULT_HEARTBEAT_MS,
   DEFAULT_LOG_LEVEL,
   DEFAULT_RECONNECT_MS,
@@ -48,9 +58,31 @@ const LEVEL_ORDER: Record<LogLevel, number> = {
 const STREAM_CLOSE_TIMEOUT_MS = 1_500;
 const CONTROL_AUTHENTICATION_FAILED = Symbol("control-authentication-failed");
 
+interface TunnelAddress {
+  host: string;
+  port: number;
+}
+
+type ResolvedTunnelClientOptions = Required<
+  Omit<
+    TunnelClientOptions,
+    | "clientId"
+    | "secret"
+    | "tunnelTlsAddr"
+    | "tunnelTlsServername"
+    | "tunnelTlsCa"
+  >
+> &
+  Pick<TunnelClientOptions, "clientId" | "secret"> & {
+    tunnelTlsAddr?: string;
+    tunnelTlsServername?: string;
+    tunnelTlsCa: Array<string | Buffer>;
+  };
+
 export class TunnelClient extends EventEmitter {
-  private readonly options: Required<Omit<TunnelClientOptions, "clientId" | "secret">> &
-    Pick<TunnelClientOptions, "clientId" | "secret">;
+  private readonly options: ResolvedTunnelClientOptions;
+  readonly #transportMode: "tls" | "plaintext";
+  private readonly tunnelAddress: TunnelAddress;
 
   private running = false;
   private controlConnected = false;
@@ -61,6 +93,7 @@ export class TunnelClient extends EventEmitter {
   // an older socket cannot satisfy a later start() wait. See VENDOR.md #14.
   private controlConnectionGeneration = 0;
   private allowTunnelReconnect = true;
+  private dataPlaneTerminalErrorReported = false;
   private readonly tunnelRuntimes = new Map<string, TunnelRuntime>();
   // VENDOR DELTA: reconnect backoffs are tied to this lifecycle controller so stop() cancels
   // both control and tunnel sleeps instead of awaiting a still-ref'd timer. See VENDOR.md #9.
@@ -83,11 +116,65 @@ export class TunnelClient extends EventEmitter {
       throw new Error("clientId and secret are required");
     }
 
+    const configuredPlaintextAddress = parseTunnelAddr(options.tunnelAddr);
+    const deadlineMs =
+      options.dataPlaneRetryDeadlineMs ?? DEFAULT_DATA_PLANE_RETRY_DEADLINE_MS;
+    if (!Number.isInteger(deadlineMs) || deadlineMs < 0) {
+      throw new RangeError("dataPlaneRetryDeadlineMs must be a non-negative integer");
+    }
+    const settleMs = options.dataPlaneSettleMs ?? DEFAULT_DATA_PLANE_SETTLE_MS;
+    if (!Number.isInteger(settleMs) || settleMs < 0) {
+      throw new RangeError("dataPlaneSettleMs must be a non-negative integer");
+    }
+    const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+    if (!Number.isInteger(connectTimeoutMs) || connectTimeoutMs < 0) {
+      throw new RangeError("connectTimeoutMs must be a non-negative integer");
+    }
+    const tlsHandshakeTimeoutMs = options.tlsHandshakeTimeoutMs ?? DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS;
+    if (!Number.isInteger(tlsHandshakeTimeoutMs) || tlsHandshakeTimeoutMs < 0) {
+      throw new RangeError("tlsHandshakeTimeoutMs must be a non-negative integer");
+    }
+    let tunnelTlsServername: string | undefined;
+    if (options.tunnelTlsAddr !== undefined) {
+      const tunnelTlsAddress = parseTunnelAddr(options.tunnelTlsAddr);
+      this.tunnelAddress = tunnelTlsAddress;
+      if (net.isIP(tunnelTlsAddress.host) !== 0 && !options.tunnelTlsServername) {
+        throw new Error(
+          "tunnelTlsServername is required when tunnelTlsAddr uses an IP-literal host",
+        );
+      }
+      tunnelTlsServername = options.tunnelTlsServername ?? tunnelTlsAddress.host;
+      if (tunnelTlsServername.trim().length === 0) {
+        throw new Error("tunnelTlsServername must not be empty");
+      }
+    } else {
+      this.tunnelAddress = configuredPlaintextAddress;
+    }
+
+    this.#transportMode = options.tunnelTlsAddr === undefined ? "plaintext" : "tls";
+    const extraTlsCa =
+      options.tunnelTlsCa === undefined
+        ? []
+        : Array.isArray(options.tunnelTlsCa)
+          ? options.tunnelTlsCa
+          : [options.tunnelTlsCa];
+
     this.options = {
       clientId: options.clientId,
       secret: options.secret,
       controlUrl: options.controlUrl,
       tunnelAddr: options.tunnelAddr,
+      ...(options.tunnelTlsAddr !== undefined
+        ? {
+            tunnelTlsAddr: options.tunnelTlsAddr,
+            tunnelTlsServername,
+          }
+        : {}),
+      tunnelTlsCa: extraTlsCa,
+      connectTimeoutMs,
+      tlsHandshakeTimeoutMs,
+      dataPlaneRetryDeadlineMs: deadlineMs,
+      dataPlaneSettleMs: settleMs,
       authTimeoutMs: options.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS,
       heartbeatMs: options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS,
       reconnectMs: options.reconnectMs ?? DEFAULT_RECONNECT_MS,
@@ -106,6 +193,10 @@ export class TunnelClient extends EventEmitter {
     };
   }
 
+  public get transport(): "tls" | "plaintext" {
+    return this.#transportMode;
+  }
+
   public async start(): Promise<void> {
     if (this.running) {
       return;
@@ -114,6 +205,7 @@ export class TunnelClient extends EventEmitter {
       this.reconnectDelayController = new AbortController();
     }
     this.running = true;
+    this.dataPlaneTerminalErrorReported = false;
 
     const expectedConnectionGeneration = this.controlConnectionGeneration + 1;
     this.controlLoopTask = this.runControlLoop();
@@ -170,24 +262,7 @@ export class TunnelClient extends EventEmitter {
   }
 
   public async stop(): Promise<void> {
-    this.running = false;
-    this.reconnectDelayController.abort();
-
-    // VENDOR DELTA: also close a socket still in CONNECTING. Upstream only
-    // closes an OPEN one, so a control plane that accepts TCP and never
-    // completes the WebSocket handshake leaves the socket untouched — and the
-    // `await this.controlLoopTask` below then waits on the very handshake
-    // nothing is going to finish. `stop()` never returns, so the caller's
-    // teardown never reaches the credential delete that follows it.
-    if (
-      this.controlWs &&
-      (this.controlWs.readyState === WebSocket.OPEN ||
-        this.controlWs.readyState === WebSocket.CONNECTING)
-    ) {
-      this.controlWs.close();
-    }
-
-    this.stopAllTunnelRuntimes();
+    this.beginStop();
 
     const tunnelTasks = Array.from(this.tunnelRuntimes.values(), (runtime) => runtime.task);
     await Promise.allSettled([this.controlLoopTask, ...tunnelTasks]);
@@ -204,9 +279,14 @@ export class TunnelClient extends EventEmitter {
         await this.connectControl();
       } catch (err) {
         if (isControlAuthFailureError(err)) {
-          const message = `Control authentication failed, stop reconnecting: ${toErrorMessage(err)}`;
+          const message = err.revoked
+            ? "tunnel credential revoked"
+            : err.acknowledged
+              ? "tunnel connection superseded or credential revoked"
+              : `Control authentication failed, stop reconnecting: ${toErrorMessage(err)}`;
           this.reportError(ErrCode.AuthFailed, message, "error");
           this.running = false;
+          this.reconnectDelayController.abort();
           this.controlConnected = false;
           this.stopAllTunnelRuntimes();
           return;
@@ -233,7 +313,16 @@ export class TunnelClient extends EventEmitter {
         try {
           await this.connectTunnel(tunnelConnectionId, runtime);
         } catch (err) {
-          this.reportError(ErrCode.TunnelDisconnected, `Tunnel ${tunnelConnectionId} disconnected: ${toErrorMessage(err)}`);
+          if (!this.running || !this.allowTunnelReconnect || runtime.stopRetryOnDisconnect) {
+            return;
+          }
+          const errorMessage = toErrorMessage(err);
+          const safeErrorMessage = redactSecret(errorMessage, this.options.secret);
+          this.recordDataPlaneFailure(tunnelConnectionId, runtime, safeErrorMessage);
+          this.reportError(
+            ErrCode.TunnelDisconnected,
+            `Tunnel ${tunnelConnectionId} disconnected: ${safeErrorMessage}`,
+          );
         }
 
         if (!this.allowTunnelReconnect || runtime.stopRetryOnDisconnect) {
@@ -246,6 +335,8 @@ export class TunnelClient extends EventEmitter {
         }
       }
     } finally {
+      this.clearDataPlaneAttemptTimers(runtime);
+      this.clearDataPlaneFailureEpisode(runtime);
       runtime.socket = undefined;
       runtime.session = undefined;
       this.tunnelRuntimes.delete(tunnelConnectionId);
@@ -264,6 +355,7 @@ export class TunnelClient extends EventEmitter {
       let heartbeatTimer: NodeJS.Timeout | undefined;
       let opened = false;
       let authenticationSettled = false;
+      let authenticationAcknowledged = false;
 
       const failAuthentication = (error: Error) => {
         if (authenticationSettled) {
@@ -322,6 +414,7 @@ export class TunnelClient extends EventEmitter {
         }
 
         if (message.type === "Ack") {
+          authenticationAcknowledged = true;
           if (!authenticationSettled) {
             authenticationSettled = true;
             this.emit("control-authenticated", connectionGeneration);
@@ -373,7 +466,7 @@ export class TunnelClient extends EventEmitter {
         );
         this.log("warn", `Control websocket closed (code=${code}, reason=${reason || "<empty>"})`);
         if (isAuthFailureClose(code, reason)) {
-          reject(new ControlAuthFailureError(code, reason));
+          reject(new ControlAuthFailureError(code, reason, authenticationAcknowledged));
           return;
         }
 
@@ -452,6 +545,7 @@ export class TunnelClient extends EventEmitter {
 
     const runtime: TunnelRuntime = {
       stopRetryOnDisconnect: false,
+      sessionEstablished: false,
       task: Promise.resolve(),
     };
 
@@ -465,15 +559,27 @@ export class TunnelClient extends EventEmitter {
     runtime: TunnelRuntime,
   ): Promise<void> {
     return new Promise((resolve, reject) => {
-      const tunnelAddress = parseTunnelAddr(this.options.tunnelAddr);
-      const socket = net.connect({
-        host: tunnelAddress.host,
-        port: tunnelAddress.port,
-      });
+      this.clearDataPlaneAttemptTimers(runtime);
+      runtime.sessionEstablished = false;
+      const transport = this.#transportMode;
+      const socket =
+        transport === "tls"
+          ? tls.connect({
+              host: this.tunnelAddress.host,
+              port: this.tunnelAddress.port,
+              servername: this.options.tunnelTlsServername!,
+              minVersion: "TLSv1.2",
+              ca: tlsCaOption(this.options.tunnelTlsCa),
+            })
+          : net.connect({
+              host: this.tunnelAddress.host,
+              port: this.tunnelAddress.port,
+            });
 
       runtime.socket = socket;
 
-      let handshakeDone = false;
+      let transportConnected = false;
+      let helloWritten = false;
       let settled = false;
 
       const settle = (next: () => void) => {
@@ -484,28 +590,72 @@ export class TunnelClient extends EventEmitter {
         next();
       };
 
+      const interrupted = () =>
+        !this.running || !this.allowTunnelReconnect || runtime.stopRetryOnDisconnect;
+
+      const rejectAttempt = (error: Error) => {
+        this.clearDataPlaneAttemptTimers(runtime);
+        if (interrupted()) {
+          settle(resolve);
+          return;
+        }
+        settle(() => {
+          if (!socket.destroyed) {
+            socket.destroy();
+          }
+          reject(error);
+        });
+      };
+
       socket.once("error", (err) => {
-        if (!handshakeDone) {
-          settle(() => reject(err));
+        if (!runtime.sessionEstablished) {
+          rejectAttempt(err);
         }
       });
 
       const finalizeClose = () => {
+        this.clearDataPlaneAttemptTimers(runtime);
+        if (runtime.socket === socket) {
+          runtime.socket = undefined;
+          runtime.session = undefined;
+        }
         settle(() => {
           this.emit("tunnel-disconnected", tunnelConnectionId);
           this.log("warn", `Tunnel tcp closed: ${tunnelConnectionId}`);
+          if (interrupted()) {
+            resolve();
+            return;
+          }
+          if (!runtime.sessionEstablished) {
+            const underlyingError = socket.errored;
+            reject(
+              underlyingError instanceof Error
+                ? underlyingError
+                : new Error(
+                    transportConnected && helloWritten
+                      ? `Tunnel ${transport} connection closed before the session was established`
+                      : `Tunnel ${transport} connection closed before TunnelHello was sent`,
+                  ),
+            );
+            return;
+          }
           resolve();
         });
       };
 
-      socket.once("connect", () => {
-        if (!this.running || !this.allowTunnelReconnect || runtime.stopRetryOnDisconnect) {
+      socket.once(transport === "tls" ? "secureConnect" : "connect", () => {
+        if (runtime.connectTimer !== undefined) {
+          clearTimeout(runtime.connectTimer);
+          runtime.connectTimer = undefined;
+        }
+        transportConnected = true;
+        if (interrupted()) {
           socket.destroy();
           settle(resolve);
           return;
         }
 
-        this.log("info", `Tunnel tcp connected: ${tunnelConnectionId}`);
+        this.log("info", `Tunnel ${transport} connected: ${tunnelConnectionId}`);
 
         const hello: TunnelHelloFrame = {
           client_id: this.options.clientId,
@@ -513,44 +663,181 @@ export class TunnelClient extends EventEmitter {
           tunnel_connection_id: tunnelConnectionId,
         };
 
-        socket.write(encodeFrame(hello));
-        handshakeDone = true;
+        try {
+          socket.write(encodeFrame(hello), error => {
+            if (error) {
+              rejectAttempt(error);
+              return;
+            }
+            if (settled || interrupted()) {
+              return;
+            }
+            helloWritten = true;
+            if (!runtime.sessionEstablished) {
+              runtime.settleTimer = setTimeout(() => {
+                runtime.settleTimer = undefined;
+                this.markDataPlaneEstablished(runtime);
+              }, this.options.dataPlaneSettleMs);
+              runtime.settleTimer.unref();
+            }
+            this.emit("tunnel-connected", tunnelConnectionId);
+          });
 
-        const session = createYamuxClientSession(socket);
-        runtime.session = session;
+          const session = createYamuxClientSession(socket);
+          runtime.session = session;
 
-        session.on("stream", (stream: Duplex) => {
-          void this.handleIncomingStream(stream);
-        });
+          session.on("stream", (stream: Duplex) => {
+            this.markDataPlaneEstablished(runtime);
+            void this.handleIncomingStream(stream);
+          });
 
-        session.on("error", (err: Error) => {
-          if (isBenignCloseError(err)) {
-            this.log("debug", `Yamux benign close (${tunnelConnectionId}): ${toErrorMessage(err)}`);
-            return;
-          }
+          session.on("error", (err: Error) => {
+            if (isBenignCloseError(err)) {
+              this.log("debug", `Yamux benign close (${tunnelConnectionId}): ${toErrorMessage(err)}`);
+              return;
+            }
 
-          this.log("warn", `Yamux error (${tunnelConnectionId}): ${toErrorMessage(err)}`);
+            this.log("warn", `Yamux error (${tunnelConnectionId}): ${toErrorMessage(err)}`);
 
-          if (!socket.destroyed) {
-            socket.destroy();
-          }
-        });
+            if (!socket.destroyed) {
+              socket.destroy(err);
+            }
+          });
 
-        session.on("close", () => {
-          this.log("debug", `Yamux session closed: ${tunnelConnectionId}`);
-        });
-
-        this.emit("tunnel-connected", tunnelConnectionId);
+          session.on("close", () => {
+            this.log("debug", `Yamux session closed: ${tunnelConnectionId}`);
+          });
+        } catch (err) {
+          rejectAttempt(err instanceof Error ? err : new Error(String(err)));
+        }
       });
 
       socket.once("close", finalizeClose);
       socket.once("end", finalizeClose);
+
+      const attemptTimeoutMs =
+        transport === "tls" ? this.options.tlsHandshakeTimeoutMs : this.options.connectTimeoutMs;
+      runtime.connectTimer = setTimeout(() => {
+        runtime.connectTimer = undefined;
+        if (transportConnected || settled) {
+          return;
+        }
+        const label = transport === "tls" ? "TLS handshake" : "Plaintext connect";
+        rejectAttempt(new Error(`${label} timed out after ${attemptTimeoutMs}ms`));
+      }, attemptTimeoutMs);
+      runtime.connectTimer.unref();
     });
+  }
+
+  private recordDataPlaneFailure(
+    tunnelConnectionId: string,
+    runtime: TunnelRuntime,
+    errorMessage: string,
+  ): void {
+    runtime.lastFailureMessage = errorMessage;
+    if (
+      runtime.failureEpisodeStartedAt !== undefined
+      || this.options.dataPlaneRetryDeadlineMs === 0
+    ) {
+      return;
+    }
+
+    runtime.failureEpisodeStartedAt = performance.now();
+    this.armDataPlaneFailureDeadline(tunnelConnectionId, runtime);
+  }
+
+  private armDataPlaneFailureDeadline(
+    tunnelConnectionId: string,
+    runtime: TunnelRuntime,
+  ): void {
+    const deadlineMs = this.options.dataPlaneRetryDeadlineMs;
+    const startedAt = runtime.failureEpisodeStartedAt;
+    if (deadlineMs === 0 || startedAt === undefined) {
+      return;
+    }
+
+    const elapsedMs = performance.now() - startedAt;
+    const remainingMs = Math.max(0, Math.ceil(deadlineMs - elapsedMs));
+    runtime.failureDeadlineTimer = setTimeout(() => {
+      runtime.failureDeadlineTimer = undefined;
+      this.expireDataPlaneFailureEpisode(tunnelConnectionId, runtime);
+    }, remainingMs);
+    runtime.failureDeadlineTimer.unref();
+  }
+
+  private expireDataPlaneFailureEpisode(
+    tunnelConnectionId: string,
+    runtime: TunnelRuntime,
+  ): void {
+    if (
+      !this.running
+      || !this.allowTunnelReconnect
+      || runtime.stopRetryOnDisconnect
+      || runtime.failureEpisodeStartedAt === undefined
+    ) {
+      this.clearDataPlaneFailureEpisode(runtime);
+      return;
+    }
+
+    runtime.stopRetryOnDisconnect = true;
+    this.clearDataPlaneAttemptTimers(runtime);
+    if (runtime.socket && !runtime.socket.destroyed) {
+      runtime.socket.destroy();
+    }
+
+    try {
+      if (!this.dataPlaneTerminalErrorReported) {
+        this.dataPlaneTerminalErrorReported = true;
+        this.reportError(
+          ErrCode.DataPlaneUnreachable,
+          `Data plane ${this.#transportMode} at ${formatTunnelAddress(this.tunnelAddress)} `
+            + `is unreachable after ${this.options.dataPlaneRetryDeadlineMs}ms: `
+            + (runtime.lastFailureMessage ?? "unknown data-plane failure"),
+          "error",
+        );
+      }
+    } finally {
+      this.beginStop();
+    }
+  }
+
+  private markDataPlaneEstablished(runtime: TunnelRuntime): void {
+    if (!this.running || !this.allowTunnelReconnect || runtime.stopRetryOnDisconnect) {
+      return;
+    }
+    runtime.sessionEstablished = true;
+    if (runtime.settleTimer !== undefined) {
+      clearTimeout(runtime.settleTimer);
+      runtime.settleTimer = undefined;
+    }
+    this.clearDataPlaneFailureEpisode(runtime);
+  }
+
+  private clearDataPlaneAttemptTimers(runtime: TunnelRuntime): void {
+    if (runtime.connectTimer !== undefined) {
+      clearTimeout(runtime.connectTimer);
+      runtime.connectTimer = undefined;
+    }
+    if (runtime.settleTimer !== undefined) {
+      clearTimeout(runtime.settleTimer);
+      runtime.settleTimer = undefined;
+    }
+  }
+
+  private clearDataPlaneFailureEpisode(runtime: TunnelRuntime): void {
+    if (runtime.failureDeadlineTimer !== undefined) {
+      clearTimeout(runtime.failureDeadlineTimer);
+      runtime.failureDeadlineTimer = undefined;
+    }
+    runtime.failureEpisodeStartedAt = undefined;
+    runtime.lastFailureMessage = undefined;
   }
 
   private stopAllTunnelRuntimes(): void {
     for (const runtime of this.tunnelRuntimes.values()) {
       runtime.stopRetryOnDisconnect = true;
+      this.clearDataPlaneAttemptTimers(runtime);
+      this.clearDataPlaneFailureEpisode(runtime);
       if (runtime.session) {
         runtime.session.close();
       }
@@ -568,6 +855,27 @@ export class TunnelClient extends EventEmitter {
       }
     }
     this.activeTargetSockets.clear();
+  }
+
+  private beginStop(): void {
+    this.running = false;
+    this.reconnectDelayController.abort();
+
+    // VENDOR DELTA: also close a socket still in CONNECTING. Upstream only
+    // closes an OPEN one, so a control plane that accepts TCP and never
+    // completes the WebSocket handshake leaves the socket untouched — and the
+    // `await this.controlLoopTask` in stop() then waits on the very handshake
+    // nothing is going to finish. stop() never returns, so the caller's
+    // teardown never reaches the credential delete that follows it.
+    if (
+      this.controlWs
+      && (this.controlWs.readyState === WebSocket.OPEN
+        || this.controlWs.readyState === WebSocket.CONNECTING)
+    ) {
+      this.controlWs.close();
+    }
+
+    this.stopAllTunnelRuntimes();
   }
 
   private async handleIncomingStream(stream: Duplex): Promise<void> {
@@ -781,6 +1089,15 @@ function toErrorMessage(err: unknown): string {
     return err.message;
   }
   return String(err);
+}
+
+function redactSecret(message: string, secret: string): string {
+  return secret.length === 0 ? message : message.replaceAll(secret, "[REDACTED]");
+}
+
+function formatTunnelAddress(address: TunnelAddress): string {
+  const host = net.isIP(address.host) === 6 ? `[${address.host}]` : address.host;
+  return `${host}:${address.port}`;
 }
 
 function isBenignCloseError(err: unknown): boolean {
@@ -1045,35 +1362,122 @@ export function ensureTargetAllowed(
   }
 }
 
+/**
+ * Build the `ca` option for a TLS dial. Extra roots are appended to Node's
+ * DEFAULT trust store — the bundled Mozilla roots plus whatever
+ * NODE_EXTRA_CA_CERTS / --use-system-ca added — because `tls.rootCertificates`
+ * alone silently drops NODE_EXTRA_CA_CERTS, which is exactly how corporate
+ * TLS-inspecting proxies are trusted. With no extra root configured the option
+ * stays undefined so Node applies its defaults untouched.
+ */
+function tlsCaOption(extraRoots: ReadonlyArray<string | Buffer>): Array<string | Buffer> | undefined {
+  if (extraRoots.length === 0) return undefined;
+  const withDefaults = tls as unknown as {
+    getCACertificates?: (type: "default") => readonly string[];
+  };
+  const defaults =
+    typeof withDefaults.getCACertificates === "function"
+      ? withDefaults.getCACertificates("default")
+      : [...tls.rootCertificates, ...readNodeExtraCaCertificates()];
+  return [...defaults, ...extraRoots];
+}
+
+/**
+ * Certificates from the NODE_EXTRA_CA_CERTS file, cached per path. Node reads
+ * that file once at startup; re-reading only when the path changes keeps the
+ * same semantics while letting tests point at a temporary file.
+ */
+let nodeExtraCaCertificates: { path: string; certificates: string[] } | undefined;
+
+function readNodeExtraCaCertificates(): string[] {
+  const path = process.env.NODE_EXTRA_CA_CERTS;
+  if (!path) return [];
+  if (nodeExtraCaCertificates?.path === path) {
+    return nodeExtraCaCertificates.certificates;
+  }
+
+  let certificates: string[];
+  try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `NODE_EXTRA_CA_CERTS` is the operator-set path Node itself reads at startup, never request or user input.
+    const contents = readFileSync(path, "utf8");
+    certificates =
+      contents.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/gu) ?? [];
+  } catch {
+    certificates = [];
+  }
+  nodeExtraCaCertificates = { path, certificates };
+  return certificates;
+}
+
 function parseTunnelAddr(addr: string): { host: string; port: number } {
+  if (addr.length === 0 || /\s|[/?#@]/u.test(addr)) {
+    throw new Error(`Invalid tunnel address: ${addr}`);
+  }
+
   let hostPart = "";
   let portPart = "";
 
   if (addr.startsWith("[")) {
     const closing = addr.indexOf("]");
-    if (closing < 0 || closing + 2 > addr.length || addr[closing + 1] !== ":") {
+    if (
+      closing <= 1
+      || closing !== addr.lastIndexOf("]")
+      || closing + 2 > addr.length
+      || addr[closing + 1] !== ":"
+    ) {
       throw new Error(`Invalid tunnel address: ${addr}`);
     }
     hostPart = addr.slice(1, closing);
     portPart = addr.slice(closing + 2);
+    if (net.isIP(hostPart) !== 6) {
+      throw new Error(`Invalid tunnel address: ${addr}`);
+    }
   } else {
-    const sep = addr.lastIndexOf(":");
+    const sep = addr.indexOf(":");
     if (sep <= 0 || sep === addr.length - 1) {
+      throw new Error(`Invalid tunnel address: ${addr}`);
+    }
+    if (sep !== addr.lastIndexOf(":")) {
       throw new Error(`Invalid tunnel address: ${addr}`);
     }
     hostPart = addr.slice(0, sep);
     portPart = addr.slice(sep + 1);
+    if (net.isIP(hostPart) === 0) {
+      const canonicalHost = canonicalDnsHostname(hostPart);
+      if (canonicalHost === undefined) {
+        throw new Error(`Invalid tunnel address: ${addr}`);
+      }
+      hostPart = canonicalHost;
+    }
   }
 
+  if (!/^\d+$/u.test(portPart)) {
+    throw new Error(`Invalid tunnel address: ${addr}`);
+  }
   const port = Number(portPart);
-  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-    throw new Error(`Invalid tunnel address port: ${addr}`);
+  if (port <= 0 || port > 65535) {
+    throw new Error(`Invalid tunnel address: ${addr}`);
   }
 
   return {
     host: hostPart,
     port,
   };
+}
+
+function canonicalDnsHostname(host: string): string | undefined {
+  const ascii = domainToASCII(host).toLowerCase();
+  if (ascii.length === 0 || ascii.length > 253) {
+    return undefined;
+  }
+  const withoutTrailingDot = ascii.endsWith(".") ? ascii.slice(0, -1) : ascii;
+  const valid = withoutTrailingDot.split(".").every(
+    (label) =>
+      label.length > 0
+      && label.length <= 63
+      && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/iu.test(label),
+  );
+  return valid ? ascii : undefined;
 }
 
 function isStreamOpenRequestFrame(value: unknown): value is StreamOpenRequestFrame {
@@ -1093,15 +1497,26 @@ function isStreamOpenRequestFrame(value: unknown): value is StreamOpenRequestFra
 
 interface TunnelRuntime {
   stopRetryOnDisconnect: boolean;
+  sessionEstablished: boolean;
+  failureEpisodeStartedAt?: number;
+  failureDeadlineTimer?: NodeJS.Timeout;
+  lastFailureMessage?: string;
+  connectTimer?: NodeJS.Timeout;
+  settleTimer?: NodeJS.Timeout;
   socket?: Socket;
   session?: YamuxSession;
   task: Promise<void>;
 }
 
 class ControlAuthFailureError extends Error {
-  constructor(code: number, reason: string) {
+  readonly revoked: boolean;
+  readonly acknowledged: boolean;
+
+  constructor(code: number, reason: string, acknowledged: boolean) {
     super(`control auth failure (code=${code}, reason=${reason || "unknown"})`);
     this.name = "ControlAuthFailureError";
+    this.revoked = reason.trim().toUpperCase() === "CLIENT_REVOKED";
+    this.acknowledged = acknowledged;
   }
 }
 
@@ -1135,5 +1550,6 @@ function isControlAuthFailureError(err: unknown): err is ControlAuthFailureError
 }
 
 function isAuthFailureClose(code: number, reason: string): boolean {
-  return code === 1008 && reason.trim().toUpperCase() === "AUTH_FAILED";
+  const normalizedReason = reason.trim().toUpperCase();
+  return code === 1008 && (normalizedReason === "AUTH_FAILED" || normalizedReason === "CLIENT_REVOKED");
 }

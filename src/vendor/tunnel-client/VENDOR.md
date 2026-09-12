@@ -150,6 +150,56 @@ upstream.
     plus the public internet) and tells the user to make the dependency
     reachable through one of those routes. The guard itself is unchanged.
 
+16. **Terminal revocation and connection takeover** (`client.ts`). The server
+    permits one live control connection per credential: a newer connection using
+    the same credential or an in-place secret rotation closes the older connection
+    with `1008 AUTH_FAILED`, the close every shipped client treats as terminal.
+    Deletion sends `1008 CLIENT_REVOKED`; there is no `1012` reconnect signal.
+    Both closes report `ErrCode.AuthFailed`, stop the control loop, tear down
+    tunnel runtimes, and abort pending data-plane reconnect delays without
+    reconnecting. `CLIENT_REVOKED` reports `tunnel credential revoked`.
+    `AUTH_FAILED` after that connection's Ack reports
+    `tunnel connection superseded or credential revoked`; before its Ack, the
+    existing authentication-failure message is unchanged. The CLI maps both
+    revocation messages to `credential-revoked` and exits 10 immediately; the
+    15-second credential poll remains a backstop.
+17. **TLS data-plane transport is being re-synced upstream in parallel**
+    (`client.ts`, `types.ts`, `config.ts`). `tunnelTlsAddr` selects an immutable
+    TLS transport; the public status is a getter backed by the ECMAScript private
+    `#transportMode` field used for every dial, so JavaScript assignment cannot
+    downgrade a live client.
+    Both data-plane addresses are validated as strict `host:port` authorities at
+    construction, including real IPv6 validation for `[v6]:port`. The client
+    verifies SNI with Node's default trust store (bundled Mozilla roots,
+    `NODE_EXTRA_CA_CERTS`, and `--use-system-ca` when enabled) plus explicit extra
+    CAs. On Node versions without `tls.getCACertificates('default')`, it combines
+    `tls.rootCertificates` with PEM blocks read once from `NODE_EXTRA_CA_CERTS`
+    before appending explicit roots. It requires TLS 1.2 or newer, bounds every
+    TLS handshake and plaintext connect at 10 seconds, and writes `TunnelHello`
+    only after `secureConnect`. DNS names are canonicalised to lower-case ASCII
+    A-labels for both the dial and default SNI. Every retry stays on the selected
+    transport and never falls back to `tunnelAddr`. The matching upstream
+    implementation lives on `TestSprite/tunnel` branch `zeshi/tunnel-tls-data-plane`
+    (`clients/node`, commits `a5fb58f`, `4b0f946`, `ad4dce3`; same option names
+    and semantics, written in parallel rather than byte-synced). Once that branch
+    is merged to `v2-patch`, do a real re-sync against it and update the source
+    commit/blob table rather than dropping this delta.
+18. **Data-plane retries have a terminal deadline** (`client.ts`, `types.ts`,
+    `config.ts`). `dataPlaneRetryDeadlineMs` defaults to 60 seconds; `0` preserves
+    indefinite retry. Each tunnel runtime starts one failure episode at the first
+    failed dial, timeout, or pre-establishment close. A successful `TunnelHello`
+    write does not reset it. Establishment is the first inbound yamux stream or a
+    socket surviving for `dataPlaneSettleMs` (5 seconds by default) after that
+    write; only establishment ends the episode. A real monotonic deadline timer
+    remains armed across attempts and destroys a connecting, handshaking, or
+    awaiting-establishment socket when it fires. Exhaustion emits exactly one
+    `ErrCode.DataPlaneUnreachable` with the selected transport, configured
+    address, and redacted last error, then initiates the same socket/timer/runtime
+    teardown as `stop()`. Intentional shutdown clears the deadline and suppresses
+    interrupted-dial errors. The `dataPlaneRetryDeadlineMs`, `dataPlaneSettleMs`,
+    and `connectTimeoutMs` names and lifecycle semantics intentionally match the
+    upstream SDK change being developed in parallel.
+
 ## Re-syncing
 
 Maintainers diff the three vendored files against a checkout of the upstream

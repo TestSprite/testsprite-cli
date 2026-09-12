@@ -702,3 +702,30 @@ describe('disallowedIpReason — called directly, as the DNS path calls it', () 
     expect(disallowedIpReason(address)).toBeUndefined();
   });
 });
+
+describe('assertNotLocal — local project creation guidance', () => {
+  it.each(['http://localhost:3000', 'http://127.0.0.1:3000', 'http://[::1]:3000'])(
+    'redirects project creation for %s to --local',
+    targetUrl => {
+      let error: unknown;
+      try {
+        assertNotLocal(targetUrl, {
+          field: 'url',
+          helpCommand: 'testsprite project create',
+          hintContext: 'local-project-create',
+        });
+      } catch (cause) {
+        error = cause;
+      }
+      expect(error).toBeInstanceOf(ApiError);
+      if (!(error instanceof ApiError)) throw new Error('expected local target refusal');
+      expect(error.exitCode).toBe(5);
+      expect(error.nextAction).toContain(
+        'Use --local <port> instead of --url for an app on this machine',
+      );
+      expect(error.nextAction).not.toContain('must be an internet-reachable address');
+      expect(error.nextAction).toContain('See `testsprite project create --help`');
+      expect(error.details?.hint).toContain('Use --local <port> instead of --url');
+    },
+  );
+});

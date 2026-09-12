@@ -2,7 +2,16 @@
  * Unit tests for `testsprite init` — all deps injected, no disk or network.
  */
 
-import { mkdtempSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import type * as NodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import path from 'node:path';
@@ -21,6 +30,18 @@ import {
   pathFor,
   type AgentTarget,
 } from '../lib/agent-targets.js';
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof NodeFs>();
+  return {
+    ...actual,
+    mkdirSync: vi.fn(actual.mkdirSync),
+    readFileSync: vi.fn(actual.readFileSync),
+    renameSync: vi.fn(actual.renameSync),
+    unlinkSync: vi.fn(actual.unlinkSync),
+    writeFileSync: vi.fn(actual.writeFileSync),
+  };
+});
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -174,6 +195,305 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+});
+
+describe('runInit — session-only environment credentials', () => {
+  const key = 'sk-user-session-secret';
+  const options = () => makeBaseOpts({ fromEnv: true, noAgent: true, output: 'json' });
+
+  async function injectWriteFailure(stage: 'mkdir' | 'lock' | 'write' | 'rename', code: string) {
+    const actual = await vi.importActual<typeof NodeFs>('node:fs');
+    const error = Object.assign(new Error(`injected ${stage} failure`), { code });
+    if (stage === 'mkdir') {
+      vi.mocked(mkdirSync).mockImplementation((...args) => {
+        if (args[0] === path.dirname(credentialsPath)) throw error;
+        return actual.mkdirSync(...args);
+      });
+    } else if (stage === 'rename') {
+      vi.mocked(renameSync).mockImplementation((...args) => {
+        if (args[1] === credentialsPath) throw error;
+        return actual.renameSync(...args);
+      });
+    } else {
+      const failedPath =
+        stage === 'lock' ? `${credentialsPath}.lock` : `${credentialsPath}.tmp.${process.pid}`;
+      vi.mocked(writeFileSync).mockImplementation((...args) => {
+        if (args[0] === failedPath) throw error;
+        return actual.writeFileSync(...args);
+      });
+    }
+    return error;
+  }
+
+  it.each([
+    ['lock', 'EPERM'],
+    ['mkdir', 'EACCES'],
+    ['write', 'EROFS'],
+    ['rename', 'EACCES'],
+    ['rename', 'EPERM'],
+  ] as const)(
+    'continues with a session-only JSON summary after %s fails with %s',
+    async (stage, code) => {
+      const { captured, deps } = makeCapture();
+      await injectWriteFailure(stage, code);
+
+      await expect(
+        runInit(options(), {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: key },
+          credentialsPath,
+          fetchImpl: makeOkFetch(),
+          isTTY: false,
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(captured.stdout).toHaveLength(1);
+      expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
+        credentials: { persisted: false, source: 'env' },
+        status: 'initialized',
+        email: ME.email,
+        agent: null,
+      });
+      expect(captured.stderr).toEqual([
+        `Using TESTSPRITE_API_KEY for this session; credentials could not be saved to ${credentialsPath} (${code}). Set TESTSPRITE_API_KEY in every shell that runs testsprite.`,
+      ]);
+      expect([...captured.stdout, ...captured.stderr].join('\n')).not.toContain(key);
+      expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own temp credentials path, never user input.
+      expect(existsSync(`${credentialsPath}.tmp.${process.pid}`)).toBe(false);
+    },
+  );
+
+  it.each(['EPERM', 'EACCES', 'EROFS'])(
+    'fails setup without a session-only claim when temp cleanup fails with %s',
+    async code => {
+      const { captured, deps } = makeCapture();
+      await injectWriteFailure('rename', 'EPERM');
+      const actual = await vi.importActual<typeof NodeFs>('node:fs');
+      const tmp = `${credentialsPath}.tmp.${process.pid}`;
+      const cleanupError = Object.assign(new Error('injected cleanup failure'), { code });
+      vi.mocked(unlinkSync).mockImplementation(file => {
+        if (file === tmp) throw cleanupError;
+        actual.unlinkSync(file);
+      });
+      try {
+        await expect(
+          runInit(options(), {
+            ...deps,
+            env: { TESTSPRITE_API_KEY: key },
+            credentialsPath,
+            fetchImpl: makeOkFetch(),
+            isTTY: false,
+          }),
+        ).rejects.toThrow(/temporary credentials.*clean/i);
+        expect(captured.stdout).toEqual([]);
+        expect(captured.stderr).toEqual([]);
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own temp path, never user input.
+        expect(existsSync(tmp)).toBe(true);
+      } finally {
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- cleanup of this test's own temp path.
+        if (existsSync(tmp)) actual.unlinkSync(tmp);
+      }
+    },
+  );
+
+  it('allows the session-only fallback if the temporary file is already removed', async () => {
+    const { captured, deps } = makeCapture();
+    await injectWriteFailure('rename', 'EPERM');
+    const actual = await vi.importActual<typeof NodeFs>('node:fs');
+    const tmp = `${credentialsPath}.tmp.${process.pid}`;
+    vi.mocked(unlinkSync).mockImplementation(file => {
+      actual.unlinkSync(file);
+      if (file === tmp) throw Object.assign(new Error('already removed'), { code: 'ENOENT' });
+    });
+    await runInit(options(), {
+      ...deps,
+      env: { TESTSPRITE_API_KEY: key },
+      credentialsPath,
+      fetchImpl: makeOkFetch(),
+      isTTY: false,
+    });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own temp path, never user input.
+    expect(existsSync(tmp)).toBe(false);
+    expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
+      credentials: { persisted: false, source: 'env' },
+      status: 'initialized',
+    });
+  });
+
+  it('reports persisted credentials after a writable environment-key setup', async () => {
+    const { captured, deps } = makeCapture();
+    await runInit(options(), {
+      ...deps,
+      env: { TESTSPRITE_API_KEY: key },
+      credentialsPath,
+      fetchImpl: makeOkFetch(),
+      isTTY: false,
+    });
+    expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
+      credentials: { persisted: true, source: 'env' },
+      status: 'initialized',
+    });
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe(key);
+    expect(captured.stderr).toEqual([]);
+  });
+
+  it.each(['env', 'flag', 'prompt'] as const)(
+    'keeps %s persistence failures fatal outside the fallback',
+    async source => {
+      const { captured, deps } = makeCapture();
+      const error = await injectWriteFailure('lock', source === 'env' ? 'ENOSPC' : 'EPERM');
+      await expect(
+        runInit(
+          makeBaseOpts({
+            fromEnv: source !== 'prompt',
+            apiKey: source === 'flag' ? 'sk-user-explicit-secret' : undefined,
+            noAgent: true,
+            output: source === 'prompt' ? 'text' : 'json',
+          }),
+          {
+            ...deps,
+            env: { TESTSPRITE_API_KEY: key },
+            credentialsPath,
+            fetchImpl: makeOkFetch(),
+            prompt: { secret: async () => 'sk-user-prompted-secret' },
+            isTTY: source === 'prompt',
+          },
+        ),
+      ).rejects.toBe(error);
+      expect(captured.stdout).toEqual([]);
+      expect(captured.stderr).toEqual([]);
+    },
+  );
+
+  it('continues skill installation in a writable target and explains session-only text output', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs, store } = makeMemFs();
+    await injectWriteFailure('lock', 'EPERM');
+    await expect(
+      runInit(makeBaseOpts({ fromEnv: true }), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: key },
+        credentialsPath,
+        fetchImpl: makeOkFetch(),
+        fs,
+        cwd: CWD,
+        isTTY: false,
+      }),
+    ).resolves.toBeUndefined();
+    expect(store.get(path.resolve(CWD, pathFor('claude', 'testsprite-verify')))).toContain(
+      'TestSprite',
+    );
+    expect(captured.stdout.join('\n')).toContain(
+      'credentials: session-only (TESTSPRITE_API_KEY; not saved)',
+    );
+    expect([...captured.stdout, ...captured.stderr].join('\n')).not.toContain(key);
+  });
+
+  it('keeps an unwritable skill target fatal without claiming credentials were saved', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs } = makeMemFs();
+    fs.mkdir = async () => {
+      throw Object.assign(new Error('skill target is read-only'), { code: 'EACCES' });
+    };
+    await injectWriteFailure('lock', 'EPERM');
+    await expect(
+      runInit(makeBaseOpts({ fromEnv: true, output: 'json' }), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: key },
+        credentialsPath,
+        fetchImpl: makeOkFetch(),
+        fs,
+        cwd: CWD,
+        isTTY: false,
+      }),
+    ).rejects.toThrow('skill target is read-only');
+    const stderr = captured.stderr.join('\n');
+    expect(stderr).toContain('credentials are session-only (TESTSPRITE_API_KEY; not saved)');
+    expect(stderr).toContain("re-run 'testsprite agent install --target claude'");
+    expect(stderr).not.toContain('credentials saved');
+    expect(captured.stdout).toEqual([]);
+    expect(stderr).not.toContain(key);
+  });
+
+  it('does not downgrade a rejected environment key when persistence would also fail', async () => {
+    const { captured, deps } = makeCapture();
+    await injectWriteFailure('lock', 'EPERM');
+    await expect(
+      runInit(options(), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: key },
+        credentialsPath,
+        fetchImpl: makeAuthFailFetch(),
+        isTTY: false,
+      }),
+    ).rejects.toMatchObject({ code: 'AUTH_INVALID', exitCode: 3 });
+    expect(captured.stderr.join('\n')).not.toContain('Using TESTSPRITE_API_KEY');
+    expect(captured.stdout).toEqual([]);
+  });
+
+  it('does not downgrade an invalid profile name', async () => {
+    const { captured, deps } = makeCapture();
+    await injectWriteFailure('lock', 'EPERM');
+    await expect(
+      runInit(
+        { ...options(), profile: 'invalid]profile' },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: key },
+          credentialsPath,
+          fetchImpl: makeOkFetch(),
+          isTTY: false,
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(captured.stderr).toEqual([]);
+    expect(captured.stdout).toEqual([]);
+  });
+
+  it('does not downgrade a profile read permission failure inside the credential write', async () => {
+    const actual = await vi.importActual<typeof NodeFs>('node:fs');
+    writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+    const error = Object.assign(new Error('profile cannot be read'), { code: 'EACCES' });
+    vi.mocked(readFileSync).mockImplementation((...args) => {
+      if (args[0] === credentialsPath && actual.existsSync(`${credentialsPath}.lock`)) throw error;
+      return actual.readFileSync(...args);
+    });
+    const { captured, deps } = makeCapture();
+    await expect(
+      runInit(options(), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: key },
+        credentialsPath,
+        fetchImpl: makeOkFetch(),
+        isTTY: false,
+      }),
+    ).rejects.toBe(error);
+    expect(captured.stderr).toEqual([]);
+    expect(captured.stdout).toEqual([]);
+  });
+
+  it('does not downgrade a stale-lock recovery permission failure', async () => {
+    const actual = await vi.importActual<typeof NodeFs>('node:fs');
+    actual.writeFileSync(`${credentialsPath}.lock`, JSON.stringify({ createdAt: 0 }));
+    const error = Object.assign(new Error('stale lock cannot be removed'), { code: 'EPERM' });
+    vi.mocked(unlinkSync).mockImplementation((...args) => {
+      if (args[0] === `${credentialsPath}.lock`) throw error;
+      return actual.unlinkSync(...args);
+    });
+    const { captured, deps } = makeCapture();
+    await expect(
+      runInit(options(), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: key },
+        credentialsPath,
+        fetchImpl: makeOkFetch(),
+        isTTY: false,
+      }),
+    ).rejects.toBe(error);
+    expect(captured.stderr).toEqual([]);
+    expect(captured.stdout).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------

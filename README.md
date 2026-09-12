@@ -116,7 +116,7 @@ Get this exact skeleton without hand-copying it (and without the risk of it drif
 
 > The `$schema` URL above is pinned to the CLI version that generated this doc (`v0.4.0`) — `--plan-template`'s live output always pins to **your installed version** instead, which is what actually resolves. If you're reading this on a later release, run the command yourself rather than trusting this snippet verbatim.
 
-**Don't want to write the first tests yourself?** Ask TestSprite to propose them. `testsprite test plan generate --project <id>` explores your app (or reads the API spec you uploaded with `project docs upload`), drafts test cases, and stages them for review — nothing is written to your disk. You read the printed table and keep what you want:
+**Don't want to write the first tests yourself?** For a deployed target, ask TestSprite to propose them. Local projects use the authored-plan flow below. `testsprite test plan generate --project <id>` explores your app (or reads the API spec you uploaded with `project docs upload`), drafts test cases, and stages them for review — nothing is written to your disk. You read the printed table and keep what you want:
 
 ```bash
 testsprite test plan generate --project proj_8f0f6           # stages proposals for review
@@ -127,6 +127,29 @@ testsprite test plan accept --project proj_8f0f6 --only prop_2 prop_5   # or jus
 It only runs what the project is still missing, so a second call picks up where the first left off. Generation spends workspace credits per stage that actually runs (the result line reports the spend), and a PRD uploaded with `project docs upload --role prd` bills 0.5 credits for its embedding — an API spec is free. Full walkthrough, including what happens on Ctrl-C and every precondition error: [Generate commands](./DOCUMENTATION.md#generate-commands).
 
 Prefer to configure each step by hand (or learn the surface offline with `--dry-run` first)? See [Manual setup](./DOCUMENTATION.md#manual-setup) and [Install & verify](./DOCUMENTATION.md#install--verify).
+
+## Testing an app on your machine (--local)
+
+Frontend tests can reach your running app through a TestSprite tunnel, including on the Free plan (ordinary run credits apply).
+Use an API key with `run:tunnel`: keys minted before that scope existed need to be replaced; the CLI names the missing scope.
+
+```bash
+testsprite project create --type frontend --name "My local app" --local 3000
+testsprite test create --plan-from ./checkout.plan.json --project <project-id>
+testsprite test run <test-id> --local 3000  # per-run tunnel; waits up to 1200 seconds
+# Or keep one tunnel open in terminal A (no port argument)
+testsprite tunnel start --ttl 3600
+# Terminal B: borrow the clientId printed above; keep terminal A running
+testsprite test run <test-id> --local 3000 --tunnel-client <client-uuid>
+```
+
+Run one test per invocation; parallel invocations are fine (5 live tunnel bindings per user); `--all --local` is refused.
+A second `tunnel start` or process using the same credential takes over, and the first exits **10**.
+The examples use `127.0.0.1`. For another loopback listener, pass the same `--local-host localhost` or `--local-host ::1` to project creation and every follow-up run. The selected host is stored in the project URL (`::1` becomes `http://[::1]:<port>`); `project get/list` exposes `originMode: 'local'` in JSON and shows `(Local)` in text output.
+The control plane is WebSocket over TLS (`wss://control.tun.testsprite.com/ws`). The data plane, which carries the tunnel secret and proxied traffic, uses TLS at `data.tun.testsprite.com:443` and verifies the certificate with Node's default trust store: its bundled Mozilla roots, plus certificates supplied through `NODE_EXTRA_CA_CERTS` and the system CAs when Node is started with `--use-system-ca`. Node 20 is supported without losing `NODE_EXTRA_CA_CERTS`. Verification cannot be disabled, and the CLI never falls back from TLS to plaintext. On a network that re-signs TLS, export your organisation's root CA to a PEM file and set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` before running `testsprite`. Plaintext connects and TLS handshakes each time out after 10 seconds. The first failed attempt starts a **60-second** retry episode; writing `TunnelHello` is not enough to reset it. The episode ends only after the first inbound tunnel stream or after the socket remains open for 5 seconds following the hello. A real deadline timer stays armed across retries and destroys an in-flight socket when it expires. After that, an owned `test run --local` run is cancelled and refunded and the command exits **10**; `tunnel start` exits **10**. If a self-hosted or older TestSprite server does not advertise a TLS endpoint, the CLI prints a one-time warning and uses legacy plaintext port **7400** under the same timeout and retry rules. `tunnel start` prints `transport: tls` or `transport: plaintext`.
+An owned tunnel's timeout or Ctrl-C cancels the run by default. A borrowed run still detaches without cancellation on Ctrl-C/SIGTERM because its owner keeps the tunnel alive; if that owner disappears while the run is active, the borrower cancels its own run and reports `cancelled`, `already finished`, or `skipped`. A run cancelled before it finishes is refunded. `--no-cancel-on-interrupt` also skips this owner-gone cancellation. Keep the early `Run <runId>` receipt on stderr and read the reported run before re-running.
+Local projects skip exploration/plan generation; author plans with `test create --plan-from`. Portal runs are blocked for free until you set a public project URL.
+See [the full local-testing reference](./DOCUMENTATION.md#local-frontend-testing-and-tunnels) for flags, login, billing/refunds, timeouts, and retargeting.
 
 ## Commands
 
@@ -159,7 +182,7 @@ Prefer to configure each step by hand (or learn the surface offline with `--dry-
 |                | `test rerun`                                               | Replay one/many tests (FE verbatim; BE with deps); billed as a run (0.5 credits FE / 0.2 BE); `--all --project <id>` reruns all tests                                                                                                                                  |
 |                | `test flaky`                                               | Replay a test several times (auto-heal off) and report a stability score                                                                                                                                                                                               |
 |                | `test wait`                                                | Block on one or more `runId`s until terminal                                                                                                                                                                                                                           |
-|                | `test cancel`                                              | Cancel one or more in-flight runs (Ctrl-C during `--wait` only detaches, `cancel` is the real stop — except a `--local` run, which Ctrl-C cancels by default)                                                                                                          |
+|                | `test cancel`                                              | Cancel one or more in-flight runs (Ctrl-C during `--wait` only detaches, `cancel` is the real stop — except an owned `--local` run, which Ctrl-C cancels by default)                                                                                                   |
 |                | `test artifact get`                                        | Download the failure bundle for a specific `runId`                                                                                                                                                                                                                     |
 | **Test lists** | `testlist list` / `testlist get`                           | Inspect saved test lists — named, cross-project collections with per-project environment pins (V3-only)                                                                                                                                                                |
 |                | `testlist create` / `update` / `add` / `remove` / `delete` | Manage a list and its cases; `--project-env <id>:<env>` pins environments; `delete` requires `--confirm`                                                                                                                                                               |

@@ -19,11 +19,11 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
-import { ApiError } from '../lib/errors.js';
+import { describe, expect, it, vi } from 'vitest';
+import { ApiError, RequestTimeoutError } from '../lib/errors.js';
 import type { ListRunsResponse, RunHistoryItem } from '../lib/runs.types.js';
 import type { CliLatestResult } from './test.js';
-import { runResultHistory, runResult, parseDuration, createTestCommand } from './test.js';
+import { runResultHistory, runResult, runSteps, parseDuration, createTestCommand } from './test.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1571,5 +1571,181 @@ describe('createTestCommand — --rerun / --no-rerun parsing', () => {
 
   it('--no-rerun → rerun is false', async () => {
     expect(await parsedRerun(['--no-rerun'])).toBe(false);
+  });
+});
+
+describe('empty latest steps history hint', () => {
+  it.each([0, 5_000])(
+    'does not retry a history 429 or leave live timers after %i ms',
+    async elapsedMs => {
+      vi.useFakeTimers();
+      try {
+        let historyCalls = 0;
+        let settled = false;
+        const stdout: string[] = [];
+        const stderr: string[] = [];
+        const pending = runSteps(
+          { profile: 'default', output: 'json', debug: false, testId: 'test_abc' },
+          {
+            ...makeCreds(),
+            stdout: line => stdout.push(line),
+            stderr: line => stderr.push(line),
+            fetchImpl: async input => {
+              if (String(input).includes('/steps'))
+                return new Response(JSON.stringify({ items: [], nextToken: null }));
+              historyCalls++;
+              return new Response(
+                JSON.stringify({ error: { code: 'RATE_LIMITED', message: 'Try later' } }),
+                { status: 429, headers: { 'retry-after': '60' } },
+              );
+            },
+          },
+        ).then(page => {
+          settled = true;
+          return page;
+        });
+        await vi.advanceTimersByTimeAsync(elapsedMs);
+        expect(settled).toBe(true);
+        expect(vi.getTimerCount()).toBe(0);
+        expect(historyCalls).toBe(1);
+        expect(await pending).toEqual({ items: [], nextToken: null });
+        expect(stdout).toEqual([JSON.stringify({ items: [], nextToken: null }, null, 2)]);
+        expect(stderr).toEqual([]);
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(['text', 'json'] as const)(
+    'points at the nearest earlier terminal run in %s mode',
+    async output => {
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const historyUrls: string[] = [];
+      const page = await runSteps(
+        { profile: 'default', output, debug: false, testId: 'test_abc' },
+        {
+          ...makeCreds(),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+          fetchImpl: makeFetch(url => {
+            if (url.includes('/steps')) return { body: { items: [], nextToken: null } };
+            historyUrls.push(url);
+            return {
+              body: makeHistoryResp(
+                [
+                  makeHistoryItem({ runId: 'run_latest', status: 'blocked' }),
+                  makeHistoryItem({ runId: 'run_active', status: 'running' }),
+                  makeHistoryItem({ runId: 'run_prior', status: 'passed' }),
+                  makeHistoryItem({ runId: 'run_oldest', status: 'failed' }),
+                ],
+                'more-history',
+              ),
+            };
+          }),
+        },
+      );
+      expect(stderr).toContain(
+        'Latest run has no steps; inspect an earlier run: testsprite test steps test_abc --run-id run_prior',
+      );
+      expect(historyUrls).toHaveLength(1);
+      expect(new URL(historyUrls[0]!).searchParams.get('pageSize')).toBe('20');
+      expect(page).toEqual({ items: [], nextToken: null });
+      expect(stdout).toEqual([output === 'json' ? JSON.stringify(page, null, 2) : 'No steps.']);
+    },
+  );
+
+  it.each([{ runs: [] }, { runs: [makeHistoryItem({ runId: 'run_latest', status: 'passed' })] }])(
+    'gives a neutral history pointer when there is no earlier run (%j)',
+    async ({ runs }) => {
+      const stderr: string[] = [];
+      await runSteps(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_abc' },
+        {
+          ...makeCreds(),
+          stdout: () => {},
+          stderr: line => stderr.push(line),
+          fetchImpl: makeFetch(url => ({
+            body: url.includes('/steps') ? { items: [], nextToken: null } : makeHistoryResp(runs),
+          })),
+        },
+      );
+      expect(stderr).toEqual([
+        'Latest run has no steps; inspect run history: testsprite test result test_abc --history',
+      ]);
+    },
+  );
+
+  it('swallows a failed lookup and still prints No steps', async () => {
+    const stdout: string[] = [];
+    let lookups = 0;
+    const result = await runSteps(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_abc' },
+      {
+        ...makeCreds(),
+        stdout: line => stdout.push(line),
+        stderr: () => {},
+        fetchImpl: makeFetch(url => {
+          if (url.includes('/steps')) return { body: { items: [], nextToken: null } };
+          lookups++;
+          throw new RequestTimeoutError(1000);
+        }),
+      },
+    );
+    expect(lookups).toBe(1);
+    expect(result).toEqual({ items: [], nextToken: null });
+    expect(stdout).toEqual(['No steps.']);
+  });
+
+  it('bounds a stalled history lookup to five seconds', async () => {
+    vi.useFakeTimers();
+    try {
+      let aborted = false;
+      let settled = false;
+      const stdout: string[] = [];
+      const pending = runSteps(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_abc' },
+        {
+          ...makeCreds(),
+          stdout: line => stdout.push(line),
+          stderr: () => {},
+          fetchImpl: async (input, init) => {
+            if (String(input).includes('/steps'))
+              return new Response(JSON.stringify({ items: [], nextToken: null }));
+            return new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener(
+                'abort',
+                () => {
+                  aborted = true;
+                  reject(init.signal?.reason);
+                },
+                { once: true },
+              );
+            });
+          },
+        },
+      ).then(result => {
+        settled = true;
+        return result;
+      });
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      expect(aborted).toBe(true);
+      await pending;
+      expect(stdout).toEqual(['No steps.']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('describes latest-run steps and the run-id selector in help', () => {
+    const steps = createTestCommand().commands.find(command => command.name() === 'steps')!;
+    const help = steps.helpInformation().replace(/\s+/g, ' ');
+    expect(help).toContain('steps of the latest run (use --run-id for a specific run)');
+    expect(help).not.toContain('cumulative');
   });
 });

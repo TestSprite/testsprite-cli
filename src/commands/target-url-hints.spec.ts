@@ -14,6 +14,10 @@ const BOOTSTRAP_GUIDANCE =
   'After a test exists, target an app on this machine for an individual run with ' +
   "`testsprite test run <test-id> --local <port>`; that tunnel is per-run and does not make localhost the project's URL. ";
 
+const LOCAL_PROJECT_GUIDANCE =
+  'Use --local <port> instead of --url for an app on this machine. ' +
+  'Local projects are frontend-only and require the V3 project platform. ';
+
 const RUNTIME_NEXT_ACTION =
   "This looks like a local-dev target. Run it with `testsprite test run <test-id> --local <port>` instead — it tunnels this machine's loopback address to the test runner (frontend tests only; requires an API key with the `run:tunnel` scope). " +
   'See `testsprite test run --help` for accepted values.';
@@ -120,7 +124,7 @@ describe('local target nextAction by command phase', () => {
       expect(error.message).toContain(`Field \`${field}\``);
       expect(error.details).toMatchObject({ field });
       expect(error.nextAction).toBe(
-        `${BOOTSTRAP_GUIDANCE}See \`${helpCommand} --help\` for accepted values.`,
+        `${helpCommand === 'testsprite project create' ? LOCAL_PROJECT_GUIDANCE : BOOTSTRAP_GUIDANCE}See \`${helpCommand} --help\` for accepted values.`,
       );
     },
   );
@@ -142,8 +146,13 @@ describe('local target nextAction by command phase', () => {
   });
 
   it('never presents <test-id> as the only instruction on a project/test-creation path', async () => {
-    for (const [, , , action] of bootstrapCases) {
+    for (const [, , helpCommand, action] of bootstrapCases) {
       const { nextAction } = await rejectedBy(action);
+      if (helpCommand === 'testsprite project create') {
+        expect(nextAction).toContain('Use --local <port> instead of --url');
+        expect(nextAction).not.toContain('<test-id>');
+        continue;
+      }
       expect(nextAction).toContain('Set the project to its deployed or staging URL.');
       expect(nextAction).toContain('After a test exists');
       expect(nextAction.indexOf('After a test exists')).toBeLessThan(

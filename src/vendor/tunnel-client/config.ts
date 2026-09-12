@@ -7,9 +7,9 @@
  *   - the endpoints are internal infrastructure names, and a default value is
  *     still a value that ships;
  *   - a default endpoint is the failure mode the facade exists to prevent.
- *     `POST /api/cli/v1/tunnel` returns `controlUrl` and `tunnelAddr` for the
- *     environment the caller authenticated against, and those are the ONLY
- *     endpoints this client may dial. A default would let a
+ *     `POST /api/cli/v1/tunnel` returns `controlUrl`, `tunnelAddr`, and
+ *     optionally `tunnelTlsAddr` for the environment the caller authenticated
+ *     against, and those are the ONLY endpoints this client may dial. A default would let a
  *     misconfigured/partially-constructed client silently connect somewhere
  *     else and fail in a way that reads like an auth problem.
  *
@@ -30,6 +30,18 @@ export const DEFAULT_HEARTBEAT_MS = 10_000;
  * accepted the transport but never authenticated it.
  */
 export const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
+
+/** Maximum time allowed for each plaintext TCP connect. */
+export const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+
+/** Maximum time allowed for each TLS connect + handshake. */
+export const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS = 10_000;
+
+/** Retry window after the first failed data-plane dial. Zero retries forever. */
+export const DEFAULT_DATA_PLANE_RETRY_DEADLINE_MS = 60_000;
+
+/** Post-hello interval after which an otherwise-idle data-plane session is established. */
+export const DEFAULT_DATA_PLANE_SETTLE_MS = 5_000;
 
 /** Delay between control/tunnel reconnect attempts. Upstream default. */
 export const DEFAULT_RECONNECT_MS = 3_000;

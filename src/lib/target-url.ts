@@ -48,7 +48,11 @@ const LOCAL_DEV_BOOTSTRAP_HINT =
   'After a test exists, target an app on this machine for an individual run with ' +
   "`testsprite test run <test-id> --local <port>`; that tunnel is per-run and does not make localhost the project's URL.";
 
-type TargetUrlHintContext = 'runtime' | 'bootstrap';
+const LOCAL_PROJECT_CREATE_HINT =
+  'Use --local <port> instead of --url for an app on this machine. ' +
+  'Local projects are frontend-only and require the V3 project platform.';
+
+type TargetUrlHintContext = 'runtime' | 'bootstrap' | 'local-project-create';
 
 export interface TargetUrlCaller {
   /** CLI flag name without the leading `--`, used in the error envelope. */
@@ -133,6 +137,7 @@ export function assertNotLocal(
 }
 
 function localDevHintFor(hintContext: TargetUrlHintContext): string {
+  if (hintContext === 'local-project-create') return LOCAL_PROJECT_CREATE_HINT;
   return hintContext === 'bootstrap' ? LOCAL_DEV_BOOTSTRAP_HINT : LOCAL_DEV_RUNTIME_HINT;
 }
 

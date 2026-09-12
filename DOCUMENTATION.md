@@ -17,6 +17,7 @@ The full reference for the TestSprite CLI: install verification, manual setup, e
   - [Write commands](#write-commands)
   - [Generate commands](#generate-commands)
   - [Run commands](#run-commands)
+  - [Local frontend testing and tunnels](#local-frontend-testing-and-tunnels)
   - [Test lists (`testlist`)](#test-lists-testlist)
   - [Schedules (`schedule`)](#schedules-schedule)
   - [CI integration (`ci init`)](#ci-integration-ci-init)
@@ -66,13 +67,13 @@ The CLI uses API keys. Create one from your [TestSprite dashboard](https://www.t
 testsprite auth configure
 
 # Non-interactive — reads TESTSPRITE_API_KEY from the environment (CI / scripts)
-TESTSPRITE_API_KEY=sk-... testsprite auth configure --from-env
+TESTSPRITE_API_KEY=sk-... testsprite setup --from-env
 
 # Verify
 testsprite auth whoami
 ```
 
-Credentials are stored at `~/.testsprite/credentials` (INI-style, mode `0600`). See [Configuration](#configuration) for profiles, environment overrides, and scopes.
+Credentials are normally stored at `~/.testsprite/credentials` (INI-style, mode `0600`). With `setup --from-env`, an unwritable or read-only HOME (`EACCES`, `EPERM`, or `EROFS` while saving credentials) produces a stderr warning and setup continues using `TESTSPRITE_API_KEY` for this session. Its JSON summary includes `credentials: { persisted: false, source: "env" }`; successful authentication does not mean the key was saved. Keep `TESTSPRITE_API_KEY` available in every shell/process that invokes the CLI. Agent installation still needs a writable destination; use `--no-agent` when only session authentication is needed. Other setup errors still fail. See [Configuration](#configuration) for profiles, environment overrides, and scopes.
 
 For an org-scoped API key, `auth status` additionally prints an `orgs:` line (every organization your account belongs to) and an `org binding:` line (the specific organization this key is bound to). Both are omitted for a personal key or an older backend that doesn't report them.
 
@@ -257,10 +258,11 @@ testsprite test code get test_xxxxxxxx --dry-run --output json
 
 #### `testsprite test steps <test-id>`
 
-List the latest steps for a test (with screenshot / DOM-snapshot pointers). Auto-paginates by default.
+List the **latest run's steps** for a test (with screenshot / DOM-snapshot pointers). Use `--run-id <run-id>` for a specific run; that run must belong to the named test (otherwise exit 4). An empty latest run does not fall back to old steps: inspect `test result <test-id> --history` and choose an earlier run explicitly. Bare reads auto-paginate; older backends may still return cumulative steps, so always pin `--run-id` when comparing runs. The run-scoped response retains `{ items, nextToken: null }`.
 
 ```bash
 testsprite test steps test_xxxxxxxx --output json
+testsprite test steps test_xxxxxxxx --run-id run_01hx3z9p8q4k2y7a --output json
 testsprite test steps test_xxxxxxxx --dry-run --output json
 ```
 
@@ -398,7 +400,7 @@ testsprite test update test_be_xxxx --produces session_token --category setup
 testsprite test update test_xxxxxxxx --dry-run --output json
 ```
 
-**Per-test step timeout.** This is a frontend-test setting. The value is 1–60000 milliseconds and the execution engine applies it to **every step** of that test. It is unrelated to `test run --timeout`: that flag is only the client-side deadline for polling under `--wait` (600 seconds by default), and reaching it never stops the server-side run. Test code bakes timeout values in when code is generated, so changing this setting affects runs that generate or regenerate code; it does not rewrite or change replays of previously stored code. `--clear-step-timeout` sends `null` and restores the execution-engine defaults. Because a larger per-step value can lengthen a run, successful set operations print a stderr warning to raise `test run --wait --timeout <s>` when needed.
+**Per-test step timeout.** This is a frontend-test setting. The value is 1–60000 milliseconds and the execution engine applies it to **every step** of that test. It is unrelated to `test run --timeout`: that flag is the polling deadline under `--wait` (600 seconds by default, 1200 with `--local`). Reaching it leaves an ordinary run executing, but the CLI cancels an owned `--local` run by default before closing its tunnel. An adopted run normally detaches, except that it cancels its own run if the tunnel owner disappears. See [local timeout and ownership rules](#local-frontend-testing-and-tunnels). Test code bakes timeout values in when code is generated, so changing this setting affects runs that generate or regenerate code; it does not rewrite or change replays of previously stored code. `--clear-step-timeout` sends `null` and restores the execution-engine defaults. Because a larger per-step value can lengthen a run, successful set operations print a stderr warning to raise `test run --wait --timeout <s>` when needed.
 
 #### `testsprite test delete <test-id>` / `test delete-batch`
 
@@ -443,6 +445,27 @@ testsprite project create --type frontend --name "Checkout" --url https://stagin
 testsprite project update proj_xxxxxxxx --name "Checkout v2"
 testsprite project update proj_xxxxxxxx --test-id-attributes data-element,data-testid
 ```
+
+**Bootstrap a local frontend project (V3).** Start your app, then create the project without a public deployment:
+
+```bash
+testsprite project create --type frontend --name <name> --local <port> \
+  [--local-host <localhost|127.0.0.1|::1>] [--skip-preflight]
+testsprite test create --plan-from ./checkout.plan.json --project <project-id>
+testsprite test run <test-id> --local <port> --local-host <host>
+```
+
+`project create --local` stores `http://<host>:<port>`, where `--local-host` selects both the probe host and the stored URL host (default `127.0.0.1`; `::1` is stored as `http://[::1]:<port>`). Use the same `--local-host <host>` in the follow-up run, especially for an IPv6-only app; omit it in both commands to use the default. `project get` and `project list` expose `originMode: 'local'` in JSON, while text output shows `(Local)`. Local creation is frontend-only and mutually exclusive with `--url`. The port is probed before creation: nothing listening means validation exit 5; `--skip-preflight` bypasses that probe. V2-only accounts receive exit 7 (`local-origin-requires-v3`).
+
+Creation performs **no exploration or plan generation**. `test plan generate --project <project-id>` on a local project is refused **before charge**, with exit 6 and guidance to use `test create --plan-from … --project <id>` followed by `test run <test-id> --local <port> --local-host <host>`. Author a plan using the [plan file format](#plan-file-format), capture the created test id, and run it through the tunnel.
+
+Portal runs of a local project are **BLOCKED for free** until you set a public URL:
+
+```bash
+testsprite project update <project-id> --url https://staging.example.com
+```
+
+A case previously run through a tunnel also has its own local-target history; see [retargeting a local case](#local-frontend-testing-and-tunnels) when running that case without a tunnel.
 
 #### `testsprite project delete <project-id>`
 
@@ -629,7 +652,7 @@ Require the `run:tests` scope.
 
 #### `testsprite test run <test-id>`
 
-Trigger a run for a test. Without `--wait`, prints `{ runId, status: "queued", enqueuedAt, codeVersion, targetUrl }` and exits 0. With `--wait`, polls until terminal — exit 0 on `passed`, exit 1 on `failed | blocked | cancelled`, exit 7 on `--timeout`. On a timeout the CLI still prints the partial run object (with `runId`) to stdout **before** exiting 7, plus a `nextAction` pointing at `test wait <run-id>` — so a script always has the id to resume with, and stdout is never empty.
+Trigger a run for a test. Without `--wait`, prints `{ runId, status: "queued", enqueuedAt, codeVersion, targetUrl }` and exits 0. With `--wait`, polls until terminal — exit 0 on `passed`, exit 1 on `failed | blocked | cancelled`, exit 7 on `--timeout`. After the trigger response, stderr immediately prints `Run <runId>` and, when the response supplies a dashboard/execution URL, `Dashboard: <url>` — before polling, including with `--output json`. Keep that id even if the process is later interrupted; stdout remains the normal JSON result channel. On timeout, stdout still receives a partial run object with `runId` before exit 7. Ordinary runs and adopted tunnels whose owner remains alive get a `test wait <run-id>` hint; owned `--local` runs and adopted runs whose owner disappears are cancelled by default (see below).
 
 `--all --project <id>` runs every test in the project in wave order. On the current unified engine that means **all tests, frontend and backend**; on the legacy backend-only engine, frontend tests can't run — they are skipped and enumerated in `skippedFrontend` with a stderr advisory.
 
@@ -660,13 +683,75 @@ Batch `--report` flags apply only to `test run --all --wait` (and batch `test re
 
 **GitHub-native CI output** (contributed in [#264](https://github.com/TestSprite/testsprite-cli/pull/264)): when `GITHUB_ACTIONS=true`, any `test run --wait` (single test or `--all`), any batch `test rerun --wait`, and `testlist run --wait` additionally emit one `::error::` workflow-command line per non-passed run (annotating the PR checks tab) and append a Markdown results table to the job summary (`$GITHUB_STEP_SUMMARY`). Pass `--gh-output` to force the annotations outside Actions (previewable locally), and `--summary-file <path>` to also write the reduced machine summary JSON (`{total, passed, failed, timedOut, runs[]}`). Everything is written even when the command exits non-zero — including a batch where nothing dispatched at all (every test already in flight → exit 6, or every test rate-deferred → exit 7), which still surfaces its verdict in CI rather than failing silently. Every write is best-effort — a failed write never changes the exit code. Tests that never dispatched (rate-deferred, conflicted, not found) appear as non-passed rows, so a partial batch cannot read as all-passed. Annotation and table content is escaped, so run-error text cannot inject workflow commands or break the table.
 
-`--target-url` must be a publicly reachable URL — the CLI pre-flights it against local addresses (`localhost`, `127.x`, `::1`, `0.0.0.0`, `169.254.x`, RFC1918) and the backend resolves it via DNS. For a frontend test running on this machine, use `test run <test-id> --local <port>` instead of `--target-url` — it tunnels this machine's loopback address (`localhost` / `127.0.0.1` / `::1` only, not a LAN or RFC1918 address) to the test runner. It's frontend-tests-only (a backend test's target is baked into its generated code) and needs an API key with the `run:tunnel` scope — a 403 there means mint a new key. `test rerun` and code-replay can never tunnel: the replay execution path has no proxy field, so those always need an already-reachable `--target-url` or none at all.
+`--target-url` must be a publicly reachable URL — the CLI pre-flights it against local addresses (`localhost`, `127.x`, `::1`, `0.0.0.0`, `169.254.x`, RFC1918) and the backend resolves it via DNS. For a frontend test running on this machine, use `test run <test-id> --local <port>` instead of `--target-url` — it tunnels this machine's loopback address (`localhost` / `127.0.0.1` / `::1` only, not a LAN or RFC1918 address) to the test runner. It's frontend-tests-only (a backend test's target is baked into its generated code) and needs an API key with the `run:tunnel` scope. Keys minted before that scope existed do not have it; mint a new key when the CLI names `run:tunnel` as missing (auth/scope exit 3). `test rerun` and code-replay can never tunnel: the replay execution path has no proxy field, so those always need an already-reachable `--target-url` or none at all.
 
 **Reachability preflight (refuse before charge).** Beyond the literal local-address check, the CLI now probes the target **before dispatching** (and before anything is billed): a DNS resolve plus a lightweight HTTP request. A confirmed-dead target — DNS `NXDOMAIN`, connection refused, or a `502`/`503`/`504` gateway error (the signature of a tunnel that has gone away) — is refused with a validation error (exit 5) instead of dispatching a run that can only fail against a URL nobody is serving. A resolved address that lands in private/loopback/link-local space is always refused (the hostname passed the literal check but actually points somewhere unreachable from the runner). Ambiguous signals — a timeout, a TLS error, an odd status — only produce a stderr warning and never block; behind a configured HTTP(S) proxy, a local DNS failure is also downgraded to a warning, since resolution really happens at the proxy. `--skip-preflight` (on `test run`, `test create`, and `test create-batch`) opts out entirely — no extra network calls. Note: for a backend test the probe is a heuristic (the test's own base URL is baked into its code) — reach for `--skip-preflight` if a refusal surprises you there.
 
 The `[advisory]` about `--target-url` on V3-routed accounts is now **response-driven**: the CLI reads the run's actual trigger response rather than guessing from account flags, so it fires only when the override genuinely did not take effect (newer backends apply `--target-url` to fresh frontend runs on V3; older ones ignore it and the advisory says so). The CLI auto-mints an idempotency key (printed to stderr under `--output json`, `--verbose`, or `--debug`); pass `--idempotency-key <uuid>` to control it explicitly.
 
 **`--wait` exit-code precedence (shared across `test run --all`, batch `test rerun`, and `testlist run`).** When a fan-out poll ends with a mix of outcomes, the process exit code is resolved through one shared precedence table — batch-wide non-retriable first: auth (3) and client-too-old (14), then per-run non-retriable (12 insufficient credits, 13 feature-gated), then per-run errors (4/5/6), then transient (11 rate-limited, 10 unavailable), then timeout (7), then the generic failure (1). A per-member poll error now surfaces its real code instead of folding into 7/1. Batch conflicts are **reason-aware**: a `run_in_flight` conflict with a known `runId` is auto-resumed under `--wait` (the CLI polls the in-flight run to its verdict instead of exiting 6), and other causes — a view-only mirror project, an un-runnable/local environment, an unknown id, a dispatch error — are named individually rather than reported as a blanket "already in flight". Rate-deferred tests are retried on a time budget: retries continue until `--timeout` minus a reserved final poll window (60 s, or a third of the timeout for short timeouts), rather than a fixed attempt count.
+
+#### Local frontend testing and tunnels
+
+`--local` connects the cloud frontend agent to an app running on **this machine**. It supports the **Free plan**; ordinary run credits still apply: a V3 frontend `--local` run costs **0.5 credit**, like any frontend run. The API key needs `run:tunnel` in addition to the scopes for running tests. Keys minted before `run:tunnel` existed must be replaced; the CLI identifies the missing scope.
+
+**Transport security and bounded retry.** The control plane is WebSocket over TLS at `wss://control.tun.testsprite.com/ws`. The data plane carries both the tunnel secret and proxied traffic over TLS at `data.tun.testsprite.com:443`, with the certificate verified by Node's default trust store: its bundled Mozilla roots, plus certificates supplied through `NODE_EXTRA_CA_CERTS` and the system CAs when Node is started with `--use-system-ca`. Node 20 retains `NODE_EXTRA_CA_CERTS` when explicit roots are also configured. Certificate verification cannot be disabled, and the CLI never falls back from TLS to plaintext. On a network that re-signs TLS, export your organisation's root CA to a PEM file and set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` before running `testsprite`. Plaintext connects and TLS handshakes each have a 10-second timeout. The first failed attempt opens a **60-second** retry episode. A successful `TunnelHello` write does not establish the session: only the first inbound tunnel stream or a socket that remains open for 5 seconds after the hello ends the episode. The deadline remains armed across backoff and later attempts, destroys any in-flight socket when it expires, reports one terminal data-plane error, and stops the client. An owned `test run --local` run is then cancelled and refunded and the command exits **10**; `tunnel start` exits **10**. Intentional shutdown reports no data-plane error. When a self-hosted or older TestSprite server does not advertise a TLS endpoint, the CLI instead prints a one-time warning and uses the legacy plaintext data port **7400** under the same retry rules. `tunnel start` makes the selected mode visible as `transport: tls` or `transport: plaintext`.
+
+```bash
+# One run owns a tunnel; --wait is implied, default timeout is 1200 seconds
+testsprite test run <test-id> --local 3000 --output json
+# A different loopback listener, or a longer run
+testsprite test run <test-id> --local 3000 --local-host localhost --timeout 1800
+```
+
+| Flag                          | Local-run behavior                                                                                                                                                                     |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--local <port>`              | Frontend only; port 1–65535. Opens a tunnel for one test and implies `--wait`. Mutually exclusive with `--target-url` and `--all` (exit 5).                                            |
+| `--local-host <host>`         | With `--local` only; `localhost`, `127.0.0.1` (default), or `::1`. Chooses the loopback name in the run's target URL; LAN/RFC1918 addresses are refused.                               |
+| `--tunnel-client <client-id>` | With `--local` only; borrows the non-secret client id from `tunnel start`. Still implies waiting, but ownership stays with the separate tunnel process.                                |
+| `--timeout <seconds>`         | 1–3600; default **600** for ordinary waits, **1200** with `--local`, including adopted tunnels.                                                                                        |
+| `--no-cancel-on-interrupt`    | With `--local` only; opts out of automatic cancellation when an owned tunnel closes or a borrowed tunnel's owner disappears. The run can no longer reach the app and remains billable. |
+| `--skip-preflight`            | Skips the local port probe. Normally a dead port is refused before minting a tunnel or charging a run (exit 5). It does not bypass flag, scope, or backend preconditions.              |
+
+**Concurrency.** Run **one test per `--local` invocation**. Parallel invocations are fine; `--all --local` is refused with exit 5. A user can have **5 live tunnel bindings**. The `tunnel_binding_limit` reason is exit 11 and is **not auto-retried**: stop an unused tunnel or reuse an existing one with `--tunnel-client` before retrying.
+
+**Login and execution.** Frontend tests only: backend tests are refused with exit 7 (`tunnel-unsupported-for-backend-test`). The project environment's username/password are passed to the cloud agent, which logs in inline through the tunnel. OTP environments are refused **before charge** with exit 6 (`tunnel-otp-auth-unsupported`). V3 `--local` runs always use the agent path, never saved-code replay, and **do not overwrite the test's saved code**. Use `test run --local` for local verification; `test rerun` cannot tunnel.
+
+**Timeout, cancellation, and refunds.** When an owned `--local` run stops waiting before a terminal result, the CLI cancels it by default and closes its tunnel. This includes `--timeout` (exit 7), Ctrl-C (exit 130), and non-terminal polling/tunnel failures. Cancellation can race completion or fail; read the reported outcome instead of assuming it succeeded. **A run cancelled before it finished is refunded.** Cancelling an already-finished run does not replace its result or refund it. After an owned local timeout, start a **new** run with `testsprite test run <test-id> --local <port> --timeout 1800`, keeping the same `--local-host <host>` if used; `test wait` cannot restore the closed tunnel. `--no-cancel-on-interrupt` detaches instead, but does not keep an owned tunnel alive.
+
+A borrowed `--tunnel-client` run is not cancelled on Ctrl-C/SIGTERM: the borrower detaches, never closes or deletes the adopted tunnel, and `test wait <run-id>` can resume polling while the owner keeps it alive. If liveness reports that the owner is gone while the run is non-terminal, the borrower cancels **its own run** exactly as an owned doomed run does. The message names the run id and the observed result (`cancelled`, `already finished`, or `skipped`), then points to the run read before a retry. A run cancelled before it finished is refunded. `--no-cancel-on-interrupt` skips the owner-gone cancel too, leaving the run executing and billable without a working tunnel.
+
+**Retargeting a local case.** A case last run through a tunnel stays local. A later run without a tunnel — Portal Run, a schedule, or bare `test run <id>` — is a **free BLOCKED** with reason `tunnel-required` (CLI exit 6). Run it with `--local` again, or explicitly retarget the case using `test run <test-id> --target-url https://staging.example.com`. For a project created with `project create --local`, also set its public project URL with `project update <id> --url https://…` to enable Portal runs.
+
+#### `testsprite tunnel start` / `status` / `stop`
+
+Keep a tunnel alive across runs by running its owner in a separate terminal:
+
+```bash
+# Terminal A — no positional port; keep this process running
+testsprite tunnel start --ttl 3600
+# Terminal B — use the clientId printed by terminal A
+testsprite test run <test-id> --local 3000 --tunnel-client <client-uuid>
+testsprite tunnel status <client-uuid>
+testsprite tunnel stop <client-uuid>
+```
+
+`tunnel start` runs in the foreground; there is no daemon. It prints the selected `transport: tls|plaintext` alongside the client id, expiry, and online status, and keeps the secret in memory. `--ttl <seconds>` requests a credential lifetime of **60–28800 seconds** (the server clamps the value; the CLI requires a positive whole number). The credential is deleted when the owner exits, regardless of TTL. Ctrl-C on `tunnel start` is a normal stop (exit 0); service disconnection or observed credential revocation is exit 10 (`UNAVAILABLE`). A selected data-plane transport that never becomes established is retried for up to 60 seconds before the same exit 10.
+
+`tunnel status <uuid>` and `tunnel stop <uuid>` require a UUID; a non-UUID is rejected locally with exit 5, including under `--dry-run`. Status returns exit 0 even for an explicit `offline` response; an absent binding is exit 4, and an API/transport failure is reported as an error rather than relabelled offline.
+
+Stop is idempotent and prints **`Tunnel credential <uuid> revoked (or already absent).`**; JSON stays `{ clientId, deleted: true }`. A running `tunnel start` exits **10** immediately on the server's revocation close, with its approximately **15-second** status cadence as a backstop. Stop itself does not issue run cancellation; an attached borrower that observes the owner gone cancels its own non-terminal run unless `--no-cancel-on-interrupt` was passed.
+
+A second `tunnel start` or process using the same credential takes over, and the first exits **10**.
+
+| Exit | Meaning and next step                                                                                                                                                               |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `3`  | Authentication/scope error; if `run:tunnel` is missing, mint a new API key.                                                                                                         |
+| `5`  | Validation: dead local port, invalid port/host/UUID, incompatible flags, or `--all --local`.                                                                                        |
+| `6`  | Precondition, including `tunnel-required`, `tunnel-offline`, or `tunnel-otp-auth-unsupported`; resolve the named condition before retrying.                                         |
+| `7`  | Wait timeout or unsupported operation, including `tunnel-unsupported-for-backend-test` and `local-origin-requires-v3`. An owned local timeout requires a new run, not reattachment. |
+| `10` | Unavailable: transport/service failure, tunnel lost, or the owner observed revocation/expiry.                                                                                       |
+| `11` | Rate limited, including `tunnel_binding_limit`; the binding-cap reason is not auto-retried.                                                                                         |
 
 #### `testsprite test rerun [test-id...]`
 
@@ -737,7 +822,7 @@ Flags:
 
 #### `testsprite test wait <run-id...>`
 
-Block until one **or more** runs reach a terminal status. With a single `run-id` the behavior is unchanged: same exit-code matrix as `test run --wait`. With several ids, the runs are polled concurrently under one shared `--timeout` and the CLI prints a `{ results, summary }` envelope — the worst status wins the exit code — so every re-attach hint the CLI prints can be pasted back as one command. `--max-concurrency <n>` (1–100, default 10) caps concurrent polls. Used to resume polling after a timed-out `--wait`, or when an agent already holds `runId`s from previous invocations.
+Block until one **or more** runs reach a terminal status. With a single `run-id` the behavior is unchanged: same exit-code matrix as `test run --wait`. With several ids, the runs are polled concurrently under one shared `--timeout` and the CLI prints a `{ results, summary }` envelope — the worst status wins the exit code — so every re-attach hint the CLI prints can be pasted back as one command. `--max-concurrency <n>` (1–100, default 10) caps concurrent polls. Used to resume polling after an ordinary timed-out `--wait`, or after detaching from an adopted tunnel whose owner is still running. For an owned `--local` timeout, start a new `test run <test-id> --local <port> --timeout 1800`, keeping the same `--local-host <host>` if used; polling cannot restore its closed tunnel.
 
 ```bash
 testsprite test wait run_01hx3z9p8q4k2y7a --timeout 600 --output json
@@ -747,7 +832,7 @@ testsprite test wait run_01hx3z9p8q4k2y7a --dry-run --output json
 
 With several ids, a per-member poll error (e.g. one id not found) is recorded as `error:<CODE>` in that run's row and folded into exit 7, rather than aborting the whole batch. Polling is handled automatically — the CLI uses server-driven long-poll where supported and exponential backoff with jitter otherwise, honoring `Retry-After`.
 
-A `RATE_LIMITED` (429) poll is the one per-member error that is retried before it becomes an outcome: each member re-polls up to 3 times, sleeping the server's `Retry-After`. Each backoff is clamped to the shared `--timeout` deadline, and a backoff interrupted by Ctrl-C detaches normally; if the deadline is reached during one, that member reports a **timeout** (exit 7), not a rate limit.
+A `RATE_LIMITED` (429) poll is the one per-member error that is retried before it becomes an outcome: each member re-polls up to 3 times, sleeping the server's `Retry-After` (except a standing limit such as `tunnel_binding_limit`, which is not auto-retried). Each backoff is clamped to the shared `--timeout` deadline, and a backoff interrupted by Ctrl-C detaches normally; if the deadline is reached during one, that member reports a **timeout** (exit 7), not a rate limit.
 
 If the throttle outlasts the retry budget **and** nothing else went wrong — no timeouts, no failed runs, no other error codes, and no repeated run id in the argument list — the exit code is **11** (rate limited) rather than 7, because the correct next action is to back off before re-attaching, not to retry immediately. Any timeout or non-passed run in the same invocation keeps the usual 7 / 1.
 
@@ -755,7 +840,7 @@ One caveat this does not fix: the HTTP layer's own 429 retries (up to 3, honorin
 
 #### `testsprite test cancel <run-id...>`
 
-Cancel one or more in-flight runs — the counterpart to Ctrl-C, which only **detaches** (the server-side run keeps executing and billing) for an ordinary run. A `--local` run is the one exception: Ctrl-C already cancels it by default (its tunnel closes with the process, so there is nothing left to detach from — see `--no-cancel-on-interrupt` to opt out). Cancelling is idempotent: an already-cancelled run reports `alreadyCancelled` as an advisory, not an error; a run that already reached a terminal verdict is a conflict — the verdict is never overwritten, and no credits are refunded. With one id, prints the run card; with several, prints a `{ cancelled, alreadyCancelled, conflicts, notFound }` summary. Exit codes: any unknown id → 4; else any conflict → 6; else 0.
+Cancel one or more in-flight runs — the counterpart to Ctrl-C, which only **detaches** (the server-side run keeps executing and billing) for an ordinary run. An owned `--local` run is the exception: Ctrl-C already cancels it by default (its tunnel closes with the process, so there is nothing left to detach from — see `--no-cancel-on-interrupt` to opt out). A borrowed run also cancels itself if it observes that its tunnel owner disappeared, but an ordinary borrower Ctrl-C remains a detach. A run cancelled before it finished is refunded. Cancelling is idempotent: an already-cancelled run reports `alreadyCancelled` as an advisory, not an error; a run that already reached a terminal verdict is a conflict — the verdict is never overwritten, and no credits are refunded. With one id, prints the run card; with several, prints a `{ cancelled, alreadyCancelled, conflicts, notFound }` summary. Exit codes: any unknown id → 4; else any conflict → 6; else 0.
 
 ```bash
 testsprite test cancel run_01hx3z9p8q4k2y7a
@@ -975,8 +1060,7 @@ a newer release exists. To learn this, the CLI contacts the public npm registry
 package name only - never your API key, project data, or command line. The
 check is skipped in CI, when stderr is not a TTY, under `--output json` /
 `--dry-run`, and entirely when `TESTSPRITE_NO_UPDATE_NOTIFIER` is set. Any
-failure is silent: the notice can never break or delay a command. This is the
-only outbound call the CLI makes besides your configured API endpoint.
+failure is silent: the notice can never break or delay a command. Target reachability probes and local tunnels also connect to their respective endpoints.
 
 Separately, the backend advertises its **minimum supported CLI version** on
 every `/api/cli/v1` response. When the running CLI is below that floor, a
@@ -997,8 +1081,9 @@ API-key scopes gate the write and run surfaces:
 | `write:tests`    | `test create / create-batch / update / delete / code put / plan put` |
 | `write:projects` | `project create / update / delete / credential / auto-auth`          |
 | `run:tests`      | `test run / rerun / flaky / wait / cancel / artifact get`            |
+| `run:tunnel`     | `test run --local`, `tunnel start / status / stop`                   |
 
-New API keys include the full scope set. If a command returns `AUTH_FORBIDDEN`, the missing scope is named in `details.requiredScope` — regenerate your key from the dashboard to pick up new scopes.
+New API keys include the full scope set. Keys minted before `run:tunnel` existed do not have that scope; mint a new key to use local tunnels. If a command returns `AUTH_FORBIDDEN`, the missing scope is named in `details.requiredScope` — regenerate your key from the dashboard to pick up new scopes.
 
 ## Output & scripting
 
@@ -1082,13 +1167,13 @@ The full list is the [exit-code table](#exit-codes). On every path the same info
 | `0`                   | Success                                                                                           |
 | `1`                   | Generic failure / non-passed run status                                                           |
 | `2`                   | Not yet implemented                                                                               |
-| `3`                   | Auth error                                                                                        |
+| `3`                   | Auth / missing-scope error                                                                        |
 | `4`                   | Not found                                                                                         |
 | `5`                   | Validation error / payload too large                                                              |
 | `6`                   | Conflict / precondition failed / ambiguous org (see below)                                        |
 | `7`                   | Timeout / unsupported                                                                             |
 | `10`                  | Service unavailable                                                                               |
-| `11`                  | Rate limited (retriable)                                                                          |
+| `11`                  | Rate limited (except standing limits such as `tunnel_binding_limit`, not auto-retried)            |
 | `12`                  | Insufficient credits (non-retriable)                                                              |
 | `13`                  | Feature gated (paid plan required)                                                                |
 | `14`                  | Client too old — the backend requires a newer CLI (HTTP 426 `CLIENT_TOO_OLD`); upgrade to proceed |
@@ -1122,7 +1207,11 @@ information in `error.details.candidates`.
 
 ### Signals & pipes
 
-During any `--wait`, SIGINT (Ctrl-C), SIGTERM, or SIGHUP triggers a **graceful detach**: the in-flight request aborts immediately, stdout gets the same partial `{ runId, status: "running" }` envelope as the request-timeout path (under `--output json`, stderr carries an `INTERRUPTED` envelope naming the signal), and stderr states the truth — the server-side run keeps executing, and any credit spend continues — with a re-attach hint (`test wait <run-id>`) and a `test cancel <run-id>` pointer. The exit code is `128 + signal` (130 / 143 / 129). A second signal exits immediately unless a tunnel credential delete or run cancel is in flight; in that case the CLI waits up to 2 seconds for the critical cleanup to finish, then exits regardless. A third signal always exits immediately. Outside a `--wait` (prompts, one-shot commands), signals keep the pre-existing immediate-exit behavior. **Ctrl-C never cancels the server-side run** — `test cancel <run-id...>` is the explicit stop — **except for a `--local` run**: its tunnel closes with this process, so by default (`--cancel-on-interrupt`, opt out with `--no-cancel-on-interrupt`) the first signal cancels the run instead of detaching, and the message says so instead of offering `test wait` (a closed tunnel cannot be re-attached to). A closed stdout pipe (`EPIPE`, e.g. `testsprite test list | head`) exits `0` silently rather than crashing.
+During an **ordinary or adopted-tunnel** `--wait`, SIGINT (Ctrl-C), SIGTERM, or SIGHUP gracefully detaches: the in-flight request aborts, stdout receives a partial run result, and stderr names the signal and offers `test wait <run-id>` / `test cancel <run-id>`. The run keeps executing and remains billable; an adopted tunnel stays with its owner. This is distinct from observing that owner disappear, which cancels the borrower's own run by default. Exit codes are `128 + signal` (130 / 143 / 129).
+
+For an **owned `--local` run**, the first signal instead cancels the non-terminal run by default and closes the tunnel. The CLI reports the cancellation outcome; a run cancelled before it finished is refunded. `--no-cancel-on-interrupt` opts out of cancellation and detaches, but the owned tunnel still closes; the same flag also skips an adopted run's owner-gone cancellation. Use a new `test run <test-id> --local <port>` to verify again, keeping the same `--local-host <host>` if used; `test wait` cannot reopen it. See [local ownership and timeout rules](#local-frontend-testing-and-tunnels).
+
+A second signal exits immediately unless a tunnel credential delete or run cancel is in flight; then the CLI waits up to 2 seconds for critical cleanup. A third signal always exits immediately. Outside a `--wait`, signals keep their immediate-exit behavior, except Ctrl-C on `tunnel start`, which is its normal exit 0. A closed stdout pipe (`EPIPE`, e.g. `testsprite test list | head`) exits 0 silently.
 
 ## Design principles
 

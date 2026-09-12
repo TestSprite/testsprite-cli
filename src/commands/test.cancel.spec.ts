@@ -145,6 +145,110 @@ describe('runTestCancel — single id happy path', () => {
     expect(block).toContain('cancelled');
   });
 
+  const baseText = (runId: string) =>
+    [
+      `runId       ${runId}`,
+      'testId      test_xyz',
+      'status      cancelled',
+      'codeVersion v1',
+      'targetUrl   https://example.com',
+      'createdAt   2026-05-15T10:00:00.000Z',
+      'startedAt   2026-05-15T10:00:01.000Z',
+      'finishedAt  2026-05-15T10:00:30.000Z',
+      'steps       2/5 (passed=2, failed=0)',
+    ].join('\n');
+
+  const refundCases: Array<{
+    name: string;
+    refund?: { status: 'refunded' | 'not_charged' | 'failed'; amount?: number };
+    textLine?: string;
+  }> = [
+    {
+      name: 'refunded with original amount',
+      refund: { status: 'refunded', amount: 2.5 },
+      textLine: 'refund      credits returned: 2.5',
+    },
+    {
+      name: 'not charged',
+      refund: { status: 'not_charged' },
+      textLine: 'refund      run was never charged; nothing to return',
+    },
+    {
+      name: 'refund failed',
+      refund: { status: 'failed' },
+      textLine:
+        'refund      failed — cancellation succeeded, but credits were not returned; contact TestSprite support',
+    },
+    { name: 'refund field absent' },
+  ];
+
+  it.each(refundCases)('renders $name truthfully in text mode', async ({ refund, textLine }) => {
+    const { credentialsPath } = makeCreds();
+    const response = makeCancelResponse('run_refund', refund === undefined ? {} : { refund });
+    const fetchImpl = makeFetch(() => ({ body: response }));
+    const stdoutLines: string[] = [];
+
+    await runTestCancel(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        runIds: ['run_refund'],
+      },
+      { credentialsPath, fetchImpl, stdout: line => stdoutLines.push(line), stderr: () => {} },
+    );
+
+    const expected = textLine ? `${baseText('run_refund')}\n${textLine}` : baseText('run_refund');
+    expect(stdoutLines).toEqual([expected]);
+  });
+
+  it.each(refundCases)('passes $name through unchanged in JSON mode', async ({ refund }) => {
+    const { credentialsPath } = makeCreds();
+    const response = makeCancelResponse('run_refund', refund === undefined ? {} : { refund });
+    const fetchImpl = makeFetch(() => ({ body: response }));
+    const stdoutLines: string[] = [];
+
+    await runTestCancel(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runIds: ['run_refund'],
+      },
+      { credentialsPath, fetchImpl, stdout: line => stdoutLines.push(line), stderr: () => {} },
+    );
+
+    const printed = JSON.parse(stdoutLines.join('\n')) as { refund?: unknown };
+    if (refund === undefined) {
+      expect('refund' in printed).toBe(false);
+    } else {
+      expect(printed.refund).toEqual(refund);
+    }
+  });
+
+  it('rejects a malformed refund object at the HttpClient validation boundary', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { ...makeCancelResponse('run_refund'), refund: { amount: 2.5 } },
+    }));
+
+    const error = await runTestCancel(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runIds: ['run_refund'],
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({ code: 'INTERNAL' });
+    expect(JSON.stringify((error as ApiError).getDetail('issues'))).toContain('refund.status');
+  });
+
   it('CXL-5: alreadyCancelled:true → [advisory] stderr line, still exit 0 (no throw)', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(() => ({

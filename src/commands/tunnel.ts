@@ -20,8 +20,10 @@
  */
 
 import { Command } from 'commander';
-import type { CommonOptions } from '../lib/client-factory.js';
+import * as v from 'valibot';
+import type { CommonOptions, HttpClientFactory } from '../lib/client-factory.js';
 import {
+  createHttpClientFactory,
   emitDryRunBanner,
   makeHttpClient,
   parseRequestTimeoutFlag,
@@ -31,7 +33,13 @@ import { ApiError, RequestTimeoutError } from '../lib/errors.js';
 import type { HttpClient } from '../lib/http.js';
 import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
-import { openTunnelSession, type TunnelClientHandle } from '../lib/tunnel-session.js';
+import {
+  formatDataPlaneUnreachableMessage,
+  formatDataPlaneUnreachableNextAction,
+  openTunnelSession,
+  type TunnelClientHandle,
+  type TunnelFatalReason,
+} from '../lib/tunnel-session.js';
 import type { TunnelStatusResponse } from '../lib/tunnel.types.js';
 import { TunnelClient, type TunnelClientOptions } from '../vendor/tunnel-client/index.js';
 
@@ -53,6 +61,22 @@ export interface TunnelStartOptions extends CommonOptions {
 
 export interface TunnelClientIdOptions extends CommonOptions {
   clientId: string;
+}
+
+const TUNNEL_CLIENT_ID_SCHEMA = v.pipe(v.string(), v.uuid());
+
+function assertTunnelClientId(clientId: string): void {
+  if (v.is(TUNNEL_CLIENT_ID_SCHEMA, clientId)) return;
+  throw ApiError.fromEnvelope({
+    error: {
+      code: 'VALIDATION_ERROR',
+      message:
+        "Tunnel client id must be a UUID (see 'testsprite tunnel status'/'tunnel start' output).",
+      nextAction: "Run 'testsprite tunnel start' to get a tunnel client id.",
+      requestId: 'local',
+      details: { field: 'clientId', reason: 'must be a UUID' },
+    },
+  });
 }
 
 function stdoutOf(deps: TunnelDeps): (line: string) => void {
@@ -78,8 +102,7 @@ function makeClient(
 }
 
 async function withUninterruptibleRequest<T>(
-  opts: CommonOptions,
-  deps: TunnelDeps,
+  createClient: HttpClientFactory,
   timeoutMs: number,
   operation: (client: HttpClient) => Promise<T>,
 ): Promise<T> {
@@ -90,7 +113,7 @@ async function withUninterruptibleRequest<T>(
   timer.unref?.();
   try {
     return await operation(
-      makeClient({ ...opts, requestTimeoutMs: timeoutMs }, deps, deadline.signal),
+      createClient({ requestTimeoutMs: timeoutMs, shutdownSignal: deadline.signal }),
     );
   } finally {
     clearTimeout(timer);
@@ -138,25 +161,18 @@ function shutdownAwareTunnelClientFactory(
  * the same helper in `commands/test.ts`.
  */
 function makeDetachedClient(
-  opts: CommonOptions,
-  deps: TunnelDeps,
+  createClient: HttpClientFactory,
   operationSignal: AbortSignal,
 ): HttpClient {
-  return makeHttpClient(
-    { ...opts, requestTimeoutMs: TEARDOWN_OPERATION_TIMEOUT_MS },
-    {
-      env: deps.env,
-      credentialsPath: deps.credentialsPath,
-      fetchImpl: deps.fetchImpl,
-      stderr: deps.stderr,
-      shutdownSignal: operationSignal,
-    },
-  );
+  return createClient({
+    requestTimeoutMs: TEARDOWN_OPERATION_TIMEOUT_MS,
+    shutdownSignal: operationSignal,
+  });
 }
 
 async function withTeardownDeadline<T>(
-  opts: CommonOptions,
-  deps: TunnelDeps,
+  createClient: HttpClientFactory,
+  shutdown: ShutdownHandle,
   operation: (client: HttpClient) => Promise<T>,
 ): Promise<T> {
   const deadline = new AbortController();
@@ -164,10 +180,9 @@ async function withTeardownDeadline<T>(
     deadline.abort(new RequestTimeoutError(TEARDOWN_OPERATION_TIMEOUT_MS));
   }, TEARDOWN_OPERATION_TIMEOUT_MS);
   timer.unref?.();
-  const shutdown = deps.shutdown ?? globalShutdown;
   try {
     return await shutdown.runCriticalOperation(() =>
-      operation(makeDetachedClient(opts, deps, deadline.signal)),
+      operation(makeDetachedClient(createClient, deadline.signal)),
     );
   } finally {
     clearTimeout(timer);
@@ -175,11 +190,11 @@ async function withTeardownDeadline<T>(
 }
 
 async function deleteTunnelForCleanup(
-  opts: CommonOptions,
-  deps: TunnelDeps,
+  createClient: HttpClientFactory,
+  shutdown: ShutdownHandle,
   clientId: string,
 ): Promise<void> {
-  await withTeardownDeadline(opts, deps, client =>
+  await withTeardownDeadline(createClient, shutdown, client =>
     client.delete<unknown>(`/tunnel/${encodeURIComponent(clientId)}`, {
       allowNoContent: true,
     }),
@@ -187,6 +202,51 @@ async function deleteTunnelForCleanup(
 }
 
 const TEARDOWN_OPERATION_TIMEOUT_MS = 10_000;
+const CREDENTIAL_POLL_INTERVAL_MS = 15_000;
+
+function startCredentialRevocationPoll(args: {
+  client: HttpClient;
+  clientId: string;
+  log: (line: string) => void;
+  onRevoked: () => void;
+}): () => void {
+  const controller = new AbortController();
+  let checking = false;
+  let warned = false;
+  const check = async (): Promise<void> => {
+    if (checking || controller.signal.aborted) return;
+    checking = true;
+    try {
+      await args.client.getTunnelStatus(args.clientId, {
+        signal: controller.signal,
+        // The observation owns its cadence, including after errors.
+        retry: false,
+      });
+      warned = false;
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      // Only the HTTP status is conclusive. An offline client still has a
+      // credential; a 5xx carrying NOT_FOUND is an observation outage.
+      if (err instanceof ApiError && err.httpStatus === 404) {
+        args.onRevoked();
+      } else if (!warned) {
+        warned = true;
+        args.log(
+          `[advisory] could not check tunnel credential ${args.clientId}; continuing to hold and retrying every 15 s.`,
+        );
+      }
+    } finally {
+      checking = false;
+    }
+  };
+  // Skip ticks while a request is pending; never overlap reads or catch up
+  // missed ticks in a burst. The first read happens after a full interval.
+  const timer = setInterval(() => void check(), CREDENTIAL_POLL_INTERVAL_MS);
+  return () => {
+    clearInterval(timer);
+    controller.abort();
+  };
+}
 
 function makeOutput(mode: OutputMode, deps: TunnelDeps): Output {
   return new Output(mode, { stdout: deps.stdout, stderr: deps.stderr });
@@ -231,9 +291,24 @@ export async function runTunnelStart(
   const requestTimeoutMs = resolveRequestTimeoutMs(opts, deps.env ?? process.env);
   const clientOpts = { ...opts, requestTimeoutMs };
   const shutdown = deps.shutdown ?? globalShutdown;
+  const createClient = createHttpClientFactory(clientOpts, {
+    env: deps.env,
+    credentialsPath: deps.credentialsPath,
+    fetchImpl: deps.fetchImpl,
+    stderr: deps.stderr,
+    shutdownSignal: shutdown.signal,
+  });
 
   let fatal = false;
+  let fatalReason: TunnelFatalReason | undefined;
+  let fatalMessage: string | undefined;
+  let revoked = false;
   let resolveWait: (() => void) | undefined;
+  let stopPolling: (() => void) | undefined;
+  const onShutdown = (): void => {
+    stopPolling?.();
+    resolveWait?.();
+  };
   let session: Awaited<ReturnType<typeof openTunnelSession>> | undefined;
   const disarm = shutdown.arm();
   try {
@@ -243,17 +318,20 @@ export async function runTunnelStart(
           log: stderr,
           logLevel: opts.debug ? 'debug' : opts.verbose ? 'info' : 'error',
           ...(opts.ttlSeconds !== undefined ? { ttlSeconds: opts.ttlSeconds } : {}),
-          onFatal: () => {
+          onFatal: (reason, message) => {
             fatal = true;
+            fatalReason = reason;
+            fatalMessage = message;
+            revoked = reason === 'credential-revoked';
             resolveWait?.();
           },
         },
         {
           mint: async ttlSeconds =>
-            withUninterruptibleRequest(clientOpts, deps, requestTimeoutMs, client =>
+            withUninterruptibleRequest(createClient, requestTimeoutMs, client =>
               client.mintTunnel({ ...(ttlSeconds ? { ttlSeconds } : {}) }),
             ),
-          destroy: async clientId => deleteTunnelForCleanup(opts, deps, clientId),
+          destroy: async clientId => deleteTunnelForCleanup(createClient, shutdown, clientId),
           createClient: shutdownAwareTunnelClientFactory(
             deps.createTunnelClient ?? (options => new TunnelClient(options)),
             shutdown.signal,
@@ -269,29 +347,51 @@ export async function runTunnelStart(
     }
 
     out.print(
-      { clientId: session.clientId, expiresAt: session.expiresAt, status: 'online' },
+      {
+        clientId: session.clientId,
+        expiresAt: session.expiresAt,
+        status: 'online',
+        transport: session.transport,
+      },
       data => {
-        const d = data as { clientId: string; expiresAt: string };
+        const d = data as {
+          clientId: string;
+          expiresAt: string;
+          transport: 'tls' | 'plaintext';
+        };
         return [
           `clientId    ${d.clientId}`,
           `expiresAt   ${d.expiresAt}`,
           `status      online`,
+          `transport   ${d.transport}`,
           `hint        Attach a run: testsprite test run <test-id> --local <port> --tunnel-client ${d.clientId}`,
-          `hint        Stop it:      Ctrl-C here (or: testsprite tunnel stop ${d.clientId})`,
+          `hint        Stop it: press Ctrl-C here, or run 'testsprite tunnel stop ${d.clientId}' from another terminal`,
         ].join('\n');
       },
     );
     void stdout;
 
+    const { clientId } = session;
     await new Promise<void>(resolve => {
       resolveWait = resolve;
       if (fatal || shutdown.signal.aborted) {
         resolve();
         return;
       }
-      shutdown.signal.addEventListener('abort', () => resolve(), { once: true });
+      shutdown.signal.addEventListener('abort', onShutdown, { once: true });
+      stopPolling = startCredentialRevocationPoll({
+        client: createClient(),
+        clientId,
+        log: stderr,
+        onRevoked: () => {
+          revoked = true;
+          resolve();
+        },
+      });
     });
   } finally {
+    stopPolling?.();
+    shutdown.signal.removeEventListener('abort', onShutdown);
     try {
       await session?.close();
     } finally {
@@ -299,16 +399,34 @@ export async function runTunnelStart(
     }
   }
 
-  if (fatal && !shutdown.signal.aborted) {
+  if ((fatal || revoked) && !shutdown.signal.aborted) {
+    const dataPlaneUnreachable = fatalReason === 'data-plane-unreachable';
+    if (revoked) {
+      stderr(
+        `Tunnel credential ${session.clientId} was revoked, expired, or taken over by another process.`,
+      );
+    }
     throw ApiError.fromEnvelope({
       error: {
         code: 'UNAVAILABLE',
-        message: 'The tunnel service disconnected this client and it cannot be restored.',
-        nextAction:
-          'Start it again — the retry mints a fresh client. Any run attached to the old client ' +
-          'has already stopped being able to reach this machine.',
+        message: dataPlaneUnreachable
+          ? formatDataPlaneUnreachableMessage(fatalMessage)
+          : revoked
+            ? `Tunnel credential ${session.clientId} was revoked, expired, or taken over by another process.`
+            : 'The tunnel service disconnected this client and it cannot be restored.',
+        nextAction: dataPlaneUnreachable
+          ? formatDataPlaneUnreachableNextAction(fatalMessage, 'retry testsprite tunnel start')
+          : 'Start it again — the retry mints a fresh client. Any run attached to the old client ' +
+            'has already stopped being able to reach this machine.',
         requestId: 'local',
-        details: { reason: 'auth-failed', clientId: session.clientId },
+        details: {
+          reason: dataPlaneUnreachable
+            ? 'data-plane-unreachable'
+            : revoked
+              ? 'credential-revoked'
+              : 'auth-failed',
+          clientId: session.clientId,
+        },
       },
     });
   }
@@ -328,6 +446,7 @@ export async function runTunnelStatus(
   opts: TunnelClientIdOptions,
   deps: TunnelDeps = {},
 ): Promise<TunnelStatusResponse> {
+  assertTunnelClientId(opts.clientId);
   const out = makeOutput(opts.output, deps);
   if (opts.dryRun) {
     emitDryRunBanner(stderrOf(deps));
@@ -363,13 +482,14 @@ function renderStatus(status: TunnelStatusResponse): string {
  * already-deleted binding is a success, because the requested end state holds.
  *
  * Worth knowing: this removes the ability to ATTACH a run to that client, and
- * removes the client from the tunnel server. It does not reach into a
- * `tunnel start` process still running elsewhere; stop that one with Ctrl-C.
+ * removes the client from the tunnel server. A running `tunnel start`
+ * observes the revocation on its next status check and exits.
  */
 export async function runTunnelStop(
   opts: TunnelClientIdOptions,
   deps: TunnelDeps = {},
 ): Promise<void> {
+  assertTunnelClientId(opts.clientId);
   const out = makeOutput(opts.output, deps);
   if (opts.dryRun) {
     emitDryRunBanner(stderrOf(deps));
@@ -380,7 +500,10 @@ export async function runTunnelStop(
     return;
   }
   await makeClient(opts, deps).deleteTunnel(opts.clientId);
-  out.print({ clientId: opts.clientId, deleted: true }, () => `Tunnel ${opts.clientId} deleted.`);
+  out.print(
+    { clientId: opts.clientId, deleted: true },
+    () => `Tunnel credential ${opts.clientId} revoked (or already absent).`,
+  );
 }
 
 export function createTunnelCommand(deps: TunnelDeps = {}): Command {
@@ -456,8 +579,8 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
     .description('Destroy a tunnel credential (idempotent)')
     .addHelpText(
       'after',
-      '\nStopping one that is already gone succeeds. This revokes the credential; it does not\n' +
-        'stop a `tunnel start` still running in another terminal (press Ctrl-C there).\n',
+      '\nStopping one that is already gone succeeds. Revoking the credential\n' +
+        'also makes a running `tunnel start` exit within ~15 s.\n',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (clientId: string, _cmdOpts: unknown, command: Command) => {

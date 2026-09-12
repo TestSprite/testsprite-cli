@@ -332,9 +332,8 @@ Commands:
                                         dashboard: prints the deep-link URL,
                                         then spawns your default browser unless
                                         --no-browser.
-  steps [options] <test-id>             List the steps for a test (server
-                                        returns the cumulative log across every
-                                        run; use --run-id to scope to one run)
+  steps [options] <test-id>             List the steps of the latest run (use
+                                        --run-id for a specific run)
   diff <run-a> <run-b>                  Compare two runs and print what
                                         regressed: verdict, failureKind,
                                         failedStepIndex, per-step status flips,
@@ -445,9 +444,10 @@ Commands:
   cancel <run-id...>                    Cancel one or more queued/running runs.
   
   Ctrl-C during --wait only detaches — it does NOT cancel the server-side
-  run. This is the real stop button. No refund is issued for the credits
-  already charged at trigger time (D3); an in-flight Lambda finishes on its
-  own and its result is discarded once cancelled.
+  run. This is the real stop button. A frontend V3 run cancelled before a
+  terminal state has its original charge returned; an uncharged run says so.
+  Backend and V2 runs keep their existing billing behavior; an in-flight Lambda
+  finishes on its own and its result is discarded once cancelled.
   
   Exit codes:
     0  cancelled (fresh or already-cancelled — naturally idempotent)
@@ -465,9 +465,10 @@ exports[`--help snapshots > test cancel 1`] = `
 Cancel one or more queued/running runs.
 
 Ctrl-C during --wait only detaches — it does NOT cancel the server-side
-run. This is the real stop button. No refund is issued for the credits
-already charged at trigger time (D3); an in-flight Lambda finishes on its
-own and its result is discarded once cancelled.
+run. This is the real stop button. A frontend V3 run cancelled before a
+terminal state has its original charge returned; an uncharged run says so.
+Backend and V2 runs keep their existing billing behavior; an in-flight Lambda
+finishes on its own and its result is discarded once cancelled.
 
 Exit codes:
   0  cancelled (fresh or already-cancelled — naturally idempotent)
@@ -565,7 +566,7 @@ Options:
 Plan file format (--plan-from <file>) — minimal valid example:
 
 {
-  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.10.0/schemas/plan.schema.json",
+  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.11.0/schemas/plan.schema.json",
   "projectId": "prj_abc123",
   "type": "frontend",
   "name": "Login rejects an empty password",
@@ -1013,15 +1014,15 @@ Options:
                               handle that command prints; the tunnel stays
                               owned by that process and is not closed when this
                               run finishes.
-  --no-cancel-on-interrupt    with --local, leave the run executing (and
-                              billing) when this command stops waiting. By
-                              default a --local run is cancelled at that point,
-                              because its tunnel closes with this process and
-                              the run could then only fail.
+  --no-cancel-on-interrupt    with --local, skip automatic cancellation when an
+                              owned tunnel is about to close or a borrowed
+                              tunnel's owner disappears. An ordinary interrupt
+                              of a borrowed run never cancels it because its
+                              tunnel remains alive.
   --wait                      poll until terminal status or --timeout elapses
                               (default: false)
-  --timeout <s>               with --wait, max seconds to wait (1–3600, default
-                              600)
+  --timeout <s>               with --wait, max seconds to wait (1–3600; default
+                              600, or 1200 with --local)
   --idempotency-key <key>     opaque key for safe retries (1–256 chars).
                               Printed to stderr at --debug if auto-generated.
   --all                       run all tests in the project (wave-ordered fresh
@@ -1076,19 +1077,14 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > test steps 1`] = `
 "Usage: testsprite test steps [options] <test-id>
 
-List the steps for a test (server returns the cumulative log across every run;
-use --run-id to scope to one run)
+List the steps of the latest run (use --run-id for a specific run)
 
 Options:
   --page-size <n>           service page size hint (1-100, default 25)
   --max-items <n>           stop after this many items across auto-paged pages
   --starting-token <token>  opaque cursor from a previous response
-  --run-id <id>             Filter steps to those belonging to the specified
-                            runId. Useful for tests that have been run multiple
-                            times — by default 'test steps' returns the
-                            cumulative log across every run. Note: legacy step
-                            records (pre-M3.1) with null runIdIfAvailable are
-                            excluded when this flag is set.
+  --run-id <id>             Show steps of the specified run instead of the
+                            latest run.
   -h, --help                display help for command
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):

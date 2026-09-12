@@ -27,6 +27,26 @@ project's TestSprite suite; before writing a new one, check `testsprite test lis
 for an existing test that already covers the behavior and extend it instead of
 duplicating.
 
+For a deployed change, wait until the deployment contains it and use its public
+`--target-url`. For a local-only change, use
+`testsprite test run <test-id> --local <port>` (frontend only; loopback hosts only).
+The CLI does not build or host the app. Honor the user's explicit tool choice.
+Local tunnels use `wss://control.tun.testsprite.com/ws` for their TLS control
+plane and verified TLS on `data.tun.testsprite.com:443` for the secret-bearing
+data plane. Node verifies the certificate with its default trust store: bundled
+Mozilla roots, certificates supplied through `NODE_EXTRA_CA_CERTS` (including
+on Node 20), and system CAs only when Node starts with `--use-system-ca`. Verification cannot be
+disabled, and the CLI never falls back after a TLS failure. On a network that
+re-signs TLS, export your organisation's root CA to a PEM file and set
+`NODE_EXTRA_CA_CERTS=/path/to/ca.pem` before running `testsprite`. Plaintext
+connects and TLS handshakes time out after 10 seconds. The first failed attempt
+starts a 60-second retry episode. A `TunnelHello` write does not reset it; the
+first inbound tunnel stream or 5 seconds of post-hello socket stability does.
+The deadline destroys an in-flight attempt. Exhaustion cancels and refunds an
+owned run and exits 10, while `tunnel start` exits 10. Only a server that
+advertises no TLS endpoint uses legacy plaintext port 7400, with a one-time
+warning and the same retry rules. `tunnel start` reports `transport: tls|plaintext`.
+
 ## When to skip
 
 The skip list is narrow:
@@ -34,8 +54,9 @@ The skip list is narrow:
 - Docs-only edits (`docs/**`, `*.md`, comments).
 - Pure build/config edits (`tsconfig*`, lint/prettier config, lockfile bumps with
   no behavior change).
-- This repo isn't actually wired to TestSprite (no project linked, no creds).
-  Don't pull the user into a setup flow they didn't ask for — say so and stop.
+- Credentials are unavailable. Explain the missing setup; do not claim a
+  verified result. If credentials exist but a local project is missing, use
+  the bootstrap below.
 
 Otherwise, run it.
 
@@ -79,6 +100,23 @@ In priority order:
    like this repo (e.g. a `Portal` repo → the `Portal` project).
 4. Still ambiguous → list the candidates and ask the user which to use (one short
    question; picking the wrong project wastes a run).
+
+If no project exists for an app running only locally, bootstrap a frontend project
+(V3 required), author a plan, and run the returned test id:
+
+```bash
+testsprite project create --type frontend --name "<repo name>" --local <port>
+testsprite test create --plan-from plan.json --project <projectId>
+testsprite test run <test-id> --local <port> --output json
+```
+
+Keep the app listening. `--local-host` accepts `localhost`, `127.0.0.1` (default),
+or `::1`; the port probe fails with exit 5 if nothing listens (`--skip-preflight`
+bypasses it). Local projects skip exploration: `test plan generate` is refused
+before charge (exit 6), so use `test create --plan-from` without `--run`, then
+`test run --local`. V2-only local-project creation is unsupported (exit 7).
+Portal runs are blocked for free until `project update <id> --url https://…`
+sets a public URL. Keep the existing `--url` / `--target-url` flow for deployed apps.
 
 ## 3. Decide what to test
 
@@ -214,8 +252,11 @@ Batch is **FE-only.** For 3 backend tests, run `test create --type backend
 
 ## 4. Run
 
-All variants use `--wait` for a synchronous verdict, `--target-url <env-url>` for
-the deployment under test, and `--timeout 600` as a sane default.
+For a deployed target, use `--target-url <env-url> --wait --timeout 600` after
+that deployment contains the change. For a change running only on this machine,
+use `testsprite test run <test-id> --local <port>` (frontend only); it implies
+waiting and defaults to 1200 seconds. Create a missing test from a plan first,
+without `--run`, then run its id with `--local`.
 
 ```bash
 # (a) existing test
@@ -227,7 +268,7 @@ testsprite test create --plan-from plan.json --run --wait --target-url <env-url>
 # (b-BE) new BE test from Python (backend create needs --project)
 testsprite test create --type backend --name "..." --project <projectId> --code-file foo.py --run --wait --target-url <env-url> --timeout 600
 
-# (c) FE coverage set — create-batch only CREATES (FE-only); trigger each created test after
+# (c) FE coverage set — create without --run, then trigger each created test
 testsprite test create-batch --plans plans.jsonl --output json   # prints the created test ids
 # then trigger each id: testsprite test run <test-id> --wait --target-url <env-url> --timeout 600
 
@@ -241,16 +282,40 @@ Key behaviors:
 - `--target-url` must be an allowed project/environment URL. The CLI rejects
   `localhost` / RFC1918 / link-local there. If the feature is only running
   locally, use `--local <port>` instead of `--target-url` (frontend tests
-  only; needs an API key with the `run:tunnel` scope — a 403 there means mint
-  a new key) — don't skip the run over this.
+  only; needs `run:tunnel` — keys minted before that scope existed need to be
+  replaced, and the CLI names the missing scope with exit 3) — don't skip the run over this.
 - `--wait` long-polls until terminal and handles its own backoff — don't wrap it
   in a retry loop.
-- Exit codes: `0` = passed; `1` = failed / blocked / cancelled; `7` = timeout.
-  Treat `7` as inconclusive (resume with `testsprite test wait <run-id>`), not a
-  regression.
-- Batch: `create-batch` only creates the tests (FE-only) — it does not run them
-  (`--run` is unsupported, exits 7). Trigger each created test with
-  `test run <id> --wait` and read each verdict individually.
+- `--local` implies `--wait`, with a default timeout of 1200 seconds (ordinary
+  waits default to 600). Run one frontend test per invocation; parallel
+  invocations are fine, but `--all --local` is refused (exit 5). There are
+  5 live tunnel bindings per user; `tunnel_binding_limit` is exit 11 and is not
+  auto-retried. Reuse a live tunnel with `--tunnel-client` or stop an unused one.
+- Keep the early `Run <runId>` line on **stderr**, emitted as soon as the trigger
+  returns; `Dashboard: <url>` follows when supplied. Preserve the id even if
+  the wait later stops; stdout remains the normal JSON result channel.
+- An **owned** local run is cancelled by default when waiting stops (timeout,
+  Ctrl-C, or a polling failure), then its tunnel closes. Read the reported
+  cancellation outcome. A run cancelled before it finished is refunded.
+  `--no-cancel-on-interrupt` detaches instead, but the owned tunnel still closes.
+  A borrower using `--tunnel-client` still does not cancel on Ctrl-C/SIGTERM and
+  never closes the adopted tunnel. If it observes that the owner disappeared,
+  however, it cancels its own run and reports `cancelled`, `already finished`,
+  or `skipped`; `--no-cancel-on-interrupt` skips that cancellation too. A run
+  cancelled before it finished is refunded. Read the named run before re-running.
+- Exit codes: `0` = passed; `1` = failed / blocked / cancelled; `7` = timeout
+  or unsupported. An owned local timeout is inconclusive: start a **new**
+  `testsprite test run <test-id> --local <port> --timeout 1800`; do not suggest
+  `test wait` for that closed tunnel. Resume **ordinary or adopted-tunnel**
+  waits with `testsprite test wait <run-id>` only while the target is reachable
+  (and the adopted tunnel's owner remains alive).
+- A case last run through a tunnel stays local: a later Portal Run, schedule,
+  or bare CLI run is a free BLOCKED (`tunnel-required`, exit 6). Use `--local`
+  again or explicitly retarget with a public `--target-url`. V3 local runs use
+  the agent path, never saved-code replay, and preserve the test's saved code.
+- Batch: `create-batch` creates frontend tests; adding `--run --wait` runs them
+  against a deployed target. For local tests, create without `--run`, then call
+  `test run <id> --local <port>` separately for each id; inspect each verdict.
 - `test code put` needs `--expected-version <codeVersion>`; stale etag → exit 6,
   re-fetch via `test get <id>` and retry. `--force` bypasses but is audit-logged.
 - Idempotency: the CLI auto-mints an `Idempotency-Key`; replays within 24h return
@@ -275,8 +340,11 @@ The product/environment is the problem (believe these) when:
   read-only", "page 404s");
 - the trace blames infra (deploy lag, auth gate, missing fixture).
 
-Scope step counts to the **current run** — `test steps` is cumulative across runs;
-filter on the run-id before counting.
+`test steps <test-id>` shows the **latest run's steps**. For the run you are
+verifying, use `testsprite test steps <test-id> --run-id <run-id> --output json`
+with the id from the early stderr receipt. An empty latest run is not evidence
+from an earlier run; use `test result <test-id> --history` to choose one explicitly.
+Older backends may return cumulative bare steps; pin `--run-id` before counting.
 
 If it's the plan: tighten via `test plan put` and re-run **once** (two runs total),
 then stop. Don't grind. If it's the product/env: report the verdict with the

@@ -53,7 +53,7 @@ beforeEach(() => {
 describe('runConfigure', () => {
   it('writes the env-supplied key when --from-env is set', async () => {
     const { capture, deps } = makeCapture();
-    await runConfigure(
+    const result = await runConfigure(
       { profile: 'default', output: 'text', debug: false, fromEnv: true },
       {
         ...deps,
@@ -67,6 +67,7 @@ describe('runConfigure', () => {
       apiUrl: 'https://from-env',
     });
     expect(capture.stdout.join('\n')).toContain('configured');
+    expect(result).toEqual({ persisted: true, source: 'env' });
   });
 
   it('rejects a malformed API key up front, before the pre-write /me ping', async () => {

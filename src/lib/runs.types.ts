@@ -316,6 +316,13 @@ export interface RunResponse {
 // DEV-331 piece 3 — cancel wire types
 // ---------------------------------------------------------------------------
 
+/** Credit outcome returned when cancellation applies V3 frontend billing rules. */
+export interface CancelRunRefund {
+  status: 'refunded' | 'not_charged' | 'failed';
+  /** Original charged amount returned to the workspace. Present when refunded. */
+  amount?: number;
+}
+
 /**
  * Response from `POST /api/cli/v1/runs/{runId}/cancel`.
  * Same shape as `GET /runs/{runId}` (`status: "cancelled"`, verdict
@@ -324,6 +331,11 @@ export interface RunResponse {
  */
 export interface CancelRunResponse extends RunResponse {
   alreadyCancelled: boolean;
+  /**
+   * Present only when the server evaluated a V3 frontend run refund. Older
+   * backends, V2 runs, and backend-test runs omit it.
+   */
+  refund?: CancelRunRefund;
 }
 
 /** Terminal states from the RunStatus union. */

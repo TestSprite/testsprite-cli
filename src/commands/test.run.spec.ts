@@ -5525,3 +5525,171 @@ describe('run --gh-output / --summary-file still require --wait (Gap A guard)', 
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 });
+
+describe('early run receipt', () => {
+  it.each([
+    { output: 'text' as const, timeout: false, chain: false },
+    { output: 'json' as const, timeout: false, chain: false },
+    { output: 'json' as const, timeout: true, chain: false },
+    { output: 'json' as const, timeout: false, chain: true },
+    { output: 'json' as const, timeout: true, chain: true },
+  ])(
+    'precedes the first poll response ($output, timeout=$timeout, chain=$chain)',
+    async ({ output, timeout, chain }) => {
+      vi.useFakeTimers();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      let releasePoll = () => {};
+      const pollGate = new Promise<void>(resolve => {
+        releasePoll = resolve;
+      });
+      let enteredPoll = () => {};
+      const polling = new Promise<void>(resolve => {
+        enteredPoll = resolve;
+      });
+      const createContext = chain
+        ? {
+            testId: 'test_xyz',
+            type: 'frontend' as const,
+            codeVersion: 'v1',
+            createdAt: '2026-05-15T10:00:00.000Z',
+          }
+        : undefined;
+      const dashboardUrl = 'https://www.testsprite.com/dashboard/test/run_abc';
+      const pending = runTestRun(
+        {
+          profile: 'default',
+          output,
+          debug: false,
+          testId: 'test_xyz',
+          wait: true,
+          timeoutSeconds: 1,
+          createContext,
+        },
+        {
+          ...makeCreds(),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+          shutdown: new ShutdownController(),
+          fetchImpl: async (_input, init) => {
+            if (init?.method === 'POST')
+              return new Response(JSON.stringify({ ...TRIGGER_RESP, dashboardUrl }));
+            enteredPoll();
+            await pollGate;
+            return new Response(
+              JSON.stringify(
+                timeout
+                  ? { ...makePassedRun(), status: 'running', retryAfterSeconds: 25 }
+                  : makePassedRun(),
+              ),
+            );
+          },
+        },
+      ).catch((err: unknown) => err);
+      try {
+        await polling;
+        expect(stderr).toContain('Run run_abc');
+        expect(stderr).toContain(`Dashboard: ${dashboardUrl}`);
+        expect(stdout).toEqual([]);
+      } finally {
+        releasePoll();
+        await vi.advanceTimersByTimeAsync(1000);
+        await pending;
+        vi.useRealTimers();
+      }
+      expect(stderr.filter(line => line === 'Run run_abc')).toHaveLength(1);
+      if (timeout) expect(await pending).toMatchObject({ exitCode: 7, code: 'UNSUPPORTED' });
+      if (output === 'json') {
+        const { runId, testId, ...passedFields } = makePassedRun();
+        const expectedRun = timeout
+          ? {
+              runId: 'run_abc',
+              status: 'running',
+              enqueuedAt: TRIGGER_RESP.enqueuedAt,
+              codeVersion: 'v1',
+              targetUrl: 'https://example.com',
+            }
+          : { runId, testId, testTitle: null, ...passedFields };
+        expect(stdout).toEqual([
+          JSON.stringify(chain ? { ...createContext, run: expectedRun } : expectedRun, null, 2),
+        ]);
+        expect(JSON.parse(stdout.join(''))).toEqual(
+          chain ? { ...createContext, run: expectedRun } : expectedRun,
+        );
+      }
+    },
+  );
+
+  it.each([false, true])(
+    'prints the resolved id after conflict resume (explicit target=$0)',
+    async explicitTarget => {
+      const stderr: string[] = [];
+      let reads = 0;
+      let receiptAtPoll: string[] = [];
+      await runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_xyz',
+          wait: true,
+          timeoutSeconds: 60,
+          ...(explicitTarget ? { targetUrl: 'https://example.com', skipPreflight: true } : {}),
+        },
+        {
+          ...makeCreds(),
+          stdout: () => {},
+          stderr: line => stderr.push(line),
+          fetchImpl: makeFetch((_url, init) => {
+            if (init.method === 'POST')
+              return errorBody('CONFLICT', {
+                reason: 'run_in_flight',
+                currentRunId: 'run_resumed',
+              });
+            reads++;
+            if (reads > 1) receiptAtPoll = [...stderr];
+            return { body: { ...makePassedRun(), runId: 'run_resumed' } };
+          }),
+        },
+      );
+      expect(receiptAtPoll).toContain('Run run_resumed');
+      expect(stderr.filter(line => line === 'Run run_resumed')).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    { links: {}, expected: undefined },
+    {
+      links: { executionUrl: 'https://www.testsprite.com/executions/run_abc' },
+      expected: 'https://www.testsprite.com/executions/run_abc',
+    },
+  ])(
+    'prints a no-wait receipt using only available server links ($expected)',
+    async ({ links, expected }) => {
+      const stderr: string[] = [];
+      const stdout: string[] = [];
+      const response = { ...TRIGGER_RESP, ...links };
+      await runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_xyz',
+          wait: false,
+          timeoutSeconds: 600,
+        },
+        {
+          ...makeCreds(),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+          fetchImpl: makeFetch(() => ({ body: response })),
+        },
+      );
+      expect(stderr).toContain('Run run_abc');
+      expect(stderr.filter(line => line.startsWith('Dashboard:'))).toEqual(
+        expected ? [`Dashboard: ${expected}`] : [],
+      );
+      expect(stdout).toEqual([JSON.stringify(response, null, 2)]);
+    },
+  );
+});

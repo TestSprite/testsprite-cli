@@ -55,7 +55,11 @@ import {
   requireEnum,
   requireString,
 } from '../lib/validate.js';
-import { REQUEST_TIMEOUT_DEFAULT_MS, REQUEST_TIMEOUT_MAX_MS } from '../lib/http.js';
+import {
+  isStandingRateLimit,
+  REQUEST_TIMEOUT_DEFAULT_MS,
+  REQUEST_TIMEOUT_MAX_MS,
+} from '../lib/http.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
 import { VERSION } from '../version.js';
@@ -68,6 +72,7 @@ import {
   type PaginationFlags,
 } from '../lib/pagination.js';
 import { isTerminalStatus, pollRunUntilTerminal, TimeoutError } from '../lib/poll.js';
+import type { WaitTimeoutTelemetry } from '../lib/telemetry.js';
 import { PlanGenerationTimeoutError, runGenerationLadder } from '../lib/plan-poll.js';
 import type {
   CliGetPlansResponse,
@@ -110,6 +115,7 @@ import {
 } from '../lib/local-target.js';
 import {
   openTunnelSession,
+  TUNNEL_DATA_PLANE_PROXY_BYPASS_DESCRIPTION,
   TunnelLostError,
   type TunnelClientHandle,
   type TunnelSession,
@@ -483,6 +489,8 @@ export interface CliFailureContext {
 }
 
 export interface TestDeps {
+  /** Report an exhausted poll deadline without changing the public output/error shape. */
+  onWaitTimeout?: (context: WaitTimeoutTelemetry) => void;
   env?: NodeJS.ProcessEnv;
   credentialsPath?: string;
   fetchImpl?: FetchImpl;
@@ -606,7 +614,10 @@ export interface TunnelDetach {
   runId: string;
   testId: string;
   localPort: number;
+  localHost: LoopbackHost;
   reason: TunnelDetachReason;
+  /** The borrowed tunnel owner disappeared while this run was non-terminal. */
+  ownerGone?: boolean;
   cancel: TunnelCancelOutcome;
   terminalStatus?: RunStatus;
 }
@@ -616,7 +627,11 @@ const TUNNEL_INTERRUPT_OPT_OUT_CONSEQUENCE =
   'reach your app and is still billed.';
 
 function tunnelRerunCommand(detach: TunnelDetach): string {
-  return `testsprite test run ${detach.testId} --local ${detach.localPort}`;
+  return (
+    `testsprite test run ${detach.testId} --local ${detach.localPort}` +
+    (detach.localHost !== DEFAULT_LOCAL_HOST ? ` --local-host ${detach.localHost}` : '') +
+    (detach.reason === 'timeout' ? ' --timeout 1800' : '')
+  );
 }
 
 /** Minimum wall-clock gap between adopted-client liveness reads. */
@@ -730,6 +745,25 @@ async function cancelDoomedTunnelRun(args: {
  */
 export function tunnelDetachMessage(detach: TunnelDetach, interrupt?: InterruptError): string {
   const { runId, reason, cancel } = detach;
+  if (detach.ownerGone === true) {
+    const cause = `The borrowed tunnel for run ${runId} is no longer registered.`;
+    const outcome: Record<TunnelCancelOutcome, string> = {
+      cancelled:
+        `Run ${runId} was cancelled. A run cancelled before it finished is not charged ` +
+        '(the server refunds it).',
+      'already-terminal': `Run ${runId} had already finished, so there was nothing to cancel.`,
+      failed:
+        `Run ${runId} could NOT be cancelled from here — stop it with: ` +
+        `testsprite test cancel ${runId}.`,
+      skipped:
+        `Run ${runId} cancellation was skipped because --no-cancel-on-interrupt was passed. ` +
+        'It may still be executing and billed.',
+    };
+    return (
+      `${cause} ${outcome[cancel]}\n` +
+      `  Check the run before re-running: testsprite test wait ${runId}.`
+    );
+  }
   if (reason === 'interrupt' && cancel === 'cancelled') {
     return (
       `Interrupted${interrupt ? ` by ${interrupt.signal}` : ''}. Run ${runId} was reaching your ` +
@@ -782,6 +816,9 @@ function detachHintLines(runId: string, detach: TunnelDetach | undefined): strin
       `hint        Re-attach with: testsprite test wait ${runId}`,
       `hint        Cancel with:    testsprite test cancel ${runId}`,
     ];
+  }
+  if (detach.ownerGone === true) {
+    return [`hint        Check before re-running: testsprite test wait ${runId}`];
   }
   return detach.cancel === 'cancelled' || detach.cancel === 'already-terminal'
     ? ['hint        The tunnel closed with this process, so the run was stopped.']
@@ -2781,8 +2818,14 @@ export const DEFERRED_RETRY_DEFAULT_SLEEP_MS = 61_000;
  * a secondary guard. If both fields are absent we treat the error as permanent
  * to avoid silently burning the entire retry budget on a non-recoverable state.
  *
+ * A 429 whose `details.reason` names a standing condition (see
+ * `STANDING_RATE_LIMIT_REASONS` in `lib/http.ts` — e.g. the live
+ * tunnel-binding cap) is also permanent, even though it now carries a real
+ * `Retry-After`: that header says when a retry COULD first succeed if the
+ * caller frees the resource, not that the condition clears on its own.
+ *
  * Limitation: a hypothetical future backend that emits `RATE_LIMITED` for a
- * third reason without a `Retry-After` header AND without the per-minute
+ * new reason without a `Retry-After` header AND without the per-minute
  * wording would be classified as permanent here. Document this if it occurs.
  */
 export function isTransientRateLimit(err: ApiError): boolean {
@@ -2790,6 +2833,9 @@ export function isTransientRateLimit(err: ApiError): boolean {
   // any Retry-After header the response may carry. Check this SHORT-CIRCUIT first
   // so a credits-429 with a stray Retry-After header is never retried.
   if (/insufficient credits/i.test(err.message)) return false;
+
+  // Standing-condition 429s are permanent regardless of Retry-After too.
+  if (isStandingRateLimit(err)) return false;
 
   // Primary transient signal: Retry-After header was present and parsed (set on
   // the error by HttpClient when retryOnRateLimit: false is used and the HTTP
@@ -4068,6 +4114,7 @@ async function runBatchRun(
       // Interrupt rejects the fan-out — see the trigger-stage catch above.
       if (err instanceof InterruptError) throw err;
       if (err instanceof TimeoutError) {
+        deps.onWaitTimeout?.({ reason: 'wait_timeout' });
         if (opts.output !== 'json') {
           stderrFn(
             `[batch-run] ${testId} (runId: ${triggerResponse.runId}) — timed out after ${timeoutSeconds}s`,
@@ -5610,8 +5657,8 @@ export async function runSteps(
     return page;
   }
 
-  // Bare `test steps <id>` (no --run-id): cumulative path — byte-identical to
-  // the original behavior. Pagination flags are honored here.
+  // Bare `test steps <id>` reads the latest run on V3. Older backends may
+  // return a cumulative log; pagination and the page shape stay unchanged.
   const paginationFlags: PaginationFlags = validatePaginationFlags({
     pageSize: opts.pageSize,
     startingToken: opts.startingToken,
@@ -5635,6 +5682,34 @@ export async function runSteps(
         client.get<Page<CliTestStep>>(path, { query: { pageSize, cursor } }),
       paginationFlags,
     );
+  }
+
+  if (page.items.length === 0 && opts.startingToken === undefined && !opts.dryRun) {
+    // One history page and a short total deadline keep this advisory best-effort.
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(), 5_000);
+    try {
+      const historyClient = makeClient(
+        opts,
+        deps,
+        AbortSignal.any([shutdownOf(deps).signal, deadline.signal]),
+      );
+      const history = await historyClient.listTestRuns(
+        opts.testId,
+        { pageSize: 20 },
+        { retry: false },
+      );
+      const earlier = history.runs.slice(1).find(run => isTerminalStatus(run.status));
+      stderrFn(
+        earlier
+          ? `Latest run has no steps; inspect an earlier run: testsprite test steps ${opts.testId} --run-id ${earlier.runId}`
+          : `Latest run has no steps; inspect run history: testsprite test result ${opts.testId} --history`,
+      );
+    } catch {
+      // Missing history must not change the steps page or the command's exit code.
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   // Bare cumulative path: when the returned items span multiple runIds,
@@ -6143,6 +6218,7 @@ export async function runFailureGet(
  * Default timeout in seconds for `--wait`. Range 1..3600.
  */
 const DEFAULT_RUN_TIMEOUT_SECONDS = 600;
+const DEFAULT_LOCAL_RUN_TIMEOUT_SECONDS = 1200;
 const MAX_RUN_TIMEOUT_SECONDS = 3600;
 
 interface RunTestRunOptions extends CommonOptions {
@@ -6889,7 +6965,7 @@ export async function runTestRun(
     if (isProxyAgentActive()) {
       stderrFn(
         '[advisory] An HTTP proxy is configured for this process. The tunnel control channel ' +
-          'honours it, but the tunnel data plane is a raw TCP connection that does not — if the ' +
+          `honours it, but ${TUNNEL_DATA_PLANE_PROXY_BYPASS_DESCRIPTION} — if the ` +
           'run cannot reach your machine, an egress proxy is the first thing to rule out.',
       );
     }
@@ -7094,6 +7170,10 @@ export async function runTestRun(
       }
     }
 
+    stderrFn(`Run ${triggerResponse.runId}`);
+    const receiptUrl = triggerResponse.dashboardUrl ?? triggerResponse.executionUrl;
+    if (receiptUrl) stderrFn(`Dashboard: ${receiptUrl}`);
+
     // Response-driven, not assumption-driven: the backend is the ground
     // truth for whether --target-url was actually applied — V3
     // deliberately returns `targetUrl: ''` rather than echoing an override it
@@ -7201,7 +7281,13 @@ export async function runTestRun(
           // source through the shared poll loop for every ordinary run.
           if (!isTerminalStatus(run.status)) {
             const fatal = tunnelSession?.fatalReason();
-            if (fatal !== undefined) throw new TunnelLostError(fatal, triggerResponse.runId);
+            if (fatal !== undefined) {
+              throw new TunnelLostError(
+                fatal,
+                triggerResponse.runId,
+                tunnelSession?.fatalMessage(),
+              );
+            }
           }
           live.onTick(run, elapsedMs);
         },
@@ -7211,14 +7297,16 @@ export async function runTestRun(
       // Stop redrawing BEFORE any final line below is written, so a stale
       // "running · Ns" can never land after "timed out" / "interrupted".
       live.stop();
-      // A tunnel run that stops being waited on is a tunnel run that is about
-      // to lose its tunnel, on ALL of these paths. `cancelOnInterrupt` defaults
-      // ON here and only here — for an ordinary run, detaching leaves something
-      // that can still pass, which is why DEV-331 deliberately did not cancel.
+      // An owned tunnel closes on every non-terminal exit, so its run is doomed.
+      // An adopted tunnel survives this process and normally detaches; only an
+      // owner-gone observation proves that the borrowed run has lost its route.
+      // `cancelOnInterrupt` defaults on for both doomed cases.
       const settleTunnelDetach = async (
         reason: TunnelDetachReason,
+        ownerGone = false,
       ): Promise<TunnelDetach | undefined> => {
-        if (tunnelSession === undefined || tunnelSession.adopted) return undefined;
+        if (tunnelSession === undefined || (tunnelSession.adopted && !ownerGone)) return undefined;
+        const borrowedOwnerGone = tunnelSession.adopted && ownerGone;
         const cancel = await cancelDoomedTunnelRun({
           runId: triggerResponse.runId,
           enabled: opts.cancelOnInterrupt !== false,
@@ -7229,7 +7317,9 @@ export async function runTestRun(
           runId: triggerResponse.runId,
           testId: opts.testId,
           localPort: opts.localPort as number,
+          localHost,
           reason,
+          ...(borrowedOwnerGone ? { ownerGone: true } : {}),
           cancel: cancel.outcome,
           ...(cancel.terminalStatus !== undefined ? { terminalStatus: cancel.terminalStatus } : {}),
         };
@@ -7237,7 +7327,10 @@ export async function runTestRun(
 
       if (err instanceof TunnelLostError) {
         ticker.finalize(`Run ${triggerResponse.runId} — tunnel disconnected`);
-        const detach = await settleTunnelDetach('tunnel-lost');
+        const detach = await settleTunnelDetach(
+          'tunnel-lost',
+          err.getDetail('reason') === 'owner-gone',
+        );
         const partial = {
           runId: triggerResponse.runId,
           status: detachPartialStatus(detach),
@@ -7264,6 +7357,17 @@ export async function runTestRun(
         // JSON consumers and AI agents can grab the runId and chain into
         // `testsprite test wait <runId>` without parsing the stderr error envelope.
         const detach = await settleTunnelDetach('timeout');
+        deps.onWaitTimeout?.({
+          reason: 'wait_timeout',
+          ...(tunnelSession
+            ? {
+                cancelOutcome:
+                  detach?.cancel === 'already-terminal'
+                    ? 'already_terminal'
+                    : (detach?.cancel ?? 'skipped'),
+              }
+            : {}),
+        });
         const timeoutPartial = {
           runId: triggerResponse.runId,
           status: detachPartialStatus(detach),
@@ -7291,7 +7395,7 @@ export async function runTestRun(
               : `Timed out after ${opts.timeoutSeconds}s waiting for run ${triggerResponse.runId}. ` +
                 stillRunningAndBillingSubject(triggerResponse.runId),
             nextAction: detach
-              ? `Start it again with --local and a longer --timeout; a retry mints a fresh tunnel.`
+              ? `Start a new run with: ${tunnelRerunCommand(detach)} (or raise --timeout up to 3600); a retry mints a fresh tunnel.`
               : `Resume polling: testsprite test wait ${triggerResponse.runId}, or cancel it: testsprite test cancel ${triggerResponse.runId}`,
             requestId: 'local',
             details: { runId: triggerResponse.runId, timeoutSeconds: opts.timeoutSeconds },
@@ -7600,7 +7704,10 @@ export async function runTestWaitMany(
       // would extend the invocation by ~1s per queued run past --timeout).
       // Re-evaluated on every iteration so a retry obeys the same rule.
       const remainingSeconds = Math.ceil((deadlineMs - Date.now()) / 1000);
-      if (remainingSeconds <= 0) return { kind: 'timeout' };
+      if (remainingSeconds <= 0) {
+        deps.onWaitTimeout?.({ reason: 'wait_timeout' });
+        return { kind: 'timeout' };
+      }
       try {
         const run = await pollRunUntilTerminal(client, runId, {
           timeoutSeconds: remainingSeconds,
@@ -7615,7 +7722,10 @@ export async function runTestWaitMany(
         });
         return { kind: 'result', run };
       } catch (err) {
-        if (err instanceof TimeoutError) return { kind: 'timeout' };
+        if (err instanceof TimeoutError) {
+          deps.onWaitTimeout?.({ reason: 'wait_timeout' });
+          return { kind: 'timeout' };
+        }
         if (err instanceof RequestTimeoutError) throw err;
         // Interrupt must reject the fan-out (handled at the collect point), not
         // be flattened into a per-member 'error' outcome that would swallow the
@@ -7640,7 +7750,10 @@ export async function runTestWaitMany(
             // makes ("Timed out … during rate-limit backoff"). Reporting the 429
             // instead would let the exit-11 escalation below claim "nothing else
             // went wrong" for an invocation that in fact exhausted `--timeout`.
-            if (clampedRetryMs <= 0) return { kind: 'timeout' };
+            if (clampedRetryMs <= 0) {
+              deps.onWaitTimeout?.({ reason: 'wait_timeout' });
+              return { kind: 'timeout' };
+            }
             stderrFn(
               `[wait] ${runId} — rate limited (attempt ${rateLimitAttempt}/${WAIT_POLL_RATE_MAX_OUTER_RETRIES}): retrying in ${Math.ceil(clampedRetryMs / 1000)}s`,
             );
@@ -7882,7 +7995,7 @@ export async function runTestCancel(
     const result = await client.cancelRun(runId);
     out.print(result, data => {
       const r = data as CancelRunResponse;
-      return renderRunResponseText(r);
+      return renderCancelResponseText(r);
     });
     if (result.alreadyCancelled) {
       stderrFn(`[advisory] run ${runId} was already cancelled`);
@@ -7971,6 +8084,31 @@ function renderCancelSummaryText(summary: CliCancelSummary): string {
   return lines.join('\n');
 }
 
+function renderCancelResponseText(response: CancelRunResponse): string {
+  const runCard = renderRunResponseText(response);
+  if (!response.refund) return runCard;
+
+  let refundLine: string;
+  switch (response.refund.status) {
+    case 'refunded':
+      refundLine =
+        response.refund.amount === undefined
+          ? 'refund      credits returned'
+          : `refund      credits returned: ${response.refund.amount}`;
+      break;
+    case 'not_charged':
+      refundLine = 'refund      run was never charged; nothing to return';
+      break;
+    case 'failed':
+      refundLine =
+        'refund      failed — cancellation succeeded, but credits were not returned; contact TestSprite support';
+      break;
+    default:
+      refundLine = `refund      ${String(response.refund.status)}`;
+  }
+  return `${runCard}\n${refundLine}`;
+}
+
 export function createTestCancelCommand(deps: TestDeps): Command {
   const cancel = new Command('cancel');
   cancel
@@ -7978,9 +8116,10 @@ export function createTestCancelCommand(deps: TestDeps): Command {
     .description(
       'Cancel one or more queued/running runs.\n' +
         '\nCtrl-C during --wait only detaches — it does NOT cancel the server-side\n' +
-        'run. This is the real stop button. No refund is issued for the credits\n' +
-        'already charged at trigger time (D3); an in-flight Lambda finishes on its\n' +
-        'own and its result is discarded once cancelled.\n' +
+        'run. This is the real stop button. A frontend V3 run cancelled before a\n' +
+        'terminal state has its original charge returned; an uncharged run says so.\n' +
+        'Backend and V2 runs keep their existing billing behavior; an in-flight Lambda\n' +
+        'finishes on its own and its result is discarded once cancelled.\n' +
         '\nExit codes:\n' +
         '  0  cancelled (fresh or already-cancelled — naturally idempotent)\n' +
         '  4  run id not found (single id), or ANY id not found (multi-id — outranks conflict)\n' +
@@ -8073,6 +8212,7 @@ export async function runTestWait(
     // "running · Ns" can never land after "timed out" / "interrupted".
     live.stop();
     if (err instanceof TimeoutError) {
+      deps.onWaitTimeout?.({ reason: 'wait_timeout' });
       ticker.finalize(`Run ${opts.runId} — timed out after ${opts.timeoutSeconds}s`);
       // Mirror the RequestTimeoutError path: emit a partial run to stdout so
       // JSON consumers and AI agents can grab the runId and chain into
@@ -8967,7 +9107,8 @@ export async function runTestRunAll(
             ? { executionUrl: finalRun.executionUrl }
             : {}),
         };
-      } catch {
+      } catch (err) {
+        if (err instanceof TimeoutError) deps.onWaitTimeout?.({ reason: 'wait_timeout' });
         // fall through to the timeout result below
       }
       return {
@@ -9015,6 +9156,7 @@ export async function runTestRunAll(
       };
     } catch (err) {
       if (err instanceof TimeoutError) {
+        deps.onWaitTimeout?.({ reason: 'wait_timeout' });
         return {
           testId: entry.testId,
           runId,
@@ -9600,7 +9742,10 @@ export async function runTestRerun(
           });
           return { kind: 'terminal', run: finalRun };
         } catch (err) {
-          if (err instanceof TimeoutError) return { kind: 'timeout' };
+          if (err instanceof TimeoutError) {
+            deps.onWaitTimeout?.({ reason: 'wait_timeout' });
+            return { kind: 'timeout' };
+          }
           // Preserve the two intentional whole-fan-out aborts: each has a
           // dedicated outer-catch branch (RequestTimeoutError → all-running
           // partial + re-attach hints + exit 7; InterruptError → DEV-331
@@ -9913,6 +10058,7 @@ export async function runTestRerun(
       });
     } catch (err) {
       if (err instanceof TimeoutError) {
+        deps.onWaitTimeout?.({ reason: 'wait_timeout' });
         ticker.finalize(`Run ${rerunResp.runId} — timed out after ${opts.timeoutSeconds}s`);
         // Mirror the RequestTimeoutError path: emit a partial run to stdout so
         // JSON consumers and AI agents can grab the runId and chain into
@@ -10541,6 +10687,7 @@ export async function runTestRerun(
       };
     } catch (err) {
       if (err instanceof TimeoutError) {
+        deps.onWaitTimeout?.({ reason: 'wait_timeout' });
         return {
           testId: entry.testId,
           runId: entry.runId,
@@ -11327,16 +11474,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
   test
     .command('steps <test-id>')
-    .description(
-      'List the steps for a test (server returns the cumulative log across every run; use --run-id to scope to one run)',
-    )
+    .description('List the steps of the latest run (use --run-id for a specific run)')
     .option('--page-size <n>', 'service page size hint (1-100, default 25)')
     .option('--max-items <n>', 'stop after this many items across auto-paged pages')
     .option('--starting-token <token>', 'opaque cursor from a previous response')
-    .option(
-      '--run-id <id>',
-      "Filter steps to those belonging to the specified runId. Useful for tests that have been run multiple times — by default 'test steps' returns the cumulative log across every run. Note: legacy step records (pre-M3.1) with null runIdIfAvailable are excluded when this flag is set.",
-    )
+    .option('--run-id <id>', 'Show steps of the specified run instead of the latest run.')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testId: string, cmdOpts: StepsFlagOpts, command: Command) => {
       await runSteps(
@@ -11636,14 +11778,14 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--no-cancel-on-interrupt',
-      'with --local, leave the run executing (and billing) when this command stops waiting. By ' +
-        'default a --local run is cancelled at that point, because its tunnel closes with this ' +
-        'process and the run could then only fail.',
+      'with --local, skip automatic cancellation when an owned tunnel is about to close or a ' +
+        "borrowed tunnel's owner disappears. An ordinary interrupt of a borrowed run never " +
+        'cancels it because its tunnel remains alive.',
     )
     .option('--wait', 'poll until terminal status or --timeout elapses', false)
     .option(
       '--timeout <s>',
-      `with --wait, max seconds to wait (1–3600, default ${DEFAULT_RUN_TIMEOUT_SECONDS})`,
+      'with --wait, max seconds to wait (1–3600; default 600, or 1200 with --local)',
     )
     .option(
       '--idempotency-key <key>',
@@ -11878,7 +12020,10 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           ...(cmdOpts.tunnelClient !== undefined ? { tunnelClientId: cmdOpts.tunnelClient } : {}),
           cancelOnInterrupt: cmdOpts.cancelOnInterrupt !== false,
           wait: effectiveWait,
-          timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
+          timeoutSeconds:
+            usingLocal && cmdOpts.timeout === undefined
+              ? DEFAULT_LOCAL_RUN_TIMEOUT_SECONDS
+              : parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
           // B2(c): tell runTestRun whether --timeout was explicitly provided.
           timeoutIsDefault: cmdOpts.timeout === undefined,
           idempotencyKey: cmdOpts.idempotencyKey,

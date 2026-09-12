@@ -17,7 +17,7 @@ import { loadConfig } from './config.js';
 import { defaultCredentialsPath } from './credentials.js';
 import { ApiError, localValidationError } from './errors.js';
 import { facadeBaseUrl } from './facade.js';
-import type { DebugEvent, FetchImpl } from './http.js';
+import type { DebugEvent, FetchImpl, HttpClientOptions } from './http.js';
 import {
   HttpClient,
   REQUEST_TIMEOUT_DEFAULT_MS,
@@ -284,6 +284,23 @@ export function parseRequestTimeoutFlag(raw: string | undefined): number | undef
 }
 
 export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}): HttpClient {
+  return new HttpClient(resolveHttpClientOptions(opts, deps));
+}
+
+export type HttpClientFactory = (
+  overrides?: Pick<HttpClientOptions, 'requestTimeoutMs' | 'shutdownSignal'>,
+) => HttpClient;
+
+/** Resolve the profile once so related requests share an identity and endpoint. */
+export function createHttpClientFactory(
+  opts: CommonOptions,
+  deps: ClientFactoryDeps = {},
+): HttpClientFactory {
+  const snapshot = Object.freeze(resolveHttpClientOptions(opts, deps));
+  return overrides => new HttpClient({ ...snapshot, ...overrides });
+}
+
+function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps): HttpClientOptions {
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const env = deps.env ?? process.env;
   const requestTimeoutMs = resolveRequestTimeoutMs(opts, env);
@@ -295,7 +312,7 @@ export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}
     // endpoint doesn't first announce a "sample response".
     assertValidEndpointUrl(dryRunEndpoint);
     emitDryRunBanner(stderr);
-    return new HttpClient({
+    return {
       baseUrl: facadeBaseUrl(dryRunEndpoint),
       apiKey: DRY_RUN_API_KEY,
       fetchImpl: deps.fetchImpl ?? createDryRunFetch(),
@@ -303,7 +320,7 @@ export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}
       onTransition: opts.verbose ? (msg: string) => stderr(`[verbose] ${msg}`) : undefined,
       requestTimeoutMs,
       shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
-    });
+    };
   }
 
   const credentialsPath = deps.credentialsPath ?? defaultCredentialsPath();
@@ -319,7 +336,7 @@ export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}
   assertValidEndpointUrl(config.apiUrl);
   if (!config.apiKey) throw ApiError.authRequired();
   assertValidApiKey(config.apiKey);
-  return new HttpClient({
+  return {
     baseUrl: facadeBaseUrl(config.apiUrl),
     apiKey: config.apiKey,
     fetchImpl: deps.fetchImpl,
@@ -339,7 +356,7 @@ export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}
       }),
     requestTimeoutMs,
     shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
-  });
+  };
 }
 
 function formatDebug(event: DebugEvent): string {

@@ -8,6 +8,7 @@ export enum ErrCode {
     TargetConnectFailed = "0004",
     StreamFailed = "0005",
     BlockedTargetRejected = "0006",
+    DataPlaneUnreachable = "0007",
 }
 
 export interface TunnelClientError {
@@ -26,6 +27,30 @@ export interface TunnelClientOptions {
   controlUrl: string;
   /** VENDOR DELTA: required. `host:port` of the tunnel DATA plane. */
   tunnelAddr: string;
+  /**
+   * TLS `host:port` (or `[v6]:port`) for the tunnel DATA plane. When set,
+   * transport is fixed to TLS and `tunnelAddr` is never dialled as fallback.
+   */
+  tunnelTlsAddr?: string;
+  /** TLS SNI/verification name. Defaults to the hostname in `tunnelTlsAddr`. */
+  tunnelTlsServername?: string;
+  /** Extra PEM roots appended to Node's built-in root certificate set. */
+  tunnelTlsCa?: string | Buffer | Array<string | Buffer>;
+  /** Maximum time to complete each plaintext TCP connect. Defaults to 10 seconds. */
+  connectTimeoutMs?: number;
+  /** Maximum time to complete each TLS connect + handshake. Defaults to 10 seconds. */
+  tlsHandshakeTimeoutMs?: number;
+  /**
+   * Maximum retry window after the first failed data-plane attempt. The first
+   * inbound yamux stream or the settle interval ends it. Defaults to 60
+   * seconds; `0` retries forever.
+   */
+  dataPlaneRetryDeadlineMs?: number;
+  /**
+   * Time a post-TunnelHello socket must remain open before the session counts
+   * as established without an inbound yamux stream. Defaults to 5 seconds.
+   */
+  dataPlaneSettleMs?: number;
   /**
    * VENDOR DELTA: maximum time `start()` waits for the current control
    * connection's first Ack, which is the server's authentication acknowledgement.

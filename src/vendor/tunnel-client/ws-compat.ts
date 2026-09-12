@@ -21,8 +21,9 @@
  *   - **The control socket uses the process-global undici dispatcher**, so an
  *     `HTTP(S)_PROXY` this CLI honours (`lib/proxy.ts`) also carries the
  *     control WebSocket. Deliberate — but note it does NOT help the tunnel
- *     DATA plane, which is a raw `net.connect` and bypasses proxies entirely.
- *     `lib/tunnel-session.ts` warns about that asymmetry rather than
+ *     DATA plane, which uses a direct TLS socket for advertised TLS endpoints
+ *     and raw TCP only for the explicit legacy transport. Both bypass HTTP
+ *     proxies. `lib/tunnel-session.ts` warns about that asymmetry rather than
  *     pretending a proxied environment is supported.
  *
  * ## Why `close()` cannot just call `WebSocket.close()` and wait

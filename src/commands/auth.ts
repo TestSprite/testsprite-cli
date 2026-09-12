@@ -15,6 +15,7 @@ import { HttpClient } from '../lib/http.js';
 import {
   defaultCredentialsPath,
   deleteProfile,
+  isCredentialsWritePermissionError,
   readProfile,
   writeProfile,
 } from '../lib/credentials.js';
@@ -125,7 +126,15 @@ const DEFAULT_API_URL = 'https://api.testsprite.com';
 const FROM_ENV_MISSING_KEY =
   'TESTSPRITE_API_KEY is not set in the environment. Set it and re-run with --from-env, or omit --from-env to enter the key interactively.';
 
-export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}): Promise<void> {
+export interface ConfigureResult {
+  persisted: boolean;
+  source: 'env' | 'prompt' | 'profile' | 'dry-run';
+}
+
+export async function runConfigure(
+  opts: ConfigureOptions,
+  deps: AuthDeps = {},
+): Promise<ConfigureResult> {
   const env = deps.env ?? process.env;
   const credentialsPath = deps.credentialsPath ?? defaultCredentialsPath();
   const out = makeOutput(opts.output, deps);
@@ -153,7 +162,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
       const d = data as { profile: string; apiUrl: string };
       return `Profile "${d.profile}" configured (dry-run). Endpoint: ${d.apiUrl}`;
     });
-    return;
+    return { persisted: false, source: 'dry-run' };
   }
 
   let apiKey: string | undefined;
@@ -190,7 +199,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
         const d = data as { profile: string; apiUrl: string };
         return `Profile "${d.profile}" already configured. Endpoint: ${d.apiUrl}`;
       });
-      return;
+      return { persisted: true, source: 'profile' };
     }
 
     const promptApi = deps.prompt ?? { secret: (q: string) => promptSecret(q) };
@@ -257,17 +266,29 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
     );
   }
 
-  writeProfile(opts.profile, { apiKey, apiUrl }, { path: credentialsPath });
+  let persisted = true;
+  try {
+    writeProfile(opts.profile, { apiKey, apiUrl }, { path: credentialsPath });
+  } catch (error) {
+    if (!opts.fromEnv || !isCredentialsWritePermissionError(error)) throw error;
+    persisted = false;
+    stderr(
+      `Using TESTSPRITE_API_KEY for this session; credentials could not be saved to ${credentialsPath} (${error.code}). Set TESTSPRITE_API_KEY in every shell that runs testsprite.`,
+    );
+  }
 
   out.print({ profile: opts.profile, apiUrl, status: 'configured' }, data => {
     const d = data as { profile: string; apiUrl: string };
-    return `Profile "${d.profile}" configured. Endpoint: ${d.apiUrl}`;
+    return persisted
+      ? `Profile "${d.profile}" configured. Endpoint: ${d.apiUrl}`
+      : `Profile "${d.profile}" configured for this session only (credentials not saved). Endpoint: ${d.apiUrl}`;
   });
 
   // Note: the old "run `testsprite agent install`" self-bootstrap tip was
   // removed with the setup consolidation. `runConfigure` now only runs as part
   // of `setup` (the sole credential-writing path), which installs the skill
   // itself (unless --no-agent) — so the tip would be redundant or misleading.
+  return { persisted, source: opts.fromEnv ? 'env' : 'prompt' };
 }
 
 export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promise<MeResponse> {

@@ -2,6 +2,18 @@
 
 All notable changes to `@testsprite/testsprite-cli` are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-09-11
+
+### Changed
+
+- **The tunnel data plane is encrypted, and never quietly falls back.** `testsprite tunnel start` and `test run --local` wrote the tunnel credential into the first frame of a raw TCP connection, so the secret crossed your network in the clear. The CLI now dials the TLS endpoint the backend advertises, verified against the system trust store — plus `NODE_EXTRA_CA_CERTS` when your machine adds corporate roots — and writes the credential only after the handshake completes. There is no downgrade path: if TLS cannot be established the CLI retries TLS, never plaintext, and no byte of the credential leaves the process in the meantime. `tunnel start` reports what it got as `transport: tls` or `transport: plaintext`, in the human output and under `--output json`. A backend that advertises no TLS endpoint still works — the CLI uses the legacy plaintext port and says so once on stderr. Nothing to configure, no flag changed.
+- **An unreachable data plane ends the run instead of leaving it executing and billed.** A tunnel that could never establish its data plane used to retry forever while the run it was opened for kept running server-side. After 60 seconds of consecutive data-plane failures the CLI now stops and exits 10, naming the address it could not reach, the last transport error, and the `NODE_EXTRA_CA_CERTS` remediation when the failure looks like an untrusted corporate root. With `--local` it also cancels the run it owns — refunded server-side — rather than leaving it pointed at a machine it can no longer reach.
+- **A borrowed tunnel whose owner disappears now cancels the borrowing run.** With `--tunnel-client <id>` the run borrows a tunnel another process owns; if that owner went away mid-run, the run was left executing against a tunnel that no longer existed, and billed for it. The CLI now cancels it once — honouring `--no-cancel-on-interrupt` — and reports whether it was cancelled, had already finished, or was skipped, along with how to follow it with `test wait <run-id>`. An ordinary Ctrl-C of a borrowed run still detaches without cancelling, because the owner's tunnel is still alive: unchanged.
+
+### Fixed
+
+- **`test cancel` reports the refund instead of denying one exists.** The backend refunds a frontend run cancelled before it reaches a terminal state, returning the amount originally charged — and the CLI both hid that and said the opposite: `test cancel --help` stated that no refund is issued for credits already charged. A user who cancelled a run and got their credits back was told, by the CLI itself, that they had not. The cancel output now carries a `refund` line whenever the server reports one: the credits returned and how many, or that the run was never charged and there is nothing to return, or — when the ledger write failed — that the cancellation succeeded but the credits did not come back and support has to be involved. That last case is stated plainly rather than softened, because nothing retries it. Under `--output json` the server's `refund` object passes through unchanged, and a backend that sends no such field, a V2 run and a backend-test run all render exactly as before. The help text now states the real rule and leaves backend and V2 runs explicitly unchanged. Exit codes and the already-cancelled advisory are untouched.
+
 ## [0.10.0] - 2026-09-03
 
 ### Added

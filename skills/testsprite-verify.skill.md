@@ -28,7 +28,8 @@ machine's own loopback address (`localhost` / `127.0.0.1` / `::1` — not a LAN
 or RFC1918 address, and not a general local-network escape hatch) to the test
 runner. Two constraints: frontend tests only (a backend test's target is baked
 into its generated code, so run it normally), and it needs an API key with the
-`run:tunnel` scope — a 403 there means mint a new key.
+`run:tunnel` scope. Keys minted before that scope existed must be replaced;
+the CLI names the missing scope (exit 3).
 
 If the user explicitly named a tool (the CLI or the MCP), honor that choice
 regardless of which one the change's reachability would otherwise suggest.
@@ -40,8 +41,9 @@ The skip list is narrow:
 - Docs-only edits (`docs/**`, `*.md`, comments).
 - Pure build/config edits (`tsconfig*`, lint/prettier config, lockfile bumps with
   no behavior change).
-- This repo isn't actually wired to TestSprite (no project linked, no creds).
-  Don't pull the user into a setup flow they didn't ask for — say so and stop.
+- Credentials are unavailable. Explain the missing setup; do not claim a
+  verified result. If credentials exist but a local project is missing, use
+  the bootstrap below.
 
 Otherwise, run it.
 
@@ -62,8 +64,8 @@ What does **not** count: unit tests / typecheck / lint; drafting a plan without
 
 If the project has **no tests at all**, that's the `testsprite-onboard` skill's
 job, not this one — seed a suite first (it can generate the proposals for you
-with `testsprite test plan generate` / `test plan accept`, or author them by
-hand). Seeding is a deliberate setup pass, not part of the verify loop.
+with `testsprite test plan generate` / `test plan accept` for a deployed target;
+local projects require authored plans and `test create --plan-from`). Seeding is a deliberate setup pass, not part of the verify loop.
 
 If you can't satisfy this — no creds, no valid target URL, repo not linked —
 **say so explicitly**: "Feature shipped but I could not run any TestSprite test
@@ -91,6 +93,25 @@ In priority order:
    like this repo (e.g. a `Portal` repo → the `Portal` project).
 4. Still ambiguous → list the candidates and ask the user which to use (one short
    question; picking the wrong project wastes a run).
+
+If no project exists for an app running only locally, bootstrap a frontend project
+(V3 required), author a plan, and run the returned test id:
+
+```bash
+testsprite project create --type frontend --name "<repo name>" --local <port> --local-host <host>
+testsprite test create --plan-from plan.json --project <projectId>
+testsprite test run <test-id> --local <port> --local-host <host> --output json
+```
+
+Keep the app listening and use the same `--local-host` for creation and follow-up
+runs. It selects both the probe and stored URL host: `localhost`, `127.0.0.1`
+(default), or `::1`; omit it in both commands to use the default.
+The port probe fails with exit 5 if nothing listens (`--skip-preflight`
+bypasses it). Local projects skip exploration: `test plan generate` is refused
+before charge (exit 6), so use `test create --plan-from` without `--run`, then
+`test run --local`. V2-only local-project creation is unsupported (exit 7).
+Portal runs are blocked for free until `project update <id> --url https://…`
+sets a public URL. Keep the existing `--url` / `--target-url` flow for deployed apps.
 
 ## 3. Decide what to test
 
@@ -345,14 +366,17 @@ Batch is **FE-only.** For 3 backend tests, run `test create --type backend
 
 ## 4. Run
 
-All variants use `--wait` for a synchronous verdict, `--target-url <env-url>` for
-the deployment under test, and `--timeout 600` as a sane default.
+For a deployed target, use `--target-url <env-url> --wait --timeout 600` after
+that deployment contains the change. For a change running only on this machine,
+use `testsprite test run <test-id> --local <port>` (frontend only); it implies
+waiting and defaults to 1200 seconds. Create a missing test from a plan first,
+without `--run`, then run its id with `--local`.
 
 ```bash
 # (a) existing test
 testsprite test run <test-id> --target-url <env-url> --wait --timeout 600 --output json
 
-# (a-rerun) cheap replay of an existing test. FE: replays the saved script (auto-heal on — more
+# (a-rerun) replay of a deployed test (V3 FE: 0.5 credit). Replays saved code (auto-heal on — more
 # lenient than a fresh run; for strict verification of a new change prefer `test run`).
 # BE: dispatches the WHOLE dependency closure — producers and teardowns run too, not just <test-id>,
 # so expect their side effects (fixtures re-created, teardown deletes) and extra runs in history.
@@ -395,11 +419,31 @@ Key behaviors:
   only, see "When to run" above) — don't skip the run over this.
 - `--wait` long-polls until terminal and handles its own backoff — don't wrap it
   in a retry loop.
-- Exit codes: `0` = passed; `1` = failed / blocked / cancelled; `7` = timeout.
-  Treat `7` as inconclusive (resume with `testsprite test wait <run-id>`), not a
-  regression — except a `--local` run: its exit 7 already cancelled the run
-  (the tunnel closes with the process, so there is nothing to resume), so
-  don't suggest `test wait` there; re-run with `--local` again instead.
+- `--local` implies `--wait`, with a default timeout of 1200 seconds (ordinary
+  waits default to 600). Run one frontend test per invocation; parallel
+  invocations are fine, but `--all --local` is refused (exit 5). There are
+  5 live tunnel bindings per user; `tunnel_binding_limit` is exit 11 and is not
+  auto-retried. Reuse a live tunnel with `--tunnel-client` or stop an unused one.
+- Keep the early `Run <runId>` line on **stderr**, emitted as soon as the trigger
+  returns; `Dashboard: <url>` follows when supplied. Preserve the id even if
+  the wait later stops; stdout remains the normal JSON result channel.
+- An **owned** local run is cancelled by default when waiting stops (timeout,
+  Ctrl-C, or a polling failure), then its tunnel closes. Read the reported
+  cancellation outcome. A run cancelled before it finished is refunded.
+  `--no-cancel-on-interrupt` detaches instead, but the owned tunnel still closes.
+  A borrower using `--tunnel-client` never automatically cancels its run or
+  closes the adopted tunnel; its owner must remain running.
+  A second `tunnel start` or process using the same credential takes over, and the first exits **10**.
+- Exit codes: `0` = passed; `1` = failed / blocked / cancelled; `7` = timeout
+  or unsupported. An owned local timeout is inconclusive: start a **new**
+  `testsprite test run <test-id> --local <port> --timeout 1800`, keeping the same
+  `--local-host <host>` if used; do not suggest `test wait` for that closed tunnel. Resume **ordinary or adopted-tunnel**
+  waits with `testsprite test wait <run-id>` only while the target is reachable
+  (and the adopted tunnel's owner remains alive).
+- A case last run through a tunnel stays local: a later Portal Run, schedule,
+  or bare CLI run is a free BLOCKED (`tunnel-required`, exit 6). Use `--local`
+  again or explicitly retarget with a public `--target-url`. V3 local runs use
+  the agent path, never saved-code replay, and preserve the test's saved code.
 - Batch: `create-batch --run --wait` creates the tests (FE-only) and fans
   out triggers in one call (bounded by `--max-concurrency`), emitting
   `{ results: [...] }` that mirrors the single-test `test run --wait`
@@ -449,8 +493,11 @@ The product/environment is the problem (believe these) when:
   read-only", "page 404s");
 - the trace blames infra (deploy lag, auth gate, missing fixture).
 
-Scope step counts to the **current run** — `test steps` is cumulative across runs;
-filter on the run-id before counting.
+`test steps <test-id>` shows the **latest run's steps**. For the run you are
+verifying, use `testsprite test steps <test-id> --run-id <run-id> --output json`
+with the id from the early stderr receipt. An empty latest run is not evidence
+from an earlier run; use `test result <test-id> --history` to choose one explicitly.
+Older backends may return cumulative bare steps; pin `--run-id` before counting.
 
 **Read the testing agent's failure summary skeptically — it can conflate two
 failure phases.** When a flow produces an artifact that then runs against an external

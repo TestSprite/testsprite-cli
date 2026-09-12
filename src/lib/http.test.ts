@@ -49,6 +49,96 @@ function makeClient(
   });
 }
 
+describe('default retry timer lifecycle', () => {
+  it('forwards a caller abort signal to a single-attempt history request', async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const client = new HttpClient({
+        baseUrl: 'https://api.example.com/api/cli/v1',
+        apiKey: 'sk-test',
+        fetchImpl: async (_input, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+              once: true,
+            });
+          }),
+      });
+      let settled = false;
+      const pending = client
+        .listTestRuns('test_abc', { pageSize: 20 }, { signal: controller.signal, retry: false })
+        .catch((error: unknown) => {
+          settled = true;
+          return error;
+        });
+      const reason = new DOMException('History deadline', 'AbortError');
+      controller.abort(reason);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(true);
+      expect(await pending).toBe(reason);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears the referenced backoff timer when shutdown aborts', async () => {
+    vi.useFakeTimers();
+    try {
+      const shutdown = new AbortController();
+      const fetchImpl = vi.fn(async () =>
+        errorEnvelopeResponse(429, 'RATE_LIMITED', { headers: { 'retry-after': '60' } }),
+      );
+      const client = new HttpClient({
+        baseUrl: 'https://api.example.com/api/cli/v1',
+        apiKey: 'sk-test',
+        fetchImpl,
+        shutdownSignal: shutdown.signal,
+      });
+      const pending = client.get('/me').catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(1);
+      const reason = new InterruptError('SIGINT');
+      shutdown.abort(reason);
+      expect(await pending).toBe(reason);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('still retries a 429 after its delay and returns the next 200', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          errorEnvelopeResponse(429, 'RATE_LIMITED', { headers: { 'retry-after': '1' } }),
+        )
+        .mockResolvedValueOnce(jsonResponse({ ok: true }));
+      const client = new HttpClient({
+        baseUrl: 'https://api.example.com/api/cli/v1',
+        apiKey: 'sk-test',
+        fetchImpl,
+        shutdownSignal: new AbortController().signal,
+      });
+      const pending = client.get('/me');
+      await vi.advanceTimersByTimeAsync(999);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await pending).toEqual({ ok: true });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('response size guard (maxResponseBytes)', () => {
   it('rejects a response whose Content-Length exceeds the cap', async () => {
     // jsonResponse sets a real Content-Length; a 50-byte cap is well under it.
@@ -388,6 +478,39 @@ describe('HttpClient error mapping', () => {
     });
     expect(fetchImpl).toHaveBeenCalledTimes(3);
     expect(sleepCalls).toEqual([2000, 2000]);
+  });
+
+  it('does NOT retry a RATE_LIMITED naming a standing condition (tunnel binding cap)', async () => {
+    // The binding-cap refusal cannot succeed until the caller frees a binding,
+    // so the Retry-After it carries must not buy it any retry budget here —
+    // the server's nextAction has to surface on the first response.
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(
+        {
+          error: {
+            code: 'RATE_LIMITED',
+            message: 'You already have 5 live tunnel bindings (limit 5).',
+            nextAction:
+              'Close an existing tunnel (`testsprite tunnel stop`) or wait for it to expire, then retry.',
+            requestId: 'req_cap',
+            details: {
+              reason: 'tunnel_binding_limit',
+              liveBindings: 5,
+              limit: 5,
+              retryAfterSeconds: 600,
+            },
+          },
+        },
+        { status: 429, headers: { 'retry-after': '600' } },
+      ),
+    );
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    const err = await client.get('/me').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('RATE_LIMITED');
+    expect((err as ApiError).exitCode).toBe(11);
+    expect((err as ApiError).getDetail('reason')).toBe('tunnel_binding_limit');
+    expect(fetchImpl).toHaveBeenCalledTimes(1); // standing condition — no retry budget spent
   });
 
   it('retries UNAVAILABLE up to 4 times with bounded backoff', async () => {

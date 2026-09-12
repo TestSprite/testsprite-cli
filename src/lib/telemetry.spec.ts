@@ -330,3 +330,67 @@ describe('resolveTelemetryAuth', () => {
     expect(auth.apiUrl).toBe('https://api.example.com');
   });
 });
+
+describe('wait timeout event fields', () => {
+  const base = {
+    command: 'test run',
+    outcome: 'error' as const,
+    exitCode: 7,
+    durationMs: 1000,
+    local: true,
+  };
+
+  it.each(['cancelled', 'already_terminal', 'failed', 'skipped'] as const)(
+    'sends the allowlisted %s outcome to the beacon',
+    async cancelOutcome => {
+      const events: unknown[] = [];
+      await recordOutcome(
+        { ...base, reason: 'wait_timeout', cancelOutcome },
+        {
+          env: {},
+          resolvedAuth: { apiKey: 'sk-user-test', apiUrl: 'https://api.example.com' },
+          fetchImpl: async (_input, init) => {
+            events.push(JSON.parse(String(init?.body)));
+            return okResponse();
+          },
+        },
+      );
+      expect(events).toEqual([expect.objectContaining({ reason: 'wait_timeout', cancelOutcome })]);
+    },
+  );
+
+  it('omits timeout fields for success', () => {
+    const event = buildTelemetryEvent({ ...base, outcome: 'success', exitCode: 0 }, {}, false);
+    expect(event).not.toHaveProperty('reason');
+    expect(event).not.toHaveProperty('cancelOutcome');
+  });
+
+  it('rejects untyped free text and the internal hyphenated cancellation value', () => {
+    const input = { ...base, reason: 'wait_timeout' as const, cancelOutcome: 'cancelled' as const };
+    Reflect.set(input, 'reason', 'private error message');
+    Reflect.set(input, 'cancelOutcome', 'secret token');
+    expect(buildTelemetryEvent(input, {}, false)).not.toHaveProperty('reason');
+    expect(buildTelemetryEvent(input, {}, false)).not.toHaveProperty('cancelOutcome');
+    Reflect.set(input, 'reason', 'wait_timeout');
+    Reflect.set(input, 'cancelOutcome', 'already-terminal');
+    expect(buildTelemetryEvent(input, {}, false)).toHaveProperty('reason', 'wait_timeout');
+    expect(buildTelemetryEvent(input, {}, false)).not.toHaveProperty('cancelOutcome');
+  });
+
+  it.each([
+    { dryRun: true, env: {} },
+    { dryRun: false, env: { DO_NOT_TRACK: '1' } },
+    { dryRun: false, env: { TESTSPRITE_NO_TELEMETRY: '1' } },
+  ])('preserves telemetry suppression (%j)', async ({ dryRun, env }) => {
+    const fetchImpl = vi.fn();
+    await recordOutcome(
+      { ...base, reason: 'wait_timeout', cancelOutcome: 'cancelled', dryRun },
+      {
+        env,
+        resolvedAuth: { apiKey: 'sk-user-test', apiUrl: 'https://api.example.com' },
+        fetchImpl,
+      },
+    );
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});

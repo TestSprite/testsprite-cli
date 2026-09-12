@@ -13,6 +13,14 @@ const MINT: TunnelMintResponse = {
   expiresAt: '2026-08-24T18:00:00.000Z',
 };
 
+const TLS_MINT = {
+  ...MINT,
+  tunnelTlsAddr: 'data.tun.testsprite.com:443',
+};
+
+const PLAINTEXT_WARNING =
+  'Warning: this TestSprite server did not advertise an encrypted tunnel data plane; the tunnel secret will be sent over plaintext TCP.';
+
 /** A stand-in for the vendored `TunnelClient`, with hooks the tests drive. */
 function fakeClientFactory(
   behaviour: {
@@ -60,6 +68,32 @@ describe('openTunnelSession — mint and connect', () => {
     expect(fake.seen[0]?.clientId).toBe(MINT.clientId);
     expect(session.clientId).toBe('client-1');
     expect(session.expiresAt).toBe(MINT.expiresAt);
+    await session.close();
+  });
+
+  it('passes tunnelTlsAddr through and exposes the TLS transport', async () => {
+    const fake = fakeClientFactory();
+    const session = await openTunnelSession(
+      { log: () => {} },
+      { mint: async () => TLS_MINT, destroy: async () => {}, createClient: fake.factory },
+    );
+
+    expect(fake.seen[0]?.tunnelTlsAddr).toBe('data.tun.testsprite.com:443');
+    expect(fake.seen[0]?.dataPlaneRetryDeadlineMs).toBe(60_000);
+    expect(session.transport).toBe('tls');
+    await session.close();
+  });
+
+  it('warns exactly once and exposes plaintext when an old backend omits tunnelTlsAddr', async () => {
+    const lines: string[] = [];
+    const fake = fakeClientFactory();
+    const session = await openTunnelSession(
+      { log: line => lines.push(line) },
+      { mint: async () => MINT, destroy: async () => {}, createClient: fake.factory },
+    );
+
+    expect(lines).toEqual([PLAINTEXT_WARNING]);
+    expect(session.transport).toBe('plaintext');
     await session.close();
   });
 
@@ -179,6 +213,27 @@ describe('openTunnelSession — mint and connect', () => {
       vi.useRealTimers();
     }
   });
+
+  it('uses the shared transport-accurate proxy-bypass wording on connect timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const fake = fakeClientFactory({ start: () => new Promise<void>(() => {}) });
+      const opening = openTunnelSession(
+        { log: () => {}, connectTimeoutMs: 20 },
+        { mint: async () => MINT, destroy: async () => {}, createClient: fake.factory },
+      ).catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(20);
+      const error = await opening;
+      expect(error).toBeInstanceOf(ApiError);
+      expect((error as ApiError).nextAction).toContain(
+        'the tunnel data plane uses a direct socket connection (TLS when the server advertises ' +
+          'it; raw TCP only for the legacy transport) that bypasses HTTP proxies',
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('openTunnelSession — secret custody', () => {
@@ -225,6 +280,26 @@ describe('openTunnelSession — fatal auth close', () => {
     await session.close();
   });
 
+  it.each(['tunnel credential revoked', 'tunnel connection superseded or credential revoked'])(
+    'records %s as credential-revoked and notifies the owner only once',
+    async message => {
+      const fake = fakeClientFactory();
+      const fatals: unknown[] = [];
+      const session = await openTunnelSession(
+        { log: () => {}, onFatal: reason => fatals.push(reason) },
+        { mint: async () => MINT, destroy: async () => {}, createClient: fake.factory },
+      );
+      try {
+        fake.emitError(ErrCode.AuthFailed, message);
+        fake.emitError(ErrCode.AuthFailed, message);
+        expect(session.fatalReason()).toBe('credential-revoked');
+        expect(fatals).toEqual(['credential-revoked']);
+      } finally {
+        await session.close();
+      }
+    },
+  );
+
   it('does NOT treat a recoverable disconnect as fatal', async () => {
     // The client reconnects with the SAME credentials, and the server still
     // holds the registration, so the in-flight run survives — reporting this
@@ -238,6 +313,25 @@ describe('openTunnelSession — fatal auth close', () => {
     fake.emitError(ErrCode.TunnelDisconnected, 'Tunnel t1 disconnected');
     fake.emitError(ErrCode.TargetConnectFailed, 'Target connect failed');
     expect(session.fatalReason()).toBeUndefined();
+    await session.close();
+  });
+
+  it('records bounded data-plane exhaustion as a fatal reason with safe detail', async () => {
+    const fake = fakeClientFactory();
+    const fatals: unknown[] = [];
+    const session = await openTunnelSession(
+      { log: () => {}, onFatal: (...args) => fatals.push(args) },
+      { mint: async () => TLS_MINT, destroy: async () => {}, createClient: fake.factory },
+    );
+    const clientMessage =
+      'Data plane tls at data.tun.testsprite.com:443 is unreachable after 60000ms: ' +
+      'unable to verify the first certificate';
+
+    fake.emitError(ErrCode.DataPlaneUnreachable, clientMessage);
+
+    expect(session.fatalReason()).toBe('data-plane-unreachable');
+    expect(session.fatalMessage()).toBe(clientMessage);
+    expect(fatals).toEqual([['data-plane-unreachable', clientMessage]]);
     await session.close();
   });
 });
@@ -346,23 +440,61 @@ describe('TunnelLostError', () => {
     expect(err.message).toMatch(/tunnel/i);
   });
 
-  it('tells a borrower to cancel the still-executing run before optionally watching it', () => {
+  it('tells a borrower the run lost its route and to check it before re-running', () => {
     const err = new TunnelLostError('owner-gone', 'run-borrowed-1');
 
+    // The cancel/refund outcome is reported by the run command itself (it is
+    // the one that issues the cancel); this error only names the cause and the
+    // read-before-rerun step.
     expect(err).toMatchObject({
       code: 'UNAVAILABLE',
       exitCode: 10,
       message:
         'The borrowed tunnel for run run-borrowed-1 is no longer registered. It was minted ' +
         'by another process (`testsprite tunnel start`), and that process has stopped or its ' +
-        'credential expired. Run run-borrowed-1 was left executing server-side and may still ' +
-        'finish; if it is cancelled, its verdict is discarded.',
-      nextAction:
-        'Run run-borrowed-1 has lost its tunnel and cannot reach your app any more. Stop it ' +
-        'now with: testsprite test cancel run-borrowed-1 (idempotent). To watch it instead: ' +
-        'testsprite test wait run-borrowed-1 --timeout <s>.',
+        'credential expired. The run cannot reach your app through that tunnel.',
+      nextAction: 'Check the run before re-running: testsprite test wait run-borrowed-1.',
       details: { reason: 'owner-gone', runId: 'run-borrowed-1' },
     });
-    expect(err.nextAction.indexOf('test cancel')).toBeLessThan(err.nextAction.indexOf('test wait'));
+    expect(err.nextAction).not.toContain('run again');
+  });
+
+  it('explains exhausted encrypted data-plane retries and points at the run', () => {
+    const err = new TunnelLostError(
+      'data-plane-unreachable',
+      'run-tls-1',
+      'Data plane tls at data.tun.testsprite.com:443 is unreachable after 60000ms: ' +
+        'unable to verify the first certificate',
+    );
+
+    expect(err).toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+      nextAction: expect.stringContaining('testsprite test wait run-tls-1'),
+      details: { reason: 'data-plane-unreachable', runId: 'run-tls-1' },
+    });
+    expect(err.message).toContain('data.tun.testsprite.com:443');
+    expect(err.message).toContain('could not be established for 60s');
+    expect(err.message).toContain('last error: unable to verify the first certificate');
+    expect(err.message).toContain('NODE_EXTRA_CA_CERTS');
+  });
+
+  it('explains plaintext exhaustion with self-hosted service and egress guidance only', () => {
+    const err = new TunnelLostError(
+      'data-plane-unreachable',
+      'run-plaintext-1',
+      'Data plane plaintext at selfhost.example:7400 is unreachable after 60000ms: ECONNREFUSED',
+    );
+
+    expect(err).toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+      details: { reason: 'data-plane-unreachable', runId: 'run-plaintext-1' },
+    });
+    expect(err.message).toContain('selfhost.example:7400');
+    expect(err.message).toMatch(/self-hosted tunnel service/i);
+    expect(err.message).toMatch(/egress firewall/i);
+    expect(err.message).not.toContain('NODE_EXTRA_CA_CERTS');
+    expect(err.message).not.toContain('port 443');
   });
 });

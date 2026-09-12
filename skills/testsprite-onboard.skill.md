@@ -7,16 +7,12 @@
 
 # TestSprite: onboard a repo with a seed test suite
 
-Your job is to take a repo that has **no TestSprite tests yet** and leave it with a
-**coherent, runnable suite** plus a couple of **already-green** smoke tests — in one pass.
-A new user who can immediately run a real, passing test is an activated user; an empty
-project is the #1 drop-off.
+Seed a repo with no tests into a coherent suite and 2–3 passing smoke tests.
 
 This skill only uses shipped CLI commands. Do **not** call backend APIs directly.
 
-Step 3 offers two paths to a suite, tried in order: let TestSprite **generate** the tests
-(fastest; needs a V3-platform account and a recent CLI), or **author** them by hand
-(always works). Everything else here is identical either way.
+For deployed targets, try generation first (V3 required), then author by hand.
+Local projects use authored plans directly; exploration is unavailable.
 
 ## When to use
 
@@ -32,28 +28,45 @@ Step 3 offers two paths to a suite, tried in order: let TestSprite **generate** 
 
 `testsprite setup` has run (an API key is configured). If `testsprite project list` errors on
 auth, stop and tell the user to run `testsprite setup` first — don't try to configure for them.
+In a sandbox, `testsprite setup --from-env` can use `TESTSPRITE_API_KEY` even when HOME
+is read-only: credential-write permission failures warn and continue session-only.
+The JSON summary has `credentials.persisted: false`; export the key in every invoking
+shell. Agent installation still needs a writable target; `--no-agent` skips it.
 
 ## Steps
 
-### 1. Understand the app (don't skip — this is where coverage quality comes from)
+### 1. Understand the app
 
-Read the repo to establish, concretely:
+Read the source to identify:
 
 - **Frontend**: the deployed/local **URL**, the 4–8 most important user flows (auth, core
   CRUD, checkout, search, settings…), and whether flows need **login**.
 - **Backend**: the key **API endpoints** and their success/error contracts.
 
-Prefer **code-derived** routes/handlers over guessing — you have the source; use it. This
-beats a blind crawl.
+Use code-derived routes/handlers; do not guess.
 
-### 2. Create the project (FE must have a URL)
+### 2. Create the project
 
-Frontend:
+Deployed frontend:
 
 ```bash
 testsprite project create --type frontend --name "<repo name>" --url <app-url> \
   [--username <user> --password-file <path-to-secret>]
 ```
+
+Local frontend (start the app first; V3 required):
+
+```bash
+testsprite project create --type frontend --name "<repo name>" --local <port> --local-host <host>
+```
+
+`--local` stores `http://<host>:<port>`; `--local-host` sets both probe and URL host:
+`localhost`, `127.0.0.1` (default), or `::1` (`http://[::1]:<port>`).
+Reuse the host on runs; omit for default IPv4.
+`project get/list`: JSON `originMode: 'local'`, text `(Local)`.
+No `--url`. Dead port: exit 5 (`--skip-preflight` bypasses).
+V2-only: exit 7 (`local-origin-requires-v3`). Local runs work on Free and need
+`run:tunnel` (mint a new key if missing).
 
 Backend:
 
@@ -63,9 +76,10 @@ testsprite project create --type backend --name "<repo name>"
 
 Capture the returned `projectId`.
 
-> **Critical for FE**: a frontend test with no resolvable target URL fails immediately with
-> `No environment URL configured` — the suite goes all-red. Always pass `--url`. If flows need
-> login, pass `--username/--password-file` now so authenticated pages are reachable.
+For frontend, configure login with
+`--username/--password-file` if needed; the cloud agent logs in through the tunnel
+using the project environment's username/password. OTP environments are refused
+before charge (exit 6).
 
 #### 2b. FE: register the app's test-hook attribute
 
@@ -73,19 +87,26 @@ If the source tags elements with something other than `data-testid` (e.g. `data-
 run `testsprite project update <projectId> --test-id-attributes data-element,data-testid`
 once; exported locators then use the tag (check: `project get` → `testIdAttrs:`).
 
-### 3. Get the tests — try generation first, author by hand if it isn't available
+### 3. Get the tests
+
+**Local project: go directly to 3b.** Creation does no exploration/generation;
+`test plan generate` is refused before charge (exit 6). Author a plan, then use:
+
+```bash
+testsprite test create --plan-from plan.json --project <projectId>
+testsprite test run <testId> --local <port> --local-host <host>
+```
+
+Portal runs are blocked for free until `project update <id> --url https://…` sets
+a public URL. For deployed projects, try 3a first.
 
 #### 3a. Preferred: generate → review → accept
 
-TestSprite proposes the cases; proposals stage **on the server** (nothing lands in the
-repo) and you accept the ones worth keeping.
+Proposals stage on the server for review; no files are written locally.
 
-**API projects need an API spec first** — with none, generation stops at
-`no_processed_inputs`. Upload the spec (the file is only read). A PRD is optional and goes
-**alongside** the spec, not instead of it: endpoints are read from the spec, and the PRD
-shapes the feature map (`--role prd`, 0.5 credits). A PRD alone can charge the strategy
-stage and then fail with no endpoints found. Frontend projects skip this, since exploring
-the live app creates their inputs.
+API projects require an API spec (`no_processed_inputs` without one). An optional
+PRD supplements it (`--role prd`, 0.5 credits); a PRD alone can charge strategy and
+then fail for missing endpoints. Deployed frontend exploration supplies its inputs.
 
 ```bash
 testsprite project docs upload ./openapi.yaml --project <projectId> --role api-doc
@@ -96,14 +117,11 @@ testsprite project docs upload ./prd.md --project <projectId> --role prd   # opt
 testsprite test plan generate --project <projectId>
 ```
 
-It runs only the stages the project is missing and prints proposals with stable ids. A
-fresh frontend project takes minutes (browser agents visit the app) — that's normal;
-Ctrl-C only detaches, the work continues. If it says inputs are still processing, wait
-and re-run.
+Only missing stages run. Frontend exploration can take minutes; Ctrl-C detaches
+while generation continues. If inputs are still processing, wait and re-run.
 
-**Review the table before accepting — that's the quality gate, and it's your job.** Check
-titles and steps against what you learned in step 1; drop anything testing a flow the repo
-doesn't have, duplicating another, or asserting something vague.
+Review titles and steps against the source. Drop nonexistent flows, duplicates,
+and vague assertions before accepting.
 
 ```bash
 testsprite test plan accept --project <projectId>                       # all of them
@@ -114,12 +132,11 @@ A subset accept **discards the rest**, so name every proposal you want in that o
 Then `testsprite test list --project <projectId>` for the ids, and go to step 5
 (**skip step 4** — that's the hand-authoring path).
 
-**If generation isn't available, fall back to 3b — don't stall.** That means an unknown
-`test plan generate` command (older CLI), an account not on the V3 platform (exit 6), or
-no reachable URL and no source to read. Say which happened, then author the tests
-yourself; don't ask the user to upgrade or migrate first.
+If generation is unavailable (older CLI, non-V3 account/exit 6, or missing inputs),
+report the reason and author tests using 3b. Local-project creation itself still
+requires V3.
 
-#### 3b. Fallback: author the tests by hand (quality over quantity)
+#### 3b. Author the tests by hand
 
 **Frontend** — one JSON plan file per flow, in a directory (e.g. `./testsprite-plans/`).
 Each file is a COMPLETE plan and must include `projectId` (from step 2), `type: "frontend"`,
@@ -146,14 +163,11 @@ Each file is a COMPLETE plan and must include `projectId` (from step 2), `type: 
 **Backend** — one `.py` file per endpoint, using `requests` with concrete assertions on
 status code and response body.
 
-**Backend auth — read the injected `__AUTH_HEADERS__`, NEVER hardcode any credential.** This
-covers **every** secret the API needs — Bearer/JWT tokens **and** API keys (`sk-…`,
-`x-api-key`), basic-auth blobs, cookies. TestSprite prepends a managed credential block
-(`__AUTH_CREDENTIAL__` / `__AUTH_TYPE__` / `__AUTH_HEADERS__`) to every backend test from the
-project's Authentication settings, and `__AUTH_HEADERS__` already holds the right header(s) for
-the configured type (Bearer → `{"Authorization": "Bearer …"}`; API key → `{"X-API-Key": "…"}`;
-basic → `{"Authorization": "Basic …"}`). Spread it into your request headers — never paste a
-literal `Bearer …` / `sk-…` / key value into the script:
+**Backend auth:** read injected `__AUTH_HEADERS__`; never hardcode Bearer/JWT tokens,
+API keys, basic-auth blobs, or cookies. TestSprite injects `__AUTH_CREDENTIAL__`,
+`__AUTH_TYPE__`, and `__AUTH_HEADERS__` from project Authentication settings.
+The headers already match the configured type (Authorization for Bearer/basic,
+X-API-Key for API keys). Spread them into each request:
 
 ```python
 r = requests.get(f"{TARGET_URL}/orders", headers={**__AUTH_HEADERS__})
@@ -167,10 +181,8 @@ runs keep working after the token expires. A hardcoded token expires within hour
 key can't be rotated centrally — `test create` emits a `[warn]` on an inlined credential; treat it
 as a must-fix.
 
-**Assertion rule (this is the whole game for FE):** every `assertion` step must name a
-**concrete, observable** outcome — an element, text, URL, count, or status. Never write
-`"verify it works"`, `"check the page loads"`, or other narrative that an AI judge can
-rubber-stamp. Vague assertions are how false-PASS sneaks in.
+Each assertion must name an observable element, text, URL, count, or status.
+Avoid "verify it works" or "check the page loads": vague assertions create false passes.
 
 Aim for ~8–15 tests covering the core flows. Don't pad.
 
@@ -198,11 +210,16 @@ Pick the **2–3 highest-value happy-path** tests (prefer ones you're most confi
 and run only those:
 
 ```bash
-testsprite test run <testId> --wait
+testsprite test run <testId> --wait                     # deployed target
+testsprite test run <testId> --local <port> --local-host <host>  # local frontend
 ```
 
-Do **not** run the whole suite automatically — a 20-test FE suite is ~40 credits and a free
-account only has 150. Running the full suite is the user's explicit choice.
+Do **not** run the whole suite automatically. V3 frontend runs, including local runs,
+cost 0.5 credit each; check `testsprite usage` before sizing the suite.
+Local runs imply waiting (1200 seconds by default); one test per invocation, parallel
+invocations allowed, 5 live tunnel bindings per user. Keep the early stderr `Run <runId>`
+receipt. An owned local timeout cancels by default: start a new run with
+`--local <port> --local-host <host> --timeout 1800` (same host), not `test wait`. A run cancelled before it finished is refunded.
 
 ### 6. Report
 
@@ -211,13 +228,13 @@ Tell the user, plainly:
 - "Your project now has **N** tests covering: <list the flows>."
 - "I smoke-ran **M** — here's the result: <pass/fail + the dashboard link from the run output>."
 - "To run the rest (≈X credits — state the cost so they choose knowingly):
-  - frontend — run each remaining test by id: `testsprite test run <testId> --wait` (there is
-    **no `--all` for frontend**);
+  - frontend — use `test run <testId> --wait` for deployed targets or
+    `test run <testId> --local <port> --local-host <host>` for local targets (`--all --local` is refused);
   - backend — `testsprite test run --all --project <id>` (wave-ordered, runs every BE test)."
 
 ## Quality checklist (self-check before reporting done)
 
-- [ ] FE project has a real `--url`; login configured if the app needs it.
+- [ ] FE project has a public `--url` or uses `--local`; login configured if needed.
 - [ ] API project: an API spec uploaded before generating (a PRD is optional, alongside it) — or you used path 3b.
 - [ ] If you generated: you **read the proposals** and dropped the ones that don't fit,
       rather than accepting the batch unseen.
@@ -231,7 +248,7 @@ Tell the user, plainly:
 - Don't auto-run the full suite (credit wall / surprise 402).
 - Don't write narrative assertions an AI judge can't fail.
 - Don't call backend endpoints directly — only the `testsprite` CLI.
-- Don't create a FE project without a URL.
+- Don't create a FE project without public `--url` or `--local <port>`.
 - Don't re-seed a project that already has tests — that's not this skill's job.
 - Don't accept a generated batch unread — reviewing it is the point of the staging step.
 - Don't stall when generation isn't available — say so and hand-author instead.
@@ -240,6 +257,4 @@ Tell the user, plainly:
 
 ## Hand off to verify
 
-This skill's job ends once the project has a seeded suite and a first green run. From here on,
-the **`testsprite-verify`** skill takes over: after the user changes code, it runs the tests
-covering that change before they report the work done. Onboard once; verify continuously.
+After seeding and a first green run, hand off to `testsprite-verify` for subsequent changes.

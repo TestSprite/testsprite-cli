@@ -9,15 +9,19 @@
  */
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import net, { type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Duplex } from 'node:stream';
+import tls from 'node:tls';
+import { EnvHttpProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import type { JUnitReportFlagOptions } from '../lib/junit-report.js';
 import { TunnelLostError } from '../lib/tunnel-session.js';
 import type { TunnelClientOptions } from '../vendor/tunnel-client/index.js';
-import { ErrCode } from '../vendor/tunnel-client/index.js';
+import { ErrCode, TunnelClient } from '../vendor/tunnel-client/index.js';
 import type { RunResponse, TriggerRunResponse } from '../lib/runs.types.js';
 import {
   createTestCommand,
@@ -174,6 +178,55 @@ function makeRecordingFetch(opts: {
   }) as typeof globalThis.fetch;
 }
 
+class CommandMemorySocket extends Duplex {
+  peer?: CommandMemorySocket;
+
+  override _read(): void {}
+
+  override _write(
+    chunk: Buffer,
+    _encoding: BufferEncoding,
+    callback: (error?: Error | null) => void,
+  ): void {
+    if (this.peer?.destroyed === false) this.peer.push(Buffer.from(chunk));
+    callback();
+  }
+
+  override _final(callback: (error?: Error | null) => void): void {
+    if (this.peer?.destroyed === false) this.peer.push(null);
+    callback();
+  }
+
+  override _destroy(_error: Error | null, callback: (error?: Error | null) => void): void {
+    if (this.peer?.destroyed === false) this.peer.push(null);
+    callback();
+  }
+}
+
+function createCommandMemoryPair(): { client: Socket; server: Socket; destroy(): void } {
+  const client = new CommandMemorySocket();
+  const server = new CommandMemorySocket();
+  client.peer = server;
+  server.peer = client;
+  for (const socket of [client, server]) {
+    Object.assign(socket, {
+      setKeepAlive: () => socket,
+      setNoDelay: () => socket,
+      ref: () => socket,
+      unref: () => socket,
+    });
+    socket.on('error', () => {});
+  }
+  return {
+    client: client as unknown as Socket,
+    server: server as unknown as Socket,
+    destroy: () => {
+      client.destroy();
+      server.destroy();
+    },
+  };
+}
+
 /** Stand-in for the vendored tunnel client. */
 function fakeTunnel() {
   let captured: TunnelClientOptions | undefined;
@@ -181,8 +234,8 @@ function fakeTunnel() {
   return {
     calls,
     seen: () => captured,
-    emitAuthFailure: () =>
-      captured?.onError?.({ code: ErrCode.AuthFailed, message: 'Control authentication failed' }),
+    emitAuthFailure: (message = 'Control authentication failed') =>
+      captured?.onError?.({ code: ErrCode.AuthFailed, message }),
     factory: (options: TunnelClientOptions) => {
       captured = options;
       return {
@@ -279,6 +332,55 @@ describe('test run --local — before anything is minted or charged', () => {
     expect(err.getDetail('field', (v): v is string => typeof v === 'string')).toBe('local');
     expect(err.nextAction).toMatch(/mutually exclusive/i);
     expect(calls).toEqual([]);
+  });
+
+  it('uses the shared transport-accurate direct-socket proxy advisory', async () => {
+    const priorDispatcher = getGlobalDispatcher();
+    const proxyDispatcher = new EnvHttpProxyAgent({
+      httpProxy: 'http://proxy.example:8080',
+      httpsProxy: 'http://proxy.example:8080',
+    });
+    const port = 5173;
+    const calls: Call[] = [];
+    const lines: string[] = [];
+    setGlobalDispatcher(proxyDispatcher);
+
+    try {
+      await runTestRun(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          testId: 'test_xyz',
+          localPort: port,
+          localHost: '127.0.0.1',
+          wait: true,
+          timeoutSeconds: 30,
+          skipPreflight: true,
+        },
+        {
+          ...makeCreds(),
+          fetchImpl: makeRecordingFetch({
+            calls,
+            targetUrl: `http://127.0.0.1:${port}`,
+          }),
+          stderr: line => lines.push(line),
+          stdout: () => {},
+          sleep: async () => {},
+          createTunnelClient: fakeTunnel().factory,
+        },
+      );
+    } finally {
+      setGlobalDispatcher(priorDispatcher);
+      await proxyDispatcher.close();
+    }
+
+    expect(lines).toContain(
+      '[advisory] An HTTP proxy is configured for this process. The tunnel control channel ' +
+        'honours it, but the tunnel data plane uses a direct socket connection (TLS when the ' +
+        'server advertises it; raw TCP only for the legacy transport) that bypasses HTTP proxies ' +
+        '— if the run cannot reach your machine, an egress proxy is the first thing to rule out.',
+    );
   });
 });
 
@@ -975,6 +1077,7 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
           runId: 'run_matrix',
           testId: 'test_matrix',
           localPort: 4173,
+          localHost: '::1',
           reason,
           cancel,
         };
@@ -982,7 +1085,7 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
         const message = tunnelDetachMessage(detach, reason === 'interrupt' ? interrupt : undefined);
 
         expect(message).not.toMatch(/guaranteed|Ctrl-C/i);
-        expect(message).toContain('testsprite test run test_matrix --local 4173');
+        expect(message).toContain('testsprite test run test_matrix --local 4173 --local-host ::1');
         if (cancel === 'cancelled') {
           expect(message).toContain(optOutConsequence);
         }
@@ -994,13 +1097,14 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
         runId: 'run_matrix',
         testId: 'test_matrix',
         localPort: 4173,
+        localHost: '::1',
         reason: 'interrupt' as const,
         cancel,
       };
       const nextAction = tunnelInterruptNextAction(detach, new InterruptError('SIGTERM'));
 
       expect(nextAction).not.toMatch(/guaranteed|Ctrl-C/i);
-      expect(nextAction).toContain('testsprite test run test_matrix --local 4173');
+      expect(nextAction).toContain('testsprite test run test_matrix --local 4173 --local-host ::1');
       if (cancel === 'cancelled') {
         expect(nextAction).toContain(optOutConsequence);
       }
@@ -1458,7 +1562,11 @@ describe('test run --local — the tunnel dying mid-run', () => {
     expect(calls.some(call => call.url.includes('/cancel'))).toBe(false);
   });
 
-  it('stops the run instead of polling a doomed run to its timeout', async () => {
+  it.each([
+    'Control authentication failed',
+    'tunnel credential revoked',
+    'tunnel connection superseded or credential revoked',
+  ])('stops the run instead of polling a doomed run to its timeout: %s', async message => {
     const port = 5173;
     const calls: Call[] = [];
     const lines: string[] = [];
@@ -1486,7 +1594,7 @@ describe('test run --local — the tunnel dying mid-run', () => {
             targetUrl: target,
             run: () => {
               ticks += 1;
-              if (ticks === 2) tunnel.emitAuthFailure();
+              if (ticks === 2) tunnel.emitAuthFailure(message);
               // Hard stop so a regression fails in a second instead of
               // spinning out the whole --timeout budget: a poll loop that
               // ignores a dead tunnel would otherwise HANG this suite rather
@@ -1515,6 +1623,102 @@ describe('test run --local — the tunnel dying mid-run', () => {
     expect(calls.some(c => c.method === 'POST' && c.url.includes('/cancel'))).toBe(true);
     expect(lines.join('\n')).toMatch(/redeploy|disconnected/i);
   });
+
+  it('cancels exactly once and exits 10 after the encrypted data plane exhausts retries', async () => {
+    const port = 5173;
+    const calls: Call[] = [];
+    const lines: string[] = [];
+    const target = `http://127.0.0.1:${port}`;
+    const connections = new Set<{ destroy(): void }>();
+    const realTlsConnect = tls.connect.bind(tls);
+    const tlsConnect = vi.spyOn(tls, 'connect').mockImplementation(((
+      options: tls.ConnectionOptions,
+    ) => {
+      const connection = createCommandMemoryPair();
+      connections.add(connection);
+      const socket = realTlsConnect({ ...options, socket: connection.client });
+      connection.server.on('data', () => {});
+      setTimeout(() => socket.destroy(new Error('unable to verify the first certificate')), 10);
+      socket.once('close', () => connection.destroy());
+      return socket;
+    }) as typeof tls.connect);
+    const netConnect = vi.spyOn(net, 'connect').mockImplementation((() => {
+      throw new Error('plaintext data-plane dial attempted');
+    }) as typeof net.connect);
+    let passedClientOptions: TunnelClientOptions | undefined;
+    let pollReads = 0;
+
+    try {
+      const error = await runTestRun(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          testId: 'test_xyz',
+          localPort: port,
+          localHost: '127.0.0.1',
+          wait: true,
+          timeoutSeconds: 600,
+          skipPreflight: true,
+        },
+        {
+          ...makeCreds(),
+          fetchImpl: makeRecordingFetch({
+            calls,
+            targetUrl: target,
+            mintBody: { ...MINT_BODY, tunnelTlsAddr: 'data.tun.testsprite.com:443' },
+            respond: async call => {
+              if (call.method !== 'GET' || !call.url.includes('/runs/run_abc')) return undefined;
+              pollReads += 1;
+              if (pollReads > 200) {
+                throw new Error('poll kept going after the data-plane retry deadline');
+              }
+              await new Promise(resolve => setTimeout(resolve, 5));
+              return new Response(JSON.stringify({ ...passedRun(target), status: 'running' }), {
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+              });
+            },
+          }),
+          stderr: line => lines.push(line),
+          stdout: line => lines.push(line),
+          sleep: async () => {},
+          createTunnelClient: options => {
+            passedClientOptions = options;
+            const client = new TunnelClient({
+              ...options,
+              dataPlaneRetryDeadlineMs: 80,
+              reconnectMs: 5,
+              connectTimeoutMs: 50,
+            });
+            const internals = client as unknown as {
+              running: boolean;
+              controlConnected: boolean;
+              ensureTunnelRuntime(tunnelConnectionId: string): void;
+            };
+            client.start = async () => {
+              internals.running = true;
+              internals.controlConnected = true;
+              internals.ensureTunnelRuntime('command-data-plane');
+            };
+            return client;
+          },
+        },
+      ).catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
+      expect((error as Error).message).toContain('data.tun.testsprite.com:443');
+      expect((error as Error).message).toContain('NODE_EXTRA_CA_CERTS');
+      expect(passedClientOptions?.dataPlaneRetryDeadlineMs).toBe(60_000);
+      expect(tlsConnect.mock.calls.length).toBeGreaterThanOrEqual(3);
+      expect(netConnect).not.toHaveBeenCalled();
+      expect(
+        calls.filter(call => call.method === 'POST' && call.url.endsWith('/runs/run_abc/cancel')),
+      ).toHaveLength(1);
+    } finally {
+      for (const connection of connections) connection.destroy();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1528,6 +1732,8 @@ type LivenessReply =
 
 interface LivenessScenarioOptions {
   adopted?: boolean;
+  cancelOnInterrupt?: boolean;
+  cancelReply?: 'cancelled' | 'already-terminal';
   livenessReplies: LivenessReply[];
   runTicks: Array<{ elapsedMs: number; status: 'running' | 'passed' }>;
 }
@@ -1583,6 +1789,9 @@ async function runLivenessScenario(options: LivenessScenarioOptions): Promise<{
       );
     }
     if (method === 'POST' && url.endsWith('/runs/run_abc/cancel')) {
+      if (options.cancelReply === 'already-terminal') {
+        return apiErrorResponse(409, 'CONFLICT', 'already finished', { status: 'passed' });
+      }
       return new Response(
         JSON.stringify({ ...passedRun(targetUrl), status: 'cancelled', alreadyCancelled: false }),
         { status: 200, headers: { 'content-type': 'application/json' } },
@@ -1657,6 +1866,7 @@ async function runLivenessScenario(options: LivenessScenarioOptions): Promise<{
         wait: true,
         timeoutSeconds: 600,
         skipPreflight: true,
+        cancelOnInterrupt: options.cancelOnInterrupt,
       },
       {
         ...makeCreds(),
@@ -1683,7 +1893,7 @@ async function runLivenessScenario(options: LivenessScenarioOptions): Promise<{
 }
 
 describe('test run --local — borrowed-tunnel liveness', () => {
-  it('surfaces a borrowed tunnel that goes offline mid-run as the owned-path TunnelLostError', async () => {
+  it('cancels its run exactly once when the borrowed tunnel goes offline', async () => {
     vi.useFakeTimers();
     const pending = runLivenessScenario({
       livenessReplies: [
@@ -1710,25 +1920,32 @@ describe('test run --local — borrowed-tunnel liveness', () => {
     });
     const borrowed = observed.error as TunnelLostError;
     expect(borrowed.message).not.toBe(ownedPathError.message);
-    expect(borrowed.message).toContain('Run run_abc was left executing server-side');
-    expect(borrowed.message).toContain('may still finish');
+    expect(borrowed.message).toContain('borrowed tunnel for run run_abc');
     expect(borrowed.nextAction).toBe(
-      'Run run_abc has lost its tunnel and cannot reach your app any more. Stop it now with: ' +
-        'testsprite test cancel run_abc (idempotent). To watch it instead: testsprite test wait ' +
-        'run_abc --timeout <s>.',
+      'Check the run before re-running: testsprite test wait run_abc.',
     );
     expect(borrowed.nextAction).not.toMatch(/restart|run again/i);
     expect((borrowed.details as { reason?: string } | undefined)?.reason).toBe('owner-gone');
-    expect(observed.calls.some(call => call.url.includes('/cancel'))).toBe(false);
+    expect(
+      observed.calls.filter(
+        call => call.method === 'POST' && call.url.endsWith('/runs/run_abc/cancel'),
+      ),
+    ).toHaveLength(1);
+    expect(observed.stderr).toContain('Run run_abc was cancelled');
+    expect(observed.stderr).toContain(
+      'A run cancelled before it finished is not charged (the server refunds it).',
+    );
+    expect(observed.stderr).toContain('testsprite test wait run_abc');
     expect(
       observed.calls.some(call => call.method === 'DELETE' && call.url.includes('/tunnel/')),
     ).toBe(false);
     expect(observed.shutdownArmed).toBe(false);
   }, 5_000);
 
-  it('treats a 404 liveness response as the same lost-tunnel verdict without cancelling or deleting', async () => {
+  it('reports that the borrowed run had already finished when cancel returns 409', async () => {
     vi.useFakeTimers();
     const pending = runLivenessScenario({
+      cancelReply: 'already-terminal',
       livenessReplies: [
         { kind: 'error', status: 404, code: 'NOT_FOUND', message: 'binding is gone' },
       ],
@@ -1739,11 +1956,31 @@ describe('test run --local — borrowed-tunnel liveness', () => {
 
     expect(observed.error).toBeInstanceOf(TunnelLostError);
     expect(observed.error).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
-    expect(observed.calls.some(call => call.url.includes('/cancel'))).toBe(false);
+    expect(observed.calls.some(call => call.url.endsWith('/runs/run_abc/cancel'))).toBe(true);
+    expect(observed.stderr).toContain('Run run_abc had already finished');
+    expect(observed.stderr).toContain('testsprite test wait run_abc');
     expect(
       observed.calls.some(call => call.method === 'DELETE' && call.url.includes('/tunnel/')),
     ).toBe(false);
     expect(observed.shutdownArmed).toBe(false);
+  }, 5_000);
+
+  it('skips owner-gone cancellation when --no-cancel-on-interrupt is set', async () => {
+    vi.useFakeTimers();
+    const pending = runLivenessScenario({
+      cancelOnInterrupt: false,
+      livenessReplies: [{ kind: 'status', value: 'offline' }],
+      runTicks: [{ elapsedMs: 0, status: 'running' }],
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    const observed = await pending;
+
+    expect(observed.error).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
+    expect(observed.calls.some(call => call.url.endsWith('/runs/run_abc/cancel'))).toBe(false);
+    expect(observed.stderr).toContain(
+      'Run run_abc cancellation was skipped because --no-cancel-on-interrupt was passed.',
+    );
+    expect(observed.stderr).toContain('testsprite test wait run_abc');
   }, 5_000);
 
   it.each([
@@ -1879,4 +2116,239 @@ describe('test run --local --dry-run', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(tunnel.calls.start).toBe(0);
   });
+});
+
+describe('test run timeout defaults', () => {
+  it.each([
+    { name: 'owned local default', args: ['--local', '5173'], seconds: 1200, local: true },
+    { name: 'ordinary default', args: ['--wait'], seconds: 600, local: false },
+    {
+      name: 'explicit local timeout',
+      args: ['--local', '5173', '--timeout', '900'],
+      seconds: 900,
+      local: true,
+    },
+  ])('$name uses its deadline and preserves the JSON partial', async ({ args, seconds, local }) => {
+    vi.useFakeTimers();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const targetUrl = local ? 'http://127.0.0.1:5173' : 'https://example.com';
+    const command = createTestCommand({
+      ...makeCreds(),
+      fetchImpl: makeRecordingFetch({
+        calls: [],
+        targetUrl,
+        run: () => ({ ...passedRun(targetUrl), status: 'running', retryAfterSeconds: 25 }),
+      }),
+      stdout: line => stdout.push(line),
+      stderr: line => stderr.push(line),
+      createTunnelClient: fakeTunnel().factory,
+      shutdown: new ShutdownController(),
+    }).option('--output <mode>');
+    let settled = false;
+    const pending = command
+      .parseAsync(['run', 'test_xyz', '--skip-preflight', '--output', 'json', ...args], {
+        from: 'user',
+      })
+      .catch((err: unknown) => err)
+      .then(result => {
+        settled = true;
+        return result;
+      });
+    await vi.advanceTimersByTimeAsync(599_000);
+    expect(settled).toBe(false);
+    if (seconds > 600) {
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(settled, 'local runs must survive the ordinary 600-second deadline').toBe(false);
+      await vi.advanceTimersByTimeAsync((seconds - 601) * 1000 - 1);
+    } else {
+      await vi.advanceTimersByTimeAsync(999);
+    }
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(settled).toBe(true);
+    expect(await pending).toMatchObject({
+      code: 'UNSUPPORTED',
+      exitCode: 7,
+      details: { timeoutSeconds: seconds },
+    });
+    expect(JSON.parse(stdout.join(''))).toEqual({
+      runId: 'run_abc',
+      status: local ? 'cancelled' : 'running',
+      enqueuedAt: '2026-08-24T10:00:00.000Z',
+      codeVersion: 'v1',
+      targetUrl,
+    });
+  });
+
+  it.each(
+    [
+      { localHost: undefined, targetUrl: 'http://127.0.0.1:5173', hostFlag: '' },
+      { localHost: '::1' as const, targetUrl: 'http://[::1]:5173', hostFlag: ' --local-host ::1' },
+      {
+        localHost: 'localhost' as const,
+        targetUrl: 'http://localhost:5173',
+        hostFlag: ' --local-host localhost',
+      },
+    ].flatMap(host => (['text', 'json'] as const).map(output => ({ ...host, output }))),
+  )(
+    'preserves $localHost in owned timeout recovery commands ($output)',
+    async ({ localHost, targetUrl, hostFlag, output }) => {
+      vi.useFakeTimers();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const calls: Call[] = [];
+      const pending = runTestRun(
+        {
+          profile: 'default',
+          output,
+          debug: false,
+          testId: 'test_xyz',
+          localPort: 5173,
+          localHost,
+          wait: true,
+          timeoutSeconds: 1,
+          skipPreflight: true,
+        },
+        {
+          ...makeCreds(),
+          fetchImpl: makeRecordingFetch({
+            calls,
+            targetUrl,
+            run: () => ({ ...passedRun(targetUrl), status: 'running', retryAfterSeconds: 25 }),
+          }),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+          createTunnelClient: fakeTunnel().factory,
+          shutdown: new ShutdownController(),
+        },
+      ).catch((err: unknown) => err);
+      await vi.advanceTimersByTimeAsync(1000);
+      const err = await pending;
+      const retry = `testsprite test run test_xyz --local 5173${hostFlag} --timeout 1800`;
+      expect(err).toMatchObject({ exitCode: 7, nextAction: expect.stringContaining(retry) });
+      expect(stderr.join('\n')).toContain(retry);
+      if (output === 'text') expect(stdout.join('\n')).toContain(targetUrl);
+      else expect(JSON.parse(stdout.join(''))).toMatchObject({ status: 'cancelled', targetUrl });
+      expect(calls.some(call => call.method === 'POST' && call.url.endsWith('/cancel'))).toBe(true);
+      expect(calls.some(call => call.method === 'DELETE' && call.url.includes('/tunnel/'))).toBe(
+        true,
+      );
+    },
+  );
+
+  it('explains the local default in run help', () => {
+    const run = createTestCommand().commands.find(command => command.name() === 'run')!;
+    expect(run.helpInformation().replace(/\s+/g, ' ')).toContain(
+      'default 600, or 1200 with --local',
+    );
+  });
+});
+
+describe('local run receipt', () => {
+  it.each(['text', 'json'] as const)(
+    'prints the run id before polling in %s mode without leaking the tunnel secret',
+    async output => {
+      const stderr: string[] = [];
+      const stdout: string[] = [];
+      const targetUrl = 'http://127.0.0.1:5173';
+      let receiptAtFirstPoll: string[] = [];
+      await runTestRun(
+        {
+          profile: 'default',
+          output,
+          debug: false,
+          testId: 'test_xyz',
+          localPort: 5173,
+          wait: true,
+          timeoutSeconds: 30,
+          skipPreflight: true,
+        },
+        {
+          ...makeCreds(),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+          createTunnelClient: fakeTunnel().factory,
+          fetchImpl: makeRecordingFetch({
+            calls: [],
+            targetUrl,
+            respond: call => {
+              if (call.method === 'GET' && call.url.includes('/runs/'))
+                receiptAtFirstPoll = [...stderr];
+              return undefined;
+            },
+          }),
+        },
+      );
+      expect(receiptAtFirstPoll).toContain('Run run_abc');
+      expect(stderr.filter(line => line === 'Run run_abc')).toHaveLength(1);
+      expect([...stdout, ...stderr].join('\n')).not.toContain(SECRET);
+      if (output === 'json')
+        expect(JSON.parse(stdout.join(''))).toMatchObject({ runId: 'run_abc', status: 'passed' });
+    },
+  );
+});
+
+describe('local wait timeout telemetry', () => {
+  it.each([
+    { branch: 'cancelled', outcome: 'cancelled', adopted: false, cancel: true },
+    { branch: 'terminal', outcome: 'already_terminal', adopted: false, cancel: true },
+    { branch: 'failed', outcome: 'failed', adopted: false, cancel: true },
+    { branch: 'opt-out', outcome: 'skipped', adopted: false, cancel: false },
+    { branch: 'borrowed', outcome: 'skipped', adopted: true, cancel: true },
+  ])(
+    'reports the actual $branch cancellation outcome',
+    async ({ branch, outcome, adopted, cancel }) => {
+      vi.useFakeTimers();
+      const observed: unknown[] = [];
+      const calls: Call[] = [];
+      const targetUrl = 'http://127.0.0.1:5173';
+      const pending = runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_xyz',
+          localPort: 5173,
+          wait: true,
+          timeoutSeconds: 1,
+          skipPreflight: true,
+          cancelOnInterrupt: cancel,
+          ...(adopted ? { tunnelClientId: 'borrowed-client' } : {}),
+        },
+        {
+          ...makeCreds(),
+          stdout: () => {},
+          stderr: () => {},
+          shutdown: new ShutdownController(),
+          createTunnelClient: fakeTunnel().factory,
+          onWaitTimeout: context => observed.push(context),
+          fetchImpl: makeRecordingFetch({
+            calls,
+            targetUrl,
+            run: () => ({ ...passedRun(targetUrl), status: 'running', retryAfterSeconds: 25 }),
+            respond: call => {
+              if (call.method === 'POST' && call.url.endsWith('/cancel')) {
+                if (branch === 'terminal')
+                  return apiErrorResponse(409, 'CONFLICT', 'already finished', {
+                    status: 'passed',
+                  });
+                if (branch === 'failed')
+                  return apiErrorResponse(403, 'AUTH_FORBIDDEN', 'cannot cancel');
+              }
+              if (call.method === 'GET' && call.url.includes('/tunnel/'))
+                return new Response(JSON.stringify({ status: 'online' }));
+              return undefined;
+            },
+          }),
+        },
+      ).catch((err: unknown) => err);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(await pending).toMatchObject({ exitCode: 7, code: 'UNSUPPORTED' });
+      expect(observed).toEqual([{ reason: 'wait_timeout', cancelOutcome: outcome }]);
+      expect(calls.filter(call => call.url.endsWith('/cancel'))).toHaveLength(
+        adopted || !cancel ? 0 : branch === 'terminal' ? 2 : 1,
+      );
+    },
+  );
 });

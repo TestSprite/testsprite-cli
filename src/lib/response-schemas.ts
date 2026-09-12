@@ -6,7 +6,8 @@
  * `undefined` output or an opaque TypeError deep inside a command. These
  * schemas are wired (opt-in, via `RequestOptions.schema`) into the typed
  * HttpClient helpers only: `triggerRun`, `triggerRunWithMeta`, `triggerRerun`,
- * `triggerBatchRerun`, `triggerBatchRunFresh`, `getRun`, `listTestRuns`.
+ * `triggerBatchRerun`, `triggerBatchRunFresh`, `getRun`, `listTestRuns`,
+ * `cancelRun`.
  * The generic `get`/`post`/`put`/`patch`/`delete` paths stay schema-free.
  *
  * Resilience rules (additive server changes must never hard-fail the CLI):
@@ -35,6 +36,8 @@ import * as v from 'valibot';
 import type {
   BatchRerunResponse,
   BatchRunFreshResponse,
+  CancelRunRefund,
+  CancelRunResponse,
   ListRunsResponse,
   RerunAdvisory,
   RerunClosure,
@@ -152,6 +155,27 @@ export const RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, RunResponse> = v.loos
   // default is applied (rule 3, optional branch).
   steps: v.optional(v.nullable(v.array(RUN_STEP_DTO_SCHEMA))),
 });
+
+// ---------------------------------------------------------------------------
+// POST /runs/{runId}/cancel
+// ---------------------------------------------------------------------------
+
+/** Mirrors `CancelRunRefund` (runs.types.ts): optional V3 frontend refund result. */
+const CANCEL_RUN_REFUND_SCHEMA: v.GenericSchema<unknown, CancelRunRefund> = v.looseObject({
+  status: openWireLiteral<CancelRunRefund['status']>(),
+  amount: v.optional(v.number()),
+});
+
+/** Mirrors `CancelRunResponse` (runs.types.ts): the run envelope plus cancel metadata. */
+export const CANCEL_RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, CancelRunResponse> = v.intersect([
+  RUN_RESPONSE_SCHEMA,
+  v.looseObject({
+    alreadyCancelled: v.boolean(),
+    // Older backends, V2 runs, and backend-test runs omit this field. No
+    // default: absence must stay absent so JSON output passes through unchanged.
+    refund: v.optional(CANCEL_RUN_REFUND_SCHEMA),
+  }),
+]);
 
 // ---------------------------------------------------------------------------
 // POST /tests/{testId}/runs
@@ -426,6 +450,7 @@ export const TUNNEL_MINT_RESPONSE_SCHEMA: v.GenericSchema<unknown, TunnelMintRes
     secret: v.pipe(v.string(), v.minLength(1)),
     controlUrl: v.pipe(v.string(), v.minLength(1)),
     tunnelAddr: v.pipe(v.string(), v.minLength(1)),
+    tunnelTlsAddr: v.optional(v.pipe(v.string(), v.minLength(1))),
     expiresAt: v.string(),
   });
 

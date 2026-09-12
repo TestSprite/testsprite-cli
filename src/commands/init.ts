@@ -21,7 +21,7 @@ import { normalizeEnvVar } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
 import { CLIError, localValidationError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
-import type { AuthDeps, MeResponse } from './auth.js';
+import type { AuthDeps, ConfigureResult, MeResponse } from './auth.js';
 import { runConfigure, runWhoami } from './auth.js';
 import type { AgentDeps, AgentFs, InstallResult } from './agent.js';
 import { runInstall } from './agent.js';
@@ -124,6 +124,11 @@ export interface InitSummary {
   env: string;
   email?: string;
   scopes: string[];
+  /** Credential persistence outcome; omitted for a dry-run preview. */
+  credentials?: {
+    persisted: boolean;
+    source: ConfigureResult['source'] | 'flag';
+  };
   /**
    * Agent skill install outcome. `action` is an AGGREGATE across the installed
    * skills (setup installs {@link DEFAULT_SKILLS}); `skills` lists which skills
@@ -518,7 +523,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   // --api-key takes precedence over --from-env: when an explicit key is supplied,
   // force fromEnv=false so runConfigure uses the injected key (toAuthDeps wires it
   // as the prompt) instead of reading TESTSPRITE_API_KEY from the environment (codex).
-  await runConfigure(
+  const configured = await runConfigure(
     {
       ...opts,
       fromEnv: opts.apiKey ? false : opts.fromEnv,
@@ -606,11 +611,12 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
       // De-dupe skills across results, preserving first-seen order.
       installedSkills = [...new Set(capturedInstallResults.flatMap(r => r.skills ?? []))];
     } catch (installErr) {
-      // Fix 6: credentials were already saved (Step 1+2 above succeeded).
-      // Emit a clear summary line BEFORE re-throwing so the user knows their
-      // API key was persisted — only the agent skill step failed (Fix 6).
+      // Explain the credential outcome before re-throwing the install failure.
+      const credentialStatus = configured.persisted
+        ? `credentials saved for profile "${opts.profile}"`
+        : 'credentials are session-only (TESTSPRITE_API_KEY; not saved)';
       stderrFn(
-        `[info] credentials saved for profile "${opts.profile}"; only the agent skill install failed — ` +
+        `[info] ${credentialStatus}; only the agent skill install failed — ` +
           `re-run 'testsprite agent install --target ${resolution.targets.join(',')}' after fixing the path`,
       );
       throw installErr;
@@ -639,6 +645,10 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     env: me.env,
     email: me.email,
     scopes: me.scopes,
+    credentials: {
+      persisted: configured.persisted,
+      source: opts.apiKey ? 'flag' : configured.source,
+    },
     agent: agentSummary,
     ...(agentSummary === null && agentSkippedBy ? { agentSkippedBy } : {}),
     status: 'initialized',
@@ -662,6 +672,9 @@ function renderInitText(data: unknown): string {
   lines.push(`  env:      ${s.env}`);
   if (s.email) lines.push(`  email:    ${s.email}`);
   if (s.scopes.length > 0) lines.push(`  scopes:   ${s.scopes.join(', ')}`);
+  if (s.credentials?.persisted === false) {
+    lines.push('  credentials: session-only (TESTSPRITE_API_KEY; not saved)');
+  }
   lines.push('');
   if (s.agent) {
     const targets = s.agent.targets.length > 0 ? s.agent.targets : [s.agent.target];

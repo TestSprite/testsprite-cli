@@ -37,8 +37,10 @@ export interface TunnelMintResponse {
    * the facade returns these two explicitly instead of a host/port pair.
    */
   controlUrl: string;
-  /** `host:port` of the tunnel DATA plane the client dials over raw TCP. */
+  /** Plaintext `host:port` retained for compatibility with older clients. */
   tunnelAddr: string;
+  /** TLS `host:port` for the encrypted data plane; absent on older backends. */
+  tunnelTlsAddr?: string;
   /** ISO8601. After this the binding is gone and the run can no longer attach. */
   expiresAt: string;
 }
