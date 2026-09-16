@@ -179,11 +179,7 @@ export function maybeEmitSkillNudge(ctx: SkillNudgeContext): void {
       readFileSync: ctx.readFileSync,
       onReadError: ctx.debug
         ? (path: string, error: unknown) =>
-            emitDebug(
-              write,
-              `skill nudge could not read ${path}; treating target as absent`,
-              error,
-            )
+            emitDebug(write, `skill nudge could not read ${path}; treating target as absent`, error)
         : undefined,
     };
     // When the environment names the calling agent, only that agent's skill
