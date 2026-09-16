@@ -45,6 +45,104 @@ export function isNoColor(env: NodeJS.ProcessEnv = process.env): boolean {
   return typeof value === 'string' && value.length > 0;
 }
 
+const DEFAULT_TERMINAL_COLUMNS = 80;
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+const markPattern = /^\p{Mark}$/u;
+const emojiPattern = /\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20e3/u;
+
+/**
+ * Return whether a Unicode code point normally occupies two terminal columns.
+ *
+ * @param codePoint - Unicode scalar value to classify.
+ * @returns Whether the code point is full-width in a terminal.
+ */
+function isFullwidthCodePoint(codePoint: number): boolean {
+  return (
+    codePoint >= 0x1100 &&
+    (codePoint <= 0x115f ||
+      codePoint === 0x2329 ||
+      codePoint === 0x232a ||
+      (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f) ||
+      (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
+      (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
+      (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
+      (codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
+      (codePoint >= 0xff00 && codePoint <= 0xff60) ||
+      (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
+      (codePoint >= 0x1b000 && codePoint <= 0x1b001) ||
+      (codePoint >= 0x1f200 && codePoint <= 0x1f251) ||
+      (codePoint >= 0x20000 && codePoint <= 0x3fffd))
+  );
+}
+
+/**
+ * Measure one grapheme cluster in terminal display columns.
+ *
+ * @param grapheme - User-perceived character produced by the segmenter.
+ * @returns The number of terminal columns occupied by the grapheme.
+ */
+function graphemeWidth(grapheme: string): number {
+  if (emojiPattern.test(grapheme)) return 2;
+
+  let width = 0;
+  for (const character of grapheme) {
+    const codePoint = character.codePointAt(0)!;
+    if (
+      codePoint === 0x200d ||
+      (codePoint >= 0xfe00 && codePoint <= 0xfe0f) ||
+      (codePoint >= 0xe0100 && codePoint <= 0xe01ef) ||
+      codePoint <= 0x1f ||
+      (codePoint >= 0x7f && codePoint <= 0x9f) ||
+      markPattern.test(character)
+    ) {
+      continue;
+    }
+    width += isFullwidthCodePoint(codePoint) ? 2 : 1;
+  }
+  return width;
+}
+
+/**
+ * Measure a complete string in terminal display columns.
+ *
+ * @param text - Text to measure.
+ * @returns The number of terminal columns occupied by the text.
+ */
+function terminalWidth(text: string): number {
+  let width = 0;
+  for (const { segment } of graphemeSegmenter.segment(text)) {
+    width += graphemeWidth(segment);
+  }
+  return width;
+}
+
+/**
+ * Keep a ticker frame inside the terminal's last safe column. Terminal width is
+ * read for every frame so an in-progress ticker follows live resizes.
+ */
+function fitToTerminal(line: string): string {
+  const reportedColumns = typeof process !== 'undefined' ? process.stderr.columns : undefined;
+  const columns =
+    typeof reportedColumns === 'number' && Number.isFinite(reportedColumns) && reportedColumns > 0
+      ? Math.floor(reportedColumns)
+      : DEFAULT_TERMINAL_COLUMNS;
+  const maxWidth = Math.max(0, columns - 1);
+
+  if (terminalWidth(line) <= maxWidth) return line;
+  if (maxWidth === 0) return '';
+
+  const contentWidth = maxWidth - 1;
+  let fitted = '';
+  let fittedWidth = 0;
+  for (const { segment } of graphemeSegmenter.segment(line)) {
+    const width = graphemeWidth(segment);
+    if (fittedWidth + width > contentWidth) break;
+    fitted += segment;
+    fittedWidth += width;
+  }
+  return `${fitted}…`;
+}
+
 /**
  * Create a ticker bound to the given stderr writer. Respects
  * `isTTY` to silently no-op in CI environments.
@@ -88,13 +186,13 @@ export function createTicker(
     return {
       redrawsInPlace: false,
       update(line: string): void {
-        const stamped = `${new Date().toISOString()} ${line}`;
+        const stamped = fitToTerminal(`${new Date().toISOString()} ${line}`);
         stderrWrite(stamped);
         lastLength = stamped.length;
       },
       finalize(line?: string): void {
         if (line !== undefined) {
-          const stamped = `${new Date().toISOString()} ${line}`;
+          const stamped = fitToTerminal(`${new Date().toISOString()} ${line}`);
           stderrWrite(stamped);
           lastLength = stamped.length;
         }
@@ -107,13 +205,13 @@ export function createTicker(
     redrawsInPlace: true,
     update(line: string): void {
       // ANSI ESC[2K clears the entire line; \r moves to column 0.
-      const stamped = `${new Date().toISOString()} ${line}`;
+      const stamped = fitToTerminal(`${new Date().toISOString()} ${line}`);
       rawWrite(`\x1b[2K\r${stamped}`);
       lastLength = stamped.length;
     },
     finalize(line?: string): void {
       if (line !== undefined) {
-        const stamped = `${new Date().toISOString()} ${line}`;
+        const stamped = fitToTerminal(`${new Date().toISOString()} ${line}`);
         rawWrite(`\x1b[2K\r${stamped}`);
         lastLength = stamped.length;
       }

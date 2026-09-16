@@ -55,6 +55,24 @@ function stripTickerTimestamp(raw: string): string {
   return prefix + afterEsc.slice(spaceIdx + 1);
 }
 
+function withStderrColumns(columns: number | undefined, run: () => void): void {
+  const originalColumns = Object.getOwnPropertyDescriptor(process.stderr, 'columns');
+  Object.defineProperty(process.stderr, 'columns', {
+    configurable: true,
+    value: columns,
+  });
+
+  try {
+    run();
+  } finally {
+    if (originalColumns === undefined) {
+      Reflect.deleteProperty(process.stderr, 'columns');
+    } else {
+      Object.defineProperty(process.stderr, 'columns', originalColumns);
+    }
+  }
+}
+
 describe('createTicker — TTY mode', () => {
   it('update writes ANSI clear-line + carriage-return + content via rawWrite', () => {
     const raw: string[] = [];
@@ -158,6 +176,156 @@ describe('createTicker — TTY mode', () => {
     expect(() => ticker.finalize()).not.toThrow();
     // The raw array may grow but should not crash.
     expect(raw.length).toBeGreaterThanOrEqual(lenAfterFirst);
+  });
+});
+
+describe('createTicker — terminal width', () => {
+  it('clips an in-place update to width - 1 so the terminal cannot soft-wrap', () => {
+    withStderrColumns(40, () => {
+      const raw: string[] = [];
+      const ticker = createTicker(
+        () => {},
+        true,
+        text => raw.push(text),
+        false,
+      );
+
+      ticker.update(`Run ${'r'.repeat(80)} — running`);
+
+      expect(raw).toHaveLength(1);
+      const rendered = raw[0]!.slice('\x1b[2K\r'.length);
+      expect(rendered.length).toBeLessThanOrEqual(39);
+      expect(rendered.endsWith('…')).toBe(true);
+    });
+  });
+
+  it('re-reads the terminal width for every update', () => {
+    withStderrColumns(60, () => {
+      const raw: string[] = [];
+      const ticker = createTicker(
+        () => {},
+        true,
+        text => raw.push(text),
+        false,
+      );
+      const longLine = `Run ${'r'.repeat(100)} — running`;
+
+      ticker.update(longLine);
+      Object.defineProperty(process.stderr, 'columns', {
+        configurable: true,
+        value: 32,
+      });
+      ticker.update(longLine);
+
+      expect(raw[0]!.slice('\x1b[2K\r'.length)).toHaveLength(59);
+      expect(raw[1]!.slice('\x1b[2K\r'.length)).toHaveLength(31);
+      expect(raw[1]!.endsWith('…')).toBe(true);
+    });
+  });
+
+  it('falls back to 80 columns when stderr.columns is unavailable', () => {
+    withStderrColumns(undefined, () => {
+      const raw: string[] = [];
+      const ticker = createTicker(
+        () => {},
+        true,
+        text => raw.push(text),
+        false,
+      );
+
+      ticker.update('x'.repeat(100));
+
+      const rendered = raw[0]!.slice('\x1b[2K\r'.length);
+      expect(rendered).toHaveLength(79);
+      expect(rendered.endsWith('…')).toBe(true);
+    });
+  });
+
+  it('clips a final in-place line before emitting the newline', () => {
+    withStderrColumns(36, () => {
+      const raw: string[] = [];
+      const ticker = createTicker(
+        () => {},
+        true,
+        text => raw.push(text),
+        false,
+      );
+
+      ticker.finalize(`Done ${'x'.repeat(80)}`);
+
+      expect(raw[0]!.slice('\x1b[2K\r'.length)).toHaveLength(35);
+      expect(raw[0]!.endsWith('…')).toBe(true);
+      expect(raw[1]).toBe('\n');
+    });
+  });
+
+  it('clips NO_COLOR output without adding ANSI sequences', () => {
+    withStderrColumns(30, () => {
+      const lines: string[] = [];
+      const ticker = createTicker(
+        line => lines.push(line),
+        true,
+        () => {},
+        true,
+      );
+
+      ticker.update('x'.repeat(80));
+
+      expect(lines[0]).toHaveLength(29);
+      expect(lines[0]!.endsWith('…')).toBe(true);
+      expect(lines[0]).not.toContain('\x1b[2K');
+    });
+  });
+
+  it('measures wide glyphs by display columns', () => {
+    withStderrColumns(32, () => {
+      const raw: string[] = [];
+      const ticker = createTicker(
+        () => {},
+        true,
+        text => raw.push(text),
+        false,
+      );
+
+      ticker.update('界界界界');
+
+      const rendered = raw[0]!.slice('\x1b[2K\r'.length);
+      expect(rendered.slice(rendered.indexOf(' ') + 1)).toBe('界界…');
+    });
+  });
+
+  it('does not split an emoji grapheme cluster', () => {
+    withStderrColumns(29, () => {
+      const raw: string[] = [];
+      const ticker = createTicker(
+        () => {},
+        true,
+        text => raw.push(text),
+        false,
+      );
+
+      ticker.update('👨‍👩‍👧‍👦xx');
+
+      const rendered = raw[0]!.slice('\x1b[2K\r'.length);
+      expect(rendered.slice(rendered.indexOf(' ') + 1)).toBe('👨‍👩‍👧‍👦…');
+    });
+  });
+
+  it('keeps combining sequences intact and counts them as one column', () => {
+    withStderrColumns(29, () => {
+      const raw: string[] = [];
+      const ticker = createTicker(
+        () => {},
+        true,
+        text => raw.push(text),
+        false,
+      );
+
+      ticker.update('e\u0301e\u0301xx');
+
+      const rendered = raw[0]!.slice('\x1b[2K\r'.length);
+      expect(rendered.slice(rendered.indexOf(' ') + 1)).toBe('e\u0301e\u0301…');
+    });
   });
 });
 
