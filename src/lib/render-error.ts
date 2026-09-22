@@ -70,6 +70,33 @@ export function renderCommanderError(
   return pendingMsg ?? `${rawMsg}\n`;
 }
 
+/**
+ * Text-mode rendering for the `AMBIGUOUS_ORG` conflict (`details.candidates[]`
+ * — an array of `{ projectId, orgId }` pairs the same testId resolved to,
+ * across the caller's organizations). Renders one actionable `candidate:`
+ * line per well-formed entry, plus a trailing hint to disambiguate with
+ * `--project <id>`.
+ *
+ * Defensive by design: any entry missing `projectId`/`orgId` (or a
+ * malformed/empty/absent `candidates` value) is silently skipped rather than
+ * thrown — this is best-effort stderr decoration on top of an error that
+ * already renders correctly via the generic envelope, so a future server
+ * shape change must never crash the CLI's error path.
+ */
+export function renderAmbiguousOrgCandidates(candidates: unknown): string[] {
+  if (!Array.isArray(candidates)) return [];
+  const lines: string[] = [];
+  for (const candidate of candidates) {
+    if (candidate === null || typeof candidate !== 'object') continue;
+    const { projectId, orgId } = candidate as { projectId?: unknown; orgId?: unknown };
+    if (typeof projectId !== 'string' || typeof orgId !== 'string') continue;
+    lines.push(`  candidate: project ${projectId} (org ${orgId})`);
+  }
+  if (lines.length === 0) return [];
+  lines.push('  hint: re-run with --project <id> to disambiguate.');
+  return lines;
+}
+
 export function rephraseUnknownOption(raw: string): string | null {
   // Commander emits: "error: unknown option '--foo'"
   const match = /unknown option\s+'--([^']+)'/.exec(raw);

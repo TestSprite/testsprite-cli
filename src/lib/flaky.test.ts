@@ -79,6 +79,17 @@ describe('summarizeFlaky', () => {
     expect(report.runs).toBe(2);
     expect(report.verdict).toBe('flaky');
   });
+
+  it('defaults advisories to an empty array when the orchestrator passes none', () => {
+    const report = summarizeFlaky('test_x', [pass(1), pass(2)]);
+    expect(report.advisories).toEqual([]);
+  });
+
+  it('carries a deduped advisories list through untouched', () => {
+    const advisories = [{ feature: 'autoHeal', message: 'not yet enforced' }];
+    const report = summarizeFlaky('test_x', [pass(1), pass(2)], advisories);
+    expect(report.advisories).toEqual(advisories);
+  });
 });
 
 describe('renderFlakyText', () => {
@@ -101,5 +112,21 @@ describe('renderFlakyText', () => {
       summarizeFlaky('test_login', [{ attempt: 1, runId: null, outcome: 'error' }]),
     );
     expect(text).toContain('#1  (no runId)  error');
+  });
+
+  it('renders one [advisory] line per entry when the report carries advisories', () => {
+    const text = renderFlakyText(
+      summarizeFlaky(
+        'test_login',
+        [pass(1), pass(2)],
+        [{ feature: 'autoHeal', message: 'not yet enforced' }],
+      ),
+    );
+    expect(text).toContain('[advisory] not yet enforced');
+  });
+
+  it('prints no advisory line when the report carries none', () => {
+    const text = renderFlakyText(summarizeFlaky('test_login', [pass(1), pass(2)]));
+    expect(text).not.toContain('[advisory]');
   });
 });

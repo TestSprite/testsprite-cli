@@ -20,6 +20,7 @@ import {
   buildMeta,
   isBundleOwnedEntry,
   pickCodeExtension,
+  pickVideoExtension,
   resolveBundleDir,
   STREAM_URL_MAX_RETRIES,
   streamUrlToFile,
@@ -539,6 +540,34 @@ describe('pickCodeExtension', () => {
   });
 });
 
+describe('pickVideoExtension', () => {
+  it('matches the actual recording container instead of hardcoding mp4', () => {
+    expect(pickVideoExtension('https://s3.example.com/run_abc.webm')).toBe('webm');
+    expect(pickVideoExtension('https://s3.example.com/run_abc.mp4')).toBe('mp4');
+  });
+
+  it('strips presigned-URL query strings before reading the extension', () => {
+    expect(
+      pickVideoExtension(
+        'https://s3.example.com/run_abc.webm?X-Amz-Signature=abc&X-Amz-Expires=60',
+      ),
+    ).toBe('webm');
+  });
+
+  it('is case-insensitive', () => {
+    expect(pickVideoExtension('https://s3.example.com/run_abc.WEBM')).toBe('webm');
+  });
+
+  it('falls back to mp4 for an unrecognized or missing extension', () => {
+    expect(pickVideoExtension('https://s3.example.com/run_abc.bin')).toBe('mp4');
+    expect(pickVideoExtension('https://s3.example.com/run_abc')).toBe('mp4');
+  });
+
+  it('falls back to mp4 on a malformed URL rather than throwing', () => {
+    expect(pickVideoExtension('not a url')).toBe('mp4');
+  });
+});
+
 describe('stepFilenamePrefix', () => {
   it('zero-pads to 2 digits for index < 100', () => {
     expect(stepFilenamePrefix(1)).toBe('01');
@@ -771,6 +800,14 @@ describe('isBundleOwnedEntry', () => {
     expect(isBundleOwnedEntry('code.py')).toBe(true);
   });
 
+  it('owns video.<ext> only for the writable-extension allowlist', () => {
+    expect(isBundleOwnedEntry('video.mp4')).toBe(true);
+    expect(isBundleOwnedEntry('video.webm')).toBe(true);
+    expect(isBundleOwnedEntry('video.mov')).toBe(true);
+    expect(isBundleOwnedEntry('video.mkv')).toBe(true);
+    expect(isBundleOwnedEntry('video.avi')).toBe(true);
+  });
+
   it('does not own foreign entries', () => {
     expect(isBundleOwnedEntry('notes.txt')).toBe(false);
     expect(isBundleOwnedEntry('src')).toBe(false);
@@ -778,6 +815,13 @@ describe('isBundleOwnedEntry', () => {
     expect(isBundleOwnedEntry('code.tar.gz')).toBe(false);
     expect(isBundleOwnedEntry('mycode.ts')).toBe(false);
     expect(isBundleOwnedEntry('code.')).toBe(false);
+    expect(isBundleOwnedEntry('video.tar.gz')).toBe(false);
+    expect(isBundleOwnedEntry('myvideo.mp4')).toBe(false);
+    expect(isBundleOwnedEntry('video.')).toBe(false);
+    // A user's own file in a pre-existing --out dir must never be swept
+    // just because it starts with `video.`.
+    expect(isBundleOwnedEntry('video.txt')).toBe(false);
+    expect(isBundleOwnedEntry('video.MP4')).toBe(false);
   });
 });
 
@@ -922,6 +966,25 @@ describe('step artifact path validation', () => {
       // stepCtx has videoUrl: null → the fresh bundle ships no video.
       await writeBundle(stepCtx(3), { dir, failedOnly: false, fetchImpl: throwIfFetched });
 
+      expect(existsSync(join(dir, 'video.mp4'))).toBe(false);
+    });
+
+    it('sweeps a stale video file with a different extension than the new bundle writes', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'bundle-test-'));
+      writeFileSync(join(dir, 'video.mp4'), 'stale-mp4-bytes', 'utf8');
+
+      const webmCtx: CliFailureContext = {
+        ...stepCtx(3),
+        result: { ...stepCtx(3).result, videoUrl: 'https://video.example.com/run_abc.webm' },
+      };
+      const fetchImpl = (async () =>
+        new Response('fake-webm-bytes', { status: 200 })) as unknown as typeof globalThis.fetch;
+
+      const res = await writeBundle(webmCtx, { dir, failedOnly: false, fetchImpl });
+
+      expect(res.files).toContain('video.webm');
+      expect(existsSync(join(dir, 'video.webm'))).toBe(true);
+      expect(readFileSync(join(dir, 'video.webm'), 'utf8')).toBe('fake-webm-bytes');
       expect(existsSync(join(dir, 'video.mp4'))).toBe(false);
     });
 

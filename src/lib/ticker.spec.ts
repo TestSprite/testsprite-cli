@@ -272,6 +272,41 @@ describe('createTicker — NO_COLOR support', () => {
   });
 });
 
+describe('createTicker — redrawsInPlace', () => {
+  // The one decision a between-polls refresher may key on: only the ANSI
+  // branch redraws the same line; the other two branches print a NEW line
+  // per update, where a 1s refresher would emit a line a second.
+  it('is true on a TTY with ANSI enabled', () => {
+    const ticker = createTicker(
+      () => {},
+      true,
+      () => {},
+      false,
+    );
+    expect(ticker.redrawsInPlace).toBe(true);
+  });
+
+  it('is false on a non-TTY (every update is a no-op)', () => {
+    const ticker = createTicker(
+      () => {},
+      false,
+      () => {},
+      false,
+    );
+    expect(ticker.redrawsInPlace).toBe(false);
+  });
+
+  it('is false under NO_COLOR on a TTY (updates print a new line each)', () => {
+    const ticker = createTicker(
+      () => {},
+      true,
+      () => {},
+      true,
+    );
+    expect(ticker.redrawsInPlace).toBe(false);
+  });
+});
+
 describe('isNoColor', () => {
   it('returns true when NO_COLOR is set to a non-empty value', () => {
     expect(isNoColor({ NO_COLOR: '1' })).toBe(true);

@@ -68,13 +68,121 @@ jobs:
             const { owner, repo } = context.repo;
             const issue = context.payload.issue.number;
             const user = context.payload.comment.user.login;
-            const body = (context.payload.comment.body || '').toLowerCase();
 
-            const wantsAssign = /(^|\s)\/assign\b/.test(body)
+            // Drop fenced code blocks, indented code blocks, inline code
+            // spans (any backtick-run length), and blockquoted (`> `) lines
+            // before matching. Without this, the literal text "/assign"
+            // reaches the matcher any time it's quoted or shown as an
+            // example rather than issued as a command (someone's prior
+            // comment quoted back, a code sample, etc.). Every stripped run
+            // is replaced by a same-position, no-newline placeholder ('x')
+            // rather than deleted outright — deleting a mid-line span like
+            // "`foo` /assign" would slide the remaining text to the start
+            // of the line and manufacture a line-start match that was never
+            // really there.
+            function stripQuotedAndCode(input) {
+              if (input == null) return '';
+              const PLACEHOLDER = 'x';
+
+              // Normalize CRLF up front so every line-based check below only
+              // has to reason about one line-ending style.
+              const lines = String(input).replace(/\r\n/g, '\n').split('\n');
+
+              // (a) Fenced code blocks (``` or ~~~, 3+ of the same char, up
+              // to 3 leading spaces per CommonMark). A fence that never
+              // finds a same-character closer of >= its own length runs to
+              // the end of the body — every line from the opener onward is
+              // blanked; it can never "reopen" into real text.
+              let fenceChar = null;
+              let fenceLen = 0;
+              for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (fenceChar) {
+                  const close = line.match(/^ {0,3}([`~])(\1*)\s*$/);
+                  if (close && close[1] === fenceChar && 1 + close[2].length >= fenceLen) {
+                    fenceChar = null;
+                    fenceLen = 0;
+                  }
+                  lines[i] = PLACEHOLDER;
+                  continue;
+                }
+                const open = line.match(/^ {0,3}([`~])(\1{2,})/);
+                if (open) {
+                  fenceChar = open[1];
+                  fenceLen = 1 + open[2].length;
+                  lines[i] = PLACEHOLDER;
+                }
+              }
+
+              // (b) Indented code blocks: 4+ leading spaces or a leading
+              // tab, anchored at the true start of the line — this is what
+              // a maintainer's own "comment /assign if you want it" prose
+              // never accidentally satisfies.
+              // (d) Blockquoted lines (`> ...`) are prior commentary being
+              // quoted back, not something the commenter is asserting now.
+              for (let i = 0; i < lines.length; i++) {
+                if (/^(?: {4,}|\t)/.test(lines[i]) || /^\s*>/.test(lines[i])) {
+                  lines[i] = PLACEHOLDER;
+                }
+              }
+
+              // (c) Inline code spans, matched by backtick-RUN length (a
+              // doubled delimiter only closes against another doubled
+              // delimiter — a naive /`[^`]*`/ gets this wrong: it treats
+              // each backtick of "``/assign" as its own empty span and
+              // leaves "/assign" exposed at the start of the line). An
+              // opener with no same-length closer anywhere later in the
+              // body is unclosed and runs to the end of the body, exactly
+              // like an unclosed fence. Implemented as one left-to-right
+              // scan (no backreference/lazy-star regex) so this stays
+              // linear-time even on a pathological multi-megabyte body.
+              const text = lines.join('\n');
+              let out = '';
+              let i = 0;
+              while (i < text.length) {
+                const tick = text.indexOf('`', i);
+                if (tick === -1) { out += text.slice(i); break; }
+                out += text.slice(i, tick);
+                let j = tick;
+                while (j < text.length && text[j] === '`') j++;
+                const openLen = j - tick;
+                let k = j;
+                let closeEnd = -1;
+                while (k < text.length) {
+                  const nextTick = text.indexOf('`', k);
+                  if (nextTick === -1) break;
+                  let m = nextTick;
+                  while (m < text.length && text[m] === '`') m++;
+                  if (m - nextTick === openLen) { closeEnd = m; break; }
+                  k = m;
+                }
+                const spanEnd = closeEnd === -1 ? text.length : closeEnd;
+                for (let p = tick; p < spanEnd; p++) out += text[p] === '\n' ? '\n' : PLACEHOLDER;
+                i = spanEnd;
+              }
+              return out;
+            }
+
+            const body = stripQuotedAndCode(context.payload.comment.body || '').toLowerCase();
+
+            // Slash commands are anchored to the START of their own line
+            // (not "appears anywhere in the body"), matched against the
+            // quote/code-stripped text above, with an optional leading
+            // markdown list marker (`- `, `* `, `1. `, `1) `) so claiming
+            // from a checklist still works. Without the line-anchor, a
+            // maintainer can never write ordinary triage prose like
+            // "comment /assign if you want it" without self-assigning — and
+            // the natural follow-up explaining the mistake ("open for
+            // anyone to claim with /assign") re-triggers the exact same bug
+            // on itself, so there is no comment text that escapes the trap.
+            // A real claim is still just `/assign` (optionally behind a
+            // list marker, or with more text after it), starting its own
+            // line, not embedded mid-sentence.
+            const wantsAssign = /^\s*(?:[-*+]\s+|\d+[.)]\s+)?\/assign\b/m.test(body)
               || /\bi('?d| would)? ?(like|want) to (work on|take|tackle) this\b/.test(body)
               || /\bcan i (work on|take|have|grab) this\b/.test(body)
               || /\bi'?ll (work on|take|tackle) this\b/.test(body);
-            const wantsUnassign = /(^|\s)\/unassign\b/.test(body)
+            const wantsUnassign = /^\s*(?:[-*+]\s+|\d+[.)]\s+)?\/unassign\b/m.test(body)
               || /\bi (can'?t|cannot) (continue|work on this)\b/.test(body);
             if (!wantsAssign && !wantsUnassign) return; // nothing to do
 
@@ -87,7 +195,15 @@ jobs:
               : '_(none)_';
 
             if (wantsUnassign) {
-              await github.rest.issues.removeAssignees({ owner, repo, issue_number: issue, assignees: [user] });
+              const { data: afterUnassign } = await github.rest.issues.removeAssignees({
+                owner, repo, issue_number: issue, assignees: [user],
+              });
+              // label hygiene: in-progress means "someone has claimed this" — once
+              // nobody is left assigned, drop it too (best-effort, mirrors the
+              // needs-triage/in-progress swap on the assign path below).
+              if (!afterUnassign.assignees || afterUnassign.assignees.length === 0) {
+                try { await github.rest.issues.removeLabel({ owner, repo, issue_number: issue, name: 'in-progress' }); } catch {}
+              }
               await github.rest.issues.createComment({ owner, repo, issue_number: issue,
                 body: `Unassigned @${user}. Thanks for the update — freeing this up for someone else.` });
               return;

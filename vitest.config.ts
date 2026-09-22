@@ -7,14 +7,30 @@ export default defineConfig({
     // Strip real TESTSPRITE_* env vars and redirect the home dir so results
     // never depend on the developer's shell or ~/.testsprite (see the file).
     setupFiles: ['./test/helpers/hermetic-env.ts'],
-    // Subprocess/snapshot suites each run `npm run build` in beforeAll; parallel
-    // file workers can race on dist/ and produce a stale binary (exit 1 vs 5 flakes).
+    // Build the CLI exactly once, before any test file/worker spawns, so the
+    // subprocess/snapshot suites never race an in-suite rebuild against a
+    // concurrent spawn of the binary they're still writing.
+    globalSetup: ['./test/global-setup.ts'],
+    // Kept as defense-in-depth: forces test files to run one at a time in a
+    // single worker, so no other per-file hook can race dist/ either.
     fileParallelism: false,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'text-summary', 'json-summary', 'html'],
       include: ['src/**/*.ts'],
-      exclude: ['src/**/*.{test,spec}.ts', 'src/**/*.d.ts', 'src/index.ts'],
+      exclude: [
+        'src/**/*.{test,spec}.ts',
+        'src/**/*.d.ts',
+        'src/index.ts',
+        // Vendored upstream protocol code (src/vendor/tunnel-client/VENDOR.md).
+        // It carries its own test suite in the tunnel repo, and holding a byte
+        // copy to this repo's per-file bar would push us to write tests we
+        // then have to re-justify at every re-sync. The DELTA files beside it
+        // (ws-compat / lodash-lite) are covered here, because those are ours.
+        'src/vendor/tunnel-client/client.ts',
+        'src/vendor/tunnel-client/protocol.ts',
+        'src/vendor/tunnel-client/types.ts',
+      ],
       thresholds: {
         lines: 80,
         functions: 80,

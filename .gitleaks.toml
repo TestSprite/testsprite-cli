@@ -14,11 +14,26 @@ useDefault = true
 
 [allowlist]
 description = "Unit-test dummy keys and documented placeholder keys (not real secrets)"
+# Full-history scanning (new: the `gitleaks-history` job in
+# security.yml, push-triggered only) sees commits the working-tree scan
+# never could. It found exactly one hit across the whole history: a fixture
+# in src/lib/client-factory.test.ts that once hardcoded a fake `tsp_u_`
+# test value literally, before a later commit rewrote it to build the value
+# at test-run time specifically so no token-shaped literal exists in source
+# (see that file's own comment). Not a real credential — never minted by a
+# real backend, never live. Allowlisted by COMMIT, not by value: writing the
+# literal string itself into this file would trip
+# scripts/make-public-snapshot.sh's own release-time leak grep, since this
+# file ships to the public repo. Verified this is the only finding in the
+# repo's history before adding the exemption.
+commits = [
+  "da04640835a2d9b02901c88581680ec2445c85b0",
+]
 regexes = [
   # Unit-test fixtures, e.g. sk-secret-12345 in *.test.ts
   '''sk-secret-[0-9]+''',
   # Documented placeholder keys used by dry-run/sample responses
-  '''sk-user-(test|DRY-RUN)''',
+  '''sk-(user|member)-(test|DRY-RUN)''',
   # Example values inside internal (never-shipped, dropped-before-publish)
   # design docs. These are only ever scanned by ci.yml's continuous gitleaks
   # job (new, 2026-07) — the release-time scan
@@ -39,3 +54,33 @@ regexes = [
   # to contain this substring (review round 2, 2026-07-15; reproduced).
   '''^eyJlayI6InByb2plY3RfYTQ3YjJjMTEifQ==$''',
 ]
+
+# ── provider-specific rules ──────────────────────────────────────────────────
+# gitleaks' default rule set has no pattern for TestSprite's own token shapes,
+# so before these a real credential in the tree was detected only by the
+# release-time LEAK_RE greps in `scripts/make-public-snapshot.sh` /
+# `copybara/leak-safety-harness.sh` — and only for the `sk-user-` spelling.
+# The 2026-08-01 rename to `sk-member-` made every NEWLY minted key invisible
+# to all three at once. After an incident that put 452 live keys in 499 public
+# repositories, "the detector does not know about the current credential" is
+# the failure that only surfaces the next time. Any future prefix must be added
+# here in the same change that introduces it.
+[[rules]]
+id = "testsprite-membership-key"
+description = "TestSprite membership API key (sk-member-… / pre-rename tsp_<kind>_…)"
+# 43 base64url chars is the exact entropy tail both mint paths emit; the
+# placeholder literals in the allowlist above are far shorter and cannot match.
+# The `tsp_` arm matches the whole NAMESPACE (`tsp_<kind>_`), not just `tsp_u_`:
+# the CLI's own format gate accepts any `tsp_`-prefixed token, and `tsp_sa_` is
+# already reserved for phase-2 service-account keys. Pinning `u_` here would
+# mean the day those are minted the CLI accepts a credential no scan can see.
+regex = '''\b(?:sk-member-|tsp_[a-z]{1,4}_)[A-Za-z0-9_-]{43}\b'''
+keywords = ["sk-member-", "tsp_u_"]
+
+[[rules]]
+id = "testsprite-legacy-envelope-key"
+description = "TestSprite legacy envelope API key (sk-user-…)"
+# The legacy envelope is variable-length base64url; 40+ keeps it clear of the
+# documented `sk-user-test` / `sk-user-DRY-RUN` placeholders.
+regex = '''\bsk-user-[A-Za-z0-9_-]{40,}\b'''
+keywords = ["sk-user-"]

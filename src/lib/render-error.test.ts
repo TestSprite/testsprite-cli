@@ -7,7 +7,11 @@
  * subcommand name.
  */
 import { describe, expect, it } from 'vitest';
-import { renderCommanderError, rephraseUnknownOption } from './render-error.js';
+import {
+  renderAmbiguousOrgCandidates,
+  renderCommanderError,
+  rephraseUnknownOption,
+} from './render-error.js';
 
 describe('rephraseUnknownOption', () => {
   it('rephrases --dry-run placed after subcommand', () => {
@@ -155,5 +159,61 @@ describe('renderCommanderError', () => {
     const out = renderCommanderError('error: test', 'test', 'json');
     const parsed = JSON.parse(out) as Record<string, unknown>;
     expect(Object.keys(parsed)).toEqual(['error']);
+  });
+});
+
+describe('renderAmbiguousOrgCandidates', () => {
+  it('renders one candidate line per well-formed entry, plus a --project hint', () => {
+    const lines = renderAmbiguousOrgCandidates([
+      { projectId: 'project_a', orgId: 'org_a' },
+      { projectId: 'project_b', orgId: 'org_b' },
+    ]);
+    expect(lines).toEqual([
+      '  candidate: project project_a (org org_a)',
+      '  candidate: project project_b (org org_b)',
+      '  hint: re-run with --project <id> to disambiguate.',
+    ]);
+  });
+
+  it('renders a single candidate', () => {
+    const lines = renderAmbiguousOrgCandidates([{ projectId: 'p1', orgId: 'o1' }]);
+    expect(lines).toEqual([
+      '  candidate: project p1 (org o1)',
+      '  hint: re-run with --project <id> to disambiguate.',
+    ]);
+  });
+
+  it('returns an empty array for undefined', () => {
+    expect(renderAmbiguousOrgCandidates(undefined)).toEqual([]);
+  });
+
+  it('returns an empty array for a non-array value', () => {
+    expect(renderAmbiguousOrgCandidates('not-an-array')).toEqual([]);
+    expect(renderAmbiguousOrgCandidates({ projectId: 'p1', orgId: 'o1' })).toEqual([]);
+    expect(renderAmbiguousOrgCandidates(null)).toEqual([]);
+  });
+
+  it('returns an empty array for an empty array', () => {
+    expect(renderAmbiguousOrgCandidates([])).toEqual([]);
+  });
+
+  it('skips malformed entries (missing projectId/orgId) without throwing', () => {
+    const lines = renderAmbiguousOrgCandidates([
+      { projectId: 'project_a' }, // missing orgId
+      { orgId: 'org_b' }, // missing projectId
+      null,
+      'not-an-object',
+      42,
+      { projectId: 'project_c', orgId: 'org_c' },
+    ]);
+    expect(lines).toEqual([
+      '  candidate: project project_c (org org_c)',
+      '  hint: re-run with --project <id> to disambiguate.',
+    ]);
+  });
+
+  it('returns an empty array when every entry is malformed (no trailing hint either)', () => {
+    const lines = renderAmbiguousOrgCandidates([{ projectId: 123, orgId: 'org_a' }, {}]);
+    expect(lines).toEqual([]);
   });
 });

@@ -14,6 +14,7 @@ import { describe, expect, it } from 'vitest';
 import { CLIError, ApiError } from '../lib/errors.js';
 import type { FlakyReport } from '../lib/flaky.js';
 import type { FetchImpl } from '../lib/http.js';
+import type { RerunAdvisory } from '../lib/runs.types.js';
 import { runFlaky } from './test.js';
 
 type FetchInput = Parameters<typeof globalThis.fetch>[0];
@@ -48,8 +49,16 @@ function makeFlakyFetch(opts: {
   testType?: 'frontend' | 'backend';
   notFoundOnTrigger?: boolean;
   triggerAuthError?: TriggerAuthErrorCode;
-}): { fetchImpl: FetchImpl; triggerCount: () => number } {
+  /** Advisories echoed on every `POST /runs/rerun` response. */
+  advisories?: RerunAdvisory[];
+}): {
+  fetchImpl: FetchImpl;
+  triggerCount: () => number;
+  /** Every rerun request body sent, in attempt order. */
+  sentBodies: () => unknown[];
+} {
   let triggers = 0;
+  const sentBodies: unknown[] = [];
   const testType = opts.testType ?? 'frontend';
   const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
     const url = urlOf(input);
@@ -69,6 +78,7 @@ function makeFlakyFetch(opts: {
     }
 
     if (method === 'POST' && url.includes('/runs/rerun')) {
+      sentBodies.push(init.body ? JSON.parse(init.body as string) : null);
       if (opts.triggerAuthError) {
         return jsonResponse(opts.triggerAuthError === 'AUTH_FORBIDDEN' ? 403 : 401, {
           error: {
@@ -98,6 +108,7 @@ function makeFlakyFetch(opts: {
         enqueuedAt: '2026-06-03T10:00:00.000Z',
         codeVersion: 'v1',
         autoHeal: false,
+        ...(opts.advisories ? { advisories: opts.advisories } : {}),
       });
     }
 
@@ -132,7 +143,7 @@ function makeFlakyFetch(opts: {
     });
   }) as FetchImpl;
 
-  return { fetchImpl, triggerCount: () => triggers };
+  return { fetchImpl, triggerCount: () => triggers, sentBodies: () => sentBodies };
 }
 
 function makeCreds(): { credentialsPath: string } {
@@ -427,5 +438,194 @@ describe('runFlaky', () => {
     ).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ApiError);
     expect((err as ApiError).exitCode).toBe(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RATE_LIMITED during an attempt's poll — same defect class as the
+// InterruptError branch: the HTTP layer already retried internally and gave
+// up, but the attempt's run keeps executing (and billing) server-side. The
+// current attempt's runId must be named on stderr before the whole probe
+// aborts, and the exit code must stay 11 (never reclassified to 7/1).
+// ---------------------------------------------------------------------------
+
+describe('runFlaky — RATE_LIMITED during an attempt poll', () => {
+  it('names the runId on stderr (stdout deliberately stays empty, matching the InterruptError branch) and rethrows with exit 11 (not 7)', async () => {
+    const fetchImpl: FetchImpl = (async (input: unknown, init: RequestInit = {}) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      const method = (init.method ?? 'GET').toUpperCase();
+
+      if (method === 'GET' && /\/tests\/[^/]+$/.test(url.split('?')[0]!)) {
+        return new Response(
+          JSON.stringify({
+            id: 'test_x',
+            projectId: 'project_abc',
+            name: 'sample',
+            type: 'frontend',
+            createdFrom: 'portal',
+            status: 'passed',
+            createdAt: '2026-06-01T10:00:00.000Z',
+            updatedAt: '2026-06-01T10:00:00.000Z',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (method === 'POST' && url.includes('/runs/rerun')) {
+        return new Response(
+          JSON.stringify({
+            runId: 'run_1',
+            status: 'queued',
+            enqueuedAt: '2026-06-03T10:00:00.000Z',
+            codeVersion: 'v1',
+            autoHeal: false,
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (method === 'GET' && url.includes('/runs/run_1')) {
+        // retry-after: 0 keeps http.ts's internal retry-then-throw budget fast.
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: 'RATE_LIMITED',
+              message: 'Run trigger rate limit exceeded: too many requests from this IP.',
+              nextAction: '',
+              requestId: 'req_rl_flaky_test',
+              details: {},
+            },
+          }),
+          { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '0' } },
+        );
+      }
+      return new Response(JSON.stringify({ error: { code: 'NOT_FOUND' } }), { status: 404 });
+    }) as FetchImpl;
+
+    const { deps, stdout, stderr } = makeDeps(fetchImpl);
+    const err = await runFlaky(
+      {
+        profile: 'default',
+        output: 'json',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        testId: 'test_x',
+        runs: 3,
+        untilFail: false,
+        timeoutSeconds: 600,
+      },
+      deps,
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('RATE_LIMITED');
+    expect((err as ApiError).exitCode).toBe(11);
+
+    const stderrBlock = stderr.join('\n');
+    expect(stderrBlock).toContain('run_1');
+    expect(stderrBlock).toContain('test wait');
+    expect(stderrBlock).toContain('Rate limited');
+
+    // Deliberate, not an oversight: `test flaky` has no single-run partial
+    // envelope to emit (its output is an aggregate FlakyReport over N attempts,
+    // not a RunResponse) — this mirrors the neighboring InterruptError branch
+    // in the same catch block, which is also stderr-only. Pin it so a future
+    // reader doesn't "helpfully" add a stdout partial to only this branch and
+    // make the two adjacent detach reasons disagree on the output contract.
+    expect(stdout).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Flaky always sends an explicit autoHeal:false + surfaces advisories once
+// ---------------------------------------------------------------------------
+
+describe('runFlaky — explicit autoHeal:false + advisories', () => {
+  it('sends autoHeal:false explicitly on every replay request', async () => {
+    const { fetchImpl, sentBodies } = makeFlakyFetch({
+      statuses: ['passed', 'passed', 'passed'],
+    });
+    const { deps } = makeDeps(fetchImpl);
+    await runFlaky(
+      {
+        profile: 'default',
+        output: 'json',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        testId: 'test_x',
+        runs: 3,
+        untilFail: false,
+        timeoutSeconds: 600,
+      },
+      deps,
+    );
+
+    const bodies = sentBodies();
+    expect(bodies).toHaveLength(3);
+    for (const body of bodies) {
+      expect((body as { autoHeal?: boolean }).autoHeal).toBe(false);
+      expect((body as { source?: string }).source).toBe('cli');
+    }
+  });
+
+  it('surfaces a repeated server advisory ONCE in the report/summary, not once per attempt', async () => {
+    const advisory = {
+      feature: 'autoHeal',
+      message:
+        'The auto-heal opt-out was forwarded to the execution engine but is not yet enforced there.',
+    };
+    const { fetchImpl } = makeFlakyFetch({
+      statuses: ['passed', 'passed', 'passed'],
+      advisories: [advisory],
+    });
+    const { deps, stderr } = makeDeps(fetchImpl);
+    const report = (await runFlaky(
+      {
+        profile: 'default',
+        output: 'text',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        testId: 'test_x',
+        runs: 3,
+        untilFail: false,
+        timeoutSeconds: 600,
+      },
+      deps,
+    )) as FlakyReport;
+
+    // Exactly one stderr line — even though 3 attempts each echoed the advisory.
+    const advisoryLines = stderr.filter(l => l === `[advisory] ${advisory.message}`);
+    expect(advisoryLines).toHaveLength(1);
+
+    // Deduped into the report too, for JSON consumers.
+    expect(report.advisories).toEqual([advisory]);
+  });
+
+  it('absent advisories: report.advisories is empty and no advisory line is printed', async () => {
+    const { fetchImpl } = makeFlakyFetch({ statuses: ['passed', 'passed'] });
+    const { deps, stderr } = makeDeps(fetchImpl);
+    const report = (await runFlaky(
+      {
+        profile: 'default',
+        output: 'text',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        testId: 'test_x',
+        runs: 2,
+        untilFail: false,
+        timeoutSeconds: 600,
+      },
+      deps,
+    )) as FlakyReport;
+
+    expect(stderr.some(l => l.includes('[advisory]'))).toBe(false);
+    expect(report.advisories).toEqual([]);
   });
 });

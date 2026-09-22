@@ -6,6 +6,7 @@ import { CLIError, localValidationError } from '../lib/errors.js';
 import type { OutputMode } from '../lib/output.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptText } from '../lib/prompt.js';
+import { FALLBACK_TARGET, resolveAgentTargets, type DetectAgentDeps } from '../lib/agent-detect.js';
 import {
   type AgentTarget,
   TARGETS,
@@ -13,9 +14,8 @@ import {
   DEFAULT_SKILLS,
   MARKER_SKILL_SEPARATOR,
   pathFor,
-  loadSkillBodyFor,
+  ownFileBodyFor,
   bodyHash12,
-  compactBodyFor,
   buildCodexAggregate,
   buildSkillMarker,
   parseSkillMarker,
@@ -309,6 +309,8 @@ export interface AgentDeps {
   stderr?: (line: string) => void;
   isTTY?: boolean;
   prompt?: (question: string) => Promise<string>;
+  /** Injected fs/env for detecting which agents the project uses. */
+  detect?: DetectAgentDeps;
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +326,18 @@ export type InstallAction =
   | 'section-installed'
   | 'section-updated'
   | 'section-unchanged';
+
+/**
+ * Actions that mean bytes actually changed on disk — the trigger set for the
+ * post-install reload hint (DEV-279). Covers both write modes: own-file
+ * (`written`/`updated`) and codex managed-section (`section-*`).
+ */
+const CHANGED_ACTIONS: ReadonlySet<InstallAction> = new Set([
+  'written',
+  'updated',
+  'section-installed',
+  'section-updated',
+]);
 
 export interface InstallResult {
   target: AgentTarget;
@@ -352,6 +366,33 @@ interface InstallOptions extends CommonOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Shared canonical-body resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-invocation cache in front of {@link ownFileBodyFor}, so each (target, skill)
+ * pair reads its asset once. `agent install` (which stamps the body's hash into the
+ * marker) and `agent status` (which re-derives it) share this rather than keeping
+ * private copies — they didn't, hence DEV-672.
+ */
+function makeOwnFileBodyResolver(): (target: AgentTarget, skill: string) => string {
+  // Keyed on the pair: the same skill resolves to different bytes per target.
+  // NUL separates them because no target or skill name can contain one; written
+  // as an escape, since a raw NUL in the source makes grep treat this file as
+  // binary and skip it.
+  const cache = new Map<string, string>();
+  return (target, skill) => {
+    const key = `${target}\u0000${skill}`;
+    let body = cache.get(key);
+    if (body === undefined) {
+      body = ownFileBodyFor(target, skill);
+      cache.set(key, body);
+    }
+    return body;
+  };
+}
+
+// ---------------------------------------------------------------------------
 // runInstall
 // ---------------------------------------------------------------------------
 
@@ -367,21 +408,43 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
     .filter(Boolean);
 
   let resolvedTargetStrings: string[];
+  // Whether the target came from the interactive prompt rather than a flag.
+  // Decides which of the two the refusal below names — telling someone their
+  // `--target` is invalid when they never typed one sends them to the wrong
+  // place.
+  let fromPrompt = false;
+
+  // Where the install lands, and so where detection looks (reused at step 3).
+  const dir = opts.dir ?? deps.cwd ?? process.cwd();
 
   if (rawTargets.length === 0) {
+    // No target named: install for the agents this project shows rather than a
+    // fixed one, so an unnamed install cannot land where the caller cannot read.
+    const detected = resolveAgentTargets(undefined, dir, { ...deps.detect });
+    const suggestion = detected.targets.join(',');
     const isTTY = deps.isTTY ?? Boolean(process.stdin.isTTY);
     if (!isTTY) {
       stderrFn(
-        '[info] --target not specified; defaulting to claude. Pass --target=<target> to select a different agent.',
+        detected.source === 'fallback'
+          ? `[info] no coding agent detected; installing for ${FALLBACK_TARGET}. Pass --target=<target> to select a different agent.`
+          : `[info] --target not specified; installing for ${suggestion}.`,
       );
-      resolvedTargetStrings = ['claude'];
+      resolvedTargetStrings = [...detected.targets];
     } else {
+      fromPrompt = true;
       const promptFn = deps.prompt ?? ((q: string) => promptText(q));
-      const answer = (await promptFn('Targets to install (comma-separated) [claude]: ')).trim();
-      const defaulted = answer || 'claude';
+      const answer = (
+        await promptFn(`Targets to install (comma-separated) [${suggestion}]: `)
+      ).trim();
+      const defaulted = answer || suggestion;
+      // Lower-cased for the same reason `setup`'s prompt does it: every target
+      // name is lower case, so `Cursor` is a typo only in the sense that the
+      // shift key was down. Accepting it in one prompt and refusing it in the
+      // other is an inconsistency the user has no way to predict. A `--target`
+      // value is left alone on both sides — that is a flag, not an answer.
       resolvedTargetStrings = defaulted
         .split(',')
-        .map(s => s.trim())
+        .map(s => s.trim().toLowerCase())
         .filter(Boolean);
     }
   } else {
@@ -392,6 +455,15 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
   const validTargets = Object.keys(TARGETS) as AgentTarget[];
   for (const t of resolvedTargetStrings) {
     if (!validTargets.includes(t as AgentTarget)) {
+      if (fromPrompt) {
+        // Not `localValidationError('target', …)`: that renders as "Flag
+        // --target is invalid", and on this path the caller passed no flag.
+        throw new CLIError(
+          `unknown target "${t}"; supported: ${validTargets.join(', ')}. ` +
+            'Re-run and answer with one of those, or pass --target <target>.',
+          5,
+        );
+      }
       throw localValidationError(
         'target',
         `unknown target "${t}"; supported: ${validTargets.join(', ')}`,
@@ -429,37 +501,13 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
     return true;
   });
 
-  // 3. Resolve dir
-  const dir = opts.dir ?? deps.cwd ?? process.cwd();
+  // 3. Resolve dir (computed above, where detection also needed it)
   const root = path.resolve(dir);
 
   // 4. Lazy asset loaders — only touch disk if a target actually needs it.
-  // own-file bodies are per-skill (cached); the codex section aggregates EVERY
-  // installed skill's contribution into ONE managed section.
-  const skillBodyCache = new Map<string, string>();
-  const bodyForSkill = (skill: string): string => {
-    let b = skillBodyCache.get(skill);
-    if (b === undefined) {
-      b = loadSkillBodyFor(skill);
-      skillBodyCache.set(skill, b);
-    }
-    return b;
-  };
-  // Budget-capped own-file targets (e.g. windsurf) render the compact per-skill
-  // body so the rule file isn't truncated by the agent. Cached separately; must
-  // match renderForTarget's default selection so written bytes equal the asserted
-  // render.
-  const compactBodyCache = new Map<string, string>();
-  const compactBodyForSkill = (skill: string): string => {
-    let b = compactBodyCache.get(skill);
-    if (b === undefined) {
-      b = compactBodyFor(skill);
-      compactBodyCache.set(skill, b);
-    }
-    return b;
-  };
-  const ownFileBodyFor = (t: AgentTarget, skill: string): string =>
-    TARGETS[t].compactBody ? compactBodyForSkill(skill) : bodyForSkill(skill);
+  // own-file bodies come from the shared per-target resolver; the codex section
+  // aggregates EVERY installed skill's contribution into ONE managed section.
+  const ownFileBodyFor = makeOwnFileBodyResolver();
   let codexSectionCache: string | undefined;
   const getCodexSection = (): string => {
     if (codexSectionCache === undefined) {
@@ -524,7 +572,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
         const bytes = Buffer.byteLength(section, 'utf8');
         let wouldBeContent = section;
         if (dryRunSt !== null) {
-          let existing: string | null = null;
+          let existing: string | null;
           try {
             existing = await agentFs.readFile(abs);
           } catch (err) {
@@ -767,6 +815,22 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
     return items.map(r => `${r.target.padEnd(12)} ${r.action.padEnd(12)} ${r.path}`).join('\n');
   });
 
+  // 8b. Reload hint (DEV-279). A coding agent reads its skill/rule files at
+  // session start, so a session already open when we wrote the file won't pick
+  // it up. Fire only when something actually changed on disk — silent on
+  // skipped/unchanged/blocked/dry-run and in --output json. Targets are
+  // de-duplicated (own-file targets produce one result per skill).
+  if (opts.output === 'text') {
+    const changedTargets = [
+      ...new Set(results.filter(r => CHANGED_ACTIONS.has(r.action)).map(r => r.target)),
+    ];
+    if (changedTargets.length > 0) {
+      stderrFn(
+        `[hint] Reopen (or restart) your coding agent (${changedTargets.join(', ')}) so it picks up the newly installed TestSprite skill(s).`,
+      );
+    }
+  }
+
   // 9. Exit with 6 if any blocked
   if (results.some(r => r.action === 'blocked')) {
     throw new CLIError(
@@ -788,8 +852,19 @@ export interface ListResult {
   path: string;
 }
 
+/**
+ * Display name for the AGENT column. Experimental targets get an "(exp.)" tag so
+ * support maturity stays visible without a dedicated STATUS column — a bare
+ * `ga`/`experimental` column reads like install state, which is `agent status`'s
+ * job, not this catalog's (DEV-279).
+ */
+function agentDisplayName(target: AgentTarget, status: string): string {
+  return status === 'experimental' ? `${target} (exp.)` : target;
+}
+
 export async function runList(opts: CommonOptions, deps: AgentDeps = {}): Promise<void> {
   const out = makeOutput(opts.output, deps);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   // One row per (target × default skill). Own-file targets land each skill at a
   // distinct path; the codex managed-section target merges all skills into the
@@ -811,15 +886,27 @@ export async function runList(opts: CommonOptions, deps: AgentDeps = {}): Promis
     }
   }
 
+  // The text table shows only what someone choosing an agent needs: the agent
+  // (with an "(exp.)" maturity tag), the skill, and where it lands. STATUS and
+  // MODE stay in the JSON shape for back-compat but are dropped from the human
+  // table — MODE is an internal write strategy, and STATUS (ga/experimental)
+  // reads like install state, which lives in `agent status` (DEV-279).
   out.print(results, data => {
     const items = data as ListResult[];
-    const header = `${'TARGET'.padEnd(14)} ${'SKILL'.padEnd(20)} ${'STATUS'.padEnd(12)} ${'MODE'.padEnd(18)} PATH`;
+    const header = `${'AGENT'.padEnd(20)} ${'SKILL'.padEnd(20)} PATH`;
     const rows = items.map(
-      r =>
-        `${r.target.padEnd(14)} ${r.skill.padEnd(20)} ${r.status.padEnd(12)} ${r.mode.padEnd(18)} ${r.path}`,
+      r => `${agentDisplayName(r.target, r.status).padEnd(20)} ${r.skill.padEnd(20)} ${r.path}`,
     );
     return [header, ...rows].join('\n');
   });
+
+  // Point at the command that answers "is it installed here?" (text mode only —
+  // never pollute the JSON stream).
+  if (opts.output === 'text') {
+    stderrFn(
+      'Run `testsprite agent status` to see which of these skills are installed in this project.',
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -869,13 +956,18 @@ interface StatusOptions extends CommonOptions {
  * Classify one own-file artifact per the {@link SkillArtifactState} contract.
  * Comparisons are byte-exact, matching the installer's own skipped/blocked
  * comparison for own-file targets.
+ *
+ * `canonicalBody` is already bound to THIS target by the caller and takes no
+ * arguments, so the per-skill-only lookup that caused DEV-672 cannot be expressed
+ * here. It is called only once an artifact is known to exist and carry a marker,
+ * so a row with nothing installed never touches the skill assets.
  */
 async function classifyOwnFileState(
   agentFs: AgentFs,
   abs: string,
   target: AgentTarget,
   skill: string,
-  bodyForSkill: (skill: string) => string,
+  canonicalBody: () => string,
 ): Promise<SkillArtifactState> {
   const stat = await agentFs.lstat(abs);
   if (stat === null) return 'absent';
@@ -887,13 +979,13 @@ async function classifyOwnFileState(
   const marker = parseSkillMarker(existing);
   if (marker === null) return 'unmarked';
 
-  const canonicalBody = bodyForSkill(skill);
-  if (marker.hash12 !== bodyHash12(canonicalBody)) return 'stale';
+  const body = canonicalBody();
+  if (marker.hash12 !== bodyHash12(body)) return 'stale';
 
   // Hash matches the current body: pristine iff the file equals the canonical
   // render carrying its own marker line, so a marker whose version string lags
   // behind an unchanged body still reads ok.
-  const reRender = renderOwnFileWithMarker(target, skill, marker.line, canonicalBody);
+  const reRender = renderOwnFileWithMarker(target, skill, marker.line, body);
   return existing === reRender ? 'ok' : 'modified';
 }
 
@@ -991,22 +1083,13 @@ export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Prom
   const dir = opts.dir !== undefined ? opts.dir.trim() : (deps.cwd ?? process.cwd());
   const root = path.resolve(dir);
 
-  // Canonical own-file bodies, read once per skill (same lazy caching pattern
-  // as runInstall's bodyForSkill).
-  const skillBodyCache = new Map<string, string>();
-  const bodyForSkill = (skill: string): string => {
-    let cachedBody = skillBodyCache.get(skill);
-    if (cachedBody === undefined) {
-      cachedBody = loadSkillBodyFor(skill);
-      skillBodyCache.set(skill, cachedBody);
-    }
-    return cachedBody;
-  };
+  // The SAME resolver the installer stamps its marker hashes from (DEV-672).
+  const ownFileBodyFor = makeOwnFileBodyResolver();
 
   const results: StatusResult[] = [];
   for (const [target, spec] of Object.entries(TARGETS) as [
     AgentTarget,
-    { mode: string; path: string },
+    (typeof TARGETS)[AgentTarget],
   ][]) {
     if (spec.mode === 'managed-section') {
       const stateFor = await classifyManagedSectionStates(agentFs, path.resolve(root, spec.path));
@@ -1026,7 +1109,9 @@ export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Prom
           path.resolve(root, relPath),
           target,
           skill,
-          bodyForSkill,
+          // Deferred, not resolved here: an absent artifact must not need the
+          // skill assets at all, as it didn't before DEV-672.
+          () => ownFileBodyFor(target, skill),
         ),
       });
     }
@@ -1066,13 +1151,14 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
   );
 
   agent
-    .command('install')
+    .command('install [targets...]')
     .description(
-      'Write the TestSprite agent skills (verification loop + first-run onboarding) into a project for a coding agent',
+      'Write the TestSprite agent skills (verification loop + first-run onboarding) into a project for a coding agent. ' +
+        'Target(s) may be given positionally (e.g. `agent install cursor codex`) and/or via --target; the two are merged.',
     )
     .option(
       '--target <t>',
-      'Agent target(s): claude, cursor, cline, antigravity, kiro, windsurf, copilot, codex (comma-separated or repeated)',
+      'Agent target(s): claude, cursor, cline, antigravity, kiro, windsurf, copilot, codex (comma-separated or repeated). Merged with any positional target(s).',
       collect,
       [],
     )
@@ -1091,13 +1177,23 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(
       async (
+        // Positional targets: `agent install cursor` previously parsed
+        // as zero targets (Commander silently drops undeclared positionals),
+        // silently falling through to the non-TTY default-to-claude path — so
+        // 7 of the 8 documented one-liners installed the WRONG agent's skill
+        // with zero signal. Declaring `[targets...]` captures them; they are
+        // merged with `--target` (order: positional first, then flag values)
+        // and flow through runInstall's existing parse/validate/dedupe pipeline
+        // unchanged, so an unknown name (positional or flag) still rejects with
+        // exit 5 instead of silently defaulting.
+        positionalTargets: string[],
         cmdOpts: { target: string[]; skill: string[]; dir?: string; force?: boolean },
         command: Command,
       ) => {
         await runInstall(
           {
             ...resolveCommonOptions(command),
-            target: cmdOpts.target,
+            target: [...positionalTargets, ...cmdOpts.target],
             skills: cmdOpts.skill,
             dir: cmdOpts.dir,
             force: Boolean(cmdOpts.force),
@@ -1109,7 +1205,9 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
 
   agent
     .command('list')
-    .description('List supported agent targets and skills, their status, and landing paths')
+    .description(
+      'List the agent targets and skills this CLI can install and where each lands (run `testsprite agent status` to see what is installed here)',
+    )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_o, command: Command) => {
       await runList(resolveCommonOptions(command), deps);

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { DRY_RUN_SAMPLE_ENTRIES, findSample, sampleJUnitReportXml } from './samples.js';
+import { ApiError } from '../errors.js';
+import {
+  DRY_RUN_SAMPLE_ENTRIES,
+  findSample,
+  findSampleOrThrow,
+  sampleJUnitReportXml,
+} from './samples.js';
 
 describe('sampleJUnitReportXml', () => {
   it('returns well-formed JUnit XML with canned batch ids', () => {
@@ -37,6 +43,98 @@ describe('findSample', () => {
   it('resolves /projects/{id}', () => {
     const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/projects/proj_anything');
     expect(e?.operationId).toBe('getProject');
+  });
+
+  it('GET /projects/{id}/plans resolves getPlans, NOT getProject (DEV-384 ordering)', () => {
+    // The plans entries are registered BEFORE getProject (first-match-wins);
+    // this proves both directions of the non-shadowing contract.
+    const plans = findSample('GET', 'https://api.testsprite.com/api/cli/v1/projects/p_x/plans');
+    expect(plans?.operationId).toBe('getPlans');
+    const project = findSample('GET', 'https://api.testsprite.com/api/cli/v1/projects/p_x');
+    expect(project?.operationId).toBe('getProject');
+  });
+
+  it('POST /projects/{id}/plans/generate resolves generatePlans (DEV-384)', () => {
+    const e = findSample(
+      'POST',
+      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans/generate',
+    );
+    expect(e?.operationId).toBe('generatePlans');
+    const body = e?.body() as { status: string; stage: string | null };
+    expect(body.status).toBe('accepted');
+  });
+
+  it('getPlans sample stages two proposals WITH stable proposalIds (FE + BE shapes)', () => {
+    const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/projects/p_x/plans');
+    const body = e?.body() as {
+      generation: { status: string };
+      proposals: Array<{
+        proposalId: string;
+        type: string;
+        steps?: unknown[];
+        endpointPath?: string | null;
+        captures?: string[];
+        consumes?: string[];
+      }>;
+      credits: { charged: Array<{ action: string; amount: number }>; balance: number | null };
+    };
+    expect(body.generation.status).toBe('idle');
+    expect(body.proposals.map(p => p.proposalId)).toEqual(['prop_1', 'prop_2']);
+    const fe = body.proposals[0]!;
+    expect(fe.type).toBe('frontend');
+    expect(Array.isArray(fe.steps)).toBe(true);
+    const be = body.proposals[1]!;
+    expect(be.type).toBe('backend');
+    expect(be.endpointPath).toBe('/v1/orders');
+    expect(be.captures).toEqual(['orderId']);
+    expect(be.consumes).toEqual(['authToken']);
+    expect(body.credits.balance).not.toBeNull();
+  });
+
+  it('POST /projects/{id}/plans/accept is input-derived: echoes the explicit only list', () => {
+    const subset = findSample(
+      'POST',
+      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans/accept',
+      { only: ['prop_2'] },
+    );
+    expect(subset?.operationId).toBe('acceptPlans');
+    const subsetBody = subset?.body() as { acceptedCount: number; caseKeys: string[] };
+    expect(subsetBody.acceptedCount).toBe(1);
+    expect(subsetBody.caseKeys).toEqual(['case_dryrun_prop_2']);
+    // No body context → the illustrative two-proposal shape.
+    const bare = findSample(
+      'POST',
+      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans/accept',
+    );
+    const bareBody = bare?.body() as { acceptedCount: number };
+    expect(bareBody.acceptedCount).toBe(2);
+  });
+
+  it('GET /projects/{id}/plans/generate has no sample (trigger is POST-only)', () => {
+    const e = findSample(
+      'GET',
+      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans/generate',
+    );
+    expect(e).toBeUndefined();
+  });
+
+  it('findSampleOrThrow returns the entry when matched, throws INTERNAL when not (F6)', () => {
+    const hit = findSampleOrThrow(
+      'GET',
+      'https://api.testsprite.com/api/cli/v1/projects/p_x/plans',
+    );
+    expect(hit.operationId).toBe('getPlans');
+    // A registry entry lost in a merge must fail loudly with a typed error,
+    // not surface as a TypeError in a renderer.
+    let thrown: unknown;
+    try {
+      findSampleOrThrow('GET', 'https://api.testsprite.com/api/cli/v1/projects/p_x/no-such-route');
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(ApiError);
+    expect((thrown as ApiError).code).toBe('INTERNAL');
+    expect((thrown as ApiError).message).toContain('/projects/p_x/no-such-route');
   });
 
   it('resolves /tests (list) — must not collide with /tests/{id}', () => {
@@ -111,6 +209,23 @@ describe('findSample', () => {
           break;
         case 'getProject':
           expect(body).toMatchObject({ id: expect.any(String), name: expect.any(String) });
+          break;
+        case 'docsUploadUrl':
+          // DEV-384 V3-D — CliDocsUploadUrlResponse wire shape.
+          expect(body).toMatchObject({
+            uploadUrl: expect.any(String),
+            s3Key: expect.any(String),
+            expiresInSeconds: expect.any(Number),
+          });
+          break;
+        case 'docsRegister':
+          // DEV-384 V3-D — CliDocsRegisterResponse wire shape.
+          expect(body).toMatchObject({
+            resourceId: expect.any(String),
+            displayName: expect.any(String),
+            docRole: expect.any(String),
+            processStatus: expect.any(String),
+          });
           break;
         case 'getTest':
           // G1a — priority must be present (truthy string or null).
@@ -316,8 +431,11 @@ describe('findSample', () => {
           break;
         }
         case 'createProject':
-          // P6 — POST /projects → CliProject shape.
+          // P6 — POST /projects → CliCreateProjectResponse shape. Both id
+          // field names present (the live field is
+          // `projectId`; `id` is kept for back-compat).
           expect(body).toMatchObject({
+            projectId: expect.any(String),
             id: expect.any(String),
             type: expect.any(String),
             name: expect.any(String),
@@ -326,8 +444,10 @@ describe('findSample', () => {
           });
           break;
         case 'updateProject':
-          // P7 — PATCH /projects/{id} → CliUpdateProjectResponse shape.
+          // P7 — PATCH /projects/{id} → CliUpdateProjectResponse shape. Both
+          // id field names present.
           expect(body).toMatchObject({
+            projectId: expect.any(String),
             id: expect.any(String),
             updatedFields: expect.any(Array),
             updatedAt: expect.any(String),
@@ -349,6 +469,68 @@ describe('findSample', () => {
             projectId: expect.any(String),
             deletedAt: expect.any(String),
           });
+          break;
+        case 'generatePlans':
+          // DEV-384 V3-B — POST /projects/{id}/plans/generate →
+          // CliGeneratePlansResponse (202 trigger ack).
+          expect(body).toMatchObject({
+            status: 'accepted',
+            projectId: expect.any(String),
+            stagesRemaining: expect.any(Array),
+            enqueuedAt: expect.any(String),
+          });
+          expect('stage' in body).toBe(true);
+          break;
+        case 'getPlans': {
+          // DEV-384 V3-B — GET /projects/{id}/plans → CliGetPlansResponse.
+          // Every staged proposal must carry its stable proposalId (that id
+          // is what `accept --only` consumes).
+          expect(body).toMatchObject({
+            generation: expect.objectContaining({ status: expect.any(String) }),
+            proposals: expect.any(Array),
+            credits: expect.objectContaining({ charged: expect.any(Array) }),
+          });
+          const proposals = (body as { proposals: Array<Record<string, unknown>> }).proposals;
+          expect(proposals.length).toBeGreaterThan(0);
+          for (const p of proposals) {
+            expect(p).toMatchObject({
+              proposalId: expect.any(String),
+              title: expect.any(String),
+              priority: expect.any(String),
+              type: expect.any(String),
+            });
+          }
+          break;
+        }
+        case 'acceptPlans':
+          // DEV-384 V3-B — POST /projects/{id}/plans/accept → the server's
+          // real `{acceptedCount, caseKeys}` shape (DR-29: no codegen field).
+          expect(body).toMatchObject({
+            acceptedCount: expect.any(Number),
+            caseKeys: expect.any(Array),
+          });
+          break;
+        case 'listSchedules':
+          expect(body).toMatchObject({ schedules: expect.any(Array) });
+          break;
+        case 'getSchedule':
+        case 'updateSchedule':
+          expect(body).toMatchObject({
+            scheduleId: expect.any(String),
+            name: expect.any(String),
+            enabled: expect.any(Boolean),
+            targetType: expect.any(String),
+            cron: expect.any(String),
+            createdAt: expect.any(String),
+            updatedAt: expect.any(String),
+          });
+          break;
+        case 'createSchedule':
+        case 'deleteSchedule':
+          expect(body).toMatchObject({ scheduleId: expect.any(String) });
+          break;
+        case 'listScheduleRuns':
+          expect(body).toMatchObject({ runs: expect.any(Array) });
           break;
         default:
           throw new Error(`Unexpected operationId in samples: ${e.operationId}`);
@@ -438,6 +620,44 @@ describe('findSample', () => {
     };
     expect(body.status).toBe('passed');
     expect(body.stepSummary.failedCount).toBe(0);
+  });
+
+  it('GET /runs/run_failed_sample resolves to the sentinel failed run-scoped step sample', () => {
+    const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/runs/run_failed_sample');
+    expect(e?.operationId).toBe('getRun');
+    const body = e?.body() as {
+      status: string;
+      runId: string;
+      failedStepIndex: number | null;
+      failureKind: string | null;
+      error: string | null;
+      stepSummary: { total: number; completed: number; passedCount: number; failedCount: number };
+      steps: Array<{
+        stepIndex: string;
+        type: string;
+        status: string | null;
+        error: string | null;
+      }>;
+    };
+    expect(body.runId).toBe('run_failed_sample');
+    expect(body.status).toBe('failed');
+    expect(body.failedStepIndex).toBe(3);
+    expect(body.failureKind).toBe('assertion');
+    expect(body.error).toEqual(expect.any(String));
+    expect(body.stepSummary).toMatchObject({
+      total: 3,
+      completed: 3,
+      passedCount: 2,
+      failedCount: 1,
+    });
+
+    const failingStep = body.steps.find(step => step.stepIndex === '0003');
+    expect(failingStep).toMatchObject({
+      type: 'assertion',
+      status: 'failed',
+      error: expect.any(String),
+    });
+    expect(failingStep?.error).not.toBe('');
   });
 
   // DEV-331 piece 3: POST /runs/{runId}/cancel must resolve to `cancelRun`,
@@ -557,13 +777,53 @@ describe('findSample', () => {
     expect(body.summary.total).toBeGreaterThanOrEqual(1);
   });
 
-  it('only one getRun entry exists in the registry (no duplicate)', () => {
-    // Guards against re-introducing the duplicate by ensuring exactly one
-    // sample is registered for GET /runs/{runId}.
-    const matches = DRY_RUN_SAMPLE_ENTRIES.filter(
-      e => e.method === 'GET' && e.operationId === 'getRun',
+  // DEV-384 piece V3-D: `project docs upload` dry-runs via an inline
+  // early-exit (zero network, stat only — the presigned PUT leg cannot be
+  // expressed through canned fetch samples). These two entries are
+  // documentation/shape-guards, same family as `deleteBatch`.
+  it('POST /projects/{id}/docs/upload-url resolves docsUploadUrl (V3-A wire shape)', () => {
+    const e = findSample(
+      'POST',
+      'https://api.testsprite.com/api/cli/v1/projects/p_x/docs/upload-url',
     );
-    expect(matches).toHaveLength(1);
+    expect(e?.operationId).toBe('docsUploadUrl');
+    const body = e?.body() as { uploadUrl: string; s3Key: string; expiresInSeconds: number };
+    expect(body.uploadUrl).toMatch(/^https:/);
+    expect(body.s3Key).toBeTruthy();
+    expect(body.expiresInSeconds).toBe(3600);
+  });
+
+  it('POST /projects/{id}/docs resolves docsRegister (not shadowed by upload-url)', () => {
+    const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/projects/p_x/docs');
+    expect(e?.operationId).toBe('docsRegister');
+    const body = e?.body() as {
+      resourceId: string;
+      displayName: string;
+      docRole: string;
+      processStatus: string;
+    };
+    expect(body.resourceId).toBeTruthy();
+    expect(body.docRole).toBe('API_DOC');
+    expect(body.processStatus).toBeTruthy();
+  });
+
+  it('keeps the failed run sentinel before generic getRun while retaining cancelRun', () => {
+    // findSample is first-match-wins; exact run fixtures must precede
+    // `/runs/{runId}` so `test wait --dry-run` still gets the passed sample.
+    // The adjacent POST cancel fixture was added on main after this branch forked.
+    const failedRunIndex = DRY_RUN_SAMPLE_ENTRIES.findIndex(
+      e => e.method === 'GET' && e.pathTemplate === '/runs/run_failed_sample',
+    );
+    const genericRunIndex = DRY_RUN_SAMPLE_ENTRIES.findIndex(
+      e => e.method === 'GET' && e.pathTemplate === '/runs/{runId}',
+    );
+    const cancelRunIndex = DRY_RUN_SAMPLE_ENTRIES.findIndex(
+      e => e.method === 'POST' && e.pathTemplate === '/runs/{runId}/cancel',
+    );
+    expect(failedRunIndex).toBeGreaterThanOrEqual(0);
+    expect(genericRunIndex).toBeGreaterThanOrEqual(0);
+    expect(cancelRunIndex).toBeGreaterThanOrEqual(0);
+    expect(failedRunIndex).toBeLessThan(genericRunIndex);
   });
 
   // Input-derived sample tests (Fix #1 — dogfood 2026-05-15)
@@ -681,5 +941,58 @@ describe('findSample', () => {
       expect(body.summary.created).toBe(2);
       expect(body.summary.failed).toBe(1);
     });
+  });
+});
+
+describe('schedule samples', () => {
+  it('resolves every schedule route', () => {
+    expect(findSample('GET', '/schedules')?.operationId).toBe('listSchedules');
+    expect(findSample('POST', '/schedules')?.operationId).toBe('createSchedule');
+    expect(findSample('GET', '/schedules/sch_1')?.operationId).toBe('getSchedule');
+    expect(findSample('PATCH', '/schedules/sch_1')?.operationId).toBe('updateSchedule');
+    expect(findSample('DELETE', '/schedules/sch_1')?.operationId).toBe('deleteSchedule');
+  });
+
+  it('matches the runs sub-path ahead of the single-schedule pattern', () => {
+    // First-match-wins: if the entries were ordered the other way, this would
+    // resolve to getSchedule and the run list would render the wrong shape.
+    expect(findSample('GET', '/schedules/sch_1/runs')?.operationId).toBe('listScheduleRuns');
+  });
+
+  it('wraps the list and run-list bodies in their named keys', () => {
+    const list = findSample('GET', '/schedules')?.body() as { schedules?: unknown[] };
+    expect(Array.isArray(list.schedules)).toBe(true);
+    const runs = findSample('GET', '/schedules/sch_1/runs')?.body() as { runs?: unknown[] };
+    expect(Array.isArray(runs.runs)).toBe(true);
+  });
+
+  it('echoes the update patch so a caller can confirm their flags landed', () => {
+    // The request body goes to `findSample`, not to `body()` — the returned
+    // entry's `body` is a zero-arity closure over it.
+    const body = findSample('PATCH', '/schedules/sch_1', {
+      enabled: false,
+      name: 'Renamed',
+    })?.body() as { enabled?: boolean; name?: string };
+    expect(body.enabled).toBe(false);
+    expect(body.name).toBe('Renamed');
+  });
+
+  it('leaves fields the patch did not mention at their sample values', () => {
+    const body = findSample('PATCH', '/schedules/sch_1', { enabled: false })?.body() as {
+      name?: string;
+      cron?: string;
+    };
+    expect(body.name).toBe('Nightly checkout');
+    expect(body.cron).toBe('0 3 * * *');
+  });
+
+  it('reports a run status consistent with its own counts', () => {
+    // The sample shows one failure, so `status` must be failed — a sample that
+    // contradicted itself would teach the wrong contract.
+    const runs = findSample('GET', '/schedules/sch_1/runs')?.body() as {
+      runs: Array<{ status: string; stats: { failed: number } }>;
+    };
+    expect(runs.runs[0]?.stats.failed).toBeGreaterThan(0);
+    expect(runs.runs[0]?.status).toBe('failed');
   });
 });

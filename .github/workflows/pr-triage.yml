@@ -113,11 +113,23 @@ jobs:
             const linkedIssues = gql.repository.pullRequest.closingIssuesReferences.nodes
               .map(n => ({ number: n.number, assignees: n.assignees.nodes.map(a => a.login) }));
 
-            // Body-text fallback for the brief window before GitHub computes the
-            // link (same-repo bare "#N" references only).
+            // Body-text references (same-repo bare "#N" only). Two jobs:
+            //  1. Closing keywords — a fallback for the brief window before GitHub
+            //     has computed closingIssuesReferences.
+            //  2. Non-closing keywords ("Part of #N", "Refs #N", "Related to #N").
+            //     An umbrella issue that explicitly invites one PR per coherent
+            //     group (e.g. #277) must NOT be closed by any single PR, so a
+            //     contributor working it *cannot* write a closing keyword — yet
+            //     under the old regex that made their PR permanently `needs-issue`.
+            //     Accepting the reference here does not weaken the gate: `state`
+            //     is still decided by `assignedToAuthor` below, so an unclaimed or
+            //     someone else's issue still fails. It only stops the gate from
+            //     contradicting an issue whose own body promised this workflow.
+            //     The leading \b also closes a pre-existing hole: without it,
+            //     "prefs #12" matched as "refs #12".
             const bodyRefs = [...(pr.body || '')
-              .matchAll(/(close[sd]?|fix(e[sd])?|resolve[sd]?)\s*:?\s+#(\d+)/gi)]
-              .map(m => Number(m[3]))
+              .matchAll(/\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|part\s+of|refs?|references?|related\s+to)\s*:?\s+#(\d+)/gi)]
+              .map(m => Number(m[1]))
               .filter(n => !linkedIssues.some(i => i.number === n))
               .slice(0, 5);
             for (const num of bodyRefs) {
@@ -162,7 +174,8 @@ jobs:
               body = `${marker}\n${stateLine}\n`
                 + `Thanks for the PR, @${author}! A quick note on our workflow: for **features and behavior changes** `
                 + `we require contributors to **open an issue first, claim it by commenting \`/assign\` on the issue, `
-                + `then submit a PR that links it** (e.g. \`Closes #123\`). This PR isn't linked to any issue yet, `
+                + `then submit a PR that references it** (e.g. \`Closes #123\`, or \`Part of #123\` when the `
+                + `issue is an umbrella that shouldn't be closed by one PR). This PR isn't linked to any issue yet, `
                 + `so it is not review-ready. ${rerunHint} `
                 + `See [CONTRIBUTING → Contribution model](${contributingUrl}).`;
             }
@@ -192,7 +205,7 @@ jobs:
             const gated = new Date(pr.created_at) >= new Date(process.env.GATE_SINCE);
             if (state !== 'ok' && gated) {
               core.setFailed(state === 'unlinked'
-                ? 'No closing-linked issue. Open/claim an issue, add "Closes #<n>" to the PR description, then re-run.'
+                ? 'No linked issue. Open/claim an issue, reference it in the PR description ("Closes #<n>", or "Part of #<n>" for an umbrella issue), then re-run.'
                 : 'Linked issue is not assigned to the PR author. Comment /assign on the issue, then re-run.');
             } else if (state !== 'ok') {
               core.notice(`Grandfathered PR (opened before ${process.env.GATE_SINCE}): gate not enforced, nudge only.`);

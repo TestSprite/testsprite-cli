@@ -6,6 +6,7 @@ import { ApiError } from '../lib/errors.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import {
   type CliProject,
+  type CliCreateProjectResponse,
   type CliDeleteProjectResponse,
   type CliUpdateProjectResponse,
   createProjectCommand,
@@ -16,6 +17,7 @@ import {
   runGet,
   runList,
   runUpdate,
+  parseTestIdAttributesFlag,
 } from './project.js';
 
 const PROJECT_FIXTURE: CliProject = {
@@ -76,10 +78,20 @@ describe('createProjectCommand', () => {
     errorSpy.mockRestore();
   });
 
-  it('exposes list, get, create, update, delete, credential and auto-auth subcommands', () => {
+  it('exposes list, get, create, update, delete, credential, auto-auth, docs and env subcommands', () => {
     const project = createProjectCommand();
     const names = project.commands.map(c => c.name()).sort();
-    expect(names).toEqual(['auto-auth', 'create', 'credential', 'delete', 'get', 'list', 'update']);
+    expect(names).toEqual([
+      'auto-auth',
+      'create',
+      'credential',
+      'delete',
+      'docs',
+      'env',
+      'get',
+      'list',
+      'update',
+    ]);
   });
 
   it('list exposes the pagination flags from the design contract', () => {
@@ -399,6 +411,165 @@ describe('runList', () => {
   });
 });
 
+describe('runList — org attribution (ORG column)', () => {
+  it('adds the ORG column only when at least one row carries orgId', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: {
+        items: [{ ...PROJECT_FIXTURE, orgId: 'org_1', orgName: 'Acme Corp' }],
+        nextToken: null,
+      },
+    }));
+
+    const out: string[] = [];
+    await runList(
+      { profile: 'default', output: 'text', debug: false, pageSize: 25 },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    const block = out.join('\n');
+    expect(block).toContain('ORG');
+    expect(block).toContain('Acme Corp');
+  });
+
+  it('omits the ORG column entirely for a legacy (non-org-scoped) response', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [PROJECT_FIXTURE], nextToken: null },
+    }));
+
+    const out: string[] = [];
+    await runList(
+      { profile: 'default', output: 'text', debug: false, pageSize: 25 },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    expect(out.join('\n')).not.toContain('ORG');
+  });
+
+  it('falls back to orgId when orgName is absent', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [{ ...PROJECT_FIXTURE, orgId: 'org_1' }], nextToken: null },
+    }));
+
+    const out: string[] = [];
+    await runList(
+      { profile: 'default', output: 'text', debug: false, pageSize: 25 },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    const block = out.join('\n');
+    expect(block).toContain('ORG');
+    expect(block).toContain('org_1');
+  });
+
+  it('an explicit --columns org still renders the column on a legacy (no-org-data) page', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [PROJECT_FIXTURE], nextToken: null },
+    }));
+
+    const out: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        pageSize: 25,
+        columns: 'name,org',
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    // No org data on this row -> the ORG cell renders empty, but the column
+    // (and the explicit selection) is still honored, not rejected.
+    expect(out.join('\n')).toMatch(/^Checkout\s*$/);
+  });
+
+  it('JSON output passes orgId/orgName through verbatim', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: {
+        items: [{ ...PROJECT_FIXTURE, orgId: 'org_1', orgName: 'Acme Corp' }],
+        nextToken: null,
+      },
+    }));
+
+    const out: string[] = [];
+    await runList(
+      { profile: 'default', output: 'json', debug: false, pageSize: 25 },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    const parsed = JSON.parse(out.join('\n')) as { items: CliProject[] };
+    expect(parsed.items[0]!.orgId).toBe('org_1');
+    expect(parsed.items[0]!.orgName).toBe('Acme Corp');
+  });
+});
+
+describe('runGet — org attribution', () => {
+  it('renders an `org:` line when the project carries orgId/orgName', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { ...PROJECT_FIXTURE, orgId: 'org_1', orgName: 'Acme Corp' },
+    }));
+
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, projectId: PROJECT_FIXTURE.id },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    expect(out.join('\n')).toContain('org:         Acme Corp (org_1)');
+  });
+
+  it('falls back to "(name unknown)" when orgId is present but orgName is absent', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { ...PROJECT_FIXTURE, orgId: 'org_1' },
+    }));
+
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, projectId: PROJECT_FIXTURE.id },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    expect(out.join('\n')).toContain('org:         (name unknown) (org_1)');
+  });
+
+  it('omits the `org:` line entirely when the project has no org attribution', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: PROJECT_FIXTURE }));
+
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, projectId: PROJECT_FIXTURE.id },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    expect(out.join('\n')).not.toContain('org:');
+    expect(out.join('\n')).not.toContain('undefined');
+  });
+
+  it('JSON output passes orgId/orgName through verbatim', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { ...PROJECT_FIXTURE, orgId: 'org_1', orgName: 'Acme Corp' },
+    }));
+
+    const project = await runGet(
+      { profile: 'default', output: 'json', debug: false, projectId: PROJECT_FIXTURE.id },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+
+    expect(project.orgId).toBe('org_1');
+    expect(project.orgName).toBe('Acme Corp');
+  });
+});
+
 describe('DEV-244 — project update no longer accepts the dead --description flag', () => {
   it('rejects --description on `project update` as an unknown option', async () => {
     const project = createProjectCommand();
@@ -484,6 +655,70 @@ describe('runGet', () => {
     expect(block).toContain('createdFrom: portal');
   });
 
+  it('renders a configured targetUrl', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { ...PROJECT_FIXTURE, targetUrl: 'https://staging.example.com' },
+    }));
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, projectId: 'project_b3c91efa' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    expect(out.join('\n')).toContain('targetUrl:   https://staging.example.com');
+  });
+
+  it('renders an explicit null targetUrl as "(not set)" with the fix-it command', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { ...PROJECT_FIXTURE, targetUrl: null } }));
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, projectId: 'project_b3c91efa' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    const block = out.join('\n');
+    expect(block).toContain('targetUrl:   (not set');
+    expect(block).toContain('testsprite project update project_b3c91efa --url <url>');
+  });
+
+  it('offers the same fix-it for a BACKEND project with a null targetUrl (the V3 case, where it works)', async () => {
+    // A null on a backend project only ever comes from V3, where the default
+    // environment URL is real, settable, and exactly what the run guard checks —
+    // so the `--url` remedy is correct there. V2 never sends null for a backend
+    // project (it omits the key, because a V2 backend run resolves no project URL
+    // and the remedy would change nothing) — which is why this renderer can print
+    // one message for `null` without asking which execution path it came from.
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { ...PROJECT_FIXTURE, type: 'backend', targetUrl: null },
+    }));
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, projectId: 'project_b3c91efa' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    const block = out.join('\n');
+    expect(block).toContain('type:        backend');
+    expect(block).toContain('testsprite project update project_b3c91efa --url <url>');
+  });
+
+  // NOTE: a guard, not a proof — this assertion also holds on the pre-change
+  // renderer (which had no targetUrl line at all). It exists so a future edit
+  // cannot switch the presence check to a truthiness check without going red.
+  it('says nothing about targetUrl when the backend omits the field (older backend, or `project list`)', async () => {
+    const { credentialsPath } = makeCreds();
+    // PROJECT_FIXTURE deliberately has no targetUrl key — an absent field must
+    // NOT render as "(not set)", or every project on a pre-field backend reads
+    // as URL-less, including the ones that have a URL.
+    const fetchImpl = makeFetch(() => ({ body: PROJECT_FIXTURE }));
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, projectId: 'project_b3c91efa' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    expect(out.join('\n')).not.toContain('targetUrl');
+  });
+
   it('NOT_FOUND envelope from server propagates as ApiError exit 4', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(() => ({
@@ -529,6 +764,70 @@ describe('runGet', () => {
 // ---------------------------------------------------------------------------
 
 describe('runCreate', () => {
+  // A loopback --url on CREATE is refused outright: the opt-in for an app on
+  // this machine is `--local <port>` (see project.local.spec.ts), which builds
+  // the loopback URL itself and marks the project `originMode: 'local'`.
+  // `--url http://localhost:…` therefore has no accepted form here — the
+  // refusal points at `--local`. RFC1918 and friends stay rejected either way.
+  it.each(['http://localhost:3123', 'http://127.0.0.1:5173', 'http://[::1]:5173'])(
+    'refuses %s as --url and points at --local <port>',
+    async targetUrl => {
+      await expect(
+        runCreate(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            dryRun: true,
+            type: 'frontend',
+            name: 'Local App',
+            targetUrl,
+          },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        nextAction: expect.stringContaining('Use --local <port> instead of --url'),
+      });
+    },
+  );
+
+  it('names --url and project create help when rejecting a private-network project URL', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network — validation must fire client-side');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: true,
+          type: 'frontend',
+          name: 'Local App',
+          targetUrl: 'http://10.0.0.5:3123',
+        },
+        {
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      nextAction: expect.stringContaining('See `testsprite project create --help`'),
+      details: {
+        field: 'url',
+        reason: expect.any(String),
+        hint: expect.any(String),
+      },
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('P6 FE happy — POSTs /projects with type=frontend + name + idempotency header', async () => {
     const { credentialsPath } = makeCreds();
     const sentBodies: unknown[] = [];
@@ -779,6 +1078,250 @@ describe('runCreate', () => {
     ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  describe('backend project without --url — dead-on-arrival advisory (dogfood 2026-07-30)', () => {
+    it('emits [advisory] on stderr naming no-target-resolvable + the copy-pasteable fix, with the real created project id', async () => {
+      const { credentialsPath } = makeCreds();
+      const createdProject: CliProject = {
+        ...PROJECT_FIXTURE,
+        id: 'proj_be_nourl',
+        type: 'backend',
+        name: 'No URL BE',
+      };
+      const fetchImpl = makeFetch(() => ({ body: createdProject }));
+      const stderrLines: string[] = [];
+
+      await runCreate(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          type: 'backend',
+          name: 'No URL BE',
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+      );
+
+      const advisory = stderrLines.find(l => l.includes('[advisory]'));
+      expect(advisory).toBeDefined();
+      expect(advisory).toContain('no-target-resolvable');
+      expect(advisory).toContain('testsprite project update proj_be_nourl --url <url>');
+      // The guard that produces no-target-resolvable only applies on the V3
+      // execution path (V2 backend runs never resolve a project URL at all),
+      // so the claim must be scoped, not stated as universal — and it must
+      // point the reader at how to check which path they're on.
+      expect(advisory).toContain('V3');
+      expect(advisory).toContain('auth status');
+    });
+
+    it('does NOT emit the advisory when --url is supplied for a backend project', async () => {
+      const { credentialsPath } = makeCreds();
+      const createdProject: CliProject = {
+        ...PROJECT_FIXTURE,
+        id: 'proj_be_withurl',
+        type: 'backend',
+        name: 'With URL BE',
+      };
+      const fetchImpl = makeFetch(() => ({ body: createdProject }));
+      const stderrLines: string[] = [];
+
+      await runCreate(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          type: 'backend',
+          name: 'With URL BE',
+          targetUrl: 'https://staging.example.com',
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+      );
+
+      expect(
+        stderrLines.some(l => l.includes('[advisory]') && l.includes('no-target-resolvable')),
+      ).toBe(false);
+    });
+
+    it('does NOT emit the advisory for a frontend project (--url is already required there)', async () => {
+      const { credentialsPath } = makeCreds();
+      const createdProject: CliProject = {
+        ...PROJECT_FIXTURE,
+        id: 'proj_fe',
+        type: 'frontend',
+        name: 'FE Project',
+      };
+      const fetchImpl = makeFetch(() => ({ body: createdProject }));
+      const stderrLines: string[] = [];
+
+      await runCreate(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          type: 'frontend',
+          name: 'FE Project',
+          targetUrl: 'https://staging.example.com',
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+      );
+
+      expect(
+        stderrLines.some(l => l.includes('[advisory]') && l.includes('no-target-resolvable')),
+      ).toBe(false);
+    });
+
+    it('emits the advisory to stderr in --output json mode too, while stdout stays valid parseable JSON with no advisory text', async () => {
+      // The advisory goes to stderr, which no output mode ever routes into
+      // stdout — there is nothing for a --output json gate to protect, and
+      // --output json is exactly the non-interactive/agent/CI case where a
+      // silent dead-on-arrival project is most costly (nobody is watching a
+      // terminal for a warning that never fires).
+      const { credentialsPath } = makeCreds();
+      const createdProject: CliProject = {
+        ...PROJECT_FIXTURE,
+        id: 'proj_be_json',
+        type: 'backend',
+        name: 'JSON BE',
+      };
+      const fetchImpl = makeFetch(() => ({ body: createdProject }));
+      const stderrLines: string[] = [];
+      const stdoutLines: string[] = [];
+
+      const result = await runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'backend',
+          name: 'JSON BE',
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: line => stdoutLines.push(line),
+          stderr: line => stderrLines.push(line),
+        },
+      );
+
+      expect(result.type).toBe('backend');
+      expect(
+        stderrLines.some(l => l.includes('[advisory]') && l.includes('no-target-resolvable')),
+      ).toBe(true);
+
+      // Pipeline-contract assertion: stdout is still exactly one valid,
+      // parseable JSON payload — the advisory never leaks into it.
+      expect(stdoutLines).toHaveLength(1);
+      const parsed: unknown = JSON.parse(stdoutLines[0]!);
+      expect((parsed as CliCreateProjectResponse).type).toBe('backend');
+      expect(stdoutLines[0]).not.toContain('[advisory]');
+    });
+
+    it('does NOT emit the advisory under --dry-run (the remedy would embed the fake dry-run project id)', async () => {
+      resetDryRunBannerForTesting();
+      const { credentialsPath } = makeCreds();
+      const fetchImpl = vi.fn(async () => {
+        throw new Error('should not hit network in dry-run');
+      });
+      const stderrLines: string[] = [];
+
+      await runCreate(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          dryRun: true,
+          type: 'backend',
+          name: 'DryRun BE No URL',
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: line => stderrLines.push(line),
+        },
+      );
+
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(
+        stderrLines.some(l => l.includes('[advisory]') && l.includes('no-target-resolvable')),
+      ).toBe(false);
+    });
+  });
+
+  describe('id-field normalization', () => {
+    it('backfills `id` when the live response only carries `projectId`', async () => {
+      const { credentialsPath } = makeCreds();
+      const fetchImpl = makeFetch(() => ({
+        body: {
+          projectId: 'proj_live_shape',
+          type: 'frontend',
+          name: 'Live Shape Project',
+          createdFrom: 'cli',
+          createdAt: '2026-07-16T00:00:00.000Z',
+        },
+      }));
+
+      const result = await runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'frontend',
+          name: 'Live Shape Project',
+          targetUrl: 'https://example.com',
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      );
+
+      expect(result.projectId).toBe('proj_live_shape');
+      expect(result.id).toBe('proj_live_shape');
+    });
+
+    it('backfills `projectId` when the live response only carries `id` (pre-fix shape)', async () => {
+      const { credentialsPath } = makeCreds();
+      const createdProject: CliProject = {
+        ...PROJECT_FIXTURE,
+        id: 'proj_legacy_shape',
+      };
+      const fetchImpl = makeFetch(() => ({ body: createdProject }));
+
+      const result = await runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'frontend',
+          name: 'Legacy Shape Project',
+          targetUrl: 'https://example.com',
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      );
+
+      expect(result.id).toBe('proj_legacy_shape');
+      expect(result.projectId).toBe('proj_legacy_shape');
+    });
+
+    it('--dry-run sample teaches both id field names', async () => {
+      resetDryRunBannerForTesting();
+      const { credentialsPath } = makeCreds();
+      const result = await runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: true,
+          type: 'frontend',
+          name: 'DryRun Shape Project',
+          targetUrl: 'https://example.com',
+        },
+        { credentialsPath, stdout: () => {}, stderr: () => {} },
+      );
+
+      expect(typeof result.projectId).toBe('string');
+      expect(typeof result.id).toBe('string');
+      expect(result.projectId).toBe(result.id);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -829,6 +1372,107 @@ describe('runUpdate', () => {
     expect(body.name).toBe('New Name');
     // User-supplied idempotency key is NOT echoed to stderr (P2-6).
     expect(stderrLines.some(l => l.includes('idem-upd-001'))).toBe(false);
+  });
+
+  it('sends testIdAttributes as an ordered list; --clear sends null', async () => {
+    const { credentialsPath } = makeCreds();
+    const sentBodies: unknown[] = [];
+    const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      if (init.body) sentBodies.push(JSON.parse(init.body as string) as unknown);
+      return new Response(
+        JSON.stringify({ projectId: 'proj_abc', updatedFields: ['testIdAttributes'] }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        },
+      );
+    }) as typeof fetch;
+    const deps = { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} };
+    const base = {
+      profile: 'default',
+      output: 'json' as const,
+      debug: false,
+      projectId: 'proj_abc',
+    };
+
+    await runUpdate({ ...base, testIdAttributes: ['data-element', 'data-testid'] }, deps);
+    expect(sentBodies[0]).toEqual({ testIdAttributes: ['data-element', 'data-testid'] });
+
+    await runUpdate({ ...base, clearTestIdAttributes: true }, deps);
+    expect(sentBodies[1]).toEqual({ testIdAttributes: null });
+  });
+
+  it("translates an older backend's generic 400 into UNSUPPORTED when testIdAttributes was sent", async () => {
+    const { credentialsPath } = makeCreds();
+    const envelope = {
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Invalid request.',
+        nextAction:
+          'Field `body` is invalid: at least one field must be provided (name, targetUrl, username, password, instruction).',
+        requestId: 'cli_old_backend',
+        details: {
+          field: 'body',
+          reason:
+            'at least one field must be provided (name, targetUrl, username, password, instruction)',
+          accepted: ['name', 'targetUrl', 'username', 'password', 'instruction'],
+        },
+      },
+    };
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify(envelope), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof fetch;
+    const deps = { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} };
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          testIdAttributes: ['data-element'],
+        },
+        deps,
+      ),
+    ).rejects.toMatchObject({
+      code: 'UNSUPPORTED',
+      details: { reason: 'test_id_attributes_unsupported_backend' },
+    });
+    // The same 400 without our flag in play stays a plain VALIDATION_ERROR.
+    await expect(
+      runUpdate(
+        { profile: 'default', output: 'json', debug: false, projectId: 'proj_abc', name: 'x' },
+        deps,
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
+  it('rejects --test-id-attributes together with --clear-test-id-attributes before any request', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not be called');
+    });
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          testIdAttributes: ['data-element'],
+          clearTestIdAttributes: true,
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('P7 — exits 5 VALIDATION_ERROR when no mutable flag is supplied', async () => {
@@ -1041,6 +1685,194 @@ describe('runUpdate', () => {
 
     expect(result.id).toBe('proj_json_no_fields');
     expect(result.updatedFields).toBeUndefined();
+  });
+
+  describe('id-field normalization', () => {
+    it('backfills `id` when the live response only carries `projectId`', async () => {
+      const { credentialsPath } = makeCreds();
+      const fetchImpl = makeFetch(() => ({
+        body: {
+          projectId: 'proj_live_update_shape',
+          updatedFields: ['name'],
+          updatedAt: '2026-07-16T00:00:00.000Z',
+        },
+      }));
+
+      const result = await runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_live_update_shape',
+          name: 'New Name',
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      );
+
+      expect(result.projectId).toBe('proj_live_update_shape');
+      expect(result.id).toBe('proj_live_update_shape');
+    });
+
+    it('backfills `projectId` when the live response only carries `id` (pre-fix shape)', async () => {
+      const { credentialsPath } = makeCreds();
+      const fetchImpl = makeFetch(() => ({
+        body: {
+          id: 'proj_legacy_update_shape',
+          updatedFields: ['name'],
+          updatedAt: '2026-07-16T00:00:00.000Z',
+        },
+      }));
+
+      const result = await runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_legacy_update_shape',
+          name: 'New Name',
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      );
+
+      expect(result.id).toBe('proj_legacy_update_shape');
+      expect(result.projectId).toBe('proj_legacy_update_shape');
+    });
+
+    it('--dry-run sample teaches both id field names', async () => {
+      resetDryRunBannerForTesting();
+      const { credentialsPath } = makeCreds();
+      const result = await runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: true,
+          projectId: 'proj_dryrun_update_shape',
+          name: 'New Name',
+        },
+        { credentialsPath, stdout: () => {}, stderr: () => {} },
+      );
+
+      expect(result.projectId).toBe('proj_dryrun_update_shape');
+      expect(result.id).toBe('proj_dryrun_update_shape');
+    });
+  });
+});
+
+describe('#79 — an unreadable --password-file is a validation error, not a crash', () => {
+  const missing = join(tmpdir(), 'testsprite-issue-79-absent-password-file');
+
+  it('runCreate rejects a missing file with VALIDATION_ERROR (exit 5) before the network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'backend',
+          name: 'Guarded',
+          passwordFile: missing,
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('runUpdate rejects a missing file with VALIDATION_ERROR (exit 5) before the network', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network');
+    });
+
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_guarded',
+          passwordFile: missing,
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('names the flag in nextAction instead of leaking a raw ENOENT', async () => {
+    const { credentialsPath } = makeCreds();
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'backend',
+          name: 'Guarded',
+          passwordFile: missing,
+        },
+        {
+          credentialsPath,
+          fetchImpl: (async () => {
+            throw new Error('should not hit network');
+          }) as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({
+      nextAction: expect.stringContaining('--password-file') as unknown as string,
+    });
+  });
+
+  it('still reads a password file that exists', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-p79-'));
+    const passwordFile = join(dir, 'pw.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (dir), not user input.
+    writeFileSync(passwordFile, 'from-file\n');
+
+    const sentBodies: unknown[] = [];
+    const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      if (init.body) sentBodies.push(JSON.parse(init.body as string) as unknown);
+      return new Response(JSON.stringify({ ...PROJECT_FIXTURE, id: 'proj_pw' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        type: 'backend',
+        name: 'Guarded',
+        passwordFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+
+    expect((sentBodies[0] as Record<string, unknown>).password).toBe('from-file');
   });
 });
 
@@ -1421,5 +2253,144 @@ describe('dogfood 2026-06-30 — whitespace-only --name is rejected (parity with
         { credentialsPath, fetchImpl: makeFetch(noNetwork), stdout: () => {}, stderr: () => {} },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+});
+
+describe('parseTestIdAttributesFlag', () => {
+  it('splits, trims, de-duplicates and keeps priority order', () => {
+    expect(
+      parseTestIdAttributesFlag(' data-element, data-testid ,data-element', 'test-id-attributes'),
+    ).toEqual(['data-element', 'data-testid']);
+  });
+
+  it('rejects invalid attribute names and empty lists with a VALIDATION_ERROR', () => {
+    for (const raw of ['bad name', '[data-element]', '', ' , ']) {
+      expect(() => parseTestIdAttributesFlag(raw, 'test-id-attributes')).toThrowError(
+        expect.objectContaining({ code: 'VALIDATION_ERROR' }),
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// project update --local <port> — one spelling for "an app on this machine",
+// on update exactly as on create
+// ---------------------------------------------------------------------------
+
+describe('runUpdate — --local <port>', () => {
+  function recording(response: unknown = { projectId: 'proj_abc', updatedFields: ['targetUrl'] }) {
+    const bodies: unknown[] = [];
+    const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      if (init.body) bodies.push(JSON.parse(init.body as string) as unknown);
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    return { bodies, fetchImpl };
+  }
+  const base = { profile: 'default', output: 'json' as const, debug: false, projectId: 'proj_abc' };
+  const quiet = { stdout: () => {}, stderr: () => {} };
+
+  it('builds the loopback URL, probes the port once, and sends the local marker', async () => {
+    const { credentialsPath } = makeCreds();
+    const { bodies, fetchImpl } = recording();
+    const connect = vi.fn(async () => {});
+    await runUpdate(
+      { ...base, local: '3000' },
+      { credentialsPath, fetchImpl, localPortProbeDeps: { connect }, ...quiet },
+    );
+    expect(connect).toHaveBeenCalledWith('127.0.0.1', 3000, 2000);
+    expect(bodies[0]).toEqual({ targetUrl: 'http://127.0.0.1:3000', originMode: 'local' });
+  });
+
+  it('--local-host selects the stored host; --skip-preflight dials nothing', async () => {
+    const { credentialsPath } = makeCreds();
+    const { bodies, fetchImpl } = recording();
+    const connect = vi.fn(async () => {
+      throw new Error('no listener');
+    });
+    await runUpdate(
+      { ...base, local: '3000', localHost: '::1', skipPreflight: true },
+      { credentialsPath, fetchImpl, localPortProbeDeps: { connect }, ...quiet },
+    );
+    expect(connect).not.toHaveBeenCalled();
+    expect(bodies[0]).toEqual({ targetUrl: 'http://[::1]:3000', originMode: 'local' });
+  });
+
+  it('refuses a dead port before any request, naming the URL and the bypass', async () => {
+    const { credentialsPath } = makeCreds();
+    const { bodies, fetchImpl } = recording();
+    const connect = vi.fn(async () => {
+      throw new Error('ECONNREFUSED');
+    });
+    await expect(
+      runUpdate(
+        { ...base, local: '3000' },
+        { credentialsPath, fetchImpl, localPortProbeDeps: { connect }, ...quiet },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      message:
+        'Nothing is listening on http://127.0.0.1:3000. Start your app first, or pass --skip-preflight.',
+    });
+    expect(bodies).toEqual([]);
+  });
+
+  it.each([
+    [
+      { local: '3000', targetUrl: 'https://example.com' },
+      '--local and --url are mutually exclusive',
+    ],
+    [{ localHost: 'localhost', targetUrl: 'https://example.com' }, '--local-host requires --local'],
+    [{ local: '65536' }, 'must be a port number between 1 and 65535'],
+    [{ local: '3000', localHost: 'example.com' }, 'must name your own machine'],
+  ])('refuses %j before TCP or HTTP', async (flags, explanation) => {
+    const { credentialsPath } = makeCreds();
+    const { bodies, fetchImpl } = recording();
+    const connect = vi.fn(async () => {});
+    const error = await runUpdate(
+      { ...base, ...flags },
+      { credentialsPath, fetchImpl, localPortProbeDeps: { connect }, ...quiet },
+    ).catch(e => e as ApiError);
+    expect((error as ApiError).code).toBe('VALIDATION_ERROR');
+    expect(`${(error as ApiError).message} ${(error as ApiError).nextAction}`).toContain(
+      explanation,
+    );
+    expect(bodies).toEqual([]);
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it('a loopback --url is refused and redirected to --local, as on create', async () => {
+    const { credentialsPath } = makeCreds();
+    const { bodies, fetchImpl } = recording();
+    const error = await runUpdate(
+      { ...base, targetUrl: 'http://localhost:3000' },
+      { credentialsPath, fetchImpl, ...quiet },
+    ).catch(e => e as ApiError);
+    expect((error as ApiError).details).toMatchObject({ field: 'url' });
+    expect((error as ApiError).nextAction).toContain('Use --local <port> instead of --url');
+    expect(bodies).toEqual([]);
+  });
+
+  it('dry-run validates the flags, dials nothing, and prints the run-it-locally hint', async () => {
+    const { credentialsPath } = makeCreds();
+    const { bodies, fetchImpl } = recording();
+    const connect = vi.fn(async () => {});
+    const out: string[] = [];
+    const res = await runUpdate(
+      { ...base, output: 'text', dryRun: true, local: '3000' },
+      {
+        credentialsPath,
+        fetchImpl,
+        localPortProbeDeps: { connect },
+        stdout: l => out.push(l),
+        stderr: () => {},
+      },
+    );
+    expect(res.updatedFields).toEqual(['targetUrl']);
+    expect(connect).not.toHaveBeenCalled();
+    expect(bodies).toEqual([]);
+    expect(out.join('\n')).toContain('testsprite test run <test-id> --local 3000');
   });
 });

@@ -14,7 +14,7 @@
  * tunnel, would re-implement what undici ships and maintains.
  */
 import type { Dispatcher } from 'undici';
-import { EnvHttpProxyAgent, setGlobalDispatcher } from 'undici';
+import { EnvHttpProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 
 export interface ProxyDeps {
   env?: NodeJS.ProcessEnv;
@@ -55,4 +55,23 @@ export function maybeInstallProxyAgent(deps: ProxyDeps = {}): boolean {
     );
     return false;
   }
+}
+
+/**
+ * Whether the currently-installed global dispatcher is the proxy-aware
+ * agent `maybeInstallProxyAgent` installs — i.e., whether a proxy is
+ * actually wired up for outgoing `fetch()` calls in this process, not
+ * merely whether an `HTTP(S)_PROXY` env var happens to be set.
+ *
+ * This distinction matters: a CI runner can export `HTTPS_PROXY` for
+ * unrelated registry/package-manager egress without that value ever
+ * reaching this CLI's proxy path (e.g. it ran before `maybeInstallProxyAgent`
+ * executed, or `install()` threw and fell back to the default dispatcher).
+ * Consumers that need to know "is my request actually going through a
+ * proxy" — the target-url reachability preflight's refuse→warn downgrade,
+ * specifically — must check this, not the env var, or an unrelated,
+ * unexercised proxy variable silently defangs their guard.
+ */
+export function isProxyAgentActive(): boolean {
+  return getGlobalDispatcher() instanceof EnvHttpProxyAgent;
 }

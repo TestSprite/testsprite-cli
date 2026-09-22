@@ -18,6 +18,7 @@
  */
 import type {
   CliProject,
+  CliCreateProjectResponse,
   CliUpdateProjectResponse,
   CliDeleteProjectResponse,
 } from '../../commands/project.js';
@@ -31,6 +32,8 @@ import type {
   CliTestStep,
 } from '../../commands/test.js';
 import type { MeResponse } from '../../commands/auth.js';
+import { ApiError } from '../errors.js';
+import type { CliSchedule, CliScheduleRun } from '../../commands/schedule.js';
 import { buildJUnitReport } from '../junit-report.js';
 import type { Page } from '../pagination.js';
 import type {
@@ -42,6 +45,11 @@ import type {
   ListRunsResponse,
   CancelRunResponse,
 } from '../runs.types.js';
+import type {
+  CliAcceptPlansResponse,
+  CliGeneratePlansResponse,
+  CliGetPlansResponse,
+} from '../plans.types.js';
 
 const SAMPLE_USER_ID = '11111111-1111-4111-8111-111111111111';
 const SAMPLE_KEY_ID = 'key_dryrun_2026';
@@ -52,6 +60,12 @@ const SAMPLE_TEST_ID_FAILED = 'test_8f2a4d10';
 const SAMPLE_TEST_ID_PASSED = 'test_3a91bb02';
 const SAMPLE_TEST_ID_BLOCKED = 'test_blocked_4f7a';
 export const SAMPLE_RUN_ID = 'run_abc';
+const SAMPLE_SCHEDULE_ID = 'sch_7d21ac48';
+const SAMPLE_SCHEDULE_RUN_ID = 'exec_5c08f1b2';
+// Documented sentinel for `test steps --run-id run_failed_sample --dry-run`:
+// keeps wait flows on the default passed sample while still demonstrating a
+// run-scoped failed step offline.
+const SAMPLE_FAILED_RUN_ID = 'run_failed_sample';
 // M3.4 rerun dry-run sample IDs
 const SAMPLE_RERUN_ID_BE_NAMED = 'run_rerun_be_named';
 const SAMPLE_RERUN_ID_BE_PRODUCER = 'run_rerun_be_producer';
@@ -110,17 +124,28 @@ const me: MeResponse = {
   scopes: ['read:projects', 'read:tests', 'write:tests', 'run:tests'],
   env: 'development',
   v3Enabled: true,
+  activeOrg: {
+    id: '22222222-2222-4222-8222-222222222222',
+    name: 'Dry Run Workspace',
+    plan: 'Standard',
+    role: 'owner',
+    remaining: 1650,
+    includedCredits: 1600,
+    seats: 1,
+  },
+};
+
+const checkoutProject: CliProject = {
+  id: SAMPLE_PROJECT_ID,
+  name: 'Checkout',
+  type: 'frontend',
+  createdFrom: 'portal',
+  createdAt: '2026-04-15T10:23:00.000Z',
+  updatedAt: '2026-05-05T08:12:00.000Z',
 };
 
 const projects: CliProject[] = [
-  {
-    id: SAMPLE_PROJECT_ID,
-    name: 'Checkout',
-    type: 'frontend',
-    createdFrom: 'portal',
-    createdAt: '2026-04-15T10:23:00.000Z',
-    updatedAt: '2026-05-05T08:12:00.000Z',
-  },
+  checkoutProject,
   {
     id: SAMPLE_PROJECT_ID_BACKEND,
     name: 'Internal API',
@@ -130,6 +155,36 @@ const projects: CliProject[] = [
     updatedAt: '2026-05-04T19:30:00.000Z',
   },
 ];
+
+const schedule: CliSchedule = {
+  scheduleId: SAMPLE_SCHEDULE_ID,
+  name: 'Nightly checkout',
+  enabled: true,
+  targetType: 'project',
+  targetId: SAMPLE_PROJECT_ID,
+  cron: '0 3 * * *',
+  timezone: 'UTC',
+  startAt: '2026-05-01T00:00:00.000Z',
+  endAt: null,
+  sendTo: null,
+  autoPausedAt: null,
+  lastRunId: SAMPLE_SCHEDULE_RUN_ID,
+  createdAt: '2026-05-01T00:00:00.000Z',
+  updatedAt: '2026-05-02T00:00:00.000Z',
+};
+
+// A finished run with one failure — more instructive for a dry-run learner than
+// an all-green one, since it shows how the per-status counts relate to `status`.
+const scheduleRun: CliScheduleRun = {
+  runId: SAMPLE_SCHEDULE_RUN_ID,
+  scheduleId: SAMPLE_SCHEDULE_ID,
+  status: 'failed',
+  projectId: SAMPLE_PROJECT_ID,
+  testListId: null,
+  stats: { total: 4, passed: 3, failed: 1, blocked: 0, running: 0, cancelled: 0 },
+  createdAt: '2026-05-02T03:00:00.000Z',
+  updatedAt: '2026-05-02T03:06:41.000Z',
+};
 
 const tests: CliTest[] = [
   {
@@ -347,6 +402,118 @@ const failureSummary: CliFailureSummary = {
   recommendedFixTarget: failureContext.failure.recommendedFixTarget,
 };
 
+const passedRunSample: RunResponse = {
+  runId: SAMPLE_RUN_ID,
+  testId: SAMPLE_TEST_ID_PASSED,
+  projectId: SAMPLE_PROJECT_ID,
+  userId: SAMPLE_USER_ID,
+  status: 'passed',
+  source: 'cli',
+  createdAt: '2026-05-15T19:32:00.000Z',
+  startedAt: '2026-05-15T19:32:05.000Z',
+  finishedAt: '2026-05-15T19:34:00.000Z',
+  codeVersion: 'v1',
+  targetUrl: SAMPLE_TARGET_URL,
+  createdFrom: null,
+  failedStepIndex: null,
+  failureKind: null,
+  error: null,
+  videoUrl: null,
+  stepSummary: {
+    total: 2,
+    completed: 2,
+    passedCount: 2,
+    failedCount: 0,
+  },
+  // Representative per-run steps so `test steps --run-id <id> --dry-run`
+  // demonstrates real output instead of an empty list (the generic
+  // `/runs/{runId}` sample is also used by `test wait`, which ignores steps).
+  steps: [
+    {
+      stepIndex: '0001',
+      type: 'action',
+      action: 'navigate',
+      status: 'passed',
+      description: 'Open the target URL',
+      error: null,
+      screenshotUrl: null,
+      htmlSnapshotUrl: null,
+      createdAt: '2026-05-15T19:32:10.000Z',
+    },
+    {
+      stepIndex: '0002',
+      type: 'assertion',
+      action: 'assert_visible',
+      status: 'passed',
+      description: 'Dashboard heading is visible',
+      error: null,
+      screenshotUrl: null,
+      htmlSnapshotUrl: null,
+      createdAt: '2026-05-15T19:32:20.000Z',
+    },
+  ],
+};
+
+const failedRunSample: RunResponse = {
+  runId: SAMPLE_FAILED_RUN_ID,
+  testId: SAMPLE_TEST_ID_FAILED,
+  projectId: SAMPLE_PROJECT_ID,
+  userId: SAMPLE_USER_ID,
+  status: 'failed',
+  source: 'cli',
+  createdAt: '2026-05-15T19:32:00.000Z',
+  startedAt: '2026-05-15T19:32:05.000Z',
+  finishedAt: '2026-05-15T19:34:00.000Z',
+  codeVersion: 'v1',
+  targetUrl: SAMPLE_TARGET_URL,
+  createdFrom: null,
+  failedStepIndex: 3,
+  failureKind: 'assertion',
+  error: 'Expected billing status badge to be visible, but it was not found.',
+  videoUrl: null,
+  stepSummary: {
+    total: 3,
+    completed: 3,
+    passedCount: 2,
+    failedCount: 1,
+  },
+  steps: [
+    {
+      stepIndex: '0001',
+      type: 'action',
+      action: 'navigate',
+      status: 'passed',
+      description: 'Open the target URL',
+      error: null,
+      screenshotUrl: null,
+      htmlSnapshotUrl: null,
+      createdAt: '2026-05-15T19:32:10.000Z',
+    },
+    {
+      stepIndex: '0002',
+      type: 'assertion',
+      action: 'assert_visible',
+      status: 'passed',
+      description: 'Dashboard heading is visible',
+      error: null,
+      screenshotUrl: null,
+      htmlSnapshotUrl: null,
+      createdAt: '2026-05-15T19:32:20.000Z',
+    },
+    {
+      stepIndex: '0003',
+      type: 'assertion',
+      action: 'assert_visible',
+      status: 'failed',
+      description: 'Billing status badge is visible',
+      error: 'Expected billing status badge to be visible, but it was not found.',
+      screenshotUrl: null,
+      htmlSnapshotUrl: null,
+      createdAt: '2026-05-15T19:32:30.000Z',
+    },
+  ],
+};
+
 /**
  * Dry-run sample lookup keyed by OpenAPI operationId. Order matters in
  * {@link findSample}: more specific patterns must precede their generic
@@ -386,19 +553,122 @@ const PATH_PREFIX = '/api/cli/v1';
 const ENTRIES: DryRunSampleEntry[] = [
   entry('whoami', 'GET', '/me', me),
   entry('listProjects', 'GET', '/projects', pageOf(projects)),
-  entry('getProject', 'GET', '/projects/{projectId}', projects[0]),
+  // DEV-384 V3-B — plan-generation surface. All three MUST be registered
+  // BEFORE `getProject`: findSample is first-match-wins and the projects/*
+  // family shares the `/projects/…` prefix, so the more specific plans
+  // paths are listed first (same defensive convention as `/tests/{id}/runs`
+  // before the `/tests/{id}` catch-all; `samples.test.ts` proves the
+  // ordering with shadowing tests).
+  //
+  // The trigger sample reports the PROPOSALS rung starting
+  // (`stagesRemaining: []`) and the plans sample shows the settled result
+  // (idle + two staged proposals), so a dry-run learner sees a coherent
+  // story: trigger → stage runs → staged batch with stable proposalIds.
+  entry('generatePlans', 'POST', '/projects/{projectId}/plans/generate', {
+    status: 'accepted',
+    projectId: SAMPLE_PROJECT_ID,
+    stage: 'proposals',
+    stagesRemaining: [],
+    enqueuedAt: '2026-07-28T09:00:00.000Z',
+  } satisfies CliGeneratePlansResponse),
+  // One frontend proposal (with action/assertion steps) and one backend
+  // proposal (with endpointPath/captures/consumes) so both wire shapes are
+  // learnable offline. `credits` shows the charged-actions breakdown the
+  // real facade fills best-effort.
+  entry('getPlans', 'GET', '/projects/{projectId}/plans', {
+    generation: { status: 'idle', errorCode: null, errorMessage: null },
+    proposals: [
+      {
+        proposalId: 'prop_1',
+        title: 'Login happy path',
+        description: 'Sign in with valid credentials and land on the dashboard.',
+        priority: 'p1',
+        category: 'auth',
+        feature: 'login',
+        type: 'frontend',
+        steps: [
+          { type: 'action', description: 'Enter valid credentials and submit the login form' },
+          { type: 'assertion', description: 'Dashboard heading is visible' },
+        ],
+      },
+      {
+        proposalId: 'prop_2',
+        title: 'Create order — success',
+        description: 'POST a valid order and capture its id for downstream tests.',
+        priority: 'p2',
+        category: 'orders',
+        feature: 'create-order',
+        type: 'backend',
+        endpointPath: '/v1/orders',
+        captures: ['orderId'],
+        consumes: ['authToken'],
+      },
+    ],
+    credits: {
+      charged: [
+        { action: 'strategy', amount: 1 },
+        { action: 'proposals', amount: 2 },
+      ],
+      balance: 147,
+    },
+  } satisfies CliGetPlansResponse),
+  // Input-derived: echoes the explicit id list the CLI always sends (never
+  // the omitted or empty forms — §3.3 safety rules), so `accept --only
+  // prop_2 --dry-run` shows acceptedCount: 1 rather than a canned 2.
+  entry('acceptPlans', 'POST', '/projects/{projectId}/plans/accept', (req?: unknown) => {
+    const body = req != null && typeof req === 'object' ? (req as Record<string, unknown>) : {};
+    const only = Array.isArray(body.only)
+      ? body.only.filter((id): id is string => typeof id === 'string')
+      : null;
+    const ids = only !== null && only.length > 0 ? only : ['prop_1', 'prop_2'];
+    return {
+      acceptedCount: ids.length,
+      caseKeys: ids.map(id => `case_dryrun_${id}`),
+    } satisfies CliAcceptPlansResponse;
+  }),
+  // DEV-384 piece V3-D — `project docs upload` two-step facade routes.
+  // Registered BEFORE the broader project patterns (design doc §7 ordering
+  // rule; findSample is first-match-wins) and with `/docs/upload-url` before
+  // `/docs`. NOT consumed by the command's dry-run path: `project docs
+  // upload --dry-run` is an inline early-exit (zero network, stat only —
+  // the presigned S3 PUT leg cannot be expressed as a canned fetch sample).
+  // These are documentation/shape-guards, same family as `deleteBatch`.
+  entry('docsUploadUrl', 'POST', '/projects/{projectId}/docs/upload-url', {
+    uploadUrl:
+      'https://s3.dry-run.invalid/testsprite-usercontent/u_dryrun/p_dryrun_2026/openapi.yaml?X-Amz-Signature=dryrun',
+    s3Key: 'u_dryrun/p_dryrun_2026/openapi.yaml',
+    expiresInSeconds: 3600,
+  }),
+  entry('docsRegister', 'POST', '/projects/{projectId}/docs', {
+    resourceId: 'res_dryrun_2026',
+    displayName: 'openapi.yaml',
+    docRole: 'API_DOC',
+    processStatus: 'Pending',
+  }),
+  // The single-project read carries the project-level test-id attribute list
+  // (present-and-null contract, see `CliProject.testIdAttributes`); the list
+  // row above deliberately omits it, like `targetUrl`.
+  entry('getProject', 'GET', '/projects/{projectId}', {
+    ...checkoutProject,
+    testIdAttributes: ['data-element', 'data-testid'],
+  } satisfies CliProject),
   // P6 — POST /projects (create project). The id uses a stable dry-run
   // sentinel so agents can see a coherent field shape without a real key.
+  // Both `projectId` (the live field) and `id` (legacy/
+  // fallback) are shown — see `CliCreateProjectResponse`.
   entry('createProject', 'POST', '/projects', {
+    projectId: 'p_dryrun_create_2026',
     id: 'p_dryrun_create_2026',
     type: 'frontend',
     name: 'Dry-run project',
     createdFrom: 'cli',
     createdAt: '2026-05-16T00:00:00.000Z',
     updatedAt: '2026-05-16T00:00:00.000Z',
-  } satisfies CliProject),
-  // P7 — PATCH /projects/{id} (update project).
+  } satisfies CliCreateProjectResponse),
+  // P7 — PATCH /projects/{id} (update project). Both id
+  // field names shown — see `CliUpdateProjectResponse`.
   entry('updateProject', 'PATCH', '/projects/{projectId}', {
+    projectId: SAMPLE_PROJECT_ID,
     id: SAMPLE_PROJECT_ID,
     updatedFields: ['name'],
     updatedAt: '2026-05-16T00:00:00.000Z',
@@ -707,57 +977,8 @@ const ENTRIES: DryRunSampleEntry[] = [
   // fix(2026-05-21): a duplicate failed-shape entry that appeared before
   // this entry was removed; findSample first-match-wins was always
   // returning status: "failed" for `test wait --dry-run`.
-  entry('getRun', 'GET', '/runs/{runId}', {
-    runId: SAMPLE_RUN_ID,
-    testId: SAMPLE_TEST_ID_PASSED,
-    projectId: SAMPLE_PROJECT_ID,
-    userId: SAMPLE_USER_ID,
-    status: 'passed',
-    source: 'cli',
-    createdAt: '2026-05-15T19:32:00.000Z',
-    startedAt: '2026-05-15T19:32:05.000Z',
-    finishedAt: '2026-05-15T19:34:00.000Z',
-    codeVersion: 'v1',
-    targetUrl: SAMPLE_TARGET_URL,
-    createdFrom: null,
-    failedStepIndex: null,
-    failureKind: null,
-    error: null,
-    videoUrl: null,
-    stepSummary: {
-      total: 8,
-      completed: 8,
-      passedCount: 8,
-      failedCount: 0,
-    },
-    // Representative per-run steps so `test steps --run-id <id> --dry-run`
-    // demonstrates real output instead of an empty list (the generic
-    // `/runs/{runId}` sample is also used by `test wait`, which ignores steps).
-    steps: [
-      {
-        stepIndex: '0001',
-        type: 'action',
-        action: 'navigate',
-        status: 'passed',
-        description: 'Open the target URL',
-        error: null,
-        screenshotUrl: null,
-        htmlSnapshotUrl: null,
-        createdAt: '2026-05-15T19:32:10.000Z',
-      },
-      {
-        stepIndex: '0002',
-        type: 'assertion',
-        action: 'assert_visible',
-        status: 'passed',
-        description: 'Dashboard heading is visible',
-        error: null,
-        screenshotUrl: null,
-        htmlSnapshotUrl: null,
-        createdAt: '2026-05-15T19:32:20.000Z',
-      },
-    ],
-  } satisfies RunResponse),
+  entry('getRun', 'GET', `/runs/${SAMPLE_FAILED_RUN_ID}`, failedRunSample),
+  entry('getRun', 'GET', '/runs/{runId}', passedRunSample),
   // DEV-331 piece 3 — POST /runs/{runId}/cancel. Method-guarded in
   // `findSample` (POST vs `getRun`'s GET), so this can't be shadowed by the
   // broader `/runs/{runId}` pattern above despite sharing its path prefix.
@@ -788,6 +1009,35 @@ const ENTRIES: DryRunSampleEntry[] = [
     },
     alreadyCancelled: false,
   } satisfies CancelRunResponse),
+  // Schedules. The `/schedules/{id}/runs` entry MUST come before the
+  // `/schedules/{id}` entries so the more specific path wins the regex match
+  // (first-match-wins).
+  entry('listScheduleRuns', 'GET', '/schedules/{scheduleId}/runs', {
+    runs: [scheduleRun],
+  }),
+  entry('listSchedules', 'GET', '/schedules', { schedules: [schedule] }),
+  // `schedule create --dry-run` exits before the HTTP client is built, so this
+  // sample is not fetched. Registered as a shape-guard only, same as
+  // `deleteBatch` above.
+  entry('createSchedule', 'POST', '/schedules', { scheduleId: 'sch_dryrun_2026' }),
+  entry('getSchedule', 'GET', '/schedules/{scheduleId}', schedule),
+  // Echoes the requested change so a caller can confirm the flags they passed
+  // reached the body, rather than showing an unrelated canned schedule.
+  entry('updateSchedule', 'PATCH', '/schedules/{scheduleId}', (req?: unknown) => {
+    const patch = req != null && typeof req === 'object' ? (req as Record<string, unknown>) : {};
+    return {
+      ...schedule,
+      ...(typeof patch.name === 'string' ? { name: patch.name } : {}),
+      ...(typeof patch.enabled === 'boolean' ? { enabled: patch.enabled } : {}),
+      ...(typeof patch.cron === 'string' ? { cron: patch.cron } : {}),
+      ...(typeof patch.timezone === 'string' ? { timezone: patch.timezone } : {}),
+      ...(typeof patch.sendTo === 'string' ? { sendTo: patch.sendTo } : {}),
+      updatedAt: '2026-05-16T00:00:00.000Z',
+    };
+  }),
+  entry('deleteSchedule', 'DELETE', '/schedules/{scheduleId}', {
+    scheduleId: SAMPLE_SCHEDULE_ID,
+  }),
 ];
 
 function entry(
@@ -830,6 +1080,36 @@ function pageOf<T>(items: T[]): Page<T> {
  * `putPlanSteps`, `createTestBatch`) so their responses reflect the
  * user's actual flags rather than static canned values.
  */
+/**
+ * Like {@link findSample}, but a missing sample throws instead of returning
+ * `undefined`. For dry-run paths that resolve samples DIRECTLY (bypassing the
+ * dry-run fetch impl, which has its own loud INTERNAL envelope for this):
+ * without the throw, a lost registry entry surfaces as a raw TypeError deep
+ * in a renderer (DEV-384 review F6 — `samples.ts` is a real merge-conflict
+ * hotspot, so a silently dropped entry is a live hazard, not a hypothetical).
+ */
+export function findSampleOrThrow(
+  method: string,
+  url: string,
+  requestBody?: unknown,
+): DryRunSampleEntry {
+  const entry = findSample(method, url, requestBody);
+  if (entry === undefined) {
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'INTERNAL',
+        message:
+          `dry-run sample registry has no entry for ${method.toUpperCase()} ${extractPath(url)} — ` +
+          'a sample was removed or shadowed in src/lib/dry-run/samples.ts (internal CLI bug).',
+        nextAction: 'Please report this to support@testsprite.com.',
+        requestId: SAMPLE_DRY_RUN_REQUEST_ID,
+        details: { method: method.toUpperCase(), path: extractPath(url) },
+      },
+    });
+  }
+  return entry;
+}
+
 export function findSample(
   method: string,
   url: string,
@@ -839,10 +1119,8 @@ export function findSample(
   const pathOnly = extractPath(url);
   for (const e of ENTRIES) {
     if (e.method === upper && e.pattern.test(pathOnly)) {
-      // Rebind body so callers get the resolved value, not the factory.
-      // We return a new object with `body` already applied so downstream
-      // code can keep calling `e.body` as-before (no API break for tests
-      // that call `findSample` directly).
+      // Rebind body so downstream code can call `e.body` as before while
+      // still preserving the original lazy factory semantics.
       return { ...e, body: () => e.body(requestBody) };
     }
   }

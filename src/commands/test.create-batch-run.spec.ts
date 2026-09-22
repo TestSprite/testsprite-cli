@@ -2265,6 +2265,23 @@ describe('isTransientRateLimit + credit-depletion not retried', () => {
       });
       expect(isTransientRateLimit(err)).toBe(false);
     });
+
+    it('returns false for a standing-condition 429 even with Retry-After signals present', () => {
+      // The tunnel binding cap carries a real Retry-After (time to the soonest
+      // binding expiry) — but the condition never clears on its own, so the
+      // transient signals must not win over the standing reason.
+      const err = makeRateLimitedError({
+        message: 'You already have 5 live tunnel bindings (limit 5).',
+        retryAfterMs: 600_000,
+        details: {
+          reason: 'tunnel_binding_limit',
+          liveBindings: 5,
+          limit: 5,
+          retryAfterSeconds: 600,
+        },
+      });
+      expect(isTransientRateLimit(err)).toBe(false);
+    });
   });
 
   // Integration: credit-depletion RATE_LIMITED is NOT retried in the outer loop.

@@ -8,6 +8,7 @@
  * (deterministic, no network / credentials), matching the repo's mock-based
  * test convention.
  */
+import type { RerunAdvisory } from './runs.types.js';
 
 /**
  * Outcome of a single flaky-detector attempt. The first four mirror the
@@ -60,6 +61,16 @@ export interface FlakyReport {
   verdict: FlakyVerdict;
   /** Non-passing attempts, in attempt order. */
   failures: FlakyFailure[];
+  /**
+   * Server-side advisories collected across all replay attempts and deduped
+   * (by `feature`+`message`) — surfaced ONCE per probe, not once per attempt.
+   * Empty when the server sent none, which is the common case: absent on
+   * every V2 response and every V3 response that isn't a V3-routed rerun
+   * with an explicit `autoHeal:false` opt-out (see `RerunAdvisory`). `test
+   * flaky` always sends `autoHeal:false`, so this is populated whenever the
+   * probe's reruns are routed to V3.
+   */
+  advisories: RerunAdvisory[];
 }
 
 /**
@@ -72,7 +83,11 @@ export interface FlakyReport {
  * An empty attempt list (no runs observed) is reported as `failing` with a
  * `0` ratio — there is no evidence the test is stable.
  */
-export function summarizeFlaky(testId: string, attempts: FlakyAttempt[]): FlakyReport {
+export function summarizeFlaky(
+  testId: string,
+  attempts: FlakyAttempt[],
+  advisories: RerunAdvisory[] = [],
+): FlakyReport {
   const runs = attempts.length;
   const passed = attempts.filter(a => a.outcome === 'passed').length;
   const failed = runs - passed;
@@ -87,7 +102,7 @@ export function summarizeFlaky(testId: string, attempts: FlakyAttempt[]): FlakyR
       outcome: a.outcome,
       failureKind: a.failureKind ?? null,
     }));
-  return { testId, runs, passed, failed, stableRatio, verdict, failures };
+  return { testId, runs, passed, failed, stableRatio, verdict, failures, advisories };
 }
 
 /**
@@ -127,6 +142,11 @@ export function renderFlakyText(report: FlakyReport): string {
       const kind = f.failureKind ? ` failureKind=${f.failureKind}` : '';
       const rid = f.runId ?? '(no runId)';
       lines.push(`    #${f.attempt}  ${rid}  ${f.outcome}${kind}`);
+    }
+  }
+  if (report.advisories.length > 0) {
+    for (const advisory of report.advisories) {
+      lines.push(`  [advisory] ${advisory.message}`);
     }
   }
   return lines.join('\n');

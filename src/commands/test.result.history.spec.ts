@@ -19,11 +19,11 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
-import { ApiError } from '../lib/errors.js';
+import { describe, expect, it, vi } from 'vitest';
+import { ApiError, RequestTimeoutError } from '../lib/errors.js';
 import type { ListRunsResponse, RunHistoryItem } from '../lib/runs.types.js';
 import type { CliLatestResult } from './test.js';
-import { runResultHistory, runResult, parseDuration } from './test.js';
+import { runResultHistory, runResult, runSteps, parseDuration, createTestCommand } from './test.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -413,6 +413,76 @@ describe('runResultHistory — text mode', () => {
 
     const output = lines.join('\n');
     expect(output).toMatch(/\byes\b/);
+  });
+
+  // --rerun / --no-rerun client-side filter (asserted in JSON mode for exactness)
+  const mixedRerunFetch = () =>
+    makeFetch(url => {
+      if (url.includes('/tests/test_abc/runs')) {
+        return {
+          body: makeHistoryResp([
+            makeHistoryItem({ runId: 'run_fresh', isRerun: false, createdFrom: null }),
+            makeHistoryItem({ runId: 'run_rerun', isRerun: true, createdFrom: 'rerun:prior' }),
+          ]),
+        };
+      }
+      return { status: 404, body: errorEnvelope('NOT_FOUND') };
+    });
+
+  it('--rerun keeps only reruns in the JSON runs array', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    await runResultHistory(
+      {
+        output: 'json',
+        testId: 'test_abc',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        rerun: true,
+      },
+      { credentialsPath, fetchImpl: mixedRerunFetch(), stdout: line => lines.push(line) },
+    );
+    const parsed = JSON.parse(lines.join('')) as { runs: RunHistoryItem[] };
+    expect(parsed.runs.map(r => r.runId)).toEqual(['run_rerun']);
+  });
+
+  it('--no-rerun keeps only fresh runs in the JSON runs array', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    await runResultHistory(
+      {
+        output: 'json',
+        testId: 'test_abc',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        rerun: false,
+      },
+      { credentialsPath, fetchImpl: mixedRerunFetch(), stdout: line => lines.push(line) },
+    );
+    const parsed = JSON.parse(lines.join('')) as { runs: RunHistoryItem[] };
+    expect(parsed.runs.map(r => r.runId)).toEqual(['run_fresh']);
+  });
+
+  it('no rerun flag keeps every run (no filter)', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    await runResultHistory(
+      {
+        output: 'json',
+        testId: 'test_abc',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { credentialsPath, fetchImpl: mixedRerunFetch(), stdout: line => lines.push(line) },
+    );
+    const parsed = JSON.parse(lines.join('')) as { runs: RunHistoryItem[] };
+    expect(parsed.runs.map(r => r.runId)).toEqual(['run_fresh', 'run_rerun']);
   });
 
   it('renders DURATION as "NmNs" when startedAt and finishedAt are present', async () => {
@@ -1463,5 +1533,315 @@ describe('runResultHistory — G1b targetUrl in history table (text mode)', () =
     expect(firstRun).toBeDefined();
     expect(firstRun?.targetUrl).toBe('https://example.com');
     expect(firstRun?.targetUrlSource).toBe('run');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// --rerun / --no-rerun parsing through Commander (the tri-state hop)
+// ---------------------------------------------------------------------------
+
+describe('createTestCommand — --rerun / --no-rerun parsing', () => {
+  // The runResultHistory tests above call the function directly, so they never
+  // exercise Commander's --rerun/--no-rerun parsing. This pins the tri-state:
+  // undefined (no filter) | true | false. A silent default to true would filter
+  // every `test result --history` to reruns only, unnoticed.
+  async function parsedRerun(extraArgs: string[]): Promise<boolean | undefined> {
+    const { credentialsPath } = makeCreds();
+    // Benign history response so parseAsync's action completes without a real
+    // network call — the assertion reads the parsed opts, not the output.
+    const fetchImpl = makeFetch(() => ({ body: makeHistoryResp([]) }));
+    const test = createTestCommand({
+      credentialsPath,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: () => undefined,
+    });
+    await test.parseAsync(['result', 'test_abc', '--history', ...extraArgs], { from: 'user' });
+    const resultCmd = test.commands.find(c => c.name() === 'result');
+    return (resultCmd?.opts() as { rerun?: boolean }).rerun;
+  }
+
+  it('no flag → rerun is undefined (no filter)', async () => {
+    expect(await parsedRerun([])).toBeUndefined();
+  });
+
+  it('--rerun → rerun is true', async () => {
+    expect(await parsedRerun(['--rerun'])).toBe(true);
+  });
+
+  it('--no-rerun → rerun is false', async () => {
+    expect(await parsedRerun(['--no-rerun'])).toBe(false);
+  });
+});
+
+describe('empty latest steps history hint', () => {
+  it.each([0, 5_000])(
+    'does not retry a history 429 or leave live timers after %i ms',
+    async elapsedMs => {
+      vi.useFakeTimers();
+      try {
+        let historyCalls = 0;
+        let settled = false;
+        const stdout: string[] = [];
+        const stderr: string[] = [];
+        const pending = runSteps(
+          { profile: 'default', output: 'json', debug: false, testId: 'test_abc' },
+          {
+            ...makeCreds(),
+            stdout: line => stdout.push(line),
+            stderr: line => stderr.push(line),
+            fetchImpl: async input => {
+              if (String(input).includes('/steps'))
+                return new Response(JSON.stringify({ items: [], nextToken: null }));
+              historyCalls++;
+              return new Response(
+                JSON.stringify({ error: { code: 'RATE_LIMITED', message: 'Try later' } }),
+                { status: 429, headers: { 'retry-after': '60' } },
+              );
+            },
+          },
+        ).then(page => {
+          settled = true;
+          return page;
+        });
+        await vi.advanceTimersByTimeAsync(elapsedMs);
+        expect(settled).toBe(true);
+        expect(vi.getTimerCount()).toBe(0);
+        expect(historyCalls).toBe(1);
+        expect(await pending).toEqual({ items: [], nextToken: null });
+        expect(stdout).toEqual([JSON.stringify({ items: [], nextToken: null }, null, 2)]);
+        expect(stderr).toEqual([]);
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(['text', 'json'] as const)(
+    'points at the nearest earlier terminal run in %s mode',
+    async output => {
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const historyUrls: string[] = [];
+      const page = await runSteps(
+        { profile: 'default', output, debug: false, testId: 'test_abc' },
+        {
+          ...makeCreds(),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+          fetchImpl: makeFetch(url => {
+            if (url.includes('/steps')) return { body: { items: [], nextToken: null } };
+            historyUrls.push(url);
+            return {
+              body: makeHistoryResp(
+                [
+                  makeHistoryItem({ runId: 'run_latest', status: 'blocked' }),
+                  makeHistoryItem({ runId: 'run_active', status: 'running' }),
+                  makeHistoryItem({ runId: 'run_prior', status: 'passed' }),
+                  makeHistoryItem({ runId: 'run_oldest', status: 'failed' }),
+                ],
+                'more-history',
+              ),
+            };
+          }),
+        },
+      );
+      expect(stderr).toContain(
+        'Latest run has no steps; inspect an earlier run: testsprite test steps test_abc --run-id run_prior',
+      );
+      expect(historyUrls).toHaveLength(1);
+      expect(new URL(historyUrls[0]!).searchParams.get('pageSize')).toBe('20');
+      expect(page).toEqual({ items: [], nextToken: null });
+      expect(stdout).toEqual([output === 'json' ? JSON.stringify(page, null, 2) : 'No steps.']);
+    },
+  );
+
+  it.each([{ runs: [] }, { runs: [makeHistoryItem({ runId: 'run_latest', status: 'passed' })] }])(
+    'gives a neutral history pointer when there is no earlier run (%j)',
+    async ({ runs }) => {
+      const stderr: string[] = [];
+      await runSteps(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_abc' },
+        {
+          ...makeCreds(),
+          stdout: () => {},
+          stderr: line => stderr.push(line),
+          fetchImpl: makeFetch(url => ({
+            body: url.includes('/steps') ? { items: [], nextToken: null } : makeHistoryResp(runs),
+          })),
+        },
+      );
+      expect(stderr).toEqual([
+        'Latest run has no steps; inspect run history: testsprite test result test_abc --history',
+      ]);
+    },
+  );
+
+  it('swallows a failed lookup and still prints No steps', async () => {
+    const stdout: string[] = [];
+    let lookups = 0;
+    const result = await runSteps(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_abc' },
+      {
+        ...makeCreds(),
+        stdout: line => stdout.push(line),
+        stderr: () => {},
+        fetchImpl: makeFetch(url => {
+          if (url.includes('/steps')) return { body: { items: [], nextToken: null } };
+          lookups++;
+          throw new RequestTimeoutError(1000);
+        }),
+      },
+    );
+    expect(lookups).toBe(1);
+    expect(result).toEqual({ items: [], nextToken: null });
+    expect(stdout).toEqual(['No steps.']);
+  });
+
+  it('bounds a stalled history lookup to five seconds', async () => {
+    vi.useFakeTimers();
+    try {
+      let aborted = false;
+      let settled = false;
+      const stdout: string[] = [];
+      const pending = runSteps(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_abc' },
+        {
+          ...makeCreds(),
+          stdout: line => stdout.push(line),
+          stderr: () => {},
+          fetchImpl: async (input, init) => {
+            if (String(input).includes('/steps'))
+              return new Response(JSON.stringify({ items: [], nextToken: null }));
+            return new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener(
+                'abort',
+                () => {
+                  aborted = true;
+                  reject(init.signal?.reason);
+                },
+                { once: true },
+              );
+            });
+          },
+        },
+      ).then(result => {
+        settled = true;
+        return result;
+      });
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      expect(aborted).toBe(true);
+      await pending;
+      expect(stdout).toEqual(['No steps.']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('describes latest-run steps and the run-id selector in help', () => {
+    const steps = createTestCommand().commands.find(command => command.name() === 'steps')!;
+    const help = steps.helpInformation().replace(/\s+/g, ' ');
+    expect(help).toContain('steps of the latest run (use --run-id for a specific run)');
+    expect(help).not.toContain('cumulative');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEV-1306 — environment on the history surface
+// ---------------------------------------------------------------------------
+
+describe('runResultHistory — environment (DEV-1306)', () => {
+  const common = { profile: 'default', dryRun: false, debug: false, verbose: false } as const;
+
+  it('renders an ENV column: the environment name, or — when the row names none', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    const fetchImpl = makeFetch(url =>
+      url.includes('/tests/test_abc/runs')
+        ? {
+            body: makeHistoryResp([
+              makeHistoryItem({
+                runId: 'run_env',
+                environment: { id: 'env_demo', name: 'demo' },
+                targetUrl: 'https://demo.example.com',
+                targetUrlSource: null,
+              }),
+              makeHistoryItem({
+                runId: 'run_local',
+                environment: { id: 'env_local', name: 'local-dev' },
+                targetUrl: 'http://127.0.0.1:55015',
+                targetUrlSource: null,
+              }),
+              makeHistoryItem({ runId: 'run_old' }),
+            ]),
+          }
+        : { status: 404, body: errorEnvelope('NOT_FOUND') },
+    );
+    await runResultHistory(
+      { ...common, output: 'text', testId: 'test_abc' },
+      { credentialsPath, fetchImpl, stdout: line => lines.push(line) },
+    );
+    const output = lines.join('\n');
+    expect(output).toMatch(/RUN ID\s+STATUS\s+SOURCE\s+ENV\s+RERUN\?/);
+    expect(output).toMatch(/run_env\s+passed\s+cli\s+demo\s+/);
+    // A run on a developer-machine environment is just that environment's
+    // name: the address it went to is the environment's own, so there is no
+    // second kind of row and nothing about credentials to add below it.
+    expect(output).toMatch(/run_local\s+passed\s+cli\s+local-dev\s+/);
+    expect(output).toMatch(/run_old\s+passed\s+cli\s+—\s+/);
+    expect(output).toContain('targetUrl: http://127.0.0.1:55015\n');
+    expect(output).toContain('targetUrl: https://demo.example.com\n');
+  });
+
+  it('--env forwards ?environment=<name> to the server', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      seen.push(url);
+      return { body: makeHistoryResp([]) };
+    });
+    await runResultHistory(
+      { ...common, output: 'json', testId: 'test_abc', environment: 'local-dev' },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(seen).toHaveLength(1);
+    expect(new URL(seen[0]!).searchParams.get('environment')).toBe('local-dev');
+  });
+
+  it('a whitespace-only --env is refused locally', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    await expect(
+      runResultHistory(
+        { ...common, output: 'json', testId: 'test_abc', environment: ' ' },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(url => {
+            seen.push(url);
+            return { body: makeHistoryResp([]) };
+          }),
+          stdout: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    expect(seen).toEqual([]);
+  });
+
+  it('`test result <id> --env x` without --history is a validation error (exit 5)', async () => {
+    const test = createTestCommand();
+    const disable = (c: { exitOverride: () => unknown; commands: Array<unknown> }) => {
+      c.exitOverride();
+      (c.commands as Array<{ exitOverride: () => unknown; commands: Array<unknown> }>).forEach(
+        disable,
+      );
+    };
+    disable(test as never);
+    await expect(
+      test.parseAsync(['result', 'test_abc', '--env', 'demo'], { from: 'user' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 });

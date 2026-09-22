@@ -22,15 +22,17 @@ import {
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { loadConfig } from '../lib/config.js';
-import { ApiError, CLIError, localValidationError } from '../lib/errors.js';
+import { ApiError, CLIError, RequestTimeoutError, localValidationError } from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
+import type { CliOrgBinding, CliOrgSummary } from '../lib/org-render.js';
+import { formatOrgBinding, formatOrgsSummary, formatPersonalScopeHint } from '../lib/org-render.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import type { MeIdentityWire } from '../lib/response-schemas.js';
 import { ME_IDENTITY_SCHEMA } from '../lib/response-schemas.js';
 import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
 import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 import { VERSION } from '../version.js';
-import { MIN_SUPPORTED_NODE_MAJOR, shouldRejectNodeVersion } from '../version-guard.js';
+import { SUPPORTED_NODE_RANGE, shouldRejectNodeVersion } from '../version-guard.js';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -52,7 +54,8 @@ export interface DoctorReport {
  * Minimal projection of `GET /me` we read for the connectivity detail.
  *
  * Aliased to the schema's wire type so the interface and
- * {@link ME_IDENTITY_SCHEMA} cannot drift apart (issue #277).
+ * {@link ME_IDENTITY_SCHEMA} cannot drift apart (issue #277). The org fields
+ * (`organizations`, `org`) live on {@link MeIdentityWire} for the same reason.
  */
 type MeIdentity = MeIdentityWire;
 
@@ -64,7 +67,7 @@ export interface DoctorDeps {
   stderr?: (line: string) => void;
   /** Project dir for the skill check. Defaults to `process.cwd()`. */
   cwd?: string;
-  /** Runtime version string (e.g. "22.9.0"). Defaults to `process.versions.node`. */
+  /** Runtime version string (e.g. "22.13.0"). Defaults to `process.versions.node`. */
   nodeVersion?: string;
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
@@ -115,6 +118,29 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     });
   }
 
+  // Org attribution lines — only when the backend reported them (no new call).
+  const orgsSummary = formatOrgsSummary(connectivity.organizations);
+  if (orgsSummary) {
+    checks.push({ name: 'Organizations', status: 'ok', detail: orgsSummary });
+  }
+  const orgBinding = formatOrgBinding(connectivity.org);
+  if (orgBinding) {
+    checks.push({ name: 'Org binding', status: 'ok', detail: orgBinding });
+  }
+  // Warn, not fail: the key works — it just cannot see the team's work, which
+  // otherwise looks like missing data rather than a scoping choice.
+  const personalScopeHint = formatPersonalScopeHint(connectivity.organizations, connectivity.org);
+  if (personalScopeHint) {
+    checks.push({ name: 'Workspace scope', status: 'warn', detail: personalScopeHint });
+  }
+
+  checks.push(
+    await checkLocalTunnel(opts, deps, {
+      hasKey,
+      endpointOk: endpointCheck.status === 'ok',
+    }),
+  );
+
   checks.push(checkSkill(cwd, deps));
 
   const failures = checks.filter(check => check.status === 'fail').length;
@@ -137,17 +163,14 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
 }
 
 function checkNodeVersion(nodeVersion: string): DoctorCheck {
-  // Reuse the CLI's own runtime guard so the verdict matches exactly what the
-  // entrypoint enforces at startup, rather than a divergent hardcoded check.
-  // The precise engines floor (20.19+/22.13+/24+) is enforced by npm at install
-  // time via .npmrc engine-strict. sourceRef: src/version-guard.ts.
+  // Reuse the CLI runtime guard so doctor and startup enforce and describe the same range.
   const rejected = shouldRejectNodeVersion(nodeVersion);
   return {
     name: 'Node.js',
     status: rejected ? 'fail' : 'ok',
     detail: rejected
-      ? `v${nodeVersion} is below the required Node ${MIN_SUPPORTED_NODE_MAJOR}; upgrade Node.js`
-      : `v${nodeVersion} (>=${MIN_SUPPORTED_NODE_MAJOR} required)`,
+      ? `v${nodeVersion} is outside the supported Node range ${SUPPORTED_NODE_RANGE}; upgrade Node.js`
+      : `v${nodeVersion} (supported range: ${SUPPORTED_NODE_RANGE})`,
   };
 }
 
@@ -201,7 +224,12 @@ async function checkConnectivity(
   opts: CommonOptions,
   deps: DoctorDeps,
   ctx: { hasKey: boolean; endpointOk: boolean },
-): Promise<{ check: DoctorCheck; v3Enabled?: boolean }> {
+): Promise<{
+  check: DoctorCheck;
+  v3Enabled?: boolean;
+  organizations?: CliOrgSummary[];
+  org?: CliOrgBinding;
+}> {
   const name = 'Connectivity';
   if (opts.dryRun) return { check: { name, status: 'warn', detail: 'skipped under --dry-run' } };
   if (!ctx.hasKey)
@@ -221,6 +249,8 @@ async function checkConnectivity(
     return {
       check: { name, status: 'ok', detail: `reached GET /me, API key accepted${who}` },
       v3Enabled: me.v3Enabled,
+      organizations: me.organizations,
+      org: me.org,
     };
   } catch (error) {
     if (error instanceof ApiError) {
@@ -242,6 +272,108 @@ async function checkConnectivity(
     };
   }
 }
+
+/**
+ * Can this key open a tunnel to this machine (`test run --local`)?
+ *
+ * A READ, not a mint. `GET /tunnel/<random-uuid>` runs the same scope guard
+ * and the same environment-configured check as the mint, and answers 404 for
+ * an id nobody owns — so it proves everything that matters without consuming
+ * one of the caller's few concurrent live bindings or any rate-limit budget on
+ * a diagnostic.
+ *
+ * The case this exists for: `run:tunnel` is the first scope deliberately kept
+ * OUT of the grandfather grant, so a key minted before it — most keys in the
+ * wild — gets a 403 the first time someone tries `--local`, and the remedy is
+ * to mint a NEW key rather than to re-authenticate. Nothing else in the CLI
+ * says that until a run has already been refused.
+ *
+ * Never `fail`: a caller who does not use `--local` should not see `doctor`
+ * exit 1 over a surface that is not even configured in their environment.
+ */
+async function checkLocalTunnel(
+  opts: CommonOptions,
+  deps: DoctorDeps,
+  ctx: { hasKey: boolean; endpointOk: boolean },
+): Promise<DoctorCheck> {
+  const name = 'Local tunnel';
+  if (opts.dryRun) return { name, status: 'warn', detail: 'skipped under --dry-run' };
+  if (!ctx.hasKey) return { name, status: 'warn', detail: 'skipped; no API key to test with' };
+  if (!ctx.endpointOk) return { name, status: 'warn', detail: 'skipped; endpoint URL is invalid' };
+
+  const controller = new AbortController();
+  const probeTimer = setTimeout(() => {
+    controller.abort(new RequestTimeoutError(DOCTOR_TUNNEL_PROBE_TIMEOUT_MS));
+  }, DOCTOR_TUNNEL_PROBE_TIMEOUT_MS);
+  probeTimer.unref();
+  try {
+    const client = makeHttpClient(
+      { ...opts, requestTimeoutMs: DOCTOR_TUNNEL_PROBE_TIMEOUT_MS },
+      {
+        env: deps.env,
+        credentialsPath: deps.credentialsPath,
+        fetchImpl: deps.fetchImpl,
+        stderr: deps.stderr,
+        // The retry sleeper listens to the client shutdown signal, so using
+        // the probe deadline here bounds attempts and Retry-After sleeps as
+        // one operation rather than timing each fetch independently.
+        shutdownSignal: controller.signal,
+      },
+    );
+    // A well-formed id that cannot name anyone's binding. A 200 here would
+    // mean the server handed us someone else's client, so it is reported as
+    // the anomaly it would be rather than quietly passing.
+    await client.getTunnelStatus(TUNNEL_PROBE_CLIENT_ID);
+    return {
+      name,
+      status: 'warn',
+      detail: 'unexpected: the server resolved a probe id that should belong to nobody',
+    };
+  } catch (error) {
+    if (!(error instanceof ApiError)) {
+      return {
+        name,
+        status: 'warn',
+        detail: `could not check (${error instanceof Error ? error.message : String(error)})`,
+      };
+    }
+    if (error.code === 'NOT_FOUND') {
+      return { name, status: 'ok', detail: 'available; this key can open a tunnel (--local)' };
+    }
+    if (error.code === 'AUTH_FORBIDDEN') {
+      return {
+        name,
+        status: 'warn',
+        detail:
+          'this API key cannot open a tunnel — it predates the `run:tunnel` scope. ' +
+          'Mint a new API key in the dashboard to use `test run --local`.',
+      };
+    }
+    if (error.code === 'UNAVAILABLE') {
+      return {
+        name,
+        status: 'warn',
+        detail: '`test run --local` is not available on this endpoint',
+      };
+    }
+    return { name, status: 'warn', detail: `could not check (${error.code})` };
+  } finally {
+    clearTimeout(probeTimer);
+  }
+}
+
+/**
+ * A syntactically valid UUID that the mint route can never produce for anyone:
+ * it is fixed, so it belongs to nobody, and the surface collapses unknown /
+ * other-tenant / expired into one 404 by design.
+ */
+const TUNNEL_PROBE_CLIENT_ID = '00000000-0000-4000-8000-000000000000';
+
+// A diagnostic status read should complete quickly; three seconds allows
+// ordinary DNS/TLS latency while keeping `doctor` useful when this optional,
+// warn-only surface is hung. This stays independent of the 120–600s business
+// request deadline because waiting longer cannot change the check's outcome.
+const DOCTOR_TUNNEL_PROBE_TIMEOUT_MS = 3_000;
 
 const STATUS_LABEL: Record<DoctorStatus, string> = {
   ok: '[OK]  ',

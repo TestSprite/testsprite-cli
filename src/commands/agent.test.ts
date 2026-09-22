@@ -10,6 +10,7 @@ import {
   ONBOARD_CODEX_LINE,
   SKILLS,
   buildSkillMarker,
+  loadSkillBodyFor,
   pathFor,
   renderForTarget,
   renderOwnFileWithMarker,
@@ -661,7 +662,14 @@ describe('runInstall — multi-target', () => {
 // ---------------------------------------------------------------------------
 
 describe('runInstall — empty target', () => {
-  it('non-TTY with no target defaults to claude and installs the skill file', async () => {
+  /**
+   * Detection reads the real environment by default, so an agent variable set
+   * by whoever runs the suite would pick these targets. Nothing set, nothing on
+   * disk: the fallback is the only outcome under test here.
+   */
+  const detectsNothing = { env: {}, existsSync: () => false, readdirSync: () => [] };
+
+  it('non-TTY with no target falls back to claude and installs the skill file', async () => {
     const { store, fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -674,12 +682,12 @@ describe('runInstall — empty target', () => {
         target: [],
         force: false,
       },
-      { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
+      { cwd: CWD, fs: agentFs, isTTY: false, detect: detectsNothing, ...deps },
     );
 
     const claudeAbs = path.resolve(CWD, TARGETS.claude.path);
     expect(store.has(claudeAbs)).toBe(true);
-    expect(capture.stderr.join('\n')).toContain('defaulting to claude');
+    expect(capture.stderr.join('\n')).toContain('no coding agent detected');
   });
 
   it('non-TTY default writes the canonical claude content', async () => {
@@ -688,7 +696,7 @@ describe('runInstall — empty target', () => {
 
     await runInstall(
       { profile: 'default', output: 'text', debug: false, dryRun: false, target: [], force: false },
-      { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
+      { cwd: CWD, fs: agentFs, isTTY: false, detect: detectsNothing, ...deps },
     );
 
     const { path: relPath, content } = renderForTarget('claude', 'testsprite-verify');
@@ -742,6 +750,92 @@ describe('runInstall — empty target', () => {
     const claudeAbs = path.resolve(CWD, TARGETS.claude.path);
     expect(store.has(claudeAbs)).toBe(true);
   });
+
+  // `setup`'s prompt already accepts this; the two must not disagree about
+  // whether the shift key makes an answer a typo.
+  it('TTY prompt accepts a target name in any case', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    const promptFn = vi.fn().mockResolvedValue('Claude');
+
+    await runInstall(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        target: [],
+        skills: ['testsprite-verify'],
+        force: false,
+      },
+      { cwd: CWD, fs: agentFs, isTTY: true, prompt: promptFn, ...deps },
+    );
+
+    expect(store.has(path.resolve(CWD, TARGETS.claude.path))).toBe(true);
+  });
+
+  // The caller passed no flag, so a refusal naming `--target` points them at
+  // something they never typed.
+  it('an unrecognised prompt answer is refused without blaming --target', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    const promptFn = vi.fn().mockResolvedValue('clyde');
+
+    let thrown: unknown;
+    try {
+      await runInstall(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          dryRun: false,
+          target: [],
+          skills: ['testsprite-verify'],
+          force: false,
+        },
+        { cwd: CWD, fs: agentFs, isTTY: true, prompt: promptFn, ...deps },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(CLIError);
+    expect((thrown as CLIError).exitCode).toBe(5);
+    // The whole detail is in the message, not tucked into a flag's nextAction.
+    expect((thrown as CLIError).message).toContain('unknown target "clyde"');
+    expect((thrown as CLIError).message).not.toBe('Invalid request.');
+    expect(store.size).toBe(0);
+  });
+
+  // The flag path keeps the flag-shaped refusal — there the field really is
+  // `--target`, and that message is a documented contract.
+  it('an unrecognised --target value still reports as a flag error', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    let thrown: unknown;
+    try {
+      await runInstall(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          dryRun: false,
+          target: ['clyde'],
+          skills: ['testsprite-verify'],
+          force: false,
+        },
+        { cwd: CWD, fs: agentFs, isTTY: false, ...deps },
+      );
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect((thrown as ApiError).message).toBe('Invalid request.');
+    expect((thrown as ApiError).nextAction).toContain('clyde');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -749,7 +843,7 @@ describe('runInstall — empty target', () => {
 // ---------------------------------------------------------------------------
 
 describe('runList', () => {
-  it('returns all five targets with correct status', async () => {
+  it('lists every target, tagging experimental ones with (exp.)', async () => {
     const { capture, deps } = makeCapture();
 
     await runList({ profile: 'default', output: 'text', debug: false, dryRun: false }, deps);
@@ -761,8 +855,11 @@ describe('runList', () => {
     expect(out).toContain('antigravity');
     expect(out).toContain('kiro');
     expect(out).toContain('codex');
-    expect(out).toContain('ga');
-    expect(out).toContain('experimental');
+    // DEV-279: maturity is a name tag now, not a STATUS/MODE column.
+    expect(out).toContain('cursor (exp.)');
+    expect(out).not.toContain('claude (exp.)'); // claude is GA — untagged
+    expect(out).not.toContain('own-file');
+    expect(out).not.toContain('managed-section');
     // All matrix paths present
     expect(out).toContain(TARGETS.claude.path);
     expect(out).toContain(TARGETS.cursor.path);
@@ -770,6 +867,22 @@ describe('runList', () => {
     expect(out).toContain(TARGETS.antigravity.path);
     expect(out).toContain(TARGETS.kiro.path);
     expect(out).toContain(TARGETS.codex.path);
+  });
+
+  it('prints a footer pointing at `agent status` (text mode)', async () => {
+    const { capture, deps } = makeCapture();
+
+    await runList({ profile: 'default', output: 'text', debug: false, dryRun: false }, deps);
+
+    expect(capture.stderr.join('\n')).toContain('testsprite agent status');
+  });
+
+  it('does NOT print the footer in --output json', async () => {
+    const { capture, deps } = makeCapture();
+
+    await runList({ profile: 'default', output: 'json', debug: false, dryRun: false }, deps);
+
+    expect(capture.stderr.join('\n')).not.toContain('testsprite agent status');
   });
 
   it('JSON mode emits array of {target, skill, status, path, mode}', async () => {
@@ -802,16 +915,17 @@ describe('runList', () => {
     expect(codexEntry?.mode).toBe('managed-section');
   });
 
-  it('text mode has a header row', async () => {
+  it('text mode has an AGENT / SKILL / PATH header row (no STATUS/MODE)', async () => {
     const { capture, deps } = makeCapture();
 
     await runList({ profile: 'default', output: 'text', debug: false, dryRun: false }, deps);
 
     const lines = capture.stdout.join('\n').split('\n');
-    expect(lines[0]).toMatch(/TARGET/i);
+    expect(lines[0]).toMatch(/AGENT/i);
     expect(lines[0]).toMatch(/SKILL/i);
-    expect(lines[0]).toMatch(/STATUS/i);
     expect(lines[0]).toMatch(/PATH/i);
+    expect(lines[0]).not.toMatch(/STATUS/i);
+    expect(lines[0]).not.toMatch(/MODE/i);
   });
 });
 
@@ -873,6 +987,166 @@ describe('runInstall — output modes', () => {
 });
 
 // ---------------------------------------------------------------------------
+// runInstall — reload hint (DEV-279)
+// ---------------------------------------------------------------------------
+
+describe('runInstall — reload hint', () => {
+  const base = {
+    profile: 'default' as const,
+    debug: false,
+    force: false,
+    skills: ['testsprite-verify'],
+  };
+
+  it('emits a [hint] to reopen the agent on a fresh write (text mode)', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      { ...base, output: 'text', dryRun: false, target: ['claude'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const err = capture.stderr.join('\n');
+    expect(err).toContain('[hint] Reopen');
+    expect(err).toContain('claude');
+  });
+
+  it('names each changed target once, even across multiple skills', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      { ...base, skills: [...DEFAULT_SKILLS], output: 'text', dryRun: false, target: ['claude'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    const hintLine = capture.stderr
+      .join('\n')
+      .split('\n')
+      .find(l => l.includes('[hint] Reopen'));
+    expect(hintLine).toBeDefined();
+    // "claude" appears once despite two skills being written.
+    expect(hintLine!.match(/claude/g)).toHaveLength(1);
+  });
+
+  it('emits the hint for the codex managed-section target (section-installed)', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      { ...base, output: 'text', dryRun: false, target: ['codex'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    expect(capture.stdout.join('\n')).toContain('section-installed');
+    const err = capture.stderr.join('\n');
+    expect(err).toContain('[hint] Reopen');
+    expect(err).toContain('codex');
+  });
+
+  it('emits the hint when an existing codex section is replaced (section-updated)', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    const agentsAbs = path.resolve(CWD, TARGETS.codex.path);
+    seedFile(agentsAbs, `${MANAGED_SECTION_BEGIN}\nOLD CONTENT\n${MANAGED_SECTION_END}\n`);
+
+    await runInstall(
+      { ...base, output: 'text', dryRun: false, target: ['codex'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    expect(capture.stdout.join('\n')).toContain('section-updated');
+    expect(capture.stderr.join('\n')).toContain('[hint] Reopen');
+  });
+
+  it('does NOT emit the hint when the codex section is byte-identical (section-unchanged)', async () => {
+    const { store, fs: agentFs, seedFile } = makeMemFs();
+    const { deps: deps1 } = makeCapture();
+
+    const agentsAbs = path.resolve(CWD, TARGETS.codex.path);
+    await runInstall(
+      { ...base, output: 'text', dryRun: false, target: ['codex'] },
+      { cwd: CWD, fs: agentFs, ...deps1 },
+    );
+    seedFile(agentsAbs, store.get(agentsAbs)!);
+
+    const { capture, deps } = makeCapture();
+    await runInstall(
+      { ...base, output: 'text', dryRun: false, target: ['codex'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    expect(capture.stdout.join('\n')).toContain('section-unchanged');
+    expect(capture.stderr.join('\n')).not.toContain('[hint] Reopen');
+  });
+
+  it('names only the written target when another target is blocked', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    // cursor already has a conflicting file → blocked; claude is untouched → written.
+    const cursorAbs = path.resolve(CWD, TARGETS.cursor.path);
+    seedFile(cursorAbs, 'DIFFERENT CONTENT');
+
+    await expect(
+      runInstall(
+        { ...base, output: 'text', dryRun: false, target: ['claude', 'cursor'] },
+        { cwd: CWD, fs: agentFs, ...deps },
+      ),
+    ).rejects.toThrow(CLIError);
+
+    const hintLine = capture.stderr
+      .join('\n')
+      .split('\n')
+      .find(l => l.includes('[hint] Reopen'));
+    expect(hintLine).toBeDefined();
+    expect(hintLine).toContain('claude');
+    expect(hintLine).not.toContain('cursor');
+  });
+
+  it('does NOT emit the reload hint on a byte-identical re-run (skipped)', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const claudeAbs = path.resolve(CWD, TARGETS.claude.path);
+    seedFile(claudeAbs, renderForTarget('claude', 'testsprite-verify').content);
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      { ...base, output: 'text', dryRun: false, target: ['claude'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    expect(capture.stdout.join('\n')).toContain('skipped');
+    expect(capture.stderr.join('\n')).not.toContain('[hint] Reopen');
+  });
+
+  it('does NOT emit the reload hint under --dry-run', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      { ...base, output: 'text', dryRun: true, target: ['claude'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    expect(capture.stderr.join('\n')).not.toContain('[hint] Reopen');
+  });
+
+  it('does NOT emit the reload hint in --output json', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { capture, deps } = makeCapture();
+
+    await runInstall(
+      { ...base, output: 'json', dryRun: false, target: ['claude'] },
+      { cwd: CWD, fs: agentFs, ...deps },
+    );
+
+    expect(capture.stderr.join('\n')).not.toContain('[hint] Reopen');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // createAgentCommand wiring (parseAsync smoke tests)
 // ---------------------------------------------------------------------------
 
@@ -924,6 +1198,117 @@ describe('createAgentCommand wiring', () => {
     const out = capture.stdout.join('\n');
     expect(out).toContain('claude');
     expect(out).toContain('antigravity');
+  });
+
+  // -------------------------------------------------------------------------
+  // `agent install <target>` positional argument
+  // -------------------------------------------------------------------------
+  //
+  // Before the fix, `install` declared only `--target <t>` with no
+  // `.argument()`, so Commander silently dropped an excess positional and
+  // `install` fell through to the non-TTY default-to-claude path regardless
+  // of what was typed — `agent install cursor` installed claude's skill with
+  // exit 0 and zero signal. These tests exercise the real Commander wiring
+  // (not just `runInstall` directly) so a regression in the `.argument()`
+  // declaration itself would be caught, not just a regression in the
+  // downstream parsing logic.
+
+  it('agent install <target> (positional) via parseAsync installs the named target, not the claude default', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    const command = createAgentCommand({ cwd: CWD, fs: agentFs, ...deps });
+    const parent = new (await import('commander')).Command('testsprite');
+    parent.option('--output <mode>', 'output', 'text');
+    parent.option('--profile <name>', 'profile', 'default');
+    parent.option('--endpoint-url <url>');
+    parent.option('--debug', 'debug', false);
+    parent.option('--verbose', 'verbose', false);
+    parent.option('--dry-run', 'dry-run', false);
+    parent.addCommand(command);
+
+    await parent.parseAsync(['node', 'ts', 'agent', 'install', 'cursor', `--dir=${CWD}`]);
+
+    const cursorAbs = path.resolve(CWD, pathFor('cursor', 'testsprite-verify'));
+    const claudeAbs = path.resolve(CWD, pathFor('claude', 'testsprite-verify'));
+    expect(store.get(cursorAbs)).toBe(renderForTarget('cursor', 'testsprite-verify').content);
+    expect(store.has(claudeAbs)).toBe(false);
+  });
+
+  it('agent install <target1> <target2> (multiple positionals) via parseAsync installs both', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    const command = createAgentCommand({ cwd: CWD, fs: agentFs, ...deps });
+    const parent = new (await import('commander')).Command('testsprite');
+    parent.option('--output <mode>', 'output', 'text');
+    parent.option('--profile <name>', 'profile', 'default');
+    parent.option('--endpoint-url <url>');
+    parent.option('--debug', 'debug', false);
+    parent.option('--verbose', 'verbose', false);
+    parent.option('--dry-run', 'dry-run', false);
+    parent.addCommand(command);
+
+    await parent.parseAsync(['node', 'ts', 'agent', 'install', 'cline', 'kiro', `--dir=${CWD}`]);
+
+    expect(store.has(path.resolve(CWD, pathFor('cline', 'testsprite-verify')))).toBe(true);
+    expect(store.has(path.resolve(CWD, pathFor('kiro', 'testsprite-verify')))).toBe(true);
+  });
+
+  it('agent install <target> --target <other> via parseAsync merges positional and flag targets', async () => {
+    const { store, fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    const command = createAgentCommand({ cwd: CWD, fs: agentFs, ...deps });
+    const parent = new (await import('commander')).Command('testsprite');
+    parent.option('--output <mode>', 'output', 'text');
+    parent.option('--profile <name>', 'profile', 'default');
+    parent.option('--endpoint-url <url>');
+    parent.option('--debug', 'debug', false);
+    parent.option('--verbose', 'verbose', false);
+    parent.option('--dry-run', 'dry-run', false);
+    parent.addCommand(command);
+
+    await parent.parseAsync([
+      'node',
+      'ts',
+      'agent',
+      'install',
+      'antigravity',
+      '--target=windsurf',
+      `--dir=${CWD}`,
+    ]);
+
+    expect(store.has(path.resolve(CWD, pathFor('antigravity', 'testsprite-verify')))).toBe(true);
+    expect(store.has(path.resolve(CWD, pathFor('windsurf', 'testsprite-verify')))).toBe(true);
+  });
+
+  it('agent install <unknown-target> (positional) via parseAsync throws CLIError exit 5', async () => {
+    const { fs: agentFs } = makeMemFs();
+    const { deps } = makeCapture();
+
+    const command = createAgentCommand({ cwd: CWD, fs: agentFs, ...deps });
+    const parent = new (await import('commander')).Command('testsprite');
+    parent.option('--output <mode>', 'output', 'text');
+    parent.option('--profile <name>', 'profile', 'default');
+    parent.option('--endpoint-url <url>');
+    parent.option('--debug', 'debug', false);
+    parent.option('--verbose', 'verbose', false);
+    parent.option('--dry-run', 'dry-run', false);
+    parent.addCommand(command);
+
+    let thrown: unknown;
+    try {
+      await parent.parseAsync(['node', 'ts', 'agent', 'install', 'banana', `--dir=${CWD}`]);
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeDefined();
+    const isValidationErr =
+      (thrown instanceof ApiError && thrown.exitCode === 5) ||
+      (thrown instanceof CLIError && thrown.exitCode === 5);
+    expect(isValidationErr).toBe(true);
   });
 });
 
@@ -2495,7 +2880,10 @@ describe('runStatus — agent status (issue #123)', () => {
     expect(rows.every(row => row.state === 'absent')).toBe(true);
   });
 
-  it('fresh installs read ok (own-file and codex managed section), exit 0', async () => {
+  // Sweeps every target rather than a sample: the compactBody ones (windsurf,
+  // copilot) read `stale` on a pristine install until DEV-672, and a future
+  // compactBody target is covered the day it is added.
+  it('fresh installs read ok — every target, own-file and codex managed section', async () => {
     const { fs: agentFs } = makeMemFs();
     const { deps } = makeCapture();
     await runInstall(
@@ -2504,7 +2892,7 @@ describe('runStatus — agent status (issue #123)', () => {
         output: 'text',
         debug: false,
         dryRun: false,
-        target: ['claude', 'codex'],
+        target: Object.keys(TARGETS) as AgentTarget[],
         skills: [...DEFAULT_SKILLS],
         force: false,
       },
@@ -2512,50 +2900,126 @@ describe('runStatus — agent status (issue #123)', () => {
     );
 
     const { rows, thrown } = await statusRows(agentFs);
+    const notOk = rows.filter(row => row.state !== 'ok');
+    expect(
+      notOk,
+      `every freshly installed row must read ok, got: ${JSON.stringify(notOk)}`,
+    ).toEqual([]);
+    expect(rows).toHaveLength(Object.keys(TARGETS).length * DEFAULT_SKILLS.length);
     expect(thrown).toBeUndefined();
-    for (const skill of DEFAULT_SKILLS) {
-      expect(rows.find(r => r.target === 'claude' && r.skill === skill)?.state).toBe('ok');
-      expect(rows.find(r => r.target === 'codex' && r.skill === skill)?.state).toBe('ok');
-      expect(rows.find(r => r.target === 'cursor' && r.skill === skill)?.state).toBe('absent');
-    }
   });
 
-  it('stale: a marker whose hash matches an OLDER body reads stale and exits 1', async () => {
+  // Inverse of the sweep above: on a compactBody target the FULL body is not
+  // canonical, so an artifact carrying its hash must still read stale.
+  it('compact-body target: an artifact rendered from the FULL body still reads stale (DEV-672)', async () => {
+    const { fs: agentFs, seedFile } = makeMemFs();
+    const fullBody = loadSkillBodyFor('testsprite-verify');
+    seedFile(
+      path.resolve(CWD, pathFor('windsurf', 'testsprite-verify')),
+      renderOwnFileWithMarker(
+        'windsurf',
+        'testsprite-verify',
+        buildSkillMarker('testsprite-verify', fullBody),
+        fullBody,
+      ),
+    );
+
+    const { rows, thrown } = await statusRows(agentFs);
+    expect(rows.find(r => r.target === 'windsurf' && r.skill === 'testsprite-verify')?.state).toBe(
+      'stale',
+    );
+    expect((thrown as CLIError).exitCode).toBe(1);
+  });
+
+  // Both non-ok states run against a full-body target AND a compactBody one:
+  // windsurf is the shape DEV-672 broke, and the field case is an outdated
+  // COMPACT body on disk, not the full-body artifact the guard above seeds.
+  const NON_OK_TARGETS: AgentTarget[] = ['claude', 'windsurf'];
+
+  it.each(NON_OK_TARGETS)(
+    'stale: a marker whose hash matches an OLDER body reads stale and exits 1 (%s)',
+    async target => {
+      const { fs: agentFs, seedFile } = makeMemFs();
+      const oldBody = '# TestSprite Verification Loop\n\nold body from a previous CLI release\n';
+      seedFile(
+        path.resolve(CWD, pathFor(target, 'testsprite-verify')),
+        renderOwnFileWithMarker(
+          target,
+          'testsprite-verify',
+          buildSkillMarker('testsprite-verify', oldBody),
+          oldBody,
+        ),
+      );
+
+      const { rows, thrown } = await statusRows(agentFs);
+      expect(rows.find(r => r.target === target && r.skill === 'testsprite-verify')?.state).toBe(
+        'stale',
+      );
+      expect(thrown).toBeInstanceOf(CLIError);
+      expect((thrown as CLIError).exitCode).toBe(1);
+      expect((thrown as CLIError).message).toContain('need attention');
+    },
+  );
+
+  // `agent status`'s error line sends the user to `agent install --force`. On a
+  // compact target under DEV-672 that was a dead end — install saw the file as
+  // current and skipped it, status still said stale — so pin that the remedy
+  // now clears the state it is printed for.
+  it('stale on a compact target: install --force clears it (DEV-672)', async () => {
     const { fs: agentFs, seedFile } = makeMemFs();
     const oldBody = '# TestSprite Verification Loop\n\nold body from a previous CLI release\n';
+    const windsurfVerify = (rows: StatusResult[]): string | undefined =>
+      rows.find(r => r.target === 'windsurf' && r.skill === 'testsprite-verify')?.state;
+
     seedFile(
-      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
+      path.resolve(CWD, pathFor('windsurf', 'testsprite-verify')),
       renderOwnFileWithMarker(
-        'claude',
+        'windsurf',
         'testsprite-verify',
         buildSkillMarker('testsprite-verify', oldBody),
         oldBody,
       ),
     );
+    expect(windsurfVerify((await statusRows(agentFs)).rows)).toBe('stale');
 
-    const { rows, thrown } = await statusRows(agentFs);
-    expect(rows.find(r => r.target === 'claude' && r.skill === 'testsprite-verify')?.state).toBe(
-      'stale',
-    );
-    expect(thrown).toBeInstanceOf(CLIError);
-    expect((thrown as CLIError).exitCode).toBe(1);
-    expect((thrown as CLIError).message).toContain('need attention');
-  });
-
-  it('modified: current hash but edited bytes reads modified and exits 1', async () => {
-    const { fs: agentFs, seedFile } = makeMemFs();
-    const canonical = renderForTarget('claude', 'testsprite-verify').content;
-    seedFile(
-      path.resolve(CWD, pathFor('claude', 'testsprite-verify')),
-      `${canonical}\n<!-- my local tweak -->\n`,
+    const { deps } = makeCapture();
+    await runInstall(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        target: ['windsurf'],
+        skills: [...DEFAULT_SKILLS],
+        force: true,
+      },
+      { cwd: CWD, fs: agentFs, ...deps },
     );
 
     const { rows, thrown } = await statusRows(agentFs);
-    expect(rows.find(r => r.target === 'claude' && r.skill === 'testsprite-verify')?.state).toBe(
-      'modified',
-    );
-    expect((thrown as CLIError).exitCode).toBe(1);
+    expect(windsurfVerify(rows)).toBe('ok');
+    // Every other row is `absent`, which is not an attention state — so the
+    // remedy leaves the command green, not merely less red.
+    expect(thrown).toBeUndefined();
   });
+
+  it.each(NON_OK_TARGETS)(
+    'modified: current hash but edited bytes reads modified and exits 1 (%s)',
+    async target => {
+      const { fs: agentFs, seedFile } = makeMemFs();
+      const canonical = renderForTarget(target, 'testsprite-verify').content;
+      seedFile(
+        path.resolve(CWD, pathFor(target, 'testsprite-verify')),
+        `${canonical}\n<!-- my local tweak -->\n`,
+      );
+
+      const { rows, thrown } = await statusRows(agentFs);
+      expect(rows.find(r => r.target === target && r.skill === 'testsprite-verify')?.state).toBe(
+        'modified',
+      );
+      expect((thrown as CLIError).exitCode).toBe(1);
+    },
+  );
 
   it('unmarked: an artifact without a marker line reads unmarked and exits 1', async () => {
     const { fs: agentFs, seedFile } = makeMemFs();

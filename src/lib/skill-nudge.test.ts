@@ -4,6 +4,7 @@ import type { OutputMode } from './output.js';
 import {
   SKILL_NUDGE_COMMANDS,
   SKILL_NUDGE_OPT_OUT_ENV,
+  isPlanTemplateInvocation,
   isVerifySkillInstalled,
   maybeEmitSkillNudge,
   type SkillNudgeContext,
@@ -67,8 +68,72 @@ describe('isVerifySkillInstalled', () => {
     expect(isVerifySkillInstalled('/proj', { existsSync, readFileSync })).toBe(false);
   });
 
+  it('reports an unreadable managed target through the optional diagnostic callback', () => {
+    const errors: Array<{ path: string; error: unknown }> = [];
+    const existsSync = (p: string) => p.endsWith('AGENTS.md');
+    const readFileSync = () => {
+      throw new Error('EACCES');
+    };
+
+    expect(
+      isVerifySkillInstalled('/proj', {
+        existsSync,
+        readFileSync,
+        onReadError: (path, error) => errors.push({ path, error }),
+      }),
+    ).toBe(false);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.path).toContain('AGENTS.md');
+    expect(errors[0]?.error).toBeInstanceOf(Error);
+  });
+
+  it('never lets a failing diagnostic callback break the presence probe', () => {
+    const existsSync = (p: string) => p.endsWith('AGENTS.md');
+    const readFileSync = () => {
+      throw new Error('EACCES');
+    };
+
+    expect(() =>
+      isVerifySkillInstalled('/proj', {
+        existsSync,
+        readFileSync,
+        onReadError: () => {
+          throw new Error('diagnostic sink failed');
+        },
+      }),
+    ).not.toThrow();
+  });
+
   it('false when nothing is present', () => {
     expect(isVerifySkillInstalled('/proj', { existsSync: () => false })).toBe(false);
+  });
+
+  it('false when the skill is installed only for an agent other than the required one', () => {
+    // The silent miss this narrowing exists for: skills landed for claude, the
+    // caller is cursor, and "installed" would be a lie from cursor's view.
+    const existsSync = (p: string) =>
+      toPosix(p).endsWith('.claude/skills/testsprite-verify/SKILL.md');
+    expect(isVerifySkillInstalled('/proj', { existsSync })).toBe(true);
+    expect(isVerifySkillInstalled('/proj', { existsSync, requiredTargets: ['cursor'] })).toBe(
+      false,
+    );
+  });
+
+  it('true when the skill is installed for the required agent', () => {
+    const existsSync = (p: string) => toPosix(p).endsWith('.cursor/rules/testsprite-verify.mdc');
+    expect(isVerifySkillInstalled('/proj', { existsSync, requiredTargets: ['cursor'] })).toBe(true);
+  });
+
+  it('probes only the required targets', () => {
+    const seen: string[] = [];
+    isVerifySkillInstalled('/proj', {
+      existsSync: (p: string) => {
+        seen.push(p);
+        return false;
+      },
+      requiredTargets: ['cursor', 'codex'],
+    });
+    expect(seen).toHaveLength(2);
   });
 
   it('checks paths under the supplied dir', () => {
@@ -129,8 +194,8 @@ describe('maybeEmitSkillNudge', () => {
     }
   });
 
-  it('is silent in JSON mode (never pollutes a machine-readable stream)', () => {
-    const { ctx, lines } = makeCtx({ output: 'json' as OutputMode });
+  it('is silent in JSON mode even with debug enabled', () => {
+    const { ctx, lines } = makeCtx({ output: 'json' as OutputMode, debug: true });
     maybeEmitSkillNudge(ctx);
     expect(lines).toHaveLength(0);
   });
@@ -193,6 +258,66 @@ describe('maybeEmitSkillNudge', () => {
     expect(lines).toHaveLength(0);
   });
 
+  it('reports a swallowed profile lookup error only in debug mode', () => {
+    const { ctx, lines } = makeCtx({
+      debug: true,
+      readProfileImpl: () => {
+        throw new Error('credentials unavailable');
+      },
+    });
+
+    maybeEmitSkillNudge(ctx);
+
+    expect(lines).toEqual(['[debug] skill nudge skipped: credentials unavailable']);
+  });
+
+  it('keeps an unreadable managed target byte-identical without debug', () => {
+    const normal = makeCtx();
+    maybeEmitSkillNudge(normal.ctx);
+
+    const unreadable = makeCtx({
+      existsSync: p => p.endsWith('AGENTS.md'),
+      readFileSync: () => {
+        throw new Error('EACCES');
+      },
+    });
+    maybeEmitSkillNudge(unreadable.ctx);
+
+    expect(unreadable.lines).toEqual(normal.lines);
+  });
+
+  it('reports an unreadable managed target only in debug mode, then preserves the warning', () => {
+    const { ctx, lines } = makeCtx({
+      debug: true,
+      existsSync: p => p.endsWith('AGENTS.md'),
+      readFileSync: () => {
+        throw new Error('EACCES');
+      },
+    });
+
+    maybeEmitSkillNudge(ctx);
+
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('[debug] skill nudge could not read');
+    expect(lines[0]).toContain('AGENTS.md');
+    expect(lines[0]).toContain('EACCES');
+    expect(lines[1]).toContain('[warn] No TestSprite verification skill is installed');
+  });
+
+  it('never lets a failing debug stderr sink break the command', () => {
+    const { ctx } = makeCtx({
+      debug: true,
+      stderr: () => {
+        throw new Error('stderr unavailable');
+      },
+      readProfileImpl: () => {
+        throw new Error('credentials unavailable');
+      },
+    });
+
+    expect(() => maybeEmitSkillNudge(ctx)).not.toThrow();
+  });
+
   it('passes the cwd through to the presence check', () => {
     const probed: string[] = [];
     const { ctx } = makeCtx({
@@ -205,5 +330,111 @@ describe('maybeEmitSkillNudge', () => {
     maybeEmitSkillNudge(ctx);
     expect(probed.length).toBeGreaterThan(0);
     expect(probed.every(p => toPosix(p).startsWith('/work/here'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// maybeEmitSkillNudge — the calling agent narrows what counts as installed
+// ---------------------------------------------------------------------------
+
+describe('maybeEmitSkillNudge — when the environment names the caller', () => {
+  const claudeInstalled = (p: string) =>
+    toPosix(p).endsWith('.claude/skills/testsprite-verify/SKILL.md');
+  const cursorInstalled = (p: string) => toPosix(p).endsWith('.cursor/rules/testsprite-verify.mdc');
+
+  it('warns a cursor caller about a claude-only install, and says so', () => {
+    const { ctx, lines } = makeCtx({
+      env: { CURSOR_AGENT: '1' } as NodeJS.ProcessEnv,
+      existsSync: claudeInstalled,
+    });
+    maybeEmitSkillNudge(ctx);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('not for cursor');
+  });
+
+  it('stays silent when the skill is installed for the calling agent', () => {
+    const { ctx, lines } = makeCtx({
+      env: { CURSOR_AGENT: '1' } as NodeJS.ProcessEnv,
+      existsSync: cursorInstalled,
+    });
+    maybeEmitSkillNudge(ctx);
+    expect(lines).toHaveLength(0);
+  });
+
+  it('keeps the any-agent answer when no environment signal names a caller', () => {
+    const { ctx, lines } = makeCtx({ existsSync: claudeInstalled });
+    maybeEmitSkillNudge(ctx);
+    expect(lines).toHaveLength(0);
+  });
+
+  it('reports nothing-installed rather than installed-elsewhere when the project is bare', () => {
+    const { ctx, lines } = makeCtx({
+      env: { CURSOR_AGENT: '1' } as NodeJS.ProcessEnv,
+      existsSync: () => false,
+    });
+    maybeEmitSkillNudge(ctx);
+    expect(lines[0]).toContain('No TestSprite verification skill is installed');
+  });
+
+  // Two agents' variables can both be present — a shell that still carries the
+  // outer agent's variable. The presence check is per caller and ANDed, so one
+  // satisfied caller must not answer for the other.
+  it('still warns when only one of two named callers has a skill', () => {
+    const { ctx, lines } = makeCtx({
+      env: { CLAUDECODE: '1', CURSOR_AGENT: '1' } as NodeJS.ProcessEnv,
+      existsSync: claudeInstalled,
+    });
+    maybeEmitSkillNudge(ctx);
+    expect(lines).toHaveLength(1);
+    // Names only the caller that is actually missing one.
+    expect(lines[0]).toContain('not for cursor');
+    expect(lines[0]).not.toContain('claude');
+  });
+
+  it('stays silent only when every named caller has its own skill', () => {
+    const { ctx, lines } = makeCtx({
+      env: { CLAUDECODE: '1', CURSOR_AGENT: '1' } as NodeJS.ProcessEnv,
+      existsSync: (p: string) => claudeInstalled(p) || cursorInstalled(p),
+    });
+    maybeEmitSkillNudge(ctx);
+    expect(lines).toHaveLength(0);
+  });
+
+  it('names both callers when neither has a skill', () => {
+    const { ctx, lines } = makeCtx({
+      env: { CLAUDECODE: '1', CURSOR_AGENT: '1' } as NodeJS.ProcessEnv,
+      existsSync: () => false,
+    });
+    maybeEmitSkillNudge(ctx);
+    expect(lines[0]).toContain('No TestSprite verification skill is installed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isPlanTemplateInvocation — src/index.ts's preAction hook uses
+// this to exempt `test create --plan-template` from BOTH the skill nudge
+// above and the update-registry check in update-check.ts. Extracted here
+// (rather than left inline in src/index.ts, which executes `program.parse()`
+// at import time and so cannot safely be imported by a unit test) purely so
+// the boolean logic is directly unit-testable.
+// ---------------------------------------------------------------------------
+
+describe('isPlanTemplateInvocation', () => {
+  it('true for `test create` with planTemplate: true', () => {
+    expect(isPlanTemplateInvocation('test create', true)).toBe(true);
+  });
+
+  it('false for `test create` without planTemplate (undefined)', () => {
+    expect(isPlanTemplateInvocation('test create', undefined)).toBe(false);
+  });
+
+  it('false for `test create` with planTemplate: false', () => {
+    expect(isPlanTemplateInvocation('test create', false)).toBe(false);
+  });
+
+  it('false for any other command path even with planTemplate: true (Commander would never actually set this, but the check must not false-positive)', () => {
+    expect(isPlanTemplateInvocation('test create-batch', true)).toBe(false);
+    expect(isPlanTemplateInvocation('test run', true)).toBe(false);
+    expect(isPlanTemplateInvocation('auth status', true)).toBe(false);
   });
 });

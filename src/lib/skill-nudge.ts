@@ -1,6 +1,12 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { MANAGED_SECTION_BEGIN, MANAGED_SECTION_END, TARGETS } from './agent-targets.js';
+import {
+  MANAGED_SECTION_BEGIN,
+  MANAGED_SECTION_END,
+  TARGETS,
+  type AgentTarget,
+} from './agent-targets.js';
+import { detectCallerFromEnv } from './agent-detect.js';
 import { defaultCredentialsPath, readProfile } from './credentials.js';
 import type { OutputMode } from './output.js';
 
@@ -35,17 +41,49 @@ export const SKILL_NUDGE_COMMANDS: ReadonlySet<string> = new Set([
  */
 export const SKILL_NUDGE_OPT_OUT_ENV = 'TESTSPRITE_NO_SKILL_WARNING';
 
+/**
+ * True when this invocation is `test create --plan-template`, a
+ * pure-local/informational flag (prints the plan-file skeleton and exits)
+ * that must be treated like `setup` / `agent install`: exempt from BOTH the
+ * missing-skill nudge above AND the update-registry check
+ * (`src/lib/update-check.ts`'s `maybeNotifyUpdate`, which hits the network
+ * and writes `~/.testsprite/update-check.json` — both contradict "no
+ * network" for this flag). Neither allowlist (`SKILL_NUDGE_COMMANDS` here,
+ * the unconditional call site in `src/index.ts`) tracks individual flags,
+ * only whole commands, so `src/index.ts`'s `preAction` hook filters this one
+ * case via this pure, independently-testable helper instead of teaching
+ * either module about flags. Exported from `skill-nudge.ts` (rather than
+ * `src/index.ts`, which executes `program.parse()` at import time and so
+ * cannot be safely imported by a unit test) purely so it has a home that
+ * supports direct unit testing.
+ */
+export function isPlanTemplateInvocation(
+  commandPath: string,
+  planTemplate: boolean | undefined,
+): boolean {
+  return commandPath === 'test create' && planTemplate === true;
+}
+
 export interface SkillPresenceDeps {
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
+  /** Best-effort diagnostic hook for an unreadable managed-section target. */
+  onReadError?: (path: string, error: unknown) => void;
+  /**
+   * Narrow the check to specific agents. Pass the agents actually calling: a
+   * skill installed for some OTHER agent is not one this caller can read, and
+   * treating it as installed is what makes the miss silent. Empty or omitted
+   * keeps the any-target answer, which is all an unidentified caller supports.
+   */
+  requiredTargets?: readonly AgentTarget[];
 }
 
 /**
- * True if the `testsprite-verify` skill is installed for ANY supported agent in
- * `dir`. own-file targets (claude/cursor/cline/antigravity): the landing file
- * exists. managed-section target (codex / AGENTS.md): the file exists AND
- * carries one complete managed section — a user-authored AGENTS.md without the
- * sentinels, or with a truncated section, does NOT count as our skill.
+ * True if the `testsprite-verify` skill is installed in `dir` — for any
+ * supported agent, or only for `deps.requiredTargets` when given. own-file
+ * targets: the landing file exists. managed-section target (codex / AGENTS.md):
+ * the file exists AND carries one complete managed section — a user-authored
+ * AGENTS.md without the sentinels, or with a truncated section, does NOT count.
  *
  * The TARGETS table is the single source of truth for landing paths, so this
  * stays in lockstep with `agent install` without re-listing paths. Best-effort:
@@ -54,13 +92,25 @@ export interface SkillPresenceDeps {
 export function isVerifySkillInstalled(dir: string, deps: SkillPresenceDeps = {}): boolean {
   const exists = deps.existsSync ?? existsSync;
   const read = deps.readFileSync ?? ((p: string) => readFileSync(p, 'utf8'));
-  for (const spec of Object.values(TARGETS)) {
+  const wanted = new Set<string>(deps.requiredTargets ?? []);
+  const specs = Object.entries(TARGETS)
+    .filter(([target]) => wanted.size === 0 || wanted.has(target))
+    .map(([, spec]) => spec);
+
+  for (const spec of specs) {
     const full = join(dir, spec.path);
     if (!exists(full)) continue;
     if (spec.mode === 'managed-section') {
       try {
         if (hasCompleteManagedSection(read(full))) return true;
-      } catch {
+      } catch (error) {
+        // A diagnostic callback must not change this best-effort probe's
+        // behavior, even if the caller's stderr sink itself is unavailable.
+        try {
+          deps.onReadError?.(full, error);
+        } catch {
+          // ignore diagnostic delivery failures
+        }
         // unreadable AGENTS.md → treat this target as absent, keep checking
       }
       continue;
@@ -92,6 +142,8 @@ export interface SkillNudgeContext {
   readProfileImpl?: (profile: string, opts: { path: string }) => { apiKey?: string } | undefined;
   /** Sink for the hint line; defaults to `process.stderr`. */
   stderr?: (line: string) => void;
+  /** Emit best-effort diagnostics for swallowed nudge errors. */
+  debug?: boolean;
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
 }
@@ -106,9 +158,11 @@ export interface SkillNudgeContext {
  * not `--dry-run`, the command is in {@link SKILL_NUDGE_COMMANDS}, the opt-out
  * env is unset, the active profile has an api key (un-configured callers hit an
  * auth error that already points at setup), and the skill is not already
- * installed. Never throws and never blocks the command — any error is swallowed.
+ * installed. Never throws and never blocks the command — any error is swallowed;
+ * `--debug` callers receive the swallowed reason on stderr.
  */
 export function maybeEmitSkillNudge(ctx: SkillNudgeContext): void {
+  const write = ctx.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   try {
     if (ctx.output !== 'text') return;
     if (ctx.dryRun) return;
@@ -120,24 +174,60 @@ export function maybeEmitSkillNudge(ctx: SkillNudgeContext): void {
     const profile = lookup(ctx.profile, { path: credsPath });
     if (!profile?.apiKey) return;
 
-    if (
-      isVerifySkillInstalled(ctx.cwd, {
-        existsSync: ctx.existsSync,
-        readFileSync: ctx.readFileSync,
-      })
-    ) {
+    const presence = {
+      existsSync: ctx.existsSync,
+      readFileSync: ctx.readFileSync,
+      onReadError: ctx.debug
+        ? (path: string, error: unknown) =>
+            emitDebug(write, `skill nudge could not read ${path}; treating target as absent`, error)
+        : undefined,
+    };
+    // When the environment names the calling agent, only that agent's skill
+    // counts — an install for a different agent is one this caller cannot read.
+    //
+    // Checked PER caller and ANDed, never as one set. `isVerifySkillInstalled`
+    // answers "any of these targets", so handing it the whole set lets one
+    // satisfied caller hide another's miss: with both CLAUDECODE and
+    // CURSOR_AGENT present — a nested shell that still carries the outer
+    // agent's variable — a project wired only for claude would fall silent for
+    // cursor, which is the exact silent miss this check exists to remove.
+    const callers = detectCallerFromEnv(ctx.env).map(d => d.target);
+    const missing = callers.filter(
+      target => !isVerifySkillInstalled(ctx.cwd, { ...presence, requiredTargets: [target] }),
+    );
+    if (callers.length > 0) {
+      if (missing.length === 0) return;
+    } else if (isVerifySkillInstalled(ctx.cwd, presence)) {
+      // No identified caller: the any-target answer is all this can support.
       return;
     }
 
-    const write = ctx.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    // Names the callers actually missing a skill, not every caller detected —
+    // with one of two satisfied, "not for cursor" is the actionable half and
+    // "not for claude or cursor" would be wrong about claude.
+    const forOtherAgent = missing.length > 0 && isVerifySkillInstalled(ctx.cwd, presence);
+    const subject = forOtherAgent
+      ? `The TestSprite verification skill is installed, but not for ${missing.join(' or ')}`
+      : 'No TestSprite verification skill is installed in this project';
     write(
-      '[warn] No TestSprite verification skill is installed in this project — your coding ' +
-        'agent will not verify its changes against TestSprite. Run `testsprite setup` (or ' +
-        `\`testsprite agent install\`) to set it up. Silence: ${SKILL_NUDGE_OPT_OUT_ENV}=1`,
+      `[warn] ${subject} — your coding agent will not verify its changes against ` +
+        'TestSprite. Run `testsprite setup` (or `testsprite agent install`) to set it up. ' +
+        `Silence: ${SKILL_NUDGE_OPT_OUT_ENV}=1`,
     );
-  } catch {
+  } catch (error) {
     // A nudge must never break, delay, or alter the exit status of a real
     // command. Swallow everything (missing creds file, fs races, etc.).
+    if (ctx.debug) emitDebug(write, 'skill nudge skipped', error);
+  }
+}
+
+/** Emit a diagnostic without letting the diagnostic path break the command. */
+function emitDebug(write: (line: string) => void, context: string, error: unknown): void {
+  try {
+    const reason = error instanceof Error ? error.message : String(error);
+    write(`[debug] ${context}: ${reason}`);
+  } catch {
+    // A broken stderr sink must not turn a best-effort nudge into a failure.
   }
 }
 

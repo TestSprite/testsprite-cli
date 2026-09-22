@@ -26,24 +26,33 @@ export const ERROR_CODES = [
   // "a Portal write is in flight."
   'IDEMPOTENCY_BODY_MISMATCH',
   'RATE_LIMITED',
-  // Client-side re-map of the credits sub-case of a RATE_LIMITED envelope.
-  // Detected when the backend returns RATE_LIMITED (HTTP 429) with a
-  // message matching /insufficient credits/i or details.required present.
-  // Exit 12: non-retriable — out-of-credits cannot self-heal with retries.
-  // The genuine per-minute throttle, 60/min/key ("Run trigger rate limit exceeded")
-  // retains code RATE_LIMITED / exit 11 / retriable.
-  // Note: backend will emit a distinct code in a future release; this is
-  // CLI-side detection only, bridging the gap.
+  // Emitted natively by the backend as HTTP 402 with `details.required` (the
+  // shortfall) — non-retriable, exit 12: out-of-credits cannot self-heal with
+  // retries. The CLI additionally re-maps the legacy credits sub-case of a
+  // RATE_LIMITED envelope (message matching /insufficient credits/i or
+  // details.required present) for older backends. The genuine per-minute
+  // throttle, 60/min/key ("Run trigger rate limit exceeded") retains code
+  // RATE_LIMITED / exit 11 / retriable.
   'INSUFFICIENT_CREDITS',
-  // Client-side code for plan-gated features that the server silently downgrades
-  // rather than emitting a 4xx. Used when the CLI detects a paid-tier feature was
-  // requested but the response shows it was not applied (e.g. autoHeal: false when
-  // autoHeal: true was sent on a Free key). This is NOT thrown as an error by
-  // default (the command still succeeds with verbatim replay) — it is used by
-  // callers that want to programmatically detect plan-downgrade events.
-  // Exit code: 13 (non-retriable). Backend follow-up: emit natively from the server
-  // so the CLI can drop the client-side detection heuristic.
+  // Emitted natively by the backend as a fatal HTTP 403 when a plan-gated
+  // feature is requested by a tier that doesn't include it (e.g. auto-auth on
+  // a Free-plan org). `details` carries `{feature, plan, reason: 'plan'}`;
+  // exit code 13 (non-retriable) — the fix is an upgrade, not a retry.
+  // Distinct from silent tier DOWNGRADES (a request that still succeeds with
+  // the feature dropped): those are surfaced via the response's advisory
+  // fields, not this error.
   'FEATURE_GATED',
+  // Client-side re-map of the org-ambiguity sub-case of a CONFLICT (409)
+  // envelope. Raised when a membership-key caller's testId resolves to
+  // projects in more than one of their organizations (uuid-derived ids
+  // should not normally collide, so this is pathological — a shared-id
+  // union-resolution edge case, not a transient snapshot race). Detected
+  // when the backend returns `code: "CONFLICT"` with
+  // `details.reason === "ambiguous_org"`. Same exit-code family as CONFLICT
+  // (exit 6) but kept as a distinct code — unlike a generic CONFLICT this is
+  // never retried (retrying resolves the same ambiguity again) and
+  // `details.candidates[]` needs its own rendering.
+  'AMBIGUOUS_ORG',
   'UNSUPPORTED',
   // The running CLI is older than the backend's minimum supported version.
   // Backend emits this as HTTP 426 when version enforcement is enabled. Exit
@@ -80,6 +89,7 @@ export function exitCodeFor(code: ErrorCode): number {
     case 'CONFLICT':
     case 'PRECONDITION_FAILED':
     case 'IDEMPOTENCY_BODY_MISMATCH':
+    case 'AMBIGUOUS_ORG':
       return 6;
     case 'UNSUPPORTED':
       return 7;
@@ -98,14 +108,58 @@ export function exitCodeFor(code: ErrorCode): number {
   }
 }
 
+/**
+ * Whether an error code is an authentication failure. DERIVED from the single
+ * `exitCodeFor` mapping (auth === exit 3) rather than a second hand-maintained
+ * list of code strings: a future `AUTH_*` code gets classified as auth the
+ * moment it is given an exit-3 row, so it can never be present in one place and
+ * missing in the other. The `ERROR_CODES` membership check keeps `exitCodeFor`
+ * off unknown/out-of-contract strings (its switch has no default).
+ */
+export function isAuthCode(code: string): boolean {
+  return (ERROR_CODES as readonly string[]).includes(code) && exitCodeFor(code as ErrorCode) === 3;
+}
+
 export class CLIError extends Error {
   readonly exitCode: number;
+  /**
+   * Stable machine error code — mirrored into telemetry's `errorCode` field
+   * and into the `--output json` error envelope (`{error:{code,...}}`).
+   * Defaults to the generic, deliberately out-of-catalog `'CLI_ERROR'`
+   * bucket for a plain `CLIError` (same convention as `InterruptError`'s
+   * `'INTERRUPTED'` and `RequestTimeoutError`'s `'REQUEST_TIMEOUT'` below —
+   * none of these are backend-issued codes, so they don't belong in
+   * `ERROR_CODES`). `ApiError` overrides this with the real catalog
+   * `ErrorCode` parsed from the server envelope.
+   *
+   * Before this field existed, `classifyCliError()`'s plain-`CLIError`
+   * fallback branch had nothing to report and telemetry events landed with
+   * `errorCode=None` — the same silent gap the final uncaught-exception
+   * branch had.
+   */
+  readonly code: string;
 
-  constructor(message: string, exitCode = 1) {
+  constructor(message: string, exitCode = 1, code = 'CLI_ERROR') {
     super(message);
     this.name = 'CLIError';
     this.exitCode = exitCode;
+    this.code = code;
   }
+}
+
+/**
+ * Best-effort extraction of a `.code` string off an arbitrary thrown value —
+ * covers Node built-in errors (`ENOENT`, `ECONNREFUSED`, …) that reach the
+ * top-level catch without ever being wrapped in a `CLIError`. Used by the
+ * genuinely-uncaught-exception fallback in both `classifyCliError()` and
+ * `index.ts`'s final catch branch, so a filesystem/network error reports its
+ * real code instead of falling into the generic `'UNCAUGHT_EXCEPTION'`
+ * bucket.
+ */
+export function extractNodeErrorCode(err: unknown): string | undefined {
+  if (typeof err !== 'object' || err === null || !('code' in err)) return undefined;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === 'string' && code.length > 0 ? code : undefined;
 }
 
 /**
@@ -137,7 +191,7 @@ export class InterruptError extends CLIError {
   readonly signal: TerminationSignal;
 
   constructor(signal: TerminationSignal) {
-    super(`Interrupted by ${signal}.`, TERMINATION_EXIT_CODES[signal]);
+    super(`Interrupted by ${signal}.`, TERMINATION_EXIT_CODES[signal], 'INTERRUPTED');
     this.name = 'InterruptError';
     this.signal = signal;
   }
@@ -145,7 +199,7 @@ export class InterruptError extends CLIError {
 
 export class NotImplementedError extends CLIError {
   constructor(commandPath: string) {
-    super(`Command not yet implemented: ${commandPath}`, 2);
+    super(`Command not yet implemented: ${commandPath}`, 2, 'NOT_IMPLEMENTED');
     this.name = 'NotImplementedError';
   }
 }
@@ -170,7 +224,16 @@ export interface ErrorEnvelope {
  * wording across paths).
  */
 export class ApiError extends CLIError {
-  readonly code: ErrorCode;
+  // `override`: CLIError now declares its own `code: string` (defaulting
+  // 'CLI_ERROR'), so `noImplicitOverride` requires this modifier on the
+  // narrowed redeclaration. Under useDefineForClassFields (the default at
+  // this tsconfig's ES2022 target) this field IS re-initialized to
+  // `undefined` right after `super(...)` returns — but the constructor body
+  // below unconditionally reassigns `this.code = envelope.code` afterward,
+  // so the final value is always the envelope's code, never the CLIError
+  // base default. See the pinned regression test in errors.test.ts
+  // ("ApiError.code overrides the CLIError base default").
+  override readonly code: ErrorCode;
   readonly requestId: string;
   readonly nextAction: string;
   readonly details: Record<string, unknown>;
@@ -268,6 +331,11 @@ export class ApiError extends CLIError {
  *
  * Use `'field'` for JSON-body paths to avoid fabricating a `--fieldName`
  * flag that doesn't exist in the CLI surface.
+ *
+ * `reason` is trailed with a period UNLESS it already ends with one — some
+ * call sites compose `reason` from multiple already-punctuated sentences
+ * (e.g. `'... Remove --target-url.'`), and unconditionally appending a
+ * second period produced a doubled `..` at the end of the rendered message.
  */
 export function localValidationError(
   field: string,
@@ -279,11 +347,12 @@ export function localValidationError(
     kind === 'flag'
       ? `Flag \`--${field.replace(/[A-Z]/g, ch => `-${ch.toLowerCase()}`)}\``
       : `Field \`${field}\``;
+  const punctuatedReason = reason.endsWith('.') ? reason : `${reason}.`;
   return ApiError.fromEnvelope({
     error: {
       code: 'VALIDATION_ERROR',
       message: 'Invalid request.',
-      nextAction: `${subject} is invalid: ${reason}.`,
+      nextAction: `${subject} is invalid: ${punctuatedReason}`,
       requestId: 'local',
       details: accepted === undefined ? { field, reason } : { field, reason, accepted },
     },
@@ -327,6 +396,7 @@ export class RequestTimeoutError extends CLIError {
       `Request timed out after ${timeoutSec}s (client-side). ` +
         `Use --request-timeout <seconds> or TESTSPRITE_REQUEST_TIMEOUT_MS to extend the deadline.`,
       7,
+      'REQUEST_TIMEOUT',
     );
     this.name = 'RequestTimeoutError';
     this.requestId = requestId;
@@ -347,6 +417,8 @@ function codeFromHttpStatus(status: number | undefined): ErrorCode {
       return 'VALIDATION_ERROR';
     case 401:
       return 'AUTH_INVALID';
+    case 402:
+      return 'INSUFFICIENT_CREDITS';
     case 403:
       return 'AUTH_FORBIDDEN';
     case 404:
@@ -395,6 +467,43 @@ function isInsufficientCredits(
   const hasRequiredField = typeof details.required === 'number' && details.required > 0;
   const hasCreditsMessage = /insufficient credits/i.test(message);
   return hasRequiredField || hasCreditsMessage;
+}
+
+/**
+ * The synthesized `nextAction` for an INSUFFICIENT_CREDITS refusal when the
+ * backend supplied none (older backends; the CLI's own all-credits batch
+ * refusal). Portal links resolve per environment from the API endpoint (dev and
+ * prod portals live on different domains); an unknown host gets the route only —
+ * a hardcoded domain would point at the wrong environment.
+ *
+ * V3 API keys are membership-bound: a key minted for a team org spends THAT
+ * org's wallet, not the holder's personal one, and there is no request-scoped
+ * signal at this layer to tell which kind of key just failed. So the hint
+ * deliberately does NOT assert "top up your (personal) credits" as the only
+ * path — it offers the personal-key link (still correct for the common case)
+ * alongside an honest org-bound alternative, rather than guessing. The
+ * `testsprite usage` pointer is the CLI-native way to check the balance before
+ * a large run fan-out.
+ */
+export function insufficientCreditsNextAction(apiUrl?: string): string {
+  const portalBase = apiUrl === undefined ? undefined : resolvePortalBase(apiUrl);
+  return (
+    (portalBase !== undefined
+      ? `Top up credits at ${portalBase}/dashboard/settings/billing (personal keys) — ask an org admin if this key is organization-bound — or upgrade your plan at ${portalBase}/pricing.`
+      : 'Top up credits on the portal Billing page (/dashboard/settings/billing) if this is a personal key — ask an org admin if it is organization-bound — or upgrade your plan (/pricing).') +
+    ' Run `testsprite usage` to check your current balance before the next run.'
+  );
+}
+
+/**
+ * Detect the "ambiguous org" sub-case of a CONFLICT (409) envelope: a
+ * membership-key caller's testId resolved to projects in more than one of
+ * their organizations. `details.reason === "ambiguous_org"` is the backend's
+ * stable discriminator (see `CliAmbiguousTestError` server-side) — distinct
+ * from the default CONFLICT meaning (snapshot in flight).
+ */
+function isAmbiguousOrgConflict(rawCode: string, details: Record<string, unknown>): boolean {
+  return rawCode === 'CONFLICT' && details.reason === 'ambiguous_org';
 }
 
 function parseEnvelopeBody(raw: unknown, httpStatus?: number, apiUrl?: string): ErrorEnvelopeBody {
@@ -462,18 +571,34 @@ function parseEnvelopeBody(raw: unknown, httpStatus?: number, apiUrl?: string): 
     // Portal links resolve per environment from the API endpoint (dev and
     // prod portals live on different domains); unknown hosts get the route
     // only — a hardcoded domain would point at the wrong environment.
-    const portalBase = apiUrl === undefined ? undefined : resolvePortalBase(apiUrl);
-    const billingNextAction =
-      nextAction !== ''
-        ? nextAction
-        : (portalBase !== undefined
-            ? `Top up your credits at ${portalBase}/dashboard/settings/billing or upgrade your plan at ${portalBase}/pricing.`
-            : 'Top up your credits on the portal Billing page (/dashboard/settings/billing) or upgrade your plan (/pricing).') +
-          ' Run `testsprite usage` to check your current balance before the next run.';
+    //
+    // V3 API keys are membership-bound: a key minted for a team org spends
+    // THAT org's wallet, not the holder's personal one, and there is no
+    // request-scoped signal here (this branch fires client-side, purely
+    // from the HTTP status/body) to tell which kind of key just failed. So
+    // this synthesized hint deliberately does NOT assert "top up your
+    // (personal) credits" as the only path — it offers the personal-key
+    // link (still correct for the common case) alongside an honest
+    // org-bound alternative, rather than guessing.
     return {
       code: 'INSUFFICIENT_CREDITS',
       message,
-      nextAction: billingNextAction,
+      nextAction: nextAction !== '' ? nextAction : insufficientCreditsNextAction(apiUrl),
+      requestId,
+      details,
+    };
+  }
+
+  // Client-side re-map: CONFLICT with the ambiguous-org discriminator ->
+  // AMBIGUOUS_ORG. Same message/nextAction as the backend supplied — the
+  // server already writes an actionable template — but a distinct `code`
+  // so the retry decision (http.ts) and the candidates rendering (index.ts)
+  // can key off it directly instead of re-parsing `details.reason`.
+  if (isAmbiguousOrgConflict(rawCode, details)) {
+    return {
+      code: 'AMBIGUOUS_ORG',
+      message,
+      nextAction,
       requestId,
       details,
     };

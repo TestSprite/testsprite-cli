@@ -10,8 +10,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Command } from 'commander';
-import { ApiError } from '../lib/errors.js';
+import type { RunResponse } from '../lib/runs.types.js';
+import { ApiError, InterruptError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT } from '../lib/output.js';
+import { ShutdownController } from '../lib/interrupt.js';
 import {
   type CliFailureContext,
   type CliLatestResult,
@@ -19,8 +21,14 @@ import {
   type CliTestCode,
   type CliTestStep,
   type TestDeps,
+  backendResultIsForThisRun,
+  backendResultToRunResponse,
+  makeBackendWaitFallback,
   createTestCommand,
   isPresignedCodeUrl,
+  PLAN_SCHEMA_URL,
+  PLAN_TEMPLATE_TEXT,
+  PLAN_TEMPLATE_WITH_SCHEMA,
   runCodeGet,
   runCodePut,
   runCreate,
@@ -35,11 +43,16 @@ import {
   runList,
   runOpen,
   runPlanPut,
+  runPlanTemplate,
   runResult,
   runScaffold,
   runSteps,
   runTestWaitMany,
   runUpdate,
+  writeBatchJUnitReportIfRequested,
+  runTestRunAll,
+  runTestRun,
+  runTestRerun,
 } from './test.js';
 
 function disableExits(cmd: Command): void {
@@ -202,6 +215,7 @@ describe('createTestCommand — surface', () => {
   it('result exposes --include-analysis (M2.1) + M3.4 piece-5 --history flags', () => {
     // M2.1 piece 3 adds `--include-analysis` to `test result`.
     // M3.4 piece 5 adds `--history`, `--source`, `--since`, `--page-size`, `--cursor`.
+    // The rerun history filter adds `--rerun` / `--no-rerun`.
     // Issue #165 adds text-table shaping via `--columns` and `--no-header`.
     // Pinning the surface so a future flag-consolidation sweep keeps every
     // option intentional. Back-compat: bare `test result <id>` (no --history)
@@ -216,9 +230,23 @@ describe('createTestCommand — surface', () => {
       '--since',
       '--page-size',
       '--cursor',
+      '--rerun',
+      '--no-rerun',
+      // DEV-1306: filter history by the credentials-supplying environment.
+      '--env',
       '--columns',
       '--no-header',
     ]);
+  });
+
+  it('create/update expose the per-test step-timeout flags', () => {
+    const test = createTestCommand();
+    const create = test.commands.find(c => c.name() === 'create')!;
+    const update = test.commands.find(c => c.name() === 'update')!;
+    expect(create.options.map(o => o.long)).toContain('--step-timeout');
+    expect(update.options.map(o => o.long)).toEqual(
+      expect.arrayContaining(['--step-timeout', '--clear-step-timeout']),
+    );
   });
 
   it('code get exposes --out as its only option', () => {
@@ -967,6 +995,72 @@ describe('runGet', () => {
     expect(out.join('\n')).toContain('planSteps:   3');
   });
 
+  describe('planSteps rendering tolerates malformed wire elements', () => {
+    const cases: Array<{ name: string; planSteps: unknown[]; renderedSteps: string[] }> = [
+      { name: 'null', planSteps: [null], renderedSteps: [] },
+      { name: 'number', planSteps: [42], renderedSteps: [] },
+      { name: 'empty object', planSteps: [{}], renderedSteps: ['  1. [step] (no description)'] },
+      {
+        name: 'type only',
+        planSteps: [{ type: 'action' }],
+        renderedSteps: ['  1. [action] (no description)'],
+      },
+      {
+        name: 'description only',
+        planSteps: [{ description: 'x' }],
+        renderedSteps: ['  1. [step] x'],
+      },
+      {
+        name: 'well-formed pair',
+        planSteps: [
+          { type: 'action', description: 'Open the checkout page' },
+          { type: 'assertion', description: 'Confirm the order total is visible' },
+        ],
+        renderedSteps: [
+          '  1. [action] Open the checkout page',
+          '  2. [assertion] Confirm the order total is visible',
+        ],
+      },
+    ];
+
+    it.each(cases)('$name renders text exactly and preserves JSON verbatim', async testCase => {
+      const wireTest = {
+        ...FE_TEST,
+        planSteps: testCase.planSteps,
+      };
+      const { credentialsPath } = makeCreds();
+      const fetchImpl = makeFetch(() => ({ body: wireTest }));
+      const jsonOut: string[] = [];
+      const textOut: string[] = [];
+
+      const jsonResult = await runGet(
+        { profile: 'default', output: 'json', debug: false, testId: 'test_fe' },
+        { credentialsPath, fetchImpl, stdout: line => jsonOut.push(line) },
+      );
+      await runGet(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+        { credentialsPath, fetchImpl, stdout: line => textOut.push(line) },
+      );
+
+      expect(jsonResult.planSteps).toEqual(testCase.planSteps);
+      expect(JSON.parse(jsonOut.join('\n')).planSteps).toEqual(testCase.planSteps);
+      expect(textOut.join('\n')).toBe(
+        [
+          'id:          test_fe',
+          'projectId:   project_alice',
+          'name:        Checkout happy path',
+          'type:        frontend',
+          'createdFrom: portal',
+          'status:      failed',
+          `planSteps:   ${testCase.planSteps.length}`,
+          ...testCase.renderedSteps,
+          'createdAt:   2026-04-20T11:00:00.000Z',
+          'updatedAt:   2026-05-05T12:34:56.000Z',
+        ].join('\n'),
+      );
+    });
+  });
+
   it('omits the planSteps line when planStepCount is null or absent (M3.4)', async () => {
     const noPlan: CliTest = { ...FE_TEST, planStepCount: null };
     const { credentialsPath } = makeCreds();
@@ -978,6 +1072,33 @@ describe('runGet', () => {
     );
     expect(out.join('\n')).not.toContain('planSteps:');
   });
+
+  it('renders the per-test step timeout when the facade ships a number', async () => {
+    const withStepTimeout: CliTest = { ...FE_TEST, stepTimeoutMs: 45_000 };
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: withStepTimeout }));
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    expect(out.join('\n')).toContain('stepTimeout: 45000 ms (applies to every step)');
+  });
+
+  it.each([undefined, null])(
+    'omits the step-timeout line when stepTimeoutMs is %s',
+    async stepTimeoutMs => {
+      const withoutStepTimeout: CliTest = { ...FE_TEST, stepTimeoutMs };
+      const { credentialsPath } = makeCreds();
+      const fetchImpl = makeFetch(() => ({ body: withoutStepTimeout }));
+      const out: string[] = [];
+      await runGet(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+        { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+      );
+      expect(out.join('\n')).not.toContain('stepTimeout:');
+    },
+  );
 
   it('renders produces/consumes/category when the facade ships them', async () => {
     const withDeps: CliTest = {
@@ -1233,6 +1354,190 @@ const RESULT_PASSED: CliLatestResult = {
   executionStatus: 'completed',
   summary: 'Test passed.',
 };
+
+describe('backendResultIsForThisRun — auto-resume stale-verdict floor (finding 2)', () => {
+  // The orphaned-row case the whole fallback exists for: a terminal result for
+  // the test that carries NO runIdIfAvailable, so the createdAt floor is the only
+  // guard against resolving the auto-resume to a PRIOR run's verdict.
+  const staleResult: CliLatestResult = {
+    ...RESULT_PASSED,
+    runIdIfAvailable: null,
+    finishedAt: '2026-01-01T00:00:00.000Z', // a prior run, long before the in-flight one
+  };
+  const inFlightCreatedAt = '2026-06-01T00:00:00.000Z'; // the run we're resuming
+
+  it('rejects a stale result whose finishedAt predates the in-flight createdAt floor', () => {
+    // Under the real createdAt floor it must be rejected — this is the false green.
+    expect(backendResultIsForThisRun(staleResult, 'run_inflight', inFlightCreatedAt)).toBe(false);
+  });
+
+  it('the pre-fix epoch sentinel would ACCEPT that same stale result (the bug this guards)', () => {
+    // Restoring notBefore='1970…' makes finishedAt >= floor for any real result,
+    // resolving the resume to the previous run's verdict — the exact regression.
+    expect(backendResultIsForThisRun(staleResult, 'run_inflight', '1970-01-01T00:00:00.000Z')).toBe(
+      true,
+    );
+  });
+
+  it("accepts this run's own verdict (finishedAt at/after the floor)", () => {
+    expect(
+      backendResultIsForThisRun(
+        { ...staleResult, finishedAt: '2026-06-01T00:00:30.000Z' },
+        'run_inflight',
+        inFlightCreatedAt,
+      ),
+    ).toBe(true);
+  });
+
+  it('a matching runIdIfAvailable accepts regardless of the floor', () => {
+    expect(
+      backendResultIsForThisRun(
+        { ...staleResult, runIdIfAvailable: 'run_inflight' },
+        'run_inflight',
+        inFlightCreatedAt,
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('backend wait fallback — testTitle overlay (DEV-1032 CI title)', () => {
+  // The non-terminal poll shape the fallback synthesizes FROM: the backend only
+  // resolves `testTitle` on a TERMINAL run read, so a running poll carries null.
+  const NON_TERMINAL_RUN: RunResponse = {
+    runId: 'run_be',
+    testId: 'test_be',
+    projectId: 'project_alice',
+    userId: 'u1',
+    status: 'running',
+    source: 'cli',
+    createdAt: '2026-06-01T10:00:00.000Z',
+    startedAt: '2026-06-01T10:00:01.000Z',
+    finishedAt: null,
+    codeVersion: null,
+    targetUrl: null,
+    createdFrom: null,
+    failedStepIndex: null,
+    failureKind: null,
+    error: null,
+    videoUrl: null,
+    testTitle: null,
+    stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
+  } as unknown as RunResponse;
+
+  describe('backendResultToRunResponse — overlay', () => {
+    it('overlays the probe-cached name onto the synthesized terminal response', () => {
+      const out = backendResultToRunResponse(
+        RESULT_PASSED,
+        NON_TERMINAL_RUN,
+        'Smoke — health check',
+      );
+      expect(out.status).toBe('passed');
+      expect(out.testTitle).toBe('Smoke — health check');
+    });
+
+    it('a blank/whitespace title falls back to the run row (null), never renders empty', () => {
+      expect(
+        backendResultToRunResponse(RESULT_PASSED, NON_TERMINAL_RUN, '   ').testTitle,
+      ).toBeNull();
+      expect(backendResultToRunResponse(RESULT_PASSED, NON_TERMINAL_RUN, '').testTitle).toBeNull();
+    });
+
+    it('no title arg keeps the run row value (byte-identical to pre-DEV-1032)', () => {
+      expect(backendResultToRunResponse(RESULT_PASSED, NON_TERMINAL_RUN).testTitle).toBeNull();
+    });
+  });
+
+  describe('makeBackendWaitFallback — wiring: probe name flows into testTitle', () => {
+    const makeClient = (
+      test: CliTest,
+      result: CliLatestResult,
+    ): { get: ReturnType<typeof vi.fn> } => ({
+      get: vi.fn(async (path: string) => {
+        if (path === `/tests/${test.id}`) return test;
+        if (path === `/tests/${test.id}/result`) return result;
+        throw new Error(`unexpected path ${path}`);
+      }),
+    });
+
+    it('BE run: synthesized terminal response carries the title from the one-time type-probe', async () => {
+      const result: CliLatestResult = {
+        ...RESULT_PASSED,
+        testId: 'test_be',
+        runIdIfAvailable: 'run_be',
+      };
+      const client = makeClient(BE_TEST, result);
+      const fallback = makeBackendWaitFallback({
+        client: client as never,
+        resolveTestId: r => r.testId,
+        resolveNotBefore: () => undefined,
+      });
+
+      const out = await fallback(NON_TERMINAL_RUN, 1000, new AbortController().signal);
+      expect(out?.status).toBe('passed');
+      expect(out?.testTitle).toBe('Smoke — health check'); // BE_TEST.name, overlaid
+      // One probe + one result read — no extra request to learn the title.
+      expect(client.get).toHaveBeenCalledWith('/tests/test_be', expect.anything());
+    });
+
+    it('FE run: no-op (fallback returns null, title path untouched)', async () => {
+      const client = makeClient(FE_TEST, RESULT_PASSED);
+      const fallback = makeBackendWaitFallback({
+        client: client as never,
+        resolveTestId: r => r.testId,
+        resolveNotBefore: () => undefined,
+      });
+      const feRun = { ...NON_TERMINAL_RUN, testId: 'test_fe' } as RunResponse;
+      expect(await fallback(feRun, 1000, new AbortController().signal)).toBeNull();
+    });
+  });
+});
+
+describe('writeBatchJUnitReportIfRequested — testcase name precedence (DEV-1032)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ts-junit-'));
+  });
+
+  const nameInReport = async (
+    row: { testId: string; status: string; name?: string; testTitle?: string | null },
+    nameMap?: ReadonlyMap<string, string>,
+  ): Promise<string> => {
+    const file = join(dir, 'report.xml');
+    await writeBatchJUnitReportIfRequested(
+      { report: 'junit', reportFile: file, projectId: 'project_alice' },
+      [row] as never,
+      nameMap,
+    );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- report path is join(dir, ...) inside this test's own mkdtempSync temp dir, never user input.
+    const xml = readFileSync(file, 'utf8');
+    const m = /<testcase[^>]*\bname="([^"]*)"/.exec(xml);
+    return m?.[1] ?? '';
+  };
+
+  it('sweep map wins over testTitle and the row name', async () => {
+    const name = await nameInReport(
+      { testId: 't1', status: 'passed', name: 'row-name', testTitle: 'poll-title' },
+      new Map([['t1', 'sweep-name']]),
+    );
+    expect(name).toBe('sweep-name');
+  });
+
+  it('falls back to testTitle when the sweep map misses (same source as the summary table)', async () => {
+    const name = await nameInReport(
+      { testId: 't1', status: 'passed', name: 'row-name', testTitle: 'poll-title' },
+      new Map(), // sweep over-paged / timed out → empty
+    );
+    expect(name).toBe('poll-title');
+  });
+
+  it('a blank testTitle does not shadow the row name', async () => {
+    const name = await nameInReport(
+      { testId: 't1', status: 'passed', name: 'row-name', testTitle: '   ' },
+      new Map(),
+    );
+    expect(name).toBe('row-name');
+  });
+});
 
 describe('isPresignedCodeUrl', () => {
   it('treats https:// as presigned and source-looking strings as inline', () => {
@@ -2594,6 +2899,69 @@ describe('runScaffold', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// `test create --plan-template`. Pure-local: no network, no
+// credentials required (unlike everything above, no makeCreds()/fetchImpl).
+// ---------------------------------------------------------------------------
+describe('runPlanTemplate', () => {
+  it('prints PLAN_TEMPLATE_TEXT verbatim to stdout (text mode) and makes no fetch calls', async () => {
+    const out: string[] = [];
+    let fetchCalled = false;
+    const result = await runPlanTemplate(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        stdout: line => out.push(line),
+        stderr: () => undefined,
+        fetchImpl: (() => {
+          fetchCalled = true;
+          throw new Error('runPlanTemplate must never call fetch');
+        }) as unknown as typeof globalThis.fetch,
+      },
+    );
+    expect(fetchCalled).toBe(false);
+    expect(out.join('\n')).toBe(PLAN_TEMPLATE_TEXT);
+    expect(result).toEqual(PLAN_TEMPLATE_WITH_SCHEMA);
+  });
+
+  it('prints byte-identical output in --output json mode (Output.print(JSON.stringify) matches PLAN_TEMPLATE_TEXT)', async () => {
+    const out: string[] = [];
+    await runPlanTemplate(
+      { profile: 'default', output: 'json', debug: false },
+      { stdout: line => out.push(line), stderr: () => undefined },
+    );
+    expect(out.join('\n')).toBe(PLAN_TEMPLATE_TEXT);
+  });
+
+  it('the printed template round-trips through the real plan-from validator (assertPlanShape via runCreateFromPlan --dry-run)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-plan-template-'));
+    const planFile = join(dir, 'plan.json');
+    writeFileSync(planFile, PLAN_TEMPLATE_TEXT, 'utf8');
+    // --dry-run swaps in the canned dry-run fetch implementation regardless of
+    // any injected fetchImpl (client-factory.ts) and needs no credentials file
+    // — local validation still runs in full, which is exactly the property
+    // under test here (mirrors the existing "--dry-run does NOT emit
+    // dashboardUrl" convention elsewhere in this file).
+    await expect(
+      runCreateFromPlan(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          planFrom: planFile,
+          dryRun: true,
+          endpointUrl: 'https://api.testsprite.com',
+        },
+        { stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).resolves.toBeDefined();
+  });
+
+  it('`$schema` is present and does not upset the validator (extra top-level key is allowed)', () => {
+    expect(PLAN_TEMPLATE_WITH_SCHEMA.$schema).toBe(PLAN_SCHEMA_URL);
+    expect(typeof PLAN_TEMPLATE_WITH_SCHEMA.$schema).toBe('string');
+  });
+});
+
 describe('runOpen', () => {
   // The mock endpoint host has no portal mapping; the operator override is the
   // supported escape hatch and gives the tests a deterministic base.
@@ -3025,6 +3393,40 @@ describe('runSteps', () => {
     expect(block.match(/error: /g)).toHaveLength(1);
   });
 
+  it('--run-id run_failed_sample dry-run sample maps the failed step error and contributor flag', async () => {
+    const out: string[] = [];
+    const page = await runSteps(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        testId: 'test_fe',
+        runId: 'run_failed_sample',
+      },
+      {
+        env: {} as NodeJS.ProcessEnv,
+        credentialsPath: join(tmpdir(), 'testsprite-no-creds'),
+        stdout: line => out.push(line),
+        stderr: () => undefined,
+      },
+    );
+
+    const failing = page.items.find(step => step.stepIndex === 3);
+    expect(failing).toMatchObject({
+      status: 'failed',
+      error: expect.any(String),
+      stepType: 'assertion',
+      outcomeContributesToFailure: true,
+    });
+    expect(page.items.find(step => step.stepIndex === 1)?.outcomeContributesToFailure).toBe(false);
+
+    const printed = JSON.parse(out[0]!) as { items: Array<{ stepIndex: number; error?: string }> };
+    expect(printed.items.some(step => step.stepIndex === 3 && typeof step.error === 'string')).toBe(
+      true,
+    );
+  });
+
   it('--run-id: rejects a runId that belongs to a different test (exit 4)', async () => {
     const { credentialsPath } = makeCreds();
     // The run-scoped endpoint returns a run whose testId differs from the
@@ -3295,10 +3697,16 @@ describe('runDiff', () => {
     expect(errs.join('\n')).toContain('different tests');
   });
 
-  it('--dry-run returns the canned sample fully offline (no credentials, no fetch)', async () => {
-    // Dry-run must not require credentials or hit the network — it returns a
-    // canned CliRunDiff so `--dry-run` shows the shape offline.
-    const diff = await runDiff(
+  it('--dry-run prints the canned sample fully offline (no credentials, no fetch) AND honors the exit-code contract', async () => {
+    // Dry-run must not require credentials or hit the network — it prints a
+    // canned CliRunDiff so `--dry-run` shows the shape offline. The
+    // canned sample has verdictChanged: true, so per the documented contract
+    // ("Exit 0 when verdicts match, 1 when they differ" — no dry-run
+    // exception) this MUST reject with exit 1, same as a real regressed
+    // pair. Before the fix, the early `return sample` bypassed the
+    // verdictChanged check entirely and `--dry-run` always exited 0.
+    const out: string[] = [];
+    const rejection = await runDiff(
       {
         profile: 'default',
         output: 'json',
@@ -3307,8 +3715,15 @@ describe('runDiff', () => {
         runA: 'run_aaa',
         runB: 'run_bbb',
       },
-      { stdout: () => undefined, stderr: () => undefined },
-    );
+      { stdout: line => out.push(line), stderr: () => undefined },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 1 });
+    const diff = JSON.parse(out.join('')) as {
+      runA: { runId: string };
+      runB: { runId: string };
+      verdictChanged: boolean;
+      changedSteps: Array<{ stepIndex: number; statusA: string; statusB: string }>;
+    };
     expect(diff.runA.runId).toBe('run_aaa');
     expect(diff.runB.runId).toBe('run_bbb');
     expect(diff.verdictChanged).toBe(true);
@@ -3336,6 +3751,25 @@ describe('runLint', () => {
     type: 'frontend',
     name: 'Broken',
     planSteps: [{ type: 'hover', description: 'Bad step type' }],
+  });
+  // Regression fixture: mirrors the customer repro (Topify,
+  // 2026-07-10/11) exactly — a `name` type error, an invalid `priority`
+  // enum value, AND an invalid step `type`, all in the SAME file. Before the
+  // fix, `test lint` reported only `name`; fixing it revealed `priority`;
+  // fixing THAT revealed the step-type error — three fix-and-rerun cycles
+  // for one file.
+  const MULTI_PROBLEM_PLAN = JSON.stringify({
+    projectId: 'project_alice',
+    type: 'frontend',
+    name: 123, // wrong type — must be a string
+    priority: 'urgent', // not one of CLI_CREATE_PRIORITIES
+    planSteps: [{ type: 'hover', description: 'Bad step type' }], // not a valid step type
+  });
+  const MULTI_PROBLEM_STEPS = JSON.stringify({
+    planSteps: [
+      { type: 'click', description: 'Click submit' }, // invalid step type
+      { type: 'action', description: 123 }, // wrong type — must be a string
+    ],
   });
 
   it('a directory with valid and invalid plans reports EVERY problem and exits 5', async () => {
@@ -3397,6 +3831,166 @@ describe('runLint', () => {
     await expect(
       runLint({ profile: 'default', output: 'json', debug: false }, { stdout: () => undefined }),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  // ---------- collect EVERY problem WITHIN a single file, not just
+  // the first ----------
+
+  it('--plan-from-dir: a single file with 3 distinct problems reports ALL of them in one pass', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-multi-'));
+    writeFileSync(join(dir, 'multi.json'), MULTI_PROBLEM_PLAN, 'utf8');
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, planFromDir: dir },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as {
+      checked: number;
+      valid: number;
+      issues: Array<{ file: string; field: string; reason: string }>;
+    };
+    expect(report.checked).toBe(1);
+    expect(report.valid).toBe(0);
+    const fields = report.issues.map(issue => issue.field);
+    expect(fields).toContain('name');
+    expect(fields).toContain('priority');
+    expect(fields).toContain('planSteps[0].type');
+    expect(report.issues.length).toBeGreaterThanOrEqual(3);
+    // All three problems are attributed to the ONE file, not scattered.
+    expect(report.issues.every(issue => issue.file === 'multi.json')).toBe(true);
+  });
+
+  it('--plan-from (single file, not a directory) also collects every problem in the file', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-single-'));
+    const file = join(dir, 'plan.json');
+    writeFileSync(file, MULTI_PROBLEM_PLAN, 'utf8');
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, planFrom: file },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as {
+      checked: number;
+      issues: Array<{ field: string }>;
+    };
+    expect(report.checked).toBe(1);
+    const fields = report.issues.map(issue => issue.field);
+    expect(fields).toContain('name');
+    expect(fields).toContain('priority');
+    expect(fields).toContain('planSteps[0].type');
+  });
+
+  it('--steps: a file with 2 distinct problems across different steps reports BOTH', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-steps-'));
+    const file = join(dir, 'steps.json');
+    writeFileSync(file, MULTI_PROBLEM_STEPS, 'utf8');
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, steps: file },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as {
+      checked: number;
+      issues: Array<{ field: string }>;
+    };
+    expect(report.checked).toBe(1);
+    const fields = report.issues.map(issue => issue.field);
+    expect(fields).toContain('planSteps[0].type');
+    expect(fields).toContain('planSteps[1].description');
+  });
+
+  it('--steps: 201 steps (over the cap) with a bad first element reports the cap issue AND the per-element issues together', async () => {
+    // Regression: a length/cap violation must
+    // NOT short-circuit per-element checking — `stepsRaw` is still a real,
+    // iterable array even when it's over MAX_PLAN_STEPS (200), so a bad
+    // step 0 must be reported in the SAME pass as the cap violation, not
+    // instead of it.
+    const steps: unknown[] = [{ type: 'hover', description: 123 }];
+    for (let i = 1; i < 201; i += 1) {
+      steps.push({ type: 'action', description: `ok step ${i}` });
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-steps-overcap-'));
+    const file = join(dir, 'steps.json');
+    writeFileSync(file, JSON.stringify({ planSteps: steps }), 'utf8');
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, steps: file },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as {
+      checked: number;
+      issues: Array<{ field: string; reason: string }>;
+    };
+    expect(report.checked).toBe(1);
+    const fields = report.issues.map(issue => issue.field);
+    // The cap violation AND both step-0 problems must all be present.
+    expect(fields).toContain('planSteps');
+    expect(fields).toContain('planSteps[0].type');
+    expect(fields).toContain('planSteps[0].description');
+    expect(report.issues.length).toBeGreaterThanOrEqual(3);
+    const capIssue = report.issues.find(issue => issue.field === 'planSteps');
+    expect(capIssue?.reason).toContain('at most 200 steps');
+  });
+
+  it('--plan-from: 201 planSteps (over the cap) with a bad first element reports the cap issue AND the per-element issues together', async () => {
+    // Same regression, exercised through the plan-shape path (collectPlanIssues)
+    // rather than the steps-shape path (collectPlanStepsIssues) — this one
+    // never had the bug (it already iterated unconditionally), but the
+    // coordinator asked to check every collect* function for the same
+    // pattern, so this locks in that it stays correct.
+    const planSteps: unknown[] = [{ type: 'hover', description: 123 }];
+    for (let i = 1; i < 201; i += 1) {
+      planSteps.push({ type: 'action', description: `ok step ${i}` });
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-plan-overcap-'));
+    const file = join(dir, 'plan.json');
+    writeFileSync(
+      file,
+      JSON.stringify({
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'Over-cap plan',
+        planSteps,
+      }),
+      'utf8',
+    );
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, planFrom: file },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as { issues: Array<{ field: string; reason: string }> };
+    const fields = report.issues.map(issue => issue.field);
+    expect(fields).toContain('planSteps');
+    expect(fields).toContain('planSteps[0].type');
+    expect(fields).toContain('planSteps[0].description');
+    const capIssue = report.issues.find(issue => issue.field === 'planSteps');
+    expect(capIssue?.reason).toContain('at most 200 steps');
+  });
+
+  it('--plans (JSONL): a single line with multiple problems reports ALL of them, prefixed with specs[N].', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-lint-jsonl-multi-'));
+    const file = join(dir, 'plans.jsonl');
+    writeFileSync(file, `${MULTI_PROBLEM_PLAN}\n`, 'utf8');
+    const out: string[] = [];
+    const rejection = await runLint(
+      { profile: 'default', output: 'json', debug: false, plans: file },
+      { stdout: line => out.push(line) },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 5 });
+    const report = JSON.parse(out.join('')) as {
+      issues: Array<{ field: string; file: string }>;
+    };
+    const fields = report.issues.map(issue => issue.field);
+    expect(fields).toContain('specs[0].name');
+    expect(fields).toContain('specs[0].priority');
+    expect(fields).toContain('specs[0].planSteps[0].type');
+    expect(report.issues.every(issue => issue.file === `${file}:1`)).toBe(true);
   });
 });
 
@@ -3551,6 +4145,329 @@ describe('runTestWaitMany', () => {
       { credentialsPath, fetchImpl, stdout: () => undefined },
     ).catch((error: unknown) => error);
     expect(rejection).toMatchObject({ exitCode: 3 });
+  });
+
+  // -------------------------------------------------------------------------
+  // RATE_LIMITED per-member handling. The 429 is returned as a real HTTP
+  // response (never thrown directly) so these exercise http.ts's own internal
+  // RATE_LIMITED retry-then-throw first, which is what makes reaching the
+  // command-level outer loop meaningful. `retry-after: 0` keeps both budgets
+  // fast; the header still yields a defined `retryAfterMs` (clamped to ≥1s),
+  // which is the signal `isTransientRateLimit` reads.
+  // -------------------------------------------------------------------------
+
+  const rateLimited = (opts: { retryAfter?: number; message?: string }): Response =>
+    new Response(
+      JSON.stringify({
+        error: {
+          code: 'RATE_LIMITED',
+          message: opts.message ?? 'Run trigger rate limit exceeded: 60 per minute per key.',
+          nextAction: '',
+          requestId: 'req_rl',
+          details: {},
+        },
+      }),
+      {
+        status: 429,
+        headers: {
+          'content-type': 'application/json',
+          ...(opts.retryAfter !== undefined ? { 'retry-after': String(opts.retryAfter) } : {}),
+        },
+      },
+    );
+
+  const jsonOk = (body: unknown): Response =>
+    new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+
+  it('retries a throttled poll and still reports the real verdict (exit 0, retry named on stderr)', async () => {
+    const { credentialsPath } = makeCreds();
+    let rateLimitedResponses = 0;
+    // Throttle every poll until http.ts has exhausted its own budget once, then
+    // let the run through: without the outer retry the member is a poll error
+    // and the invocation exits 7 even though the run passed.
+    const fetchImpl = (async () => {
+      if (rateLimitedResponses < 4) {
+        rateLimitedResponses += 1;
+        return rateLimited({ retryAfter: 0 });
+      }
+      return jsonOk(terminalRun('run_slow', 'passed'));
+    }) as unknown as typeof globalThis.fetch;
+
+    const out: string[] = [];
+    const errs: string[] = [];
+    const payload = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_slow'],
+        timeoutSeconds: 600,
+        maxConcurrency: 1,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => errs.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    );
+    expect(payload.summary).toMatchObject({ passed: 1, errors: 0 });
+    expect(errs.join('\n')).toContain('[wait] run_slow — rate limited (attempt 1/3)');
+  });
+
+  it('exits 11 (not 7) when a persistent throttle is the ONLY thing that went wrong', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = (async () =>
+      rateLimited({ retryAfter: 0 })) as unknown as typeof globalThis.fetch;
+    const errs: string[] = [];
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_a', 'run_b'],
+        timeoutSeconds: 600,
+        maxConcurrency: 2,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => errs.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 11 });
+    expect((rejection as Error).message).toContain('rate limited on 2 of 2 runs');
+    // Every member spent its full outer budget before the escalation.
+    expect(errs.filter(l => l.includes('attempt 3/3')).length).toBe(2);
+  });
+
+  it('reports a TIMEOUT (exit 7), not a rate limit, when the shared deadline is reached during a backoff', async () => {
+    // The escalation claims "nothing else went wrong". An invocation that spent
+    // its entire `--timeout` inside rate-limit backoff HAS had something else go
+    // wrong — the wait budget ran out — so exit 11 would be a false claim.
+    // `sleep` advances a fake clock past the deadline instead of resolving free.
+    const { credentialsPath } = makeCreds();
+    let now = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      // `retry-after: 0` keeps http.ts's OWN retry chain (real timers) instant.
+      // Each request advances the fake clock, so the budget is consumed by the
+      // POLL rather than by the backoff — which is what forces the deadline check
+      // inside the clamp (`clampedRetryMs <= 0`) rather than the one at the top of
+      // the loop, i.e. the branch under test.
+      const fetchImpl = (async () => {
+        now += 1200;
+        return rateLimited({ retryAfter: 0 });
+      }) as unknown as typeof globalThis.fetch;
+      const rejection = await runTestWaitMany(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          runIds: ['run_slowpoke'],
+          timeoutSeconds: 2,
+          maxConcurrency: 1,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => undefined,
+          stderr: () => undefined,
+          // Every sleep burns real budget on the fake clock.
+          sleep: (ms: number) => {
+            now += ms;
+            return Promise.resolve();
+          },
+        },
+      ).catch((error: unknown) => error);
+      expect(rejection).toMatchObject({ exitCode: 7 });
+      expect((rejection as Error).message).toContain('timed out');
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('a Ctrl-C during a rate-limit backoff still detaches gracefully (DEV-331), not a hard exit', async () => {
+    // `pollRunUntilTerminal` disarms the graceful scope in its own `finally`, so
+    // the outer backoff has to re-arm it — otherwise the sleep is a window where
+    // the first signal hard-exits with empty stdout.
+    const { credentialsPath } = makeCreds();
+    const shutdown = new ShutdownController();
+    const fetchImpl = (async () =>
+      rateLimited({ retryAfter: 0 })) as unknown as typeof globalThis.fetch;
+    const out: string[] = [];
+    const errs: string[] = [];
+    // Fire the signal from inside the OUTER backoff specifically. The stderr line
+    // is the unambiguous marker that we are in that window (and not in one of the
+    // poll loop's own sleeps, which share the same injected `sleep`).
+    let inOuterBackoff = false;
+    let armedDuringBackoff: boolean | undefined;
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_interrupted'],
+        timeoutSeconds: 600,
+        maxConcurrency: 1,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => {
+          errs.push(line);
+          if (line.includes('rate limited (attempt')) inOuterBackoff = true;
+        },
+        shutdown,
+        sleep: () => {
+          if (inOuterBackoff) {
+            // THE assertion that distinguishes the fix. `installSignalHandlers`
+            // branches on `isArmed`: armed ⇒ abort and let the wait paths own the
+            // detach; disarmed ⇒ immediate `process.exit(130)` with empty stdout.
+            // The in-process abort below would be picked up by the NEXT poll
+            // either way, so only the armed flag proves the window is covered.
+            armedDuringBackoff = shutdown.isArmed;
+            shutdown.interrupt('SIGINT');
+          }
+          return Promise.resolve();
+        },
+      },
+    ).catch((error: unknown) => error);
+    expect(inOuterBackoff).toBe(true);
+    expect(armedDuringBackoff).toBe(true);
+
+    expect(rejection).toBeInstanceOf(InterruptError);
+    // The DEV-331 contract: stdout stays parseable and names the still-running id.
+    const payload = JSON.parse(out.join('')) as {
+      results: Array<{ runId: string; status: string }>;
+    };
+    expect(payload.results[0]).toMatchObject({ runId: 'run_interrupted', status: 'running' });
+    expect(errs.join('\n')).toContain('run_interrupted');
+  });
+
+  it('declines to escalate when the caller repeated a run id (a real failure must not be masked)', async () => {
+    // `outcomes` is keyed by runId, so a duplicate has ONE shared entry that the
+    // last lane to finish overwrites. Without the uniqueness guard a later
+    // RATE_LIMITED replaces an observed `failed` and the invocation exits 11.
+    const { credentialsPath } = makeCreds();
+    let call = 0;
+    const fetchImpl = (async () => {
+      call += 1;
+      // First lane sees a terminal failure; every later poll is throttled.
+      if (call === 1) return jsonOk(terminalRun('run_dup', 'failed'));
+      return rateLimited({ retryAfter: 0 });
+    }) as unknown as typeof globalThis.fetch;
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_dup', 'run_dup'],
+        timeoutSeconds: 600,
+        maxConcurrency: 2,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    ).catch((error: unknown) => error);
+    expect(rejection).not.toMatchObject({ exitCode: 11 });
+  });
+
+  // NOTE: a guard, not a proof — exit 7 is also what the pre-change code returned
+  // here. It exists so nobody can widen the escalation to fire whenever ANY
+  // RATE_LIMITED is present without going red.
+  it('keeps exit 7 when a throttle is mixed with a non-rate-limit poll error (escalation stays narrow)', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = (async (input: unknown) => {
+      const url = String(input);
+      if (url.includes('run_gone')) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: 'NOT_FOUND',
+              message: 'no such run',
+              nextAction: 'check the id',
+              requestId: 'req_x',
+              details: {},
+            },
+          }),
+          { status: 404, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return rateLimited({ retryAfter: 0 });
+    }) as unknown as typeof globalThis.fetch;
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_throttled', 'run_gone'],
+        timeoutSeconds: 600,
+        maxConcurrency: 2,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    ).catch((error: unknown) => error);
+    expect(rejection).toMatchObject({ exitCode: 7 });
+  });
+
+  // NOTE: partly a guard — the exit code and the absence of retry logging also
+  // hold on the pre-change code. What it genuinely proves is the re-mapped CODE
+  // (`error:INSUFFICIENT_CREDITS`), i.e. that this envelope is structurally
+  // outside both the new retry loop and the new escalation.
+  it('does not spend the retry budget on a credit-depletion 429, and does not claim it was rate limited', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = (async () =>
+      rateLimited({
+        message: 'Insufficient credits: 2 credit(s) required.',
+      })) as unknown as typeof globalThis.fetch;
+    const out: string[] = [];
+    const errs: string[] = [];
+    const rejection = await runTestWaitMany(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runIds: ['run_broke'],
+        timeoutSeconds: 600,
+        maxConcurrency: 1,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => errs.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    ).catch((error: unknown) => error);
+    // `errors.ts` re-maps a credits-flavoured 429 to INSUFFICIENT_CREDITS before
+    // the poll catch sees it, so it is structurally excluded from both the retry
+    // loop and the exit-11 escalation — a depleted wallet can't be waited out.
+    const payload = JSON.parse(out.join('')) as { results: Array<{ status: string }> };
+    expect(payload.results[0]!.status).toBe('error:INSUFFICIENT_CREDITS');
+    expect(errs.filter(l => l.includes('rate limited (attempt')).length).toBe(0);
+    // Still folded into 7 (resumable-error bucket). Left alone deliberately:
+    // escalating a non-retriable code here would be speculative — a poll of
+    // `GET /runs/{id}` never charges credits, so this envelope is not reachable
+    // from a real backend on this path; the case exists only to prove the
+    // re-mapped code neither retries nor masquerades as a throttle.
+    expect(rejection).toMatchObject({ exitCode: 7 });
   });
 });
 
@@ -4898,6 +5815,48 @@ describe('runCreate', () => {
     expect(sent.headers.get('x-api-key')).toBe('sk-user-test');
   });
 
+  it('includes stepTimeoutMs in the create body and warns once after success', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('def test_smoke():\n    assert True\n');
+    let seenBody: Record<string, unknown> | undefined;
+    const fetchImpl = makeFetch((_url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { body: { items: [] } };
+      seenBody = JSON.parse(init.body as string) as Record<string, unknown>;
+      return { body: SAMPLE_RESPONSE };
+    });
+    const stderrLines: string[] = [];
+
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'step timeout create',
+        codeFile,
+        stepTimeoutMs: 45_000,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+
+    expect(seenBody).toMatchObject({ stepTimeoutMs: 45_000 });
+    const timeoutWarnings = stderrLines.filter(
+      line => line.includes('[warn]') && line.includes('per-step timeout'),
+    );
+    expect(timeoutWarnings).toHaveLength(1);
+    expect(timeoutWarnings[0]).toContain('test run --wait');
+    expect(timeoutWarnings[0]).toContain('600s');
+    expect(timeoutWarnings[0]).toContain('--timeout <s>');
+    expect(timeoutWarnings[0]).toContain('never stops the server-side run');
+  });
+
   it('emits backend warnings[] to stderr without polluting stdout JSON', async () => {
     const { credentialsPath } = makeCreds();
     const codeFile = writeCodeFile('BEARER = "eyJhbGciOi.eyJzdWIiOiJ4In0.sig"\n');
@@ -5577,6 +6536,67 @@ describe('runCreate', () => {
     ).toBe(true);
   });
 
+  // `test create --type backend --target-url --run` only soft-advises
+  // (this test's own [C1 Fix 4] case above) while `test run --all --target-url`
+  // hard-rejects (exit 5, test.run.spec.ts) for the same underlying condition —
+  // "the URL override has no effect here". The enforcement difference is
+  // deliberate and kept as-is; only the cosmetic doubled period + wording is
+  // fixed here. This test locks in the cosmetic half: neither message may
+  // contain a doubled `..`, regardless of which enforcement path it's on.
+  it('neither the create soft-advisory nor the run --all hard-reject double their trailing period', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('test("be", async () => {});');
+    const fetchImpl = makeFetch(url =>
+      url.includes('/runs')
+        ? {
+            body: {
+              runId: 'run_dev297',
+              status: 'queued',
+              enqueuedAt: '2026-07-16T00:00:00.000Z',
+              codeVersion: 'v-dev297',
+              targetUrl: '',
+            },
+          }
+        : { body: { ...SAMPLE_RESPONSE, testId: 'test_dev297', type: 'backend' } },
+    );
+    const createStderr: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_be',
+        type: 'backend',
+        name: 'be test dev297',
+        codeFile,
+        targetUrl: 'https://staging.example.com',
+        run: true,
+        wait: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => createStderr.push(line),
+      },
+    );
+    const createAdvisory = createStderr.find(
+      l => l.includes('[advisory]') && l.includes('--target-url'),
+    );
+    expect(createAdvisory).toBeDefined();
+    expect(createAdvisory).not.toContain('..');
+
+    const test = createTestCommand();
+    disableExits(test);
+    const rejection = (await test
+      .parseAsync(['run', '--all', '--project', 'proj_1', '--target-url', 'https://example.com'], {
+        from: 'user',
+      })
+      .catch((error: unknown) => error)) as ApiError;
+    expect(rejection.nextAction).toBeDefined();
+    expect(rejection.nextAction).not.toContain('..');
+  });
+
   // Fix 4 — B3: duplicate-name advisory
   it('Fix 4 — emits advisory on stderr when a test with the same name exists, but still proceeds', async () => {
     const { credentialsPath } = makeCreds();
@@ -5627,6 +6647,69 @@ describe('runCreate', () => {
     );
     expect(advisoryLine).toBeDefined();
     expect(advisoryLine).toContain('test update');
+  });
+
+  it('a 429 with a long Retry-After on the dup-name lookup cannot delay the create', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('// test code');
+    let listCallCount = 0;
+    let postCalled = false;
+    // Raw fetch impl rather than makeFetch, because this needs a real
+    // `Retry-After` response header.
+    const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+      const url =
+        typeof input === 'string'
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as { url: string }).url;
+      if ((init.method ?? 'GET') === 'GET' && url.includes('/tests')) {
+        listCallCount++;
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: 'RATE_LIMITED',
+              message: 'Too many requests',
+              nextAction: 'Wait Retry-After seconds and retry.',
+              requestId: 'req_dup',
+            },
+          }),
+          { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '60' } },
+        );
+      }
+      postCalled = true;
+      return new Response(JSON.stringify(SAMPLE_RESPONSE), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof globalThis.fetch;
+
+    const stderrLines: string[] = [];
+    const result = await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'Sign-up happy',
+        codeFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+    );
+
+    // The create still happens — a best-effort advisory must never gate it.
+    expect(result.testId).toBe('test_new');
+    expect(postCalled).toBe(true);
+    // Exactly one attempt. The load-bearing assertion: `retryOnRateLimit: false`
+    // makes the 429 throw on the first response instead of entering a retry
+    // sleep. That sleep observes only the process shutdown signal, so the
+    // lookup's own 5s AbortController could not have interrupted it — without
+    // this, a 60s Retry-After honoured across 3 attempts would park the create
+    // behind the advisory for roughly two minutes.
+    expect(listCallCount).toBe(1);
+    // And nothing leaks to the user about it.
+    expect(stderrLines.filter(l => l.includes('[advisory]'))).toHaveLength(0);
   });
 
   it('Fix 4 — swallows listing error and still proceeds with create', async () => {
@@ -6574,6 +7657,89 @@ describe('runUpdate', () => {
     expect(seenBody).toEqual({ priority: 'p2' });
   });
 
+  it('accepts a step-timeout-only update, sends the number, and warns once', async () => {
+    const { credentialsPath } = makeCreds();
+    let seenBody: unknown;
+    const fetchImpl = makeFetch((_url, init) => {
+      seenBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { body: { ...SAMPLE_RESPONSE, updatedFields: ['stepTimeoutMs'] } };
+    });
+    const stderrLines: string[] = [];
+
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_alpha',
+        stepTimeoutMs: 30_000,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+
+    expect(seenBody).toEqual({ stepTimeoutMs: 30_000 });
+    expect(
+      stderrLines.filter(line => line.includes('[warn]') && line.includes('per-step timeout')),
+    ).toHaveLength(1);
+  });
+
+  it('--clear-step-timeout sends null and does not print the run-duration warning', async () => {
+    const { credentialsPath } = makeCreds();
+    let seenBody: unknown;
+    const fetchImpl = makeFetch((_url, init) => {
+      seenBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { body: { ...SAMPLE_RESPONSE, updatedFields: ['stepTimeoutMs'] } };
+    });
+    const stderrLines: string[] = [];
+
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_alpha',
+        clearStepTimeout: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+
+    expect(seenBody).toEqual({ stepTimeoutMs: null });
+    expect(stderrLines.some(line => line.includes('per-step timeout'))).toBe(false);
+  });
+
+  it('rejects --step-timeout with --clear-step-timeout before sending', async () => {
+    const fetchImpl = vi.fn();
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_alpha',
+          stepTimeoutMs: 30_000,
+          clearStepTimeout: true,
+        },
+        { fetchImpl: fetchImpl as never, stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      nextAction: expect.stringContaining(
+        '--step-timeout and --clear-step-timeout are mutually exclusive',
+      ),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('threads --produces/--needs/--category into the PUT body with wire names', async () => {
     const { credentialsPath } = makeCreds();
     let seenBody: unknown;
@@ -6885,6 +8051,106 @@ describe('runUpdate', () => {
     );
     expect(res.updatedFields).toEqual(expect.arrayContaining(['name', 'description']));
     expect(res.updatedFields).toHaveLength(2);
+  });
+});
+
+describe('--step-timeout command validation', () => {
+  it.each(['0', '-1', '60001', '1.5', 'abc'])(
+    'create and update reject %s with the millisecond bounds in VALIDATION_ERROR',
+    async raw => {
+      for (const args of [
+        [
+          'create',
+          '--project',
+          'project_alice',
+          '--type',
+          'frontend',
+          '--name',
+          'bounded timeout',
+          '--code-file',
+          '/tmp/not-read-because-validation-runs-first.py',
+          '--step-timeout',
+          raw,
+        ],
+        ['update', 'test_alpha', '--step-timeout', raw],
+      ]) {
+        const test = createTestCommand();
+        disableExits(test);
+        await expect(test.parseAsync(args, { from: 'user' })).rejects.toMatchObject({
+          code: 'VALIDATION_ERROR',
+          details: expect.objectContaining({ field: 'step-timeout' }),
+          nextAction: expect.stringContaining(
+            'must be an integer between 1 and 60000 milliseconds',
+          ),
+        });
+      }
+    },
+  );
+
+  it.each([1, 60_000])('create and update accept the boundary value %i', async boundary => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-step-timeout-'));
+    const codeFile = join(dir, 'test.py');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- code fixture written into this test's own mkdtempSync-created temp dir, never user input.
+    writeFileSync(codeFile, 'def test_smoke():\n    assert True\n', 'utf8');
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchImpl = makeFetch((_url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { body: { items: [] } };
+      bodies.push(JSON.parse(init.body as string) as Record<string, unknown>);
+      if (method === 'POST') {
+        return {
+          body: {
+            testId: 'test_step_timeout',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-08-27T00:00:00.000Z',
+          },
+        };
+      }
+      return {
+        body: {
+          testId: 'test_step_timeout',
+          updatedFields: ['stepTimeoutMs'],
+          updatedAt: '2026-08-27T00:01:00.000Z',
+        },
+      };
+    });
+    const deps = {
+      credentialsPath,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: () => undefined,
+    };
+
+    const create = createTestCommand(deps);
+    disableExits(create);
+    await create.parseAsync(
+      [
+        'create',
+        '--project',
+        'project_alice',
+        '--type',
+        'frontend',
+        '--name',
+        'boundary timeout',
+        '--code-file',
+        codeFile,
+        '--step-timeout',
+        String(boundary),
+      ],
+      { from: 'user' },
+    );
+
+    const update = createTestCommand(deps);
+    disableExits(update);
+    await update.parseAsync(['update', 'test_step_timeout', '--step-timeout', String(boundary)], {
+      from: 'user',
+    });
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toMatchObject({ stepTimeoutMs: boundary });
+    expect(bodies[1]).toEqual({ stepTimeoutMs: boundary });
   });
 });
 
@@ -7565,6 +8831,277 @@ describe('runCreateFromPlan', () => {
     expect(errText).toContain('warning: --plan-from supplies the test definition');
     expect(errText).toContain('--project');
     expect(errText).toContain('--name');
+  });
+
+  it('--plan-from warns that --step-timeout is ignored and omits it from the body', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile(FE_PLAN);
+    let postBody: Record<string, unknown> | undefined;
+    const fetchImpl = makeFetch((_url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { body: { items: [] } };
+      postBody = JSON.parse(init.body as string) as Record<string, unknown>;
+      return { body: SAMPLE_RESPONSE };
+    });
+    const stderrLines: string[] = [];
+    const test = createTestCommand({
+      credentialsPath,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: line => stderrLines.push(line),
+    });
+    disableExits(test);
+
+    await test.parseAsync(['create', '--plan-from', planFile, '--step-timeout', '45000'], {
+      from: 'user',
+    });
+
+    expect(stderrLines.join(' ')).toContain(
+      'warning: --plan-from supplies the test definition; ignoring --step-timeout',
+    );
+    expect(postBody).toBeDefined();
+    expect(postBody).not.toHaveProperty('stepTimeoutMs');
+    expect(stderrLines.some(line => line.includes('per-step timeout'))).toBe(false);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Teach-the-schema validation errors (plan-schema discoverability
+  // trio: errors / docs+help / schema+template).
+  // ---------------------------------------------------------------------------
+
+  it('a top-level array gets a dedicated "one test per file" message pointing at create-batch', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile([FE_PLAN, FE_PLAN]);
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    await expect(
+      runCreateFromPlan(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          planFrom: planFile,
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      nextAction: expect.stringContaining('a plan file holds ONE test as a single JSON object'),
+    });
+    await expect(
+      runCreateFromPlan(
+        { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      nextAction: expect.stringContaining('test create-batch --plans'),
+    });
+    await expect(
+      runCreateFromPlan(
+        { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      nextAction: expect.stringContaining('--plan-from-dir'),
+    });
+  });
+
+  it('steps nested under `plan.steps` (the Copilot hallucination) hints at top-level `planSteps`', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      projectId: 'project_alice',
+      type: 'frontend',
+      name: 'x',
+      plan: { steps: [{ type: 'action', description: 'go' }] },
+    });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    await expect(
+      runCreateFromPlan(
+        { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'planSteps' }),
+      nextAction: expect.stringContaining('Did you mean `planSteps`?'),
+    });
+  });
+
+  it('a bare top-level `steps` array also triggers the `planSteps` hint', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      projectId: 'project_alice',
+      type: 'frontend',
+      name: 'x',
+      steps: [{ type: 'action', description: 'go' }],
+    });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    await expect(
+      runCreateFromPlan(
+        { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      nextAction: expect.stringContaining('Did you mean `planSteps`?'),
+    });
+  });
+
+  it('a plan with planSteps simply absent (no plan/steps hint fields either) keeps the generic message', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({ projectId: 'project_alice', type: 'frontend', name: 'x' });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    await expect(
+      runCreateFromPlan(
+        { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      details: expect.objectContaining({ field: 'planSteps' }),
+      nextAction: expect.not.stringContaining('Did you mean'),
+    });
+  });
+
+  it('a missing projectId AND a supplied --project flag appends the ignored-flag note to the SAME error', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      type: 'frontend',
+      name: 'x',
+      planSteps: [{ type: 'action', description: 'go' }],
+    });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    const stderrLines: string[] = [];
+    await expect(
+      runCreateFromPlan(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          planFrom: planFile,
+          ignoredFlags: ['--project'],
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: l => stderrLines.push(l) },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'projectId' }),
+      nextAction: expect.stringContaining(
+        'note: with --plan-from, --project is ignored; all fields live inside the file.',
+      ),
+    });
+    // L1778 regression guard: the separate ignored-flags stderr warning still
+    // must not precede/accompany a validation failure.
+    expect(stderrLines.join(' ')).not.toContain('warning: --plan-from');
+  });
+
+  it('the ignored-flag note is NOT appended when the flag was not actually supplied', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      type: 'frontend',
+      name: 'x',
+      planSteps: [{ type: 'action', description: 'go' }],
+    });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    await expect(
+      runCreateFromPlan(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          planFrom: planFile,
+          ignoredFlags: [], // --project was NOT supplied on the command line
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      details: expect.objectContaining({ field: 'projectId' }),
+      nextAction: expect.not.stringContaining('note: with --plan-from'),
+    });
+  });
+
+  it('a `{{VAR}}` placeholder in a step description is a non-fatal [advisory], not a validation error', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      ...FE_PLAN,
+      planSteps: [
+        { type: 'action', description: 'log in as {{LOGIN_USER}}' },
+        { type: 'assertion', description: 'no placeholder here' },
+      ],
+    });
+    let posted = false;
+    const fetchImpl = makeFetch(() => {
+      posted = true;
+      return { body: SAMPLE_RESPONSE };
+    });
+    const stderrLines: string[] = [];
+    const res = await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: l => stderrLines.push(l) },
+    );
+    expect(res).toEqual(SAMPLE_RESPONSE);
+    expect(posted).toBe(true);
+    const errText = stderrLines.join(' ');
+    expect(errText).toContain('[advisory]');
+    // `.description` must attach to EACH
+    // flagged path, not just the last one in a joined list.
+    expect(errText).toContain('planSteps[0].description');
+    expect(errText).toContain('contains a');
+    expect(errText).toContain('{{...}}');
+    expect(errText).not.toContain('planSteps[1]');
+    expect(errText).toContain('project update');
+  });
+
+  it('multiple flagged steps (0 and 2) each read `planSteps[N].description`, not a shared trailing suffix', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      ...FE_PLAN,
+      planSteps: [
+        { type: 'action', description: 'log in as {{LOGIN_USER}}' },
+        { type: 'action', description: 'no placeholder here' },
+        { type: 'assertion', description: 'verify the {{PRODUCT_NAME}} banner' },
+      ],
+    });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    const stderrLines: string[] = [];
+    await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: l => stderrLines.push(l) },
+    );
+    const errText = stderrLines.join(' ');
+    // Both flagged paths must EACH carry their own `.description` suffix —
+    // NOT `planSteps[0], planSteps[2].description` (misattributes to only
+    // the last entry).
+    expect(errText).toContain('planSteps[0].description');
+    expect(errText).toContain('planSteps[2].description');
+    expect(errText).not.toMatch(/planSteps\[0\],\s*planSteps\[2\]\.description/);
+    expect(errText).not.toContain('planSteps[1]');
+    // Plural grammar for 2+ flagged steps.
+    expect(errText).toContain('contain a');
+  });
+
+  it('the placeholder advisory still fires under --dry-run (the agent-iteration loop must not regress)', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile({
+      ...FE_PLAN,
+      planSteps: [{ type: 'action', description: 'log in as {{LOGIN_USER}}' }],
+    });
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    const stderrLines: string[] = [];
+    await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile, dryRun: true },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: l => stderrLines.push(l) },
+    );
+    expect(stderrLines.join(' ')).toContain('[advisory]');
+  });
+
+  it('a plan with no placeholders never emits the advisory', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile(FE_PLAN);
+    const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
+    const stderrLines: string[] = [];
+    await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: l => stderrLines.push(l) },
+    );
+    expect(stderrLines.join(' ')).not.toContain('[advisory]');
   });
 
   it('rejects a plan with an invalid step type', async () => {
@@ -8596,7 +10133,7 @@ describe('Fix 5 — dashboardUrl emission', () => {
 
   it('runCreate: JSON mode includes dashboardUrl when API URL is prod', async () => {
     // Use prod API URL → resolvePortalUrl returns a URL
-    const { credentialsPath } = makeCreds('sk-test', 'https://api.testsprite.com');
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const codeFile = writeCodeFile('test("dash", async () => {});');
     const fetchImpl = makeFetch((_url, init) => {
       if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
@@ -8623,7 +10160,7 @@ describe('Fix 5 — dashboardUrl emission', () => {
   });
 
   it('runCreate: text mode emits Dashboard: line to stderr when API URL is prod', async () => {
-    const { credentialsPath } = makeCreds('sk-test', 'https://api.testsprite.com');
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const codeFile = writeCodeFile('test("dash", async () => {});');
     const fetchImpl = makeFetch((_url, init) => {
       if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
@@ -8653,7 +10190,7 @@ describe('Fix 5 — dashboardUrl emission', () => {
   });
 
   it('runCreate: no dashboardUrl when API URL is unknown (localhost)', async () => {
-    const { credentialsPath } = makeCreds('sk-test', 'http://localhost:13502');
+    const { credentialsPath } = makeCreds('sk-user-test', 'http://localhost:13502');
     const codeFile = writeCodeFile('test("dash", async () => {});');
     const fetchImpl = makeFetch((_url, init) => {
       if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
@@ -8738,7 +10275,7 @@ describe('Fix 5 — dashboardUrl emission', () => {
       writeFileSync(path, JSON.stringify(plan), 'utf8');
       return path;
     }
-    const { credentialsPath } = makeCreds('sk-test', 'https://api.testsprite.com');
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const planFile = writePlanFileDash({
       projectId: 'proj_dash_plan',
       type: 'frontend',
@@ -8828,7 +10365,7 @@ describe('Fix 5 — dashboardUrl emission', () => {
   // R3a: dashboardUrl in create --run JSON envelope
   it('runCreate --run: dashboardUrl is included in the merged { ...create, run } JSON envelope', async () => {
     // prod API URL so resolvePortalUrl maps correctly
-    const { credentialsPath } = makeCreds('sk-test', 'https://api.testsprite.com');
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const codeFile = writeCodeFile('test("chain", async () => {});');
     const CREATE_RESP = {
       testId: 'test_chain_01',
@@ -8901,7 +10438,7 @@ describe('Fix 5 — dashboardUrl emission', () => {
       return path;
     }
     // Use prod API URL
-    const { credentialsPath } = makeCreds('sk-test', 'https://api.testsprite.com');
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const spec = {
       projectId: 'proj_batch',
       type: 'frontend' as const,
@@ -8992,5 +10529,1568 @@ describe('Fix 5 — dashboardUrl emission', () => {
       { stdout: line => out.push(line), stderr: () => undefined },
     );
     expect(out.join('').includes('dashboardUrl')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEV-737 — server-provided dashboardUrl precedence on create paths
+// ---------------------------------------------------------------------------
+
+describe('DEV-737 — create paths prefer a server-provided dashboardUrl', () => {
+  function writeCodeFileDev737(contents: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-'));
+    const path = join(dir, 'test.py');
+    writeFileSync(path, contents, 'utf8');
+    return path;
+  }
+
+  it('runCreate JSON: a server-provided dashboardUrl wins over the client V2 guess', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const serverUrl =
+      'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_dash/test-cases/test_dash_01';
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          dashboardUrl: serverUrl,
+        },
+      };
+    });
+    const out: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_dash',
+        type: 'frontend',
+        name: 'dash test',
+        codeFile,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => undefined },
+    );
+    const printed = JSON.parse(out.join('')) as { dashboardUrl?: string };
+    // NOT the client-computed V2 shape (`/dashboard/tests/...`) — the server's
+    // V3 org-scoped link, verbatim.
+    expect(printed.dashboardUrl).toBe(serverUrl);
+  });
+
+  it('runCreate JSON: server dashboardUrl absent (backend predates this field) — falls back to the client-computed legacy link, no suppression advisory', async () => {
+    // Third state of the pinned three-state contract, alongside the
+    // present-string test above and the present-null test below: a wire
+    // response that OMITS the key entirely (not merely nullish) must be
+    // treated as "backend predates this field", never as suppression.
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          // No `dashboardUrl` key at all.
+        },
+      };
+    });
+    const out: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_dash',
+        type: 'frontend',
+        name: 'dash test',
+        codeFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as { dashboardUrl?: string };
+    expect(printed.dashboardUrl).toBe(
+      'https://www.testsprite.com/dashboard/tests/proj_dash/test/test_dash_01',
+    );
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      false,
+    );
+  });
+
+  it('runCreate JSON: server dashboardUrl:null suppresses the link — no client guess, and an advisory fires', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          dashboardUrl: null,
+        },
+      };
+    });
+    const out: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_dash',
+        type: 'frontend',
+        name: 'dash test',
+        codeFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as Record<string, unknown>;
+    // The field must be OMITTED, not serialized as a literal `null`.
+    expect('dashboardUrl' in printed).toBe(false);
+    expect(
+      stderrLines.some(l => l.includes('[advisory]') && l.includes('test get test_dash_01')),
+    ).toBe(true);
+  });
+
+  it('runCreate text mode: suppressed link — no dead Dashboard: line, advisory still fires on stderr', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          dashboardUrl: null,
+        },
+      };
+    });
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_dash',
+        type: 'frontend',
+        name: 'dash test',
+        codeFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    expect(stderrLines.some(l => l.startsWith('Dashboard:'))).toBe(false);
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      true,
+    );
+  });
+
+  it('runCreate --run chain: suppressed server link is not replaced by the client guess', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileDev737('test("dash", async () => {});');
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET' && url.includes('/tests?')) return { status: 200, body: { items: [] } };
+      if (method === 'POST' && url.endsWith('/tests')) {
+        return {
+          status: 200,
+          body: {
+            testId: 'test_dash_01',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-08-09T10:00:00.000Z',
+            dashboardUrl: null,
+          },
+        };
+      }
+      // POST /tests/{id}/runs — trigger
+      return {
+        status: 200,
+        body: {
+          runId: 'run_dash_01',
+          status: 'queued',
+          enqueuedAt: '2026-08-09T10:00:01.000Z',
+          codeVersion: 'v1',
+          targetUrl: '',
+        },
+      };
+    });
+    const out: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_dash',
+        type: 'frontend',
+        name: 'dash test',
+        codeFile,
+        run: true,
+        wait: false,
+        timeout: 60,
+        timeoutIsDefault: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as Record<string, unknown>;
+    expect('dashboardUrl' in printed).toBe(false);
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      true,
+    );
+  });
+
+  it('runCreateFromPlan JSON: a server-provided dashboardUrl wins over the plan-derived client guess', async () => {
+    function writePlanFileDev737(plan: unknown): string {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-plan-'));
+      const path = join(dir, 'plan.json');
+      writeFileSync(path, JSON.stringify(plan), 'utf8');
+      return path;
+    }
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const planFile = writePlanFileDev737({
+      projectId: 'proj_dash_plan',
+      type: 'frontend',
+      name: 'dash plan test',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    });
+    const serverUrl =
+      'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_dash_plan/test-cases/test_dash_01';
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          dashboardUrl: serverUrl,
+        },
+      };
+    });
+    const out: string[] = [];
+    await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => undefined },
+    );
+    const printed = JSON.parse(out.join('')) as { dashboardUrl?: string };
+    expect(printed.dashboardUrl).toBe(serverUrl);
+  });
+
+  it('runCreateFromPlan JSON: server dashboardUrl:null suppresses the link — no plan-derived client guess', async () => {
+    function writePlanFileDev737(plan: unknown): string {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-plan-'));
+      const path = join(dir, 'plan.json');
+      writeFileSync(path, JSON.stringify(plan), 'utf8');
+      return path;
+    }
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const planFile = writePlanFileDev737({
+      projectId: 'proj_dash_plan',
+      type: 'frontend',
+      name: 'dash plan test',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    });
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          dashboardUrl: null,
+        },
+      };
+    });
+    const out: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as Record<string, unknown>;
+    expect('dashboardUrl' in printed).toBe(false);
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      true,
+    );
+  });
+
+  it('runCreateFromPlan JSON: server dashboardUrl absent (backend predates this field) — falls back to the plan-derived client guess', async () => {
+    function writePlanFileDev737(plan: unknown): string {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-plan-'));
+      const path = join(dir, 'plan.json');
+      writeFileSync(path, JSON.stringify(plan), 'utf8');
+      return path;
+    }
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const planFile = writePlanFileDev737({
+      projectId: 'proj_dash_plan',
+      type: 'frontend',
+      name: 'dash plan test',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    });
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_dash_01',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-09T10:00:00.000Z',
+          // No `dashboardUrl` key at all.
+        },
+      };
+    });
+    const out: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: planFile },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as { dashboardUrl?: string };
+    expect(printed.dashboardUrl).toBe(
+      'https://www.testsprite.com/dashboard/tests/proj_dash_plan/test/test_dash_01',
+    );
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      false,
+    );
+  });
+
+  it('runCreateBatch JSON: per-item server dashboardUrl wins/suppresses independently; one aggregate advisory', async () => {
+    function writePlansJsonlDev737(plans: unknown[]): string {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-batch-'));
+      const path = join(dir, 'plans.jsonl');
+      writeFileSync(path, plans.map(p => JSON.stringify(p)).join('\n') + '\n', 'utf8');
+      return path;
+    }
+    const specA = {
+      projectId: 'proj_batch_a',
+      type: 'frontend' as const,
+      name: 'batch spec a',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    const specB = {
+      projectId: 'proj_batch_b',
+      type: 'frontend' as const,
+      name: 'batch spec b',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    const plansFile = writePlansJsonlDev737([specA, specB]);
+    const serverUrlA =
+      'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_batch_a/test-cases/test_a';
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const fetchImpl = makeFetch(() => ({
+      status: 200,
+      body: {
+        results: [
+          { specIndex: 0, status: 'created', testId: 'test_a', dashboardUrl: serverUrlA },
+          { specIndex: 1, status: 'created', testId: 'test_b', dashboardUrl: null },
+        ],
+        summary: { total: 2, created: 2, failed: 0 },
+      },
+    }));
+    const out: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        plans: plansFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as {
+      results: Array<{ testId: string; dashboardUrl?: string }>;
+    };
+    const itemA = printed.results.find(r => r.testId === 'test_a')!;
+    const itemB = printed.results.find(r => r.testId === 'test_b')!;
+    expect(itemA.dashboardUrl).toBe(serverUrlA);
+    expect('dashboardUrl' in itemB).toBe(false);
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      true,
+    );
+  });
+
+  // R3b (finding 2) — the `--run` fan-out must reuse the SAME per-item
+  // dashboard decision the create phase already resolved, not recompute a
+  // client-side URL from testId→projectId. Covers both `--output json`
+  // (the field is directly assertable) and `--output text` (asserts no
+  // legacy URL leaks anywhere and the batch-run summary still renders).
+  function writeTwoSpecPlansDev737(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-dev737-batch-run-'));
+    const path = join(dir, 'plans.jsonl');
+    const specA = {
+      projectId: 'proj_run_a',
+      type: 'frontend' as const,
+      name: 'batch run spec a',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    const specB = {
+      projectId: 'proj_run_b',
+      type: 'frontend' as const,
+      name: 'batch run spec b',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    writeFileSync(path, [specA, specB].map(p => JSON.stringify(p)).join('\n') + '\n', 'utf8');
+    return path;
+  }
+
+  const RUN_SERVER_URL_A =
+    'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_run_a/test-cases/test_run_a';
+  const LEGACY_V2_URL_FRAGMENT = '/dashboard/tests/'; // the dead link this feature removes
+
+  function makeBatchRunFanoutFetch(): typeof globalThis.fetch {
+    return makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      if (url.includes('/tests/batch')) {
+        return {
+          status: 200,
+          body: {
+            results: [
+              {
+                specIndex: 0,
+                status: 'created',
+                testId: 'test_run_a',
+                dashboardUrl: RUN_SERVER_URL_A,
+              },
+              { specIndex: 1, status: 'created', testId: 'test_run_b', dashboardUrl: null },
+            ],
+            summary: { total: 2, created: 2, failed: 0 },
+          },
+        };
+      }
+      // POST /tests/{id}/runs — trigger
+      return {
+        status: 200,
+        body: {
+          runId: 'run_fanout',
+          status: 'queued',
+          enqueuedAt: '2026-08-09T10:00:01.000Z',
+          codeVersion: 'v1',
+          targetUrl: '',
+        },
+      };
+    });
+  }
+
+  it('runCreateBatch --run --output json: per-item run results reuse the create-time server dashboardUrl/suppression — not a client-side recompute', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansDev737();
+    const out: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeBatchRunFanoutFetch(),
+        stdout: line => out.push(line),
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    );
+    const printed = JSON.parse(out.join('')) as {
+      results: Array<{ testId: string; dashboardUrl?: string }>;
+    };
+    const itemA = printed.results.find(r => r.testId === 'test_run_a')!;
+    const itemB = printed.results.find(r => r.testId === 'test_run_b')!;
+    // The server's V3-shaped link survives into the RUN result unchanged —
+    // a client-side recompute would have produced the legacy V2 shape instead.
+    expect(itemA.dashboardUrl).toBe(RUN_SERVER_URL_A);
+    expect(itemA.dashboardUrl).not.toContain(LEGACY_V2_URL_FRAGMENT);
+    // The suppressed item carries no link at all in its RUN result — a
+    // client-side recompute would have resurrected the dead legacy link here.
+    expect('dashboardUrl' in itemB).toBe(false);
+    expect(out.join('')).not.toContain(LEGACY_V2_URL_FRAGMENT);
+  });
+
+  it('runCreateBatch --run --output text: no legacy dashboard link leaks anywhere; batch-run summary still prints', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansDev737();
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeBatchRunFanoutFetch(),
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    );
+    // Text mode never prints per-item run dashboard links today, but the
+    // create-time suppression state must still be honored end to end: no
+    // dead legacy V2 link may appear anywhere in the output, and the
+    // create-phase aggregate advisory (now computed unconditionally,
+    // regardless of --output mode) must fire for the suppressed item.
+    expect(stdoutLines.join('\n')).not.toContain(LEGACY_V2_URL_FRAGMENT);
+    expect(stderrLines.join('\n')).not.toContain(LEGACY_V2_URL_FRAGMENT);
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('no dashboard link'))).toBe(
+      true,
+    );
+    expect(stderrLines.some(l => l.includes('batch-run summary:'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Finding 3 (dogfood 2026-08-09) — `test create --run` in text mode must still
+// print the authoritative `Dashboard:` line. The create's own print is
+// suppressed on the --run chain (delegated to `runTestRun` -> `printRunOrChain`,
+// whose text-mode header renders via `renderCreateText`, which never prints
+// `dashboardUrl`), so without an explicit emission the link silently
+// disappears — worst on a no-wait V3 create, where the client cannot
+// recompute it at all.
+// ---------------------------------------------------------------------------
+
+describe('[finding-3] test create --run text mode prints the authoritative Dashboard: line', () => {
+  function writeCodeFileFinding3(contents: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-finding3-'));
+    const path = join(dir, 'test.py');
+    writeFileSync(path, contents, 'utf8');
+    return path;
+  }
+
+  const TRIGGER_RESP_F3 = {
+    runId: 'run_f3_01',
+    status: 'queued' as const,
+    enqueuedAt: '2026-08-09T10:00:01.000Z',
+    codeVersion: 'v1',
+    targetUrl: '',
+  };
+
+  it('server dashboardUrl (string) → printed verbatim on stderr as Dashboard: <url>', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileFinding3('test("dash", async () => {});');
+    const serverUrl =
+      'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_f3/test-cases/test_f3_01';
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      if (method === 'POST' && url.endsWith('/tests')) {
+        return {
+          status: 200,
+          body: {
+            testId: 'test_f3_01',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-08-09T10:00:00.000Z',
+            dashboardUrl: serverUrl,
+          },
+        };
+      }
+      // POST /tests/{id}/runs — trigger.
+      return { status: 200, body: TRIGGER_RESP_F3 };
+    });
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_f3',
+        type: 'frontend',
+        name: 'f3 test',
+        codeFile,
+        run: true,
+        wait: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    expect(stderrLines.some(l => l === `Dashboard: ${serverUrl}`)).toBe(true);
+  });
+
+  it('server dashboardUrl:null → no Dashboard: line (no legacy guess); suppressed advisory fires instead', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileFinding3('test("dash", async () => {});');
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      if (method === 'POST' && url.endsWith('/tests')) {
+        return {
+          status: 200,
+          body: {
+            testId: 'test_f3_02',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-08-09T10:00:00.000Z',
+            dashboardUrl: null,
+          },
+        };
+      }
+      return { status: 200, body: TRIGGER_RESP_F3 };
+    });
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_f3',
+        type: 'frontend',
+        name: 'f3 test',
+        codeFile,
+        run: true,
+        wait: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    expect(stderrLines.some(l => l.startsWith('Dashboard:'))).toBe(false);
+    expect(
+      stderrLines.some(l => l.includes('[advisory]') && l.includes('test get test_f3_02')),
+    ).toBe(true);
+  });
+
+  it('absent dashboardUrl key (backend that predates the field) → legacy client-computed link still prints', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileFinding3('test("dash", async () => {});');
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      if (method === 'POST' && url.endsWith('/tests')) {
+        return {
+          status: 200,
+          body: {
+            testId: 'test_f3_03',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-08-09T10:00:00.000Z',
+            // No dashboardUrl key at all — simulates a backend that predates
+            // the field; the legacy client-side fallback is the correct
+            // behavior here (not suppression).
+          },
+        };
+      }
+      return { status: 200, body: TRIGGER_RESP_F3 };
+    });
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_f3',
+        type: 'frontend',
+        name: 'f3 test',
+        codeFile,
+        run: true,
+        wait: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    expect(
+      stderrLines.some(
+        l => l === 'Dashboard: https://www.testsprite.com/dashboard/tests/proj_f3/test/test_f3_03',
+      ),
+    ).toBe(true);
+  });
+
+  it('--output json is unaffected (no duplicate Dashboard: line; field stays in the merged envelope)', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const codeFile = writeCodeFileFinding3('test("dash", async () => {});');
+    const serverUrl =
+      'https://www.testsprite.com/dashboard-v3/o/org_1/projects/proj_f3/test-cases/test_f3_04';
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      if (method === 'POST' && url.endsWith('/tests')) {
+        return {
+          status: 200,
+          body: {
+            testId: 'test_f3_04',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-08-09T10:00:00.000Z',
+            dashboardUrl: serverUrl,
+          },
+        };
+      }
+      return { status: 200, body: TRIGGER_RESP_F3 };
+    });
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_f3',
+        type: 'frontend',
+        name: 'f3 test',
+        codeFile,
+        run: true,
+        wait: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    expect(stderrLines.some(l => l.startsWith('Dashboard:'))).toBe(false);
+    const printed = JSON.parse(stdoutLines.join('')) as Record<string, unknown>;
+    expect(printed['dashboardUrl']).toBe(serverUrl);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// create-batch --run --target-url: the response-driven mismatch advisory
+// must fire at most ONCE for the whole batch, not once per member — even
+// though this fan-out calls `triggerRunWithMeta` directly per item rather
+// than delegating to `runTestRun` (where the advisory normally lives).
+// ---------------------------------------------------------------------------
+
+describe('create-batch --run --target-url mismatch advisory fires once, not per item', () => {
+  function writeTwoSpecPlansFinding2(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-finding2-batch-run-'));
+    const path = join(dir, 'plans.jsonl');
+    const specA = {
+      projectId: 'proj_f2_a',
+      type: 'frontend' as const,
+      name: 'finding2 spec a',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    const specB = {
+      projectId: 'proj_f2_b',
+      type: 'frontend' as const,
+      name: 'finding2 spec b',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    writeFileSync(path, [specA, specB].map(p => JSON.stringify(p)).join('\n') + '\n', 'utf8');
+    return path;
+  }
+
+  /** Routes POST /tests/batch to a 2-item created response; every other call is a run trigger. */
+  function makeFinding2Fetch(triggerTargetUrl: string): typeof globalThis.fetch {
+    let triggerCount = 0;
+    return makeFetch(url => {
+      if (url.includes('/tests/batch')) {
+        return {
+          status: 200,
+          body: {
+            results: [
+              { specIndex: 0, status: 'created', testId: 'test_f2_a' },
+              { specIndex: 1, status: 'created', testId: 'test_f2_b' },
+            ],
+            summary: { total: 2, created: 2, failed: 0 },
+          },
+        };
+      }
+      // POST /tests/{id}/runs — trigger, once per created item.
+      triggerCount += 1;
+      return {
+        status: 200,
+        body: {
+          runId: `run_f2_${triggerCount}`,
+          status: 'queued',
+          enqueuedAt: '2026-08-09T10:00:01.000Z',
+          codeVersion: 'v1',
+          targetUrl: triggerTargetUrl,
+        },
+      };
+    });
+  }
+
+  it('fires exactly once for the whole batch (not once per item) when the response mismatches', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansFinding2();
+    const stderrLines: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
+      },
+      {
+        credentialsPath,
+        // Every member's trigger response reports '' — the V3 "didn't
+        // apply the override" shape — so every member mismatches, and the
+        // advisory must still print only once for the whole invocation.
+        fetchImpl: makeFinding2Fetch(''),
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    );
+    const advisoryLines = stderrLines.filter(
+      l => l.includes('[advisory]') && l.includes('--target-url'),
+    );
+    expect(advisoryLines).toHaveLength(1);
+  });
+
+  it('does not fire when --target-url is absent', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansFinding2();
+    const stderrLines: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFinding2Fetch(''),
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    );
+    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
+  });
+
+  it('response echoes the requested targetUrl for every member → no advisory', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansFinding2();
+    const stderrLines: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFinding2Fetch('https://staging.example.com'),
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    );
+    expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
+  });
+
+  it('--output json: the advisory stays on stderr only — stdout parses clean with no [advisory] text', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansFinding2();
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFinding2Fetch(''),
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: () => Promise.resolve(),
+      },
+    );
+    expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('--target-url'))).toBe(
+      true,
+    );
+    expect(() => JSON.parse(stdoutLines.join(''))).not.toThrow();
+    expect(stdoutLines.join('')).not.toContain('[advisory]');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runCreate / runCreateFromPlan --run --target-url: pre-charge reachability
+// preflight wiring. The rule table itself (every refuse/warn classification)
+// is covered in `src/lib/target-url-preflight.test.ts`; these two blocks only
+// pin that each command wires the probe correctly — before the create POST,
+// and opt-outable — mirroring the `runTestRun` and create-batch preflight
+// wiring pairs above. Both call sites were previously undefended: deleting
+// either preflight block in test.ts leaves the full suite green.
+// ---------------------------------------------------------------------------
+
+describe('runCreate — --target-url reachability preflight wiring', () => {
+  function writeCodeFile(contents: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-preflight-create-'));
+    const path = join(dir, 'test.py');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- code fixture written into this test's own mkdtempSync-created temp dir, never user input.
+    writeFileSync(path, contents, 'utf8');
+    return path;
+  }
+
+  // A literal IP skips the probe's DNS step, so these tests are governed
+  // purely by the injected fetchImpl — no real DNS lookups.
+  const LITERAL_IP_TARGET = 'http://203.0.113.30';
+
+  it('a gateway-error response (503) refuses before the create POST — exit 5, no create POST', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('def test_smoke():\n    pass\n');
+    let createPosted = false;
+    const fetchImpl = makeFetch((url, init) => {
+      if (url === LITERAL_IP_TARGET) return { status: 503, body: {} };
+      if ((init.method ?? 'GET') === 'POST') createPosted = true;
+      return { status: 200, body: { items: [] } };
+    });
+    const err = await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'preflight guard',
+        codeFile,
+        targetUrl: LITERAL_IP_TARGET,
+        run: true,
+        wait: false,
+        dryRun: false,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('VALIDATION_ERROR');
+    expect((err as ApiError).exitCode).toBe(5);
+    expect(createPosted).toBe(false);
+  });
+
+  it('--skip-preflight makes the probe a zero-network-call no-op — create still proceeds', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('def test_smoke():\n    pass\n');
+    const probeHits: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      if (url === LITERAL_IP_TARGET) {
+        probeHits.push(url);
+        return { status: 503, body: {} }; // would refuse if the probe ran at all
+      }
+      const method = init.method ?? 'GET';
+      if (url.includes('/runs')) {
+        return {
+          status: 200,
+          body: {
+            runId: 'run_pf_create',
+            status: 'queued',
+            enqueuedAt: '2026-08-14T00:00:00.000Z',
+            codeVersion: 'v1',
+            targetUrl: LITERAL_IP_TARGET,
+          },
+        };
+      }
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_pf_create',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-14T00:00:00.000Z',
+        },
+      };
+    });
+    const res = await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'preflight skip',
+        codeFile,
+        targetUrl: LITERAL_IP_TARGET,
+        run: true,
+        wait: false,
+        dryRun: false,
+        skipPreflight: true,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    );
+    expect(probeHits).toHaveLength(0);
+    expect(res).toMatchObject({ testId: 'test_pf_create' });
+  });
+});
+
+describe('runCreateFromPlan — --target-url reachability preflight wiring', () => {
+  function writePlanFile(plan: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-preflight-plan-'));
+    const path = join(dir, 'plan.json');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- plan fixture written into this test's own mkdtempSync-created temp dir, never user input.
+    writeFileSync(path, JSON.stringify(plan), 'utf8');
+    return path;
+  }
+
+  const FE_PLAN = {
+    projectId: 'project_alice',
+    type: 'frontend' as const,
+    name: 'preflight plan test',
+    planSteps: [{ type: 'action', description: 'navigate' }],
+  };
+
+  // A literal IP skips the probe's DNS step, so these tests are governed
+  // purely by the injected fetchImpl — no real DNS lookups.
+  const LITERAL_IP_TARGET = 'http://203.0.113.40';
+
+  it('a gateway-error response (502) refuses before the create POST — exit 5, no create POST', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile(FE_PLAN);
+    let createPosted = false;
+    const fetchImpl = makeFetch((url, init) => {
+      if (url === LITERAL_IP_TARGET) return { status: 502, body: {} };
+      if ((init.method ?? 'GET') === 'POST') createPosted = true;
+      return { status: 200, body: {} };
+    });
+    const err = await runCreateFromPlan(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        planFrom: planFile,
+        targetUrl: LITERAL_IP_TARGET,
+        run: true,
+        wait: false,
+        dryRun: false,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('VALIDATION_ERROR');
+    expect((err as ApiError).exitCode).toBe(5);
+    expect(createPosted).toBe(false);
+  });
+
+  it('--skip-preflight makes the probe a zero-network-call no-op — create still proceeds', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile(FE_PLAN);
+    const probeHits: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      if (url === LITERAL_IP_TARGET) {
+        probeHits.push(url);
+        return { status: 502, body: {} }; // would refuse if the probe ran at all
+      }
+      const method = init.method ?? 'GET';
+      if (url.includes('/runs')) {
+        return {
+          status: 200,
+          body: {
+            runId: 'run_pf_plan',
+            status: 'queued',
+            enqueuedAt: '2026-08-14T00:00:00.000Z',
+            codeVersion: 'v1',
+            targetUrl: LITERAL_IP_TARGET,
+          },
+        };
+      }
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_pf_plan',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-14T00:00:00.000Z',
+        },
+      };
+    });
+    const res = await runCreateFromPlan(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        planFrom: planFile,
+        targetUrl: LITERAL_IP_TARGET,
+        run: true,
+        wait: false,
+        dryRun: false,
+        skipPreflight: true,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    );
+    expect(probeHits).toHaveLength(0);
+    expect(res).toMatchObject({ testId: 'test_pf_plan' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// create-batch --run --target-url: pre-charge reachability preflight fires
+// ONCE for the whole batch (mirrors the advisory dedup above), not once per
+// member, and --skip-preflight is a true zero-network-call opt-out.
+// ---------------------------------------------------------------------------
+
+describe('create-batch --run --target-url reachability preflight wiring', () => {
+  function writeTwoSpecPlansPreflight(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-preflight-batch-run-'));
+    const path = join(dir, 'plans.jsonl');
+    const specA = {
+      projectId: 'proj_pf_a',
+      type: 'frontend' as const,
+      name: 'preflight spec a',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    const specB = {
+      projectId: 'proj_pf_b',
+      type: 'frontend' as const,
+      name: 'preflight spec b',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- plan-batch fixture written into this test's own mkdtempSync-created temp dir, never user input.
+    writeFileSync(path, [specA, specB].map(p => JSON.stringify(p)).join('\n') + '\n', 'utf8');
+    return path;
+  }
+
+  // A literal IP skips the probe's DNS step, so these tests are governed
+  // purely by the injected fetchImpl — no real DNS lookups.
+  const LITERAL_IP_TARGET = 'http://203.0.113.20';
+
+  it('probes the target exactly once for the whole batch, before the create POST', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansPreflight();
+    const probeHits: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url === LITERAL_IP_TARGET) {
+        probeHits.push(url);
+        return { status: 200, body: {} };
+      }
+      if (url.includes('/tests/batch')) {
+        return {
+          status: 200,
+          body: {
+            results: [
+              { specIndex: 0, status: 'created', testId: 'test_pf_a' },
+              { specIndex: 1, status: 'created', testId: 'test_pf_b' },
+            ],
+            summary: { total: 2, created: 2, failed: 0 },
+          },
+        };
+      }
+      return {
+        status: 200,
+        body: {
+          runId: 'run_pf',
+          status: 'queued',
+          enqueuedAt: '2026-08-09T10:00:01.000Z',
+          codeVersion: 'v1',
+          targetUrl: LITERAL_IP_TARGET,
+        },
+      };
+    });
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: LITERAL_IP_TARGET,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    );
+    expect(probeHits).toHaveLength(1);
+  });
+
+  it('a gateway-error response (503) refuses before any per-member run trigger — exit 5, zero triggers', async () => {
+    // The batch CREATE (`POST /tests/batch`) is a single request for the
+    // whole batch and always runs first; the preflight sits before the
+    // per-member RUN trigger fan-out, not before the create. So a refused
+    // target still leaves the batch's created-test rows behind — it only
+    // guarantees no run row and no charge, mirroring the other three call
+    // sites' "no trigger POST" contract.
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansPreflight();
+    let triggerPosted = false;
+    const fetchImpl = makeFetch(url => {
+      if (url === LITERAL_IP_TARGET) return { status: 503, body: {} };
+      if (url.includes('/tests/batch')) {
+        return {
+          status: 200,
+          body: {
+            results: [
+              { specIndex: 0, status: 'created', testId: 'test_pf_a' },
+              { specIndex: 1, status: 'created', testId: 'test_pf_b' },
+            ],
+            summary: { total: 2, created: 2, failed: 0 },
+          },
+        };
+      }
+      // Any `POST /tests/{id}/runs` reaching here would mean the preflight
+      // failed to gate the fan-out.
+      triggerPosted = true;
+      return { status: 200, body: {} };
+    });
+    const err = await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: LITERAL_IP_TARGET,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('VALIDATION_ERROR');
+    expect((err as ApiError).exitCode).toBe(5);
+    expect(triggerPosted).toBe(false);
+  });
+
+  it('--skip-preflight makes the probe a zero-network-call no-op', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansPreflight();
+    const probeHits: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url === LITERAL_IP_TARGET) {
+        probeHits.push(url);
+        return { status: 503, body: {} }; // would refuse if the probe ran at all
+      }
+      if (url.includes('/tests/batch')) {
+        return {
+          status: 200,
+          body: {
+            results: [{ specIndex: 0, status: 'created', testId: 'test_pf_a' }],
+            summary: { total: 1, created: 1, failed: 0 },
+          },
+        };
+      }
+      return {
+        status: 200,
+        body: {
+          runId: 'run_pf',
+          status: 'queued',
+          enqueuedAt: '2026-08-09T10:00:01.000Z',
+          codeVersion: 'v1',
+          targetUrl: LITERAL_IP_TARGET,
+        },
+      };
+    });
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: LITERAL_IP_TARGET,
+        skipPreflight: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    );
+    expect(probeHits).toHaveLength(0);
+  });
+});
+
+describe('test run --all — the project-level closing link prefers the server field', () => {
+  const BATCH_OK = {
+    accepted: [{ testId: 't1', runId: 'r1', enqueuedAt: '2026-09-02T00:00:00.000Z' }],
+    conflicts: [],
+    deferred: [],
+    skippedFrontend: [],
+    skippedIntegration: [],
+  };
+  const SERVER_LINK = 'https://portal.example.com/dashboard-v3/o/org-1/projects/proj_1';
+
+  async function runAll(batchBody: Record<string, unknown>, apiUrl?: string) {
+    const { credentialsPath } = makeCreds('sk-user-test', apiUrl);
+    const fetchImpl = makeFetch((url, init) =>
+      (init.method ?? 'GET') === 'POST' && url.includes('/tests/batch/run')
+        ? { status: 202, body: batchBody }
+        : { body: {} },
+    );
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_1',
+        wait: false,
+        timeoutSeconds: 60,
+        maxConcurrency: 1,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    return { stdout: stdoutLines.join('\n'), stderr: stderrLines.join('\n') };
+  }
+
+  it('server dashboardUrl (string) → printed verbatim, never the legacy /dashboard/tests template', async () => {
+    const { stdout } = await runAll(
+      { ...BATCH_OK, dashboardUrl: SERVER_LINK },
+      'https://api.testsprite.com',
+    );
+    expect(stdout).toContain(`dashboard     ${SERVER_LINK}`);
+    expect(stdout).not.toContain('/dashboard/tests/');
+  });
+
+  it('server dashboardUrl: null → no dashboard line at all (no dead legacy guess)', async () => {
+    const { stdout } = await runAll(
+      { ...BATCH_OK, dashboardUrl: null },
+      'https://api.testsprite.com',
+    );
+    expect(stdout).not.toContain('dashboard     ');
+  });
+
+  it('field absent (older backend / V2 engine) on the prod API → the legacy client template, unchanged', async () => {
+    const { stdout } = await runAll(BATCH_OK, 'https://api.testsprite.com');
+    expect(stdout).toContain('dashboard     https://www.testsprite.com/dashboard/tests/proj_1');
+  });
+
+  it('field absent on an unknown API host → still no line (resolvePortalBase contract)', async () => {
+    const { stdout } = await runAll(BATCH_OK);
+    expect(stdout).not.toContain('dashboard     ');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// test run / test rerun (no --wait): the server-built dashboard link
+// ---------------------------------------------------------------------------
+
+describe('runTestRun / runTestRerun — dashboard line on the queued-run output', () => {
+  const QUEUED = {
+    runId: 'run_link_1',
+    status: 'queued',
+    enqueuedAt: '2026-09-02T00:00:00.000Z',
+    codeVersion: 'v1',
+    targetUrl: 'https://example.com',
+  };
+  const LINK = 'https://portal.example.com/dashboard-v3/o/org-1/projects/p/test-cases/test_1';
+
+  it('test run <id>: prints the dashboard line when the server supplies the link', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url =>
+      url.includes('/runs') ? { body: { ...QUEUED, dashboardUrl: LINK } } : { body: FE_TEST },
+    );
+    const out: string[] = [];
+    const resp = await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        testId: 'test_1',
+        wait: false,
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => {} },
+    );
+    const block = out.join('\n');
+    expect(block).toContain('runId       run_link_1');
+    expect(block).toContain(`dashboard   ${LINK}`);
+    expect((resp as { dashboardUrl?: string }).dashboardUrl).toBe(LINK);
+  });
+
+  it('test run <id>: an absent link prints nothing — never a guessed URL, never "undefined"', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url =>
+      url.includes('/runs') ? { body: QUEUED } : { body: FE_TEST },
+    );
+    const out: string[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        testId: 'test_1',
+        wait: false,
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => {} },
+    );
+    const block = out.join('\n');
+    expect(block).toContain('targetUrl   https://example.com');
+    expect(block).not.toContain('dashboard');
+    expect(block).not.toContain('undefined');
+  });
+
+  it('test run <id> --output json: the envelope carries dashboardUrl and executionUrl verbatim', async () => {
+    const { credentialsPath } = makeCreds();
+    const EXEC = 'https://portal.example.com/dashboard-v3/o/org-1/projects/p/execution/e';
+    const fetchImpl = makeFetch(url =>
+      url.includes('/runs')
+        ? { body: { ...QUEUED, dashboardUrl: LINK, executionUrl: EXEC } }
+        : { body: FE_TEST },
+    );
+    const out: string[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_1',
+        wait: false,
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => {} },
+    );
+    const parsed = JSON.parse(out.join('\n')) as { dashboardUrl?: string; executionUrl?: string };
+    expect(parsed.dashboardUrl).toBe(LINK);
+    expect(parsed.executionUrl).toBe(EXEC);
+  });
+
+  it('test rerun <id>: prints the dashboard line when supplied, nothing when absent', async () => {
+    const { credentialsPath } = makeCreds();
+    const RERUN = {
+      runId: 'run_rerun_1',
+      status: 'queued',
+      enqueuedAt: '2026-09-02T00:00:00.000Z',
+      codeVersion: 'v1',
+      autoHeal: false,
+      closure: null,
+    };
+    const rerunOpts = {
+      profile: 'default',
+      output: 'text' as const,
+      debug: false,
+      testIds: ['test_1'],
+      all: false,
+      wait: false,
+      timeoutSeconds: 600,
+      autoHeal: false,
+      autoHealExplicit: false,
+      skipDependencies: false,
+      maxConcurrency: 1,
+    };
+    const linked: string[] = [];
+    await runTestRerun(rerunOpts, {
+      credentialsPath,
+      fetchImpl: makeFetch(url =>
+        url.includes('/runs/rerun')
+          ? { body: { ...RERUN, dashboardUrl: LINK } }
+          : { body: FE_TEST },
+      ),
+      stdout: line => linked.push(line),
+      stderr: () => {},
+    });
+    expect(linked.join('\n')).toContain(`dashboard   ${LINK}`);
+
+    const bare: string[] = [];
+    await runTestRerun(rerunOpts, {
+      credentialsPath,
+      fetchImpl: makeFetch(url =>
+        url.includes('/runs/rerun') ? { body: RERUN } : { body: FE_TEST },
+      ),
+      stdout: line => bare.push(line),
+      stderr: () => {},
+    });
+    expect(bare.join('\n')).toContain('autoHeal    false');
+    expect(bare.join('\n')).not.toContain('dashboard');
   });
 });

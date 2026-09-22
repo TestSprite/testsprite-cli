@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/main/schemas/plan.schema.json",
+  "title": "TestSprite CLI plan file",
+  "description": "Shape ingested by `testsprite test create --plan-from <file>` (and, per-line, by `test create-batch --plans <file.jsonl>` / `--plan-from-dir <dir>`). One plan file describes exactly ONE test — a top-level JSON array is rejected; use create-batch for many. This schema is the machine-readable ground truth for THIS command (`--plan-from`), not for `assertPlanShape`'s raw structural check in isolation — where the two diverge (see `type` below), this schema encodes what `--plan-from` actually accepts end-to-end. It is asserted in `src/lib/plan-schema.spec.ts` against the real validator; if the two ever disagree, the validator's actual acceptance behavior is authoritative and this file is out of date. Not enforced by this schema (checked separately by the CLI as a pre-flight guard, not a structural JSON constraint): a plan file must be <= 256 KB total.",
+  "type": "object",
+  "required": ["projectId", "type", "name", "planSteps"],
+  "properties": {
+    "$schema": {
+      "description": "Optional. Point your editor at this file (e.g. the raw URL in the plan template, or a local path to a copy shipped in node_modules/@testsprite/testsprite-cli/schemas/plan.schema.json) to get inline validation and completion while authoring. Ignored by the CLI — plan files are not restricted to a fixed property set (see `additionalProperties`, implicitly true throughout this schema), and this property is deliberately left type-unconstrained here to match: assertPlanShape does not inspect `$schema` at all, so a non-string value here is exactly as valid to the CLI as a string one."
+    },
+    "projectId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "Project id returned by `testsprite project list`. Must be non-empty and not whitespace-only."
+    },
+    "type": {
+      "type": "string",
+      "enum": ["frontend"],
+      "description": "Restricted to `frontend` — `--plan-from` rejects a `backend`-typed plan pre-flight with a `nextAction` pointing at `test create --type backend --code-file <path>` (backend tests are authored from a code file, not a plan). `assertPlanShape`'s own structural check is looser (it accepts `backend` as a bare shape check before that later rejection), but this schema is the ground truth for the `--plan-from` COMMAND as a whole, not for the isolated structural check — so it encodes the value that actually succeeds end-to-end."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "Human-readable test name. Write it as an assertable behavior statement (subject + verb + outcome), not a noun fragment."
+    },
+    "description": {
+      "type": "string",
+      "description": "Optional one-sentence elaboration of `name` — the condition plus the expected outcome. Any string is accepted (including empty), unlike `name`/`projectId`."
+    },
+    "priority": {
+      "type": "string",
+      "enum": ["p0", "p1", "p2", "p3"],
+      "description": "Optional. p0 = must-pass, p1 = important paths, p2 = edge cases, p3 = cosmetic."
+    },
+    "planSteps": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 200,
+      "description": "1-200 steps describing user intent in plain language, not selectors. `{{...}}`-style placeholders are NOT substituted by the CLI — a step containing one is structurally valid (passes this schema and assertPlanShape) but triggers a non-fatal `[advisory]` at `test create --plan-from` time; store login credentials on the project instead (`project update --username/--password`, or Portal -> Project Settings).",
+      "items": {
+        "type": "object",
+        "required": ["type", "description"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["action", "assertion"]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "description": "One verb per step. Describe the outcome/intent, not a CSS selector or literal button label."
+          }
+        }
+      }
+    }
+  }
+}

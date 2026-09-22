@@ -6,11 +6,12 @@
  * (or a spy) so there are no real delays.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ApiError, InterruptError } from './errors.js';
 import { ShutdownController } from './interrupt.js';
 import { pollRunUntilTerminal, TimeoutError } from './poll.js';
 import type { RunClient } from './poll.js';
+import { defaultSleep, sleepUnlessInterrupted } from './poll-support.js';
 import type { RunResponse } from './runs.types.js';
 
 // ---------------------------------------------------------------------------
@@ -541,7 +542,14 @@ describe('pollRunUntilTerminal — AbortSignal + timeout enforcement', () => {
     expect(receivedSignals[0]).toBeInstanceOf(AbortSignal);
   });
 
-  it('passes a fresh AbortSignal on each poll iteration', async () => {
+  it('reuses the same session AbortSignal across poll iterations (no per-iteration churn)', async () => {
+    // Regression guard for the AbortController/AbortSignal.any churn fix: a
+    // fresh controller + composed signal per iteration was pure waste (the
+    // abort target — deadlineMs + cushion — never changes between
+    // iterations), and on a `--wait` fan-out over many concurrent runIds it
+    // produced enough short-lived `AbortSignal.any` composites to make V8's
+    // FinalizationRegistry cleanup pass pathologically slow. The signal is
+    // now hoisted once per poll session and reused for every iteration.
     const receivedSignals: Array<AbortSignal | undefined> = [];
     const client: RunClient = {
       getRun: async (_runId, opts) => {
@@ -555,8 +563,8 @@ describe('pollRunUntilTerminal — AbortSignal + timeout enforcement', () => {
       sleep: instantSleep,
     });
     expect(receivedSignals).toHaveLength(2);
-    // Each iteration gets its own controller → distinct signal objects
-    expect(receivedSignals[0]).not.toBe(receivedSignals[1]);
+    expect(receivedSignals[0]).toBeInstanceOf(AbortSignal);
+    expect(receivedSignals[0]).toBe(receivedSignals[1]);
   });
 
   it('surfaces TimeoutError when fetch resolves as AbortError (hung fetch past deadline)', async () => {
@@ -800,6 +808,25 @@ describe('pollRunUntilTerminal — resolveAlternate hook', () => {
 // Graceful detach — shutdown handle (DEV-331 piece 1)
 // ---------------------------------------------------------------------------
 
+describe('sleepUnlessInterrupted', () => {
+  it('clears the default sleep timer when shutdown aborts the backoff', async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const reason = new InterruptError('SIGINT');
+      const pending = sleepUnlessInterrupted(defaultSleep, 15_000, controller.signal);
+
+      expect(vi.getTimerCount()).toBe(1);
+      controller.abort(reason);
+
+      await expect(pending).rejects.toBe(reason);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('pollRunUntilTerminal — shutdown (SIGINT/SIGTERM graceful detach)', () => {
   it('throws the InterruptError when the shutdown signal was already aborted (beats the deadline)', async () => {
     const shutdown = new ShutdownController();
@@ -868,6 +895,7 @@ describe('pollRunUntilTerminal — shutdown (SIGINT/SIGTERM graceful detach)', (
           disposedCount += 1;
         };
       },
+      runCriticalOperation: <T>(operation: () => Promise<T>) => operation(),
     };
     const run = await pollRunUntilTerminal(makeClient([makeRun('passed')]), RUN_ID, {
       timeoutSeconds: 5,
@@ -886,6 +914,7 @@ describe('pollRunUntilTerminal — shutdown (SIGINT/SIGTERM graceful detach)', (
       arm: () => () => {
         disposedCount += 1;
       },
+      runCriticalOperation: <T>(operation: () => Promise<T>) => operation(),
     };
     const err = await pollRunUntilTerminal(makeClient([makeRun('running')]), RUN_ID, {
       timeoutSeconds: 0,

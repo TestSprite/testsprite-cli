@@ -16,7 +16,7 @@
  * and these validators are the third gate.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import type {
   CliFailureContext,
   CliFailureBlock,
@@ -179,22 +179,30 @@ describe('P5 schema contract — FailureContext fixtures match the OpenAPI shape
 
 // ---- CLI surface contract: what runFailureGet returns ----
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { makeTempDir } from '../helpers/tempDir.js';
 import { runFailureGet } from '../../src/commands/test.js';
 
+// Every makeCreds() call gets its own temp dir; each is registered here and
+// swept in afterEach so a failing assertion mid-test still leaves nothing behind.
+const pendingCredsCleanups: Array<() => void> = [];
+
 function makeCreds(): { credentialsPath: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'cli-p5-contract-'));
-  const credentialsPath = join(dir, 'credentials');
-  mkdirSync(dir, { recursive: true });
+  const dir = makeTempDir('cli-p5-contract-');
+  pendingCredsCleanups.push(dir.cleanup);
+  const credentialsPath = join(dir.path, 'credentials');
   writeFileSync(
     credentialsPath,
-    `[default]\napi_url = https://api.testsprite.com\napi_key = sk-test\n`,
+    `[default]\napi_url = https://api.testsprite.com\napi_key = sk-user-test\n`,
     { mode: 0o600 },
   );
   return { credentialsPath };
 }
+
+afterEach(() => {
+  while (pendingCredsCleanups.length > 0) pendingCredsCleanups.pop()?.();
+});
 
 describe('P5 schema contract — runFailureGet returns a §6.7 FailureContext', () => {
   it('runFailureGet returns the wire envelope for a known failing test', async () => {

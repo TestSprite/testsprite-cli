@@ -33,6 +33,7 @@ function makeClient(
     apiKey?: string | null;
     onDebug?: (e: DebugEvent) => void;
     onServerVersion?: (info: { minVersion?: string }) => void;
+    maxResponseBytes?: number;
   } = {},
 ): HttpClient {
   const apiKey = 'apiKey' in options ? (options.apiKey ?? undefined) : 'sk-test';
@@ -44,8 +45,150 @@ function makeClient(
     random: () => 0,
     onDebug: options.onDebug,
     onServerVersion: options.onServerVersion,
+    maxResponseBytes: options.maxResponseBytes,
   });
 }
+
+describe('default retry timer lifecycle', () => {
+  it('forwards a caller abort signal to a single-attempt history request', async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const client = new HttpClient({
+        baseUrl: 'https://api.example.com/api/cli/v1',
+        apiKey: 'sk-test',
+        fetchImpl: async (_input, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+              once: true,
+            });
+          }),
+      });
+      let settled = false;
+      const pending = client
+        .listTestRuns('test_abc', { pageSize: 20 }, { signal: controller.signal, retry: false })
+        .catch((error: unknown) => {
+          settled = true;
+          return error;
+        });
+      const reason = new DOMException('History deadline', 'AbortError');
+      controller.abort(reason);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toBe(true);
+      expect(await pending).toBe(reason);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears the referenced backoff timer when shutdown aborts', async () => {
+    vi.useFakeTimers();
+    try {
+      const shutdown = new AbortController();
+      const fetchImpl = vi.fn(async () =>
+        errorEnvelopeResponse(429, 'RATE_LIMITED', { headers: { 'retry-after': '60' } }),
+      );
+      const client = new HttpClient({
+        baseUrl: 'https://api.example.com/api/cli/v1',
+        apiKey: 'sk-test',
+        fetchImpl,
+        shutdownSignal: shutdown.signal,
+      });
+      const pending = client.get('/me').catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vi.getTimerCount()).toBe(1);
+      const reason = new InterruptError('SIGINT');
+      shutdown.abort(reason);
+      expect(await pending).toBe(reason);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it('still retries a 429 after its delay and returns the next 200', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          errorEnvelopeResponse(429, 'RATE_LIMITED', { headers: { 'retry-after': '1' } }),
+        )
+        .mockResolvedValueOnce(jsonResponse({ ok: true }));
+      const client = new HttpClient({
+        baseUrl: 'https://api.example.com/api/cli/v1',
+        apiKey: 'sk-test',
+        fetchImpl,
+        shutdownSignal: new AbortController().signal,
+      });
+      const pending = client.get('/me');
+      await vi.advanceTimersByTimeAsync(999);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await pending).toEqual({ ok: true });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('response size guard (maxResponseBytes)', () => {
+  it('rejects a response whose Content-Length exceeds the cap', async () => {
+    // jsonResponse sets a real Content-Length; a 50-byte cap is well under it.
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ blob: 'x'.repeat(500) }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch, { maxResponseBytes: 50 });
+
+    const err = await client.get('/tests').catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('PAYLOAD_TOO_LARGE');
+    expect((err as ApiError).exitCode).toBe(5);
+    expect((err as ApiError).getDetail('maxBytes')).toBe(50);
+  });
+
+  it('rejects an over-cap chunked response that has no Content-Length', async () => {
+    // A body built from a ReadableStream carries no Content-Length, so only the
+    // streaming byte-counter can catch it.
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('{"data":"'));
+        controller.enqueue(encoder.encode('y'.repeat(500)));
+        controller.enqueue(encoder.encode('"}'));
+        controller.close();
+      },
+    });
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(stream, { status: 200, headers: { 'content-type': 'application/json' } }),
+      );
+    const client = makeClient(fetchImpl as unknown as typeof fetch, { maxResponseBytes: 50 });
+
+    const err = await client.get('/tests').catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('PAYLOAD_TOO_LARGE');
+  });
+
+  it('reads a within-cap response unchanged', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ ok: true, items: [1, 2, 3] }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch, {
+      maxResponseBytes: 1_000_000,
+    });
+
+    const body = await client.get<{ ok: boolean; items: number[] }>('/tests');
+
+    expect(body).toEqual({ ok: true, items: [1, 2, 3] });
+  });
+});
 
 describe('CLIENT_TOO_OLD (426)', () => {
   it('is not retried — fails fast with the typed error', async () => {
@@ -187,6 +330,38 @@ describe('HttpClient happy path', () => {
     await client.get('/me');
   });
 
+  it('appends a valid TESTSPRITE_CLIENT tag to the User-Agent', async () => {
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      expect(headers.get('user-agent')).toBe(`testsprite-cli/${VERSION} (github-action/v1)`);
+      return jsonResponse({});
+    });
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      env: { TESTSPRITE_CLIENT: 'github-action/v1' },
+    });
+    await client.get('/me');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores an invalid TESTSPRITE_CLIENT tag (User-Agent unchanged, value never sent)', async () => {
+    const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      expect(headers.get('user-agent')).toBe(`testsprite-cli/${VERSION}`);
+      return jsonResponse({});
+    });
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      env: { TESTSPRITE_CLIENT: 'not a tag (nope)' },
+    });
+    await client.get('/me');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it('honors a caller-supplied requestId', async () => {
     const fetchImpl = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const headers = new Headers(init?.headers);
@@ -280,6 +455,34 @@ describe('HttpClient error mapping', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
+  it('does not retry a CONFLICT remapped to AMBIGUOUS_ORG (permanent id collision, not a race)', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(
+        {
+          error: {
+            code: 'CONFLICT',
+            message: 'Test id "test_x" resolves in more than one of your organizations.',
+            nextAction: 'Open the specific project in the Portal, or contact support.',
+            requestId: 'req_ambig',
+            details: {
+              reason: 'ambiguous_org',
+              testId: 'test_x',
+              candidates: [{ projectId: 'p1', orgId: 'o1' }],
+            },
+          },
+        },
+        { status: 409 },
+      ),
+    );
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    const err = await client.get('/tests/test_x').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('AMBIGUOUS_ORG');
+    expect((err as ApiError).exitCode).toBe(6);
+    expect((err as ApiError).getDetail('candidates')).toEqual([{ projectId: 'p1', orgId: 'o1' }]);
+    expect(fetchImpl).toHaveBeenCalledTimes(1); // no retry — distinct from generic CONFLICT
+  });
+
   it('retries INTERNAL once then propagates', async () => {
     const fetchImpl = vi.fn(async () => errorEnvelopeResponse(500, 'INTERNAL'));
     const client = makeClient(fetchImpl as unknown as typeof fetch);
@@ -307,6 +510,39 @@ describe('HttpClient error mapping', () => {
     });
     expect(fetchImpl).toHaveBeenCalledTimes(3);
     expect(sleepCalls).toEqual([2000, 2000]);
+  });
+
+  it('does NOT retry a RATE_LIMITED naming a standing condition (tunnel binding cap)', async () => {
+    // The binding-cap refusal cannot succeed until the caller frees a binding,
+    // so the Retry-After it carries must not buy it any retry budget here —
+    // the server's nextAction has to surface on the first response.
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(
+        {
+          error: {
+            code: 'RATE_LIMITED',
+            message: 'You already have 5 live tunnel bindings (limit 5).',
+            nextAction:
+              'Close an existing tunnel (`testsprite tunnel stop`) or wait for it to expire, then retry.',
+            requestId: 'req_cap',
+            details: {
+              reason: 'tunnel_binding_limit',
+              liveBindings: 5,
+              limit: 5,
+              retryAfterSeconds: 600,
+            },
+          },
+        },
+        { status: 429, headers: { 'retry-after': '600' } },
+      ),
+    );
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    const err = await client.get('/me').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('RATE_LIMITED');
+    expect((err as ApiError).exitCode).toBe(11);
+    expect((err as ApiError).getDetail('reason')).toBe('tunnel_binding_limit');
+    expect(fetchImpl).toHaveBeenCalledTimes(1); // standing condition — no retry budget spent
   });
 
   it('retries UNAVAILABLE up to 4 times with bounded backoff', async () => {
@@ -717,7 +953,12 @@ describe('HttpClient per-request timeout', () => {
       return {
         ok: true,
         status: 200,
-        json: () => Promise.reject(timeoutErr),
+        headers: new Headers(),
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(timeoutErr);
+          },
+        }),
       } as unknown as Response;
     });
     const client = new HttpClient({

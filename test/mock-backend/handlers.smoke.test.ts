@@ -35,7 +35,13 @@ import {
 
 mockBackend.installLifecycle();
 
-const VALID_KEY = 'tsp_dev_canary_key';
+// Deliberately NOT credential-shaped. This is a mock-backend header value, but
+// `tsp_dev_…` matched the release LEAK_RE's membership-namespace pattern once
+// that pattern learned `tsp_` — a false positive in the one scan whose whole
+// job is to refuse to publish a real key. Renaming is better than adding an
+// exception: an exception for `tsp_dev_*` would also mask a real credential
+// that happened to start that way.
+const VALID_KEY = 'mock-backend-accepts-any-key';
 
 function get(path: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);

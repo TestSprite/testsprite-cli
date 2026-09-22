@@ -3,10 +3,13 @@ import {
   ApiError,
   CLIError,
   ERROR_CODES,
+  InterruptError,
   NotImplementedError,
   RequestTimeoutError,
   TransportError,
   exitCodeFor,
+  extractNodeErrorCode,
+  isAuthCode,
   isErrorCode,
   localValidationError,
 } from './errors.js';
@@ -23,6 +26,76 @@ describe('CLIError', () => {
   it('accepts a custom exit code', () => {
     expect(new CLIError('boom', 42).exitCode).toBe(42);
   });
+
+  // A bare CLIError (not ApiError/InterruptError/RequestTimeoutError)
+  // previously had no `code` at all, so the telemetry fallback branch and the
+  // `--output json` error envelope both had nothing to key on. Every CLIError
+  // now carries a stable machine code, defaulting to the out-of-catalog
+  // 'CLI_ERROR' bucket (same convention as InterruptError's 'INTERRUPTED' and
+  // RequestTimeoutError's 'REQUEST_TIMEOUT' — deliberately not in ERROR_CODES,
+  // since none of these are backend-issued codes).
+  it('defaults `code` to CLI_ERROR', () => {
+    const err = new CLIError('boom');
+    expect(err.code).toBe('CLI_ERROR');
+  });
+
+  it('accepts a custom code as the third constructor argument', () => {
+    const err = new CLIError('boom', 5, 'MY_CODE');
+    expect(err.code).toBe('MY_CODE');
+  });
+});
+
+describe('CLIError subclasses set a specific `code` (not the CLI_ERROR default)', () => {
+  it('InterruptError.code is INTERRUPTED', () => {
+    const err = new InterruptError('SIGINT');
+    expect(err.code).toBe('INTERRUPTED');
+  });
+
+  it('RequestTimeoutError.code is REQUEST_TIMEOUT', () => {
+    const err = new RequestTimeoutError(5_000);
+    expect(err.code).toBe('REQUEST_TIMEOUT');
+  });
+});
+
+// Regression pin (not a red/green TDD case — there is no unpatched behavior to
+// contrast against once CLIError gains a base `code` field; this exists purely
+// to lock in that ApiError's own `this.code = envelope.code` assignment keeps
+// winning over whatever CLIError's constructor would have defaulted it to).
+describe('ApiError.code overrides the CLIError base default', () => {
+  it('is the envelope code, never the CLI_ERROR base default', () => {
+    const err = ApiError.fromEnvelope({
+      error: {
+        code: 'NOT_FOUND',
+        message: 'gone',
+        nextAction: '',
+        requestId: 'req_1',
+        details: {},
+      },
+    });
+    expect(err.code).toBe('NOT_FOUND');
+    expect(err.code).not.toBe('CLI_ERROR');
+  });
+});
+
+describe('extractNodeErrorCode', () => {
+  it('returns the string `.code` off an arbitrary thrown object', () => {
+    const err = Object.assign(new Error('no such file'), { code: 'ENOENT' });
+    expect(extractNodeErrorCode(err)).toBe('ENOENT');
+  });
+
+  it('returns undefined when there is no `.code`', () => {
+    expect(extractNodeErrorCode(new Error('plain'))).toBeUndefined();
+  });
+
+  it('returns undefined for non-string `.code` values', () => {
+    expect(extractNodeErrorCode({ code: 42 })).toBeUndefined();
+  });
+
+  it('returns undefined for non-object thrown values', () => {
+    expect(extractNodeErrorCode('a string was thrown')).toBeUndefined();
+    expect(extractNodeErrorCode(null)).toBeUndefined();
+    expect(extractNodeErrorCode(undefined)).toBeUndefined();
+  });
 });
 
 describe('NotImplementedError', () => {
@@ -32,6 +105,16 @@ describe('NotImplementedError', () => {
     expect(err.exitCode).toBe(2);
     expect(err.name).toBe('NotImplementedError');
     expect(err).toBeInstanceOf(CLIError);
+  });
+
+  // Its own dedicated code instead of inheriting the generic CLIError
+  // default — 'NOT_IMPLEMENTED' is a meaningful, already-known signal (this
+  // command path isn't wired up yet), so falling back to 'CLI_ERROR' would
+  // throw that information away.
+  it('uses NOT_IMPLEMENTED, not the CLIError base default', () => {
+    const err = new NotImplementedError('project list');
+    expect(err.code).toBe('NOT_IMPLEMENTED');
+    expect(err.code).not.toBe('CLI_ERROR');
   });
 });
 
@@ -61,9 +144,36 @@ describe('exitCodeFor', () => {
     ['INSUFFICIENT_CREDITS', 12],
     ['FEATURE_GATED', 13],
     ['CLIENT_TOO_OLD', 14],
+    ['AMBIGUOUS_ORG', 6],
     ['INTERNAL', 1],
   ] as const)('%s → exit %d', (code, expected) => {
     expect(exitCodeFor(code)).toBe(expected);
+  });
+});
+
+describe('isAuthCode', () => {
+  it('is true exactly for the auth codes', () => {
+    expect(isAuthCode('AUTH_REQUIRED')).toBe(true);
+    expect(isAuthCode('AUTH_INVALID')).toBe(true);
+    expect(isAuthCode('AUTH_FORBIDDEN')).toBe(true);
+  });
+
+  it('is false for non-auth and unknown codes (never calls exitCodeFor off-contract)', () => {
+    expect(isAuthCode('NOT_FOUND')).toBe(false);
+    expect(isAuthCode('RATE_LIMITED')).toBe(false);
+    expect(isAuthCode('INTERNAL')).toBe(false);
+    expect(isAuthCode('timeout')).toBe(false);
+    expect(isAuthCode('NONSENSE_CODE')).toBe(false);
+    expect(isAuthCode('')).toBe(false);
+  });
+
+  // The single-source guarantee: auth-ness is DERIVED from exitCodeFor (exit 3),
+  // so the two can't drift. If a future AUTH_* code is given an exit-3 row it is
+  // auth automatically; if a code is added to exit 3 it must be auth by intent.
+  it('agrees with exitCodeFor for every ERROR_CODE (auth ⟺ exit 3)', () => {
+    for (const code of ERROR_CODES) {
+      expect(isAuthCode(code)).toBe(exitCodeFor(code) === 3);
+    }
   });
 });
 
@@ -137,6 +247,7 @@ describe('ApiError.fromEnvelope status fallback', () => {
   it.each([
     [400, 'VALIDATION_ERROR' as const],
     [401, 'AUTH_INVALID' as const],
+    [402, 'INSUFFICIENT_CREDITS' as const],
     [403, 'AUTH_FORBIDDEN' as const],
     [404, 'NOT_FOUND' as const],
     [409, 'CONFLICT' as const],
@@ -256,6 +367,29 @@ describe('localValidationError', () => {
     const err = localValidationError('code-file', 'file does not exist: /tmp/x.ts');
     expect(err.details).toEqual({ field: 'code-file', reason: 'file does not exist: /tmp/x.ts' });
     expect('accepted' in err.details).toBe(false);
+  });
+
+  // A reason string that already ends in a period (common when a
+  // call site composes multiple already-punctuated sentences, e.g.
+  // `test run --all --target-url` builds its rejection out of an
+  // explanatory sentence + an instruction sentence) must not end up with a
+  // doubled `..` once the template appends its own trailing period.
+  it('does not double the trailing period when reason already ends with one', () => {
+    const err = localValidationError(
+      'target-url',
+      '--target-url has no effect with --all. Remove --target-url.',
+    );
+    expect(err.nextAction).toBe(
+      'Flag `--target-url` is invalid: --target-url has no effect with --all. Remove --target-url.',
+    );
+    expect(err.nextAction.endsWith('..')).toBe(false);
+    expect(err.nextAction.endsWith('.')).toBe(true);
+  });
+
+  it('still appends exactly one period when reason has no trailing punctuation', () => {
+    const err = localValidationError('pageSize', 'must be a positive integer');
+    expect(err.nextAction).toBe('Flag `--page-size` is invalid: must be a positive integer.');
+    expect(err.nextAction.endsWith('..')).toBe(false);
   });
 });
 
@@ -394,6 +528,32 @@ describe('INSUFFICIENT_CREDITS detection', () => {
     expect(err.nextAction).not.toContain('https://');
   });
 
+  // V3 API keys are membership-bound: a team-org key spends that org's
+  // wallet, not the personal one. The CLI has no way to know which kind of
+  // key just failed here (this is a client-side synthesis with no backend
+  // nextAction), so the synthesized hint must not assert the personal
+  // billing page is the ONLY fix — it should also point an org-bound caller
+  // at their org admin instead of silently sending them to top up the wrong
+  // wallet.
+  it('synthesized billing hint does not assert a personal-only path (org-bound key wording)', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Insufficient credits: please top up.',
+          nextAction: '',
+          requestId: 'req_cred_org',
+          details: {},
+        },
+      },
+      429,
+    );
+    expect(err.nextAction.toLowerCase()).toContain('org admin');
+    // The personal-key link is still offered — it's a real, correct fix for
+    // the common case, just no longer presented as the only one.
+    expect(err.nextAction).toContain('(/dashboard/settings/billing)');
+  });
+
   it('synthesized billing link resolves the PROD portal from a prod apiUrl', () => {
     const err = ApiError.fromEnvelope(
       {
@@ -506,5 +666,74 @@ describe('INSUFFICIENT_CREDITS detection', () => {
     // required=0 is not a valid credit cost; stays RATE_LIMITED
     expect(err.code).toBe('RATE_LIMITED');
     expect(err.exitCode).toBe(11);
+  });
+});
+
+describe('AMBIGUOUS_ORG detection (409 CONFLICT + reason: ambiguous_org)', () => {
+  it('remaps a CONFLICT envelope with details.reason === "ambiguous_org" to AMBIGUOUS_ORG / exit 6', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'CONFLICT',
+          message: 'Test id "test_x" resolves in more than one of your organizations.',
+          nextAction: 'Open the specific project in the Portal, or contact support.',
+          requestId: 'req_ambig_1',
+          details: {
+            reason: 'ambiguous_org',
+            testId: 'test_x',
+            candidates: [
+              { projectId: 'project_a', orgId: 'org_a' },
+              { projectId: 'project_b', orgId: 'org_b' },
+            ],
+          },
+        },
+      },
+      409,
+    );
+    expect(err.code).toBe('AMBIGUOUS_ORG');
+    expect(err.exitCode).toBe(6);
+    // Message/nextAction pass through verbatim — the backend already
+    // supplies an actionable template, unlike the INSUFFICIENT_CREDITS
+    // sub-case which sometimes synthesizes one for older backends.
+    expect(err.message).toContain('resolves in more than one of your organizations');
+    expect(err.nextAction).toContain('Open the specific project');
+    expect(err.getDetail('testId')).toBe('test_x');
+    expect(err.getDetail('candidates')).toEqual([
+      { projectId: 'project_a', orgId: 'org_a' },
+      { projectId: 'project_b', orgId: 'org_b' },
+    ]);
+  });
+
+  it('a plain CONFLICT (snapshot in flight, no ambiguous_org reason) stays CONFLICT / exit 6', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'CONFLICT',
+          message: 'Snapshot in flight; retry shortly.',
+          nextAction: 'Retry in a few seconds.',
+          requestId: 'req_conflict_1',
+          details: { reason: 'snapshot_in_flight' },
+        },
+      },
+      409,
+    );
+    expect(err.code).toBe('CONFLICT');
+    expect(err.exitCode).toBe(6);
+  });
+
+  it('a CONFLICT with an unrelated reason string stays CONFLICT (not falsely remapped)', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'CONFLICT',
+          message: 'Another run is already in flight.',
+          nextAction: 'Poll it with test wait.',
+          requestId: 'req_conflict_2',
+          details: { reason: 'run_in_flight', currentRunId: 'run_abc' },
+        },
+      },
+      409,
+    );
+    expect(err.code).toBe('CONFLICT');
   });
 });

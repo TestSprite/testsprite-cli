@@ -46,6 +46,7 @@ export async function expectJsonModeStdoutIsPureJson(
     throw new Error(
       `JSON-mode stdout is not parseable JSON: ${(err as Error).message}\n` +
         `--- stdout (${trimmed.length} bytes) ---\n${trimmed.slice(0, 400)}\n--- end ---`,
+      { cause: err },
     );
   }
 

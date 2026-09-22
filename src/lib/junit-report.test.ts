@@ -6,12 +6,30 @@ import { ApiError } from './errors.js';
 import {
   assertJUnitReportOptions,
   buildJUnitReport,
+  durationSecondsBetween,
   escapeXml,
   parseJUnitReportFormat,
   resolveBatchReportProjectId,
   writeJUnitReportFile,
   type JUnitTestResult,
 } from './junit-report.js';
+
+describe('durationSecondsBetween', () => {
+  it('computes seconds between two ISO timestamps', () => {
+    expect(durationSecondsBetween('2026-08-17T10:00:00.000Z', '2026-08-17T10:00:12.500Z')).toBe(
+      12.5,
+    );
+  });
+  it('returns undefined when a timestamp is missing / unparseable / negative', () => {
+    expect(durationSecondsBetween(null, '2026-08-17T10:00:00.000Z')).toBeUndefined();
+    expect(durationSecondsBetween('2026-08-17T10:00:00.000Z', undefined)).toBeUndefined();
+    expect(durationSecondsBetween('nonsense', '2026-08-17T10:00:00.000Z')).toBeUndefined();
+    // finishedAt before startedAt (clock skew) → undefined, not a negative time.
+    expect(
+      durationSecondsBetween('2026-08-17T10:00:05.000Z', '2026-08-17T10:00:00.000Z'),
+    ).toBeUndefined();
+  });
+});
 
 function makeResult(overrides: Partial<JUnitTestResult> & { testId: string }): JUnitTestResult {
   return {
@@ -140,9 +158,41 @@ describe('buildJUnitReport', () => {
       classname: 'proj_1',
       results: [makeResult({ testId: 'test_a', status: 'passed' })],
     });
-    expect(xml).toContain('<testcase classname="proj_1" name="test_a" time="0">');
+    // name falls back to the id (no name provided); testId is preserved as an attr.
+    expect(xml).toContain('name="test_a" testId="test_a" time="0">');
     expect(xml).not.toContain('<failure');
     expect(xml).toContain('tests="1" failures="0" errors="0"');
+  });
+
+  it('renders the human name, preserves the testId attr, and renders the duration', () => {
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({
+          testId: 'test_a',
+          runId: 'run_a',
+          status: 'passed',
+          name: 'Login flow works',
+          durationSeconds: 12.5,
+        }),
+      ],
+    });
+    // A CI test tab shows "Login flow works", not the UUID — the id stays as an attr.
+    expect(xml).toContain(
+      '<testcase classname="proj_1" name="Login flow works" testId="test_a" runId="run_a" time="12.5">',
+    );
+    // testsuite time is the sum of testcase durations (was always 0 before).
+    expect(xml).toContain('skipped="0" time="12.5">');
+  });
+
+  it('falls back to time="0" when the run carries no timing', () => {
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [makeResult({ testId: 'test_a', status: 'passed', name: 'Named' })],
+    });
+    expect(xml).toContain('name="Named" testId="test_a" time="0">');
   });
 
   it('maps failed status to failure elements', () => {

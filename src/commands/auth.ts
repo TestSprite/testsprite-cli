@@ -1,5 +1,6 @@
 import { Command } from 'commander';
 import {
+  assertValidApiKey,
   assertValidEndpointUrl,
   emitDryRunBanner,
   makeHttpClient,
@@ -14,6 +15,7 @@ import { HttpClient } from '../lib/http.js';
 import {
   defaultCredentialsPath,
   deleteProfile,
+  isCredentialsWritePermissionError,
   readProfile,
   writeProfile,
 } from '../lib/credentials.js';
@@ -23,6 +25,8 @@ import type { OutputMode } from '../lib/output.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import { promptSecret } from '../lib/prompt.js';
 import { ME_RESPONSE_SCHEMA } from '../lib/response-schemas.js';
+import type { CliOrgBinding, CliOrgSummary } from '../lib/org-render.js';
+import { formatOrgBinding, formatOrgsSummary, formatPersonalScopeHint } from '../lib/org-render.js';
 import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 
 export interface MeResponse {
@@ -44,6 +48,40 @@ export interface MeResponse {
    * so it is only rendered when present.
    */
   v3Enabled?: boolean;
+  /**
+   * Legacy per-user billing projections. Absent-safe; superseded by
+   * `activeOrg` when both are present. Declared so shared fixtures typed as
+   * `MeResponse` can carry them (the `usage` command has its own richer view).
+   */
+  credits?: number;
+  subPlan?: string;
+  creditsPerRun?: number;
+  /**
+   * The caller's organization (org-based billing subject). Absent-safe:
+   * rendered as a single `org:` line when present (V3-routed callers only).
+   */
+  activeOrg?: {
+    id: string;
+    name: string;
+    plan: string;
+    role: string;
+    remaining: number;
+    includedCredits: number;
+    seats: number;
+  };
+  /**
+   * Every organization the underlying user belongs to (account-wide
+   * membership list, personal org included). Independent of `org` below.
+   * Absent-safe: omitted on a server-side lookup failure or an older
+   * backend.
+   */
+  organizations?: CliOrgSummary[];
+  /**
+   * The calling key's own org binding. Present only when the request
+   * authenticated with a Postgres-backed membership key (`sk-member-…`);
+   * absent for a legacy envelope key, which has no binding to echo.
+   */
+  org?: CliOrgBinding;
 }
 
 export interface AuthDeps {
@@ -89,7 +127,15 @@ const DEFAULT_API_URL = 'https://api.testsprite.com';
 const FROM_ENV_MISSING_KEY =
   'TESTSPRITE_API_KEY is not set in the environment. Set it and re-run with --from-env, or omit --from-env to enter the key interactively.';
 
-export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}): Promise<void> {
+export interface ConfigureResult {
+  persisted: boolean;
+  source: 'env' | 'prompt' | 'profile' | 'dry-run';
+}
+
+export async function runConfigure(
+  opts: ConfigureOptions,
+  deps: AuthDeps = {},
+): Promise<ConfigureResult> {
   const env = deps.env ?? process.env;
   const credentialsPath = deps.credentialsPath ?? defaultCredentialsPath();
   const out = makeOutput(opts.output, deps);
@@ -117,7 +163,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
       const d = data as { profile: string; apiUrl: string };
       return `Profile "${d.profile}" configured (dry-run). Endpoint: ${d.apiUrl}`;
     });
-    return;
+    return { persisted: false, source: 'dry-run' };
   }
 
   let apiKey: string | undefined;
@@ -154,7 +200,7 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
         const d = data as { profile: string; apiUrl: string };
         return `Profile "${d.profile}" already configured. Endpoint: ${d.apiUrl}`;
       });
-      return;
+      return { persisted: true, source: 'profile' };
     }
 
     const promptApi = deps.prompt ?? { secret: (q: string) => promptSecret(q) };
@@ -175,6 +221,10 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
   ) {
     stderr(`[advisory] Inheriting api_url from existing profile: ${resolvedFromProfile}`);
   }
+
+  // Reject a malformed key up front — before any network — so `setup` fails
+  // fast with a VALIDATION_ERROR instead of a live ping or a raw Headers error.
+  assertValidApiKey(apiKey);
 
   // Verify the key is accepted before persisting. Build an HttpClient
   // directly (bypassing loadConfig) so we can test the candidate key+url
@@ -217,17 +267,29 @@ export async function runConfigure(opts: ConfigureOptions, deps: AuthDeps = {}):
     );
   }
 
-  writeProfile(opts.profile, { apiKey, apiUrl }, { path: credentialsPath });
+  let persisted = true;
+  try {
+    writeProfile(opts.profile, { apiKey, apiUrl }, { path: credentialsPath });
+  } catch (error) {
+    if (!opts.fromEnv || !isCredentialsWritePermissionError(error)) throw error;
+    persisted = false;
+    stderr(
+      `Using TESTSPRITE_API_KEY for this session; credentials could not be saved to ${credentialsPath} (${error.code}). Set TESTSPRITE_API_KEY in every shell that runs testsprite.`,
+    );
+  }
 
   out.print({ profile: opts.profile, apiUrl, status: 'configured' }, data => {
     const d = data as { profile: string; apiUrl: string };
-    return `Profile "${d.profile}" configured. Endpoint: ${d.apiUrl}`;
+    return persisted
+      ? `Profile "${d.profile}" configured. Endpoint: ${d.apiUrl}`
+      : `Profile "${d.profile}" configured for this session only (credentials not saved). Endpoint: ${d.apiUrl}`;
   });
 
   // Note: the old "run `testsprite agent install`" self-bootstrap tip was
   // removed with the setup consolidation. `runConfigure` now only runs as part
   // of `setup` (the sole credential-writing path), which installs the skill
   // itself (unless --no-agent) — so the tip would be redundant or misleading.
+  return { persisted, source: opts.fromEnv ? 'env' : 'prompt' };
 }
 
 export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promise<MeResponse> {
@@ -277,8 +339,26 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
       `endpoint: ${resolvedEndpoint}`,
       `env:    ${m.env}`,
       `scopes: ${m.scopes.join(', ')}`,
+      // Org context — confirms whose wallet a billable command will draw
+      // from, so it renders only for V3-routed callers (`v3Enabled` is the
+      // authoritative routing bit; field presence alone is not trusted).
+      ...(m.v3Enabled === true && m.activeOrg
+        ? [`org:    ${m.activeOrg.name} (${m.activeOrg.plan}, ${m.activeOrg.role})`]
+        : []),
       // Authoritative routing mode, rendered only when the backend supplies it.
       ...(m.v3Enabled !== undefined ? [`routing: ${routingLabel(m.v3Enabled)}`] : []),
+      // Org attribution — account-wide membership list, rendered only when
+      // the backend supplies a non-empty list.
+      ...(formatOrgsSummary(m.organizations)
+        ? [`orgs: ${formatOrgsSummary(m.organizations)}`]
+        : []),
+      // The calling key's own org binding — membership keys only.
+      ...(formatOrgBinding(m.org) ? [`org binding: ${formatOrgBinding(m.org)}`] : []),
+      // A personal-scoped key held by someone who is also in a team: say so
+      // here rather than letting the team's projects just not show up.
+      ...(formatPersonalScopeHint(m.organizations, m.org)
+        ? [`note: ${formatPersonalScopeHint(m.organizations, m.org)}`]
+        : []),
     ];
     // C2: warn in text mode when key cannot write/run
     const missingScopes = (['write:tests', 'run:tests'] as const).filter(

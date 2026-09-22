@@ -11,7 +11,7 @@
 
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -45,6 +45,15 @@ beforeAll(() => {
 // ---------------------------------------------------------------------------
 // Per-test tmp dir (cleaned after each test)
 // ---------------------------------------------------------------------------
+
+/**
+ * `pathFor` returns POSIX-separated paths, but the CLI prints native ones, so a
+ * substring match against its output fails on Windows. Use this whenever a
+ * `pathFor` result is compared against CLI output; it is a no-op on POSIX.
+ */
+function nativePath(p: string): string {
+  return p.split('/').join(sep);
+}
 
 let currentTmpDir: string | null = null;
 
@@ -435,8 +444,8 @@ describe('dry-run', () => {
 
     // Stderr shows both skill paths and "would write" banner
     expect(result.stderr).toContain('would write');
-    expect(result.stderr).toContain(pathFor('claude', 'testsprite-verify'));
-    expect(result.stderr).toContain(pathFor('claude', 'testsprite-onboard'));
+    expect(result.stderr).toContain(nativePath(pathFor('claude', 'testsprite-verify')));
+    expect(result.stderr).toContain(nativePath(pathFor('claude', 'testsprite-onboard')));
 
     // No files created on disk for either skill
     for (const skill of DEFAULT_SKILLS) {
@@ -779,13 +788,16 @@ describe('--skill flag', () => {
 // ---------------------------------------------------------------------------
 
 describe('agent list', () => {
-  it('output includes TARGET, SKILL column header and both default skill names', () => {
+  it('output includes AGENT, SKILL column header and both default skill names', () => {
     const result = runCli(['agent', 'list']);
     expect(result.status).toBe(0);
 
-    // Header must include TARGET and SKILL columns
-    expect(result.stdout).toContain('TARGET');
+    // Header must include AGENT and SKILL columns; STATUS/MODE were dropped from
+    // the text table in DEV-279 (still present in --output json).
+    expect(result.stdout).toContain('AGENT');
     expect(result.stdout).toContain('SKILL');
+    expect(result.stdout).not.toContain('STATUS');
+    expect(result.stdout).not.toContain('MODE');
 
     // Both default skills must appear in the output
     for (const skill of DEFAULT_SKILLS) {
@@ -835,6 +847,60 @@ describe('agent list', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 11b. agent status — a fresh install of every target must read clean (DEV-672)
+// ---------------------------------------------------------------------------
+
+describe('agent status after a full install', () => {
+  // The install→status round trip had no e2e coverage at all, which is how a
+  // permanent false `stale` on the compact-body targets shipped (DEV-672).
+  it('every target × skill reads ok and the command exits 0', () => {
+    const tmpDir = freshTmpDir();
+    const allTargets = Object.keys(TARGETS) as AgentTarget[];
+
+    const install = runCli(['agent', 'install', ...allTargets, '--dir', tmpDir]);
+    expect(install.status, `install failed: ${install.stderr}`).toBe(0);
+
+    const status = runCli(['agent', 'status', '--dir', tmpDir, '--output', 'json']);
+    const rows = JSON.parse(status.stdout) as Array<{
+      target: string;
+      skill: string;
+      state: string;
+      path: string;
+    }>;
+
+    const notOk = rows.filter(row => row.state !== 'ok');
+    expect(notOk, `rows not ok after a fresh install: ${JSON.stringify(notOk)}`).toEqual([]);
+    expect(rows.length).toBe(allTargets.length * DEFAULT_SKILLS.length);
+    // Exit 0 is the CI-gate contract; a non-ok row would have exited 1.
+    expect(status.status, `status stderr: ${status.stderr}`).toBe(0);
+  });
+
+  // `agent status`'s own error message sends the user to `agent install`, with
+  // `--force` for own-file targets. Under DEV-672 that advice was a dead end —
+  // install saw the file as already current and skipped it, status still said
+  // stale — so the loop is worth pinning, not just the plain round trip.
+  it('re-running install with --force leaves every row ok and exits 0', () => {
+    const tmpDir = freshTmpDir();
+    const allTargets = Object.keys(TARGETS) as AgentTarget[];
+
+    expect(runCli(['agent', 'install', ...allTargets, '--dir', tmpDir]).status).toBe(0);
+    const forced = runCli(['agent', 'install', ...allTargets, '--dir', tmpDir, '--force']);
+    expect(forced.status, `forced install failed: ${forced.stderr}`).toBe(0);
+
+    const status = runCli(['agent', 'status', '--dir', tmpDir, '--output', 'json']);
+    const rows = JSON.parse(status.stdout) as Array<{
+      target: string;
+      skill: string;
+      state: string;
+    }>;
+
+    const notOk = rows.filter(row => row.state !== 'ok');
+    expect(notOk, `rows not ok after install --force: ${JSON.stringify(notOk)}`).toEqual([]);
+    expect(status.status, `status stderr: ${status.stderr}`).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 12. Matrix-coverage guard — hardcoded list forces a conscious update when
 //     a target is added or removed from TARGETS.
 // ---------------------------------------------------------------------------
@@ -864,4 +930,80 @@ describe('matrix coverage guard', () => {
 // ---------------------------------------------------------------------------
 it.skip('bootstrap tip after auth configure — see auth.test.ts for tip coverage', () => {
   // No-op: piece-3 unit tests in src/commands/auth.test.ts cover the tip.
+});
+
+// ---------------------------------------------------------------------------
+// 13. Positional target argument
+//
+// Repro: `agent install <target>` (the exact one-liner form documented in
+// DOCUMENTATION.md / README for all 8 targets) previously installed the
+// claude skill regardless of the target named, because `install` declared
+// only `--target <t>` with no positional `.argument()` — Commander silently
+// dropped the excess positional and the non-TTY default-to-claude path won.
+// These tests drive the real built binary (not just the command wiring) to
+// pin the documented one-liner behavior for good.
+// ---------------------------------------------------------------------------
+describe('positional target argument', () => {
+  it('installs the named target, not the claude default (repro: agent install cursor)', () => {
+    const tmpDir = freshTmpDir();
+    const result = runCli(['agent', 'install', 'cursor', '--dir', tmpDir, '--output', 'json']);
+    expect(result.status).toBe(0);
+
+    expect(existsSync(join(tmpDir, pathFor('cursor', 'testsprite-verify')))).toBe(true);
+    expect(existsSync(join(tmpDir, pathFor('claude', 'testsprite-verify')))).toBe(false);
+  });
+
+  it('accepts every documented one-liner form (agent install <target>) for all 8 targets', () => {
+    for (const target of Object.keys(TARGETS) as AgentTarget[]) {
+      const tmpDir = freshTmpDir();
+      const result = runCli(['agent', 'install', target, '--dir', tmpDir, '--output', 'json']);
+      expect(result.status, `exit code for positional '${target}'`).toBe(0);
+      expect(
+        existsSync(join(tmpDir, pathFor(target, 'testsprite-verify'))),
+        `landing file for positional '${target}'`,
+      ).toBe(true);
+    }
+  });
+
+  it('accepts multiple positional targets in one invocation', () => {
+    const tmpDir = freshTmpDir();
+    const result = runCli([
+      'agent',
+      'install',
+      'cline',
+      'kiro',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
+    expect(result.status).toBe(0);
+    expect(existsSync(join(tmpDir, pathFor('cline', 'testsprite-verify')))).toBe(true);
+    expect(existsSync(join(tmpDir, pathFor('kiro', 'testsprite-verify')))).toBe(true);
+  });
+
+  it('merges a positional target with --target', () => {
+    const tmpDir = freshTmpDir();
+    const result = runCli([
+      'agent',
+      'install',
+      'antigravity',
+      '--target=windsurf',
+      '--dir',
+      tmpDir,
+      '--output',
+      'json',
+    ]);
+    expect(result.status).toBe(0);
+    expect(existsSync(join(tmpDir, pathFor('antigravity', 'testsprite-verify')))).toBe(true);
+    expect(existsSync(join(tmpDir, pathFor('windsurf', 'testsprite-verify')))).toBe(true);
+  });
+
+  it('rejects an unknown positional target with exit 5 instead of silently defaulting', () => {
+    const tmpDir = freshTmpDir();
+    const result = runCli(['agent', 'install', 'banana', '--dir', tmpDir]);
+    expect(result.status).toBe(5);
+    expect(result.stderr).toContain('unknown target "banana"');
+    expect(existsSync(join(tmpDir, pathFor('claude', 'testsprite-verify')))).toBe(false);
+  });
 });

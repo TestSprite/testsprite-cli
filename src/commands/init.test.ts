@@ -2,7 +2,16 @@
  * Unit tests for `testsprite init` — all deps injected, no disk or network.
  */
 
-import { mkdtempSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import type * as NodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import path from 'node:path';
@@ -14,7 +23,25 @@ import type { MeResponse } from './auth.js';
 import type { AgentFs } from './agent.js';
 import type { InitDeps } from './init.js';
 import { runInit } from './init.js';
-import { TARGETS, DEFAULT_SKILLS, pathFor, type AgentTarget } from '../lib/agent-targets.js';
+import {
+  TARGETS,
+  DEFAULT_SKILLS,
+  MANAGED_SECTION_BEGIN,
+  pathFor,
+  type AgentTarget,
+} from '../lib/agent-targets.js';
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof NodeFs>();
+  return {
+    ...actual,
+    mkdirSync: vi.fn(actual.mkdirSync),
+    readFileSync: vi.fn(actual.readFileSync),
+    renameSync: vi.fn(actual.renameSync),
+    unlinkSync: vi.fn(actual.unlinkSync),
+    writeFileSync: vi.fn(actual.writeFileSync),
+  };
+});
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -170,6 +197,305 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe('runInit — session-only environment credentials', () => {
+  const key = 'sk-user-session-secret';
+  const options = () => makeBaseOpts({ fromEnv: true, noAgent: true, output: 'json' });
+
+  async function injectWriteFailure(stage: 'mkdir' | 'lock' | 'write' | 'rename', code: string) {
+    const actual = await vi.importActual<typeof NodeFs>('node:fs');
+    const error = Object.assign(new Error(`injected ${stage} failure`), { code });
+    if (stage === 'mkdir') {
+      vi.mocked(mkdirSync).mockImplementation((...args) => {
+        if (args[0] === path.dirname(credentialsPath)) throw error;
+        return actual.mkdirSync(...args);
+      });
+    } else if (stage === 'rename') {
+      vi.mocked(renameSync).mockImplementation((...args) => {
+        if (args[1] === credentialsPath) throw error;
+        return actual.renameSync(...args);
+      });
+    } else {
+      const failedPath =
+        stage === 'lock' ? `${credentialsPath}.lock` : `${credentialsPath}.tmp.${process.pid}`;
+      vi.mocked(writeFileSync).mockImplementation((...args) => {
+        if (args[0] === failedPath) throw error;
+        return actual.writeFileSync(...args);
+      });
+    }
+    return error;
+  }
+
+  it.each([
+    ['lock', 'EPERM'],
+    ['mkdir', 'EACCES'],
+    ['write', 'EROFS'],
+    ['rename', 'EACCES'],
+    ['rename', 'EPERM'],
+  ] as const)(
+    'continues with a session-only JSON summary after %s fails with %s',
+    async (stage, code) => {
+      const { captured, deps } = makeCapture();
+      await injectWriteFailure(stage, code);
+
+      await expect(
+        runInit(options(), {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: key },
+          credentialsPath,
+          fetchImpl: makeOkFetch(),
+          isTTY: false,
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(captured.stdout).toHaveLength(1);
+      expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
+        credentials: { persisted: false, source: 'env' },
+        status: 'initialized',
+        email: ME.email,
+        agent: null,
+      });
+      expect(captured.stderr).toEqual([
+        `Using TESTSPRITE_API_KEY for this session; credentials could not be saved to ${credentialsPath} (${code}). Set TESTSPRITE_API_KEY in every shell that runs testsprite.`,
+      ]);
+      expect([...captured.stdout, ...captured.stderr].join('\n')).not.toContain(key);
+      expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own temp credentials path, never user input.
+      expect(existsSync(`${credentialsPath}.tmp.${process.pid}`)).toBe(false);
+    },
+  );
+
+  it.each(['EPERM', 'EACCES', 'EROFS'])(
+    'fails setup without a session-only claim when temp cleanup fails with %s',
+    async code => {
+      const { captured, deps } = makeCapture();
+      await injectWriteFailure('rename', 'EPERM');
+      const actual = await vi.importActual<typeof NodeFs>('node:fs');
+      const tmp = `${credentialsPath}.tmp.${process.pid}`;
+      const cleanupError = Object.assign(new Error('injected cleanup failure'), { code });
+      vi.mocked(unlinkSync).mockImplementation(file => {
+        if (file === tmp) throw cleanupError;
+        actual.unlinkSync(file);
+      });
+      try {
+        await expect(
+          runInit(options(), {
+            ...deps,
+            env: { TESTSPRITE_API_KEY: key },
+            credentialsPath,
+            fetchImpl: makeOkFetch(),
+            isTTY: false,
+          }),
+        ).rejects.toThrow(/temporary credentials.*clean/i);
+        expect(captured.stdout).toEqual([]);
+        expect(captured.stderr).toEqual([]);
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own temp path, never user input.
+        expect(existsSync(tmp)).toBe(true);
+      } finally {
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- cleanup of this test's own temp path.
+        if (existsSync(tmp)) actual.unlinkSync(tmp);
+      }
+    },
+  );
+
+  it('allows the session-only fallback if the temporary file is already removed', async () => {
+    const { captured, deps } = makeCapture();
+    await injectWriteFailure('rename', 'EPERM');
+    const actual = await vi.importActual<typeof NodeFs>('node:fs');
+    const tmp = `${credentialsPath}.tmp.${process.pid}`;
+    vi.mocked(unlinkSync).mockImplementation(file => {
+      actual.unlinkSync(file);
+      if (file === tmp) throw Object.assign(new Error('already removed'), { code: 'ENOENT' });
+    });
+    await runInit(options(), {
+      ...deps,
+      env: { TESTSPRITE_API_KEY: key },
+      credentialsPath,
+      fetchImpl: makeOkFetch(),
+      isTTY: false,
+    });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own temp path, never user input.
+    expect(existsSync(tmp)).toBe(false);
+    expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
+      credentials: { persisted: false, source: 'env' },
+      status: 'initialized',
+    });
+  });
+
+  it('reports persisted credentials after a writable environment-key setup', async () => {
+    const { captured, deps } = makeCapture();
+    await runInit(options(), {
+      ...deps,
+      env: { TESTSPRITE_API_KEY: key },
+      credentialsPath,
+      fetchImpl: makeOkFetch(),
+      isTTY: false,
+    });
+    expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
+      credentials: { persisted: true, source: 'env' },
+      status: 'initialized',
+    });
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe(key);
+    expect(captured.stderr).toEqual([]);
+  });
+
+  it.each(['env', 'flag', 'prompt'] as const)(
+    'keeps %s persistence failures fatal outside the fallback',
+    async source => {
+      const { captured, deps } = makeCapture();
+      const error = await injectWriteFailure('lock', source === 'env' ? 'ENOSPC' : 'EPERM');
+      await expect(
+        runInit(
+          makeBaseOpts({
+            fromEnv: source !== 'prompt',
+            apiKey: source === 'flag' ? 'sk-user-explicit-secret' : undefined,
+            noAgent: true,
+            output: source === 'prompt' ? 'text' : 'json',
+          }),
+          {
+            ...deps,
+            env: { TESTSPRITE_API_KEY: key },
+            credentialsPath,
+            fetchImpl: makeOkFetch(),
+            prompt: { secret: async () => 'sk-user-prompted-secret' },
+            isTTY: source === 'prompt',
+          },
+        ),
+      ).rejects.toBe(error);
+      expect(captured.stdout).toEqual([]);
+      expect(captured.stderr).toEqual([]);
+    },
+  );
+
+  it('continues skill installation in a writable target and explains session-only text output', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs, store } = makeMemFs();
+    await injectWriteFailure('lock', 'EPERM');
+    await expect(
+      runInit(makeBaseOpts({ fromEnv: true }), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: key },
+        credentialsPath,
+        fetchImpl: makeOkFetch(),
+        fs,
+        cwd: CWD,
+        isTTY: false,
+      }),
+    ).resolves.toBeUndefined();
+    expect(store.get(path.resolve(CWD, pathFor('claude', 'testsprite-verify')))).toContain(
+      'TestSprite',
+    );
+    expect(captured.stdout.join('\n')).toContain(
+      'credentials: session-only (TESTSPRITE_API_KEY; not saved)',
+    );
+    expect([...captured.stdout, ...captured.stderr].join('\n')).not.toContain(key);
+  });
+
+  it('keeps an unwritable skill target fatal without claiming credentials were saved', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs } = makeMemFs();
+    fs.mkdir = async () => {
+      throw Object.assign(new Error('skill target is read-only'), { code: 'EACCES' });
+    };
+    await injectWriteFailure('lock', 'EPERM');
+    await expect(
+      runInit(makeBaseOpts({ fromEnv: true, output: 'json' }), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: key },
+        credentialsPath,
+        fetchImpl: makeOkFetch(),
+        fs,
+        cwd: CWD,
+        isTTY: false,
+      }),
+    ).rejects.toThrow('skill target is read-only');
+    const stderr = captured.stderr.join('\n');
+    expect(stderr).toContain('credentials are session-only (TESTSPRITE_API_KEY; not saved)');
+    expect(stderr).toContain("re-run 'testsprite agent install --target claude'");
+    expect(stderr).not.toContain('credentials saved');
+    expect(captured.stdout).toEqual([]);
+    expect(stderr).not.toContain(key);
+  });
+
+  it('does not downgrade a rejected environment key when persistence would also fail', async () => {
+    const { captured, deps } = makeCapture();
+    await injectWriteFailure('lock', 'EPERM');
+    await expect(
+      runInit(options(), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: key },
+        credentialsPath,
+        fetchImpl: makeAuthFailFetch(),
+        isTTY: false,
+      }),
+    ).rejects.toMatchObject({ code: 'AUTH_INVALID', exitCode: 3 });
+    expect(captured.stderr.join('\n')).not.toContain('Using TESTSPRITE_API_KEY');
+    expect(captured.stdout).toEqual([]);
+  });
+
+  it('does not downgrade an invalid profile name', async () => {
+    const { captured, deps } = makeCapture();
+    await injectWriteFailure('lock', 'EPERM');
+    await expect(
+      runInit(
+        { ...options(), profile: 'invalid]profile' },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: key },
+          credentialsPath,
+          fetchImpl: makeOkFetch(),
+          isTTY: false,
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(captured.stderr).toEqual([]);
+    expect(captured.stdout).toEqual([]);
+  });
+
+  it('does not downgrade a profile read permission failure inside the credential write', async () => {
+    const actual = await vi.importActual<typeof NodeFs>('node:fs');
+    writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+    const error = Object.assign(new Error('profile cannot be read'), { code: 'EACCES' });
+    vi.mocked(readFileSync).mockImplementation((...args) => {
+      if (args[0] === credentialsPath && actual.existsSync(`${credentialsPath}.lock`)) throw error;
+      return actual.readFileSync(...args);
+    });
+    const { captured, deps } = makeCapture();
+    await expect(
+      runInit(options(), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: key },
+        credentialsPath,
+        fetchImpl: makeOkFetch(),
+        isTTY: false,
+      }),
+    ).rejects.toBe(error);
+    expect(captured.stderr).toEqual([]);
+    expect(captured.stdout).toEqual([]);
+  });
+
+  it('does not downgrade a stale-lock recovery permission failure', async () => {
+    const actual = await vi.importActual<typeof NodeFs>('node:fs');
+    actual.writeFileSync(`${credentialsPath}.lock`, JSON.stringify({ createdAt: 0 }));
+    const error = Object.assign(new Error('stale lock cannot be removed'), { code: 'EPERM' });
+    vi.mocked(unlinkSync).mockImplementation((...args) => {
+      if (args[0] === `${credentialsPath}.lock`) throw error;
+      return actual.unlinkSync(...args);
+    });
+    const { captured, deps } = makeCapture();
+    await expect(
+      runInit(options(), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: key },
+        credentialsPath,
+        fetchImpl: makeOkFetch(),
+        isTTY: false,
+      }),
+    ).rejects.toBe(error);
+    expect(captured.stderr).toEqual([]);
+    expect(captured.stdout).toEqual([]);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 1. Happy path — interactive (text + json output)
 // ---------------------------------------------------------------------------
@@ -179,7 +505,7 @@ describe('runInit — happy path (interactive)', () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs } = makeMemFs();
     const fetchMock = makeOkFetch();
-    const secretPrompt = vi.fn(async () => 'sk-test-key');
+    const secretPrompt = vi.fn(async () => 'sk-user-test-key');
 
     await runInit(makeBaseOpts(), {
       ...deps,
@@ -215,7 +541,7 @@ describe('runInit — happy path (interactive)', () => {
     const { fs: agentFs } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ output: 'json', apiKey: 'sk-json-test' }), {
+    await runInit(makeBaseOpts({ output: 'json', apiKey: 'sk-user-json-test' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -264,7 +590,7 @@ describe('runInit — happy path (interactive)', () => {
     }) as unknown as InitDeps['fetchImpl'];
 
     await runInit(
-      makeBaseOpts({ apiKey: 'sk-json-test', debug: true, noAgent: true, output: 'json' }),
+      makeBaseOpts({ apiKey: 'sk-user-json-test', debug: true, noAgent: true, output: 'json' }),
       {
         ...deps,
         fetchImpl: fetchMock,
@@ -290,7 +616,7 @@ describe('runInit — --yes --api-key (non-interactive)', () => {
     const fetchMock = makeOkFetch();
     const secretPrompt = vi.fn(async () => 'should-never-be-called');
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-test', yes: true }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test', yes: true }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -319,7 +645,7 @@ describe('runInit — --no-agent', () => {
     const { fs: agentFs, writeCalls } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-test', noAgent: true, output: 'json' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test', noAgent: true, output: 'json' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -341,7 +667,7 @@ describe('runInit — --no-agent', () => {
     const { fs: agentFs } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-test', noAgent: true }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test', noAgent: true }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -368,7 +694,7 @@ describe('runInit — --no-agent', () => {
     const { fs: agentFs } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-test' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -395,7 +721,7 @@ describe('runInit — default claude target installs 2 skill files', () => {
     const { fs: agentFs, writeCalls } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-test' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -415,6 +741,511 @@ describe('runInit — default claude target installs 2 skill files', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 3c. Caller detection: setup installs for the agents this repo shows
+// ---------------------------------------------------------------------------
+
+/** A fake repo for the detection step, keyed the way detection joins paths. */
+function detectRepo(
+  rels: string[],
+  env: NodeJS.ProcessEnv = {},
+  fileBody = '# Contributing\n',
+): NonNullable<InitDeps['detect']> {
+  const norm = (p: string) => p.replace(/\\/g, '/');
+  const files = new Set(rels.map(r => norm(path.join(CWD, r))));
+  const dirs = new Set<string>();
+  for (const f of files) {
+    const parts = f.split('/');
+    for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join('/'));
+  }
+
+  return {
+    env,
+    existsSync: p => files.has(norm(p)) || dirs.has(norm(p)),
+    isDirectory: p => dirs.has(norm(p)),
+    readdirSync: p => {
+      const base = norm(p);
+      const kids = new Set<string>();
+      for (const f of [...files, ...dirs]) {
+        if (!f.startsWith(`${base}/`)) continue;
+        kids.add(f.slice(base.length + 1).split('/')[0]!);
+      }
+      return [...kids];
+    },
+    readFileSync: () => fileBody,
+  };
+}
+
+/** Base opts with NO --agent — the shape a caller who never passed the flag produces. */
+function makeDetectOpts(overrides: Partial<Parameters<typeof runInit>[0]> = {}) {
+  const opts = makeBaseOpts({ apiKey: 'sk-user-test', ...overrides });
+  delete (opts as { agent?: unknown }).agent;
+  return opts;
+}
+
+describe('runInit — installs for the agents this project shows', () => {
+  it('installs for a detected agent instead of the fallback', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(['.cursor/rules/team-style.mdc']),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cursor', 'testsprite-verify')));
+    expect(writeCalls).not.toContain(path.resolve(CWD, pathFor('claude', 'testsprite-verify')));
+    expect(captured.stderr.join('\n')).toContain('detected cursor');
+  });
+
+  it('installs the codex managed section, not a claude skill, in a codex-only repo', async () => {
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls, store } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(['AGENTS.md']),
+    });
+
+    const agentsMd = path.resolve(CWD, TARGETS.codex.path);
+    expect(writeCalls).toContain(agentsMd);
+    expect(store.get(agentsMd)).toContain(MANAGED_SECTION_BEGIN);
+    // The claude fallback must not also fire once codex is the detected target.
+    expect(writeCalls.some(p => p.includes('.claude'))).toBe(false);
+  });
+
+  it('installs for every detected agent, not just the first', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts({ output: 'json' as const }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cline', 'testsprite-verify')));
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('kiro', 'testsprite-verify')));
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as {
+      agent: {
+        target: string;
+        targets: string[];
+        detectedBy: string;
+        detections: Array<{ target: string; source: string; signal: string }>;
+      };
+    };
+    expect(parsed.agent.targets.sort()).toEqual(['cline', 'kiro']);
+    // `detectedBy` says HOW the set was arrived at, not which signal won — the
+    // set is a union, so one word cannot attribute it.
+    expect(parsed.agent.detectedBy).toBe('detected');
+    // Per-target provenance is what a consumer needs to tell env from trace.
+    expect(parsed.agent.detections.map(d => `${d.target}:${d.source}`).sort()).toEqual([
+      'cline:trace',
+      'kiro:trace',
+    ]);
+  });
+
+  it('reports mixed provenance per target when env and traces both fire', async () => {
+    // The case a single `detectedBy` word misrepresented: the caller is named
+    // by the environment while the repo carries other agents' configs.
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+
+    await runInit(makeDetectOpts({ output: 'json' as const }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(['.clinerules/team-style.md'], { CLAUDECODE: '1' }),
+    });
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as {
+      agent: {
+        detectedBy: string;
+        detections: Array<{ target: string; source: string; signal: string }>;
+      };
+    };
+    expect(parsed.agent.detectedBy).toBe('detected');
+    expect(parsed.agent.detections.map(d => `${d.target}:${d.source}`).sort()).toEqual([
+      'claude:env',
+      'cline:trace',
+    ]);
+  });
+
+  it('on a terminal, confirms the detected set and installs only what was chosen', async () => {
+    // Detection is a union, so an ordinary multi-agent repo resolves to a set
+    // large enough to be worth seeing before it is written.
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+    const asked: string[] = [];
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async (q: string) => {
+        asked.push(q);
+        return 'cline';
+      },
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(asked[0]).toContain('cline,kiro');
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cline', 'testsprite-verify')));
+    expect(writeCalls.some(p => p.includes('.kiro'))).toBe(false);
+  });
+
+  it('accepts the detected set when the prompt is answered empty', async () => {
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => '',
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cline', 'testsprite-verify')));
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('kiro', 'testsprite-verify')));
+  });
+
+  it('accepts a target typed in the wrong case, as "none" already did', async () => {
+    // The prompt lower-cased `none` but not the target names, so `NONE` skipped
+    // while `Cline` was refused as unknown — an inconsistency the user has no
+    // way to predict from a pre-filled, all-lower-case suggestion.
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => 'Cline',
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cline', 'testsprite-verify')));
+    expect(writeCalls.some(p => p.includes('.kiro'))).toBe(false);
+  });
+
+  it('skips the install for an upper-case NONE', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => 'NONE',
+      detect: detectRepo(['.clinerules/team-style.md']),
+    });
+
+    expect(writeCalls).toEqual([]);
+    expect(captured.stdout.join('\n')).toContain('skipped');
+  });
+
+  it('treats a separators-only answer as the empty answer it is', async () => {
+    // ", ," parses to no names at all; installing for nothing there would
+    // report success over an empty set.
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => ', ,',
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cline', 'testsprite-verify')));
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('kiro', 'testsprite-verify')));
+  });
+
+  it('re-asks on an unrecognised target instead of failing after credentials are written', async () => {
+    // A typo at the prompt used to surface only inside runInstall — exit 5
+    // with the key already saved. The prompt validates before anything lands.
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+    const answers = ['clien', 'cline'];
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => answers.shift() ?? '',
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(answers).toHaveLength(0);
+    const stderr = captured.stderr.join('\n');
+    expect(stderr).toContain('unknown target "clien"');
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('cline', 'testsprite-verify')));
+    expect(writeCalls.some(p => p.includes('.kiro'))).toBe(false);
+  });
+
+  it('gives up after three unrecognised answers with exit 5, before any credential or skill write', async () => {
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+    const fetchImpl = vi.fn(makeOkFetch()!);
+    let asked = 0;
+
+    let thrown: unknown;
+    try {
+      await runInit(makeDetectOpts(), {
+        ...deps,
+        fetchImpl,
+        credentialsPath,
+        isTTY: true,
+        cwd: CWD,
+        fs: agentFs,
+        agentPrompt: async () => {
+          asked += 1;
+          return 'nope';
+        },
+        detect: detectRepo(['.clinerules/team-style.md']),
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(asked).toBe(3);
+    expect((thrown as CLIError).exitCode).toBe(5);
+    // The hint names the supported targets, not the unusable answer.
+    expect((thrown as CLIError).message).not.toContain('nope');
+    expect((thrown as CLIError).message).toContain('--no-agent');
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(writeCalls).toHaveLength(0);
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+  });
+
+  it('answering "none" skips the skill install the way --no-agent does', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => 'none',
+      detect: detectRepo(['.clinerules/team-style.md']),
+    });
+
+    expect(writeCalls).toHaveLength(0);
+    // Credentials still land — only the skill step was declined.
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBeTruthy();
+    const stderr = captured.stderr.join('\n');
+    expect(stderr).toContain('skipping the agent skill install');
+  });
+
+  it('announces the detected set before the prompt and the chosen set after it', async () => {
+    // Before the answer nothing is decided, so the pre-prompt line must not
+    // claim an install; the post-answer line carries the narrowed set.
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    let stderrAtPrompt = '';
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => {
+        stderrAtPrompt = captured.stderr.join('\n');
+        return 'cline';
+      },
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(stderrAtPrompt).toContain('[info] detected cline (.clinerules), kiro (.kiro)');
+    expect(stderrAtPrompt).not.toContain('installing skills for');
+    expect(captured.stderr.join('\n')).toContain('[info] installing skills for cline');
+  });
+
+  it('does not prompt under --yes, and installs the whole detected set', async () => {
+    // --yes means "stop asking me"; the union is still what gets installed.
+    const { deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+    let asked = 0;
+
+    await runInit(makeDetectOpts({ yes: true }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => {
+        asked += 1;
+        return 'cline';
+      },
+      detect: detectRepo(['.clinerules/team-style.md', '.kiro/steering/product.md']),
+    });
+
+    expect(asked).toBe(0);
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('kiro', 'testsprite-verify')));
+  });
+
+  it('refuses an unknown --agent up front, naming --agent, before credentials are written', async () => {
+    // Left to runInstall this read "Flag `--target` is invalid" — a flag setup
+    // does not have — after the key was saved, with a hint echoing "AGENT".
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+    const fetchImpl = vi.fn(makeOkFetch()!);
+
+    let thrown: unknown;
+    try {
+      const bogus = 'AGENT' as unknown as Parameters<typeof runInit>[0]['agent'];
+      await runInit(makeBaseOpts({ apiKey: 'sk-user-test', agent: bogus }), {
+        ...deps,
+        fetchImpl,
+        credentialsPath,
+        isTTY: false,
+        cwd: CWD,
+        fs: agentFs,
+        detect: detectRepo([]),
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect((thrown as CLIError).exitCode).toBe(5);
+    // localValidationError puts the detail in nextAction; message is always 'Invalid request.'
+    const nextAction = (thrown as ApiError).nextAction ?? '';
+    expect(nextAction).toContain('Flag `--agent` is invalid');
+    expect(nextAction).not.toContain('--target');
+    expect(nextAction).toContain('supported:');
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(writeCalls).toHaveLength(0);
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(captured.stderr.join('\n')).not.toContain('credentials saved');
+  });
+
+  it('does not prompt when --agent named the target', async () => {
+    // Already explicit — there is nothing to confirm.
+    const { deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    let asked = 0;
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test', agent: 'cursor' }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      agentPrompt: async () => {
+        asked += 1;
+        return 'cline';
+      },
+      detect: detectRepo(['.clinerules/team-style.md']),
+    });
+
+    expect(asked).toBe(0);
+  });
+
+  it('names the fallback on stderr when nothing is detected', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo([]),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('claude', 'testsprite-verify')));
+    const stderr = captured.stderr.join('\n');
+    expect(stderr).toContain('no coding agent detected');
+    expect(stderr).toContain('claude');
+    expect(stderr).toContain('--agent');
+  });
+
+  it('does not treat its own previously-installed skills as a detected agent', async () => {
+    // A second setup run in a repo we already wrote to must still say "nothing
+    // detected", or the first run's guess silently becomes the answer forever.
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+
+    await runInit(makeDetectOpts(), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(DEFAULT_SKILLS.map(s => pathFor('claude', s))),
+    });
+
+    expect(captured.stderr.join('\n')).toContain('no coding agent detected');
+  });
+
+  it('an explicit --agent wins over both the environment and the repo', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test', agent: 'kiro' as AgentTarget }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(['.cursor/rules/team-style.mdc'], { CLAUDECODE: '1' }),
+    });
+
+    expect(writeCalls).toContain(path.resolve(CWD, pathFor('kiro', 'testsprite-verify')));
+    expect(writeCalls).not.toContain(path.resolve(CWD, pathFor('cursor', 'testsprite-verify')));
+    expect(captured.stderr.join('\n')).not.toContain('detected');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 4. --agent cursor: passes target:'cursor' to runInstall
 // ---------------------------------------------------------------------------
 
@@ -424,7 +1255,7 @@ describe('runInit — --agent cursor', () => {
     const { fs: agentFs, writeCalls } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-test', agent: 'cursor' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-test', agent: 'cursor' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -448,6 +1279,110 @@ describe('runInit — --agent cursor', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 4b. Reload hint in the setup summary (DEV-279)
+// ---------------------------------------------------------------------------
+
+describe('runInit — reload hint', () => {
+  it('text mode: summary tells the user to reopen the agent after a real install', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-hint' }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    const stdout = captured.stdout.join('\n');
+    expect(stdout).toContain('Reopen (or restart) your coding agent');
+    expect(stdout).toContain('claude');
+  });
+
+  it('does NOT show the reload hint with --no-agent (nothing was installed)', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-hint', noAgent: true }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    expect(captured.stdout.join('\n')).not.toContain('Reopen (or restart)');
+  });
+
+  it('does NOT show the reload hint when re-running setup with skills already current', async () => {
+    const { fs: agentFs } = makeMemFs();
+
+    // First setup writes both skill files.
+    const { deps: firstDeps } = makeCapture();
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-hint' }), {
+      ...firstDeps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    // Second setup finds them byte-identical → aggregate action 'skipped'.
+    const { captured, deps } = makeCapture();
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-hint' }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    const stdout = captured.stdout.join('\n');
+    expect(stdout).toContain('(skipped)');
+    expect(stdout).not.toContain('Reopen (or restart)');
+  });
+
+  it('does NOT show the reload hint under --dry-run (nothing landed on disk)', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+
+    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-user-hint' }), {
+      ...deps,
+      fetchImpl: vi.fn(async () => new Response('{}')) as unknown as InitDeps['fetchImpl'],
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    expect(captured.stdout.join('\n')).not.toContain('Reopen (or restart)');
+  });
+
+  it('does NOT show the reload hint in --output json (stdout stays pure JSON)', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-hint', output: 'json' }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    const stdout = captured.stdout.join('\n');
+    expect(stdout).not.toContain('Reopen (or restart)');
+    expect(() => JSON.parse(stdout)).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 5. --dry-run: zero fetch calls, zero fs writes
 // ---------------------------------------------------------------------------
 
@@ -459,7 +1394,7 @@ describe('runInit — --dry-run', () => {
       async () => new Response('{}', { status: 200 }),
     ) as unknown as InitDeps['fetchImpl'];
 
-    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-dry' }), {
+    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-user-dry' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -479,7 +1414,7 @@ describe('runInit — --dry-run', () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs } = makeMemFs();
 
-    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-dry' }), {
+    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-user-dry' }), {
       ...deps,
       fetchImpl: vi.fn(async () => new Response('{}')) as unknown as InitDeps['fetchImpl'],
       credentialsPath,
@@ -497,7 +1432,7 @@ describe('runInit — --dry-run', () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs } = makeMemFs();
 
-    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-dry', output: 'json' }), {
+    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-user-dry', output: 'json' }), {
       ...deps,
       fetchImpl: vi.fn(async () => new Response('{}')) as unknown as InitDeps['fetchImpl'],
       credentialsPath,
@@ -520,14 +1455,17 @@ describe('runInit — --dry-run', () => {
     const { fs: agentFs, writeCalls } = makeMemFs();
     const fetchMock = vi.fn(async () => new Response('{}')) as unknown as InitDeps['fetchImpl'];
 
-    await runInit(makeBaseOpts({ dryRun: true, apiKey: 'sk-dry', noAgent: true, output: 'json' }), {
-      ...deps,
-      fetchImpl: fetchMock,
-      credentialsPath,
-      isTTY: false,
-      cwd: CWD,
-      fs: agentFs,
-    });
+    await runInit(
+      makeBaseOpts({ dryRun: true, apiKey: 'sk-user-dry', noAgent: true, output: 'json' }),
+      {
+        ...deps,
+        fetchImpl: fetchMock,
+        credentialsPath,
+        isTTY: false,
+        cwd: CWD,
+        fs: agentFs,
+      },
+    );
 
     expect(fetchMock).not.toHaveBeenCalled();
     expect(writeCalls).toHaveLength(0);
@@ -587,7 +1525,7 @@ describe('runInit — codex-review hardening', () => {
     const fetchImpl = makeOkFetch();
     // env has NO TESTSPRITE_API_KEY; if --from-env wrongly won, runConfigure would
     // read undefined and throw. Success proves --api-key took precedence.
-    await runInit(makeBaseOpts({ apiKey: 'sk-wins', fromEnv: true, noAgent: true }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-wins', fromEnv: true, noAgent: true }), {
       ...deps,
       env: {},
       fetchImpl,
@@ -611,7 +1549,7 @@ describe('runInit — codex-review hardening', () => {
         }),
         {
           ...deps,
-          env: { TESTSPRITE_API_KEY: 'sk' },
+          env: { TESTSPRITE_API_KEY: 'sk-user-min' },
           fetchImpl,
           credentialsPath,
           isTTY: false,
@@ -634,7 +1572,7 @@ describe('runInit — codex-review hardening', () => {
     // production/no-email banner even though configure wrote the correct key.
     const fetchImpl = vi.fn(async (_url: string, init: { headers?: Record<string, string> }) => {
       const key = init.headers?.['x-api-key'] ?? init.headers?.['X-API-Key'];
-      if (key === 'sk-real') {
+      if (key === 'sk-user-real') {
         return new Response(JSON.stringify(ME), {
           status: 200,
           headers: { 'content-type': 'application/json' },
@@ -648,9 +1586,9 @@ describe('runInit — codex-review hardening', () => {
       );
     }) as unknown as InitDeps['fetchImpl'];
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-real', noAgent: true, output: 'json' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-real', noAgent: true, output: 'json' }), {
       ...deps,
-      env: { TESTSPRITE_API_KEY: 'sk-stale-bogus' },
+      env: { TESTSPRITE_API_KEY: 'sk-user-stale-bogus' },
       fetchImpl,
       credentialsPath,
       isTTY: false,
@@ -668,7 +1606,7 @@ describe('runInit — codex-review hardening', () => {
 
   it('summary reports the endpoint from TESTSPRITE_API_URL, not a flat prod default', async () => {
     const { captured, deps } = makeCapture();
-    await runInit(makeBaseOpts({ apiKey: 'sk-env-url', noAgent: true, output: 'json' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-env-url', noAgent: true, output: 'json' }), {
       ...deps,
       env: { TESTSPRITE_API_URL: 'https://api.example.com:8443' },
       fetchImpl: makeOkFetch(),
@@ -709,7 +1647,7 @@ describe('runInit — bad API key', () => {
 
     let thrown: unknown;
     try {
-      await runInit(makeBaseOpts({ apiKey: 'sk-bad' }), {
+      await runInit(makeBaseOpts({ apiKey: 'sk-user-bad' }), {
         ...deps,
         fetchImpl: makeAuthFailFetch(),
         credentialsPath,
@@ -743,7 +1681,7 @@ describe('runInit — summary JSON shape', () => {
     const { fs: agentFs } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-shape', output: 'json' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-shape', output: 'json' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -766,7 +1704,7 @@ describe('runInit — summary JSON shape', () => {
     const { fs: agentFs } = makeMemFs();
     const fetchMock = makeOkFetch();
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-agent-shape', output: 'json' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-agent-shape', output: 'json' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -805,7 +1743,7 @@ describe('runInit — --from-env', () => {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
-      env: { TESTSPRITE_API_KEY: 'sk-from-env-key' },
+      env: { TESTSPRITE_API_KEY: 'sk-user-from-env-key' },
       prompt: { secret: secretPrompt },
       isTTY: false,
       cwd: CWD,
@@ -840,7 +1778,7 @@ describe('runInit — all agent targets', () => {
         'credentials',
       );
 
-      await runInit(makeBaseOpts({ apiKey: 'sk-target', agent: target }), {
+      await runInit(makeBaseOpts({ apiKey: 'sk-user-target', agent: target }), {
         ...deps,
         fetchImpl: fetchMock,
         credentialsPath: localCreds,
@@ -889,14 +1827,17 @@ describe('[B-E2E-05] runInit: --no-agent + --agent conflict emits [warn] on stde
     // Pass rawArgConflict signal: noAgent=true wins (--no-agent was last)
     // runInit exposes a rawArgConflict option that the command action passes
     // when it detects both --agent and --no-agent in rawArgs.
-    await runInit(makeBaseOpts({ apiKey: 'sk-conflict', noAgent: true, rawArgConflict: true }), {
-      ...deps,
-      fetchImpl: fetchMock,
-      credentialsPath: localCreds,
-      isTTY: false,
-      cwd: CWD,
-      fs: agentFs,
-    });
+    await runInit(
+      makeBaseOpts({ apiKey: 'sk-user-conflict', noAgent: true, rawArgConflict: true }),
+      {
+        ...deps,
+        fetchImpl: fetchMock,
+        credentialsPath: localCreds,
+        isTTY: false,
+        cwd: CWD,
+        fs: agentFs,
+      },
+    );
 
     const warnLine = captured.stderr.find(l => l.includes('[warn]') && l.includes('--no-agent'));
     expect(warnLine).toBeDefined();
@@ -911,7 +1852,7 @@ describe('[B-E2E-05] runInit: --no-agent + --agent conflict emits [warn] on stde
 
     await runInit(
       makeBaseOpts({
-        apiKey: 'sk-conflict2',
+        apiKey: 'sk-user-conflict2',
         agent: 'cursor',
         noAgent: false,
         rawArgConflict: true,
@@ -942,7 +1883,7 @@ describe('[B-E2E-05] runInit: --no-agent + --agent conflict emits [warn] on stde
 
     await runInit(
       // rawArgConflict not set (default undefined/false)
-      makeBaseOpts({ apiKey: 'sk-no-conflict', agent: 'claude' }),
+      makeBaseOpts({ apiKey: 'sk-user-no-conflict', agent: 'claude' }),
       {
         ...deps,
         fetchImpl: fetchMock,
@@ -990,7 +1931,7 @@ describe('[B-E2E-06] runInit: install failure → info message on stderr + re-th
 
     let caughtErr: unknown;
     try {
-      await runInit(makeBaseOpts({ apiKey: 'sk-install-fail', agent: 'claude' }), {
+      await runInit(makeBaseOpts({ apiKey: 'sk-user-install-fail', agent: 'claude' }), {
         ...deps,
         fetchImpl: fetchMock,
         credentialsPath: localCreds,
@@ -1031,7 +1972,7 @@ describe('runInit — telemetry attribution (X-CLI-Command)', () => {
       });
     }) as unknown as InitDeps['fetchImpl'];
 
-    await runInit(makeBaseOpts({ apiKey: 'sk-tag', noAgent: true, output: 'json' }), {
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-tag', noAgent: true, output: 'json' }), {
       ...deps,
       fetchImpl: fetchMock,
       credentialsPath,
@@ -1084,7 +2025,7 @@ describe('runInit -- skipIfConfigured', () => {
     const { fs: agentFs } = makeMemFs();
     // No pre-existing credentials -- skip has no effect.
     const fetchMock = makeOkFetch();
-    const prompt = { secret: vi.fn(async () => 'sk-fresh') };
+    const prompt = { secret: vi.fn(async () => 'sk-user-fresh') };
 
     await runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'text' }), {
       ...deps,
@@ -1097,7 +2038,7 @@ describe('runInit -- skipIfConfigured', () => {
 
     // With no saved key, the prompt should fire.
     expect(prompt.secret).toHaveBeenCalledTimes(1);
-    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-fresh');
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-fresh');
     expect(captured.stdout.join('')).toContain('initialized');
   });
 
@@ -1128,7 +2069,12 @@ describe('runInit -- skipIfConfigured', () => {
     const fetchMock = makeOkFetch();
 
     await runInit(
-      makeBaseOpts({ apiKey: 'sk-new', skipIfConfigured: true, noAgent: true, output: 'text' }),
+      makeBaseOpts({
+        apiKey: 'sk-user-new',
+        skipIfConfigured: true,
+        noAgent: true,
+        output: 'text',
+      }),
       {
         ...deps,
         credentialsPath,
@@ -1139,6 +2085,6 @@ describe('runInit -- skipIfConfigured', () => {
     );
 
     // Explicit --api-key must overwrite regardless of skipIfConfigured.
-    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-new');
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-new');
   });
 });

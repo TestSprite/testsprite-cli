@@ -243,7 +243,9 @@ export const latestResultRunningFixture = {
   targetUrl: FIXTURE_TARGET_URL,
   failedStepIndex: null,
   failureKind: null,
-  summary: { passed: 0, failed: 0, skipped: 0 },
+  verdict: null,
+  executionStatus: 'running' as const,
+  summary: 'Run is still in progress.',
 };
 
 export const latestResultPassedFixture = {
@@ -260,7 +262,9 @@ export const latestResultPassedFixture = {
   targetUrlSource: 'run' as const,
   failedStepIndex: null,
   failureKind: null,
-  summary: { passed: 8, failed: 0, skipped: 0 },
+  verdict: 'passed' as const,
+  executionStatus: 'completed' as const,
+  summary: 'Passed all 8 steps.',
 };
 
 export const latestResultFailedFixture = {
@@ -277,7 +281,9 @@ export const latestResultFailedFixture = {
   targetUrlSource: 'run' as const,
   failedStepIndex: 5,
   failureKind: 'assertion' as const,
-  summary: { passed: 4, failed: 1, skipped: 0 },
+  verdict: 'failed' as const,
+  executionStatus: 'completed' as const,
+  summary: 'Failed (assertion) on step 5: expected cart badge to show 1 item, but it was empty.',
 };
 
 export const failureContextFixture = {
@@ -351,7 +357,9 @@ export const failureContextNoAnalysisFixture = {
     targetUrl: 'https://staging.example.com/',
     failedStepIndex: 2,
     failureKind: 'unknown' as const,
-    summary: { passed: 1, failed: 1, skipped: 0 },
+    verdict: 'failed' as const,
+    executionStatus: 'completed' as const,
+    summary: 'Failed with no detailed analysis available.',
   },
   steps: [],
   code: {
