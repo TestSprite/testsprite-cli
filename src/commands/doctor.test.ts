@@ -281,6 +281,47 @@ describe('runDoctor — failing checks exit non-zero', () => {
     expect(out).toContain('Credentials');
   });
 
+  it('unreadable credentials file (EPERM) reports the repair path and fails', async () => {
+    const { capture, deps } = makeCapture();
+    const eperm = Object.assign(new Error('read EPERM: permission denied'), { code: 'EPERM' });
+    const rejection = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...healthyDeps(credentialsPath),
+        ...deps,
+        loadConfigFn: () => {
+          throw eperm;
+        },
+      },
+    ).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(CLIError);
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('Credentials');
+    expect(out).toContain('cannot be read (EPERM)');
+    expect(out).toContain('delete the file and re-run `testsprite setup`');
+  });
+
+  it('unreadable credentials file with TESTSPRITE_API_KEY set degrades to a warning', async () => {
+    const { capture, deps } = makeCapture();
+    const eperm = Object.assign(new Error('read EPERM: permission denied'), { code: 'EPERM' });
+    const report = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...healthyDeps(credentialsPath),
+        ...deps,
+        env: { TESTSPRITE_API_KEY: 'sk-env' },
+        loadConfigFn: () => {
+          throw eperm;
+        },
+      },
+    );
+    expect(report.failures).toBe(0);
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('[WARN]');
+    expect(out).toContain('cannot be read (EPERM)');
+    expect(out).toContain('TESTSPRITE_API_KEY is set');
+  });
+
   it('invalid endpoint URL fails the API endpoint check', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();

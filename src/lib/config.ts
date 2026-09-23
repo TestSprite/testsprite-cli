@@ -15,7 +15,7 @@ export interface LoadConfigOptions {
   credentialsPath?: string;
 }
 
-const DEFAULT_API_URL = 'https://api.testsprite.com';
+export const DEFAULT_API_URL = 'https://api.testsprite.com';
 
 /** Treat empty / whitespace-only env values as unset for `??` resolution chains. */
 export function normalizeEnvVar(value: string | undefined): string | undefined {

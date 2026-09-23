@@ -464,7 +464,9 @@ describe('ensureRestrictiveMode', () => {
   });
 
   it('warns on Windows when icacls /reset exits non-zero', () => {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmpRoot` is this suite's own mkdtempSync temp dir, never user input
     mkdirSync(tmpRoot, { recursive: true });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` is inside this suite's mkdtempSync temp dir, never user input
     writeFileSync(credentialsPath, 'data');
     const warnings: string[] = [];
     const spawn = vi.fn(() => ({ status: 1, signal: null, output: [], pid: 123 })) as never;
@@ -480,7 +482,9 @@ describe('ensureRestrictiveMode', () => {
   });
 
   it('warns on Windows when /reset succeeds but /grant:r fails with an error', () => {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmpRoot` is this suite's own mkdtempSync temp dir, never user input
     mkdirSync(tmpRoot, { recursive: true });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` is inside this suite's mkdtempSync temp dir, never user input
     writeFileSync(credentialsPath, 'data');
     const warnings: string[] = [];
     const spawn = vi
@@ -507,7 +511,9 @@ describe('ensureRestrictiveMode', () => {
   });
 
   it('warns on Windows when /reset succeeds but /grant:r exits non-zero', () => {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmpRoot` is this suite's own mkdtempSync temp dir, never user input
     mkdirSync(tmpRoot, { recursive: true });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` is inside this suite's mkdtempSync temp dir, never user input
     writeFileSync(credentialsPath, 'data');
     const warnings: string[] = [];
     const spawn = vi
@@ -523,6 +529,28 @@ describe('ensureRestrictiveMode', () => {
 
     expect(spawn).toHaveBeenCalledTimes(2);
     expect(warnings.join('\n')).toContain('icacls exited with status 5');
+  });
+
+  it('writes the ACL warning to stderr by default, without an injected warn sink', () => {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmpRoot` is this suite's own mkdtempSync temp dir, never user input
+    mkdirSync(tmpRoot, { recursive: true });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` is inside this suite's mkdtempSync temp dir, never user input
+    writeFileSync(credentialsPath, 'data');
+    const stderrWrites: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => {
+      stderrWrites.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+    try {
+      ensureRestrictiveMode(credentialsPath, {
+        platform: 'win32',
+        spawnSync: vi.fn(() => ({ status: 1, signal: null, output: [], pid: 123 })) as never,
+      });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(stderrWrites.join('')).toContain('[warning]');
+    expect(stderrWrites.join('')).toContain('icacls /reset exited with status 1');
   });
 
   // POSIX-only premise: Windows has no 0644/0600 distinction to downgrade.
