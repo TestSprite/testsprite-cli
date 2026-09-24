@@ -278,6 +278,11 @@ function ensureWindowsRestrictiveAcl(path: string, options: RestrictiveModeOptio
     return;
   }
 
+  // The trailing :F is load-bearing, not incidental: after /inheritance:r the
+  // file carries exactly this one ACE, and Full Control is what leaves
+  // WRITE_DAC with the owner — which is what makes a later `icacls /reset`
+  // possible at all. Tightening this to :R would leave the file unrepairable
+  // without taking ownership.
   const grantResult = run(
     'icacls',
     [path, '/inheritance:r', '/grant:r', '*S-1-3-4:F'],
