@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   formatBelowFloorNotice,
+  formatPinnedVersionWarning,
   noteServerVersion,
   resetBelowFloorNoticeState,
   shouldWarnBelowFloor,
+  shouldWarnPinnedInActions,
   type VersionNoticeDeps,
 } from './version-notice.js';
 
@@ -106,5 +108,72 @@ describe('noteServerVersion', () => {
     const stderr = vi.fn();
     noteServerVersion({ minVersion: '0.5.0' }, baseDeps({ stderr }));
     expect(stderr).not.toHaveBeenCalled();
+  });
+});
+
+describe('GitHub Actions pinned-version warning', () => {
+  const actions = { GITHUB_ACTIONS: 'true' };
+
+  it('shouldWarnPinnedInActions: only under GITHUB_ACTIONS=true and strictly below the floor', () => {
+    expect(shouldWarnPinnedInActions({ minVersion: '1.0.0' }, baseDeps({ env: actions }))).toBe(
+      true,
+    );
+    expect(shouldWarnPinnedInActions({ minVersion: '1.0.0' }, baseDeps({ env: {} }))).toBe(false);
+    expect(
+      shouldWarnPinnedInActions(
+        { minVersion: '1.0.0' },
+        baseDeps({ env: { GITHUB_ACTIONS: '1' } }),
+      ),
+    ).toBe(false);
+    expect(shouldWarnPinnedInActions({ minVersion: '0.9.0' }, baseDeps({ env: actions }))).toBe(
+      false,
+    );
+    expect(shouldWarnPinnedInActions({}, baseDeps({ env: actions }))).toBe(false);
+  });
+
+  it('ignores the TTY and JSON gates (a job is never a TTY; the command rides stderr)', () => {
+    expect(
+      shouldWarnPinnedInActions(
+        { minVersion: '1.0.0' },
+        baseDeps({ env: actions, isTTY: false, outputMode: 'json' }),
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps the opt-out env and the dry-run gate', () => {
+    expect(
+      shouldWarnPinnedInActions(
+        { minVersion: '1.0.0' },
+        baseDeps({ env: { ...actions, TESTSPRITE_NO_UPDATE_NOTIFIER: '1' } }),
+      ),
+    ).toBe(false);
+    expect(
+      shouldWarnPinnedInActions({ minVersion: '1.0.0' }, baseDeps({ env: actions, dryRun: true })),
+    ).toBe(false);
+  });
+
+  it('formatPinnedVersionWarning is a single ::warning workflow command naming both versions', () => {
+    const line = formatPinnedVersionWarning('0.9.0', '1.0.0');
+    expect(line).toBe(
+      '::warning title=TestSprite::testsprite-cli 0.9.0 is pinned in this workflow and is below the minimum supported version 1.0.0. Regenerate with testsprite ci init github --force.',
+    );
+    expect(line).not.toContain('\n');
+  });
+
+  it('noteServerVersion emits the ::warning form once under Actions, even non-TTY / json', () => {
+    const stderr = vi.fn();
+    const deps = baseDeps({ env: actions, isTTY: false, outputMode: 'json', stderr });
+    noteServerVersion({ minVersion: '1.0.0' }, deps);
+    noteServerVersion({ minVersion: '1.0.0' }, deps);
+    expect(stderr).toHaveBeenCalledTimes(1);
+    expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/^::warning title=TestSprite::/));
+    expect(stderr).not.toHaveBeenCalledWith(expect.stringContaining('Your testsprite-cli'));
+  });
+
+  it('off Actions the plain TTY advisory is unchanged', () => {
+    const stderr = vi.fn();
+    noteServerVersion({ minVersion: '1.0.0' }, baseDeps({ stderr }));
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('below the minimum supported'));
+    expect(stderr).not.toHaveBeenCalledWith(expect.stringMatching(/^::warning/));
   });
 });

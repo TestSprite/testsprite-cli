@@ -18,7 +18,19 @@ export default defineConfig({
       provider: 'v8',
       reporter: ['text', 'text-summary', 'json-summary', 'html'],
       include: ['src/**/*.ts'],
-      exclude: ['src/**/*.{test,spec}.ts', 'src/**/*.d.ts', 'src/index.ts'],
+      exclude: [
+        'src/**/*.{test,spec}.ts',
+        'src/**/*.d.ts',
+        'src/index.ts',
+        // Vendored upstream protocol code (src/vendor/tunnel-client/VENDOR.md).
+        // It carries its own test suite in the tunnel repo, and holding a byte
+        // copy to this repo's per-file bar would push us to write tests we
+        // then have to re-justify at every re-sync. The DELTA files beside it
+        // (ws-compat / lodash-lite) are covered here, because those are ours.
+        'src/vendor/tunnel-client/client.ts',
+        'src/vendor/tunnel-client/protocol.ts',
+        'src/vendor/tunnel-client/types.ts',
+      ],
       thresholds: {
         lines: 80,
         functions: 80,

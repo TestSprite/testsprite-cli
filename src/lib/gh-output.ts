@@ -1,15 +1,18 @@
+import { appendFileSync, writeFileSync } from 'node:fs';
+
 /**
  * CI-native output layer for the run path (issue #99, reshaped from
  * the withdrawn top-level `ci` command per the #264 review). Covers both a
  * single `test run <test-id> --wait` and the `test run --all --wait` batch.
  *
  * A `--wait` run presents its result in the formats CI consumes:
- *   (a) a stable machine summary `{total, passed, failed, timedOut, runs[]}`
- *       written to `--summary-file <path>` when requested,
+ *   (a) a stable machine summary `{total, passed, failed, skipped, timedOut,
+ *       runs[]}` written to `--summary-file <path>` when requested,
  *   (b) a Markdown results table appended to `$GITHUB_STEP_SUMMARY` when
  *       running under GitHub Actions,
- *   (c) one `::error::` workflow-command line per non-passed run so failures
- *       annotate the PR checks tab.
+ *   (c) one workflow-command line per non-passed run so it annotates the PR
+ *       checks tab — `::error::` for a dispatched run that failed or timed
+ *       out, `::warning::` for a test that never dispatched.
  * Activation: `GITHUB_ACTIONS=true` in the environment, or the explicit
  * `--gh-output` flag (which forces the annotations even off-Actions, so the
  * behavior is previewable locally). All writes are best-effort: a broken
@@ -18,9 +21,14 @@
 
 export interface CiRunRow {
   testId: string;
+  /** Human title for the Test column; falls back to `testId` when absent. */
+  title?: string;
   runId?: string;
   status: string;
+  /** Test-case page link — anchors the Test column title. */
   dashboardUrl?: string;
+  /** This run's execution-result page link — anchors the Run column. */
+  executionUrl?: string;
   error?: string;
 }
 
@@ -28,9 +36,31 @@ export interface CiSummary {
   total: number;
   passed: number;
   failed: number;
+  /**
+   * Requested tests that never dispatched (deferred / conflict / not_found /
+   * skipped / no_tests rows). Kept OUT of `failed`: `failed` claiming
+   * a test failed while the exit code says otherwise is the artifacts-disagree
+   * bug this field fixes. Non-dispatch still gates the exit where it should
+   * (deferred → 7, all-conflict → 6, all-not-found rerun → 4, zero-dispatch → 5).
+   */
+  skipped: number;
   timedOut: number;
   runs: CiRunRow[];
 }
+
+/**
+ * Row statuses that mean "this test never ran" as opposed to "this run did not
+ * pass". They count as `skipped` in the summary (not `failed`) and annotate as
+ * `::warning::` (not `::error::`) so every CI surface tells the same story as
+ * the exit code.
+ */
+const NON_DISPATCHED_STATUSES: ReadonlySet<string> = new Set([
+  'deferred',
+  'conflict',
+  'not_found',
+  'skipped',
+  'no_tests',
+]);
 
 /**
  * Reduce a non-dispatched bucket (`deferred` / `conflicts` / `notFound`) into
@@ -62,13 +92,18 @@ function bucketRows(bucket: unknown, status: string, note: string): CiRunRow[] {
  * after a timeout) reduces to an empty run list rather than a crash.
  *
  * Non-dispatched work (`deferred` / `conflicts` / `notFound`) is folded in as
- * non-passed rows: those buckets already force a non-zero exit (deferred /
- * timeout → 7, all-conflict → 6) but were previously absent from the summary,
- * so a partial batch like `1 accepted passed + 1 deferred` read as "1/1 passed"
- * with no annotation. (`skippedFrontend` / `skippedIntegration` are NOT folded
- * in — they exit 0 and are the Action layer's allow-partial concern.)
+ * non-passed rows so a partial batch like `1 accepted passed + 1 deferred`
+ * cannot read as "1/1 passed" with no annotation — but it counts as `skipped`,
+ * never `failed`: whether non-dispatch fails the job is the exit-code
+ * gates' call, and a `failed` count the gates disagree with is exactly the
+ * artifacts-contradict-the-exit bug. (`skippedFrontend` / `skippedIntegration`
+ * are NOT folded in — they exit 0 and are the Action layer's allow-partial
+ * concern.)
  */
-export function summarizeAcceptedPayload(capturedJson: string): CiSummary {
+export function summarizeAcceptedPayload(
+  capturedJson: string,
+  opts: { notFoundNote?: string } = {},
+): CiSummary {
   let parsed: unknown;
   try {
     parsed = JSON.parse(capturedJson);
@@ -96,9 +131,11 @@ export function summarizeAcceptedPayload(capturedJson: string): CiSummary {
               : undefined;
           return {
             testId: String(row.testId ?? ''),
+            ...(typeof row.testTitle === 'string' ? { title: row.testTitle } : {}),
             ...(typeof row.runId === 'string' ? { runId: row.runId } : {}),
             status: String(row.status ?? 'unknown'),
             ...(typeof row.dashboardUrl === 'string' ? { dashboardUrl: row.dashboardUrl } : {}),
+            ...(typeof row.executionUrl === 'string' ? { executionUrl: row.executionUrl } : {}),
             ...(typeof errorMessage === 'string' ? { error: errorMessage } : {}),
           };
         })
@@ -107,12 +144,21 @@ export function summarizeAcceptedPayload(capturedJson: string): CiSummary {
     ...acceptedRows,
     ...bucketRows(payload.deferred, 'deferred', 'rate-deferred (not dispatched)'),
     ...bucketRows(payload.conflicts, 'conflict', 'already in flight (not dispatched)'),
-    ...bucketRows(payload.notFound, 'not_found', 'no replayable run (not dispatched)'),
+    // Default note is `test rerun`'s cause (a not-found id has no replayable
+    // run). `testlist run` passes its own — a not-found `--case` id is one that
+    // is not a member of the list — so the annotation/artifact don't state the
+    // wrong reason on the surface this whole layer exists to serve.
+    ...bucketRows(
+      payload.notFound,
+      'not_found',
+      opts.notFoundNote ?? 'no replayable run (not dispatched)',
+    ),
   ];
   const passed = rows.filter(row => row.status === 'passed').length;
   const timedOut = rows.filter(row => row.status === 'timeout').length;
-  const failed = rows.length - passed - timedOut;
-  return { total: rows.length, passed, failed, timedOut, runs: rows };
+  const skipped = rows.filter(row => NON_DISPATCHED_STATUSES.has(row.status)).length;
+  const failed = rows.length - passed - timedOut - skipped;
+  return { total: rows.length, passed, failed, skipped, timedOut, runs: rows };
 }
 
 /**
@@ -124,22 +170,27 @@ export function summarizeAcceptedPayload(capturedJson: string): CiSummary {
  */
 export function summarizeSingleRun(run: {
   testId?: string;
+  testTitle?: string | null;
   runId?: string;
   status?: string;
   dashboardUrl?: string | null;
+  executionUrl?: string | null;
   error?: string | null;
 }): CiSummary {
   const row: CiRunRow = {
     testId: String(run.testId ?? ''),
+    ...(typeof run.testTitle === 'string' ? { title: run.testTitle } : {}),
     ...(typeof run.runId === 'string' ? { runId: run.runId } : {}),
     status: String(run.status ?? 'unknown'),
     ...(typeof run.dashboardUrl === 'string' ? { dashboardUrl: run.dashboardUrl } : {}),
+    ...(typeof run.executionUrl === 'string' ? { executionUrl: run.executionUrl } : {}),
     ...(typeof run.error === 'string' && run.error.length > 0 ? { error: run.error } : {}),
   };
   const passed = row.status === 'passed' ? 1 : 0;
   const timedOut = row.status === 'timeout' ? 1 : 0;
-  const failed = 1 - passed - timedOut;
-  return { total: 1, passed, failed, timedOut, runs: [row] };
+  const skipped = NON_DISPATCHED_STATUSES.has(row.status) ? 1 : 0;
+  const failed = 1 - passed - timedOut - skipped;
+  return { total: 1, passed, failed, skipped, timedOut, runs: [row] };
 }
 
 /**
@@ -147,9 +198,31 @@ export function summarizeSingleRun(run: {
  * layout and a CR/LF would inject extra Markdown lines (rows are newline-joined)
  * — the same injection class the annotation escaping guards against, on the
  * step-summary surface.
+ *
+ * Backslashes are escaped FIRST: GFM reads `\\` as a literal backslash, so a
+ * title's own trailing `\` would otherwise consume the `\` we insert before `|`
+ * (turning `\|` back into an unescaped column break). Doubling the value's own
+ * backslashes up front keeps every later insert a real escape.
  */
 function escapeTableCell(value: string): string {
-  return value.replace(/\|/g, '\\|').replace(/[\r\n]+/g, ' ');
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/\|/g, '\\|')
+    .replace(/[\r\n]+/g, ' ');
+}
+
+/**
+ * Escape a value used as the TEXT half of a Markdown `[text](url)` link inside a
+ * table cell. On top of the cell escaping (backslashes, `|`, CR/LF), an unescaped
+ * `]` closes the link early — so a bracketed title like `x](https://evil) y` would
+ * retarget the visible link at the injected URL. Titles are workspace-authored and
+ * often LLM-generated, so brackets are realistic; escape `[` and `]` (backslash).
+ * `escapeTableCell` has already doubled the value's own backslashes, so the escape
+ * we insert before a bracket can't be consumed by a preceding `\`. Plain (unlinked)
+ * cells keep `escapeTableCell`.
+ */
+function escapeMarkdownLinkText(value: string): string {
+  return escapeTableCell(value).replace(/([[\]])/g, '\\$1');
 }
 
 /**
@@ -170,15 +243,30 @@ export function renderJobSummaryMarkdown(summary: CiSummary): string {
   return [
     '## TestSprite results',
     '',
-    `**${summary.passed}/${summary.total} passed** (${summary.failed} failed, ${summary.timedOut} timed out)`,
+    `**${summary.passed}/${summary.total} passed** (${summary.failed} failed, ${summary.skipped} skipped, ${summary.timedOut} timed out)`,
     '',
     '| Test | Status | Run |',
     '| --- | --- | --- |',
     ...summary.runs.map(row => {
-      const run = row.dashboardUrl
-        ? `[dashboard](${escapeMarkdownUrl(row.dashboardUrl)})`
-        : escapeTableCell(row.runId ?? '');
-      return `| ${escapeTableCell(row.testId)} | ${escapeTableCell(row.status)} | ${run} |`;
+      // `|| ` not `?? `: an empty / whitespace-only title must fall back to the
+      // id (a blank Test cell is useless), matching JUnit's `name?.trim() || id`.
+      const label = row.title?.trim() || row.testId;
+      const runId = row.runId ?? '';
+      // Test cell links the human label to the TEST-CASE page (`dashboardUrl`);
+      // Run cell links to THIS RUN's result page (`executionUrl`). The two are
+      // distinct destinations — the run link is absent for a V2 run (no execution
+      // page), where the run cell degrades to the raw runId. The label sits in
+      // link-text position, so it uses the bracket-aware escaper.
+      const test = row.dashboardUrl
+        ? `[${escapeMarkdownLinkText(label)}](${escapeMarkdownUrl(row.dashboardUrl)})`
+        : escapeTableCell(label);
+      // Keep the run id as the link text (not a constant "result") so it stays
+      // scannable while being clickable.
+      const run =
+        row.executionUrl && runId
+          ? `[${escapeMarkdownLinkText(runId)}](${escapeMarkdownUrl(row.executionUrl)})`
+          : escapeTableCell(runId);
+      return `| ${test} | ${escapeTableCell(row.status)} | ${run} |`;
     }),
     '',
   ].join('\n');
@@ -207,8 +295,11 @@ function escapeCommandProperty(value: string): string {
 /**
  * Emit the GitHub-native surfaces. Self-gating on the standard env vars:
  * `$GITHUB_STEP_SUMMARY` (a file path Actions provides) receives the Markdown
- * table; `GITHUB_ACTIONS=true` enables one `::error::` workflow command per
- * non-passed run on stdout (Actions parses workflow commands from stdout).
+ * table; `GITHUB_ACTIONS=true` enables one workflow command per non-passed run
+ * on stdout (Actions parses workflow commands from stdout) — `::error::` for a
+ * dispatched run that failed or timed out, `::warning::` for a test that never
+ * ran (deferred / conflict / not_found / skipped), so a red annotation always
+ * means a red-worthy outcome and never contradicts the exit code.
  * `force` (the `--gh-output` flag) emits the annotations even off-Actions;
  * the step summary still requires the env-provided file path to exist.
  * Both writes are best-effort: a broken summary file must not mask the gate.
@@ -228,14 +319,15 @@ export function emitGithubOutputs(
      */
     annotations?: (line: string) => void;
   },
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean; label?: string } = {},
 ): void {
+  const label = opts.label ?? 'run';
   const summaryPath = env.GITHUB_STEP_SUMMARY;
   if (typeof summaryPath === 'string' && summaryPath.length > 0) {
     try {
       sinks.appendFile(summaryPath, renderJobSummaryMarkdown(summary));
     } catch {
-      sinks.stderr('[run] could not append to GITHUB_STEP_SUMMARY; continuing');
+      sinks.stderr(`[${label}] could not append to GITHUB_STEP_SUMMARY; continuing`);
     }
   }
   if (env.GITHUB_ACTIONS === 'true' || opts.force === true) {
@@ -243,12 +335,66 @@ export function emitGithubOutputs(
     for (const row of summary.runs) {
       if (row.status === 'passed') continue;
       const detail = row.error !== undefined ? ` ${row.error}` : '';
-      const link = row.dashboardUrl !== undefined ? ` ${row.dashboardUrl}` : '';
+      // Prefer this run's result page over the test-case page — on a failure the
+      // result is what the reviewer wants to open. Falls back to the test-case
+      // link (V2 runs, which have no execution page), then to nothing.
+      const linkUrl = row.executionUrl ?? row.dashboardUrl;
+      const link = linkUrl !== undefined ? ` ${linkUrl}` : '';
       // Escape both halves: a raw multiline run error (or a testId) must not be
       // able to smuggle a second workflow command into the Actions stream.
-      const title = `TestSprite ${escapeCommandProperty(row.testId)}`;
+      const title = `TestSprite ${escapeCommandProperty(row.title?.trim() || row.testId)}`;
       const message = escapeCommandData(`status=${row.status}${detail}${link}`);
-      annotate(`::error title=${title}::${message}`);
+      // Severity mirrors the summary counters: never-dispatched rows are
+      // warnings (they may not even gate the exit), real failures are errors.
+      const severity = NON_DISPATCHED_STATUSES.has(row.status) ? 'warning' : 'error';
+      annotate(`::${severity} title=${title}::${message}`);
     }
+  }
+}
+
+/**
+ * Emit the CI artifacts for a `--wait` run: the machine summary file (when
+ * `--summary-file` is set) and the GitHub-native annotations + job-summary table
+ * (when `--gh-output` or `GITHUB_ACTIONS=true`). One shared implementation for
+ * every `--wait` command — `test run` (single + `--all`), `test rerun`, and
+ * `testlist run` — so the four copies of this block can no longer drift (a
+ * per-copy fix like the `notFound` fold reaching only one of them is what this
+ * consolidates away). The caller reduces its own envelope to a `CiSummary` first
+ * (`summarizeAcceptedPayload` for a batch, `summarizeSingleRun` for one run);
+ * this owns only the two sinks and their best-effort writes. `label` names the
+ * command in the failure messages (`[run]` / `[rerun]` / `[testlist run]`).
+ * Both writes are best-effort — a sink throwing must never change the exit code.
+ */
+export function emitCiArtifacts(
+  summary: CiSummary,
+  opts: { ghOutput?: boolean; summaryFile?: string; output?: string },
+  io: { env: NodeJS.ProcessEnv; stdout: (line: string) => void; stderr: (line: string) => void },
+  label: string,
+): void {
+  const ghEnabled = opts.ghOutput === true || io.env.GITHUB_ACTIONS === 'true';
+  if (!ghEnabled && opts.summaryFile === undefined) return;
+  if (opts.summaryFile !== undefined) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `--summary-file` is an explicit operator-supplied CI-artifact output path; best-effort in try/catch.
+      writeFileSync(opts.summaryFile, `${JSON.stringify(summary, null, 2)}\n`, 'utf8');
+    } catch {
+      io.stderr(`[${label}] could not write --summary-file ${opts.summaryFile}; continuing`);
+    }
+  }
+  if (ghEnabled) {
+    emitGithubOutputs(
+      summary,
+      io.env,
+      {
+        stdout: io.stdout,
+        stderr: io.stderr,
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- `path` is the CI-provided `$GITHUB_STEP_SUMMARY` env path, never external input.
+        appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf8'),
+        // Under --output json the run envelope owns stdout; workflow commands go
+        // to stderr instead (the Actions runner parses both streams).
+        annotations: opts.output === 'json' ? io.stderr : io.stdout,
+      },
+      { force: opts.ghOutput === true, label },
+    );
   }
 }

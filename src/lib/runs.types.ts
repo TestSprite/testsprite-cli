@@ -5,12 +5,41 @@
 
  */
 
+import type { RunConflict } from './conflict-reason.js';
+
 /** Literal body sent to `POST /api/cli/v1/tests/{testId}/runs`. */
 export interface TriggerRunBody {
   /** Fixed source literal for CLI-triggered runs. */
   source: 'cli';
   /** Optional override for the project's configured target URL. */
   targetUrl?: string;
+  /**
+   * DEV-747: id of a tunnel client minted through `POST /api/cli/v1/tunnel`.
+   *
+   * An ID, never a proxy string — the caller does not choose the proxy host.
+   * The server loads the binding, checks it belongs to the calling principal
+   * and that the tunnel is connected, and only then builds the proxy string
+   * from its own configuration. Sent ONLY alongside a loopback `targetUrl`;
+   * the server refuses the pairing in every other combination rather than
+   * dropping the field.
+   */
+  tunnelClientId?: string;
+  /**
+   * DEV-1305: the NAME of the project environment whose credentials, auto-auth
+   * and OTP settings this run should use (`unique(project_id, name)` server
+   * side). Absent → the project's default environment, exactly as before.
+   * Composes with `targetUrl`/`tunnelClientId`: those pick WHERE the browser
+   * goes, this picks WHOSE credentials it logs in with.
+   */
+  environment?: string;
+}
+
+/** The environment a run resolved to — its credentials, its config, its address. */
+export interface RunEnvironmentRef {
+  /** `test_environment.id`; null when the row keeps only the denormalised name. */
+  id: string | null;
+  /** Environment name at seed time; null on an id-only row. */
+  name: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -28,6 +57,8 @@ export interface RerunRequest {
   autoHeal?: boolean;
   /** BE only: rerun only the named test without expanding the producer/teardown closure. */
   skipDependencies?: boolean;
+  /** See `TriggerRunBody.environment` — the named environment to replay against. */
+  environment?: string;
 }
 
 /** One closure member returned in `RerunResponse.closure.members[]`. */
@@ -87,6 +118,10 @@ export interface RerunResponse {
    * on every other response, including older backends that predate the field.
    */
   advisories?: RerunAdvisory[];
+  /** See `TriggerRunResponse.dashboardUrl` — same present-or-absent contract. */
+  dashboardUrl?: string;
+  /** See `TriggerRunResponse.executionUrl` — same present-or-absent contract. */
+  executionUrl?: string;
 }
 
 /**
@@ -98,6 +133,8 @@ export interface BatchRerunRequest {
   testIds: string[];
   autoHeal?: boolean;
   skipDependencies?: boolean;
+  /** See `TriggerRunBody.environment` — applied to every test in the batch. */
+  environment?: string;
 }
 
 /** One accepted run in the batch rerun response. */
@@ -168,6 +205,23 @@ export interface TriggerRunResponse {
   codeVersion: string;
   /** Resolved target URL (project default when --target-url absent). */
   targetUrl: string;
+  /**
+   * The environment this run resolved to. Absent on an older backend; `null`
+   * when the server resolved no environment row.
+   */
+  environment?: RunEnvironmentRef | null;
+  /**
+   * Portal deep link for the run's test, built by the server for the store
+   * that dispatched it. Present-or-absent (never null): an older backend, a
+   * V3 run while the server's org-link flag is off, or one with no resolvable
+   * workspace all OMIT it, and the CLI prints nothing rather than guessing.
+   */
+  dashboardUrl?: string;
+  /**
+   * Portal deep link to THIS run's result page — V3-served runs only (a V2
+   * run has no execution page). Same present-or-absent contract.
+   */
+  executionUrl?: string;
 }
 
 /**
@@ -213,6 +267,11 @@ export interface RunStepDto {
 export interface RunResponse {
   runId: string;
   testId: string;
+  /**
+   * The test's human title, for CI output. `null`/absent on older servers or
+   * when it can't be resolved — consumers fall back to `testId`.
+   */
+  testTitle?: string | null;
   projectId: string;
   userId: string;
   status: RunStatus;
@@ -233,6 +292,11 @@ export interface RunResponse {
    * (`RunEnvelope.targetUrl` is `[string, 'null']`).
    */
   targetUrl: string | null;
+  /**
+   * The environment this run resolved to. Absent on an older backend (or a
+   * V2-served run); `null` when the row names no environment.
+   */
+  environment?: RunEnvironmentRef | null;
   createdFrom: string | null;
   failedStepIndex: number | null;
   failureKind: string | null;
@@ -259,6 +323,14 @@ export interface RunResponse {
    */
   dashboardUrl?: string | null;
   /**
+   * Portal deep link to THIS RUN's result page (`…/projects/{pid}/execution/{eid}`),
+   * the run-scoped companion to `dashboardUrl` (which opens the test case). Same
+   * server-built / omit-not-null contract as `dashboardUrl`: **V3-served runs
+   * only** — a V2 run has no execution page, so the field is absent there and the
+   * CLI keeps `dashboardUrl` (the test-case link) for the run cell.
+   */
+  executionUrl?: string | null;
+  /**
    * Full ordered step list. Only present when the request includes
    * `?includeSteps=true`. Absent (undefined) when the flag was not sent.
    * Null means the server returned the field explicitly as null (treated
@@ -274,6 +346,13 @@ export interface RunResponse {
 // DEV-331 piece 3 — cancel wire types
 // ---------------------------------------------------------------------------
 
+/** Credit outcome returned when cancellation applies V3 frontend billing rules. */
+export interface CancelRunRefund {
+  status: 'refunded' | 'not_charged' | 'failed';
+  /** Original charged amount returned to the workspace. Present when refunded. */
+  amount?: number;
+}
+
 /**
  * Response from `POST /api/cli/v1/runs/{runId}/cancel`.
  * Same shape as `GET /runs/{runId}` (`status: "cancelled"`, verdict
@@ -282,6 +361,11 @@ export interface RunResponse {
  */
 export interface CancelRunResponse extends RunResponse {
   alreadyCancelled: boolean;
+  /**
+   * Present only when the server evaluated a V3 frontend run refund. Older
+   * backends, V2 runs, and backend-test runs omit it.
+   */
+  refund?: CancelRunRefund;
 }
 
 /** Terminal states from the RunStatus union. */
@@ -348,11 +432,15 @@ export interface RunHistoryItem {
   targetUrl?: string | null;
   /**
    * G1b — provenance of `targetUrl`.
-   * - `'run'`: stamped at run-trigger time (authoritative).
+   * - `'run'`: stamped at run-trigger time (authoritative; V2).
    * - `'unresolved'`: backend could not resolve a URL for this run.
-   * - `null` / absent: pre-G1b backend; treat as unknown.
+   * - `null`: a V3 run — the environment in `environment` IS the target and
+   *   `targetUrl` is its address, so there is no separate provenance.
+   * - absent: pre-G1b backend; treat as unknown.
    */
   targetUrlSource?: 'run' | 'unresolved' | null;
+  /** The environment this run resolved to. Absent on older backends. */
+  environment?: RunEnvironmentRef | null;
 }
 
 /**
@@ -396,6 +484,8 @@ export interface ListRunsQuery {
   source?: RunSource;
   /** ISO timestamp (after client-side duration parsing). */
   since?: string;
+  /** DEV-1306: only runs whose credentials came from this environment (by name). */
+  environment?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -411,6 +501,8 @@ export interface BatchRunFreshRequest {
   projectId: string;
   testIds?: string[];
   source: 'cli';
+  /** See `TriggerRunBody.environment` — applied to every test in the batch. */
+  environment?: string;
 }
 
 /** One accepted run in the batch fresh-run response. */
@@ -444,8 +536,24 @@ export interface BatchRunFreshAccepted {
  */
 export interface BatchRunFreshResponse {
   accepted: BatchRunFreshAccepted[];
-  conflicts: Array<{ testId: string }>;
+  /**
+   * A run-slot conflict. `currentRunId`, when present, is the id of the run
+   * ALREADY in flight for this test — under `--wait` the CLI polls it to a
+   * verdict (auto-resume) instead of failing the batch. Absent ⇒ a hard
+   * conflict with no resolvable in-flight run (still fails the batch).
+   */
+  conflicts: RunConflict[];
   deferred: Array<{ testId: string }>;
   skippedFrontend: string[];
   skippedIntegration: Array<{ testId: string }>;
+  /**
+   * Project-level portal link the batch closes with ("watch it here"). Same
+   * absent-vs-present contract as the per-run `dashboardUrl`: ABSENT ⇒ an older
+   * backend (or the V2 engine, whose live page is the CLI's own
+   * `/dashboard/tests/{projectId}` template) — compute the legacy link
+   * client-side; a string ⇒ print it verbatim; `null` ⇒ the server knows no
+   * correct page exists (several sibling projects, no owning org) — print
+   * nothing rather than a dead link.
+   */
+  dashboardUrl?: string | null;
 }

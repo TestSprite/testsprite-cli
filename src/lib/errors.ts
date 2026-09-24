@@ -108,14 +108,58 @@ export function exitCodeFor(code: ErrorCode): number {
   }
 }
 
+/**
+ * Whether an error code is an authentication failure. DERIVED from the single
+ * `exitCodeFor` mapping (auth === exit 3) rather than a second hand-maintained
+ * list of code strings: a future `AUTH_*` code gets classified as auth the
+ * moment it is given an exit-3 row, so it can never be present in one place and
+ * missing in the other. The `ERROR_CODES` membership check keeps `exitCodeFor`
+ * off unknown/out-of-contract strings (its switch has no default).
+ */
+export function isAuthCode(code: string): boolean {
+  return (ERROR_CODES as readonly string[]).includes(code) && exitCodeFor(code as ErrorCode) === 3;
+}
+
 export class CLIError extends Error {
   readonly exitCode: number;
+  /**
+   * Stable machine error code — mirrored into telemetry's `errorCode` field
+   * and into the `--output json` error envelope (`{error:{code,...}}`).
+   * Defaults to the generic, deliberately out-of-catalog `'CLI_ERROR'`
+   * bucket for a plain `CLIError` (same convention as `InterruptError`'s
+   * `'INTERRUPTED'` and `RequestTimeoutError`'s `'REQUEST_TIMEOUT'` below —
+   * none of these are backend-issued codes, so they don't belong in
+   * `ERROR_CODES`). `ApiError` overrides this with the real catalog
+   * `ErrorCode` parsed from the server envelope.
+   *
+   * Before this field existed, `classifyCliError()`'s plain-`CLIError`
+   * fallback branch had nothing to report and telemetry events landed with
+   * `errorCode=None` — the same silent gap the final uncaught-exception
+   * branch had.
+   */
+  readonly code: string;
 
-  constructor(message: string, exitCode = 1) {
+  constructor(message: string, exitCode = 1, code = 'CLI_ERROR') {
     super(message);
     this.name = 'CLIError';
     this.exitCode = exitCode;
+    this.code = code;
   }
+}
+
+/**
+ * Best-effort extraction of a `.code` string off an arbitrary thrown value —
+ * covers Node built-in errors (`ENOENT`, `ECONNREFUSED`, …) that reach the
+ * top-level catch without ever being wrapped in a `CLIError`. Used by the
+ * genuinely-uncaught-exception fallback in both `classifyCliError()` and
+ * `index.ts`'s final catch branch, so a filesystem/network error reports its
+ * real code instead of falling into the generic `'UNCAUGHT_EXCEPTION'`
+ * bucket.
+ */
+export function extractNodeErrorCode(err: unknown): string | undefined {
+  if (typeof err !== 'object' || err === null || !('code' in err)) return undefined;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === 'string' && code.length > 0 ? code : undefined;
 }
 
 /**
@@ -147,7 +191,7 @@ export class InterruptError extends CLIError {
   readonly signal: TerminationSignal;
 
   constructor(signal: TerminationSignal) {
-    super(`Interrupted by ${signal}.`, TERMINATION_EXIT_CODES[signal]);
+    super(`Interrupted by ${signal}.`, TERMINATION_EXIT_CODES[signal], 'INTERRUPTED');
     this.name = 'InterruptError';
     this.signal = signal;
   }
@@ -155,7 +199,7 @@ export class InterruptError extends CLIError {
 
 export class NotImplementedError extends CLIError {
   constructor(commandPath: string) {
-    super(`Command not yet implemented: ${commandPath}`, 2);
+    super(`Command not yet implemented: ${commandPath}`, 2, 'NOT_IMPLEMENTED');
     this.name = 'NotImplementedError';
   }
 }
@@ -180,7 +224,16 @@ export interface ErrorEnvelope {
  * wording across paths).
  */
 export class ApiError extends CLIError {
-  readonly code: ErrorCode;
+  // `override`: CLIError now declares its own `code: string` (defaulting
+  // 'CLI_ERROR'), so `noImplicitOverride` requires this modifier on the
+  // narrowed redeclaration. Under useDefineForClassFields (the default at
+  // this tsconfig's ES2022 target) this field IS re-initialized to
+  // `undefined` right after `super(...)` returns — but the constructor body
+  // below unconditionally reassigns `this.code = envelope.code` afterward,
+  // so the final value is always the envelope's code, never the CLIError
+  // base default. See the pinned regression test in errors.test.ts
+  // ("ApiError.code overrides the CLIError base default").
+  override readonly code: ErrorCode;
   readonly requestId: string;
   readonly nextAction: string;
   readonly details: Record<string, unknown>;
@@ -343,6 +396,7 @@ export class RequestTimeoutError extends CLIError {
       `Request timed out after ${timeoutSec}s (client-side). ` +
         `Use --request-timeout <seconds> or TESTSPRITE_REQUEST_TIMEOUT_MS to extend the deadline.`,
       7,
+      'REQUEST_TIMEOUT',
     );
     this.name = 'RequestTimeoutError';
     this.requestId = requestId;
@@ -413,6 +467,32 @@ function isInsufficientCredits(
   const hasRequiredField = typeof details.required === 'number' && details.required > 0;
   const hasCreditsMessage = /insufficient credits/i.test(message);
   return hasRequiredField || hasCreditsMessage;
+}
+
+/**
+ * The synthesized `nextAction` for an INSUFFICIENT_CREDITS refusal when the
+ * backend supplied none (older backends; the CLI's own all-credits batch
+ * refusal). Portal links resolve per environment from the API endpoint (dev and
+ * prod portals live on different domains); an unknown host gets the route only —
+ * a hardcoded domain would point at the wrong environment.
+ *
+ * V3 API keys are membership-bound: a key minted for a team org spends THAT
+ * org's wallet, not the holder's personal one, and there is no request-scoped
+ * signal at this layer to tell which kind of key just failed. So the hint
+ * deliberately does NOT assert "top up your (personal) credits" as the only
+ * path — it offers the personal-key link (still correct for the common case)
+ * alongside an honest org-bound alternative, rather than guessing. The
+ * `testsprite usage` pointer is the CLI-native way to check the balance before
+ * a large run fan-out.
+ */
+export function insufficientCreditsNextAction(apiUrl?: string): string {
+  const portalBase = apiUrl === undefined ? undefined : resolvePortalBase(apiUrl);
+  return (
+    (portalBase !== undefined
+      ? `Top up credits at ${portalBase}/dashboard/settings/billing (personal keys) — ask an org admin if this key is organization-bound — or upgrade your plan at ${portalBase}/pricing.`
+      : 'Top up credits on the portal Billing page (/dashboard/settings/billing) if this is a personal key — ask an org admin if it is organization-bound — or upgrade your plan (/pricing).') +
+    ' Run `testsprite usage` to check your current balance before the next run.'
+  );
 }
 
 /**
@@ -500,18 +580,10 @@ function parseEnvelopeBody(raw: unknown, httpStatus?: number, apiUrl?: string): 
     // (personal) credits" as the only path — it offers the personal-key
     // link (still correct for the common case) alongside an honest
     // org-bound alternative, rather than guessing.
-    const portalBase = apiUrl === undefined ? undefined : resolvePortalBase(apiUrl);
-    const billingNextAction =
-      nextAction !== ''
-        ? nextAction
-        : (portalBase !== undefined
-            ? `Top up credits at ${portalBase}/dashboard/settings/billing (personal keys) — ask an org admin if this key is organization-bound — or upgrade your plan at ${portalBase}/pricing.`
-            : 'Top up credits on the portal Billing page (/dashboard/settings/billing) if this is a personal key — ask an org admin if it is organization-bound — or upgrade your plan (/pricing).') +
-          ' Run `testsprite usage` to check your current balance before the next run.';
     return {
       code: 'INSUFFICIENT_CREDITS',
       message,
-      nextAction: billingNextAction,
+      nextAction: nextAction !== '' ? nextAction : insufficientCreditsNextAction(apiUrl),
       requestId,
       details,
     };

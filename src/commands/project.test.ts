@@ -17,6 +17,7 @@ import {
   runGet,
   runList,
   runUpdate,
+  parseTestIdAttributesFlag,
 } from './project.js';
 
 const PROJECT_FIXTURE: CliProject = {
@@ -77,10 +78,20 @@ describe('createProjectCommand', () => {
     errorSpy.mockRestore();
   });
 
-  it('exposes list, get, create, update, delete, credential and auto-auth subcommands', () => {
+  it('exposes list, get, create, update, delete, credential, auto-auth, docs and env subcommands', () => {
     const project = createProjectCommand();
     const names = project.commands.map(c => c.name()).sort();
-    expect(names).toEqual(['auto-auth', 'create', 'credential', 'delete', 'get', 'list', 'update']);
+    expect(names).toEqual([
+      'auto-auth',
+      'create',
+      'credential',
+      'delete',
+      'docs',
+      'env',
+      'get',
+      'list',
+      'update',
+    ]);
   });
 
   it('list exposes the pagination flags from the design contract', () => {
@@ -753,6 +764,70 @@ describe('runGet', () => {
 // ---------------------------------------------------------------------------
 
 describe('runCreate', () => {
+  // A loopback --url on CREATE is refused outright: the opt-in for an app on
+  // this machine is `--local <port>` (see project.local.spec.ts), which builds
+  // the loopback URL itself and marks the project `originMode: 'local'`.
+  // `--url http://localhost:…` therefore has no accepted form here — the
+  // refusal points at `--local`. RFC1918 and friends stay rejected either way.
+  it.each(['http://localhost:3123', 'http://127.0.0.1:5173', 'http://[::1]:5173'])(
+    'refuses %s as --url and points at --local <port>',
+    async targetUrl => {
+      await expect(
+        runCreate(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            dryRun: true,
+            type: 'frontend',
+            name: 'Local App',
+            targetUrl,
+          },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        nextAction: expect.stringContaining('Use --local <port> instead of --url'),
+      });
+    },
+  );
+
+  it('names --url and project create help when rejecting a private-network project URL', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network — validation must fire client-side');
+    });
+
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: true,
+          type: 'frontend',
+          name: 'Local App',
+          targetUrl: 'http://10.0.0.5:3123',
+        },
+        {
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      nextAction: expect.stringContaining('See `testsprite project create --help`'),
+      details: {
+        field: 'url',
+        reason: expect.any(String),
+        hint: expect.any(String),
+      },
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('P6 FE happy — POSTs /projects with type=frontend + name + idempotency header', async () => {
     const { credentialsPath } = makeCreds();
     const sentBodies: unknown[] = [];
@@ -1299,6 +1374,107 @@ describe('runUpdate', () => {
     expect(stderrLines.some(l => l.includes('idem-upd-001'))).toBe(false);
   });
 
+  it('sends testIdAttributes as an ordered list; --clear sends null', async () => {
+    const { credentialsPath } = makeCreds();
+    const sentBodies: unknown[] = [];
+    const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      if (init.body) sentBodies.push(JSON.parse(init.body as string) as unknown);
+      return new Response(
+        JSON.stringify({ projectId: 'proj_abc', updatedFields: ['testIdAttributes'] }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        },
+      );
+    }) as typeof fetch;
+    const deps = { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} };
+    const base = {
+      profile: 'default',
+      output: 'json' as const,
+      debug: false,
+      projectId: 'proj_abc',
+    };
+
+    await runUpdate({ ...base, testIdAttributes: ['data-element', 'data-testid'] }, deps);
+    expect(sentBodies[0]).toEqual({ testIdAttributes: ['data-element', 'data-testid'] });
+
+    await runUpdate({ ...base, clearTestIdAttributes: true }, deps);
+    expect(sentBodies[1]).toEqual({ testIdAttributes: null });
+  });
+
+  it("translates an older backend's generic 400 into UNSUPPORTED when testIdAttributes was sent", async () => {
+    const { credentialsPath } = makeCreds();
+    const envelope = {
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Invalid request.',
+        nextAction:
+          'Field `body` is invalid: at least one field must be provided (name, targetUrl, username, password, instruction).',
+        requestId: 'cli_old_backend',
+        details: {
+          field: 'body',
+          reason:
+            'at least one field must be provided (name, targetUrl, username, password, instruction)',
+          accepted: ['name', 'targetUrl', 'username', 'password', 'instruction'],
+        },
+      },
+    };
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify(envelope), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      })) as unknown as typeof fetch;
+    const deps = { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} };
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          testIdAttributes: ['data-element'],
+        },
+        deps,
+      ),
+    ).rejects.toMatchObject({
+      code: 'UNSUPPORTED',
+      details: { reason: 'test_id_attributes_unsupported_backend' },
+    });
+    // The same 400 without our flag in play stays a plain VALIDATION_ERROR.
+    await expect(
+      runUpdate(
+        { profile: 'default', output: 'json', debug: false, projectId: 'proj_abc', name: 'x' },
+        deps,
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
+  it('rejects --test-id-attributes together with --clear-test-id-attributes before any request', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not be called');
+    });
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'proj_abc',
+          testIdAttributes: ['data-element'],
+          clearTestIdAttributes: true,
+        },
+        {
+          credentialsPath,
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('P7 — exits 5 VALIDATION_ERROR when no mutable flag is supplied', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn(async () => {
@@ -1672,6 +1848,7 @@ describe('#79 — an unreadable --password-file is a validation error, not a cra
     const { credentialsPath } = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-p79-'));
     const passwordFile = join(dir, 'pw.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (dir), not user input.
     writeFileSync(passwordFile, 'from-file\n');
 
     const sentBodies: unknown[] = [];
@@ -2076,5 +2253,144 @@ describe('dogfood 2026-06-30 — whitespace-only --name is rejected (parity with
         { credentialsPath, fetchImpl: makeFetch(noNetwork), stdout: () => {}, stderr: () => {} },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+});
+
+describe('parseTestIdAttributesFlag', () => {
+  it('splits, trims, de-duplicates and keeps priority order', () => {
+    expect(
+      parseTestIdAttributesFlag(' data-element, data-testid ,data-element', 'test-id-attributes'),
+    ).toEqual(['data-element', 'data-testid']);
+  });
+
+  it('rejects invalid attribute names and empty lists with a VALIDATION_ERROR', () => {
+    for (const raw of ['bad name', '[data-element]', '', ' , ']) {
+      expect(() => parseTestIdAttributesFlag(raw, 'test-id-attributes')).toThrowError(
+        expect.objectContaining({ code: 'VALIDATION_ERROR' }),
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// project update --local <port> — one spelling for "an app on this machine",
+// on update exactly as on create
+// ---------------------------------------------------------------------------
+
+describe('runUpdate — --local <port>', () => {
+  function recording(response: unknown = { projectId: 'proj_abc', updatedFields: ['targetUrl'] }) {
+    const bodies: unknown[] = [];
+    const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      if (init.body) bodies.push(JSON.parse(init.body as string) as unknown);
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    return { bodies, fetchImpl };
+  }
+  const base = { profile: 'default', output: 'json' as const, debug: false, projectId: 'proj_abc' };
+  const quiet = { stdout: () => {}, stderr: () => {} };
+
+  it('builds the loopback URL, probes the port once, and sends the local marker', async () => {
+    const { credentialsPath } = makeCreds();
+    const { bodies, fetchImpl } = recording();
+    const connect = vi.fn(async () => {});
+    await runUpdate(
+      { ...base, local: '3000' },
+      { credentialsPath, fetchImpl, localPortProbeDeps: { connect }, ...quiet },
+    );
+    expect(connect).toHaveBeenCalledWith('127.0.0.1', 3000, 2000);
+    expect(bodies[0]).toEqual({ targetUrl: 'http://127.0.0.1:3000', originMode: 'local' });
+  });
+
+  it('--local-host selects the stored host; --skip-preflight dials nothing', async () => {
+    const { credentialsPath } = makeCreds();
+    const { bodies, fetchImpl } = recording();
+    const connect = vi.fn(async () => {
+      throw new Error('no listener');
+    });
+    await runUpdate(
+      { ...base, local: '3000', localHost: '::1', skipPreflight: true },
+      { credentialsPath, fetchImpl, localPortProbeDeps: { connect }, ...quiet },
+    );
+    expect(connect).not.toHaveBeenCalled();
+    expect(bodies[0]).toEqual({ targetUrl: 'http://[::1]:3000', originMode: 'local' });
+  });
+
+  it('refuses a dead port before any request, naming the URL and the bypass', async () => {
+    const { credentialsPath } = makeCreds();
+    const { bodies, fetchImpl } = recording();
+    const connect = vi.fn(async () => {
+      throw new Error('ECONNREFUSED');
+    });
+    await expect(
+      runUpdate(
+        { ...base, local: '3000' },
+        { credentialsPath, fetchImpl, localPortProbeDeps: { connect }, ...quiet },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      message:
+        'Nothing is listening on http://127.0.0.1:3000. Start your app first, or pass --skip-preflight.',
+    });
+    expect(bodies).toEqual([]);
+  });
+
+  it.each([
+    [
+      { local: '3000', targetUrl: 'https://example.com' },
+      '--local and --url are mutually exclusive',
+    ],
+    [{ localHost: 'localhost', targetUrl: 'https://example.com' }, '--local-host requires --local'],
+    [{ local: '65536' }, 'must be a port number between 1 and 65535'],
+    [{ local: '3000', localHost: 'example.com' }, 'must name your own machine'],
+  ])('refuses %j before TCP or HTTP', async (flags, explanation) => {
+    const { credentialsPath } = makeCreds();
+    const { bodies, fetchImpl } = recording();
+    const connect = vi.fn(async () => {});
+    const error = await runUpdate(
+      { ...base, ...flags },
+      { credentialsPath, fetchImpl, localPortProbeDeps: { connect }, ...quiet },
+    ).catch(e => e as ApiError);
+    expect((error as ApiError).code).toBe('VALIDATION_ERROR');
+    expect(`${(error as ApiError).message} ${(error as ApiError).nextAction}`).toContain(
+      explanation,
+    );
+    expect(bodies).toEqual([]);
+    expect(connect).not.toHaveBeenCalled();
+  });
+
+  it('a loopback --url is refused and redirected to --local, as on create', async () => {
+    const { credentialsPath } = makeCreds();
+    const { bodies, fetchImpl } = recording();
+    const error = await runUpdate(
+      { ...base, targetUrl: 'http://localhost:3000' },
+      { credentialsPath, fetchImpl, ...quiet },
+    ).catch(e => e as ApiError);
+    expect((error as ApiError).details).toMatchObject({ field: 'url' });
+    expect((error as ApiError).nextAction).toContain('Use --local <port> instead of --url');
+    expect(bodies).toEqual([]);
+  });
+
+  it('dry-run validates the flags, dials nothing, and prints the run-it-locally hint', async () => {
+    const { credentialsPath } = makeCreds();
+    const { bodies, fetchImpl } = recording();
+    const connect = vi.fn(async () => {});
+    const out: string[] = [];
+    const res = await runUpdate(
+      { ...base, output: 'text', dryRun: true, local: '3000' },
+      {
+        credentialsPath,
+        fetchImpl,
+        localPortProbeDeps: { connect },
+        stdout: l => out.push(l),
+        stderr: () => {},
+      },
+    );
+    expect(res.updatedFields).toEqual(['targetUrl']);
+    expect(connect).not.toHaveBeenCalled();
+    expect(bodies).toEqual([]);
+    expect(out.join('\n')).toContain('testsprite test run <test-id> --local 3000');
   });
 });

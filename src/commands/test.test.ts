@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Command } from 'commander';
+import type { RunResponse } from '../lib/runs.types.js';
 import { ApiError, InterruptError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT } from '../lib/output.js';
 import { ShutdownController } from '../lib/interrupt.js';
@@ -20,6 +21,9 @@ import {
   type CliTestCode,
   type CliTestStep,
   type TestDeps,
+  backendResultIsForThisRun,
+  backendResultToRunResponse,
+  makeBackendWaitFallback,
   createTestCommand,
   isPresignedCodeUrl,
   PLAN_SCHEMA_URL,
@@ -45,6 +49,10 @@ import {
   runSteps,
   runTestWaitMany,
   runUpdate,
+  writeBatchJUnitReportIfRequested,
+  runTestRunAll,
+  runTestRun,
+  runTestRerun,
 } from './test.js';
 
 function disableExits(cmd: Command): void {
@@ -224,9 +232,21 @@ describe('createTestCommand — surface', () => {
       '--cursor',
       '--rerun',
       '--no-rerun',
+      // DEV-1306: filter history by the credentials-supplying environment.
+      '--env',
       '--columns',
       '--no-header',
     ]);
+  });
+
+  it('create/update expose the per-test step-timeout flags', () => {
+    const test = createTestCommand();
+    const create = test.commands.find(c => c.name() === 'create')!;
+    const update = test.commands.find(c => c.name() === 'update')!;
+    expect(create.options.map(o => o.long)).toContain('--step-timeout');
+    expect(update.options.map(o => o.long)).toEqual(
+      expect.arrayContaining(['--step-timeout', '--clear-step-timeout']),
+    );
   });
 
   it('code get exposes --out as its only option', () => {
@@ -975,6 +995,72 @@ describe('runGet', () => {
     expect(out.join('\n')).toContain('planSteps:   3');
   });
 
+  describe('planSteps rendering tolerates malformed wire elements', () => {
+    const cases: Array<{ name: string; planSteps: unknown[]; renderedSteps: string[] }> = [
+      { name: 'null', planSteps: [null], renderedSteps: [] },
+      { name: 'number', planSteps: [42], renderedSteps: [] },
+      { name: 'empty object', planSteps: [{}], renderedSteps: ['  1. [step] (no description)'] },
+      {
+        name: 'type only',
+        planSteps: [{ type: 'action' }],
+        renderedSteps: ['  1. [action] (no description)'],
+      },
+      {
+        name: 'description only',
+        planSteps: [{ description: 'x' }],
+        renderedSteps: ['  1. [step] x'],
+      },
+      {
+        name: 'well-formed pair',
+        planSteps: [
+          { type: 'action', description: 'Open the checkout page' },
+          { type: 'assertion', description: 'Confirm the order total is visible' },
+        ],
+        renderedSteps: [
+          '  1. [action] Open the checkout page',
+          '  2. [assertion] Confirm the order total is visible',
+        ],
+      },
+    ];
+
+    it.each(cases)('$name renders text exactly and preserves JSON verbatim', async testCase => {
+      const wireTest = {
+        ...FE_TEST,
+        planSteps: testCase.planSteps,
+      };
+      const { credentialsPath } = makeCreds();
+      const fetchImpl = makeFetch(() => ({ body: wireTest }));
+      const jsonOut: string[] = [];
+      const textOut: string[] = [];
+
+      const jsonResult = await runGet(
+        { profile: 'default', output: 'json', debug: false, testId: 'test_fe' },
+        { credentialsPath, fetchImpl, stdout: line => jsonOut.push(line) },
+      );
+      await runGet(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+        { credentialsPath, fetchImpl, stdout: line => textOut.push(line) },
+      );
+
+      expect(jsonResult.planSteps).toEqual(testCase.planSteps);
+      expect(JSON.parse(jsonOut.join('\n')).planSteps).toEqual(testCase.planSteps);
+      expect(textOut.join('\n')).toBe(
+        [
+          'id:          test_fe',
+          'projectId:   project_alice',
+          'name:        Checkout happy path',
+          'type:        frontend',
+          'createdFrom: portal',
+          'status:      failed',
+          `planSteps:   ${testCase.planSteps.length}`,
+          ...testCase.renderedSteps,
+          'createdAt:   2026-04-20T11:00:00.000Z',
+          'updatedAt:   2026-05-05T12:34:56.000Z',
+        ].join('\n'),
+      );
+    });
+  });
+
   it('omits the planSteps line when planStepCount is null or absent (M3.4)', async () => {
     const noPlan: CliTest = { ...FE_TEST, planStepCount: null };
     const { credentialsPath } = makeCreds();
@@ -986,6 +1072,33 @@ describe('runGet', () => {
     );
     expect(out.join('\n')).not.toContain('planSteps:');
   });
+
+  it('renders the per-test step timeout when the facade ships a number', async () => {
+    const withStepTimeout: CliTest = { ...FE_TEST, stepTimeoutMs: 45_000 };
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: withStepTimeout }));
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    expect(out.join('\n')).toContain('stepTimeout: 45000 ms (applies to every step)');
+  });
+
+  it.each([undefined, null])(
+    'omits the step-timeout line when stepTimeoutMs is %s',
+    async stepTimeoutMs => {
+      const withoutStepTimeout: CliTest = { ...FE_TEST, stepTimeoutMs };
+      const { credentialsPath } = makeCreds();
+      const fetchImpl = makeFetch(() => ({ body: withoutStepTimeout }));
+      const out: string[] = [];
+      await runGet(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+        { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+      );
+      expect(out.join('\n')).not.toContain('stepTimeout:');
+    },
+  );
 
   it('renders produces/consumes/category when the facade ships them', async () => {
     const withDeps: CliTest = {
@@ -1241,6 +1354,190 @@ const RESULT_PASSED: CliLatestResult = {
   executionStatus: 'completed',
   summary: 'Test passed.',
 };
+
+describe('backendResultIsForThisRun — auto-resume stale-verdict floor (finding 2)', () => {
+  // The orphaned-row case the whole fallback exists for: a terminal result for
+  // the test that carries NO runIdIfAvailable, so the createdAt floor is the only
+  // guard against resolving the auto-resume to a PRIOR run's verdict.
+  const staleResult: CliLatestResult = {
+    ...RESULT_PASSED,
+    runIdIfAvailable: null,
+    finishedAt: '2026-01-01T00:00:00.000Z', // a prior run, long before the in-flight one
+  };
+  const inFlightCreatedAt = '2026-06-01T00:00:00.000Z'; // the run we're resuming
+
+  it('rejects a stale result whose finishedAt predates the in-flight createdAt floor', () => {
+    // Under the real createdAt floor it must be rejected — this is the false green.
+    expect(backendResultIsForThisRun(staleResult, 'run_inflight', inFlightCreatedAt)).toBe(false);
+  });
+
+  it('the pre-fix epoch sentinel would ACCEPT that same stale result (the bug this guards)', () => {
+    // Restoring notBefore='1970…' makes finishedAt >= floor for any real result,
+    // resolving the resume to the previous run's verdict — the exact regression.
+    expect(backendResultIsForThisRun(staleResult, 'run_inflight', '1970-01-01T00:00:00.000Z')).toBe(
+      true,
+    );
+  });
+
+  it("accepts this run's own verdict (finishedAt at/after the floor)", () => {
+    expect(
+      backendResultIsForThisRun(
+        { ...staleResult, finishedAt: '2026-06-01T00:00:30.000Z' },
+        'run_inflight',
+        inFlightCreatedAt,
+      ),
+    ).toBe(true);
+  });
+
+  it('a matching runIdIfAvailable accepts regardless of the floor', () => {
+    expect(
+      backendResultIsForThisRun(
+        { ...staleResult, runIdIfAvailable: 'run_inflight' },
+        'run_inflight',
+        inFlightCreatedAt,
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('backend wait fallback — testTitle overlay (DEV-1032 CI title)', () => {
+  // The non-terminal poll shape the fallback synthesizes FROM: the backend only
+  // resolves `testTitle` on a TERMINAL run read, so a running poll carries null.
+  const NON_TERMINAL_RUN: RunResponse = {
+    runId: 'run_be',
+    testId: 'test_be',
+    projectId: 'project_alice',
+    userId: 'u1',
+    status: 'running',
+    source: 'cli',
+    createdAt: '2026-06-01T10:00:00.000Z',
+    startedAt: '2026-06-01T10:00:01.000Z',
+    finishedAt: null,
+    codeVersion: null,
+    targetUrl: null,
+    createdFrom: null,
+    failedStepIndex: null,
+    failureKind: null,
+    error: null,
+    videoUrl: null,
+    testTitle: null,
+    stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
+  } as unknown as RunResponse;
+
+  describe('backendResultToRunResponse — overlay', () => {
+    it('overlays the probe-cached name onto the synthesized terminal response', () => {
+      const out = backendResultToRunResponse(
+        RESULT_PASSED,
+        NON_TERMINAL_RUN,
+        'Smoke — health check',
+      );
+      expect(out.status).toBe('passed');
+      expect(out.testTitle).toBe('Smoke — health check');
+    });
+
+    it('a blank/whitespace title falls back to the run row (null), never renders empty', () => {
+      expect(
+        backendResultToRunResponse(RESULT_PASSED, NON_TERMINAL_RUN, '   ').testTitle,
+      ).toBeNull();
+      expect(backendResultToRunResponse(RESULT_PASSED, NON_TERMINAL_RUN, '').testTitle).toBeNull();
+    });
+
+    it('no title arg keeps the run row value (byte-identical to pre-DEV-1032)', () => {
+      expect(backendResultToRunResponse(RESULT_PASSED, NON_TERMINAL_RUN).testTitle).toBeNull();
+    });
+  });
+
+  describe('makeBackendWaitFallback — wiring: probe name flows into testTitle', () => {
+    const makeClient = (
+      test: CliTest,
+      result: CliLatestResult,
+    ): { get: ReturnType<typeof vi.fn> } => ({
+      get: vi.fn(async (path: string) => {
+        if (path === `/tests/${test.id}`) return test;
+        if (path === `/tests/${test.id}/result`) return result;
+        throw new Error(`unexpected path ${path}`);
+      }),
+    });
+
+    it('BE run: synthesized terminal response carries the title from the one-time type-probe', async () => {
+      const result: CliLatestResult = {
+        ...RESULT_PASSED,
+        testId: 'test_be',
+        runIdIfAvailable: 'run_be',
+      };
+      const client = makeClient(BE_TEST, result);
+      const fallback = makeBackendWaitFallback({
+        client: client as never,
+        resolveTestId: r => r.testId,
+        resolveNotBefore: () => undefined,
+      });
+
+      const out = await fallback(NON_TERMINAL_RUN, 1000, new AbortController().signal);
+      expect(out?.status).toBe('passed');
+      expect(out?.testTitle).toBe('Smoke — health check'); // BE_TEST.name, overlaid
+      // One probe + one result read — no extra request to learn the title.
+      expect(client.get).toHaveBeenCalledWith('/tests/test_be', expect.anything());
+    });
+
+    it('FE run: no-op (fallback returns null, title path untouched)', async () => {
+      const client = makeClient(FE_TEST, RESULT_PASSED);
+      const fallback = makeBackendWaitFallback({
+        client: client as never,
+        resolveTestId: r => r.testId,
+        resolveNotBefore: () => undefined,
+      });
+      const feRun = { ...NON_TERMINAL_RUN, testId: 'test_fe' } as RunResponse;
+      expect(await fallback(feRun, 1000, new AbortController().signal)).toBeNull();
+    });
+  });
+});
+
+describe('writeBatchJUnitReportIfRequested — testcase name precedence (DEV-1032)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ts-junit-'));
+  });
+
+  const nameInReport = async (
+    row: { testId: string; status: string; name?: string; testTitle?: string | null },
+    nameMap?: ReadonlyMap<string, string>,
+  ): Promise<string> => {
+    const file = join(dir, 'report.xml');
+    await writeBatchJUnitReportIfRequested(
+      { report: 'junit', reportFile: file, projectId: 'project_alice' },
+      [row] as never,
+      nameMap,
+    );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- report path is join(dir, ...) inside this test's own mkdtempSync temp dir, never user input.
+    const xml = readFileSync(file, 'utf8');
+    const m = /<testcase[^>]*\bname="([^"]*)"/.exec(xml);
+    return m?.[1] ?? '';
+  };
+
+  it('sweep map wins over testTitle and the row name', async () => {
+    const name = await nameInReport(
+      { testId: 't1', status: 'passed', name: 'row-name', testTitle: 'poll-title' },
+      new Map([['t1', 'sweep-name']]),
+    );
+    expect(name).toBe('sweep-name');
+  });
+
+  it('falls back to testTitle when the sweep map misses (same source as the summary table)', async () => {
+    const name = await nameInReport(
+      { testId: 't1', status: 'passed', name: 'row-name', testTitle: 'poll-title' },
+      new Map(), // sweep over-paged / timed out → empty
+    );
+    expect(name).toBe('poll-title');
+  });
+
+  it('a blank testTitle does not shadow the row name', async () => {
+    const name = await nameInReport(
+      { testId: 't1', status: 'passed', name: 'row-name', testTitle: '   ' },
+      new Map(),
+    );
+    expect(name).toBe('row-name');
+  });
+});
 
 describe('isPresignedCodeUrl', () => {
   it('treats https:// as presigned and source-looking strings as inline', () => {
@@ -5518,6 +5815,48 @@ describe('runCreate', () => {
     expect(sent.headers.get('x-api-key')).toBe('sk-user-test');
   });
 
+  it('includes stepTimeoutMs in the create body and warns once after success', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('def test_smoke():\n    assert True\n');
+    let seenBody: Record<string, unknown> | undefined;
+    const fetchImpl = makeFetch((_url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { body: { items: [] } };
+      seenBody = JSON.parse(init.body as string) as Record<string, unknown>;
+      return { body: SAMPLE_RESPONSE };
+    });
+    const stderrLines: string[] = [];
+
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'step timeout create',
+        codeFile,
+        stepTimeoutMs: 45_000,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+
+    expect(seenBody).toMatchObject({ stepTimeoutMs: 45_000 });
+    const timeoutWarnings = stderrLines.filter(
+      line => line.includes('[warn]') && line.includes('per-step timeout'),
+    );
+    expect(timeoutWarnings).toHaveLength(1);
+    expect(timeoutWarnings[0]).toContain('test run --wait');
+    expect(timeoutWarnings[0]).toContain('600s');
+    expect(timeoutWarnings[0]).toContain('--timeout <s>');
+    expect(timeoutWarnings[0]).toContain('never stops the server-side run');
+  });
+
   it('emits backend warnings[] to stderr without polluting stdout JSON', async () => {
     const { credentialsPath } = makeCreds();
     const codeFile = writeCodeFile('BEARER = "eyJhbGciOi.eyJzdWIiOiJ4In0.sig"\n');
@@ -7318,6 +7657,89 @@ describe('runUpdate', () => {
     expect(seenBody).toEqual({ priority: 'p2' });
   });
 
+  it('accepts a step-timeout-only update, sends the number, and warns once', async () => {
+    const { credentialsPath } = makeCreds();
+    let seenBody: unknown;
+    const fetchImpl = makeFetch((_url, init) => {
+      seenBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { body: { ...SAMPLE_RESPONSE, updatedFields: ['stepTimeoutMs'] } };
+    });
+    const stderrLines: string[] = [];
+
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_alpha',
+        stepTimeoutMs: 30_000,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+
+    expect(seenBody).toEqual({ stepTimeoutMs: 30_000 });
+    expect(
+      stderrLines.filter(line => line.includes('[warn]') && line.includes('per-step timeout')),
+    ).toHaveLength(1);
+  });
+
+  it('--clear-step-timeout sends null and does not print the run-duration warning', async () => {
+    const { credentialsPath } = makeCreds();
+    let seenBody: unknown;
+    const fetchImpl = makeFetch((_url, init) => {
+      seenBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { body: { ...SAMPLE_RESPONSE, updatedFields: ['stepTimeoutMs'] } };
+    });
+    const stderrLines: string[] = [];
+
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_alpha',
+        clearStepTimeout: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+
+    expect(seenBody).toEqual({ stepTimeoutMs: null });
+    expect(stderrLines.some(line => line.includes('per-step timeout'))).toBe(false);
+  });
+
+  it('rejects --step-timeout with --clear-step-timeout before sending', async () => {
+    const fetchImpl = vi.fn();
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_alpha',
+          stepTimeoutMs: 30_000,
+          clearStepTimeout: true,
+        },
+        { fetchImpl: fetchImpl as never, stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      nextAction: expect.stringContaining(
+        '--step-timeout and --clear-step-timeout are mutually exclusive',
+      ),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('threads --produces/--needs/--category into the PUT body with wire names', async () => {
     const { credentialsPath } = makeCreds();
     let seenBody: unknown;
@@ -7629,6 +8051,106 @@ describe('runUpdate', () => {
     );
     expect(res.updatedFields).toEqual(expect.arrayContaining(['name', 'description']));
     expect(res.updatedFields).toHaveLength(2);
+  });
+});
+
+describe('--step-timeout command validation', () => {
+  it.each(['0', '-1', '60001', '1.5', 'abc'])(
+    'create and update reject %s with the millisecond bounds in VALIDATION_ERROR',
+    async raw => {
+      for (const args of [
+        [
+          'create',
+          '--project',
+          'project_alice',
+          '--type',
+          'frontend',
+          '--name',
+          'bounded timeout',
+          '--code-file',
+          '/tmp/not-read-because-validation-runs-first.py',
+          '--step-timeout',
+          raw,
+        ],
+        ['update', 'test_alpha', '--step-timeout', raw],
+      ]) {
+        const test = createTestCommand();
+        disableExits(test);
+        await expect(test.parseAsync(args, { from: 'user' })).rejects.toMatchObject({
+          code: 'VALIDATION_ERROR',
+          details: expect.objectContaining({ field: 'step-timeout' }),
+          nextAction: expect.stringContaining(
+            'must be an integer between 1 and 60000 milliseconds',
+          ),
+        });
+      }
+    },
+  );
+
+  it.each([1, 60_000])('create and update accept the boundary value %i', async boundary => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-step-timeout-'));
+    const codeFile = join(dir, 'test.py');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- code fixture written into this test's own mkdtempSync-created temp dir, never user input.
+    writeFileSync(codeFile, 'def test_smoke():\n    assert True\n', 'utf8');
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchImpl = makeFetch((_url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { body: { items: [] } };
+      bodies.push(JSON.parse(init.body as string) as Record<string, unknown>);
+      if (method === 'POST') {
+        return {
+          body: {
+            testId: 'test_step_timeout',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-08-27T00:00:00.000Z',
+          },
+        };
+      }
+      return {
+        body: {
+          testId: 'test_step_timeout',
+          updatedFields: ['stepTimeoutMs'],
+          updatedAt: '2026-08-27T00:01:00.000Z',
+        },
+      };
+    });
+    const deps = {
+      credentialsPath,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: () => undefined,
+    };
+
+    const create = createTestCommand(deps);
+    disableExits(create);
+    await create.parseAsync(
+      [
+        'create',
+        '--project',
+        'project_alice',
+        '--type',
+        'frontend',
+        '--name',
+        'boundary timeout',
+        '--code-file',
+        codeFile,
+        '--step-timeout',
+        String(boundary),
+      ],
+      { from: 'user' },
+    );
+
+    const update = createTestCommand(deps);
+    disableExits(update);
+    await update.parseAsync(['update', 'test_step_timeout', '--step-timeout', String(boundary)], {
+      from: 'user',
+    });
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toMatchObject({ stepTimeoutMs: boundary });
+    expect(bodies[1]).toEqual({ stepTimeoutMs: boundary });
   });
 });
 
@@ -8309,6 +8831,37 @@ describe('runCreateFromPlan', () => {
     expect(errText).toContain('warning: --plan-from supplies the test definition');
     expect(errText).toContain('--project');
     expect(errText).toContain('--name');
+  });
+
+  it('--plan-from warns that --step-timeout is ignored and omits it from the body', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile(FE_PLAN);
+    let postBody: Record<string, unknown> | undefined;
+    const fetchImpl = makeFetch((_url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'GET') return { body: { items: [] } };
+      postBody = JSON.parse(init.body as string) as Record<string, unknown>;
+      return { body: SAMPLE_RESPONSE };
+    });
+    const stderrLines: string[] = [];
+    const test = createTestCommand({
+      credentialsPath,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: line => stderrLines.push(line),
+    });
+    disableExits(test);
+
+    await test.parseAsync(['create', '--plan-from', planFile, '--step-timeout', '45000'], {
+      from: 'user',
+    });
+
+    expect(stderrLines.join(' ')).toContain(
+      'warning: --plan-from supplies the test definition; ignoring --step-timeout',
+    );
+    expect(postBody).toBeDefined();
+    expect(postBody).not.toHaveProperty('stepTimeoutMs');
+    expect(stderrLines.some(line => line.includes('per-step timeout'))).toBe(false);
   });
 
   // ---------------------------------------------------------------------------
@@ -10764,13 +11317,13 @@ describe('[finding-3] test create --run text mode prints the authoritative Dashb
 });
 
 // ---------------------------------------------------------------------------
-// Finding 2 (dogfood 2026-08-09) — create-batch --run --target-url must still
-// warn a V3-routed caller once, up front, even though this fan-out calls
-// `triggerRunWithMeta` directly and bypasses `runTestRun` (where the
-// `--target-url` V3 advisory normally lives).
+// create-batch --run --target-url: the response-driven mismatch advisory
+// must fire at most ONCE for the whole batch, not once per member — even
+// though this fan-out calls `triggerRunWithMeta` directly per item rather
+// than delegating to `runTestRun` (where the advisory normally lives).
 // ---------------------------------------------------------------------------
 
-describe('[finding-2] create-batch --run --target-url V3 advisory fires once, not per item', () => {
+describe('create-batch --run --target-url mismatch advisory fires once, not per item', () => {
   function writeTwoSpecPlansFinding2(): string {
     const dir = mkdtempSync(join(tmpdir(), 'cli-finding2-batch-run-'));
     const path = join(dir, 'plans.jsonl');
@@ -10790,16 +11343,10 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
     return path;
   }
 
-  /** Routes GET /me to `me`; POST /tests/batch to a 2-item created response; everything else to the run trigger. */
-  function makeFinding2Fetch(
-    me: { v3Enabled?: boolean } | undefined,
-    meCalls: string[],
-  ): typeof globalThis.fetch {
+  /** Routes POST /tests/batch to a 2-item created response; every other call is a run trigger. */
+  function makeFinding2Fetch(triggerTargetUrl: string): typeof globalThis.fetch {
+    let triggerCount = 0;
     return makeFetch(url => {
-      if (url.endsWith('/me')) {
-        meCalls.push('called');
-        return { status: 200, body: me ?? {} };
-      }
       if (url.includes('/tests/batch')) {
         return {
           status: 200,
@@ -10813,23 +11360,23 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
         };
       }
       // POST /tests/{id}/runs — trigger, once per created item.
+      triggerCount += 1;
       return {
         status: 200,
         body: {
-          runId: `run_f2_${meCalls.length}`,
+          runId: `run_f2_${triggerCount}`,
           status: 'queued',
           enqueuedAt: '2026-08-09T10:00:01.000Z',
           codeVersion: 'v1',
-          targetUrl: '',
+          targetUrl: triggerTargetUrl,
         },
       };
     });
   }
 
-  it('fires exactly once for the whole batch (not once per item) when V3-routed', async () => {
+  it('fires exactly once for the whole batch (not once per item) when the response mismatches', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const plansFile = writeTwoSpecPlansFinding2();
-    const meCalls: string[] = [];
     const stderrLines: string[] = [];
     await runCreateBatch(
       {
@@ -10841,28 +11388,28 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
         wait: false,
         dryRun: false,
         targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
       },
       {
         credentialsPath,
-        fetchImpl: makeFinding2Fetch({ v3Enabled: true }, meCalls),
+        // Every member's trigger response reports '' — the V3 "didn't
+        // apply the override" shape — so every member mismatches, and the
+        // advisory must still print only once for the whole invocation.
+        fetchImpl: makeFinding2Fetch(''),
         stdout: () => undefined,
         stderr: line => stderrLines.push(line),
         sleep: () => Promise.resolve(),
       },
     );
-    // Exactly one /me probe for the whole batch, regardless of how many
-    // items are in it (two created + triggered here).
-    expect(meCalls).toHaveLength(1);
     const advisoryLines = stderrLines.filter(
       l => l.includes('[advisory]') && l.includes('--target-url'),
     );
     expect(advisoryLines).toHaveLength(1);
   });
 
-  it('does not fire when --target-url is absent, even for a V3-routed caller', async () => {
+  it('does not fire when --target-url is absent', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const plansFile = writeTwoSpecPlansFinding2();
-    const meCalls: string[] = [];
     const stderrLines: string[] = [];
     await runCreateBatch(
       {
@@ -10876,23 +11423,18 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
       },
       {
         credentialsPath,
-        fetchImpl: makeFinding2Fetch({ v3Enabled: true }, meCalls),
+        fetchImpl: makeFinding2Fetch(''),
         stdout: () => undefined,
         stderr: line => stderrLines.push(line),
         sleep: () => Promise.resolve(),
       },
     );
-    // No --target-url supplied: the probe must not even fire (mirrors
-    // single `test run`'s "only pay the extra /me round trip when
-    // --target-url was actually supplied" gating).
-    expect(meCalls).toHaveLength(0);
     expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
   });
 
-  it('v3Enabled:false → no advisory even with --target-url set', async () => {
+  it('response echoes the requested targetUrl for every member → no advisory', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const plansFile = writeTwoSpecPlansFinding2();
-    const meCalls: string[] = [];
     const stderrLines: string[] = [];
     await runCreateBatch(
       {
@@ -10904,23 +11446,22 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
         wait: false,
         dryRun: false,
         targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
       },
       {
         credentialsPath,
-        fetchImpl: makeFinding2Fetch({ v3Enabled: false }, meCalls),
+        fetchImpl: makeFinding2Fetch('https://staging.example.com'),
         stdout: () => undefined,
         stderr: line => stderrLines.push(line),
         sleep: () => Promise.resolve(),
       },
     );
-    expect(meCalls).toHaveLength(1);
     expect(stderrLines.some(l => l.includes('--target-url'))).toBe(false);
   });
 
   it('--output json: the advisory stays on stderr only — stdout parses clean with no [advisory] text', async () => {
     const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
     const plansFile = writeTwoSpecPlansFinding2();
-    const meCalls: string[] = [];
     const stdoutLines: string[] = [];
     const stderrLines: string[] = [];
     await runCreateBatch(
@@ -10933,10 +11474,11 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
         wait: false,
         dryRun: false,
         targetUrl: 'https://staging.example.com',
+        skipPreflight: true,
       },
       {
         credentialsPath,
-        fetchImpl: makeFinding2Fetch({ v3Enabled: true }, meCalls),
+        fetchImpl: makeFinding2Fetch(''),
         stdout: line => stdoutLines.push(line),
         stderr: line => stderrLines.push(line),
         sleep: () => Promise.resolve(),
@@ -10947,5 +11489,608 @@ describe('[finding-2] create-batch --run --target-url V3 advisory fires once, no
     );
     expect(() => JSON.parse(stdoutLines.join(''))).not.toThrow();
     expect(stdoutLines.join('')).not.toContain('[advisory]');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runCreate / runCreateFromPlan --run --target-url: pre-charge reachability
+// preflight wiring. The rule table itself (every refuse/warn classification)
+// is covered in `src/lib/target-url-preflight.test.ts`; these two blocks only
+// pin that each command wires the probe correctly — before the create POST,
+// and opt-outable — mirroring the `runTestRun` and create-batch preflight
+// wiring pairs above. Both call sites were previously undefended: deleting
+// either preflight block in test.ts leaves the full suite green.
+// ---------------------------------------------------------------------------
+
+describe('runCreate — --target-url reachability preflight wiring', () => {
+  function writeCodeFile(contents: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-preflight-create-'));
+    const path = join(dir, 'test.py');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- code fixture written into this test's own mkdtempSync-created temp dir, never user input.
+    writeFileSync(path, contents, 'utf8');
+    return path;
+  }
+
+  // A literal IP skips the probe's DNS step, so these tests are governed
+  // purely by the injected fetchImpl — no real DNS lookups.
+  const LITERAL_IP_TARGET = 'http://203.0.113.30';
+
+  it('a gateway-error response (503) refuses before the create POST — exit 5, no create POST', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('def test_smoke():\n    pass\n');
+    let createPosted = false;
+    const fetchImpl = makeFetch((url, init) => {
+      if (url === LITERAL_IP_TARGET) return { status: 503, body: {} };
+      if ((init.method ?? 'GET') === 'POST') createPosted = true;
+      return { status: 200, body: { items: [] } };
+    });
+    const err = await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'preflight guard',
+        codeFile,
+        targetUrl: LITERAL_IP_TARGET,
+        run: true,
+        wait: false,
+        dryRun: false,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('VALIDATION_ERROR');
+    expect((err as ApiError).exitCode).toBe(5);
+    expect(createPosted).toBe(false);
+  });
+
+  it('--skip-preflight makes the probe a zero-network-call no-op — create still proceeds', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('def test_smoke():\n    pass\n');
+    const probeHits: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      if (url === LITERAL_IP_TARGET) {
+        probeHits.push(url);
+        return { status: 503, body: {} }; // would refuse if the probe ran at all
+      }
+      const method = init.method ?? 'GET';
+      if (url.includes('/runs')) {
+        return {
+          status: 200,
+          body: {
+            runId: 'run_pf_create',
+            status: 'queued',
+            enqueuedAt: '2026-08-14T00:00:00.000Z',
+            codeVersion: 'v1',
+            targetUrl: LITERAL_IP_TARGET,
+          },
+        };
+      }
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_pf_create',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-14T00:00:00.000Z',
+        },
+      };
+    });
+    const res = await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'preflight skip',
+        codeFile,
+        targetUrl: LITERAL_IP_TARGET,
+        run: true,
+        wait: false,
+        dryRun: false,
+        skipPreflight: true,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    );
+    expect(probeHits).toHaveLength(0);
+    expect(res).toMatchObject({ testId: 'test_pf_create' });
+  });
+});
+
+describe('runCreateFromPlan — --target-url reachability preflight wiring', () => {
+  function writePlanFile(plan: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-preflight-plan-'));
+    const path = join(dir, 'plan.json');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- plan fixture written into this test's own mkdtempSync-created temp dir, never user input.
+    writeFileSync(path, JSON.stringify(plan), 'utf8');
+    return path;
+  }
+
+  const FE_PLAN = {
+    projectId: 'project_alice',
+    type: 'frontend' as const,
+    name: 'preflight plan test',
+    planSteps: [{ type: 'action', description: 'navigate' }],
+  };
+
+  // A literal IP skips the probe's DNS step, so these tests are governed
+  // purely by the injected fetchImpl — no real DNS lookups.
+  const LITERAL_IP_TARGET = 'http://203.0.113.40';
+
+  it('a gateway-error response (502) refuses before the create POST — exit 5, no create POST', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile(FE_PLAN);
+    let createPosted = false;
+    const fetchImpl = makeFetch((url, init) => {
+      if (url === LITERAL_IP_TARGET) return { status: 502, body: {} };
+      if ((init.method ?? 'GET') === 'POST') createPosted = true;
+      return { status: 200, body: {} };
+    });
+    const err = await runCreateFromPlan(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        planFrom: planFile,
+        targetUrl: LITERAL_IP_TARGET,
+        run: true,
+        wait: false,
+        dryRun: false,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('VALIDATION_ERROR');
+    expect((err as ApiError).exitCode).toBe(5);
+    expect(createPosted).toBe(false);
+  });
+
+  it('--skip-preflight makes the probe a zero-network-call no-op — create still proceeds', async () => {
+    const { credentialsPath } = makeCreds();
+    const planFile = writePlanFile(FE_PLAN);
+    const probeHits: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      if (url === LITERAL_IP_TARGET) {
+        probeHits.push(url);
+        return { status: 502, body: {} }; // would refuse if the probe ran at all
+      }
+      const method = init.method ?? 'GET';
+      if (url.includes('/runs')) {
+        return {
+          status: 200,
+          body: {
+            runId: 'run_pf_plan',
+            status: 'queued',
+            enqueuedAt: '2026-08-14T00:00:00.000Z',
+            codeVersion: 'v1',
+            targetUrl: LITERAL_IP_TARGET,
+          },
+        };
+      }
+      if (method === 'GET') return { status: 200, body: { items: [] } };
+      return {
+        status: 200,
+        body: {
+          testId: 'test_pf_plan',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-08-14T00:00:00.000Z',
+        },
+      };
+    });
+    const res = await runCreateFromPlan(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        planFrom: planFile,
+        targetUrl: LITERAL_IP_TARGET,
+        run: true,
+        wait: false,
+        dryRun: false,
+        skipPreflight: true,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    );
+    expect(probeHits).toHaveLength(0);
+    expect(res).toMatchObject({ testId: 'test_pf_plan' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// create-batch --run --target-url: pre-charge reachability preflight fires
+// ONCE for the whole batch (mirrors the advisory dedup above), not once per
+// member, and --skip-preflight is a true zero-network-call opt-out.
+// ---------------------------------------------------------------------------
+
+describe('create-batch --run --target-url reachability preflight wiring', () => {
+  function writeTwoSpecPlansPreflight(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-preflight-batch-run-'));
+    const path = join(dir, 'plans.jsonl');
+    const specA = {
+      projectId: 'proj_pf_a',
+      type: 'frontend' as const,
+      name: 'preflight spec a',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    const specB = {
+      projectId: 'proj_pf_b',
+      type: 'frontend' as const,
+      name: 'preflight spec b',
+      planSteps: [{ type: 'action', description: 'navigate' }],
+    };
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- plan-batch fixture written into this test's own mkdtempSync-created temp dir, never user input.
+    writeFileSync(path, [specA, specB].map(p => JSON.stringify(p)).join('\n') + '\n', 'utf8');
+    return path;
+  }
+
+  // A literal IP skips the probe's DNS step, so these tests are governed
+  // purely by the injected fetchImpl — no real DNS lookups.
+  const LITERAL_IP_TARGET = 'http://203.0.113.20';
+
+  it('probes the target exactly once for the whole batch, before the create POST', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansPreflight();
+    const probeHits: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url === LITERAL_IP_TARGET) {
+        probeHits.push(url);
+        return { status: 200, body: {} };
+      }
+      if (url.includes('/tests/batch')) {
+        return {
+          status: 200,
+          body: {
+            results: [
+              { specIndex: 0, status: 'created', testId: 'test_pf_a' },
+              { specIndex: 1, status: 'created', testId: 'test_pf_b' },
+            ],
+            summary: { total: 2, created: 2, failed: 0 },
+          },
+        };
+      }
+      return {
+        status: 200,
+        body: {
+          runId: 'run_pf',
+          status: 'queued',
+          enqueuedAt: '2026-08-09T10:00:01.000Z',
+          codeVersion: 'v1',
+          targetUrl: LITERAL_IP_TARGET,
+        },
+      };
+    });
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: LITERAL_IP_TARGET,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    );
+    expect(probeHits).toHaveLength(1);
+  });
+
+  it('a gateway-error response (503) refuses before any per-member run trigger — exit 5, zero triggers', async () => {
+    // The batch CREATE (`POST /tests/batch`) is a single request for the
+    // whole batch and always runs first; the preflight sits before the
+    // per-member RUN trigger fan-out, not before the create. So a refused
+    // target still leaves the batch's created-test rows behind — it only
+    // guarantees no run row and no charge, mirroring the other three call
+    // sites' "no trigger POST" contract.
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansPreflight();
+    let triggerPosted = false;
+    const fetchImpl = makeFetch(url => {
+      if (url === LITERAL_IP_TARGET) return { status: 503, body: {} };
+      if (url.includes('/tests/batch')) {
+        return {
+          status: 200,
+          body: {
+            results: [
+              { specIndex: 0, status: 'created', testId: 'test_pf_a' },
+              { specIndex: 1, status: 'created', testId: 'test_pf_b' },
+            ],
+            summary: { total: 2, created: 2, failed: 0 },
+          },
+        };
+      }
+      // Any `POST /tests/{id}/runs` reaching here would mean the preflight
+      // failed to gate the fan-out.
+      triggerPosted = true;
+      return { status: 200, body: {} };
+    });
+    const err = await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: LITERAL_IP_TARGET,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('VALIDATION_ERROR');
+    expect((err as ApiError).exitCode).toBe(5);
+    expect(triggerPosted).toBe(false);
+  });
+
+  it('--skip-preflight makes the probe a zero-network-call no-op', async () => {
+    const { credentialsPath } = makeCreds('sk-user-test', 'https://api.testsprite.com');
+    const plansFile = writeTwoSpecPlansPreflight();
+    const probeHits: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url === LITERAL_IP_TARGET) {
+        probeHits.push(url);
+        return { status: 503, body: {} }; // would refuse if the probe ran at all
+      }
+      if (url.includes('/tests/batch')) {
+        return {
+          status: 200,
+          body: {
+            results: [{ specIndex: 0, status: 'created', testId: 'test_pf_a' }],
+            summary: { total: 1, created: 1, failed: 0 },
+          },
+        };
+      }
+      return {
+        status: 200,
+        body: {
+          runId: 'run_pf',
+          status: 'queued',
+          enqueuedAt: '2026-08-09T10:00:01.000Z',
+          codeVersion: 'v1',
+          targetUrl: LITERAL_IP_TARGET,
+        },
+      };
+    });
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        dryRun: false,
+        targetUrl: LITERAL_IP_TARGET,
+        skipPreflight: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    );
+    expect(probeHits).toHaveLength(0);
+  });
+});
+
+describe('test run --all — the project-level closing link prefers the server field', () => {
+  const BATCH_OK = {
+    accepted: [{ testId: 't1', runId: 'r1', enqueuedAt: '2026-09-02T00:00:00.000Z' }],
+    conflicts: [],
+    deferred: [],
+    skippedFrontend: [],
+    skippedIntegration: [],
+  };
+  const SERVER_LINK = 'https://portal.example.com/dashboard-v3/o/org-1/projects/proj_1';
+
+  async function runAll(batchBody: Record<string, unknown>, apiUrl?: string) {
+    const { credentialsPath } = makeCreds('sk-user-test', apiUrl);
+    const fetchImpl = makeFetch((url, init) =>
+      (init.method ?? 'GET') === 'POST' && url.includes('/tests/batch/run')
+        ? { status: 202, body: batchBody }
+        : { body: {} },
+    );
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_1',
+        wait: false,
+        timeoutSeconds: 60,
+        maxConcurrency: 1,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    return { stdout: stdoutLines.join('\n'), stderr: stderrLines.join('\n') };
+  }
+
+  it('server dashboardUrl (string) → printed verbatim, never the legacy /dashboard/tests template', async () => {
+    const { stdout } = await runAll(
+      { ...BATCH_OK, dashboardUrl: SERVER_LINK },
+      'https://api.testsprite.com',
+    );
+    expect(stdout).toContain(`dashboard     ${SERVER_LINK}`);
+    expect(stdout).not.toContain('/dashboard/tests/');
+  });
+
+  it('server dashboardUrl: null → no dashboard line at all (no dead legacy guess)', async () => {
+    const { stdout } = await runAll(
+      { ...BATCH_OK, dashboardUrl: null },
+      'https://api.testsprite.com',
+    );
+    expect(stdout).not.toContain('dashboard     ');
+  });
+
+  it('field absent (older backend / V2 engine) on the prod API → the legacy client template, unchanged', async () => {
+    const { stdout } = await runAll(BATCH_OK, 'https://api.testsprite.com');
+    expect(stdout).toContain('dashboard     https://www.testsprite.com/dashboard/tests/proj_1');
+  });
+
+  it('field absent on an unknown API host → still no line (resolvePortalBase contract)', async () => {
+    const { stdout } = await runAll(BATCH_OK);
+    expect(stdout).not.toContain('dashboard     ');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// test run / test rerun (no --wait): the server-built dashboard link
+// ---------------------------------------------------------------------------
+
+describe('runTestRun / runTestRerun — dashboard line on the queued-run output', () => {
+  const QUEUED = {
+    runId: 'run_link_1',
+    status: 'queued',
+    enqueuedAt: '2026-09-02T00:00:00.000Z',
+    codeVersion: 'v1',
+    targetUrl: 'https://example.com',
+  };
+  const LINK = 'https://portal.example.com/dashboard-v3/o/org-1/projects/p/test-cases/test_1';
+
+  it('test run <id>: prints the dashboard line when the server supplies the link', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url =>
+      url.includes('/runs') ? { body: { ...QUEUED, dashboardUrl: LINK } } : { body: FE_TEST },
+    );
+    const out: string[] = [];
+    const resp = await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        testId: 'test_1',
+        wait: false,
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => {} },
+    );
+    const block = out.join('\n');
+    expect(block).toContain('runId       run_link_1');
+    expect(block).toContain(`dashboard   ${LINK}`);
+    expect((resp as { dashboardUrl?: string }).dashboardUrl).toBe(LINK);
+  });
+
+  it('test run <id>: an absent link prints nothing — never a guessed URL, never "undefined"', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url =>
+      url.includes('/runs') ? { body: QUEUED } : { body: FE_TEST },
+    );
+    const out: string[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        testId: 'test_1',
+        wait: false,
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => {} },
+    );
+    const block = out.join('\n');
+    expect(block).toContain('targetUrl   https://example.com');
+    expect(block).not.toContain('dashboard');
+    expect(block).not.toContain('undefined');
+  });
+
+  it('test run <id> --output json: the envelope carries dashboardUrl and executionUrl verbatim', async () => {
+    const { credentialsPath } = makeCreds();
+    const EXEC = 'https://portal.example.com/dashboard-v3/o/org-1/projects/p/execution/e';
+    const fetchImpl = makeFetch(url =>
+      url.includes('/runs')
+        ? { body: { ...QUEUED, dashboardUrl: LINK, executionUrl: EXEC } }
+        : { body: FE_TEST },
+    );
+    const out: string[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_1',
+        wait: false,
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line), stderr: () => {} },
+    );
+    const parsed = JSON.parse(out.join('\n')) as { dashboardUrl?: string; executionUrl?: string };
+    expect(parsed.dashboardUrl).toBe(LINK);
+    expect(parsed.executionUrl).toBe(EXEC);
+  });
+
+  it('test rerun <id>: prints the dashboard line when supplied, nothing when absent', async () => {
+    const { credentialsPath } = makeCreds();
+    const RERUN = {
+      runId: 'run_rerun_1',
+      status: 'queued',
+      enqueuedAt: '2026-09-02T00:00:00.000Z',
+      codeVersion: 'v1',
+      autoHeal: false,
+      closure: null,
+    };
+    const rerunOpts = {
+      profile: 'default',
+      output: 'text' as const,
+      debug: false,
+      testIds: ['test_1'],
+      all: false,
+      wait: false,
+      timeoutSeconds: 600,
+      autoHeal: false,
+      autoHealExplicit: false,
+      skipDependencies: false,
+      maxConcurrency: 1,
+    };
+    const linked: string[] = [];
+    await runTestRerun(rerunOpts, {
+      credentialsPath,
+      fetchImpl: makeFetch(url =>
+        url.includes('/runs/rerun')
+          ? { body: { ...RERUN, dashboardUrl: LINK } }
+          : { body: FE_TEST },
+      ),
+      stdout: line => linked.push(line),
+      stderr: () => {},
+    });
+    expect(linked.join('\n')).toContain(`dashboard   ${LINK}`);
+
+    const bare: string[] = [];
+    await runTestRerun(rerunOpts, {
+      credentialsPath,
+      fetchImpl: makeFetch(url =>
+        url.includes('/runs/rerun') ? { body: RERUN } : { body: FE_TEST },
+      ),
+      stdout: line => bare.push(line),
+      stderr: () => {},
+    });
+    expect(bare.join('\n')).toContain('autoHeal    false');
+    expect(bare.join('\n')).not.toContain('dashboard');
   });
 });

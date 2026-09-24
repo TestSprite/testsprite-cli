@@ -3,6 +3,7 @@
 import { Command, CommanderError } from 'commander';
 import { createAgentCommand } from './commands/agent.js';
 import { createAuthCommand } from './commands/auth.js';
+import { createCiCommand } from './commands/ci.js';
 import { createCompletionCommand, type CompletionSpec } from './commands/completion.js';
 import { createDoctorCommand } from './commands/doctor.js';
 import {
@@ -13,10 +14,19 @@ import {
   type SetupCmdOpts,
 } from './commands/init.js';
 import { createProjectCommand } from './commands/project.js';
-import { createTestCommand } from './commands/test.js';
+import { createScheduleCommand } from './commands/schedule.js';
+import { createTunnelCommand } from './commands/tunnel.js';
+import { createTestCommand, type TunnelInterruptDetach } from './commands/test.js';
+import { createTestListCommand } from './commands/testlist.js';
 import { createUsageCommand } from './commands/usage.js';
 import { TARGETS, type AgentTarget } from './lib/agent-targets.js';
-import { ApiError, CLIError, InterruptError, RequestTimeoutError } from './lib/errors.js';
+import {
+  ApiError,
+  CLIError,
+  InterruptError,
+  RequestTimeoutError,
+  extractNodeErrorCode,
+} from './lib/errors.js';
 import { installBrokenPipeGuard, installSignalHandlers } from './lib/interrupt.js';
 import { Output, isOutputMode } from './lib/output.js';
 import { maybeInstallProxyAgent } from './lib/proxy.js';
@@ -32,16 +42,17 @@ import {
   recordOutcome,
   resolveTelemetryAuth,
   type ResolvedTelemetryAuth,
+  type WaitTimeoutTelemetry,
 } from './lib/telemetry.js';
 import { maybeNotifyUpdate } from './lib/update-check.js';
 import { VERSION } from './version.js';
-import { shouldRejectNodeVersion } from './version-guard.js';
+import { SUPPORTED_NODE_RANGE, shouldRejectNodeVersion } from './version-guard.js';
 
 // Guard: exit early with a clear message on unsupported Node.js versions,
 // rather than failing later with a cryptic ESM/runtime error.
 if (shouldRejectNodeVersion(process.versions.node)) {
   process.stderr.write(
-    `Error: testsprite requires Node.js >= 20 (found ${process.versions.node}).\nInstall the latest LTS from https://nodejs.org\n`,
+    `Error: testsprite requires Node.js ${SUPPORTED_NODE_RANGE} (found ${process.versions.node}).\nInstall a supported Node.js release from https://nodejs.org\n`,
   );
   process.exit(1);
 }
@@ -105,7 +116,18 @@ addSetupOptions(
 program.addCommand(authCommand);
 
 program.addCommand(createProjectCommand({}));
-program.addCommand(createTestCommand());
+let waitTimeoutTelemetry: Partial<WaitTimeoutTelemetry> = {};
+program.addCommand(
+  createTestCommand({
+    onWaitTimeout: context => {
+      waitTimeoutTelemetry = context;
+    },
+  }),
+);
+program.addCommand(createTestListCommand());
+program.addCommand(createCiCommand({}));
+program.addCommand(createScheduleCommand({}));
+program.addCommand(createTunnelCommand({}));
 program.addCommand(createAgentCommand({}));
 program.addCommand(createUsageCommand());
 program.addCommand(createDoctorCommand());
@@ -152,6 +174,17 @@ let telemetryEmit = false;
 // `auth remove` (which deletes the profile) is still reported on the key it used.
 let telemetryAuth: ResolvedTelemetryAuth | undefined;
 
+// True when the leaf command that is about to run carries a `--local` option
+// value — `test run --local <port>` or `project create --local <port>`.
+// Set before validation so test-run refusals still report attempts that a
+// backend-side mint/attach event never observes. Local project admission
+// failures have a separate zero-HTTP exception below.
+let telemetryLocal = false;
+
+// Local project admission failures must exit without any TestSprite HTTP,
+// including telemetry. Track companion flags even when --local is missing.
+let telemetryLocalProject = false;
+
 // Propagate exitOverride AND the buffered outputError config to every
 // subcommand in the tree. Commander's addCommand() does NOT inherit either
 // from the parent, so commands built externally (createTestCommand, etc.) and
@@ -171,6 +204,39 @@ function applyExitOverrideDeep(cmd: Command): void {
   }
 }
 applyExitOverrideDeep(program);
+
+function isRegisteredRootCommand(name: string): boolean {
+  return (
+    name === 'help' ||
+    program.commands.some(command => command.name() === name || command.aliases().includes(name))
+  );
+}
+
+/**
+ * Commander checks its implicit help option before reporting an unknown root
+ * command. It also falls back to root help when `help <command>` names a
+ * missing command. Detect both cases while help is being rendered so the
+ * normal unknown-command error wins before any misleading help is written.
+ */
+function unknownRootCommandMaskedByHelp(args: readonly string[]): string | undefined {
+  const [first, second] = args;
+  if (first === 'help') {
+    return second && !isRegisteredRootCommand(second) ? second : undefined;
+  }
+  if (!first || first.startsWith('-') || isRegisteredRootCommand(first)) return undefined;
+  return args.slice(1).some(arg => arg === '--help' || arg === '-h') ? first : undefined;
+}
+
+program.addHelpText('beforeAll', context => {
+  if (context.command !== program) return '';
+  const unknownCommand = unknownRootCommandMaskedByHelp(program.args);
+  if (unknownCommand) {
+    program.error(`error: unknown command '${unknownCommand}'`, {
+      code: 'commander.unknownCommand',
+    });
+  }
+  return '';
+});
 
 /**
  * Render a leaf command's full path (group + leaf), e.g. `test run` /
@@ -213,11 +279,20 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     profile?: string;
     endpointUrl?: string;
     dryRun?: boolean;
+    debug?: boolean;
     planTemplate?: boolean;
+    local?: string;
+    localHost?: string;
   };
   const commandPath = commandPathOf(actionCommand);
   // Record which leaf command ran, for the telemetry emit around parseAsync.
   ranCommandPath = commandPath;
+  // The raw --local opt is a port string; only its presence is
+  // recorded (see `telemetryLocal`'s own comment — never the value).
+  telemetryLocal = globals.local !== undefined;
+  telemetryLocalProject =
+    commandPath === 'project create' &&
+    (globals.local !== undefined || globals.localHost !== undefined);
   // See `isPlanTemplateInvocation` for why this one case is
   // filtered here rather than in skill-nudge.ts / update-check.ts.
   const isPlanTemplate = isPlanTemplateInvocation(commandPath, globals.planTemplate);
@@ -241,6 +316,7 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
       profile: globals.profile ?? 'default',
       cwd: process.cwd(),
       env: process.env,
+      debug: globals.debug ?? false,
     });
   }
 
@@ -291,40 +367,66 @@ try {
         exitCode: 0,
         durationMs: Date.now() - telemetryStartedAt,
         ...telemetryGlobals(),
+        local: telemetryLocal,
       },
       { resolvedAuth: telemetryAuth },
     );
   }
 } catch (err) {
   const telemetryOutcome = classifyCliError(err);
+  const localProjectAdmissionFailure =
+    telemetryLocalProject &&
+    err instanceof ApiError &&
+    err.code === 'VALIDATION_ERROR' &&
+    err.requestId === 'local';
   // Flush the outcome AFTER the error is rendered to stderr below (via each
-  // branch's `flushThenExit`), so a slow backend never delays the user's error.
-  // The classification mirrors the exit-code mapping the branches apply.
-  const flushThenExit = async (code: number): Promise<never> => {
-    if (telemetryEmit) {
+  // branch's `flushThenSetExitCode`), so a slow backend never delays the
+  // user's error. The classification mirrors the exit-code mapping the
+  // branches apply.
+  //
+  // DEV-673: SET `process.exitCode` and let the event loop drain instead of
+  // forcing `process.exit()`. A forced exit tears the process down while the
+  // just-completed HTTPS request's TLS socket is still mid-close; on Windows
+  // libuv asserts on the half-closed handle (src/win/async.c) and the process
+  // dies with 0xC0000409 (-1073740791) — overwriting the mapped exit code
+  // with a crash code and voiding the documented exit-code contract for every
+  // script/CI/agent that branches on it. Draining takes milliseconds and is
+  // exactly how the success path above already exits.
+  const flushThenSetExitCode = async (code: number): Promise<void> => {
+    if (telemetryEmit && !localProjectAdmissionFailure) {
       await recordOutcome(
         {
           command: ranCommandPath,
           outcome: telemetryOutcome.outcome,
           exitCode: telemetryOutcome.exitCode,
           errorCode: telemetryOutcome.errorCode,
+          errorOrigin: telemetryOutcome.errorOrigin,
+          timeoutSeconds: telemetryOutcome.timeoutSeconds,
+          ...waitTimeoutTelemetry,
           durationMs: Date.now() - telemetryStartedAt,
           ...telemetryGlobals(),
+          local: telemetryLocal,
         },
         { resolvedAuth: telemetryAuth },
       );
     }
-    process.exit(code);
+    process.exitCode = code;
   };
 
   const rawMode = program.opts<{ output?: string }>().output;
   const mode = isOutputMode(rawMode) ? rawMode : 'text';
+  const output = new Output(mode);
   if (err instanceof ApiError) {
+    const message =
+      err.code === 'UNSUPPORTED' &&
+      err.getDetail('reason') === 'tunnel-unsupported-for-backend-test'
+        ? '--local only supports frontend tests today. Re-run without --local, or point the test at a reachable base URL.'
+        : err.message;
     if (mode === 'json') {
       const envelope = {
         error: {
           code: err.code,
-          message: err.message,
+          message,
           nextAction: err.nextAction,
           requestId: err.requestId,
           details: err.details,
@@ -332,7 +434,7 @@ try {
       };
       process.stderr.write(`${JSON.stringify(envelope, null, 2)}\n`);
     } else {
-      process.stderr.write(`Error: ${err.message}\n`);
+      process.stderr.write(`Error: ${message}\n`);
       if (err.nextAction) process.stderr.write(`${err.nextAction}\n`);
       if (err.requestId && err.requestId !== 'local')
         process.stderr.write(`requestId: ${err.requestId}\n`);
@@ -366,34 +468,39 @@ try {
         }
       }
     }
-    await flushThenExit(err.exitCode);
-  }
-  const output = new Output(mode);
-  if (err instanceof InterruptError) {
+    await flushThenSetExitCode(err.exitCode);
+  } else if (err instanceof InterruptError) {
     // Graceful detach (DEV-331 piece 1, errors.md §8.1): the wait-path catch
     // block already printed the honest partial + re-attach hint. Exit with
     // the conventional 128+signum code; `INTERRUPTED` is deliberately outside
     // the error catalog. Note: Ctrl-C does NOT cancel the server-side run.
     if (mode === 'json') {
+      const tunnelDetach = (err as InterruptError & { tunnelDetach?: TunnelInterruptDetach })
+        .tunnelDetach;
       const envelope = {
         error: {
           code: 'INTERRUPTED',
           message: err.message,
           nextAction:
+            tunnelDetach?.nextAction ??
             'The server-side run (if any) keeps executing and billing. ' +
-            'Re-attach with: testsprite test wait <runId>, or stop it with: testsprite test cancel <runId> ' +
-            '(runId is in the partial JSON on stdout).',
+              'Re-attach with: testsprite test wait <runId>, or stop it with: testsprite test cancel <runId> ' +
+              '(runId is in the partial JSON on stdout).',
           requestId: 'local',
-          details: { signal: err.signal },
+          details: {
+            signal: err.signal,
+            ...(tunnelDetach
+              ? { runId: tunnelDetach.runId, cancelOutcome: tunnelDetach.cancel }
+              : {}),
+          },
         },
       };
       process.stderr.write(`${JSON.stringify(envelope, null, 2)}\n`);
     } else {
       process.stderr.write(`Error: ${err.message}\n`);
     }
-    await flushThenExit(err.exitCode);
-  }
-  if (err instanceof RequestTimeoutError) {
+    await flushThenSetExitCode(err.exitCode);
+  } else if (err instanceof RequestTimeoutError) {
     // Structured rendering for per-request timeouts: JSON mode emits a
     // machine-readable envelope; text mode emits the message with a hint.
     if (mode === 'json') {
@@ -412,9 +519,8 @@ try {
     } else {
       process.stderr.write(`Error: ${err.message}\n`);
     }
-    await flushThenExit(err.exitCode);
-  }
-  if (err instanceof CommanderError) {
+    await flushThenSetExitCode(err.exitCode);
+  } else if (err instanceof CommanderError) {
     // Map exit codes per the CLI taxonomy:
     //   help / version  → 0  (user asked for it; Commander already wrote the text)
     //   parse errors    → 5  (VALIDATION_ERROR family: missing arg, invalid
@@ -433,31 +539,40 @@ try {
       err.code === 'commander.help' ||
       err.code === 'commander.version'
     ) {
-      await flushThenExit(0);
+      await flushThenSetExitCode(0);
+    } else {
+      // For parse errors, write the buffered message in the correct format.
+      // rawMode from program.opts() is reliable when --output was parsed before
+      // the error. When the error occurs first (e.g. `testsprite badcmd --output
+      // json`), rawMode is the default 'text'; scan argv as a best-effort
+      // fallback so machine consumers still receive a JSON envelope.
+      const commanderMode = (() => {
+        if (rawMode === 'json') return 'json' as const;
+        for (let i = 2; i < process.argv.length; i++) {
+          const arg = process.argv[i]!;
+          if (arg === '--output' && process.argv[i + 1] === 'json') return 'json' as const;
+          if (arg === '--output=json') return 'json' as const;
+        }
+        return mode;
+      })();
+      process.stderr.write(
+        renderCommanderError(pendingCommanderErrorMsg, err.message, commanderMode),
+      );
+      await flushThenSetExitCode(5);
     }
-    // For parse errors, write the buffered message in the correct format.
-    // rawMode from program.opts() is reliable when --output was parsed before
-    // the error. When the error occurs first (e.g. `testsprite badcmd --output
-    // json`), rawMode is the default 'text'; scan argv as a best-effort
-    // fallback so machine consumers still receive a JSON envelope.
-    const commanderMode = (() => {
-      if (rawMode === 'json') return 'json' as const;
-      for (let i = 2; i < process.argv.length; i++) {
-        const arg = process.argv[i]!;
-        if (arg === '--output' && process.argv[i + 1] === 'json') return 'json' as const;
-        if (arg === '--output=json') return 'json' as const;
-      }
-      return mode;
-    })();
-    process.stderr.write(
-      renderCommanderError(pendingCommanderErrorMsg, err.message, commanderMode),
-    );
-    await flushThenExit(5);
+  } else if (err instanceof CLIError) {
+    // Same 5-key envelope shape as the ApiError/InterruptError/
+    // RequestTimeoutError branches above — `err.code` defaults to the
+    // out-of-catalog 'CLI_ERROR' bucket for a plain CLIError (see errors.ts).
+    output.error({ code: err.code, message: err.message });
+    await flushThenSetExitCode(err.exitCode);
+  } else {
+    // Genuinely uncaught, non-CLIError exception. Prefer a real Node error
+    // code (ENOENT, ECONNREFUSED, …) when one is present; otherwise fall
+    // back to the same 'UNCAUGHT_EXCEPTION' bucket classifyCliError() uses,
+    // so the JSON envelope's code and the telemetry errorCode always agree.
+    const message = err instanceof Error ? err.message : String(err);
+    output.error({ code: extractNodeErrorCode(err) ?? 'UNCAUGHT_EXCEPTION', message });
+    await flushThenSetExitCode(1);
   }
-  if (err instanceof CLIError) {
-    output.error(err.message);
-    await flushThenExit(err.exitCode);
-  }
-  output.error(err instanceof Error ? err.message : String(err));
-  await flushThenExit(1);
 }

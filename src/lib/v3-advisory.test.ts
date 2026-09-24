@@ -3,8 +3,8 @@ import {
   routingLabel,
   V3_ROUTING_ADVISORY,
   emitV3RoutingAdvisory,
-  TARGET_URL_V3_ADVISORY,
-  emitTargetUrlV3Advisory,
+  targetUrlAdvisoryText,
+  emitTargetUrlMismatchAdvisory,
 } from './v3-advisory.js';
 
 describe('routingLabel', () => {
@@ -35,18 +35,40 @@ describe('V3 routing advisory', () => {
   });
 });
 
-describe('target-url V3 advisory (DEV-749)', () => {
-  it('is a single [advisory]-prefixed line naming --target-url', () => {
-    expect(TARGET_URL_V3_ADVISORY.startsWith('[advisory]')).toBe(true);
-    expect(TARGET_URL_V3_ADVISORY).toContain('--target-url');
-    // Type-agnostic: never claims this is frontend-only, since the CLI
-    // cannot learn test type without an extra round trip at `test run` time.
-    expect(TARGET_URL_V3_ADVISORY).not.toContain('frontend');
+describe('target-url mismatch advisory (response-driven redesign)', () => {
+  it('is a single [advisory]-prefixed line naming --target-url and the requested value', () => {
+    const text = targetUrlAdvisoryText('https://staging.example.com', '');
+    expect(text.startsWith('[advisory]')).toBe(true);
+    expect(text).toContain('--target-url https://staging.example.com');
+    // Type-agnostic: never claims this is V3-specific, since the comparison
+    // is purely response-driven and applies identically whatever the cause.
+    expect(text).not.toContain('V3');
+    expect(text).not.toContain('frontend');
   });
 
-  it('emitTargetUrlV3Advisory writes exactly one line to the sink', () => {
+  it('names the value the server actually applied when it applied a (different) one', () => {
+    const text = targetUrlAdvisoryText('https://staging.example.com', 'https://prod.example.com');
+    expect(text).toContain('https://prod.example.com instead');
+  });
+
+  it('says no target URL was applied when the response is empty', () => {
+    const text = targetUrlAdvisoryText('https://staging.example.com', '');
+    expect(text).toContain('reports no target URL for it');
+  });
+
+  it('emitTargetUrlMismatchAdvisory writes exactly one line when requested != applied', () => {
     const lines: string[] = [];
-    emitTargetUrlV3Advisory(l => lines.push(l));
-    expect(lines).toEqual([TARGET_URL_V3_ADVISORY]);
+    emitTargetUrlMismatchAdvisory(l => lines.push(l), 'https://staging.example.com', '');
+    expect(lines).toEqual([targetUrlAdvisoryText('https://staging.example.com', '')]);
+  });
+
+  it('emitTargetUrlMismatchAdvisory is a no-op when requested === applied (override was honored)', () => {
+    const lines: string[] = [];
+    emitTargetUrlMismatchAdvisory(
+      l => lines.push(l),
+      'https://staging.example.com',
+      'https://staging.example.com',
+    );
+    expect(lines).toEqual([]);
   });
 });

@@ -3081,6 +3081,172 @@ describe('[fix-C] batch rerun: every test in-flight → CONFLICT exit 6', () => 
 });
 
 // ---------------------------------------------------------------------------
+// Exit code and emitted CI summary must agree.
+// All-notFound batch: nothing was queued → exit 4 (was a silent exit 0 that
+// let a rerun gate pass green on zero dispatched runs). Mixed batch: the
+// not-dispatched member counts as `skipped` (not `failed`) so an exit-0 job
+// no longer ships an artifact claiming failures.
+// ---------------------------------------------------------------------------
+
+describe('batch rerun: notFound gates the exit and the summary agrees', () => {
+  const allNotFoundResp: BatchRerunResponse = {
+    accepted: [],
+    deferred: [],
+    conflicts: [],
+    closure: { byProject: [] },
+    notFound: ['test_1', 'test_2'],
+  };
+
+  it('no --wait: accepted=[], all ids notFound → exit 4 (NOT_FOUND), not exit 0', async () => {
+    const creds = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/rerun')) return { status: 202, body: allNotFoundResp };
+      return errorBody('NOT_FOUND');
+    });
+    const err = await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, sleep: instantSleep, fetchImpl },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).code).toBe('NOT_FOUND');
+    expect((err as ApiError).exitCode).toBe(4);
+    expect((err as ApiError).message).toContain('no replayable run');
+  });
+
+  it('--wait: all-notFound → exit 4, and the CI artifact agrees (0 failed, 2 skipped)', async () => {
+    // The measured pre-fix shape: exit 0 + an artifact claiming failed:2 + two
+    // red annotations. Now: exit 4, skipped:2, warning annotations — every
+    // surface tells the same story.
+    const creds = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/rerun')) return { status: 202, body: allNotFoundResp };
+      return errorBody('NOT_FOUND');
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'cli-gh-rerun-notfound-'));
+    const summaryFile = join(dir, 'summary.json');
+    const stdoutLines: string[] = [];
+    const err = await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 10,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'text',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        ghOutput: true,
+        summaryFile,
+      },
+      {
+        ...creds,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
+        env: {} as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).exitCode).toBe(4);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
+      total: number;
+      passed: number;
+      failed: number;
+      skipped: number;
+      runs: { testId: string; status: string }[];
+    };
+    expect(artifact).toMatchObject({ total: 2, passed: 0, failed: 0, skipped: 2 });
+    expect(artifact.runs.every(r => r.status === 'not_found')).toBe(true);
+    expect(stdoutLines.filter(l => l.startsWith('::warning'))).toHaveLength(2);
+    expect(stdoutLines.filter(l => l.startsWith('::error'))).toHaveLength(0);
+  });
+
+  it('mixed batch (1 passed + 1 notFound) --wait: exits 0 and the artifact reports skipped, not failed', async () => {
+    const creds = makeCreds();
+    const mixedResp: BatchRerunResponse = {
+      accepted: [{ testId: 'test_1', runId: 'run_new_1', enqueuedAt: '2026-06-03T10:00:00.000Z' }],
+      deferred: [],
+      conflicts: [],
+      closure: { byProject: [] },
+      notFound: ['test_2'],
+    };
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/rerun')) return { status: 202, body: mixedResp };
+      if (url.includes('/runs/run_new_1')) return { body: makeTerminalRun('run_new_1', 'passed') };
+      if (url.includes('/tests/test_1')) return { body: FE_TEST };
+      return errorBody('NOT_FOUND');
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'cli-gh-rerun-mixed-'));
+    const summaryFile = join(dir, 'summary.json');
+    const stdoutLines: string[] = [];
+    // Must resolve (exit 0): the dispatched run passed, and the skipped member
+    // is surfaced without being miscounted as a failure.
+    await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 60,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'text',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        ghOutput: true,
+        summaryFile,
+      },
+      {
+        ...creds,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
+        env: {} as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
+      total: number;
+      passed: number;
+      failed: number;
+      skipped: number;
+      runs: { testId: string; status: string }[];
+    };
+    // exit 0 and `failed: 0` now agree — the summary-vs-exit contradiction is gone.
+    expect(artifact).toMatchObject({ total: 2, passed: 1, failed: 0, skipped: 1 });
+    expect(artifact.runs.some(r => r.testId === 'test_2' && r.status === 'not_found')).toBe(true);
+    // The skipped member still annotates (as a warning) so it stays visible.
+    expect(stdoutLines.filter(l => l.startsWith('::warning'))).toHaveLength(1);
+    expect(stdoutLines.filter(l => l.startsWith('::error'))).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Fix D — --all with >50 tests: chunk into ≤50-id requests, aggregate
 // ---------------------------------------------------------------------------
 
@@ -3894,13 +4060,13 @@ describe('runTestRerun --all --filter (client-side name filter)', () => {
     expect(filterMsg).toContain('"checkout"');
   });
 
-  it('--filter with no match produces empty selection and emits the info message', async () => {
+  it('--filter with no match fails with exit 5 (zero-dispatch false-green) and emits the info message', async () => {
     const creds = makeCreds();
     const dispatched: string[] = [];
     const stderr: string[] = [];
     const stdout: string[] = [];
 
-    await runTestRerun(
+    const err = await runTestRerun(
       {
         testIds: [],
         all: true,
@@ -3925,10 +4091,13 @@ describe('runTestRerun --all --filter (client-side name filter)', () => {
         stderr: (line: string) => stderr.push(line),
         stdout: (line: string) => stdout.push(line),
       },
-    );
+    ).catch(e => e as Error);
 
-    // Nothing dispatched
+    // Nothing dispatched — and that must NOT exit 0 (parity with
+    // `test run --all`'s zero-dispatch gate): a rerun step that greens on zero
+    // dispatched runs is an unsafe CI gate.
     expect(dispatched).toHaveLength(0);
+    expect(err).toMatchObject({ exitCode: 5 });
 
     // The "nothing to rerun" message should appear
     const noTestsMsg = stderr.find(
@@ -3939,6 +4108,45 @@ describe('runTestRerun --all --filter (client-side name filter)', () => {
     // stdout should contain the empty batch envelope
     const body = JSON.parse(stdout.join('\n'));
     expect(body).toMatchObject({ accepted: [], deferred: [], conflicts: [] });
+  });
+
+  it('--filter with no match + --allow-empty exits 0 (explicit opt-in)', async () => {
+    const creds = makeCreds();
+    const dispatched: string[] = [];
+    const stderr: string[] = [];
+    const stdout: string[] = [];
+
+    await runTestRerun(
+      {
+        testIds: [],
+        all: true,
+        projectId: 'project_abc',
+        nameFilter: 'nomatchwhatsoever',
+        allowEmpty: true,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl: makeNamedFilterFetch(dispatched),
+        stderr: (line: string) => stderr.push(line),
+        stdout: (line: string) => stdout.push(line),
+      },
+    );
+
+    // Resolves (exit 0) and says why on stderr.
+    expect(dispatched).toHaveLength(0);
+    expect(stderr.join('\n')).toContain('--allow-empty');
   });
 
   it('rerun command exposes --filter flag', async () => {
@@ -5861,6 +6069,71 @@ describe('gh-output integration on batch rerun --wait (Gap B)', () => {
     expect(annotations).toHaveLength(1);
     expect(annotations[0]).toContain('test_2');
   });
+
+  it('all-conflict --wait: emits annotations + summary before exiting 6 (not a silent CI exit)', async () => {
+    const creds = makeCreds();
+    const allConflictResp: BatchRerunResponse = {
+      accepted: [],
+      deferred: [],
+      conflicts: [
+        { testId: 'test_1', currentRunId: 'run_inflight_1' },
+        { testId: 'test_2', currentRunId: 'run_inflight_2' },
+      ],
+      closure: { byProject: [] },
+    };
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/rerun')) return { status: 202, body: allConflictResp };
+      return errorBody('NOT_FOUND');
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'cli-gh-rerun-conflict-'));
+    const summaryFile = join(dir, 'summary.json');
+    const stdoutLines: string[] = [];
+    const err = await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 10,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'text',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+        ghOutput: true,
+        summaryFile,
+      },
+      {
+        ...creds,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: () => undefined,
+        env: {} as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    // The all-conflict rerun still exits 6, but now surfaces it in CI first.
+    expect(err).toMatchObject({ exitCode: 6 });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
+      total: number;
+      passed: number;
+      failed: number;
+      skipped: number;
+      runs: { testId: string; status: string }[];
+    };
+    // Conflicts count as `skipped`, not `failed` — nothing ran; the
+    // exit-6 above is what fails the job, and the artifact agrees with it.
+    expect(artifact).toMatchObject({ total: 2, passed: 0, failed: 0, skipped: 2 });
+    expect(artifact.runs.every(r => r.status === 'conflict')).toBe(true);
+    // Never-dispatched rows annotate as warnings, not errors.
+    const annotations = stdoutLines.filter(line => line.startsWith('::warning'));
+    expect(annotations).toHaveLength(2);
+    expect(stdoutLines.filter(line => line.startsWith('::error'))).toHaveLength(0);
+  });
 });
 
 describe('rerun --gh-output / --summary-file require a batch --wait (Gap B guard)', () => {
@@ -5885,5 +6158,121 @@ describe('rerun --gh-output / --summary-file require a batch --wait (Gap B guard
     await expect(
       test.parseAsync(['rerun', 'test_1', 'test_2', '--gh-output'], { from: 'user' }),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEV-1305 — `test rerun --env <name>`
+// ---------------------------------------------------------------------------
+
+describe('runTestRerun — --env (DEV-1305)', () => {
+  const ME_ON = { userId: 'u_1' };
+
+  interface Seen {
+    method: string;
+    url: string;
+    body: unknown;
+  }
+
+  function fetchFor(me: unknown, seen: Seen[]): typeof globalThis.fetch {
+    return makeFetch((url, init) => {
+      const method = (init.method ?? 'GET').toUpperCase();
+      const body =
+        init.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      seen.push({ method, url, body });
+      if (url.endsWith('/me')) return { body: me };
+      if (url.includes('/tests/batch/rerun')) {
+        return {
+          body: {
+            accepted: [
+              { testId: 'test_fe_01', runId: 'run_1', enqueuedAt: '2026-09-09T00:00:00.000Z' },
+              { testId: 'test_fe_02', runId: 'run_2', enqueuedAt: '2026-09-09T00:00:00.000Z' },
+            ],
+            deferred: [],
+            conflicts: [],
+            closure: { byProject: [] },
+          },
+        };
+      }
+      if (url.includes('/runs/rerun')) return { body: makeFeRerunResp() };
+      return { body: FE_TEST };
+    });
+  }
+
+  const base = {
+    all: false,
+    wait: false,
+    timeoutSeconds: 600,
+    autoHeal: false,
+    autoHealExplicit: false,
+    skipDependencies: false,
+    maxConcurrency: 10,
+    output: 'json' as const,
+    profile: 'default',
+    dryRun: false,
+    debug: false,
+    verbose: false,
+  };
+
+  it('single rerun: `environment` rides on the body, with no capability probe', async () => {
+    const creds = makeCreds();
+    const seen: Seen[] = [];
+    await runTestRerun(
+      { ...base, testIds: ['test_fe_01'], environment: 'staging' },
+      {
+        ...creds,
+        fetchImpl: fetchFor(ME_ON, seen),
+        stdout: () => {},
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    const rerun = seen.find(
+      s => s.method === 'POST' && s.url.includes('/tests/test_fe_01/runs/rerun'),
+    );
+    expect(rerun?.body).toEqual({ source: 'cli', autoHeal: false, environment: 'staging' });
+    // Naming an environment is an argument, not a privilege — nothing is asked
+    // for permission before the rerun is dispatched.
+    expect(seen.filter(s => s.url.endsWith('/me'))).toEqual([]);
+  });
+
+  it('batch rerun: every chunk carries `environment`', async () => {
+    const creds = makeCreds();
+    const seen: Seen[] = [];
+    await runTestRerun(
+      { ...base, testIds: ['test_fe_01', 'test_fe_02'], environment: 'staging' },
+      {
+        ...creds,
+        fetchImpl: fetchFor(ME_ON, seen),
+        stdout: () => {},
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    const batch = seen.find(s => s.method === 'POST' && s.url.includes('/tests/batch/rerun'));
+    expect(batch?.body).toEqual({
+      source: 'cli',
+      testIds: ['test_fe_01', 'test_fe_02'],
+      autoHeal: false,
+      environment: 'staging',
+    });
+  });
+
+  it('without --env the body is byte-identical to before', async () => {
+    const creds = makeCreds();
+    const seen: Seen[] = [];
+    await runTestRerun(
+      { ...base, testIds: ['test_fe_01'] },
+      {
+        ...creds,
+        fetchImpl: fetchFor(ME_ON, seen),
+        stdout: () => {},
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    const rerun = seen.find(s => s.method === 'POST');
+    expect(rerun?.body).toEqual({ source: 'cli', autoHeal: false });
+    expect(seen.some(s => s.url.endsWith('/me'))).toBe(false);
   });
 });

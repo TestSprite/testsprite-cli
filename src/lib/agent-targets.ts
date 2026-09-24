@@ -22,10 +22,12 @@ export interface TargetSpec {
   mode: 'own-file' | 'managed-section';
   /**
    * When true, render the budget-friendly body (see {@link compactBodyFor})
-   * instead of the full own-file skill body. Used for own-file targets whose
-   * rule files are size-capped — currently `windsurf` (`.windsurf/rules/*.md`
-   * files cap at ~12 K characters and Cascade silently truncates beyond that,
-   * which would cut the full ~22 KB verify skill in half).
+   * instead of the full own-file skill body. Set for own-file targets that must
+   * keep their rule file small: `windsurf` (hard ~12 K-char cap, silently
+   * truncated beyond) and `copilot` (no cap, but `applyTo: '**'` injects it into
+   * every request, so context cost is the constraint).
+   *
+   * Read it via {@link ownFileBodyFor}, never by testing target names (DEV-672).
    */
   compactBody?: boolean;
   /**
@@ -394,6 +396,20 @@ export function compactBodyFor(skill: string, read: ReadFn = defaultRead): strin
 }
 
 /**
+ * The canonical own-file body for a (target, skill) pair, and therefore the body
+ * the install marker's hash covers. Every producer AND consumer of an own-file
+ * body must resolve through here — install and status keeping separate copies of
+ * this rule is what caused DEV-672.
+ */
+export function ownFileBodyFor(
+  target: AgentTarget,
+  skill: string,
+  read: ReadFn = defaultRead,
+): string {
+  return TARGETS[target].compactBody ? compactBodyFor(skill, read) : loadSkillBodyFor(skill, read);
+}
+
+/**
  * Resolve a skill's codex (AGENTS.md) contribution as a Markdown string.
  * 'full' → read the `*.codex.md` asset; 'line' → the inline one-liner; 'none' → ''.
  */
@@ -483,7 +499,7 @@ export function renderOwnFileWithMarker(
   }
   const skillSpec = SKILLS[skill];
   if (!skillSpec) throw new Error(`unknown skill: ${skill}`);
-  const resolvedBody = body !== undefined ? body : loadSkillBodyFor(skill);
+  const resolvedBody = body !== undefined ? body : ownFileBodyFor(target, skill);
   return injectMarkerLine(
     spec.wrap(skillSpec.name, skillSpec.description, resolvedBody),
     markerLine,
@@ -516,8 +532,7 @@ export function renderForTarget(
     const resolvedBody = body !== undefined ? body : codexContentFor(skill);
     return { path, content: spec.wrap(skillSpec.name, skillSpec.description, resolvedBody) };
   }
-  const resolvedBody =
-    body !== undefined ? body : spec.compactBody ? compactBodyFor(skill) : loadSkillBodyFor(skill);
+  const resolvedBody = body !== undefined ? body : ownFileBodyFor(t, skill);
   return {
     path,
     content: renderOwnFileWithMarker(t, skill, buildSkillMarker(skill, resolvedBody), resolvedBody),

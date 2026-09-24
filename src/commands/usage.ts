@@ -24,6 +24,7 @@ import type { FetchImpl } from '../lib/http.js';
 import type { CliOrgBinding, CliOrgSummary } from '../lib/org-render.js';
 import { formatOrgBinding, formatOrgsSummary } from '../lib/org-render.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
+import { USAGE_RESPONSE_SCHEMA } from '../lib/response-schemas.js';
 
 /**
  * Usage/balance response from `/me` (when the backend supplies it) or a future
@@ -168,7 +169,7 @@ export async function runUsage(opts: CommonOptions, deps: UsageDeps = {}): Promi
   // /me is the only available source of credits/plan today. If the backend
   // adds a dedicated /usage endpoint later, this single get call is where
   // it would be swapped in — no other code change needed in the CLI.
-  const me = await client.get<UsageResponse>('/me');
+  const me = await client.get<UsageResponse>('/me', { schema: USAGE_RESPONSE_SCHEMA });
 
   out.print(me, data => renderUsage(data as UsageResponse, portalBase));
 

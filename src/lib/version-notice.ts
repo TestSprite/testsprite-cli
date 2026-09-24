@@ -15,6 +15,15 @@
  * notice names the npm LATEST and fires whenever a newer release exists. Each
  * owns its own number — the backend never advertises "latest".
  *
+ * Under GitHub Actions the same below-floor observation is surfaced as a
+ * `::warning::` workflow command instead (see {@link formatPinnedVersionWarning}):
+ * a `ci init`-generated workflow pins `cli-version` to the version that
+ * generated it, so the job keeps running that version forever and the plain
+ * stderr line (TTY-gated) would never be seen. The floor header is the only
+ * version signal a CI run has in-process — the npm update check is skipped
+ * under `CI` by design — so this fires only when the pin has fallen BELOW the
+ * floor, not merely behind the newest release.
+ *
  * Reuses `compareSemver` and the `TESTSPRITE_NO_UPDATE_NOTIFIER` opt-out from
  * `update-check.ts` so the gating and semver semantics stay consistent.
  */
@@ -41,6 +50,26 @@ export interface VersionNoticeDeps {
 }
 
 /**
+ * The gates every advisory shares: opt-out env, dry-run, a present + parseable
+ * floor, and the running version strictly below it. Pure.
+ */
+function isBelowFloor(info: ServerVersionInfo, deps: VersionNoticeDeps): boolean {
+  const env = deps.env ?? process.env;
+  const currentVersion = deps.currentVersion ?? VERSION;
+
+  const optOut = env[UPDATE_CHECK_OPT_OUT_ENV];
+  if (optOut !== undefined && optOut !== '') return false;
+  if (deps.dryRun === true) return false;
+
+  const minVersion = info.minVersion;
+  if (!minVersion) return false;
+
+  // compareSemver returns -1 when the first arg is OLDER than the second.
+  // Unparseable input on either side compares as 0, so garbage never warns.
+  return compareSemver(currentVersion, minVersion) === -1;
+}
+
+/**
  * True when every gate passes and the running version is strictly below the
  * advertised floor. Gates mirror the update notice: opt-out env, JSON output,
  * dry-run, and non-TTY all suppress. Pure — no side effects, no process state.
@@ -49,22 +78,27 @@ export function shouldWarnBelowFloor(
   info: ServerVersionInfo,
   deps: VersionNoticeDeps = {},
 ): boolean {
-  const env = deps.env ?? process.env;
-  const currentVersion = deps.currentVersion ?? VERSION;
   const isTTY = deps.isTTY ?? process.stderr.isTTY === true;
-
-  const optOut = env[UPDATE_CHECK_OPT_OUT_ENV];
-  if (optOut !== undefined && optOut !== '') return false;
   if (deps.outputMode === 'json') return false;
-  if (deps.dryRun === true) return false;
   if (!isTTY) return false;
+  return isBelowFloor(info, deps);
+}
 
-  const minVersion = info.minVersion;
-  if (!minVersion) return false;
-
-  // compareSemver returns -1 when the first arg is OLDER than the second.
-  // Unparseable input on either side compares as 0, so garbage never warns.
-  return compareSemver(currentVersion, minVersion) === -1;
+/**
+ * True when the below-floor state should be surfaced as a GitHub Actions
+ * `::warning::` annotation: running under Actions (`GITHUB_ACTIONS=true`), not
+ * opted out, not dry-run, and strictly below the floor. Deliberately NOT gated
+ * on TTY or `--output json` — an Actions job is never a TTY, and a workflow
+ * command is parsed by the runner from either stream, so it can ride stderr
+ * without touching a JSON envelope on stdout.
+ */
+export function shouldWarnPinnedInActions(
+  info: ServerVersionInfo,
+  deps: VersionNoticeDeps = {},
+): boolean {
+  const env = deps.env ?? process.env;
+  if (env.GITHUB_ACTIONS !== 'true') return false;
+  return isBelowFloor(info, deps);
 }
 
 /**
@@ -80,6 +114,21 @@ export function formatBelowFloorNotice(currentVersion: string, minVersion: strin
   );
 }
 
+/**
+ * The GitHub Actions workflow-command form of the advisory. Names the pinned
+ * (running) version, the floor it has fallen below, and the one command that
+ * re-pins the workflow to a current release. Both versions come from semver
+ * strings that already parsed (see `isBelowFloor`), so no command-data escaping
+ * is needed — neither can carry `%`, CR or LF.
+ */
+export function formatPinnedVersionWarning(currentVersion: string, minVersion: string): string {
+  return (
+    `::warning title=TestSprite::testsprite-cli ${currentVersion} is pinned in this workflow ` +
+    `and is below the minimum supported version ${minVersion}. ` +
+    `Regenerate with testsprite ci init github --force.`
+  );
+}
+
 /** Module-level guard: at most one below-floor advisory per process. */
 let warnedThisProcess = false;
 
@@ -91,19 +140,27 @@ export function resetBelowFloorNoticeState(): void {
 /**
  * Emit the below-floor advisory at most once per process. Wired to the HTTP
  * client's `onServerVersion` hook. Never throws — an advisory must not break or
- * delay the command it rides along with.
+ * delay the command it rides along with. Under GitHub Actions the advisory is
+ * the `::warning::` workflow command (annotates the job) instead of the plain
+ * TTY line; exactly one of the two is ever emitted.
  */
 export function noteServerVersion(info: ServerVersionInfo, deps: VersionNoticeDeps = {}): void {
   try {
     if (warnedThisProcess) return;
-    if (!shouldWarnBelowFloor(info, deps)) return;
+
+    const inActions = shouldWarnPinnedInActions(info, deps);
+    if (!inActions && !shouldWarnBelowFloor(info, deps)) return;
 
     const minVersion = info.minVersion;
     if (!minVersion) return;
 
     const currentVersion = deps.currentVersion ?? VERSION;
     const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-    stderr(formatBelowFloorNotice(currentVersion, minVersion));
+    stderr(
+      inActions
+        ? formatPinnedVersionWarning(currentVersion, minVersion)
+        : formatBelowFloorNotice(currentVersion, minVersion),
+    );
     warnedThisProcess = true;
   } catch {
     // Advisory is best-effort; never surface its failures to the command.

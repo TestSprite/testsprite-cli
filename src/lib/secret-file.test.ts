@@ -20,29 +20,34 @@ afterEach(() => {
 describe('readSecretFileGuarded', () => {
   it('returns the file contents', () => {
     const path = join(tmpRoot, 'pw.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (tmpRoot), not user input.
     writeFileSync(path, 'hunter2');
     expect(readSecretFileGuarded('password-file', path)).toBe('hunter2');
   });
 
   it('trims surrounding whitespace and the trailing newline', () => {
     const path = join(tmpRoot, 'pw-newline.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (tmpRoot), not user input.
     writeFileSync(path, '  hunter2  \n');
     expect(readSecretFileGuarded('password-file', path)).toBe('hunter2');
   });
 
   it('drops a leading UTF-8 BOM so PowerShell-written files still work', () => {
     const path = join(tmpRoot, 'pw-bom.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (tmpRoot), not user input.
     writeFileSync(path, '﻿hunter2\n');
     expect(readSecretFileGuarded('password-file', path)).toBe('hunter2');
   });
 
   it('preserves interior whitespace', () => {
     const path = join(tmpRoot, 'pw-spaces.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (tmpRoot), not user input.
     writeFileSync(path, 'two words\n');
     expect(readSecretFileGuarded('password-file', path)).toBe('two words');
   });
 
   it('resolves a relative path against the working directory', () => {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (tmpRoot), not user input.
     writeFileSync(join(tmpRoot, 'relative.txt'), 'from-cwd');
     process.chdir(tmpRoot);
     expect(readSecretFileGuarded('password-file', 'relative.txt')).toBe('from-cwd');
@@ -50,6 +55,7 @@ describe('readSecretFileGuarded', () => {
 
   it('returns an empty string for an empty file rather than throwing', () => {
     const path = join(tmpRoot, 'empty.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (tmpRoot), not user input.
     writeFileSync(path, '');
     expect(readSecretFileGuarded('password-file', path)).toBe('');
   });
@@ -105,6 +111,7 @@ describe('readSecretFileGuarded', () => {
   describe('directory instead of a file', () => {
     it('throws VALIDATION_ERROR instead of crashing with EISDIR', () => {
       const path = join(tmpRoot, 'a-directory');
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture directory created inside this test's own mkdtempSync-created temp dir (tmpRoot), not user input.
       mkdirSync(path);
       try {
         readSecretFileGuarded('password-file', path);

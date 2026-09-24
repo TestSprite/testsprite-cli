@@ -64,6 +64,30 @@ export interface CredentialsOptions {
   path?: string;
 }
 
+type CredentialsWritePermissionError = NodeJS.ErrnoException & {
+  code: 'EPERM' | 'EACCES' | 'EROFS';
+};
+
+// Keep the original errno object and distinguish write permissions from errors
+// while reading profiles, recovering locks, or tightening file permissions.
+const writePermissionErrors = new WeakSet<Error>();
+
+export function isCredentialsWritePermissionError(
+  error: unknown,
+): error is CredentialsWritePermissionError {
+  return error instanceof Error && writePermissionErrors.has(error);
+}
+
+function rethrowCredentialsWriteError(error: unknown): never {
+  if (
+    isErrnoException(error) &&
+    (error.code === 'EPERM' || error.code === 'EACCES' || error.code === 'EROFS')
+  ) {
+    writePermissionErrors.add(error);
+  }
+  throw error;
+}
+
 interface CredentialsLockInfo {
   pid?: number;
   createdAt?: number;
@@ -266,7 +290,12 @@ function mutateCredentialsFile(
   path: string,
   mutate: (file: CredentialsFile) => CredentialsFile | undefined,
 ): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `path` is the credentials-file path this module already operates on (default `~/.testsprite/credentials`, or the caller-supplied `CredentialsOptions.path`), not new external input; same risk profile as the baselined fs calls in this file.
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  } catch (error) {
+    rethrowCredentialsWriteError(error);
+  }
   const lock = acquireCredentialsLock(path);
   try {
     const file = readCredentialsFile({ path });
@@ -281,8 +310,26 @@ function mutateCredentialsFile(
 
 function writeCredentialsAtomic(path: string, file: CredentialsFile): void {
   const tmp = `${path}.tmp.${process.pid}`;
-  writeFileSync(tmp, serializeCredentials(file), { mode: 0o600, encoding: 'utf8' });
-  renameSync(tmp, path);
+  try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmp` is `${path}.tmp.${pid}`, derived from the same internal credentials-file path; same baselined risk profile as the other fs calls in this file.
+    writeFileSync(tmp, serializeCredentials(file), { mode: 0o600, encoding: 'utf8' });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- both operands derive from the internal credentials-file path (see above).
+    renameSync(tmp, path);
+  } catch (error) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- best-effort cleanup of the temp file this function just created; same internal path.
+      unlinkSync(tmp);
+    } catch (cleanupError) {
+      if (!isErrnoException(cleanupError) || cleanupError.code !== 'ENOENT') {
+        // Do not mark this as a permission error eligible for session-only setup:
+        // the temporary file can still contain the API key.
+        throw new Error(`Temporary credentials could not be cleaned up at ${tmp}.`, {
+          cause: cleanupError,
+        });
+      }
+    }
+    rethrowCredentialsWriteError(error);
+  }
   ensureRestrictiveMode(path);
 }
 
@@ -309,7 +356,7 @@ function acquireCredentialsLock(path: string): CredentialsLock {
       };
     } catch (error) {
       if (!isErrnoException(error) || error.code !== 'EEXIST') {
-        throw error;
+        rethrowCredentialsWriteError(error);
       }
 
       reclaimStaleCredentialsLock(lockPath);
@@ -326,6 +373,34 @@ function acquireCredentialsLock(path: string): CredentialsLock {
   }
 }
 
+/**
+ * Age is normally read from the lock body's own `createdAt` (unchanged from
+ * before — this is what lets a legitimately abandoned lock from a crashed
+ * process, or a test simulating one, report an age older than the file's own
+ * mtime). It is ONLY when the body cannot be read/parsed that this falls back
+ * to the lock file's filesystem mtime (`statSync`) rather than treating an
+ * unreadable body as `Number.POSITIVE_INFINITY` (i.e. "infinitely stale"), as
+ * an earlier version of this function did.
+ *
+ * That fallback-to-infinity was the bug: a transient, benign read/parse
+ * failure — e.g. this reader's `readFileSync` landing in the brief window
+ * where the current holder is rewriting or releasing the file — was
+ * indistinguishable from "no `createdAt` at all", which always cleared the
+ * staleness check regardless of true age. That could unlink a lock that was
+ * milliseconds old and actively held, so the real owner's later
+ * `assertHeld()` call failed with "lost ownership" even though nothing had
+ * actually gone stale — reproduced locally under concurrent-writer load
+ * (multiple `writeProfile` calls racing for the same credentials file) and
+ * matches the failure signature seen under CI contention. `statSync` is a
+ * single atomic syscall, so — unlike reading-then-parsing a small file — it
+ * cannot itself be fooled by a torn write; when it also fails (ENOENT because
+ * the holder already released it, or a transient EPERM/EBUSY on Windows
+ * while a handle is still closing) that is treated as "nothing to safely
+ * reclaim right now" rather than "definitely gone" — the acquire loop's own
+ * retry/deadline handles the ordinary case of the file being gone by simply
+ * succeeding on the next `wx` attempt, so there is no need for this function
+ * to draw that conclusion itself.
+ */
 function reclaimStaleCredentialsLock(lockPath: string): void {
   let lockInfo: CredentialsLockInfo | undefined;
   try {
@@ -335,7 +410,19 @@ function reclaimStaleCredentialsLock(lockPath: string): void {
   }
 
   const createdAt = typeof lockInfo?.createdAt === 'number' ? lockInfo.createdAt : undefined;
-  const ageMs = createdAt === undefined ? Number.POSITIVE_INFINITY : Date.now() - createdAt;
+  let ageMs: number;
+  if (createdAt !== undefined) {
+    ageMs = Date.now() - createdAt;
+  } else {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `lockPath` is `${credentialsPath}.lock`, derived internally from the same credentials-file path this whole module already operates on (default `~/.testsprite/credentials`, or the caller-supplied path in `CredentialsOptions.path`) — the identical, already-baselined risk profile as this file's other lock/credentials fs calls, not new external input.
+      ageMs = Date.now() - statSync(lockPath).mtimeMs;
+    } catch {
+      // Already gone (or otherwise inaccessible) — nothing to reclaim.
+      return;
+    }
+  }
+
   const pid = typeof lockInfo?.pid === 'number' ? lockInfo.pid : undefined;
   if (ageMs <= CREDENTIALS_LOCK_STALE_MS && (pid === undefined || isProcessAlive(pid))) {
     return;

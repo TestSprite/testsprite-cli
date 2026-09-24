@@ -80,19 +80,83 @@ describe('Output', () => {
     expect(logSpy).toHaveBeenCalledWith(JSON.stringify({ x: 1 }, null, 2));
   });
 
-  it('error in json mode emits structured JSON to stderr', () => {
-    new Output('json').error('boom');
-    expect(errorSpy).toHaveBeenCalledWith(JSON.stringify({ error: 'boom' }, null, 2));
+  it('error in json mode emits a structured {code,message} envelope to stderr', () => {
+    new Output('json').error({ code: 'CLI_ERROR', message: 'boom' });
+    expect(errorSpy).toHaveBeenCalledWith(
+      JSON.stringify(
+        {
+          error: {
+            code: 'CLI_ERROR',
+            message: 'boom',
+            nextAction: '',
+            requestId: 'local',
+            details: {},
+          },
+        },
+        null,
+        2,
+      ),
+    );
   });
 
-  it('error in text mode emits prefixed text to stderr', () => {
-    new Output('text').error('boom');
+  it('error in text mode emits prefixed text to stderr (code is not shown)', () => {
+    new Output('text').error({ code: 'CLI_ERROR', message: 'boom' });
     expect(errorSpy).toHaveBeenCalledWith('Error: boom');
   });
 
   it('defaults to text mode', () => {
-    new Output().error('boom');
+    new Output().error({ code: 'CLI_ERROR', message: 'boom' });
     expect(errorSpy).toHaveBeenCalledWith('Error: boom');
+  });
+
+  // Contract test: every `--output json` error branch in
+  // index.ts's catch (ApiError, InterruptError, RequestTimeoutError,
+  // CLIError, and the uncaught-exception fallback) must render the SAME
+  // 5-key envelope shape `{error:{code,message,nextAction,requestId,details}}`
+  // — never a bare string. Before this patch, Output.error() only accepted a
+  // plain message string and emitted `{"error":"<message>"}`, which is why
+  // the CLIError/uncaught-exception branches in index.ts (the only two
+  // callers of this method) broke the contract that the ApiError/
+  // InterruptError/RequestTimeoutError branches (which build their own
+  // envelopes by hand) already followed.
+  describe('error() envelope shape contract', () => {
+    it.each([
+      { code: 'CLI_ERROR', message: 'boom' },
+      { code: 'UNCAUGHT_EXCEPTION', message: 'ENOENT: no such file' },
+      { code: 'ENOENT', message: 'no such file' },
+    ])('always emits the full 5-key envelope for %j', input => {
+      new Output('json').error(input);
+      const written = errorSpy.mock.calls[0]?.[0] as string;
+      const parsed = JSON.parse(written) as { error: Record<string, unknown> };
+      expect(Object.keys(parsed.error).sort()).toEqual(
+        ['code', 'details', 'message', 'nextAction', 'requestId'].sort(),
+      );
+      expect(parsed.error.code).toBe(input.code);
+      expect(parsed.error.message).toBe(input.message);
+      expect(parsed.error.nextAction).toBe('');
+      expect(parsed.error.requestId).toBe('local');
+      expect(parsed.error.details).toEqual({});
+    });
+
+    it('honors explicit nextAction / requestId / details overrides', () => {
+      new Output('json').error({
+        code: 'VALIDATION_ERROR',
+        message: 'bad flag',
+        nextAction: 'fix the flag',
+        requestId: 'req_123',
+        details: { field: 'x' },
+      });
+      const written = errorSpy.mock.calls[0]?.[0] as string;
+      expect(JSON.parse(written)).toEqual({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'bad flag',
+          nextAction: 'fix the flag',
+          requestId: 'req_123',
+          details: { field: 'x' },
+        },
+      });
+    });
   });
 });
 

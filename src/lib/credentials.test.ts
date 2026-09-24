@@ -1,4 +1,12 @@
-import { mkdtempSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import {
+  mkdtempSync,
+  statSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  utimesSync,
+} from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -169,6 +177,47 @@ describe('writeProfile', () => {
     expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
     expect(existsSync(lockPath)).toBe(false);
   });
+
+  it('reclaims a stale lock via filesystem mtime when the lock body is corrupt/unreadable', () => {
+    // A lock whose body cannot be parsed (e.g. a crash mid-write, or disk
+    // corruption) must still be reclaimable once it is genuinely old -- the
+    // mtime fallback (used only when `createdAt` cannot be read) is what
+    // makes that possible without trusting the unreadable content itself.
+    const lockPath = `${credentialsPath}.lock`;
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `lockPath` is derived from this suite's `mkdtempSync` temp dir, never user input; writing a deliberately corrupt lock body is the point of the test
+    writeFileSync(lockPath, 'not valid json{{{');
+    const old = new Date(Date.now() - 60_000);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same temp path; ageing the lock's mtime is how this test makes it genuinely stale without trusting the unreadable body
+    utimesSync(lockPath, old, old);
+
+    writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath });
+
+    expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same temp path; asserting the stale lock was reclaimed
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it('does NOT reclaim a fresh lock just because its body is corrupt/unreadable', () => {
+    // Regression guard: an earlier implementation treated an unreadable body
+    // as `Number.POSITIVE_INFINITY` age -- indistinguishable from "genuinely
+    // abandoned" -- regardless of how young the lock file actually was. That
+    // let a benign, transient read failure (racing the real holder's own
+    // create/release of the very same file) delete an active lock that was
+    // milliseconds old, stealing it out from under its legitimate owner. A
+    // freshly-written (mtime ~= now) but unparseable lock must be left alone;
+    // `writeProfile` should time out waiting for it rather than silently
+    // reclaiming it.
+    const lockPath = `${credentialsPath}.lock`;
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same temp path; a freshly-written corrupt lock is exactly the regression case being guarded
+    writeFileSync(lockPath, 'not valid json{{{');
+
+    expect(() => writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath })).toThrow(
+      ApiError,
+    );
+    // The lock must still be there -- it was never reclaimed.
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same temp path; asserting the fresh lock was NOT reclaimed
+    expect(existsSync(lockPath)).toBe(true);
+  }, 8_000);
 
   it('does not leak the api key into the on-disk file format aside from the value itself', () => {
     writeProfile('default', { apiKey: 'sk-secret-12345' }, { path: credentialsPath });

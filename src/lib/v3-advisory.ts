@@ -1,9 +1,16 @@
 /**
- * Shared V3-routing text surfaces for `auth status` and `doctor`.
+ * Shared V3-routing text surfaces.
  *
- * `v3Enabled` on the `/me` response is the authoritative routing bit. When it
- * is on, some commands behave differently while the V3 gaps stay open — the
- * advisory names them. Copy lives here so both commands stay in sync.
+ * `V3_ROUTING_ADVISORY`/`emitV3RoutingAdvisory` back `auth status` and
+ * `doctor`: `v3Enabled` on the `/me` response is the authoritative routing
+ * bit, and when it is on, some commands behave differently while the V3
+ * gaps stay open — the advisory names them. Copy lives here so both
+ * commands stay in sync.
+ *
+ * `targetUrlAdvisoryText`/`emitTargetUrlMismatchAdvisory` back the
+ * `--target-url` point-of-use advisory in `commands/test.ts` — a different,
+ * response-driven mechanism (see its own docblock below) that does not
+ * depend on `v3Enabled` at all.
  */
 
 /** One-word routing label for the text card. */
@@ -33,27 +40,45 @@ export function emitV3RoutingAdvisory(stderr: (line: string) => void): void {
 }
 
 /**
- * Point-of-use advisory for `test run --target-url` on a V3-routed caller
- * (DEV-749). `V3_ROUTING_ADVISORY` above already names this gap once, in
- * the account-level summary `auth status`/`doctor` print — this is the
- * SAME gap surfaced at the moment the caller actually hits it, matching
- * the existing backend-test `--target-url` advisory in `runCreate`
- * (`commands/test.ts`): unconditional across every `--output` mode. That
- * advisory's family is "a flag the caller just passed has a structural
- * consequence" — `--output json` is precisely the unattended/CI case that
- * needs the warning most, not the case to withhold it from (unlike the
- * routing-advisory family above, which a JSON caller can skip by reading
- * `v3Enabled` directly off that command's own structured output — `test
- * run`'s JSON output carries no such field). Deliberately type-agnostic
- * (no "on frontend runs" claim): the CLI cannot learn a test's type at
- * `test run <existing-test-id>` time without an extra round trip, and the
- * override is equally inert on the V3 backend-run path.
+ * Point-of-use advisory for `test run --target-url`, redesigned to be
+ * response-driven rather than assumption-driven. The original
+ * version probed `GET /me` for `v3Enabled` and warned on that ASSUMPTION —
+ * but the backend is the ground truth here, not a proxy for it. V3
+ * deliberately returns `targetUrl: ''` rather than echoing an override it
+ * did not apply ("so the response doesn't claim a target we didn't use"),
+ * while V2 echoes the real applied value. So the advisory now fires purely
+ * from comparing what the caller asked for against what the trigger
+ * response reports — it self-corrects the day the backend applies the
+ * override, needs no `v3Enabled` lookup (and so no extra `/me` round trip,
+ * no `X-CLI-Command` tagging machinery), and is exact rather than inferred.
+ *
+ * Deliberately type-agnostic in its wording (no "on the V3 path" claim):
+ * a mismatch is reported purely from the observed response, regardless of
+ * why the backend didn't apply the override.
  */
-export const TARGET_URL_V3_ADVISORY =
-  "[advisory] --target-url is not applied on the V3 execution path; the run uses the test's " +
-  'configured environment instead.';
+export function targetUrlAdvisoryText(requested: string, applied: string): string {
+  const appliedClause =
+    applied.length > 0
+      ? `the run will use ${applied} instead`
+      : 'the run reports no target URL for it';
+  return (
+    `[advisory] --target-url ${requested} was not applied to this run — ${appliedClause}. ` +
+    `The run used its own configured environment.`
+  );
+}
 
-/** Write the target-url advisory to a stderr sink. */
-export function emitTargetUrlV3Advisory(stderr: (line: string) => void): void {
-  stderr(TARGET_URL_V3_ADVISORY);
+/**
+ * Compare the requested `--target-url` against what the trigger response
+ * reports and write the advisory when they differ. No-op when they match
+ * (the override was applied, or the caller didn't supply one — callers are
+ * expected to gate the `requested` argument on `opts.targetUrl !== undefined`
+ * themselves so this stays a pure comparison).
+ */
+export function emitTargetUrlMismatchAdvisory(
+  stderr: (line: string) => void,
+  requested: string,
+  applied: string,
+): void {
+  if (applied === requested) return;
+  stderr(targetUrlAdvisoryText(requested, applied));
 }

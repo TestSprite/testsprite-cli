@@ -7,8 +7,12 @@
  * forced).
  */
 
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  emitCiArtifacts,
   emitGithubOutputs,
   renderJobSummaryMarkdown,
   summarizeAcceptedPayload,
@@ -68,9 +72,13 @@ describe('summarizeAcceptedPayload', () => {
         notFound: ['test_nf'],
       }),
     );
-    // 1 accepted-passed + 3 not-dispatched → NOT reported as "1/1 passed".
+    // 1 accepted-passed + 3 not-dispatched → NOT reported as "1/1 passed",
+    // but the never-dispatched rows count as `skipped`, not `failed`:
+    // nothing ran and failed, and a `failed` count the exit-code gates disagree
+    // with is exactly the summary-contradicts-the-exit bug.
     expect(summary).toMatchObject({ total: 4, passed: 1, timedOut: 0 });
-    expect(summary.failed).toBe(3);
+    expect(summary.failed).toBe(0);
+    expect(summary.skipped).toBe(3);
     expect(summary.runs.map(r => r.status)).toEqual([
       'passed',
       'deferred',
@@ -92,7 +100,20 @@ describe('summarizeAcceptedPayload', () => {
         notFound: [],
       }),
     );
-    expect(summary).toMatchObject({ total: 1, passed: 1, failed: 0, timedOut: 0 });
+    expect(summary).toMatchObject({ total: 1, passed: 1, failed: 0, skipped: 0, timedOut: 0 });
+  });
+
+  it('a mixed batch keeps `failed` for dispatched non-passes only (measured repro shape)', () => {
+    // The ticket's reproduction: test_1 accepted+passed, test_2 conflicted.
+    // The artifact must not claim `failed: 1` while the batch's own summary
+    // (and possibly the exit code) says nothing failed.
+    const summary = summarizeAcceptedPayload(
+      JSON.stringify({
+        accepted: [{ testId: 'test_1', runId: 'run_1', status: 'passed' }],
+        conflicts: [{ testId: 'test_2', currentRunId: 'run_2' }],
+      }),
+    );
+    expect(summary).toMatchObject({ total: 2, passed: 1, failed: 0, skipped: 1, timedOut: 0 });
   });
 });
 
@@ -142,8 +163,10 @@ describe('summarizeSingleRun', () => {
 describe('renderJobSummaryMarkdown', () => {
   it('renders the counts headline and one table row per run', () => {
     const md = renderJobSummaryMarkdown(summarizeAcceptedPayload(PAYLOAD));
-    expect(md).toContain('**1/3 passed** (1 failed, 1 timed out)');
-    expect(md).toContain('| test_a | passed | [dashboard](https://portal.example.com/a) |');
+    expect(md).toContain('**1/3 passed** (1 failed, 0 skipped, 1 timed out)');
+    // test_a has dashboardUrl but no executionUrl: the title (id fallback) links
+    // to the test-case page; the Run cell shows the raw runId (no execution link).
+    expect(md).toContain('| [test_a](https://portal.example.com/a) | passed | run_a |');
     expect(md).toContain('| test_c | timeout | run_c |');
   });
 
@@ -152,6 +175,7 @@ describe('renderJobSummaryMarkdown', () => {
       total: 1,
       passed: 0,
       failed: 1,
+      skipped: 0,
       timedOut: 0,
       runs: [
         {
@@ -209,6 +233,32 @@ describe('emitGithubOutputs', () => {
     expect(annotations[1]).toContain('test_c');
   });
 
+  it('never-dispatched rows annotate as ::warning::, dispatched failures as ::error::', () => {
+    const { stdout, sinks } = makeSinks();
+    const mixed = summarizeAcceptedPayload(
+      JSON.stringify({
+        accepted: [
+          { testId: 'test_pass', runId: 'r1', status: 'passed' },
+          { testId: 'test_fail', runId: 'r2', status: 'failed' },
+        ],
+        conflicts: [{ testId: 'test_conf', currentRunId: 'r3' }],
+        notFound: ['test_nf'],
+        deferred: [{ testId: 'test_def' }],
+      }),
+    );
+    emitGithubOutputs(mixed, { GITHUB_ACTIONS: 'true' }, sinks);
+    // A red ::error:: on a green job is the checks-tab half of the same
+    // contradiction — only the genuinely-failed run may carry it.
+    const errors = stdout.filter(line => line.startsWith('::error'));
+    const warnings = stdout.filter(line => line.startsWith('::warning'));
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('test_fail');
+    expect(warnings).toHaveLength(3);
+    expect(warnings.join('\n')).toContain('test_conf');
+    expect(warnings.join('\n')).toContain('test_nf');
+    expect(warnings.join('\n')).toContain('test_def');
+  });
+
   it('emits nothing off-CI, and a broken summary file downgrades to stderr', () => {
     const offCi = makeSinks();
     emitGithubOutputs(summary, {}, offCi.sinks);
@@ -227,6 +277,24 @@ describe('emitGithubOutputs', () => {
       },
     );
     expect(broken.stderr.join('\n')).toContain('could not append');
+    // The failure message names the command via the `label` opt (default 'run').
+    // Pin BOTH directions so reverting the `[${label}]` template to a hardcoded
+    // `[run]` can't pass silently: default is `[run]`, and a caller-supplied
+    // label appears verbatim.
+    expect(broken.stderr.join('\n')).toContain('[run]');
+    const labeled = makeSinks();
+    emitGithubOutputs(
+      summary,
+      { GITHUB_STEP_SUMMARY: '/gh/summary.md' },
+      {
+        ...labeled.sinks,
+        appendFile: () => {
+          throw new Error('EROFS');
+        },
+      },
+      { label: 'testlist run' },
+    );
+    expect(labeled.stderr.join('\n')).toContain('[testlist run]');
   });
 
   it('force (--gh-output) emits annotations off-Actions; the step summary still needs its env path', () => {
@@ -243,6 +311,7 @@ describe('emitGithubOutputs', () => {
       total: 1,
       passed: 0,
       failed: 1,
+      skipped: 0,
       timedOut: 0,
       runs: [
         {
@@ -278,5 +347,344 @@ describe('emitGithubOutputs', () => {
     );
     expect(stdout).toHaveLength(0);
     expect(diverted.filter(line => line.startsWith('::error'))).toHaveLength(2);
+  });
+});
+
+// The shared chokepoint four commands funnel through. Its two guard branches
+// (summary-file-without-gh-output, and the complete no-op) are otherwise pinned
+// by no command's suite, so exercise them directly against real temp files.
+describe('emitCiArtifacts', () => {
+  const summary: CiSummary = summarizeAcceptedPayload(PAYLOAD);
+
+  it('--summary-file only (no --gh-output, off Actions): writes the file, emits no annotations', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-emitci-file-'));
+    const summaryFile = join(dir, 'summary.json');
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    emitCiArtifacts(
+      summary,
+      { summaryFile },
+      { env: {}, stdout: l => stdout.push(l), stderr: l => stderr.push(l) },
+      'run',
+    );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as CiSummary;
+    expect(artifact.total).toBe(summary.total);
+    // Off Actions and no --gh-output ⇒ the machine artifact is written but no
+    // ::error:: annotations are emitted.
+    expect(stdout.some(l => l.startsWith('::error'))).toBe(false);
+    expect(stderr).toHaveLength(0);
+  });
+
+  it('neither --gh-output nor --summary-file, off Actions: complete no-op', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-emitci-noop-'));
+    const summaryFile = join(dir, 'should-not-exist.json');
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    emitCiArtifacts(
+      summary,
+      {},
+      { env: {}, stdout: l => stdout.push(l), stderr: l => stderr.push(l) },
+      'run',
+    );
+    expect(stdout).toHaveLength(0);
+    expect(stderr).toHaveLength(0);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own mkdtempSync temp path, never user input.
+    expect(existsSync(summaryFile)).toBe(false);
+  });
+
+  it('the label names the command in BOTH failure messages (summary-file write + step-summary append)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-emitci-label-'));
+    // A path whose parent directory does not exist makes the real writeFileSync /
+    // appendFileSync throw synchronously, exercising both best-effort catch paths.
+    const badSummary = join(dir, 'missing', 'summary.json');
+    const badStep = join(dir, 'missing', 'step-summary.md');
+    const stderr: string[] = [];
+    emitCiArtifacts(
+      summary,
+      { ghOutput: true, summaryFile: badSummary },
+      { env: { GITHUB_STEP_SUMMARY: badStep }, stdout: () => {}, stderr: l => stderr.push(l) },
+      'testlist run',
+    );
+    const out = stderr.join('\n');
+    expect(out).toContain('[testlist run] could not write --summary-file');
+    expect(out).toContain('[testlist run] could not append');
+  });
+});
+
+describe('test title in CI output', () => {
+  it('summarizeAcceptedPayload maps testTitle → row.title (batch)', () => {
+    const s = summarizeAcceptedPayload(
+      JSON.stringify({
+        accepted: [
+          {
+            testId: 't-1',
+            testTitle: 'Sign in from the login page',
+            runId: 'r-1',
+            status: 'passed',
+          },
+        ],
+      }),
+    );
+    expect(s.runs[0]).toMatchObject({ testId: 't-1', title: 'Sign in from the login page' });
+  });
+
+  it('summarizeSingleRun maps testTitle → row.title, and null leaves it absent', () => {
+    expect(
+      summarizeSingleRun({ testId: 't', testTitle: 'Login', status: 'passed' }).runs[0],
+    ).toMatchObject({
+      title: 'Login',
+    });
+    // A null title (older server) → no title key → renderer falls back to the id.
+    expect(
+      summarizeSingleRun({ testId: 't', testTitle: null, status: 'passed' }).runs[0]!.title,
+    ).toBeUndefined();
+  });
+
+  it('renderJobSummaryMarkdown shows the title in the Test column, falling back to the id', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 2,
+      passed: 2,
+      failed: 0,
+      skipped: 0,
+      timedOut: 0,
+      runs: [
+        { testId: 't-1', title: 'Sign in from the login page', status: 'passed', runId: 'r-1' },
+        { testId: 't-2', status: 'passed', runId: 'r-2' }, // no title → id
+      ],
+    });
+    expect(md).toContain('| Sign in from the login page | passed | r-1 |');
+    expect(md).toContain('| t-2 | passed | r-2 |');
+  });
+
+  it('a title with a pipe / newline cannot break the table row', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 1,
+      passed: 0,
+      failed: 1,
+      skipped: 0,
+      timedOut: 0,
+      runs: [{ testId: 't', title: 'evil|title\nfake', status: 'failed', runId: 'r' }],
+    });
+    const rows = md.split('\n').filter(l => l.startsWith('| ') && !l.startsWith('| ---'));
+    expect(rows).toHaveLength(2); // header + one data row, no injected line
+    expect(rows[1]!).toContain('evil\\|title'); // pipe escaped
+  });
+
+  it('an empty / whitespace-only title falls back to the id (parity with JUnit)', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 2,
+      passed: 2,
+      failed: 0,
+      skipped: 0,
+      timedOut: 0,
+      runs: [
+        { testId: 't-1', title: '', status: 'passed', runId: 'r-1' },
+        { testId: 't-2', title: '   ', status: 'passed', runId: 'r-2' },
+      ],
+    });
+    expect(md).toContain('| t-1 | passed | r-1 |');
+    expect(md).toContain('| t-2 | passed | r-2 |');
+  });
+
+  it('renders the title into the ::error annotation, escaped, id fallback when empty', () => {
+    const stdout: string[] = [];
+    const sinks = { stdout: (l: string) => stdout.push(l), stderr: () => {}, appendFile: () => {} };
+    emitGithubOutputs(
+      {
+        total: 2,
+        passed: 0,
+        failed: 2,
+        skipped: 0,
+        timedOut: 0,
+        runs: [
+          { testId: 't-1', title: 'Sign in\nnow', status: 'failed', runId: 'r-1' },
+          { testId: 't-2', title: '  ', status: 'failed', runId: 'r-2' },
+        ],
+      },
+      {},
+      sinks,
+      { force: true },
+    );
+    const anns = stdout.filter(l => l.startsWith('::error'));
+    // Title used (not the id), and its newline is escaped — can't inject a command.
+    expect(anns[0]).toContain('TestSprite Sign in%0Anow');
+    expect(anns[0]).not.toContain('\n:: ');
+    // Empty title → id fallback in the annotation too.
+    expect(anns[1]).toContain('TestSprite t-2');
+  });
+});
+
+describe('run-scoped execution link in CI output', () => {
+  it('summarizeAcceptedPayload maps executionUrl → row.executionUrl (batch)', () => {
+    const summary = summarizeAcceptedPayload(
+      JSON.stringify({
+        accepted: [
+          {
+            testId: 't1',
+            runId: 'r1',
+            status: 'passed',
+            dashboardUrl: 'https://portal.example.com/case/t1',
+            executionUrl: 'https://portal.example.com/exec/e1',
+          },
+        ],
+        conflicts: [],
+      }),
+    );
+    expect(summary.runs[0]!.executionUrl).toBe('https://portal.example.com/exec/e1');
+  });
+
+  it('summarizeSingleRun maps executionUrl → row.executionUrl (absent when null)', () => {
+    expect(
+      summarizeSingleRun({ testId: 't1', status: 'passed', executionUrl: 'https://x/exec/e1' })
+        .runs[0]!.executionUrl,
+    ).toBe('https://x/exec/e1');
+    expect(
+      summarizeSingleRun({ testId: 't1', status: 'passed', executionUrl: null }).runs[0]!
+        .executionUrl,
+    ).toBeUndefined();
+  });
+
+  it('renders two distinct links: title → test-case page, Run → execution result page', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 1,
+      passed: 1,
+      failed: 0,
+      skipped: 0,
+      timedOut: 0,
+      runs: [
+        {
+          testId: 't1',
+          title: 'Sign in',
+          status: 'passed',
+          runId: 'r1',
+          dashboardUrl: 'https://portal.example.com/case/t1',
+          executionUrl: 'https://portal.example.com/exec/e1',
+        },
+      ],
+    });
+    expect(md).toContain(
+      '| [Sign in](https://portal.example.com/case/t1) | passed | [r1](https://portal.example.com/exec/e1) |',
+    );
+  });
+
+  it('a bracketed title in link position cannot retarget the link (]/[ escaped)', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 1,
+      passed: 1,
+      failed: 0,
+      skipped: 0,
+      timedOut: 0,
+      runs: [
+        {
+          testId: 't1',
+          // A `]` would close the markdown link early and point the visible title
+          // at the injected URL — realistic for an LLM-authored title.
+          title: 'x](https://evil.example) y',
+          status: 'passed',
+          runId: 'r1',
+          dashboardUrl: 'https://portal.example.com/case/t1',
+        },
+      ],
+    });
+    const dataRow = md.split('\n').find(l => l.startsWith('| ['))!;
+    // The `]` is backslash-escaped, so GFM treats it as literal text: the link
+    // text runs to the REAL closing `](portal-url)`, not the injected one. (The
+    // link-text escaper touches brackets only — parens stay as inert text.)
+    expect(dataRow).toContain('[x\\](https://evil.example) y](https://portal.example.com/case/t1)');
+  });
+
+  it('a backslash before the bracket cannot defeat the escape (backslash escaped first)', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 1,
+      passed: 1,
+      failed: 0,
+      skipped: 0,
+      timedOut: 0,
+      runs: [
+        {
+          testId: 't1',
+          // The title's own `\` would consume the escape we insert before `]`,
+          // re-exposing the bracket — unless backslashes are doubled first.
+          title: 'a\\](https://evil.example) y',
+          status: 'passed',
+          runId: 'r1',
+          dashboardUrl: 'https://portal.example.com/case/t1',
+        },
+      ],
+    });
+    const dataRow = md.split('\n').find(l => l.startsWith('| ['))!;
+    // Value's `\` doubled → `\\` (literal backslash) then `\]` (literal bracket):
+    // the link text survives to the REAL portal close, evil URL is inert text.
+    expect(dataRow).toContain(
+      '[a\\\\\\](https://evil.example) y](https://portal.example.com/case/t1)',
+    );
+  });
+
+  it('a backslash before a pipe cannot break the column (plain cell, backslash escaped first)', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 1,
+      passed: 1,
+      failed: 0,
+      skipped: 0,
+      timedOut: 0,
+      // Plain (unlinked) cell — no dashboardUrl — exercises escapeTableCell alone.
+      runs: [{ testId: 'a\\|b', status: 'passed', runId: 'r1' }],
+    });
+    const rows = md.split('\n').filter(l => l.startsWith('| ') && !l.startsWith('| ---'));
+    // Header + exactly one data row: the `\|` did NOT open a fourth column.
+    expect(rows).toHaveLength(2);
+    // `\\` (literal backslash) + `\|` (literal pipe), not an unescaped separator.
+    expect(rows[1]!).toContain('a\\\\\\|b');
+  });
+
+  it('no executionUrl (V2 run): Run cell degrades to the raw runId, title still links', () => {
+    const md = renderJobSummaryMarkdown({
+      total: 1,
+      passed: 1,
+      failed: 0,
+      skipped: 0,
+      timedOut: 0,
+      runs: [
+        {
+          testId: 't1',
+          title: 'Sign in',
+          status: 'passed',
+          runId: 'r1',
+          dashboardUrl: 'https://portal.example.com/case/t1',
+        },
+      ],
+    });
+    expect(md).toContain('| [Sign in](https://portal.example.com/case/t1) | passed | r1 |');
+  });
+
+  it('annotation link prefers the execution result page over the test-case page', () => {
+    const stdout: string[] = [];
+    const sinks = { stdout: (l: string) => stdout.push(l), stderr: () => {}, appendFile: () => {} };
+    emitGithubOutputs(
+      {
+        total: 1,
+        passed: 0,
+        failed: 1,
+        skipped: 0,
+        timedOut: 0,
+        runs: [
+          {
+            testId: 't1',
+            title: 'Sign in',
+            status: 'failed',
+            runId: 'r1',
+            dashboardUrl: 'https://portal.example.com/case/t1',
+            executionUrl: 'https://portal.example.com/exec/e1',
+          },
+        ],
+      },
+      {},
+      sinks,
+      { force: true },
+    );
+    const ann = stdout.find(l => l.startsWith('::error'))!;
+    expect(ann).toContain('https://portal.example.com/exec/e1');
+    expect(ann).not.toContain('/case/t1');
   });
 });

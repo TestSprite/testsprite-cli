@@ -35,6 +35,23 @@ export function resolveOutputMode(raw: unknown): OutputMode {
   throw localValidationError('output', 'must be one of: json, text', ['json', 'text']);
 }
 
+/**
+ * Input to {@link Output.error} — the same 5-key shape as the hand-built
+ * envelopes in `index.ts`'s ApiError / InterruptError / RequestTimeoutError
+ * catch branches (`{error:{code,message,nextAction,requestId,details}}`).
+ * Only `code` and `message` are required; the rest default to the
+ * client-local values (`''`, `'local'`, `{}`) so every `--output json` error
+ * — regardless of which catch branch produced it — renders the identical
+ * envelope shape.
+ */
+export interface ErrorEnvelopeInput {
+  code: string;
+  message: string;
+  nextAction?: string;
+  requestId?: string;
+  details?: Record<string, unknown>;
+}
+
 export interface OutputStreams {
   /**
    * Line-oriented stdout writer. Each call is one logical line; the
@@ -106,12 +123,31 @@ export class Output {
     await this.rawStdoutWrite(text);
   }
 
-  error(message: string): void {
+  /**
+   * Render a terminal error. JSON mode always emits the SAME 5-key envelope
+   * shape as the ApiError / InterruptError / RequestTimeoutError branches
+   * hand-build in `index.ts`'s catch (`{error:{code,message,nextAction,
+   * requestId,details}}`) — before this, the only two callers of
+   * this method (the plain-CLIError and uncaught-exception catch branches)
+   * fell through to a bare `{"error":"<message>"}` string, breaking the
+   * envelope contract that machine consumers (`--output json` scripts/CI/
+   * agents) rely on for every other error path.
+   */
+  error(input: ErrorEnvelopeInput): void {
     if (this.mode === 'json') {
-      this.stderrWrite(JSON.stringify({ error: message }, null, 2));
+      const envelope = {
+        error: {
+          code: input.code,
+          message: input.message,
+          nextAction: input.nextAction ?? '',
+          requestId: input.requestId ?? 'local',
+          details: input.details ?? {},
+        },
+      };
+      this.stderrWrite(JSON.stringify(envelope, null, 2));
       return;
     }
-    this.stderrWrite(`Error: ${message}`);
+    this.stderrWrite(`Error: ${input.message}`);
   }
 }
 

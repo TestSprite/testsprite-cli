@@ -2,15 +2,20 @@ import { randomUUID } from 'node:crypto';
 import * as v from 'valibot';
 import type { ErrorCode } from './errors.js';
 import { ApiError, InterruptError, RequestTimeoutError, TransportError } from './errors.js';
-import { VERSION } from '../version.js';
+import { buildUserAgent } from './client-tag.js';
 import {
   BATCH_RERUN_RESPONSE_SCHEMA,
   BATCH_RUN_FRESH_RESPONSE_SCHEMA,
+  CANCEL_RUN_RESPONSE_SCHEMA,
   LIST_RUNS_RESPONSE_SCHEMA,
   RERUN_RESPONSE_SCHEMA,
   RUN_RESPONSE_SCHEMA,
+  TESTLIST_RUN_RESPONSE_SCHEMA,
   TRIGGER_RUN_RESPONSE_SCHEMA,
+  TUNNEL_MINT_RESPONSE_SCHEMA,
+  TUNNEL_STATUS_RESPONSE_SCHEMA,
 } from './response-schemas.js';
+import type { CliTestListRunResponse } from './testlist.types.js';
 import type {
   TriggerRunBody,
   TriggerRunResponse,
@@ -25,6 +30,12 @@ import type {
   ListRunsResponse,
   CancelRunResponse,
 } from './runs.types.js';
+import type {
+  CliAcceptPlansResponse,
+  CliGeneratePlansResponse,
+  CliGetPlansResponse,
+} from './plans.types.js';
+import type { MintTunnelBody, TunnelMintResponse, TunnelStatusResponse } from './tunnel.types.js';
 
 export type FetchImpl = typeof globalThis.fetch;
 
@@ -93,6 +104,12 @@ export interface HttpClientOptions {
    */
   onServerVersion?: (info: { minVersion?: string }) => void;
   /**
+   * Environment the client reads the optional `TESTSPRITE_CLIENT` tag from
+   * (see `client-tag.ts`) to build its User-Agent. Defaults to `process.env`;
+   * injectable so tests never depend on the developer's shell.
+   */
+  env?: NodeJS.ProcessEnv;
+  /**
    * Per-request wall-clock timeout in milliseconds applied to every outgoing
    * fetch. The signal fires independently of any caller-supplied signal — the
    * request aborts on whichever fires first.
@@ -130,6 +147,15 @@ export interface RequestOptions<T = unknown> {
   signal?: AbortSignal;
   requestId?: string;
   /**
+   * Accept an HTTP 204 as a successful response with no body.
+   *
+   * This is deliberately opt-in: the CLI's established response contract is
+   * JSON even for schema-less generic callers, so silently returning
+   * `undefined` would turn a server-side body regression into apparent
+   * success. Use only for endpoints whose documented success response is 204.
+   */
+  allowNoContent?: boolean;
+  /**
    * Optional valibot schema for the parsed 2xx response body (issue #102).
    *
    * When present, `requestWithMeta` runs `v.safeParse` on the OK-path JSON:
@@ -141,7 +167,7 @@ export interface RequestOptions<T = unknown> {
    *
    * Wired by the typed run helpers only (`triggerRun`, `triggerRunWithMeta`,
    * `triggerRerun`, `triggerBatchRerun`, `triggerBatchRunFresh`, `getRun`,
-   * `listTestRuns`); generic `get`/`post`/... callers stay opt-in.
+   * `listTestRuns`, `cancelRun`); generic `get`/`post`/... callers stay opt-in.
    * sourceRef: response-schemas.ts.
    */
   schema?: v.GenericSchema<unknown, T>;
@@ -182,6 +208,15 @@ export interface RequestOptions<T = unknown> {
    * other callers.
    */
   retryOnRateLimit?: boolean;
+  /**
+   * Disable every automatic retry for a read whose caller owns its cadence.
+   *
+   * The borrowed-tunnel liveness probe is one such read: a failed observation
+   * is "unknown", and its next attempt belongs to the 15-second wall-clock
+   * schedule rather than an HTTP-layer retry burst. Defaults to `true` so all
+   * existing request paths retain their retry behaviour.
+   */
+  retry?: boolean;
 }
 
 const RETRY_BASE_MS = 250;
@@ -197,6 +232,21 @@ const MAX_ATTEMPTS_INTERNAL = 2;
 // Cap server-directed RATE_LIMITED waits so a hostile or misconfigured
 // `Retry-After` (e.g. 86400) can't hang the CLI inside the retry sleep.
 const MAX_RATE_LIMITED_DELAY_MS = 60_000;
+
+/**
+ * 429 reasons that name a STANDING condition rather than a passing throttle —
+ * e.g. the per-user cap on live tunnel bindings. Retrying cannot succeed until
+ * the caller frees the resource, so the retry budget is skipped and the
+ * server's nextAction (e.g. `testsprite tunnel stop`) surfaces immediately.
+ */
+export const STANDING_RATE_LIMIT_REASONS: ReadonlySet<string> = new Set(['tunnel_binding_limit']);
+
+/** True for a RATE_LIMITED error whose envelope names a standing condition. */
+export function isStandingRateLimit(err: ApiError): boolean {
+  if (err.code !== 'RATE_LIMITED') return false;
+  const reason = err.getDetail<string>('reason', (v): v is string => typeof v === 'string');
+  return reason !== undefined && STANDING_RATE_LIMIT_REASONS.has(reason);
+}
 
 const CONFLICT_DELAY_MS = 1000;
 const INTERNAL_DELAY_MS = 500;
@@ -229,7 +279,7 @@ export class HttpClient {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
   private readonly fetchImpl: FetchImpl;
-  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly random: () => number;
   private readonly onDebug?: (event: DebugEvent) => void;
   private readonly onTransition?: (msg: string) => void;
@@ -237,11 +287,14 @@ export class HttpClient {
   private readonly requestTimeoutMs: number;
   private readonly shutdownSignal?: AbortSignal;
   private readonly maxResponseBytes: number;
+  private readonly userAgent: string;
 
   constructor(options: HttpClientOptions) {
     this.baseUrl = trimTrailingSlash(options.baseUrl);
     this.apiKey = options.apiKey;
     this.shutdownSignal = options.shutdownSignal;
+    // Resolved once: the tag is process-wide configuration, not per-request.
+    this.userAgent = buildUserAgent(options.env ?? process.env);
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.sleep = options.sleep ?? defaultSleep;
     this.random = options.random ?? Math.random;
@@ -250,6 +303,14 @@ export class HttpClient {
     this.onServerVersion = options.onServerVersion;
     this.requestTimeoutMs = options.requestTimeoutMs ?? REQUEST_TIMEOUT_DEFAULT_MS;
     this.maxResponseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES_DEFAULT;
+  }
+
+  /** The resolved facade base URL (trailing slash trimmed). Read-only —
+   *  callers that bypass the client for a side-channel request (e.g. the
+   *  presigned S3 PUT) use it to reason about the facade's locality
+   *  (DEV-384 review F3). */
+  get resolvedBaseUrl(): string {
+    return this.baseUrl;
   }
 
   /**
@@ -436,6 +497,32 @@ export class HttpClient {
   }
 
   /**
+   * POST /api/cli/v1/testlist/{listId}/run
+   * Dispatch a test list's cases (optionally a `testIds` subset) per project
+   * with their configured environments; returns pollable runIds. `--wait` polls
+   * each `accepted[].runId`.
+   *
+   * `retryOnConflict: false` — a 409 here (every dispatched project is an
+   * MCP-mirrored view-only mirror) is a permanent condition, not a transient one.
+   */
+  async triggerTestListRun(
+    listId: string,
+    body: { testIds?: string[] },
+    options: { idempotencyKey: string; signal?: AbortSignal },
+  ): Promise<CliTestListRunResponse> {
+    return this.postWithMeta<CliTestListRunResponse>(
+      `/testlist/${encodeURIComponent(listId)}/run`,
+      {
+        body,
+        headers: { 'idempotency-key': options.idempotencyKey },
+        signal: options.signal,
+        schema: TESTLIST_RUN_RESPONSE_SCHEMA,
+        retryOnConflict: false,
+      },
+    ).then(r => r.body);
+  }
+
+  /**
    * GET /api/cli/v1/tests/{testId}/runs
    * List a test's prior run history, newest-first.
    *
@@ -443,14 +530,21 @@ export class HttpClient {
    * than `pageSize` rows while still yielding a non-null `nextCursor`.
    * That means "none in THIS window", not end-of-history.
    */
-  async listTestRuns(testId: string, query: ListRunsQuery): Promise<ListRunsResponse> {
+  async listTestRuns(
+    testId: string,
+    query: ListRunsQuery,
+    options: { signal?: AbortSignal; retry?: boolean } = {},
+  ): Promise<ListRunsResponse> {
     const q: Record<string, string | number | undefined> = {};
     if (query.cursor !== undefined) q.cursor = query.cursor;
     if (query.pageSize !== undefined) q.pageSize = query.pageSize;
     if (query.source !== undefined) q.source = query.source;
     if (query.since !== undefined) q.since = query.since;
+    if (query.environment !== undefined) q.environment = query.environment;
     return this.get<ListRunsResponse>(`/tests/${encodeURIComponent(testId)}/runs`, {
       query: q,
+      signal: options.signal,
+      retry: options.retry,
       schema: LIST_RUNS_RESPONSE_SCHEMA,
     });
   }
@@ -487,6 +581,66 @@ export class HttpClient {
   }
 
   /**
+   * POST /api/cli/v1/tunnel — mint a tunnel client for `test run --local`.
+   *
+   * The ONLY response on this surface that carries a secret. Deliberately NOT
+   * sent with an `Idempotency-Key`: the interceptor persists the response body
+   * for the whole replay window, so an idempotent mint would put a live
+   * credential in the idempotency store — the exact copy the server-side
+   * binding exists to avoid. The server rate-limits this route instead.
+   *
+   * `retryOnConflict: false` for the same reason `triggerRun` opts out: a 409
+   * here means the per-principal live-binding cap is reached, which is a
+   * standing condition, not a transient snapshot conflict.
+   */
+  async mintTunnel(
+    body: MintTunnelBody,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<TunnelMintResponse> {
+    return this.postWithMeta<TunnelMintResponse>('/tunnel', {
+      body,
+      signal: options.signal,
+      schema: TUNNEL_MINT_RESPONSE_SCHEMA,
+      retryOnConflict: false,
+    }).then(r => r.body);
+  }
+
+  /**
+   * GET /api/cli/v1/tunnel/{clientId} — is this binding's client connected?
+   *
+   * A 404 covers unknown, another tenant's, and expired alike; the surface is
+   * deliberately not an existence oracle for client ids. Callers must not
+   * translate a transport failure or a non-200 into `offline` — "the tunnel is
+   * down" and "we could not reach TestSprite to ask" are different answers,
+   * and collapsing them is what DEV-1005 was.
+   */
+  async getTunnelStatus(
+    clientId: string,
+    options: { signal?: AbortSignal; retry?: boolean } = {},
+  ): Promise<TunnelStatusResponse> {
+    return this.get<TunnelStatusResponse>(`/tunnel/${encodeURIComponent(clientId)}`, {
+      signal: options.signal,
+      retry: options.retry,
+      schema: TUNNEL_STATUS_RESPONSE_SCHEMA,
+    });
+  }
+
+  /**
+   * DELETE /api/cli/v1/tunnel/{clientId} — destroy a binding. 204, idempotent.
+   *
+   * No body, no `Idempotency-Key`: the operation is idempotent by definition
+   * and this is the call made from a `finally` block, including after a
+   * signal, where there is least room for extra ceremony.
+   */
+  async deleteTunnel(clientId: string, options: { signal?: AbortSignal } = {}): Promise<void> {
+    await this.deleteWithMeta<unknown>(`/tunnel/${encodeURIComponent(clientId)}`, {
+      signal: options.signal,
+      allowNoContent: true,
+      retryOnConflict: false,
+    });
+  }
+
+  /**
    * POST /api/cli/v1/runs/{runId}/cancel
    * User-initiated cancel of a queued/running run (DEV-331 piece 3). No
    * body, no `Idempotency-Key` — the endpoint is naturally idempotent (D10):
@@ -500,8 +654,78 @@ export class HttpClient {
   async cancelRun(runId: string, options?: { signal?: AbortSignal }): Promise<CancelRunResponse> {
     return this.post<CancelRunResponse>(`/runs/${encodeURIComponent(runId)}/cancel`, {
       signal: options?.signal,
+      schema: CANCEL_RUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
     });
+  }
+
+  /**
+   * POST /api/cli/v1/projects/{projectId}/plans/generate  (DEV-384 V3-B)
+   * Start whichever generation stage the project is missing next. The body
+   * is empty by contract — the server decides which rung fires. 202 both
+   * for `accepted` (a stage started) and `nothing_to_start` (proposals are
+   * already staged; the facade's no-restart guard refuses a duplicate
+   * append because it would wipe the batch and re-bill 2 credits).
+   *
+   * `retryOnConflict: false` — a 409 here is `stage_in_flight`, a flow
+   * signal the ladder answers by attaching and polling, never a transient
+   * snapshot conflict to paper over with a retry.
+   */
+  async generatePlans(
+    projectId: string,
+    options: { idempotencyKey: string; signal?: AbortSignal },
+  ): Promise<CliGeneratePlansResponse> {
+    return this.post<CliGeneratePlansResponse>(
+      `/projects/${encodeURIComponent(projectId)}/plans/generate`,
+      {
+        body: {},
+        headers: { 'idempotency-key': options.idempotencyKey },
+        signal: options.signal,
+        retryOnConflict: false,
+      },
+    );
+  }
+
+  /**
+   * GET /api/cli/v1/projects/{projectId}/plans  (DEV-384 V3-B)
+   * Pure read: the facade-synthesized generation status, the staged
+   * proposal list (stable proposalIds — what `accept --only` consumes),
+   * and a best-effort credits block. When `waitSeconds` (1–25) is
+   * provided the server long-polls: one request per window, answered
+   * early on any change.
+   */
+  async getPlans(
+    projectId: string,
+    options?: { waitSeconds?: number; signal?: AbortSignal },
+  ): Promise<CliGetPlansResponse> {
+    return this.get<CliGetPlansResponse>(`/projects/${encodeURIComponent(projectId)}/plans`, {
+      query: options?.waitSeconds !== undefined ? { waitSeconds: options.waitSeconds } : undefined,
+      signal: options?.signal,
+    });
+  }
+
+  /**
+   * POST /api/cli/v1/projects/{projectId}/plans/accept  (DEV-384 V3-B)
+   * Convert staged proposals into real test cases. `only` is ALWAYS an
+   * explicit, non-empty id list — the caller enforces the two §3.3 safety
+   * rules (full list when the user didn't subset; an empty selection is a
+   * client-side validation error because `[]` is server-destructive:
+   * it means "reject everything" and clears the staged batch).
+   */
+  async acceptPlans(
+    projectId: string,
+    only: string[],
+    options: { idempotencyKey: string; signal?: AbortSignal },
+  ): Promise<CliAcceptPlansResponse> {
+    return this.post<CliAcceptPlansResponse>(
+      `/projects/${encodeURIComponent(projectId)}/plans/accept`,
+      {
+        body: { only },
+        headers: { 'idempotency-key': options.idempotencyKey },
+        signal: options.signal,
+        retryOnConflict: false,
+      },
+    );
   }
 
   /**
@@ -549,7 +773,8 @@ export class HttpClient {
 
     const url = buildUrl(this.baseUrl, path, options.query);
     const requestId = options.requestId ?? newRequestId();
-    const allowTransportRetry = canRetryTransport(method, options);
+    const allowRetry = options.retry !== false;
+    const allowTransportRetry = allowRetry && canRetryTransport(method, options);
 
     let attempt = 0;
     while (true) {
@@ -668,10 +893,17 @@ export class HttpClient {
           });
           let raw: unknown;
           try {
-            // Bounded read, then parse — assigning to `raw` rather than returning
-            // here keeps the schema validation below on the success path.
-            const text = await readBoundedText(response, this.maxResponseBytes, requestId);
-            raw = JSON.parse(text);
+            if (response.status === 204 && options.allowNoContent === true) {
+              // Only explicitly bodyless endpoints may bypass the historical
+              // JSON-envelope contract. Every other 204 still falls through
+              // to JSON.parse('') and becomes a typed malformed-response error.
+              raw = undefined;
+            } else {
+              // Bounded read, then parse — assigning to `raw` rather than returning
+              // here keeps the schema validation below on the success path.
+              const text = await readBoundedText(response, this.maxResponseBytes, requestId);
+              raw = JSON.parse(text);
+            }
           } catch (err) {
             // Interrupt passthrough (see the fetch catch above).
             if (err instanceof InterruptError) throw err;
@@ -796,15 +1028,21 @@ export class HttpClient {
           durationMs,
         });
         const retryOnConflict = options.retryOnConflict !== false;
-        const retryOnRateLimit = options.retryOnRateLimit !== false;
-        const decision = apiRetryDecision(
-          apiError.code,
-          attempt,
-          retryAfterSec,
-          this.random,
-          retryOnConflict,
-          retryOnRateLimit,
-        );
+        // A standing-condition 429 skips the retry budget outright: its
+        // Retry-After says when a retry COULD first succeed if the caller
+        // frees the resource, not that the condition clears on its own.
+        const retryOnRateLimit =
+          options.retryOnRateLimit !== false && !isStandingRateLimit(apiError);
+        const decision = allowRetry
+          ? apiRetryDecision(
+              apiError.code,
+              attempt,
+              retryAfterSec,
+              this.random,
+              retryOnConflict,
+              retryOnRateLimit,
+            )
+          : { retry: false, delayMs: 0 };
         if (!decision.retry) throw apiError;
         const delaySec = Math.round(decision.delayMs / 1000);
         if (apiError.code === 'RATE_LIMITED') {
@@ -846,7 +1084,7 @@ export class HttpClient {
     const headers: Record<string, string> = {
       'x-request-id': requestId,
       accept: 'application/json',
-      'user-agent': `testsprite-cli/${VERSION}`,
+      'user-agent': this.userAgent,
     };
     // The CLI v1 facade authenticates via `x-api-key`.
     // (securitySchemes.ApiKeyAuth). Sending only Authorization Bearer would be
@@ -877,7 +1115,7 @@ export class HttpClient {
     return new Promise((resolve, reject) => {
       const onAbort = (): void => reject(signal.reason);
       signal.addEventListener('abort', onAbort, { once: true });
-      this.sleep(ms).then(
+      this.sleep(ms, signal).then(
         () => {
           signal.removeEventListener('abort', onAbort);
           resolve();
@@ -1306,8 +1544,19 @@ function backoffDelay(attempt: number, random: () => number): number {
   return Math.min(base + jitter, RETRY_MAX_DELAY_MS);
 }
 
-function defaultSleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function isAbortError(err: unknown): boolean {

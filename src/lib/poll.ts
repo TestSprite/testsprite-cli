@@ -23,8 +23,11 @@
 
 import { ApiError, InterruptError } from './errors.js';
 import type { ShutdownHandle } from './interrupt.js';
+import { defaultSleep, isAbortError, sleepUnlessInterrupted } from './poll-support.js';
 import type { RunResponse } from './runs.types.js';
 import { isTerminalStatus } from './runs.types.js';
+
+export { isTerminalStatus } from './runs.types.js';
 
 /**
  * Minimal interface that `pollRunUntilTerminal` requires from the HTTP client.
@@ -397,51 +400,4 @@ function backoffScheduleDelay(index: number): number {
   const base = BACKOFF_SCHEDULE_MS[Math.min(index, BACKOFF_SCHEDULE_MS.length - 1)]!;
   const jitter = base * 0.2 * (Math.random() * 2 - 1); // ±20%
   return Math.max(0, Math.round(base + jitter));
-}
-
-function defaultSleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
- * Race a sleep against the shutdown signal: rejects with the signal's
- * `InterruptError` reason the moment it fires, so no backoff/retry wait can
- * delay the honest-detach UX. Wraps the injected `sleep` (tests keep their
- * deterministic fakes); the underlying timer is left to fire harmlessly —
- * the interrupt path exits the process long before it matters.
- */
-function sleepUnlessInterrupted(
-  sleep: (ms: number) => Promise<void>,
-  ms: number,
-  signal: AbortSignal | undefined,
-): Promise<void> {
-  if (signal == null) return sleep(ms);
-  if (signal.aborted) return Promise.reject(signal.reason);
-  return new Promise((resolve, reject) => {
-    const onAbort = (): void => reject(signal.reason);
-    signal.addEventListener('abort', onAbort, { once: true });
-    sleep(ms).then(
-      () => {
-        signal.removeEventListener('abort', onAbort);
-        resolve();
-      },
-      err => {
-        signal.removeEventListener('abort', onAbort);
-        reject(err instanceof Error ? err : new Error(String(err)));
-      },
-    );
-  });
-}
-
-/**
- * Detects an AbortError thrown when an AbortSignal fires.
- * Works for native fetch AbortErrors as well as `AbortController.abort()`
- * from Node 18+ stdlib (both set `name === 'AbortError'`).
- */
-function isAbortError(err: unknown): boolean {
-  if (err instanceof Error && err.name === 'AbortError') return true;
-  if (typeof err === 'object' && err !== null && 'name' in err) {
-    return (err as { name?: string }).name === 'AbortError';
-  }
-  return false;
 }

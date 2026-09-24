@@ -20,10 +20,31 @@
 #     ~380 pre-existing findings (almost entirely
 #     `security/detect-non-literal-fs-filename` on ordinary local-path fs
 #     calls a config-file-reading CLI makes routinely — not a real
-#     vulnerability signal for this codebase shape). Blocking on that
-#     backlog on day one would make the job noise from the first run; this
-#     keeps every rule at its designed severity and holds new/changed code to
-#     it without silently exempting the existing tree from the rule.
+#     vulnerability signal for this codebase shape).
+#
+#     ESLint lints whole FILES, though, so "changed files only" still dumps a
+#     legacy file's entire backlog the moment one line of it is touched — which
+#     is exactly what happened on the v0.6.0 release push (touching the ~11k-line
+#     `src/commands/test.ts` surfaced 128 pre-existing `detect-non-literal-fs-
+#     filename` errors and failed the job). Two layers fix that WITHOUT lowering
+#     any rule's severity or exempting the tree:
+#       (C) A committed `eslint-suppressions.security.json` baseline (ESLint's
+#           native bulk suppressions) records today's backlog, so pre-existing
+#           findings are not re-reported; a genuinely NEW fs call pushes the
+#           per-file count past the baseline and surfaces. It uses a dedicated
+#           filename (NOT ESLint's default `eslint-suppressions.json`) so the
+#           main `eslint .` lint — a different config that never enables these
+#           security rules — does not auto-read it and fail on "unused
+#           suppressions"; the security job passes `--suppressions-location`
+#           explicitly.
+#       (A) `.github/scripts/filter-changed-line-findings.mjs` then keeps only the
+#           remaining error findings that fall on lines THIS diff added/modified,
+#           so touching a legacy file never fails on its untouched lines.
+#     Net: every rule stays at its designed severity, new/changed code is held to
+#     it, and the existing tree is neither re-linted from scratch nor exempted.
+#     To retire baseline entries as they get fixed, run ESLint with
+#     `--prune-suppressions` in a maintenance PR (never regenerate it to hide new
+#     findings).
 #   - Secret scanning: this repo's `ci.yml` already runs a gitleaks
 #     WORKING-TREE scan on every PR/push (added by atlas #274, 2026-07). This
 #     file adds the complementary FULL-HISTORY scan from #220 as its own job,
@@ -65,7 +86,7 @@ jobs:
     name: Dependency Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -94,7 +115,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request' && github.repository == 'TestSprite/testsprite-cli'
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -108,7 +129,7 @@ jobs:
     name: ESLint Security (changed files)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -165,6 +186,11 @@ jobs:
 
           echo "Base used: ${BASE_DESC}"
 
+          # Persist the resolved base for the lint step's changed-line filter
+          # (empty string on the full-tree fallback — the filter treats that as
+          # "keep every finding", so nothing new is hidden).
+          printf '%s' "${RESOLVED_BASE}" > "$RUNNER_TEMP/resolved-base.txt"
+
           if [ -n "$RESOLVED_BASE" ]; then
             git diff --name-only --diff-filter=ACMR -z "$RESOLVED_BASE" "$HEAD_SHA" -- ':(glob)src/**/*.ts' \
               > "$RUNNER_TEMP/changed-ts-files.txt"
@@ -207,8 +233,40 @@ jobs:
           fi
           FILE_COUNT=$(tr -dc '\0' < "$RUNNER_TEMP/changed-ts-files.txt" | wc -c)
           echo "Linting ${FILE_COUNT} file(s)."
-          xargs -a "$RUNNER_TEMP/changed-ts-files.txt" -0 \
-            npx eslint --config eslint.security.config.mjs --format stylish --
+
+          # Read the NUL-separated list into an array (NUL-safe, single ESLint
+          # invocation so `--format json` emits ONE array) and lint with:
+          #   - the committed eslint-suppressions.security.json baseline (passed
+          #     explicitly so the main `eslint .` lint never reads it) so the
+          #     pre-existing backlog is not re-reported; and
+          #   - --pass-on-unpruned-suppressions so FIXING a baselined finding in
+          #     a changed file (its count drops) doesn't fail the job over a now-
+          #     stale suppression entry (prune it in a separate maintenance pass).
+          # The trailing `--` stops ESLint's option parser at the file boundary.
+          mapfile -d '' -t FILES < "$RUNNER_TEMP/changed-ts-files.txt"
+
+          # ESLint exits 1 when it reports findings and 2 on a fatal (config/crash)
+          # error; only 2 is a real failure here, because the changed-line filter
+          # below — not ESLint's own exit — decides pass/fail. Capture the report
+          # even on exit 1, but surface a genuine crash.
+          set +e
+          npx eslint --config eslint.security.config.mjs \
+            --suppressions-location=eslint-suppressions.security.json \
+            --pass-on-unpruned-suppressions --format json -- "${FILES[@]}" \
+            > "$RUNNER_TEMP/eslint-report.json"
+          ESLINT_EXIT=$?
+          set -e
+          if [ "$ESLINT_EXIT" -gt 1 ]; then
+            echo "::error title=Security lint crashed::ESLint exited ${ESLINT_EXIT} (fatal error, not a lint finding)."
+            cat "$RUNNER_TEMP/eslint-report.json" || true
+            exit "$ESLINT_EXIT"
+          fi
+
+          # Fail only on findings that land on lines this change added/modified
+          # (see the header note and .github/scripts/filter-changed-line-findings.mjs).
+          RESOLVED_BASE="$(cat "$RUNNER_TEMP/resolved-base.txt")" \
+          HEAD_SHA="${{ github.sha }}" \
+            node .github/scripts/filter-changed-line-findings.mjs "$RUNNER_TEMP/eslint-report.json"
 
   # ── 4. Full-history secret scan (push only) ────────────────────────────────
   # Complements ci.yml's working-tree gitleaks job (every PR/push) with the
@@ -219,7 +277,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0 # full history required for a history-mode scan
