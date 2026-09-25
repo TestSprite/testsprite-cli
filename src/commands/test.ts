@@ -1132,23 +1132,24 @@ function assertChainedRunKeyFits(
   }
 }
 
+/** Short deadline for the advisory duplicate-name lookup (5 s). */
+const DUP_NAME_ADVISORY_TIMEOUT_MS = 5_000;
+
 /**
  * B3 / Fix 4: best-effort duplicate-name advisory shared by `runCreate`
  * and `runCreateFromPlan`. One-page lookup (pageSize=100) — not
- * exhaustive but cheap. Silently swallows all errors; must never block
- * or fail the caller's create.
+ * exhaustive but cheap. Reports swallowed errors only under --debug; must
+ * never block or fail the caller's create.
  *
  * Skip when `projectId` or `name` is absent (e.g. plan not yet parsed)
  * or when the caller is in dry-run mode.
  */
-/** Short deadline for the advisory duplicate-name lookup (5 s). */
-const DUP_NAME_ADVISORY_TIMEOUT_MS = 5_000;
-
 async function emitDupNameAdvisoryIfNeeded(
   client: HttpClient,
   projectId: string | undefined,
   name: string | undefined,
   stderrFn: (line: string) => void,
+  debug: boolean,
 ): Promise<void> {
   if (!projectId || !name) return;
   // B: the advisory lookup must NEVER block the create critical path.
@@ -1184,8 +1185,16 @@ async function emitDupNameAdvisoryIfNeeded(
           `Use \`testsprite test update ${match.id}\` to modify it, or proceed to create a duplicate.`,
       );
     }
-  } catch {
-    // Swallow — this is best-effort; must not block the create.
+  } catch (error) {
+    // Diagnostics are best-effort too: a broken sink must not block creation.
+    if (debug) {
+      try {
+        const reason = error instanceof Error ? error.message : String(error);
+        stderrFn(`[debug] duplicate-name advisory skipped: ${reason}`);
+      } catch {
+        // Preserve the advisory's failure isolation if diagnostic delivery fails.
+      }
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -1381,7 +1390,7 @@ export async function runCreate(
   // B3: best-effort duplicate-name advisory. Skip under --dry-run.
   if (!opts.dryRun) {
     const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-    await emitDupNameAdvisoryIfNeeded(client, projectId, opts.name, stderrFn);
+    await emitDupNameAdvisoryIfNeeded(client, projectId, opts.name, stderrFn, opts.debug);
   }
 
   const response = await client.post<CliCreateTestResponse>('/tests', {
@@ -3058,7 +3067,7 @@ export async function runCreateFromPlan(
   // The plan's projectId + name are available after validation above. Skip
   // under dry-run (no network calls); swallow all errors (advisory only).
   if (!opts.dryRun) {
-    await emitDupNameAdvisoryIfNeeded(client, plan.projectId, plan.name, stderrFn);
+    await emitDupNameAdvisoryIfNeeded(client, plan.projectId, plan.name, stderrFn, opts.debug);
   }
 
   const response = await client.post<CliCreateFromPlanResponse>('/tests', {

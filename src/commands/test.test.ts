@@ -12094,3 +12094,98 @@ describe('runTestRun / runTestRerun — dashboard line on the queued-run output'
     expect(bare.join('\n')).not.toContain('dashboard');
   });
 });
+
+// #186: advisory failures stay non-fatal, but are diagnosable under --debug.
+describe.each(['code', 'plan'] as const)('duplicate-name debug diagnostics (%s)', source => {
+  /** Run either create path with a controlled advisory response and capture both output streams. */
+  async function create({
+    debug = false,
+    verbose = false,
+    output = 'json',
+    lookupFails = true,
+    brokenSink = false,
+  }: {
+    debug?: boolean;
+    verbose?: boolean;
+    output?: 'json' | 'text';
+    lookupFails?: boolean;
+    brokenSink?: boolean;
+  } = {}) {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-dup-debug-'));
+    const codeFile = join(dir, 'test.py');
+    const planFrom = join(dir, 'plan.json');
+    const plan = {
+      projectId: 'project_alice',
+      type: 'frontend' as const,
+      name: 'Login',
+      planSteps: [{ type: 'assertion', description: 'Login succeeds' }],
+    };
+    writeFileSync(codeFile, '// test code');
+    writeFileSync(planFrom, JSON.stringify(plan));
+    const response = {
+      testId: 'test_new',
+      type: 'frontend',
+      codeVersion: 'v1',
+      createdAt: '2026-05-13T10:00:00.000Z',
+    };
+    let posts = 0;
+    let lookups = 0;
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const deps = {
+      credentialsPath,
+      fetchImpl: makeFetch((_url, init) => {
+        if ((init.method ?? 'GET') === 'GET') {
+          lookups++;
+          return lookupFails
+            ? {
+                status: 403,
+                body: { error: { code: 'AUTH_FORBIDDEN', message: 'Forbidden', requestId: 'r1' } },
+              }
+            : { body: { items: [] } };
+        }
+        posts++;
+        return { body: response };
+      }),
+      stdout: (line: string) => stdout.push(line),
+      stderr: (line: string) => {
+        stderr.push(line);
+        if (brokenSink && line.startsWith('[debug] duplicate-name')) throw new Error('sink failed');
+      },
+    };
+    const opts = { profile: 'default', output, debug, verbose, idempotencyKey: 'dup-debug-test' };
+    const result =
+      source === 'code'
+        ? await runCreate({ ...opts, ...plan, codeFile }, deps)
+        : await runCreateFromPlan({ ...opts, planFrom }, deps);
+    expect(posts).toBe(1);
+    expect(lookups).toBe(1);
+    expect(result.testId).toBe(response.testId);
+    return { stdout: stdout.join('\n'), stderr: stderr.join('\n') };
+  }
+
+  it.each(['json', 'text'] as const)('keeps non-debug %s output byte-identical', async output => {
+    const baseline = await create({ output, lookupFails: false });
+    expect(await create({ output })).toEqual(baseline);
+    expect(await create({ output, verbose: true })).toEqual(baseline);
+  });
+
+  it.each(['json', 'text'] as const)(
+    'reports the swallowed reason only on stderr (%s)',
+    async output => {
+      const baseline = await create({ output });
+      const actual = await create({ output, debug: true });
+      expect(actual.stdout).toBe(baseline.stdout);
+      expect(actual.stderr).toContain('[debug] duplicate-name advisory skipped: Forbidden');
+      if (output === 'json') expect(JSON.parse(actual.stdout).testId).toBe('test_new');
+      const success = await create({ output, debug: true, lookupFails: false });
+      expect(success.stderr).not.toContain('duplicate-name advisory skipped');
+    },
+  );
+
+  it('still creates when diagnostic delivery throws', async () => {
+    const result = await create({ debug: true, brokenSink: true });
+    expect(JSON.parse(result.stdout).testId).toBe('test_new');
+  });
+});

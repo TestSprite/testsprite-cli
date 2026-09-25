@@ -357,6 +357,8 @@ testsprite test lint --steps ./refined.plan.json       # the shape `test plan pu
 
 Create a new test. Backend tests use `--code-file` (agents supply backend code directly); frontend tests use either `--code-file` or `--plan-from` (see [Plan file format](#plan-file-format)). With `--run --wait`, the CLI chains create → trigger → poll in a single invocation. `--step-timeout <ms>` sets a per-test step timeout from 1 to 60000 milliseconds on the code-file path. Backend tests can declare wave-ordering dependencies at create time — `--produces <var>` / `--needs <var>` (repeatable) and `--category <setup|main|teardown>` — and amend them later via `test update`.
 
+Before creating a test, the CLI makes a best-effort check for an existing test with the same name. If that lookup fails, creation still proceeds; `--debug` reports the skipped advisory and its reason on stderr. Without `--debug`, lookup failures stay silent. This applies to both `--code-file` and `--plan-from`; the lookup is skipped under `--dry-run`.
+
 `--plan-template` prints the canonical minimal plan-file skeleton to stdout and exits — pure-local, no network/credentials, ignores every other flag. The exact same example is embedded in `test create --help`.
 
 ```bash
