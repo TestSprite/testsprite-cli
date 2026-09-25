@@ -2,8 +2,8 @@
 Thanks for contributing to testsprite-cli!
 
 Open this PR against `main` (this repo has only `main` as its contribution
-branch). For large or breaking changes, please open an issue first so we can
-agree on the approach before you invest time — see CONTRIBUTING.md.
+branch). For code changes, please open and claim an eligible issue first so we
+can agree on the approach before you invest time — see CONTRIBUTING.md.
 -->
 
 ## What does this PR do?
@@ -12,9 +12,9 @@ agree on the approach before you invest time — see CONTRIBUTING.md.
 
 ## Related issue
 
-<!-- e.g. "Closes #123". Required for features and behavior changes — open an
-     issue first and get it assigned (comment `/assign` there); see
-     CONTRIBUTING.md → Contribution model. Docs and small fixes don't need one. -->
+<!-- e.g. "Closes #123" or "Part of #123" for an umbrella issue. Required for
+     community PRs unless the title starts with `docs`: claim an eligible issue
+     with `/assign` first. See CONTRIBUTING.md → Contribution model. -->
 
 ## Type of change
 

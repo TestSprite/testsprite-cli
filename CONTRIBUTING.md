@@ -1,9 +1,8 @@
 # Contributing to testsprite-cli
 
-Thanks for contributing! Drive-by fixes and small PRs are welcome — you don't
-need permission to start. For anything large or breaking, please open an issue
-first (see [Contribution model](#contribution-model)) so we can agree on the
-approach before you invest time.
+Thanks for contributing! Docs fixes can go straight to a pull request. For
+code changes — even small ones — please follow the issue-and-claim flow below,
+so we can agree on the approach before you invest time.
 
 ## Questions & support
 
@@ -20,33 +19,38 @@ Discussions**, so the issue tracker stays a clean, actionable list.
 
 ## Contribution model
 
-- **Docs and small fixes** (typos, doc corrections, comment-only changes):
-  just open a pull request. No issue required (linking one is still
-  appreciated).
-- **Features and behavior changes** (new commands or flags, changed output,
-  new dependencies, refactors) follow **issue-first**:
+- **Docs PRs whose title starts with `docs`** can be opened without an issue
+  (linking one is still appreciated).
+- **Code changes**, including small fixes, new commands or flags, changed
+  output, new dependencies, and refactors, follow **issue-first**:
   1. Find an existing issue, or open a new one describing the change.
-  2. Claim it by commenting `/assign` — the whole comment, on its own line.
-     That's the one form the triage bot reliably recognizes. Don't paste
-     the literal command anywhere you don't mean it: a mention inside
-     prose, a code sample, or a quoted reply may still be picked up as a
-     claim, so leave `/assign` out of your comment unless you intend to
-     take the issue. A few natural-language phrasings also work (e.g.
-     "I'd like to work on this", "can I take this?", "I'll take this").
-     Either way, the bot assigns you automatically and replies with how
-     many open issues you currently hold.
-  3. If the issue is new, wait for triage — we check proposals against
+  2. If the issue is new, wait for triage — we check proposals against
      [VISION.md](./VISION.md) and the [standing policies](#standing-scope-policies)
      below before any code is written, so you don't invest in something
      we'd ask you to rework or decline.
-  4. Open your PR with a closing link (e.g. `Closes #123`) in the
-     description.
-- **PR gate:** a bot checks every non-docs community PR for a closing-linked
-  issue that is **assigned to the PR author**. PRs that don't meet this get
-  the `needs-issue` label and a failing `gate` check (from the PR-triage
-  workflow), and **are not reviewed** until it's fixed — file or claim the
-  issue, add the closing link, then edit the PR description (or push a
-  commit) to re-run the check.
+  3. Once it has an `accepted`, `good first issue`, or `help wanted` label,
+     claim it by commenting `/assign` at the start of a line (a Markdown list
+     marker and text after the command are fine). The bot also recognizes
+     phrases such as "I'd like to work on this", "can I take this?", and
+     "I'll take this". It ignores quoted text and code. You can release a
+     claim with `/unassign`. Community contributors can hold at most **3 open
+     claimed issues**; the bot refuses further claims until a slot is free.
+     It replies with your open assignment count.
+  4. Open your PR with a same-repository issue reference in its description:
+     `Closes #123`, `Fixes #123`, or `Resolves #123`. For an umbrella issue
+     that should stay open, use `Part of #123`, `Refs #123`, or
+     `Related to #123`. The bot also accepts `Close`/`Closed`, `Fix`/`Fixed`,
+     `Resolve`/`Resolved`, and `Ref`/`Reference`/`References` (case-insensitive,
+     with an optional colon before `#123`).
+- **Claim lifetime:** the bot warns after 72 hours and releases a claim after
+  96 hours unless you have an open PR whose description references the issue
+  as in step 4 (a bare `#123` mention does not count). You can `/assign` again
+  if the issue is still free.
+- **PR gate:** a bot checks every community PR whose title does not start with
+  `docs` for a referenced issue **assigned to the PR author**. PRs that don't
+  meet this get the `needs-issue` label and a failing `gate` check, and are
+  not reviewed until it's fixed. If you claimed after opening the PR, edit
+  the PR description to re-run the check.
 - Suspected **security vulnerabilities** are the exception to "file an
   issue": report them privately per [SECURITY.md](./SECURITY.md) instead.
 - We **do** accept community code contributions — this is an actively maintained
