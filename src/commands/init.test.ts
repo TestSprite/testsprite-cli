@@ -618,6 +618,7 @@ describe('runInit — happy path (interactive)', () => {
     const { captured, deps } = makeCapture();
     const fetchMock = makeOkFetch();
     const badCredsPath = join(tmpdir(), `corrupt-creds-${Date.now()}.json`);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes this test's own temp credentials path, never user input.
     writeFileSync(badCredsPath, '{ not valid json');
 
     try {
@@ -638,6 +639,7 @@ describe('runInit — happy path (interactive)', () => {
       ).toBe(true);
     } finally {
       try {
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- cleanup of this test's own temp path.
         unlinkSync(badCredsPath);
       } catch {
         // ignore
