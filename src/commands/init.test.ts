@@ -614,6 +614,37 @@ describe('runInit — happy path (interactive)', () => {
     expect(captured.stderr.some(line => line.includes('setup identity lookup failed'))).toBe(true);
   });
 
+  it('debug mode reports resolve endpoint profile read failure without failing the command', async () => {
+    const { captured, deps } = makeCapture();
+    const fetchMock = makeOkFetch();
+    const badCredsPath = join(tmpdir(), `corrupt-creds-${Date.now()}.json`);
+    writeFileSync(badCredsPath, '{ not valid json');
+
+    try {
+      await runInit(
+        makeBaseOpts({ apiKey: 'sk-user-json-test', debug: true, noAgent: true, output: 'json' }),
+        {
+          ...deps,
+          fetchImpl: fetchMock,
+          credentialsPath: badCredsPath,
+          isTTY: false,
+        },
+      );
+
+      const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
+      expect(parsed.status).toBe('initialized');
+      expect(
+        captured.stderr.some(line => line.includes('[debug] resolve endpoint profile read failed:')),
+      ).toBe(true);
+    } finally {
+      try {
+        unlinkSync(badCredsPath);
+      } catch {
+        // ignore
+      }
+    }
+  });
+
   it('stops before skill installation when the identity request is interrupted', async () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs, writeCalls, mkdirCalls } = makeMemFs();
