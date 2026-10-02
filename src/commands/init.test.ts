@@ -635,7 +635,9 @@ describe('runInit — happy path (interactive)', () => {
       const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
       expect(parsed.status).toBe('initialized');
       expect(
-        captured.stderr.some(line => line.includes('[debug] resolve endpoint profile read failed:')),
+        captured.stderr.some(line =>
+          line.includes('[debug] resolve endpoint profile read failed:'),
+        ),
       ).toBe(true);
     } finally {
       try {

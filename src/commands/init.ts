@@ -48,7 +48,11 @@ const DEFAULT_API_URL = 'https://api.testsprite.com';
  * configuring staging/dev (codex). On the real path this runs AFTER the profile
  * is written, so the persisted apiUrl is reflected faithfully.
  */
-function resolveReportedEndpoint(opts: InitOptions, deps: InitDeps, stderrFn?: (line: string) => void): string {
+function resolveReportedEndpoint(
+  opts: InitOptions,
+  deps: InitDeps,
+  stderrFn?: (line: string) => void,
+): string {
   const env = deps.env ?? process.env;
   const envApiUrl = normalizeEnvVar(env.TESTSPRITE_API_URL);
   let existing: string | undefined;
