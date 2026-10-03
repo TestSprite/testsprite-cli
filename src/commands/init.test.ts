@@ -616,37 +616,39 @@ describe('runInit — happy path (interactive)', () => {
 
   it('debug mode reports resolve endpoint profile read failure without failing the command', async () => {
     const { captured, deps } = makeCapture();
-    const fetchMock = makeOkFetch();
-    const badCredsPath = join(tmpdir(), `corrupt-creds-${Date.now()}.json`);
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes this test's own temp credentials path, never user input.
-    writeFileSync(badCredsPath, '{ not valid json');
+    const fetchMock = makeOkFetch()!;
+    const actual = await vi.importActual<typeof NodeFs>('node:fs');
+    let fetchCount = 0;
+    const trackingFetch = vi.fn(async (input: Parameters<typeof fetchMock>[0], init?: Parameters<typeof fetchMock>[1]) => {
+      fetchCount++;
+      return fetchMock(input, init);
+    });
 
-    try {
-      await runInit(
-        makeBaseOpts({ apiKey: 'sk-user-json-test', debug: true, noAgent: true, output: 'json' }),
-        {
-          ...deps,
-          fetchImpl: fetchMock,
-          credentialsPath: badCredsPath,
-          isTTY: false,
-        },
-      );
-
-      const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
-      expect(parsed.status).toBe('initialized');
-      expect(
-        captured.stderr.some(line =>
-          line.includes('[debug] resolve endpoint profile read failed:'),
-        ),
-      ).toBe(true);
-    } finally {
-      try {
-        // eslint-disable-next-line security/detect-non-literal-fs-filename -- cleanup of this test's own temp path.
-        unlinkSync(badCredsPath);
-      } catch {
-        // ignore
+    vi.mocked(readFileSync).mockImplementation((...args) => {
+      // After both configure and whoami fetch calls have completed, fail the subsequent readProfile call in resolveReportedEndpoint
+      if (fetchCount >= 2 && args[0] === credentialsPath) {
+        throw new Error('simulated credentials read error');
       }
-    }
+      return actual.readFileSync(...args);
+    });
+
+    await runInit(
+      makeBaseOpts({ apiKey: 'sk-user-json-test', debug: true, noAgent: true, output: 'json' }),
+      {
+        ...deps,
+        fetchImpl: trackingFetch,
+        credentialsPath,
+        isTTY: false,
+      },
+    );
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
+    expect(parsed.status).toBe('initialized');
+    expect(
+      captured.stderr.some(line =>
+        line.includes('[debug] resolve endpoint profile read failed: simulated credentials read error'),
+      ),
+    ).toBe(true);
   });
 
   it('stops before skill installation when the identity request is interrupted', async () => {
