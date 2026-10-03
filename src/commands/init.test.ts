@@ -619,10 +619,12 @@ describe('runInit — happy path (interactive)', () => {
     const fetchMock = makeOkFetch()!;
     const actual = await vi.importActual<typeof NodeFs>('node:fs');
     let fetchCount = 0;
-    const trackingFetch = vi.fn(async (input: Parameters<typeof fetchMock>[0], init?: Parameters<typeof fetchMock>[1]) => {
-      fetchCount++;
-      return fetchMock(input, init);
-    });
+    const trackingFetch = vi.fn(
+      async (input: Parameters<typeof fetchMock>[0], init?: Parameters<typeof fetchMock>[1]) => {
+        fetchCount++;
+        return fetchMock(input, init);
+      },
+    );
 
     vi.mocked(readFileSync).mockImplementation((...args) => {
       // After both configure and whoami fetch calls have completed, fail the subsequent readProfile call in resolveReportedEndpoint
@@ -646,7 +648,9 @@ describe('runInit — happy path (interactive)', () => {
     expect(parsed.status).toBe('initialized');
     expect(
       captured.stderr.some(line =>
-        line.includes('[debug] resolve endpoint profile read failed: simulated credentials read error'),
+        line.includes(
+          '[debug] resolve endpoint profile read failed: simulated credentials read error',
+        ),
       ),
     ).toBe(true);
   });
