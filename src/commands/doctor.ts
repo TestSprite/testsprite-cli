@@ -21,7 +21,6 @@ import {
   makeHttpClient,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
-import { DEFAULT_PROFILE } from '../lib/credentials.js';
 import {
   loadConfig,
   resolveProfileName,
@@ -115,7 +114,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     if (!isFsPermissionError(error)) throw error;
     credentialsReadError = error.code;
     config = {
-      profile: opts.profile ?? normalizeEnvVar(env.TESTSPRITE_PROFILE) ?? DEFAULT_PROFILE,
+      profile: resolveProfileName(opts.profile, env),
       apiUrl: opts.endpointUrl ?? normalizeEnvVar(env.TESTSPRITE_API_URL) ?? DEFAULT_API_URL,
       apiKey: normalizeEnvVar(env.TESTSPRITE_API_KEY),
     };

@@ -328,6 +328,7 @@ describe('runDoctor — failing checks exit non-zero', () => {
     'a real unreadable file does not leak EACCES into the Connectivity or Local tunnel checks',
     async () => {
       writeProfile('default', { apiKey: 'sk-brick' }, { path: credentialsPath });
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` lives in this suite's `mkdtempSync` temp dir, never user input
       chmodSync(credentialsPath, 0o000);
       const { capture, deps } = makeCapture();
       const report = await runDoctor(
@@ -343,7 +344,7 @@ describe('runDoctor — failing checks exit non-zero', () => {
       // The regression this pins: Connectivity and Local tunnel resolved their
       // client from the pre-resolved config, so neither re-read the file and
       // reported its EACCES as a bogus API failure.
-      expect(out).not.toContain('EACCES: operation not permitted');
+      expect(out).not.toContain('EACCES: permission denied');
       const connectivity = report.checks.find(c => c.name === 'Connectivity');
       expect(connectivity?.status).toBe('ok');
       const tunnel = report.checks.find(c => c.name === 'Local tunnel');
