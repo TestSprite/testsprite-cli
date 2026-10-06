@@ -3,10 +3,12 @@ import * as net from 'node:net';
 import { ApiError } from './errors.js';
 import {
   LOOPBACK_HOSTS,
+  loopbackHost,
   assertLocalPortListening,
   buildLocalTargetUrl,
   normalizeLocalHost,
   parseLocalPort,
+  parseStoredLocalTarget,
   probeLocalPort,
 } from './local-target.js';
 
@@ -77,8 +79,8 @@ describe('parseLocalPort', () => {
 });
 
 describe('normalizeLocalHost', () => {
-  it('defaults to 127.0.0.1', () => {
-    expect(normalizeLocalHost(undefined)).toBe('127.0.0.1');
+  it('defaults to localhost', () => {
+    expect(normalizeLocalHost(undefined)).toBe('localhost');
   });
 
   it.each([
@@ -261,5 +263,49 @@ describe('assertLocalPortListening', () => {
       assertLocalPortListening('127.0.0.1', port, {}, line => lines.push(line)),
     ).resolves.toBeUndefined();
     expect(lines).toEqual([]);
+  });
+});
+
+describe('loopbackHost', () => {
+  it('recognises every loopback spelling, bracketed IPv6 and mixed case included', () => {
+    expect(loopbackHost('localhost')).toBe('localhost');
+    expect(loopbackHost('LocalHost')).toBe('localhost');
+    expect(loopbackHost('127.0.0.1')).toBe('127.0.0.1');
+    expect(loopbackHost('[::1]')).toBe('::1');
+  });
+
+  it('answers undefined for anything else instead of throwing', () => {
+    expect(loopbackHost('example.com')).toBeUndefined();
+    expect(loopbackHost('127.0.0.2')).toBeUndefined();
+    expect(loopbackHost('')).toBeUndefined();
+  });
+});
+
+describe('stored loopback URL targets', () => {
+  it.each([
+    ['http://localhost:3000', 'localhost'],
+    ['http://127.0.0.1:3000/', '127.0.0.1'],
+    ['http://[::1]:3000', '::1'],
+    ['http://localhost:80', 'localhost'],
+  ])('parses %s without changing its stored spelling', (url, host) => {
+    expect(parseStoredLocalTarget({ url })).toEqual({
+      host,
+      port: url.includes(':80') ? 80 : 3000,
+    });
+  });
+
+  it.each([
+    'https://localhost:3000',
+    'http://localhost',
+    'http://localhost:3000/page',
+    'http://localhost:3000/?x=1',
+    'http://qa:secret@localhost:3000',
+    'http://localhost:3000/#section',
+  ])('refuses an unsupported stored loopback shape %s', url => {
+    expect(() => parseStoredLocalTarget({ url })).toThrow(ApiError);
+  });
+
+  it('leaves a public URL to the existing public-address validation', () => {
+    expect(parseStoredLocalTarget({ url: 'https://example.com/page' })).toBeUndefined();
   });
 });

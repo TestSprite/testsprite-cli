@@ -16,7 +16,7 @@ import {
 import { createProjectCommand } from './commands/project.js';
 import { createScheduleCommand } from './commands/schedule.js';
 import { createTunnelCommand } from './commands/tunnel.js';
-import { createTestCommand, type TunnelInterruptDetach } from './commands/test.js';
+import { createTestCommand } from './commands/test.js';
 import { createTestListCommand } from './commands/testlist.js';
 import { createUsageCommand } from './commands/usage.js';
 import { resolveProfileName } from './lib/config.js';
@@ -36,7 +36,9 @@ import {
 } from './lib/interrupt.js';
 import { Output, isOutputMode } from './lib/output.js';
 import { maybeInstallProxyAgent } from './lib/proxy.js';
+import { redactDeep } from './lib/redact.js';
 import {
+  buildInterruptEnvelope,
   renderAmbiguousOrgCandidates,
   renderTunnelBindingLimitIds,
   renderCommanderError,
@@ -47,6 +49,7 @@ import {
   classifyCliError,
   isTelemetryOptedOut,
   recordOutcome,
+  recordTelemetryExtras,
   resolveTelemetryAuth,
   type ResolvedTelemetryAuth,
   type WaitTimeoutTelemetry,
@@ -176,13 +179,6 @@ let telemetryEmit = false;
 // `auth remove` (which deletes the profile) is still reported on the key it used.
 let telemetryAuth: ResolvedTelemetryAuth | undefined;
 
-// True when the leaf command that is about to run carries a `--local` option
-// value — `test run --local <port>` or `project create --local <port>`.
-// Set before validation so test-run refusals still report attempts that a
-// backend-side mint/attach event never observes. Local project admission
-// failures have a separate zero-HTTP exception below.
-let telemetryLocal = false;
-
 // Local project admission failures must exit without any TestSprite HTTP,
 // including telemetry. Track companion flags even when --local is missing.
 let telemetryLocalProject = false;
@@ -289,9 +285,9 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
   const commandPath = commandPathOf(actionCommand);
   // Record which leaf command ran, for the telemetry emit around parseAsync.
   ranCommandPath = commandPath;
-  // The raw --local opt is a port string; only its presence is
-  // recorded (see `telemetryLocal`'s own comment — never the value).
-  telemetryLocal = globals.local !== undefined;
+  // Preserve explicit --local attempts, including refusals and borrowed tunnels;
+  // only flag presence is recorded. Automatic tunnel paths record the same fact.
+  if (globals.local !== undefined) recordTelemetryExtras({ local: true });
   telemetryLocalProject =
     commandPath === 'project create' &&
     (globals.local !== undefined || globals.localHost !== undefined);
@@ -369,7 +365,6 @@ try {
         exitCode: 0,
         durationMs: Date.now() - telemetryStartedAt,
         ...telemetryGlobals(),
-        local: telemetryLocal,
       },
       { resolvedAuth: telemetryAuth },
     );
@@ -407,7 +402,6 @@ try {
           ...waitTimeoutTelemetry,
           durationMs: Date.now() - telemetryStartedAt,
           ...telemetryGlobals(),
-          local: telemetryLocal,
         },
         { resolvedAuth: telemetryAuth },
       );
@@ -432,7 +426,10 @@ try {
           message,
           nextAction: err.nextAction,
           requestId: err.requestId,
-          details: err.details,
+          // `err.details` is already redacted at ApiError construction (see
+          // `errors.ts`); redacting again here is defence in depth for this
+          // hand-built envelope specifically, independent of that.
+          details: redactDeep(err.details),
           ...(billingRefusal ? { links: billingRefusal.links } : {}),
         },
       };
@@ -486,30 +483,7 @@ try {
     // A disarmed request has no run ID, so its JSON hint describes checking
     // current state before retrying. Both use the conventional 128+signum code.
     if (mode === 'json') {
-      const tunnelDetach = (err as InterruptError & { tunnelDetach?: TunnelInterruptDetach })
-        .tunnelDetach;
-      const envelope = {
-        error: {
-          code: 'INTERRUPTED',
-          message: err.message,
-          nextAction:
-            tunnelDetach?.nextAction ??
-            (err.runWaitContext
-              ? 'The server-side run (if any) keeps executing and billing. ' +
-                'Re-attach with: testsprite test wait <runId>, or stop it with: testsprite test cancel <runId> ' +
-                '(runId is in the partial JSON on stdout).'
-              : 'The request was interrupted. Check the current state before retrying; ' +
-                'a multi-item command may have processed some items.'),
-          requestId: 'local',
-          details: {
-            signal: err.signal,
-            ...(tunnelDetach
-              ? { runId: tunnelDetach.runId, cancelOutcome: tunnelDetach.cancel }
-              : {}),
-          },
-        },
-      };
-      process.stderr.write(`${JSON.stringify(envelope, null, 2)}\n`);
+      process.stderr.write(`${JSON.stringify(buildInterruptEnvelope(err), null, 2)}\n`);
     } else {
       process.stderr.write(`Error: ${err.message}\n`);
     }

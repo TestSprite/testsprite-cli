@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { createReadStream, readFileSync, statSync, type Stats } from 'node:fs';
 import { basename, extname } from 'node:path';
 import { Readable } from 'node:stream';
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import {
   emitDryRunBanner,
   makeHttpClient,
@@ -17,7 +17,6 @@ import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
 import {
   assertStoredLocalTargetListening,
   buildLocalTargetUrl,
-  DEFAULT_LOCAL_HOST,
   parseStoredLocalTarget,
   type LocalPortProbeDeps,
   type StoredLocalTarget,
@@ -35,6 +34,7 @@ import {
   type PaginationFlags,
 } from '../lib/pagination.js';
 import { createProjectEnvCommand } from './project-env.js';
+import { createProjectSignInCommand } from './project-sign-in.js';
 
 export interface CliProject {
   id: string;
@@ -75,6 +75,9 @@ export interface CliProject {
    * (see the `project create --type backend` note in CLAUDE.md).
    */
   targetUrl?: string | null;
+  /** Absent on older servers, V2 projects, or when the environment read failed. */
+  defaultEnvironment?: string | null;
+  environmentCount?: number;
   /** Present only when the stored project target is local to the developer machine. */
   originMode?: 'local';
   /**
@@ -296,6 +299,9 @@ export async function runCreate(
   if (opts.password !== undefined && opts.password.trim().length === 0) {
     throw localValidationError('--password must not be empty or whitespace-only');
   }
+  if (opts.password !== undefined && opts.passwordFile !== undefined) {
+    stderr('Warning: --password takes precedence; --password-file was ignored.');
+  }
   if (opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
   }
@@ -316,13 +322,19 @@ export async function runCreate(
     localHost: opts.localHost,
     url: opts.targetUrl,
   });
-  const targetUrl = localTarget
-    ? buildLocalTargetUrl(localTarget.host, localTarget.port)
-    : opts.targetUrl;
+  // A loopback --url is the same stored target as --local, so it gets the same
+  // refusal before anything is sent.
+  if (localTarget && opts.type !== 'frontend') {
+    throw localValidationError(
+      'a --url on this machine (localhost, 127.0.0.1, [::1]) is frontend-only; give a backend project a public URL',
+    );
+  }
+  const targetUrl =
+    opts.targetUrl ??
+    (localTarget ? buildLocalTargetUrl(localTarget.host, localTarget.port) : undefined);
 
-  // P2-7: guard --url against localhost/RFC1918/non-http(s) (same rules as
-  // `test create --target-url`). Applies to both FE (required) and BE (optional).
-  if (opts.targetUrl !== undefined) {
+  // Keep the existing public-address guard for targets a loopback tunnel cannot reach.
+  if (opts.targetUrl !== undefined && !localTarget) {
     assertNotLocal(opts.targetUrl, {
       field: 'url',
       helpCommand: 'testsprite project create',
@@ -480,6 +492,9 @@ export interface CliUpdateProjectResponse {
   updatedFields?: string[];
   /** Absent-safe: not guaranteed on every backend response. */
   updatedAt?: string;
+  /** Present on servers that report which default environment was edited. */
+  environment?: { name: string; isDefault: true };
+  effects?: string[];
 }
 
 /** Resolve the updated project's id regardless of which field name the backend used. */
@@ -528,23 +543,23 @@ export async function runUpdate(
   if (opts.password !== undefined && opts.password.trim().length === 0) {
     throw localValidationError('--password must not be empty or whitespace-only');
   }
+  if (opts.password !== undefined && opts.passwordFile !== undefined) {
+    stderr('Warning: --password takes precedence; --password-file was ignored.');
+  }
   if (opts.name !== undefined && opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
   }
-  // `--local <port>` is the one way to point a project at an app on this
-  // machine, on update exactly as on create. A loopback `--url` has no
-  // accepted form here and is redirected to `--local`. The project's type is
-  // not known client-side on update; the server refuses `--local` on a
-  // backend project.
+  // A loopback URL and --local shorthand use the same stored-target wire shape.
+  // The server owns project-type validation on update.
   const localTarget = parseStoredLocalTarget({
     local: opts.local,
     localHost: opts.localHost,
     url: opts.targetUrl,
   });
-  const targetUrl = localTarget
-    ? buildLocalTargetUrl(localTarget.host, localTarget.port)
-    : opts.targetUrl;
-  if (opts.targetUrl !== undefined) {
+  const targetUrl =
+    opts.targetUrl ??
+    (localTarget ? buildLocalTargetUrl(localTarget.host, localTarget.port) : undefined);
+  if (opts.targetUrl !== undefined && !localTarget) {
     assertNotLocal(opts.targetUrl, {
       field: 'url',
       helpCommand: 'testsprite project update',
@@ -1462,16 +1477,18 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .option('--name <name>', 'project name (required)')
     .option(
       '--url <url>',
-      'target URL (required for frontend unless --local is used; also required for backend on the V3 execution ' +
+      'target URL (public http/https or a loopback http origin with an explicit port; required for frontend unless --local is used; also required for backend on the V3 execution ' +
         'path — see `auth status` for your routing)',
     )
     .option(
       '--local <port>',
-      'create a frontend project for an app on this machine (1-65535; excludes --url)',
+      'shorthand for --url http://localhost:<port> (1-65535; excludes --url; runs open a tunnel automatically)',
     )
-    .option(
-      '--local-host <host>',
-      'loopback host: localhost, 127.0.0.1 (default), or ::1; requires --local',
+    .addOption(
+      new Option(
+        '--local-host <host>',
+        'deprecated loopback host override; requires --local',
+      ).hideHelp(),
     )
     .option('--skip-preflight', 'skip the local TCP listener check before project creation')
     .option(
@@ -1527,14 +1544,19 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .command('update <project-id>')
     .description('Update project metadata')
     .option('--name <name>', 'new project name')
-    .option('--url <url>', 'new target URL (public; for an app on this machine use --local)')
     .option(
-      '--local <port>',
-      'point the project at an app on this machine (1-65535; excludes --url; frontend only)',
+      '--url <url>',
+      'new target URL (public http/https, or a loopback http origin with an explicit port)',
     )
     .option(
-      '--local-host <host>',
-      'loopback host: localhost, 127.0.0.1 (default), or ::1; requires --local',
+      '--local <port>',
+      'shorthand for --url http://localhost:<port> (1-65535; excludes --url; frontend only)',
+    )
+    .addOption(
+      new Option(
+        '--local-host <host>',
+        'deprecated loopback host override; requires --local',
+      ).hideHelp(),
     )
     .option('--skip-preflight', 'skip the local TCP listener check before the update')
     .option('--username <user>', 'new auth username')
@@ -1746,6 +1768,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
   // `project env <verb>` — the per-project environment surface (credentials,
   // URL, default). Own module; `deps` threaded so tests inject.
   project.addCommand(createProjectEnvCommand(deps));
+  project.addCommand(createProjectSignInCommand(deps));
 
   return project;
 }
@@ -1910,7 +1933,21 @@ const PROJECT_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliProject>> = [
     width: rows => Math.max(3, ...rows.map(project => renderProjectUrl(project).length)),
     render: renderProjectUrl,
   },
-  { header: 'CREATED', width: 0, render: project => project.createdAt },
+  {
+    header: 'CREATED',
+    width: rows => Math.max(7, ...rows.map(project => project.createdAt.length)),
+    render: project => project.createdAt,
+  },
+  {
+    header: 'DEFAULT ENV',
+    width: rows => Math.max(11, ...rows.map(project => (project.defaultEnvironment ?? '-').length)),
+    render: project => project.defaultEnvironment ?? '-',
+  },
+  {
+    header: 'ENVS',
+    width: 4,
+    render: project => project.environmentCount?.toString() ?? '-',
+  },
 ];
 
 function renderProjectUrl(project: CliProject): string {
@@ -1970,6 +2007,15 @@ function renderProjectText(p: CliProject): string {
   if (p.orgId !== undefined) {
     lines.push(`org:         ${p.orgName ?? '(name unknown)'} (${p.orgId})`);
   }
+  if ('defaultEnvironment' in p) {
+    lines.push(`defaultEnv:  ${p.defaultEnvironment ?? '-'}`);
+  }
+  if ('environmentCount' in p) {
+    const count = p.environmentCount;
+    lines.push(
+      `envs:        ${count}${count !== undefined && count > 0 ? ` (list with: testsprite project env list ${p.id})` : ''}`,
+    );
+  }
   // Presence, not truthiness — see the `targetUrl` docstring on `CliProject`.
   // `'targetUrl' in p` distinguishes "the backend answered 'no URL'" (render the
   // hint) from "this endpoint doesn't report it" (say nothing).
@@ -2015,14 +2061,12 @@ function renderCreateProjectText(
   if (localTarget) {
     const projectId = resolveCreatedProjectId(p) ?? '<project-id>';
     const url = buildLocalTargetUrl(localTarget.host, localTarget.port);
-    const hostFlag =
-      localTarget.host === DEFAULT_LOCAL_HOST ? '' : ` --local-host ${localTarget.host}`;
     lines.push(
       `Local project: TestSprite will reach ${url} only through a tunnel from this machine.`,
       'Next: write a plan and run it locally:',
       `  In plan.json, set projectId to ${projectId}.`,
       `  testsprite test create --project ${projectId} --plan-from plan.json`,
-      `  testsprite test run <test-id> --local ${localTarget.port}${hostFlag}`,
+      '  testsprite test run <test-id>',
       `Portal runs of this project stay blocked (free) until you set a public URL with: testsprite project update ${projectId} --url https://...`,
     );
   }
@@ -2035,13 +2079,24 @@ function renderUpdateText(r: CliUpdateProjectResponse, localTarget?: StoredLocal
     `updatedFields: ${r.updatedFields?.join(', ') ?? '(none)'}`,
   ];
   if (r.updatedAt !== undefined) lines.push(`updatedAt:     ${r.updatedAt}`);
+  if (r.environment !== undefined) {
+    lines.push(`environment: ${r.environment.name} (default)`);
+    const labels: Record<string, string> = {
+      'environment.url': 'Environment URL updated',
+      'environment.credentials': 'Environment credentials updated',
+      'project.name': 'Project name updated',
+      'project.instruction': 'Project instruction updated',
+      'project.testIdAttributes': 'Project test ID attributes updated',
+    };
+    for (const effect of r.effects ?? []) {
+      if (labels[effect]) lines.push(`effect:      ${labels[effect]}`);
+    }
+  }
   if (localTarget) {
     const url = buildLocalTargetUrl(localTarget.host, localTarget.port);
-    const hostFlag =
-      localTarget.host === DEFAULT_LOCAL_HOST ? '' : ` --local-host ${localTarget.host}`;
     lines.push(
       `Local project: TestSprite will reach ${url} only through a tunnel from this machine.`,
-      `Run its tests with: testsprite test run <test-id> --local ${localTarget.port}${hostFlag}`,
+      'Run its tests with: testsprite test run <test-id> (the CLI opens a tunnel automatically).',
     );
   }
   return lines.join('\n');

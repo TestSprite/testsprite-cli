@@ -27,6 +27,7 @@ import {
 import { globalShutdown, type ShutdownHandle } from './interrupt.js';
 import type { OutputMode } from './output.js';
 import { createDryRunFetch } from './dry-run/fetch.js';
+import { redactDeep } from './redact.js';
 import { noteServerVersion } from './version-notice.js';
 import { VERSION } from '../version.js';
 
@@ -383,10 +384,19 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
   };
 }
 
-function formatDebug(event: DebugEvent): string {
-  return `[debug ${new Date().toISOString()}] ${JSON.stringify(event)}`;
+/**
+ * `DebugEvent` today carries only method/url/attempt/status/errorCode/
+ * durationMs/requestId/delayMs — no headers or body — so there is nothing to
+ * redact in the current shape. This still routes through `redactDeep` so a
+ * future field (request/response headers or body added to `DebugEvent` for
+ * richer `--debug` tracing) is protected from day one rather than needing a
+ * second fix when that lands. Exported for direct unit coverage of that
+ * forward-compatibility contract.
+ */
+export function formatDebug(event: DebugEvent): string {
+  return `[debug ${new Date().toISOString()}] ${JSON.stringify(redactDeep(event))}`;
 }
 
-function formatDryRunDebug(event: DebugEvent): string {
-  return `[debug ${new Date().toISOString()}] ${JSON.stringify({ ...event, mode: 'dry-run' })}`;
+export function formatDryRunDebug(event: DebugEvent): string {
+  return `[debug ${new Date().toISOString()}] ${JSON.stringify(redactDeep({ ...event, mode: 'dry-run' }))}`;
 }

@@ -99,12 +99,8 @@ export interface TelemetryOutcomeInput extends Partial<WaitTimeoutTelemetry> {
   output?: string;
   dryRun?: boolean;
   /**
-   * True when the invocation requested a local tunnel target (`test run
-   * --local <port>`) — the flag's mere presence, never its port number or
-   * host. Reported regardless of outcome, including a zero-network refusal
-   * (dead port, `--local` combined with an incompatible flag): those are
-   * exactly the attempts nothing server-side ever sees, which is why this
-   * field is not redundant with a backend-side mint/attach analytics event.
+   * True when --local was present, including refusals and borrowed tunnels,
+   * or when this invocation automatically opened a saved-environment tunnel.
    */
   local?: boolean;
 }
@@ -223,6 +219,7 @@ export type TelemetryConflictReason =
  * integers; enums are closed. Nothing here can carry an id, a URL, or a message.
  */
 export interface TelemetryExtras {
+  local?: boolean;
   /** Batch dispatch accounting (`test run --all`, `testlist run`). */
   accepted?: number;
   conflicts?: number;
@@ -260,7 +257,7 @@ const COUNT_KEYS = [
   'localConcurrencyLimit',
   'localPeakInFlight',
 ] as const;
-const BOOLEAN_KEYS = ['force', 'workflowExisted'] as const;
+const BOOLEAN_KEYS = ['force', 'workflowExisted', 'local'] as const;
 const ENUM_KEYS: { [K in 'conflictReason' | 'platform' | 'projectResolved']: ReadonlySet<string> } =
   {
     conflictReason: new Set<TelemetryConflictReason>([
@@ -314,6 +311,11 @@ let pendingExtras: TelemetryExtras = {};
  */
 export function recordTelemetryExtras(partial: TelemetryExtrasInput): void {
   pendingExtras = { ...pendingExtras, ...sanitizeTelemetryExtras(partial) };
+}
+
+/** Extend explicit --local telemetry to commands that automatically open a tunnel. */
+export function recordTelemetryTunnelOpened(opened: boolean): void {
+  if (opened) recordTelemetryExtras({ local: true });
 }
 
 /** Return everything recorded so far and clear the sink (one event per process). */
@@ -383,7 +385,7 @@ export interface TelemetryEvent extends Partial<WaitTimeoutTelemetry>, Telemetry
   nodeVersion?: string;
   output?: string;
   ci?: boolean;
-  /** Present (always `true`) only for a `test run --local` invocation; absent otherwise. */
+  /** Present (always `true`) for --local attempts or automatically opened tunnels. */
   local?: boolean;
   /** The validated `TESTSPRITE_CLIENT` tag (e.g. `github-action/v1`); absent when unset/invalid. */
   client?: string;
@@ -519,6 +521,8 @@ export function buildTelemetryEvent(
   extras: TelemetryExtrasInput = {},
 ): TelemetryEvent {
   const client = resolveClientTag(env);
+  const { local: runtimeLocal, ...sanitizedExtras } = sanitizeTelemetryExtras(extras);
+  const local = input.local === true || runtimeLocal === true;
   return {
     command: input.command,
     outcome: input.outcome,
@@ -534,11 +538,11 @@ export function buildTelemetryEvent(
     ci: isTruthyEnv(env.CI) || !isTTY,
     ...(client !== undefined ? { client } : {}),
     ...buildCiContext(env),
-    ...(input.local ? { local: true } : {}),
+    ...(local ? { local: true } : {}),
     ...(input.outcome === 'error' && input.reason === 'wait_timeout'
       ? {
           reason: 'wait_timeout',
-          ...(input.local &&
+          ...(local &&
           (input.cancelOutcome === 'cancelled' ||
             input.cancelOutcome === 'already_terminal' ||
             input.cancelOutcome === 'failed' ||
@@ -547,7 +551,7 @@ export function buildTelemetryEvent(
             : {}),
         }
       : {}),
-    ...sanitizeTelemetryExtras(extras),
+    ...sanitizedExtras,
   };
 }
 

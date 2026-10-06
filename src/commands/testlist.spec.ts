@@ -721,11 +721,11 @@ describe('testlist run', () => {
     expect(err.code).toBe('VALIDATION_ERROR');
   });
 
-  it('--gh-output without --wait → VALIDATION_ERROR, no network (silent no-op is the bug it prevents)', async () => {
+  it('--gh-output without --wait → VALIDATION_ERROR, no dispatch (silent no-op is the bug it prevents)', async () => {
     const { env } = makeCreds();
     let called = false;
-    const fetchImpl = makeFetch(() => {
-      called = true;
+    const fetchImpl = makeFetch((_url, init) => {
+      if (init.method === 'POST') called = true;
       return { body: RUN_ACCEPTED };
     });
     const err = (await runTestlistRun(
@@ -736,11 +736,11 @@ describe('testlist run', () => {
     expect(called).toBe(false);
   });
 
-  it('--summary-file without --wait → VALIDATION_ERROR, no network', async () => {
+  it('--summary-file without --wait → VALIDATION_ERROR, no dispatch', async () => {
     const { env } = makeCreds();
     let called = false;
-    const fetchImpl = makeFetch(() => {
-      called = true;
+    const fetchImpl = makeFetch((_url, init) => {
+      if (init.method === 'POST') called = true;
       return { body: RUN_ACCEPTED };
     });
     const summaryDir = mkdtempSync(join(tmpdir(), 'cli-testlist-summary-'));
@@ -1054,3 +1054,31 @@ describe('testlist run — insufficient credits → exit 12 + telemetry facts', 
     expect(takeTelemetryExtras()).toEqual({ accepted: 1, conflicts: 0, deferred: 0, skipped: 0 });
   });
 });
+
+it.each([null, '2026-08-01T00:00:05.000Z'])(
+  'uses polled run timing for test-list JUnit with startedAt=%s',
+  async startedAt => {
+    const { env } = makeCreds();
+    const reportFile = join(mkdtempSync(join(tmpdir(), 'testlist-junit-timing-')), 'report.xml');
+    const stdout: string[] = [];
+    await runTestlistRun(
+      { ...runBase, output: 'json', listId: 'list-1', wait: true, report: 'junit', reportFile },
+      {
+        env,
+        fetchImpl: makeFetch((_url, init) => ({
+          body: init.method === 'POST' ? RUN_ACCEPTED : { ...makeRun('passed'), startedAt },
+        })),
+        stdout: line => stdout.push(line),
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads the JUnit report this test wrote to its own temp dir, never user input
+    const xml = readFileSync(reportFile, 'utf8');
+    const time = startedAt === null ? '30' : '25';
+    expect(xml).toContain(`skipped="0" time="${time}">`);
+    expect(xml).toContain(`runId="run_abc" time="${time}">`);
+    expect(stdout[0]).not.toContain('durationSeconds');
+    expect(stdout[0]).not.toContain('createdAt');
+  },
+);

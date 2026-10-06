@@ -127,6 +127,7 @@ export function summarizeAcceptedPayload(
     deferred?: unknown;
     conflicts?: unknown;
     notFound?: unknown;
+    skipped?: unknown;
   } = parsed !== null && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
   const acceptedRows: CiRunRow[] = Array.isArray(payload.accepted)
     ? payload.accepted
@@ -151,6 +152,11 @@ export function summarizeAcceptedPayload(
     : [];
   const rows: CiRunRow[] = [
     ...acceptedRows,
+    ...bucketRows(payload.skipped, 'skipped', item =>
+      typeof (item as { reason?: unknown })?.reason === 'string'
+        ? (item as { reason: string }).reason
+        : 'not dispatched',
+    ),
     ...bucketRows(payload.deferred, 'deferred', 'rate-deferred (not dispatched)'),
     ...bucketRows(payload.conflicts, 'conflict', item => {
       const conflict = item as Partial<RunConflict> | null;

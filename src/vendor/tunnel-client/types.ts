@@ -1,4 +1,5 @@
 export type LogLevel = "debug" | "info" | "warn" | "error";
+export type TunnelTransport = "tls" | "plaintext";
 
 
 export enum ErrCode {
@@ -9,6 +10,7 @@ export enum ErrCode {
     StreamFailed = "0005",
     BlockedTargetRejected = "0006",
     DataPlaneUnreachable = "0007",
+    ClientUnknown = "0008",
 }
 
 export interface TunnelClientError {
@@ -19,42 +21,29 @@ export interface TunnelClientError {
 export interface TunnelClientOptions {
   clientId: string;
   secret: string;
-  /**
-   * VENDOR DELTA: required, not optional. The endpoint defaults upstream
-   * carries are hard-coded TestSprite dev hostnames; they are gone here and
-   * both values come from `POST /api/cli/v1/tunnel`. See ./config.ts.
-   */
+  /** CLI endpoints must come from the tunnel mint response. */
   controlUrl: string;
-  /** VENDOR DELTA: required. `host:port` of the tunnel DATA plane. */
+  /** Legacy unencrypted data-plane address (`host:port` or `[v6]:port`). */
   tunnelAddr: string;
-  /**
-   * TLS `host:port` (or `[v6]:port`) for the tunnel DATA plane. When set,
-   * transport is fixed to TLS and `tunnelAddr` is never dialled as fallback.
-   */
+  /** TLS data-plane address (`host:port` or `[v6]:port`). Takes precedence over `tunnelAddr`. */
   tunnelTlsAddr?: string;
-  /** TLS SNI/verification name. Defaults to the hostname in `tunnelTlsAddr`. */
+  /** TLS SNI and certificate hostname. Defaults to the DNS host in `tunnelTlsAddr`. */
   tunnelTlsServername?: string;
-  /** Extra PEM roots appended to Node's built-in root certificate set. */
+  /** Additional PEM roots appended to Node's default trust store. */
   tunnelTlsCa?: string | Buffer | Array<string | Buffer>;
-  /** Maximum time to complete each plaintext TCP connect. Defaults to 10 seconds. */
-  connectTimeoutMs?: number;
-  /** Maximum time to complete each TLS connect + handshake. Defaults to 10 seconds. */
+  /** Maximum wait for the data-plane TLS handshake; defaults to 10 seconds. */
   tlsHandshakeTimeoutMs?: number;
-  /**
-   * Maximum retry window after the first failed data-plane attempt. The first
-   * inbound yamux stream or the settle interval ends it. Defaults to 60
-   * seconds; `0` retries forever.
-   */
+  /** Maximum wait for a plaintext data-plane TCP connection; defaults to 10 seconds. */
+  connectTimeoutMs?: number;
+  /** Continuous data-plane failure episode; defaults to 60 seconds. Zero retries forever. */
   dataPlaneRetryDeadlineMs?: number;
-  /**
-   * Time a post-TunnelHello socket must remain open before the session counts
-   * as established without an inbound yamux stream. Defaults to 5 seconds.
-   */
+  /** Continuous unknown-client episode; defaults to 120 seconds. Zero retries forever. */
+  clientUnknownRetryDeadlineMs?: number;
+  /** Called before retrying an unknown client; can re-register the same ID and secret. */
+  onClientUnknown?: () => Promise<boolean | void>;
+  /** Open-session stability period that establishes the data plane; defaults to 5 seconds. */
   dataPlaneSettleMs?: number;
-  /**
-   * VENDOR DELTA: maximum time `start()` waits for the current control
-   * connection's first Ack, which is the server's authentication acknowledgement.
-   */
+  /** Maximum wait for the initial control connection's authentication Ack; defaults to 10 seconds. */
   authTimeoutMs?: number;
   heartbeatMs?: number;
   reconnectMs?: number;
@@ -74,11 +63,7 @@ export interface TunnelClientOptions {
    */
   allowPrivateNetworkTarget?: boolean;
   onError?(e: TunnelClientError): void;
-  /**
-   * VENDOR DELTA (not upstream): where log lines go. Upstream writes them to
-   * `console.log`/`console.warn`, i.e. STDOUT, which would corrupt this CLI's
-   * `--output json` contract. Absent -> stderr.
-   */
+  /** CLI logs use the injected sink; the default writes only to stderr. */
   logSink?(level: LogLevel, line: string): void;
 }
 

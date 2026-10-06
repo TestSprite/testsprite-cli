@@ -1025,6 +1025,10 @@ describe('create-batch --run --wait — InterruptError partial names dispatched 
           { status: 200, headers: { 'content-type': 'application/json' } },
         );
       }
+      if (init.method === 'GET' && /\/tests\/[^/]+$/.test(url))
+        return new Response(JSON.stringify({ type: 'frontend', projectId: 'project_1' }));
+      if (init.method === 'GET' && url.endsWith('/projects/project_abc/env'))
+        return new Response(JSON.stringify({ environments: [] }));
       // GET /runs/{id} long-poll: hang until aborted.
       return new Promise<Response>((_resolve, reject) => {
         const signal = init.signal;

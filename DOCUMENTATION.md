@@ -52,7 +52,7 @@ testsprite --version
 testsprite project list --dry-run --output json
 ```
 
-`--dry-run` is a global flag that skips the network, credentials, and the local filesystem and emits a canned sample matching the API contract. It's the right way to confirm an install or learn the surface before configuring auth — the response _shapes_ match the wire contract, but the data is fake.
+`--dry-run` is a global flag that emits a canned sample matching the API contract without writes or charges. Credentialless previews and explicit targets remain offline. With configured credentials, `test run` may make bounded read-only metadata requests to show an automatic tunnel decision; it never mints a tunnel or dispatches runs. It's the right way to confirm an install or learn the surface before configuring auth — the response _shapes_ match the wire contract, but the data is fake.
 
 ## Manual setup
 
@@ -211,6 +211,8 @@ Common flags:
 
 For an org-scoped API key, the text table gains an `ORG` column (project owning organization) whenever at least one row carries org attribution; a personal key or a page with no org data keeps the legacy column set unchanged. `--output json` always includes `orgId`/`orgName` when the backend supplies them.
 
+The text table includes `DEFAULT ENV` and `ENVS` (select with `--columns defaultenv,envs`). Missing values show `-`; a reported zero environment count shows `0`. JSON includes `defaultEnvironment: string | null` and `environmentCount: number` only when the server supplies them.
+
 #### `testsprite project get <project-id>`
 
 Get a single project by id. Project ids look like `proj_xxxxxxxx` and come from `project list`.
@@ -220,13 +222,16 @@ testsprite project get proj_xxxxxxxx --output json
 testsprite project get proj_xxxxxxxx --dry-run --output json
 ```
 
+When the server supplies an environment summary, text detail shows `defaultEnv:  <name>` and `envs:        <count>`, with a `testsprite project env list <project-id>` hint for a positive count. A reported null default shows `-`; older servers and V2 projects omit both lines. JSON preserves the server's fields without adding missing values.
+
 #### `testsprite test list --project <id>`
 
-List tests under a project. `--project` is required. Cursor-paginated.
+List tests under a project. `--project` is required. Cursor-paginated. Use `--env <name>` to show each frontend test's status in that environment; a test without a result there shows `ready`. Text output has an `ENV` column for the environment that supplied each row's status (`-` when absent). JSON retains `status` and passes through `statusByEnvironment` and `headlineEnvironment` when the backend provides them.
 
 ```bash
 testsprite test list --project proj_xxxxxxxx --output json
 testsprite test list --project proj_xxxxxxxx --type frontend --created-from portal
+testsprite test list --project proj_xxxxxxxx --env staging
 testsprite test list --project proj_xxxxxxxx --dry-run --output json
 ```
 
@@ -235,11 +240,12 @@ Common flags:
 - `--type <frontend|backend>` — filter by test type.
 - `--created-from <portal|mcp>` — filter by where the test was authored.
 - `--status <list>` — filter by status.
+- `--env <name>` — select the environment used for frontend status (name is case-sensitive).
 - `--page-size`, `--starting-token`, `--max-items` — pagination, same shape as `project list`.
 
 #### `testsprite test get <test-id>`
 
-Get a single test by id. Test ids look like `test_xxxxxxxx` and come from `test list`. Backend tests echo their dependency declarations — `produces` / `consumes` / `category` — when present. When a per-test timeout is set, text output includes `Step timeout: <N> ms (applies to every step)`; the line is omitted when the value is absent or cleared.
+Get a single test by id. Test ids look like `test_xxxxxxxx` and come from `test list`. For frontend tests, text output shows the headline environment when a result identifies one. Backend tests echo their dependency declarations — `produces` / `consumes` / `category` — when present. When a per-test timeout is set, text output includes `Step timeout: <N> ms (applies to every step)`; the line is omitted when the value is absent or cleared.
 
 ```bash
 testsprite test get test_xxxxxxxx --output json
@@ -281,6 +287,8 @@ testsprite test result test_xxxxxxxx --dry-run --output json
 ```
 
 With `--history`, the command lists a test's **prior runs** instead of the latest result — `{ runs: [...], nextCursor }`, where each run carries `runId`, `status`, `source` (`cli | portal | mcp | schedule | github_action`), `isRerun`, `createdFrom`, timestamps, `codeVersion`, and `failureKind`. Filter with `--source <src>` and `--since <24h|7d|ISO>`; paginate with `--page-size` (1–100, default 20) and `--cursor`. For one run's detail use `test wait <run-id>`; for its failure bundle use `test artifact get <run-id>`.
+
+`--history --env <name>` naming an environment that does not exist (or was soft-deleted) is a `VALIDATION_ERROR` (exit 5) that names the requested value and the project's current environment names — it never silently falls back to unfiltered history. A name that DOES exist but has no matching runs is an ordinary empty result (exit 0), same as `--history` with no filter finding nothing. `--env` is a V3-only filter: on a V2 (legacy) project the server returns `UNSUPPORTED` (exit 7) before reading any history, with a `nextAction` pointing at migrating the project — the same shape `test list --env` uses.
 
 ```bash
 testsprite test result test_xxxxxxxx --history --output json
@@ -438,7 +446,9 @@ testsprite test plan put test_xxxxxxxx --steps ./refined.plan.json --dry-run --o
 
 #### `testsprite project create` / `project update`
 
-Manage projects from the CLI. Both pre-flight `--url` against local addresses for fast feedback. Projects have **no description field** — `--description` is rejected client-side with a validation error (descriptions live on tests: `test create --description`). `project update` accepts `--name`, `--url`, `--username`, `--password`, `--password-file`, `--instruction`, `--test-id-attributes`, and `--clear-test-id-attributes`.
+Manage projects from the CLI. Both validate `--url` before network access; supported loopback origins follow the same stored-URL path as `--local`. Projects have **no description field** — `--description` is rejected client-side with a validation error (descriptions live on tests: `test create --description`). `project update` accepts `--name`, `--url`, `--username`, `--password`, `--password-file`, `--instruction`, `--test-id-attributes`, and `--clear-test-id-attributes`.
+
+`project update --url` and credential flags edit the existing default environment. When the server reports the change, text output names that environment and the fields applied; an older server keeps the previous output. If no default environment can be resolved, the server returns a conflict with the `project env set-default` next step.
 
 `--test-id-attributes <list>` (also on `project create`) is the project's locator attribute priority list: a comma-separated, ordered set of DOM attributes your app uses as stable test hooks (e.g. `data-element,data-testid`). The execution engine tries them in that order before any other locator strategy when it exports test code, so a tagged element is exported as `page.locator('[data-element="nav.team-selector.trigger-btn"]')`; an attribute whose value is not unique on the page is skipped. `--clear-test-id-attributes` removes the list (engine default: `data-testid`). V3-native projects only — on a V2-mirrored project the backend answers `PRECONDITION_FAILED` (`test_id_attributes_native_only`). Against a backend that predates the field, the CLI answers `UNSUPPORTED` (exit 7, `test_id_attributes_unsupported_backend`) instead of passing through the server's generic 400.
 
@@ -451,15 +461,14 @@ testsprite project update proj_xxxxxxxx --test-id-attributes data-element,data-t
 **Bootstrap a local frontend project (V3).** Start your app, then create the project without a public deployment:
 
 ```bash
-testsprite project create --type frontend --name <name> --local <port> \
-  [--local-host <localhost|127.0.0.1|::1>] [--skip-preflight]
+testsprite project create --type frontend --name <name> --local <port> [--skip-preflight]
 testsprite test create --plan-from ./checkout.plan.json --project <project-id>
-testsprite test run <test-id> --local <port> --local-host <host>
+testsprite test run <test-id>
 ```
 
-`project create --local` stores `http://<host>:<port>`, where `--local-host` selects both the probe host and the stored URL host (default `127.0.0.1`; `::1` is stored as `http://[::1]:<port>`). Use the same `--local-host <host>` in the follow-up run, especially for an IPv6-only app; omit it in both commands to use the default. `project get` and `project list` expose `originMode: 'local'` in JSON, while text output shows `(Local)`. Local creation is frontend-only and mutually exclusive with `--url`. The port is probed before creation: nothing listening means validation exit 5; `--skip-preflight` bypasses that probe. V2-only accounts receive exit 7 (`local-origin-requires-v3`).
+`project create --local` stores `http://localhost:<port>`. Alternatively, pass `--url http://localhost:<port>`, `--url http://127.0.0.1:<port>` or `--url http://[::1]:<port>` (an optional trailing `/` is preserved). Loopback stored URLs must use HTTP, an explicit port and no path; HTTPS, missing ports, other `127.x` hosts, unspecified addresses, LAN/RFC1918, link-local and metadata addresses remain refused. `--local-host` still overrides the shorthand host, but is deprecated and hidden from project/environment help; prefer an explicit URL. Existing rows retain their host spelling. `project get` and `project list` expose `originMode: 'local'` in JSON, while text output shows `(Local)`. Loopback creation is frontend-only; `--local` and `--url` remain mutually exclusive. The port is probed before creation unless `--skip-preflight` is given. V2-only accounts receive exit 7 (`local-origin-requires-v3`).
 
-Creation performs **no exploration or plan generation**. `test plan generate --project <project-id>` on a local project is refused **before charge**, with exit 6 and guidance to use `test create --plan-from … --project <id>` followed by `test run <test-id> --local <port> --local-host <host>`. Author a plan using the [plan file format](#plan-file-format), capture the created test id, and run it through the tunnel.
+Creation performs **no exploration or plan generation**. `test plan generate --project <project-id>` on a local project is refused **before charge**, with exit 6 and guidance to use `test create --plan-from … --project <id>` followed by `test run <test-id>`. Author a plan using the [plan file format](#plan-file-format), capture the created test id, and run it through the tunnel.
 
 Portal runs of a local project are **BLOCKED for free** until you set a public URL:
 
@@ -469,13 +478,14 @@ testsprite project update <project-id> --url https://staging.example.com
 
 A case previously run through a tunnel also has its own local-target history; see [retargeting a local case](#local-frontend-testing-and-tunnels) when running that case without a tunnel.
 
-#### `testsprite project env list | create | update | delete | set-default`
+#### `testsprite project env list | get | create | update | delete | set-default`
 
-An **environment** is a named bundle of "how to reach and log in to the app": a URL, a test account (username + password), auto-auth and OTP settings. Every project has a default environment — it is what `project create --url` / `project update --url --username --password` have always been editing, and what a run without `--env` or a run-time target uses. `project env` manages additional ones by name (unique within the project), and `test run --env <name>` / `test rerun --env <name>` select one.
+An **environment** is a named bundle of "how to reach and log in to the app": a URL, a test account (username + password), auto-auth and OTP settings. A project with configured environments can have a default environment — it is what `project create --url` / `project update --url --username --password` have always been editing, and what a run without `--env` or a run-time target uses. `project env` manages additional ones by name (unique within the project), and `test run --env <name>` / `test rerun --env <name>` select one.
 
 ```bash
 # What does this project have?
 testsprite project env list proj_xxxxxxxx
+testsprite project env get proj_xxxxxxxx staging
 
 # A second deployed target with its own test account
 testsprite project env create proj_xxxxxxxx --name staging --url https://staging.your-app.com \
@@ -484,20 +494,47 @@ testsprite project env create proj_xxxxxxxx --name staging --url https://staging
 # An app that only runs on your own machine: name it by its port, the same way as `project create --local`.
 testsprite project env create proj_xxxxxxxx --name local-dev --local 5173 \
   --username dev@your-app.com --password-file ./local-pw.txt
-testsprite test run test_xxxxxxxx --local 5173 --env local-dev
+testsprite test run test_xxxxxxxx --env local-dev
 
 # Change, rename, promote, remove
 testsprite project env update proj_xxxxxxxx staging --url https://staging2.your-app.com
 testsprite project env update proj_xxxxxxxx staging --rename preview
+testsprite project env update proj_xxxxxxxx preview --clear-credentials
+testsprite project env update proj_xxxxxxxx preview --var REGION=west --var TENANT=trial
 testsprite project env set-default proj_xxxxxxxx preview
 testsprite project env delete proj_xxxxxxxx local-dev --confirm
 ```
 
-Rules worth knowing: `create` needs exactly one of `--url <url>` (publicly reachable) or `--local <port>` (an app on this machine; `--local-host` picks `localhost`, `127.0.0.1` or `::1`, and the port is probed first unless `--skip-preflight`). A loopback `--url` is refused and pointed at `--local` — one spelling everywhere, on `project create`, `project update` and both `project env` writes. `update --local <port>` repoints an environment at this machine, `update --url https://…` back at a deployment. A local environment is run with `test run --local <port> --env <name>`. Passwords come from `--password-file` and are never printed back. `delete` refuses the default environment; deleting any other is a soft delete, so run history keeps naming it.
+`create` needs exactly one of `--url <url>` or `--local <port>`. Supported HTTP loopback origins are ordinary environment URLs: `localhost`, `127.0.0.1` and `[::1]`, with an explicit port and no path. `--local` is a shorthand for `http://localhost:<port>`; the deprecated `--local-host` override remains accepted. The port is probed first unless `--skip-preflight` is given. `update --local <port>` or `update --url http://localhost:<port>` changes the stored origin; existing URLs are never normalized or merged. Run a saved environment with `test run --env <name>`: its loopback URL opens a tunnel automatically. Passwords come from `--password-file` and are never printed back. `delete` refuses the default environment; deleting any other is a soft delete, so run history keeps naming it.
+
+`get` shows the environment id, name, URL, default status, safe login mode and variables without a password. An older server without the get route returns a clear `UNSUPPORTED` error (exit 7). Portal-only login modes are shown as managed in Portal. `--output json` returns the server response, including the environment id and `variables`; text `list` stays compact. `update --clear-credentials` removes the username and password and disables account login; it cannot be combined with `--username`, `--password` or `--password-file`. Portal-only login settings must be changed in Portal.
+
+Use repeatable `--var KEY=VALUE` on `env create` and `env update` to set frontend environment variables. Update merges by key. The first `=` separates key from value, so `--var TOKEN_HINT=a=b` stores `a=b`. Keys must match `^[A-Za-z_][A-Za-z0-9_]{0,63}$` and cannot be `url`, `username`, `password`, `authType`, `credential`, `memory_hints`, `rerun_context`, `__proto__`, `constructor` or `prototype` (case-sensitive). At most 50 keys fit in one environment; a value is limited to 4096 UTF-8 bytes and the total to 32 KiB. Values are plain text in `get` and JSON, so do not use variables for secrets.
+
+Create and update require the server response to confirm requested `--var` values; update also requires confirmation that `--clear-credentials` removed the stored account. If an older server ignores either flag, the CLI exits nonzero and asks you to upgrade or retry. A mixed update's URL may already have changed before that error, so inspect the environment before retrying.
 
 ##### Temporary environments for run-time targets
 
-For a frontend run with `--target-url` and no `--env`, TestSprite reuses an environment that already points at the URL's origin. Otherwise it creates a temporary environment for that run. Temporary environments are hidden from `project env list`, do not count toward the environment limit, and are deleted when the run finishes; users cannot create them directly. With `--env <name> --target-url <url>`, the named environment's login and other settings are used against the override URL. The backend refuses a login-once, OTP, or manual-login environment when its origin differs from the target (`PRECONDITION_FAILED`, exit 6). Backend tests still use the URL in their generated code.
+For a frontend run with `--target-url` and no `--env`, TestSprite reuses an environment that already points at the URL's origin. Otherwise a supporting backend creates a temporary environment that clones the default environment's sign-in configuration; an older backend retains its previous temporary-environment behavior. Temporary environments are hidden from `project env list`, do not count toward the environment limit, and are deleted when the run finishes; users cannot create them directly. With `--env <name> --target-url <url>`, the named environment's login and other settings are used against the override URL. The backend refuses a login-once, OTP, or manual-login environment when its origin differs from the target (`PRECONDITION_FAILED`, exit 6). Backend tests still use the URL in their generated code.
+
+#### `testsprite project sign-in get | set`
+
+Choose how runs sign in to one environment. `--env <name>` selects a named environment; omitting it uses the project default. `get` prints the mode, account password status, OTP channels and provisioned inbox/phone, or the SSO session status. `--output json` returns the server response unchanged. Text mode warns that runs **will NOT be signed in** when a manual environment has no valid captured session.
+
+```bash
+testsprite project sign-in get proj_xxxxxxxx --env staging
+testsprite project sign-in set proj_xxxxxxxx --env staging --mode account \
+  --username qa@your-app.com --password-file ./staging-pw.txt
+testsprite project sign-in set proj_xxxxxxxx --env staging --mode public
+testsprite project sign-in set proj_xxxxxxxx --env sso --mode manual --session-ttl 3600
+testsprite project env create proj_xxxxxxxx --name otp --url https://staging.your-app.com \
+  --sign-in otp --otp-channel email,sms
+testsprite project env set-default proj_xxxxxxxx otp
+```
+
+Modes are `public`, `account`, `otp`, and `manual`; aliases `none`, `credentials`, and `sso` map to `public`, `account`, and `manual`. OTP is chosen when creating an environment and cannot be switched on or off later: create a new environment and optionally make it default. `--otp-channel` accepts `email` and `sms` (comma-separated or repeated) and defaults to email. SSO login itself happens once in the Portal under Project → Settings → Environments → the environment name → Log in; the CLI can choose manual mode and report session status but cannot capture the login. SSO (`manual`) selection is behind a per-account feature flag; `--mode manual` returns `FEATURE_GATED` (exit 13, `manual-login-disabled`) when it is off. Manual `--session-ttl` accepts 1–2592000 seconds or `never`; omitting it lets the server retain an existing manual TTL or use its 1-hour default. Local environments support only public and account sign-in. A temporary environment (created for one `--target-url` run) has no settable sign-in, so `set` refuses it with exit 5; create a permanent environment for that URL instead. An SSO or OTP environment keeps no username or password, so `project env update --username/--password` (and `project update --username/--password` when it is the default environment) on one exits 6 and points at `sign-in set`; `--local` on one exits 6 too, and a temporary environment refuses credentials with exit 5. An environment with no stored account takes `--username` and `--password` together or not at all (exit 5), on `project env create` without `--sign-in` and on `project env update`; changing one half of a stored account is still a rotate. The CLI cannot tell whether a captured SSO session still fits a changed address: `project env update --url` on an SSO environment reminds you to log in again in the Portal if the site changed. Both writes accept `--idempotency-key` and support global `--dry-run` without reading password files.
+
+For `project sign-in get/set` and `project env create`, exit **0** means success; **3** means authentication or scope failure; **4** means the project or environment was not found; **5** means invalid flags or fields (including a locally rejected OTP/manual `--local` combination); **6** means a server `PRECONDITION_FAILED` refusal (including OTP fixed at creation or unsupported local sign-in) or a write conflict; **7** means `UNSUPPORTED` (V2 environments or manual/OTP in BYOC); and **13** means `FEATURE_GATED` (manual login disabled). Shared request failures can also return **10** (`UNAVAILABLE`), **11** (`RATE_LIMITED`), or **14** (`CLIENT_TOO_OLD`). Inspect the error `code` and `details.reason` in JSON mode to distinguish causes that share an exit code.
 
 #### `testsprite project delete <project-id>`
 
@@ -574,10 +611,12 @@ testsprite test plan generate --project proj_xxxxxxxx --dry-run       # no netwo
 
 ```
 $ testsprite test plan generate --project proj_abc123
-[hint] this project hasn't been explored yet — the full pipeline will run
-       (exploration + strategy + proposals). Ctrl-C detaches safely; work
-       continues server-side.
-2026-08-18T20:41:07.312Z exploring app… (resources 3/8, 4m10s)
+[hint] 3 stages: exploration, strategy, proposals. Takes minutes. Ctrl-C is safe; re-run to continue.
+[warn] exploration signs in only with the test account stored on the project's default environment. If your app requires login and no test account is configured, the agents will explore only the public pages — a shallow result from a stage that still runs and still bills. For signed-in coverage, store a test account first: testsprite project update proj_abc123 --username <user> --password-file <path>
+stage 1/3 exploration done 4m48s
+stage 2/3 strategy done 1m12s
+stage 3/3 proposals done 55s
+2026-08-18T20:48:02.117Z 12 proposals staged
 
 12 test-case proposals staged for review (credits used: 6, balance: 144)
 
@@ -603,10 +642,11 @@ Flags:
 Behavior worth knowing:
 
 - **Progress is a single stderr line**, updated in place, and only in an interactive terminal. `--output json` and CI runs get no ticker — just the final result object on stdout.
-- **Re-running re-attaches.** If a stage is already running — including one you started in the Portal — the command attaches to it and keeps polling instead of failing or starting a second one.
+- **Re-running joins a stage already in progress.** If a stage is already running — including one you started in the Portal — the command waits for it instead of failing or starting a second one.
 - **If proposals are already staged, nothing is started.** The command prints the existing batch and says so. Regenerating a batch you don't like is a Portal action for now: accept or discard the staged batch there first.
-- **Ctrl-C detaches, it does not cancel.** The server keeps working. Exit 130/143/129; stdout still gets a partial `{ projectId, status: "running", … }` object so a redirected file is never empty.
-- **On `--timeout` (exit 7)** the same partial is printed with a re-attach hint — running the identical command again picks up where it left off.
+- **Ctrl-C pauses, it does not cancel.** The stage in progress finishes on its own; the stages after it wait until you run the command again. Exit 130/143/129; stdout still gets a partial `{ projectId, status: "running", stagesRemaining, … }` object so a redirected file is never empty, and stderr says which stage you paused in and how many are left.
+- **On `--timeout` (exit 7)** the same partial is printed with a `Continue:` line; running the identical command again picks up where it left off. Raise `--timeout` if you want one run to cover every stage.
+- **Stage progress lines.** In text mode one `stage i/N <name> done <elapsed>` line is printed as each stage finishes and stays in scrollback; the live progress line (`exploring app… (resources 3/8, 4m10s)`) redraws in place beneath it on a terminal and is cleared before each stage line is written, so the two never share a row.
 - **A stage that fails server-side exits 1** with the server's error. Stages that already completed stay completed, so a re-run resumes rather than restarts.
 - **The result line reports what this invocation actually charged** (`credits used: N, balance: M`), from the server's own figures. It is best-effort — against a backend that cannot supply it the line simply omits those numbers, and a run that charged nothing (for example a re-run that found proposals already staged) omits `credits used` rather than repeating old spend. `testsprite usage` shows your balance any time.
 - **In `--output json`, read `creditsUsedThisInvocation` for this run's spend** — a top-level number that is this invocation's charge alone, not the project's lifetime total. It is `null` when the spend can't be determined (the billing read was unavailable at either end of the run); a script must treat `null` as "unknown", not as zero. Prefer it over summing `credits.charged[]`, which is the project's cumulative ledger.
@@ -688,6 +728,8 @@ Trigger a run for a test. Without `--wait`, prints `{ runId, status: "queued", e
 
 `--all --project <id>` runs every test in the project in wave order. Add `--target-url <url>` to point its frontend tests at a run-time target. On the current unified engine that means **all tests, frontend and backend**; on the legacy backend-only engine, frontend tests can't run — they are skipped and enumerated in `skippedFrontend` with a stderr advisory.
 
+`testsprite test run list` — a literal `list` where a test id goes — is a usage error (exit 5), not a run against a test named "list": there is no `test run list` subcommand. It points you at `test result <test-id> --history`, which lists a test's prior runs.
+
 The server controls whether a fresh run auto-heals drifted generated code by default. When healing is enabled, the agent re-authors stale code and runs the new version instead of replaying a script that can only fail. Healing saves the new code as the test's stored version.
 
 When healing is on only because it is the server's default, it does not re-author code **you** wrote (`test code put`, a file passed to `test create --code-file`, or a hand-edit in the portal): that code is run as written. A healed verdict can mask a real regression, so use `--no-auto-heal` to ask the server for a strict stored-code replay when available. The flag is accepted by `test run`, `test run --all`, and `test rerun`; its effect depends on the command and server.
@@ -721,13 +763,15 @@ Batch `--report` flags apply only to `test run --all --wait` (and batch `test re
 
 **GitHub-native CI output** (contributed in [#264](https://github.com/TestSprite/testsprite-cli/pull/264)): when `GITHUB_ACTIONS=true`, any `test run --wait` (single test or `--all`), any batch `test rerun --wait`, and `testlist run --wait` additionally emit one workflow-command line per non-passed run (annotating the PR checks tab — `::error::` for a dispatched run that failed or timed out, `::warning::` for a test that never dispatched) and append a Markdown results table to the job summary (`$GITHUB_STEP_SUMMARY`). Pass `--gh-output` to force the annotations outside Actions (previewable locally), and `--summary-file <path>` to also write the reduced machine summary JSON (`{total, passed, failed, skipped, timedOut, runs[]}`). Everything is written even when the command exits non-zero — including a batch where nothing dispatched at all (every test already in flight → exit 6, or every test rate-deferred → exit 7), which still surfaces its verdict in CI rather than failing silently. Every write is best-effort — a failed write never changes the exit code. Tests that never dispatched (rate-deferred, conflicted, not found) appear as non-passed rows counted under `skipped` — never under `failed`, so the artifact always agrees with the exit code — and a partial batch still cannot read as all-passed. Annotation and table content is escaped, so run-error text cannot inject workflow commands or break the table.
 
-**`--target-url` with `--all` (the CI deployment gate).** The flag applies to a batch too: `test run --all --project <id> --target-url https://pr-42.preview.example.com` runs every **frontend** test in the project against that URL — the shape a PR gate needs, where the URL is this PR's preview deployment and differs on every run. The project's configured environment is never modified; the URL is applied as a per-run override, exactly as on a single run. A **backend** test is unaffected (its base URL is baked into its generated code) and the CLI prints an advisory saying so. The reachability preflight runs once for the whole batch before anything is dispatched or billed; use `--skip-preflight` if the preview is still warming up. If the server does not echo the exact URL, including on a deferred retry, the command exits **7** (`target-url-not-honored`) after attempting to cancel all accepted runs. Cancellation and refunds are best-effort; the CLI prints each refund status returned by the server. With `--wait`, this failure also writes the requested JUnit and machine summary files, GitHub annotations, and the job summary.
+**`--target-url` with `--all` (the CI deployment gate).** The flag applies to a batch too: `test run --all --project <id> --target-url https://pr-42.preview.example.com` runs every **frontend** test in the project against that URL — the shape a PR gate needs, where the URL is this PR's preview deployment and differs on every run. The project's configured environment is never modified; the URL is applied as a per-run override, exactly as on a single run. A **backend** test is unaffected (its base URL is baked into its generated code) and the CLI prints an advisory saying so. The reachability preflight runs once for the whole batch before anything is dispatched or billed; use `--skip-preflight` if the preview is still warming up. If the server does not echo the exact URL, including on a deferred retry, the command exits **7** (`target-url-not-honored`) after attempting to cancel only the runs accepted in the unconfirmed dispatch. Runs confirmed by an earlier dispatch are reported as not awaited and remain running. Cancellation and refunds are best-effort; the CLI prints each refund status returned by the server. With `--wait`, this failure also writes the requested JUnit and machine summary files, GitHub annotations, and the job summary.
 
-`--target-url` must be a publicly reachable URL — the CLI pre-flights it against local addresses (`localhost`, `127.x`, `::1`, `0.0.0.0`, `169.254.x`, RFC1918) and the backend resolves it via DNS. For a frontend test running on this machine, use `test run <test-id> --local <port>` instead of `--target-url` — it tunnels this machine's loopback address (`localhost` / `127.0.0.1` / `::1` only, not a LAN or RFC1918 address) to the test runner. It's frontend-tests-only (a backend test's target is baked into its generated code) and needs an API key with the `run:tunnel` scope. Keys minted before that scope existed do not have it; mint a new key when the CLI names `run:tunnel` as missing (auth/scope exit 3). `test rerun` and code-replay can never tunnel: the replay execution path has no proxy field, so those always need an already-reachable `--target-url` or none at all.
+`--target-url` accepts public URLs and supported loopback URLs such as `http://localhost:3000`, `http://127.0.0.1:3000` and `http://[::1]:3000`. A loopback target on `test run` uses the same tunnel path as `--local <port>` with that host. Other private, unspecified, link-local and metadata addresses remain refused. Tunnels are frontend-only and need `run:tunnel`; a scope refusal names the missing scope (exit 3). Existing keys receive it on backend v0.18.0 or later unless deliberately narrowed.
 
-**`--env <name>` — whose credentials the run logs in with.** `--target-url` and `--local` decide _where_ the browser goes; `--env` decides _which environment's_ test account, auto-auth and OTP settings it uses (see [`project env`](#testsprite-project-env-list--create--update--delete--set-default)). Alone, it runs against that environment's own URL. Combined with `--local <port>`, the tunnel supplies the address and the environment supplies the login — the way to test a change on your machine with a local test account instead of the deployed one's. With `--target-url`, those settings apply to the override URL, subject to the cross-origin login restriction above. The name must exist on the project — the server answers an unknown name with a validation error that lists the valid ones, never with a silent fall-back to the default — and nothing is asked for permission first: naming an environment is an ordinary argument. Also accepted by `--all` (applied to every test in the batch) and by `test rerun`.
+**`--env <name>` — the origin and sign-in configuration.** Select a named environment, or omit it for the project default (see [`project env`](#testsprite-project-env-list--get--create--update--delete--set-default)). A saved loopback URL automatically opens a tunnel on frontend `test run` (one/many/`--all`), `test rerun`, `test create --run`, `test create-batch --run` and `testlist run`. The stored URL is sent verbatim, so `localhost`, `127.0.0.1` and `[::1]` remain distinct origins. `--no-wait` disables automatic tunneling; drop it to run through a tunnel. If the environment list cannot be read, the CLI sends the previous request and renders the server's refusal. Backend tests keep their previous cloud behavior.
 
-**Reachability preflight (refuse before charge).** Beyond the literal local-address check, the CLI now probes the target **before dispatching** (and before anything is billed): a DNS resolve plus a lightweight HTTP request. A confirmed-dead target — DNS `NXDOMAIN`, connection refused, or a `502`/`503`/`504` gateway error (the signature of a tunnel that has gone away) — is refused with a validation error (exit 5) instead of dispatching a run that can only fail against a URL nobody is serving. A resolved address that lands in private/loopback/link-local space is always refused (the hostname passed the literal check but actually points somewhere unreachable from the runner). Ambiguous signals — a timeout, a TLS error, an odd status — only produce a stderr warning and never block; behind a configured HTTP(S) proxy, a local DNS failure is also downgraded to a warning, since resolution really happens at the proxy. `--skip-preflight` (on `test run`, `test create`, and `test create-batch`) opts out entirely — no extra network calls. Note: for a backend test the probe is a heuristic (the test's own base URL is baked into its code) — reach for `--skip-preflight` if a refusal surprises you there.
+`--target-url` and `--local` can supply an ad-hoc origin while `--env` supplies its sign-in configuration and run attribution. When no saved origin matches and no `--env` is selected, a supporting backend clones the project default's sign-in configuration into a temporary environment. Explicit `--local` can use a public environment's sign-in configuration on a new backend; an older backend's refusal is rendered verbatim and the tunnel is closed. Unknown environment names remain validation errors with the available names. `--env` is also accepted by `--all` and `test rerun`.
+
+**Reachability preflight (refuse before charge).** For a public `--target-url`, the CLI probes **before dispatching** (and before anything is billed): a DNS resolve plus a lightweight HTTP request. Loopback tunnel targets use a TCP probe of the stored host and port instead. A confirmed-dead target — DNS `NXDOMAIN`, connection refused, or a `502`/`503`/`504` gateway error (the signature of a tunnel that has gone away) — is refused with a validation error (exit 5) instead of dispatching a run that can only fail against a URL nobody is serving. A resolved address that lands in private/loopback/link-local space is always refused (the hostname passed the literal check but actually points somewhere unreachable from the runner). Ambiguous signals — a timeout, a TLS error, an odd status — only produce a stderr warning and never block; behind a configured HTTP(S) proxy, a local DNS failure is also downgraded to a warning, since resolution really happens at the proxy. `--skip-preflight` (on `test run`, `test create`, and `test create-batch`) skips these probes; metadata reads needed to resolve an environment still occur. Note: for a backend test the probe is a heuristic (the test's own base URL is baked into its code) — reach for `--skip-preflight` if a refusal surprises you there.
 
 The `[advisory]` about `--target-url` on V3-routed accounts is now **response-driven**: the CLI reads the run's actual trigger response rather than guessing from account flags, so it fires only when the override genuinely did not take effect (newer backends apply `--target-url` to fresh frontend runs on V3; older ones ignore it and the advisory says so). The CLI auto-mints an idempotency key (printed to stderr under `--output json`, `--verbose`, or `--debug`); pass `--idempotency-key <uuid>` to control it explicitly.
 
@@ -735,39 +779,41 @@ The `[advisory]` about `--target-url` on V3-routed accounts is now **response-dr
 
 #### Local frontend testing and tunnels
 
-`--local` connects the cloud frontend agent to an app running on **this machine**. It supports the **Free plan**; ordinary run credits still apply: a V3 frontend `--local` run costs **0.5 credit**, like any frontend run. The API key needs `run:tunnel` in addition to the scopes for running tests. Keys minted before `run:tunnel` existed must be replaced; the CLI identifies the missing scope.
+A tunnel connects the cloud frontend agent to an app running on **this machine**. It supports the **Free plan**; ordinary run credits still apply: a V3 frontend `--local` run costs **0.5 credit**, like any frontend run. The API key needs `run:tunnel` in addition to the scopes for running tests. The CLI identifies a missing scope; a key deliberately narrowed without it needs a key that includes it.
 
 **Transport security and bounded retry.** The control plane is WebSocket over TLS at `wss://control.tun.testsprite.com/ws`. The data plane carries both the tunnel secret and proxied traffic over TLS at `data.tun.testsprite.com:443`, with the certificate verified by Node's default trust store: its bundled Mozilla roots, plus certificates supplied through `NODE_EXTRA_CA_CERTS` and the system CAs when Node is started with `--use-system-ca`. Node 20 retains `NODE_EXTRA_CA_CERTS` when explicit roots are also configured. Certificate verification cannot be disabled, and the CLI never falls back from TLS to plaintext. On a network that re-signs TLS, export your organisation's root CA to a PEM file and set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` before running `testsprite`. Plaintext connects and TLS handshakes each have a 10-second timeout. The first failed attempt opens a **60-second** retry episode. A successful `TunnelHello` write does not establish the session: only the first inbound tunnel stream or a socket that remains open for 5 seconds after the hello ends the episode. The deadline remains armed across backoff and later attempts, destroys any in-flight socket when it expires, reports one terminal data-plane error, and stops the client. An owned `test run --local` run is then cancelled and refunded and the command exits **10**; `tunnel start` exits **10**. Intentional shutdown reports no data-plane error. When a self-hosted or older TestSprite server does not advertise a TLS endpoint, the CLI instead prints a one-time warning and uses the legacy plaintext data port **7400** under the same retry rules. `tunnel start` makes the selected mode visible as `transport: tls` or `transport: plaintext`.
 
 ```bash
-# --wait is implied; each local run defaults to a 1200-second timeout
-testsprite test run <test-id> --local 3000 --output json
+# A saved loopback environment opens a tunnel and waits automatically
+testsprite test run <test-id> --env local-dev --output json
+# Or supply an ad-hoc loopback target
+testsprite test run <test-id> --target-url http://localhost:3000 --output json
 # Several frontend tests share one tunnel and run five at a time by default
 testsprite test run <id> <id> --local 3000 --max-concurrency 5 --output json
 testsprite test run --all --project <project-id> --local 3000 --output json
 # A different loopback listener, or a longer run
-testsprite test run <test-id> --local 3000 --local-host localhost --timeout 1800
+testsprite test run <test-id> --env local-dev --timeout 1800
 ```
 
-| Flag                          | Local-run behavior                                                                                                                                                                     |
-| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--local <port>`              | Frontend only; port 1–65535. Opens one tunnel for the invocation and implies `--wait`. Mutually exclusive with `--target-url` (exit 5).                                                |
-| `--max-concurrency <n>`       | With `--local` batches, at most 1–10 runs in flight; default **5**. The timeout applies to each run from its own trigger.                                                              |
-| `--local-host <host>`         | With `--local` only; `localhost`, `127.0.0.1` (default), or `::1`. Chooses the loopback name in the run's target URL; LAN/RFC1918 addresses are refused.                               |
-| `--tunnel-client <client-id>` | With `--local` only; borrows the non-secret client id from `tunnel start`. Still implies waiting, but ownership stays with the separate tunnel process.                                |
-| `--timeout <seconds>`         | 1–3600; default **600** for ordinary waits, **1200** with `--local`, including adopted tunnels.                                                                                        |
-| `--no-cancel-on-interrupt`    | With `--local` only; opts out of automatic cancellation when an owned tunnel closes or a borrowed tunnel's owner disappears. The run can no longer reach the app and remains billable. |
-| `--skip-preflight`            | Skips the local port probe. Normally a dead port is refused before minting a tunnel or charging a run (exit 5). It does not bypass flag, scope, or backend preconditions.              |
+| Flag                          | Local-run behavior                                                                                                                                                                                                                                                                                                                                                                                      |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--local <port>`              | Frontend only; port 1–65535. Opens one tunnel for the invocation and implies `--wait`. Mutually exclusive with `--target-url` (exit 5).                                                                                                                                                                                                                                                                 |
+| `--max-concurrency <n>`       | With tunnel batches, at most 1–10 runs in flight; default **5**. The timeout applies to each run from its own trigger.                                                                                                                                                                                                                                                                                  |
+| `--local-host <host>`         | With `--local` only; `localhost`, `127.0.0.1`, or `::1`. Deprecated on project/environment writes. The shorthand defaults to the selected loopback environment's host, else the one host agreed by saved non-temporary loopback environments on that port, else `localhost`; unreadable lists retain `127.0.0.1`. Chooses the loopback name in the run's target URL; LAN/RFC1918 addresses are refused. |
+| `--tunnel-client <client-id>` | Borrows the non-secret client id from `tunnel start` for a loopback target or selected environment. Still implies waiting, but ownership stays with the separate tunnel process.                                                                                                                                                                                                                        |
+| `--timeout <seconds>`         | 1–3600; default **600** for ordinary waits, **1200** for tunnel runs, including adopted tunnels.                                                                                                                                                                                                                                                                                                        |
+| `--no-cancel-on-interrupt`    | For tunnel runs; opts out of automatic cancellation when an owned tunnel closes or a borrowed tunnel's owner disappears. The run can no longer reach the app and remains billable.                                                                                                                                                                                                                      |
+| `--skip-preflight`            | Skips the local port probe. Normally a dead port is refused before minting a tunnel or charging a run (exit 5). It does not bypass flag, scope, or backend preconditions.                                                                                                                                                                                                                               |
 
 **Concurrency.** Run several frontend tests with `test run <id> <id> … --local <port>` or all frontend tests in a project with `test run --all --project <id> --local <port>`. One invocation mints one binding and runs up to **5** tests concurrently by default (`--max-concurrency` accepts 1–10); `--all` reports backend tests as skipped. A user can have **5 live tunnel bindings**. The `tunnel_binding_limit` reason is exit 11 and is **not auto-retried**: stop an unused tunnel or reuse an existing one with `--tunnel-client` before retrying. Ctrl-C stops queuing, cancels unfinished runs on an owned tunnel by default, and prints one partial JSON object with `not-run` rows; tunnel loss also stops queuing and exits 10. The minted client id is printed before connecting so a failed connection still identifies the binding.
 
-**Login and execution.** Frontend tests only: backend tests are refused with exit 7 (`tunnel-unsupported-for-backend-test`). The project environment's username/password are passed to the cloud agent, which logs in inline through the tunnel. OTP environments are refused **before charge** with exit 6 (`tunnel-otp-auth-unsupported`). V3 `--local` runs always use the agent path, never saved-code replay, and **do not overwrite the test's saved code**. Use `test run --local` for local verification; `test rerun` cannot tunnel.
+**Login and execution.** Tunnels serve frontend tests. An explicit loopback target on a backend test fails client validation (exit 5); single backend tests keep their previous cloud path; tunnel batches skip only backend tests whose own selected environment is loopback, and include their IDs in `skipped`. Public-environment backend tests dispatch normally. The project environment's username/password are passed to the cloud agent, which logs in inline through the tunnel. OTP environments are refused **before charge** with exit 6 (`tunnel-otp-auth-unsupported`). V3 `--local` runs always use the agent path, never saved-code replay, and **do not overwrite the test's saved code**. Saved loopback environments also open tunnels for reruns. Rerun and test-list tunnel batches use one `--timeout` deadline, including capacity waits. Explicit public-environment sign-in against a local origin is announced once on stderr. Rerun/test-list responses must echo the tunnel client id; if an old server strips it, the CLI attempts to cancel what started and exits with a clear error.
 
-**Timeout, cancellation, and refunds.** When a single owned `--local` run stops waiting before a terminal result, the CLI cancels it by default and closes its tunnel. This includes `--timeout` (exit 7), Ctrl-C (exit 130), and non-terminal polling/tunnel failures. In a local batch, each test has its own timeout measured from its trigger: a timed-out run is cancelled on an owned tunnel, the other tests continue, and the tunnel closes after the batch settles. Cancellation can race completion or fail; read the reported outcome instead of assuming it succeeded. **A run cancelled before it finished is refunded.** Cancelling an already-finished run does not replace its result or refund it. After an owned local timeout, start a **new** run with `testsprite test run <test-id> --local <port> --timeout 1800`, keeping the same `--local-host <host>` if used; `test wait` cannot restore the closed tunnel. `--no-cancel-on-interrupt` detaches instead, but does not keep an owned tunnel alive.
+**Timeout, cancellation, and refunds.** When a single owned `--local` run stops waiting before a terminal result, the CLI cancels it by default and closes its tunnel. This includes `--timeout` (exit 7), Ctrl-C (exit 130), and non-terminal polling/tunnel failures. In a local batch, each test has its own timeout measured from its trigger: a timed-out run is cancelled on an owned tunnel, the other tests continue, and the tunnel closes after the batch settles. Cancellation can race completion or fail; read the reported outcome instead of assuming it succeeded. **A run cancelled before it finished is refunded.** Cancelling an already-finished run does not replace its result or refund it. After an owned local timeout, start a **new** run with `testsprite test run <test-id> --env <name> --timeout 1800`; `test wait` cannot restore the closed tunnel. `--no-cancel-on-interrupt` detaches instead, but does not keep an owned tunnel alive.
 
 A borrowed `--tunnel-client` run is not cancelled on Ctrl-C/SIGTERM: the borrower detaches, never closes or deletes the adopted tunnel, and `test wait <run-id>` can resume polling while the owner keeps it alive. If liveness reports that the owner is gone while the run is non-terminal, the borrower cancels **its own run** exactly as an owned doomed run does. The message names the run id and the observed result (`cancelled`, `already finished`, or `skipped`), then points to the run read before a retry. A run cancelled before it finished is refunded. `--no-cancel-on-interrupt` skips the owner-gone cancel too, leaving the run executing and billable without a working tunnel.
 
-**Retargeting a local case.** A case last run through a tunnel stays local. A later run without a tunnel — Portal Run, a schedule, or bare `test run <id>` — is a **free BLOCKED** with reason `tunnel-required` (CLI exit 6). Run it with `--local` again, or explicitly retarget the case using `test run <test-id> --target-url https://staging.example.com`. For a project created with `project create --local`, also set its public project URL with `project update <id> --url https://…` to enable Portal runs.
+**Retargeting a local case.** Cloud runs such as Portal Run and schedules cannot reach a loopback environment and are **free BLOCKED** with reason `tunnel-required`. A CLI frontend run opens a tunnel when the resolved saved environment is loopback. Select that environment with `--env <name>`, or explicitly retarget the case using `test run <test-id> --target-url https://staging.example.com`. For a project created with `project create --local`, also set its public project URL with `project update <id> --url https://…` to enable Portal runs.
 
 #### `testsprite tunnel start` / `list` / `status` / `stop`
 
@@ -777,7 +823,7 @@ Keep a tunnel alive across runs by running its owner in a separate terminal:
 # Terminal A — no positional port; keep this process running
 testsprite tunnel start --ttl 3600
 # Terminal B — use the clientId printed by terminal A
-testsprite test run <test-id> --local 3000 --tunnel-client <client-uuid>
+testsprite test run <test-id> --env local-dev --tunnel-client <client-uuid>
 testsprite tunnel list
 testsprite tunnel status <client-uuid>
 testsprite tunnel stop <client-uuid>
@@ -794,7 +840,7 @@ Stop is idempotent and prints **`Tunnel credential <uuid> revoked (or already ab
 
 Hit the tunnel limit? List your bindings with `testsprite tunnel list`, then stop an unused one with `testsprite tunnel stop <client-uuid>`. `testsprite tunnel stop --all --confirm` revokes every live binding on the account, including bindings owned by another terminal or CI job. It deletes sequentially, reports each result, and exits 1 if any stop fails. `testsprite --dry-run tunnel stop --all` uses sample ids and makes no real deletion; run `tunnel list` to see the actual bindings before confirming.
 
-A second `tunnel start` or process using the same credential takes over, and the first exits **10**.
+A second `tunnel start` or process using the same credential takes over, and the first exits **10**. Dev servers can take a minute per page through the tunnel; for a heavy dev server, test a built server with `npm run build`, then the framework's preview/start command.
 
 | Exit | Meaning and next step                                                                                                                                                               |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -878,7 +924,7 @@ Flags:
 
 #### `testsprite test wait <run-id...>`
 
-Block until one **or more** runs reach a terminal status. With a single `run-id` the behavior is unchanged: same exit-code matrix as `test run --wait`. With several ids, the runs are polled concurrently under one shared `--timeout` and the CLI prints a `{ results, summary }` envelope — the worst status wins the exit code — so every re-attach hint the CLI prints can be pasted back as one command. `--max-concurrency <n>` (1–100, default 10) caps concurrent polls. Used to resume polling after an ordinary timed-out `--wait`, or after detaching from an adopted tunnel whose owner is still running. For an owned `--local` timeout, start a new `test run <test-id> --local <port> --timeout 1800`, keeping the same `--local-host <host>` if used; polling cannot restore its closed tunnel.
+Block until one **or more** runs reach a terminal status. With a single `run-id` the behavior is unchanged: same exit-code matrix as `test run --wait`. With several ids, the runs are polled concurrently under one shared `--timeout` and the CLI prints a `{ results, summary }` envelope — the worst status wins the exit code — so every re-attach hint the CLI prints can be pasted back as one command. `--max-concurrency <n>` (1–100, default 10) caps concurrent polls. Used to resume polling after an ordinary timed-out `--wait`, or after detaching from an adopted tunnel whose owner is still running. For an owned tunnel timeout, start a new `test run <test-id> --env <name> --timeout 1800`; polling cannot restore its closed tunnel.
 
 ```bash
 testsprite test wait run_01hx3z9p8q4k2y7a --timeout 600 --output json
@@ -954,7 +1000,7 @@ A **schedule** runs a project or a test list on a cron, unattended — the CLI s
 
 ```bash
 # Read
-testsprite schedule list                       # table: ID / NAME / STATUS / TARGET / CRON / TZ / LAST RUN
+testsprite schedule list                       # table: ID / NAME / STATUS / TARGET / ENVIRONMENT / CRON / TZ / LAST RUN
 testsprite schedule list --columns id,name,cron --no-header   # pick + reorder columns for scripts
 testsprite schedule get <schedule-id>          # one schedule, one field per line
 testsprite schedule run list <schedule-id>     # past runs: RUN ID / STATUS / TOTAL / PASS / FAIL / BLOCK / STARTED
@@ -964,9 +1010,12 @@ testsprite schedule create --name "Nightly checkout" \
   --target-type testList --target-id tl_aaaa \
   --cron "0 3 * * *" --timezone America/New_York \
   --send-to oncall@example.com,qa@example.com
+testsprite schedule create --name "Staging nightly" \
+  --target-type project --target-id proj_aaaa --env staging --cron "0 3 * * *"
 
 # Update, pause, resume
 testsprite schedule update <schedule-id> --name "Renamed"
+testsprite schedule update <project-schedule-id> --env staging
 testsprite schedule update <schedule-id> --cron "0 6 * * 1"   # re-states the new frequency first
 testsprite schedule update <schedule-id> --pause              # stop it firing, keep the schedule
 testsprite schedule update <schedule-id> --resume
@@ -976,6 +1025,10 @@ testsprite schedule delete <schedule-id> --confirm
 ```
 
 **Target.** `--target-type project` runs the project's **entire live suite** on every tick — there is no way to schedule a subset of a project's tests, so use a test list for that. `--target-type testList` runs the list's cases, each through its project's configured environment (see [Test lists](#test-lists-testlist)). `--target-id` is the matching project id or test-list id, and a target that does not resolve is a `404` (exit 4). Deleting a test list also deletes its schedules.
+
+**Environment.** On a project target, `--env <name>` pins the schedule to that environment name. Without it, a new schedule uses the project's live default at each tick; changing the default changes future ticks. An unknown or deleted name fails validation rather than falling back. `schedule update --env` pins an existing project schedule; omitting it leaves its current mode unchanged. There is no unpin flag. Test-list schedules inherit the list's live per-project bindings: change those with `testsprite testlist update <testlist-id> --project-env <projectId>:<environmentName>`. `schedule create --target-type testList --env` fails locally (exit 5); `schedule update --env` sends the request and the API rejects it if that schedule targets a test list. Blank `--env` values fail locally (exit 5).
+
+Text output derives `staging (pinned)`, `project default (inherits)` or `-` from the API response. The list's `ENVIRONMENT` column is appended after all existing columns; get/update append the environment detail line. JSON preserves exact `environment` and `environmentMode` fields, including `null` or omission. For explicit `--env`, the CLI first reads existing schedules: a project schedule with no environment mode proves the server is too old and returns `UNSUPPORTED` (exit 7) before a write. An empty or unreadable list is inconclusive, so response confirmation still applies. An unconfirmed create is best-effort deleted, reporting the exact created id and whether it was removed; an unconfirmed update reports the schedule id and other requested fields that may have been applied. Commands without `--env` add no capability read and retain their previous output when the server omits environment fields.
 
 **What a project tick dispatches.** The project's own type decides how its cases run: a **frontend** project's cases go through a shared rolling pool, so a nightly cannot open the whole suite's browser sessions against your site at once — the same cap a portal-triggered run gets; a **backend** project's cases are dispatched together as one fan-out — a scheduled tick does not currently order them producers-before-consumers the way `test run --all` does. Integration cases are not dispatched as targets: a full run re-assembles them from the units they compose once those have run, which is also why the per-run cost counts only the non-integration cases.
 
@@ -1114,15 +1167,23 @@ Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one
 
 These apply to every command:
 
-| Flag                          | Purpose                                                                                         |
-| ----------------------------- | ----------------------------------------------------------------------------------------------- |
-| `--profile <name>`            | Pick a named profile (default: `default`)                                                       |
-| `--endpoint-url <url>`        | Override the API host                                                                           |
-| `--output json\|text`         | JSON is the stable automation contract; text is human-friendly                                  |
-| `--request-timeout <seconds>` | Per-request wall-clock timeout (default 120, range 1–600)                                       |
-| `--verbose`                   | Human-readable HTTP retry / backoff / polling messages to stderr                                |
-| `--debug`                     | Method / URL / request-id / latency / retry decisions to stderr (the API key is never included) |
-| `--dry-run`                   | Run end-to-end with no network, credentials, or filesystem writes; emits canned data            |
+| Flag                          | Purpose                                                                                            |
+| ----------------------------- | -------------------------------------------------------------------------------------------------- |
+| `--profile <name>`            | Pick a named profile (default: `default`)                                                          |
+| `--endpoint-url <url>`        | Override the API host                                                                              |
+| `--output json\|text`         | JSON is the stable automation contract; text is human-friendly                                     |
+| `--request-timeout <seconds>` | Per-request wall-clock timeout (default 120, range 1–600)                                          |
+| `--verbose`                   | Human-readable HTTP retry / backoff / polling messages to stderr                                   |
+| `--debug`                     | Method / URL / request-id / latency / retry decisions to stderr (the API key is never included)    |
+| `--dry-run`                   | Preview without writes or charges; configured `test run` may read metadata for its tunnel decision |
+
+### Secrets in output
+
+Any field named like `password`, `token`, `secret`, `apiKey` / `api_key`, `authorization`, `cookie`, or `credential(s)` — at any depth, inside arrays too — is replaced with `[REDACTED]` in an error envelope's `details` and in `--debug` request tracing, in both `--output json` and text. `--dry-run` previews never contain a secret in the first place: they show presence flags (such as `hasCredentials`) and field names, not credential values. This is a second, independent layer: the backend already redacts its own error envelopes, but the CLI redacts again on the way out. Ordinary fields that merely contain one of those words as a substring — a boolean presence flag like `hasCredentials`, a file path like `credentialsPath`, or a pagination cursor like `nextToken` — are left alone; only the credential-shaped field itself is blanked.
+
+**Success output is never redacted.** A command's result — generated test code, plans, backend-test fixtures — is the caller's own data and must round-trip byte-identical (`test code get --output json` piped through an edit into `test code put`, `test plan get` into `test plan put`): it prints exactly as the server stored it, even when it legitimately contains a literal `Authorization: Bearer …` header or a `password` key. Redaction only ever touches error envelopes and request traces, never a success payload.
+
+`project env create/update` also reject conflicting credential flags before a `--dry-run` plan. For backward compatibility, `project create/update` keep `--password` precedence when `--password-file` is also given, with a one-line stderr warning; the ignored file is never read.
 
 ### Environment variables
 
@@ -1164,7 +1225,7 @@ run and diagnose failures. Each event carries only:
   excludes blocked runs) — plus `conflictReason`, the most frequent reason a
   case did not dispatch (`in_flight`, `insufficient_credits`, `billing_hold`,
   `mcp_view_only`, `local_address`, `tunnel-required`, `error`);
-- for local runs: `localConcurrencyLimit` and `localPeakInFlight`, the chosen limit and maximum number of runs active through the one tunnel (both 1 for a single local run);
+- `local=true` for an explicit `--local` invocation (including borrowed/refused runs and project creation) or an automatically opened tunnel; tunnel runs also record `localConcurrencyLimit` and `localPeakInFlight`, the chosen limit and maximum number of active tunnel runs;
 - for `ci init`: `platform`, whether `--force` was passed, whether a workflow
   file already existed at the target path (`workflowExisted`), and whether the
   project came from `--project` or auto-detection (`projectResolved`).
@@ -1205,17 +1266,17 @@ backend may also reject a too-old client outright with HTTP 426 - surfaced as
 
 API-key scopes gate the write and run surfaces:
 
-| Scope            | Required by                                                          |
-| ---------------- | -------------------------------------------------------------------- |
-| `read:me`        | `auth status`, `usage`, `doctor` (connectivity check)                |
-| `read:projects`  | `project list / get`                                                 |
-| `read:tests`     | every `test *` read command                                          |
-| `write:tests`    | `test create / create-batch / update / delete / code put / plan put` |
-| `write:projects` | `project create / update / delete / credential / auto-auth`          |
-| `run:tests`      | `test run / rerun / flaky / wait / cancel / artifact get`            |
-| `run:tunnel`     | `test run --local`, `tunnel start / list / status / stop`            |
+| Scope            | Required by                                                             |
+| ---------------- | ----------------------------------------------------------------------- |
+| `read:me`        | `auth status`, `usage`, `doctor` (connectivity check)                   |
+| `read:projects`  | `project list / get`                                                    |
+| `read:tests`     | every `test *` read command                                             |
+| `write:tests`    | `test create / create-batch / update / delete / code put / plan put`    |
+| `write:projects` | `project create / update / delete / credential / auto-auth`             |
+| `run:tests`      | `test run / rerun / flaky / wait / cancel / artifact get`               |
+| `run:tunnel`     | frontend runs that open a tunnel, `tunnel start / list / status / stop` |
 
-New API keys include the full scope set. Keys minted before `run:tunnel` existed do not have that scope; mint a new key to use local tunnels. If a command returns `AUTH_FORBIDDEN`, the missing scope is named in `details.requiredScope` — regenerate your key from the dashboard to pick up new scopes.
+New API keys include the full scope set. Backend v0.18.0 or later grants `run:tunnel` to existing keys unless deliberately narrowed; older backends may require a new key. If a command returns `AUTH_FORBIDDEN`, the missing scope is named in `details.requiredScope` — regenerate your key from the dashboard to pick up new scopes.
 
 ## Output & scripting
 
@@ -1307,7 +1368,7 @@ The full list is the [exit-code table](#exit-codes). On every path the same info
 | `10`                  | Service unavailable                                                                               |
 | `11`                  | Rate limited (except standing limits such as `tunnel_binding_limit`, not auto-retried)            |
 | `12`                  | Insufficient credits (non-retriable)                                                              |
-| `13`                  | Feature gated (paid plan required)                                                                |
+| `13`                  | Feature gated (plan entitlement or per-account flag)                                              |
 | `14`                  | Client too old — the backend requires a newer CLI (HTTP 426 `CLIENT_TOO_OLD`); upgrade to proceed |
 | `129` / `130` / `143` | Interrupted by a signal (SIGHUP / SIGINT / SIGTERM) — `128 + signal number`                       |
 
@@ -1317,10 +1378,10 @@ Exit `7` is a shared bucket, and on this command it has three producers. The
 message text tells them apart:
 
 - **Wait budget elapsed** — `Timed out after <n>s waiting for plan generation on
-project <projectId>`. Generation is still running server-side; re-running the same
-  command re-attaches, and raising `--timeout` helps on exploration-heavy first
-  runs. Under `--output json` the partial object on stdout carries the
-  `projectId` to resume with.
+project <projectId>`, followed by the stage you paused in and how many are left.
+  Running the same command again picks up where it left off; raising `--timeout`
+  lets one run cover every stage. Under `--output json` the partial object on
+  stdout carries the `projectId` and `stagesRemaining` to resume with.
 - **Backend does not have these routes yet** — the message names an unsupported
   operation rather than a timeout, and there is no partial object on stdout. Exit
   7 here means _unsupported_, not _slow_.
@@ -1341,7 +1402,7 @@ information in `error.details.candidates`.
 
 During an **ordinary or adopted-tunnel** `--wait`, SIGINT (Ctrl-C), SIGTERM, or SIGHUP gracefully detaches: the in-flight request aborts, stdout receives a partial run result, and stderr names the signal and offers `test wait <run-id>` / `test cancel <run-id>`. The run keeps executing and remains billable; an adopted tunnel stays with its owner. This is distinct from observing that owner disappear, which cancels the borrower's own run by default. Exit codes are `128 + signal` (130 / 143 / 129).
 
-For an **owned `--local` run**, the first signal instead cancels the non-terminal run by default and closes the tunnel. The CLI reports the cancellation outcome; a run cancelled before it finished is refunded. `--no-cancel-on-interrupt` opts out of cancellation and detaches, but the owned tunnel still closes; the same flag also skips an adopted run's owner-gone cancellation. Use a new `test run <test-id> --local <port>` to verify again, keeping the same `--local-host <host>` if used; `test wait` cannot reopen it. See [local ownership and timeout rules](#local-frontend-testing-and-tunnels).
+For an **owned `--local` run**, the first signal instead cancels the non-terminal run by default and closes the tunnel. The CLI reports the cancellation outcome; a run cancelled before it finished is refunded. `--no-cancel-on-interrupt` opts out of cancellation and detaches, but the owned tunnel still closes; the same flag also skips an adopted run's owner-gone cancellation. Use a new `test run <test-id> --env <name>` to verify again; `test wait` cannot reopen it. See [local ownership and timeout rules](#local-frontend-testing-and-tunnels).
 
 A second signal exits immediately unless a tunnel credential delete or run cancel is in flight; then the CLI waits up to 2 seconds for critical cleanup. A third signal always exits immediately. Outside a `--wait`, signals keep their immediate-exit behavior, except Ctrl-C on `tunnel start`, which is its normal exit 0. A closed stdout pipe (`EPIPE`, e.g. `testsprite test list | head`) exits 0 silently.
 

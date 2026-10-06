@@ -34,6 +34,13 @@ const cases: Array<[string, string[]]> = [
   ['project', ['project', '--help']],
   ['project list', ['project', 'list', '--help']],
   ['project get', ['project', 'get', '--help']],
+  ['project create', ['project', 'create', '--help']],
+  ['project update', ['project', 'update', '--help']],
+  ['project sign-in', ['project', 'sign-in', '--help']],
+  ['project sign-in get', ['project', 'sign-in', 'get', '--help']],
+  ['project sign-in set', ['project', 'sign-in', 'set', '--help']],
+  ['project env create', ['project', 'env', 'create', '--help']],
+  ['project env update', ['project', 'env', 'update', '--help']],
   ['project docs upload', ['project', 'docs', 'upload', '--help']],
   ['test', ['test', '--help']],
   ['test list', ['test', 'list', '--help']],
@@ -72,6 +79,7 @@ const cases: Array<[string, string[]]> = [
   ['tunnel start', ['tunnel', 'start', '--help']],
   ['tunnel list', ['tunnel', 'list', '--help']],
   ['tunnel stop', ['tunnel', 'stop', '--help']],
+  ['tunnel status', ['tunnel', 'status', '--help']],
 ];
 
 describe('--help snapshots', () => {

@@ -391,7 +391,7 @@ export async function runTunnelStart(
           `expiresAt   ${d.expiresAt}`,
           `status      online`,
           `transport   ${d.transport}`,
-          `hint        Attach a run: testsprite test run <test-id> --local <port> --tunnel-client ${d.clientId}`,
+          `hint        Attach a run: testsprite test run <test-id> --env <name> --tunnel-client ${d.clientId}`,
           `hint        Stop it: press Ctrl-C here, or run 'testsprite tunnel stop ${d.clientId}' from another terminal`,
         ].join('\n');
       },
@@ -727,15 +727,15 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
     .description('Open a tunnel so TestSprite can reach an app on this machine')
     .addHelpText(
       'after',
-      '\n`testsprite test run <id> --local <port>` opens and closes a tunnel for you for a single\n' +
-        'run. Use these commands when you want one tunnel to serve several runs, or to check on\n' +
+      '\nFrontend runs automatically open and close a tunnel when the selected environment URL\n' +
+        'is on this machine. Use these commands when you want one tunnel to serve several runs, or to check on\n' +
         'one that a run reported as down.\n' +
         '\nA tunnel lives only as long as `tunnel start` is running — there is no background\n' +
         'daemon, because the credential that authorises an inbound network path into this machine\n' +
         'is never written to disk.\n' +
         '\nExamples:\n' +
         '  testsprite tunnel start                                   # hold a tunnel open (Ctrl-C to stop)\n' +
-        '  testsprite test run <id> --local 5173 --tunnel-client <id>\n' +
+        '  testsprite test run <id> --env <name> --tunnel-client <id>\n' +
         '  testsprite tunnel list\n' +
         '  testsprite tunnel status <id>\n' +
         '  testsprite tunnel stop <id>\n' +
@@ -757,7 +757,10 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
     .addHelpText(
       'after',
       '\nPrints the client id to stderr as soon as it is minted, before connecting; pass it\n' +
-        'to `test run --local <port> --tunnel-client <id>`.\n' +
+        'to `test run <id> --env <name> --tunnel-client <id>` for an environment on this machine.\n' +
+        'Frontend runs normally open their own tunnel automatically for a loopback environment URL.\n' +
+        '\nDev servers can take a minute per page through the tunnel. For a heavy dev server,\n' +
+        "test a built server: `npm run build`, then your framework's preview/start command.\n" +
         '\nExit codes:\n' +
         '  0  you stopped it (Ctrl-C is the normal way to end this command)\n' +
         '  3  auth error — the key needs the `run:tunnel` scope; mint a new key\n' +
@@ -782,6 +785,7 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
     .addHelpText(
       'after',
       '\nShows each tunnel client id, connection status, creation time and expiry.\n' +
+        'Includes tunnels automatically opened for environments on this machine.\n' +
         '\nExit codes:\n' +
         '  0  listed (possibly empty)\n' +
         '  3  auth error — the key needs the `run:tunnel` scope\n' +
@@ -800,6 +804,7 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
       'after',
       '\n`offline` means the API answered and said nothing is connected with that id. A failure\n' +
         'to reach TestSprite is reported as its own error, never as `offline`.\n' +
+        'Use the client id printed by a run that automatically opened a tunnel.\n' +
         '\nExit codes:\n' +
         '  0  answered (the answer may be `offline`)\n' +
         '  4  no such tunnel for this account\n' +
@@ -819,6 +824,7 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
       'after',
       '\nStopping one that is already gone succeeds. Revoking the credential\n' +
         'also makes a running `tunnel start` exit within ~15 s.\n' +
+        'A run that automatically opened this tunnel loses access to its environment when you stop it.\n' +
         'Stopping all requires --confirm; --dry-run previews sample ids without it.\n' +
         '\nExit codes:\n' +
         '  0  stopped (or already absent), including an empty --all result\n' +

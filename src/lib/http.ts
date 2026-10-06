@@ -527,7 +527,7 @@ export class HttpClient {
    */
   async triggerTestListRun(
     listId: string,
-    body: { testIds?: string[] },
+    body: { testIds?: string[]; tunnelClientId?: string; targetUrl?: string },
     options: { idempotencyKey: string; signal?: AbortSignal },
   ): Promise<CliTestListRunResponse> {
     return this.postWithMeta<CliTestListRunResponse>(

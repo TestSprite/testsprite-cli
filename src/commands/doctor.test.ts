@@ -167,7 +167,8 @@ describe('runDoctor — healthy environment', () => {
     expect(report.failures).toBe(0);
     expect(report.checks.some(c => c.name === 'Routing' && c.detail.includes('v3'))).toBe(true);
     expect(capture.stderr.join('\n')).toContain('[advisory]');
-    expect(capture.stderr.join('\n')).toContain('--target-url');
+    expect(capture.stderr.join('\n')).toContain('rerun');
+    expect(capture.stderr.join('\n')).not.toContain('--target-url');
   });
 
   it('shows Routing v2 and no advisory when v3Enabled is false', async () => {

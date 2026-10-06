@@ -1,7 +1,7 @@
 /**
  * VENDOR DELTA (not upstream). Upstream's `config.ts` reads `TSTUN_*`
- * environment variables and falls back to **hard-coded TestSprite dev
- * ALB/NLB hostnames**. Neither belongs in a package published to the public
+ * environment variables and falls back to **hard-coded TestSprite
+ * endpoints**. Neither belongs in a package published to the public
  * npm registry:
  *
  *   - the endpoints are internal infrastructure names, and a default value is
@@ -25,9 +25,7 @@ export const DEFAULT_HEARTBEAT_MS = 10_000;
 /**
  * Maximum time `start()` waits for the server's authentication Ack.
  *
- * VENDOR DELTA: matches the existing 10-second heartbeat and target-connect
- * windows, so a control socket cannot look ready indefinitely when the server
- * accepted the transport but never authenticated it.
+ * Upstream default: matches the heartbeat and target-connect windows.
  */
 export const DEFAULT_AUTH_TIMEOUT_MS = 10_000;
 
@@ -39,6 +37,9 @@ export const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS = 10_000;
 
 /** Retry window after the first failed data-plane dial. Zero retries forever. */
 export const DEFAULT_DATA_PLANE_RETRY_DEADLINE_MS = 60_000;
+
+/** Upstream unknown-client retry window; dormant with the current capability-gated server. */
+export const DEFAULT_CLIENT_UNKNOWN_RETRY_DEADLINE_MS = 120_000;
 
 /** Post-hello interval after which an otherwise-idle data-plane session is established. */
 export const DEFAULT_DATA_PLANE_SETTLE_MS = 5_000;
