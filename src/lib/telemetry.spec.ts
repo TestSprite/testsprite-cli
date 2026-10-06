@@ -331,6 +331,38 @@ describe('buildTelemetryEvent', () => {
     expect(event.local).toBe(true);
   });
 
+  it('preserves an explicit local flag when the runtime sink reports no owned tunnel', () => {
+    const event = buildTelemetryEvent(
+      { command: 'test run', outcome: 'error', exitCode: 5, durationMs: 1, local: true },
+      {},
+      false,
+      { local: false },
+    );
+    expect(event.local).toBe(true);
+  });
+
+  it('keeps timeout cancellation metadata when the runtime sink records an opened tunnel', () => {
+    const event = buildTelemetryEvent(
+      {
+        command: 'test run',
+        outcome: 'error',
+        exitCode: 7,
+        durationMs: 100,
+        local: false,
+        reason: 'wait_timeout',
+        cancelOutcome: 'cancelled',
+      },
+      {},
+      false,
+      { local: true },
+    );
+    expect(event).toMatchObject({
+      local: true,
+      reason: 'wait_timeout',
+      cancelOutcome: 'cancelled',
+    });
+  });
+
   it('omits the local key entirely for an ordinary invocation', () => {
     const event = buildTelemetryEvent(
       { command: 'test list', outcome: 'success', exitCode: 0, durationMs: 1 },

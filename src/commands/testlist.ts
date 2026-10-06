@@ -1,3 +1,16 @@
+import { TunnelLostError } from '../lib/tunnel-session.js';
+import {
+  resolveEnvironmentRunTarget,
+  readEnvironmentPreflight,
+  groupEnvironmentTargets,
+  emitEnvironmentDispatchPartial,
+  withEnvironmentTunnel,
+  type EnvironmentTunnelContext,
+  type ResolvedRunTarget,
+} from '../lib/environment-tunnel.js';
+import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
+import type { TunnelClientOptions } from '../vendor/tunnel-client/index.js';
+import type { TunnelClientHandle } from '../lib/tunnel-session.js';
 import { randomUUID } from 'node:crypto';
 import { Command } from 'commander';
 import {
@@ -37,6 +50,7 @@ import { formatRunProgressLine } from '../lib/run-progress.js';
 import { createTicker } from '../lib/ticker.js';
 import {
   buildJUnitReport,
+  durationSecondsBetween,
   parseJUnitReportFormat,
   skippedJUnitResultsFromSummary,
   writeJUnitReportFile,
@@ -57,6 +71,9 @@ import type {
 } from '../lib/testlist.types.js';
 
 export interface TestListDeps {
+  shutdown?: ShutdownHandle;
+  createTunnelClient?: (options: TunnelClientOptions) => TunnelClientHandle;
+  environmentTunnel?: EnvironmentTunnelContext;
   env?: NodeJS.ProcessEnv;
   credentialsPath?: string;
   fetchImpl?: FetchImpl;
@@ -400,6 +417,9 @@ function parseTestlistConcurrencyFlag(raw: string | undefined): number {
 }
 
 export interface RunTestlistRunOptions extends CommonOptions {
+  noWait?: boolean;
+  skipPreflight?: boolean;
+  concurrencyIsDefault?: boolean;
   listId: string;
   /** --case (repeatable): run only this subset of the list's cases (== test ids). */
   cases?: string[];
@@ -466,13 +486,7 @@ function assertNoNotFound(resp: CliTestListRunResponse): void {
  * with `--wait`, poll every returned runId to a verdict, optionally writing a
  * JUnit XML report (`--report junit`). testlist run is V3-only.
  */
-export async function runTestlistRun(
-  opts: RunTestlistRunOptions,
-  deps: TestListDeps = {},
-): Promise<CliTestListRunResponse> {
-  const out = makeOutput(opts.output, deps);
-  const stderrFn = deps.stderr ?? (line => process.stderr.write(`${line}\n`));
-
+function validateTestlistRunOptions(opts: RunTestlistRunOptions): void {
   if (opts.idempotencyKey !== undefined) assertIdempotencyKey(opts.idempotencyKey);
   if (
     !Number.isInteger(opts.maxConcurrency) ||
@@ -510,6 +524,97 @@ export async function runTestlistRun(
       '--summary-file requires --wait (it reduces the terminal run result). Add --wait.',
     );
   }
+}
+
+export async function runTestlistRun(
+  opts: RunTestlistRunOptions,
+  deps: TestListDeps = {},
+): Promise<CliTestListRunResponse> {
+  validateTestlistRunOptions({ ...opts, wait: opts.wait || (!opts.dryRun && !opts.noWait) });
+  if (opts.dryRun || deps.environmentTunnel) return runTestlistRunCore(opts, deps);
+  let client: HttpClient;
+  try {
+    client = makeClient(opts, deps);
+  } catch (err) {
+    validateTestlistRunOptions(opts);
+    throw err;
+  }
+  const stderr = deps.stderr ?? (line => process.stderr.write(`${line}\n`));
+  let list: CliTestListDetail;
+  try {
+    list = await readEnvironmentPreflight<CliTestListDetail>(
+      client,
+      `/testlist/${encodeURIComponent(opts.listId)}`,
+    );
+  } catch (err) {
+    if (err instanceof InterruptError) throw err;
+    return runTestlistRunCore(opts, deps);
+  }
+  const targets = new Map<string, ResolvedRunTarget>();
+  const backend: Array<{ testId: string; reason: 'backend-test' }> = [];
+  const cache = new Map();
+  for (const test of list.cases ?? []) {
+    if (opts.cases?.length && !opts.cases.includes(test.testId)) continue;
+    const environment = list.projectEnvironments?.find(
+      row => row.projectId === test.projectId,
+    )?.environmentName;
+    const target = await resolveEnvironmentRunTarget({
+      client,
+      testId: test.testId,
+      knownTest: test,
+      includeBackend: true,
+      environment,
+      noWait: opts.noWait,
+      verbose: opts.verbose || opts.debug,
+      stderr,
+      cache,
+    });
+    if (target && test.type === 'backend')
+      backend.push({ testId: test.testId, reason: 'backend-test' });
+    else if (target) targets.set(test.testId, target);
+  }
+  if (!targets.size) return runTestlistRunCore(opts, deps);
+  const maxConcurrency = opts.concurrencyIsDefault ? 5 : opts.maxConcurrency;
+  if (maxConcurrency > 10)
+    throw localValidationError(
+      'max-concurrency',
+      'tunnel runs support at most 10 concurrent runs (default 5)',
+    );
+  if (backend.length)
+    stderr(
+      `[advisory] ${backend.length} backend test(s) skipped — tunnel runs frontend tests only.`,
+    );
+  const cases = (list.cases ?? [])
+    .filter(
+      test =>
+        !backend.some(row => row.testId === test.testId) &&
+        (!opts.cases?.length || opts.cases.includes(test.testId)),
+    )
+    .map(test => test.testId);
+  cases.push(...(opts.cases ?? []).filter(id => !list.cases?.some(test => test.testId === id)));
+  return withEnvironmentTunnel(
+    { ...opts, maxConcurrency, requestTimeoutMs: waitRequestTimeoutMs({ ...opts, wait: true }) },
+    deps,
+    [...targets.values()],
+    'testlist run',
+    context => {
+      context.targets = targets;
+      context.skipped = backend;
+      return runTestlistRunCore(
+        { ...opts, cases, wait: true, maxConcurrency },
+        { ...deps, environmentTunnel: context },
+      );
+    },
+  );
+}
+
+async function runTestlistRunCore(
+  opts: RunTestlistRunOptions,
+  deps: TestListDeps = {},
+): Promise<CliTestListRunResponse> {
+  validateTestlistRunOptions(opts);
+  const out = makeOutput(opts.output, deps);
+  const stderrFn = deps.stderr ?? (line => process.stderr.write(`${line}\n`));
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-testlist-run-${randomUUID()}`;
   emitIdempotencyKey(opts, deps, idempotencyKey, opts.idempotencyKey);
@@ -522,12 +627,72 @@ export async function runTestlistRun(
   }
 
   // Under --wait, raise the per-request timeout to cover --timeout (see helper).
-  const client = makeClient({ ...opts, requestTimeoutMs: waitRequestTimeoutMs(opts) }, deps);
-  const resp = await client.triggerTestListRun(
-    opts.listId,
-    opts.cases && opts.cases.length > 0 ? { testIds: opts.cases } : {},
-    { idempotencyKey },
-  );
+  const client =
+    deps.environmentTunnel?.client ??
+    makeClient({ ...opts, requestTimeoutMs: waitRequestTimeoutMs(opts) }, deps);
+  let resp: CliTestListRunResponse;
+  if (deps.environmentTunnel) {
+    const targets = deps.environmentTunnel.targets!;
+    const groups = groupEnvironmentTargets(
+      opts.cases ?? [...targets.keys()],
+      targets,
+      deps.environmentTunnel.maxConcurrency,
+    );
+    const responses: CliTestListRunResponse[] = [];
+    try {
+      for (const [index, testIds] of groups.entries()) {
+        const target = targets.get(testIds[0]!);
+        const suffix = groups.length > 1 ? `:group${index}` : '';
+        if (target) await deps.environmentTunnel.waitForCapacity(testIds.length);
+        const response = await client.triggerTestListRun(
+          opts.listId,
+          {
+            testIds,
+            ...(target
+              ? { targetUrl: target.targetUrl, tunnelClientId: deps.environmentTunnel.clientId }
+              : {}),
+          },
+          { idempotencyKey: `${idempotencyKey.slice(0, 256 - suffix.length)}${suffix}` },
+        );
+        responses.push(response);
+        if (target)
+          await deps.environmentTunnel.confirm(
+            response,
+            response.accepted.map(row => row.runId),
+          );
+      }
+    } catch (err) {
+      if (responses.length)
+        await emitEnvironmentDispatchPartial(
+          responses,
+          groups.flat(),
+          opts,
+          deps,
+          'testlist',
+          err,
+          deps.environmentTunnel,
+        );
+      throw err;
+    }
+    resp = {
+      ...responses[0]!,
+      ...(deps.environmentTunnel.skipped?.length
+        ? { skipped: deps.environmentTunnel.skipped }
+        : {}),
+      accepted: responses.flatMap(row => row.accepted),
+      conflicts: responses.flatMap(row => row.conflicts),
+      deferred: responses.flatMap(row => row.deferred),
+      ...(responses.some(row => row.notFound)
+        ? { notFound: responses.flatMap(row => row.notFound ?? []) }
+        : {}),
+    };
+  } else {
+    resp = await client.triggerTestListRun(
+      opts.listId,
+      opts.cases && opts.cases.length > 0 ? { testIds: opts.cases } : {},
+      { idempotencyKey },
+    );
+  }
 
   // Partial `--case` miss: some ids were not members of this list. The matched
   // subset still dispatched; a FULL miss is a 404 upstream and never reaches
@@ -651,8 +816,10 @@ export async function runTestlistRun(
 
   // --- --wait fan-out ---
   const ticker = createTicker(stderrFn, opts.output === 'json' ? false : undefined);
-  const batchDeadlineMs = Date.now() + opts.timeoutSeconds * 1000;
+  const batchDeadlineMs =
+    deps.environmentTunnel?.deadlineMs ?? Date.now() + opts.timeoutSeconds * 1000;
   const results: TestlistRunMemberResult[] = [];
+  const reportDurations = new Map<string, number | undefined>();
 
   async function pollOne(entry: CliTestListRunAccepted): Promise<TestlistRunMemberResult> {
     const remainingMs = batchDeadlineMs - Date.now();
@@ -676,9 +843,16 @@ export async function runTestlistRun(
         timeoutSeconds: Math.ceil(remainingMs / 1000),
         sleep: deps.sleep,
         onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
-        onTick: (run, elapsedMs) =>
-          ticker.update(formatRunProgressLine(run, elapsedMs, `(${entry.testId})`)),
+        shutdown: deps.shutdown ?? globalShutdown,
+        onTick: (run, elapsedMs) => {
+          deps.environmentTunnel?.onPoll(run);
+          ticker.update(formatRunProgressLine(run, elapsedMs, `(${entry.testId})`));
+        },
       });
+      reportDurations.set(
+        entry.runId,
+        durationSecondsBetween(finalRun.startedAt, finalRun.finishedAt, finalRun.createdAt),
+      );
       return {
         testId: entry.testId,
         testTitle: finalRun.testTitle ?? null,
@@ -702,6 +876,7 @@ export async function runTestlistRun(
           : {}),
       };
     } catch (err) {
+      if (deps.environmentTunnel && err instanceof TunnelLostError) throw err;
       if (err instanceof TimeoutError) {
         return {
           testId: entry.testId,
@@ -743,24 +918,39 @@ export async function runTestlistRun(
   // `runTestRunAll`'s inline driver rather than extracting a shared helper).
   let pollIdx = 0;
   let inFlight = 0;
-  await new Promise<void>((resolve, reject) => {
-    function startNext(): void {
-      while (inFlight < opts.maxConcurrency && pollIdx < resp.accepted.length) {
-        const entry = resp.accepted[pollIdx++]!;
-        inFlight++;
-        pollOne(entry)
-          .then(r => {
-            results.push(r);
-            inFlight--;
-            startNext();
-            if (inFlight === 0 && pollIdx >= resp.accepted.length) resolve();
-          })
-          .catch(reject);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      function startNext(): void {
+        while (inFlight < opts.maxConcurrency && pollIdx < resp.accepted.length) {
+          const entry = resp.accepted[pollIdx++]!;
+          inFlight++;
+          pollOne(entry)
+            .then(r => {
+              results.push(r);
+              inFlight--;
+              startNext();
+              if (inFlight === 0 && pollIdx >= resp.accepted.length) resolve();
+            })
+            .catch(reject);
+        }
       }
-    }
-    startNext();
-    if (resp.accepted.length === 0) resolve();
-  });
+      startNext();
+      if (resp.accepted.length === 0) resolve();
+    });
+  } catch (err) {
+    ticker.finalize();
+    if (deps.environmentTunnel)
+      await emitEnvironmentDispatchPartial(
+        [resp],
+        resp.accepted.map(row => row.testId),
+        opts,
+        deps,
+        'testlist',
+        err,
+        deps.environmentTunnel,
+      );
+    throw err;
+  }
 
   ticker.finalize();
 
@@ -772,6 +962,7 @@ export async function runTestlistRun(
   );
 
   const jsonPayload = {
+    ...(deps.environmentTunnel?.skipped?.length ? { skipped: deps.environmentTunnel.skipped } : {}),
     accepted: results,
     conflicts: resp.conflicts,
     deferred: resp.deferred,
@@ -803,7 +994,13 @@ export async function runTestlistRun(
     const xml = buildJUnitReport({
       suiteName,
       classname: `testlist:${opts.listId}`,
-      results: [...results, ...skippedJUnitResultsFromSummary(summary)],
+      results: [
+        ...results.map(r => ({
+          ...r,
+          durationSeconds: r.runId ? reportDurations.get(r.runId) : undefined,
+        })),
+        ...skippedJUnitResultsFromSummary(summary, results),
+      ],
     });
     await writeJUnitReportFile(opts.reportFile, xml);
   }
@@ -1093,7 +1290,9 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
 
   testlist
     .command('run <list-id>')
-    .description('Run a test list (dispatch its cases and return pollable run ids)')
+    .description(
+      'Run a test list (dispatch its cases and return pollable run ids). Loopback environments open a tunnel automatically and wait.',
+    )
     .option(
       '--case <test-id>',
       'run only this case (repeatable; default: every case in the list)',
@@ -1101,10 +1300,12 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
       [] as string[],
     )
     .option('--wait', 'poll every dispatched run until terminal or --timeout', false)
+    .option('--no-wait', 'detach without opening an automatic environment tunnel')
+    .option('--skip-preflight', 'skip the loopback port probe before opening a tunnel')
     .option('--timeout <s>', 'with --wait, max seconds to wait (1–3600, default 600)')
     .option(
       '--max-concurrency <n>',
-      `with --wait, max in-flight polls at once (1-${MAX_TESTLIST_RUN_CONCURRENCY}, default ${DEFAULT_TESTLIST_RUN_CONCURRENCY})`,
+      `with a tunnel, max runs in flight (1-10, default 5); otherwise with --wait, max polls (1-${MAX_TESTLIST_RUN_CONCURRENCY}, default ${DEFAULT_TESTLIST_RUN_CONCURRENCY})`,
     )
     .option('--idempotency-key <key>', 'caller-supplied idempotency key (1-256 chars)')
     .option(
@@ -1131,6 +1332,7 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
         cmdOpts: {
           case?: string[];
           wait?: boolean;
+          skipPreflight?: boolean;
           timeout?: string;
           maxConcurrency?: string;
           idempotencyKey?: string;
@@ -1149,6 +1351,9 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
             listId,
             cases: cmdOpts.case,
             wait,
+            noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
+            skipPreflight: cmdOpts.skipPreflight === true,
+            concurrencyIsDefault: cmdOpts.maxConcurrency === undefined,
             timeoutSeconds: parseTestlistTimeoutFlag(cmdOpts.timeout),
             maxConcurrency: parseTestlistConcurrencyFlag(cmdOpts.maxConcurrency),
             idempotencyKey: cmdOpts.idempotencyKey,

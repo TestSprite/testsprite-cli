@@ -340,7 +340,7 @@ async function checkConnectivity(
 }
 
 /**
- * Can this key open a tunnel to this machine (`test run --local`)?
+ * Can this key open a tunnel for an environment on this machine?
  *
  * A READ, not a mint. `GET /tunnel/<random-uuid>` runs the same scope guard
  * and the same environment-configured check as the mint, and answers 404 for
@@ -348,13 +348,10 @@ async function checkConnectivity(
  * one of the caller's few concurrent live bindings or any rate-limit budget on
  * a diagnostic.
  *
- * The case this exists for: `run:tunnel` is the first scope deliberately kept
- * OUT of the grandfather grant, so a key minted before it — most keys in the
- * wild — gets a 403 the first time someone tries `--local`, and the remedy is
- * to mint a NEW key rather than to re-authenticate. Nothing else in the CLI
- * says that until a run has already been refused.
+ * Keys deliberately narrowed without `run:tunnel` receive a 403. Older
+ * servers may also exclude the scope from their legacy-key grant.
  *
- * Never `fail`: a caller who does not use `--local` should not see `doctor`
+ * Never `fail`: a caller who does not use a tunnel should not see `doctor`
  * exit 1 over a surface that is not even configured in their environment.
  */
 async function checkLocalTunnel(
@@ -409,22 +406,26 @@ async function checkLocalTunnel(
       };
     }
     if (error.code === 'NOT_FOUND') {
-      return { name, status: 'ok', detail: 'available; this key can open a tunnel (--local)' };
+      return {
+        name,
+        status: 'ok',
+        detail: 'available; this key can open a tunnel for an environment on this machine',
+      };
     }
     if (error.code === 'AUTH_FORBIDDEN') {
       return {
         name,
         status: 'warn',
         detail:
-          'this API key cannot open a tunnel — it predates the `run:tunnel` scope. ' +
-          'Mint a new API key in the dashboard to use `test run --local`.',
+          'this API key does not have the `run:tunnel` scope. ' +
+          'Mint a new API key with that scope in the dashboard to run an environment on this machine.',
       };
     }
     if (error.code === 'UNAVAILABLE') {
       return {
         name,
         status: 'warn',
-        detail: '`test run --local` is not available on this endpoint',
+        detail: 'tunnels for environments on this machine are not available on this endpoint',
       };
     }
     return { name, status: 'warn', detail: `could not check (${error.code})` };

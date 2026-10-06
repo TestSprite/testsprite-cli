@@ -142,23 +142,38 @@ describe('project create local flags', () => {
     expect(h.connect).not.toHaveBeenCalled();
   });
 
+  it.each(['http://localhost:3000', 'http://127.0.0.1:3000/', 'http://[::1]:3000'])(
+    'rejects a backend project with loopback --url %s before TCP or HTTP',
+    async url => {
+      const h = harness();
+      const error = apiError(
+        await h.run(['create', '--type', 'backend', '--name', 'API', '--url', url]),
+      );
+      expect(error.code).toBe('VALIDATION_ERROR');
+      expect(error.exitCode).toBe(5);
+      expect(error.nextAction).toBe(
+        'a --url on this machine (localhost, 127.0.0.1, [::1]) is frontend-only; give a backend project a public URL',
+      );
+      expect(h.requests).toEqual([]);
+      expect(h.connect).not.toHaveBeenCalled();
+    },
+  );
+
   it('documents the local flags and the frontend URL alternative in help', () => {
     const h = harness();
     const create = h.root.commands[0]!.commands.find(command => command.name() === 'create')!;
     const help = create.helpInformation();
     expect(help).toContain('--local <port>');
-    expect(help).toContain('--local-host <host>');
+    expect(help).not.toContain('--local-host <host>');
     expect(help).toContain('--skip-preflight');
-    expect(help).toContain('127.0.0.1');
     expect(help).toContain('localhost');
-    expect(help).toContain('::1');
     expect(help).toContain('frontend unless --local');
   });
 });
 
 describe('project create local preflight and request', () => {
   it.each([
-    [[], '127.0.0.1', 'http://127.0.0.1:3000'],
+    [[], '127.0.0.1', 'http://localhost:3000'],
     [['--local-host', 'localhost'], '127.0.0.1', 'http://localhost:3000'],
     [['--local-host', '127.0.0.1'], '127.0.0.1', 'http://127.0.0.1:3000'],
     [['--local-host', '::1'], '::1', 'http://[::1]:3000'],
@@ -215,10 +230,10 @@ describe('project create local preflight and request', () => {
     expect(error.code).toBe('VALIDATION_ERROR');
     expect(error.exitCode).toBe(5);
     expect(error.message).toBe(
-      'Nothing is listening on http://127.0.0.1:3000. Start your app first, or pass --skip-preflight.',
+      'Nothing is listening on http://localhost:3000. Start your app first, or pass --skip-preflight.',
     );
     expect(h.requests).toEqual([]);
-    expect(h.connect).toHaveBeenCalledOnce();
+    expect(h.connect).toHaveBeenCalledTimes(2);
   });
 
   it('skip-preflight performs no TCP attempts and still sends the local marker', async () => {
@@ -231,7 +246,7 @@ describe('project create local preflight and request', () => {
     expect(h.connect).not.toHaveBeenCalled();
     expect(h.requests).toHaveLength(1);
     expect(JSON.parse(String(h.requests[0]!.init.body))).toMatchObject({
-      targetUrl: 'http://127.0.0.1:3000',
+      targetUrl: 'http://localhost:3000',
       originMode: 'local',
     });
   });
@@ -239,7 +254,7 @@ describe('project create local preflight and request', () => {
   it.each(['1', '65535'])('accepts boundary port %s', async port => {
     const h = harness();
     expect(await h.run([...CREATE, '--local', port, '--skip-preflight'])).toBeUndefined();
-    expect(JSON.parse(String(h.requests[0]!.init.body)).targetUrl).toBe(`http://127.0.0.1:${port}`);
+    expect(JSON.parse(String(h.requests[0]!.init.body)).targetUrl).toBe(`http://localhost:${port}`);
   });
 
   it('dry-run validates local flags but neither dials nor creates', async () => {
@@ -250,7 +265,7 @@ describe('project create local preflight and request', () => {
     expect(h.connect).not.toHaveBeenCalled();
     expect(h.requests).toEqual([]);
     expect(JSON.parse(h.stdout.join(''))).toMatchObject({
-      targetUrl: 'http://127.0.0.1:3000',
+      targetUrl: 'http://localhost:3000',
       originMode: 'local',
     });
     expect(h.stderr.join('\n')).toContain('[dry-run] sample response — not from the server');
@@ -267,13 +282,13 @@ describe('project create local output and errors', () => {
       const text = h.stdout.join('\n');
       expect(text).toContain('id:          project_local');
       expect(text).toContain(
-        'Local project: TestSprite will reach http://127.0.0.1:3000 only through a tunnel from this machine.',
+        'Local project: TestSprite will reach http://localhost:3000 only through a tunnel from this machine.',
       );
       expect(text).toContain('Next: write a plan and run it locally:');
       expect(text).toContain(
         '  testsprite test create --project project_local --plan-from plan.json',
       );
-      expect(text).toContain('  testsprite test run <test-id> --local 3000');
+      expect(text).toContain('  testsprite test run <test-id>');
       expect(text).toContain(
         'Portal runs of this project stay blocked (free) until you set a public URL with: testsprite project update project_local --url https://...',
       );
@@ -440,18 +455,35 @@ describe('local-origin project reads', () => {
   });
 });
 
-describe('local project run guidance preserves the selected host', () => {
+describe('local project run guidance uses the saved environment', () => {
   it.each([
     ['localhost', 'http://localhost:3000'],
     ['::1', 'http://[::1]:3000'],
-  ])('keeps %s in the suggested tunnel command', async (host, targetUrl) => {
+  ])('describes the saved %s URL and suggests an automatic tunnel run', async (host, targetUrl) => {
     const h = harness({ response: { ...CREATED, targetUrl } });
     expect(await h.run([...CREATE, '--local', '3000', '--local-host', host])).toBeUndefined();
     expect(h.stdout.join('\n')).toContain(
       `Local project: TestSprite will reach ${targetUrl} only through a tunnel from this machine.`,
     );
-    expect(h.stdout.join('\n')).toContain(
-      `  testsprite test run <test-id> --local 3000 --local-host ${host}`,
-    );
+    expect(h.stdout.join('\n')).toContain('  testsprite test run <test-id>');
+  });
+});
+
+describe('project loopback URL inputs', () => {
+  it.each([
+    'http://localhost:3000',
+    'http://127.0.0.1:3000/',
+    'http://[::1]:3000',
+    'http://localhost:80',
+  ])('stores --url %s verbatim with the existing local marker on create and update', async url => {
+    for (const args of [CREATE, ['update', 'project_local']]) {
+      const h = harness();
+      expect(await h.run([...args, '--url', url, '--skip-preflight'])).toBeUndefined();
+      expect(JSON.parse(String(h.requests[0]!.init.body))).toMatchObject({
+        targetUrl: url,
+        originMode: 'local',
+      });
+      expect(h.connect).not.toHaveBeenCalled();
+    }
   });
 });

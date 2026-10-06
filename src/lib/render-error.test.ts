@@ -7,12 +7,124 @@
  * subcommand name.
  */
 import { describe, expect, it } from 'vitest';
+import { InterruptError } from './errors.js';
 import {
+  buildInterruptEnvelope,
   renderAmbiguousOrgCandidates,
   renderTunnelBindingLimitIds,
   renderCommanderError,
   rephraseUnknownOption,
 } from './render-error.js';
+
+describe('buildInterruptEnvelope (JSON-mode INTERRUPTED envelope)', () => {
+  it('interrupted run wait: the run-detach story with the signal', () => {
+    const err = new InterruptError('SIGINT');
+    err.runWaitContext = true;
+    const env = buildInterruptEnvelope(err);
+    expect(env.error.code).toBe('INTERRUPTED');
+    expect(env.error.message).toBe('Interrupted by SIGINT.');
+    expect(env.error.nextAction).toContain('testsprite test wait <runId>');
+    expect(env.error.requestId).toBe('local');
+    expect(env.error.details).toEqual({ signal: 'SIGINT' });
+  });
+
+  it('interrupted non-wait request: the generic check-state hint, no run story', () => {
+    const env = buildInterruptEnvelope(new InterruptError('SIGINT'));
+    expect(env.error.nextAction).toBe(
+      'The request was interrupted. Check the current state before retrying; ' +
+        'a multi-item command may have processed some items.',
+    );
+    expect(env.error.nextAction).not.toContain('test wait');
+    expect(env.error.details).toEqual({ signal: 'SIGINT' });
+  });
+
+  it('plan detach attached: the envelope tells the paused-stage story, never "keeps executing"', () => {
+    const err = new InterruptError('SIGINT');
+    (err as InterruptError & { planDetach?: unknown }).planDetach = {
+      projectId: 'p1',
+      stagesRemaining: ['strategy', 'proposals'],
+      nextAction:
+        'Plan generation paused during stage 1/3 exploration. 2 stages left. ' +
+        'Continue: testsprite test plan generate --project p1',
+    };
+    const env = buildInterruptEnvelope(err);
+    expect(env.error.nextAction).toBe(
+      'Plan generation paused during stage 1/3 exploration. 2 stages left. ' +
+        'Continue: testsprite test plan generate --project p1',
+    );
+    expect(env.error.nextAction).not.toContain('keeps executing');
+    expect(env.error.nextAction).not.toContain('test wait');
+    expect(env.error.details).toEqual({
+      signal: 'SIGINT',
+      projectId: 'p1',
+      stagesRemaining: ['strategy', 'proposals'],
+    });
+  });
+
+  it('plan detach with an unknown plan carries stagesRemaining: null', () => {
+    const err = new InterruptError('SIGTERM');
+    (err as InterruptError & { planDetach?: unknown }).planDetach = {
+      projectId: 'p1',
+      stagesRemaining: null,
+      nextAction: 'Plan generation paused. Continue: testsprite test plan generate --project p1',
+    };
+    const env = buildInterruptEnvelope(err);
+    expect(env.error.details).toEqual({
+      signal: 'SIGTERM',
+      projectId: 'p1',
+      stagesRemaining: null,
+    });
+  });
+
+  it('tunnel detach attached: its nextAction and run details win, unchanged', () => {
+    const err = new InterruptError('SIGINT');
+    (err as InterruptError & { tunnelDetach?: unknown }).tunnelDetach = {
+      runId: 'run_1',
+      cancel: 'cancelled',
+      nextAction: 'Tunnel story.',
+    };
+    const env = buildInterruptEnvelope(err);
+    expect(env.error.nextAction).toBe('Tunnel story.');
+    expect(env.error.details).toEqual({
+      signal: 'SIGINT',
+      runId: 'run_1',
+      cancelOutcome: 'cancelled',
+    });
+  });
+
+  it('precedence: a tunnel detach beats a plan detach, which beats a run wait', () => {
+    const plan = {
+      projectId: 'p1',
+      stagesRemaining: ['proposals'],
+      nextAction: 'Plan story.',
+    };
+    const tunnel = { runId: 'run_1', cancel: 'cancelled', nextAction: 'Tunnel story.' };
+    const withMarkers = (markers: { tunnel?: boolean; plan?: boolean }) => {
+      const err = new InterruptError('SIGINT');
+      err.runWaitContext = true;
+      const tagged = err as InterruptError & { tunnelDetach?: unknown; planDetach?: unknown };
+      if (markers.tunnel) tagged.tunnelDetach = tunnel;
+      if (markers.plan) tagged.planDetach = plan;
+      return buildInterruptEnvelope(err);
+    };
+
+    const all = withMarkers({ tunnel: true, plan: true });
+    expect(all.error.nextAction).toBe('Tunnel story.');
+    expect(all.error.details).toEqual({
+      signal: 'SIGINT',
+      runId: 'run_1',
+      cancelOutcome: 'cancelled',
+    });
+
+    const planAndRun = withMarkers({ plan: true });
+    expect(planAndRun.error.nextAction).toBe('Plan story.');
+    expect(planAndRun.error.details).toEqual({
+      signal: 'SIGINT',
+      projectId: 'p1',
+      stagesRemaining: ['proposals'],
+    });
+  });
+});
 
 describe('rephraseUnknownOption', () => {
   it('rephrases --dry-run placed after subcommand', () => {

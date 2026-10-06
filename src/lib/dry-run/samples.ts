@@ -51,6 +51,10 @@ import type {
   CliGetPlansResponse,
 } from '../plans.types.js';
 import type { TunnelListResponse, TunnelStatusResponse } from '../tunnel.types.js';
+import type {
+  CliProjectSignInResponse,
+  CliProjectSignInSetResponse,
+} from '../../commands/project-sign-in.js';
 
 const SAMPLE_USER_ID = '11111111-1111-4111-8111-111111111111';
 const SAMPLE_KEY_ID = 'key_dryrun_2026';
@@ -580,6 +584,61 @@ function buildPathPattern(pathTemplate: string): RegExp {
 const ENTRIES: DryRunSampleEntry[] = [
   entry('whoami', 'GET', '/me', me),
   entry('listProjects', 'GET', '/projects', pageOf(projects)),
+  entry('getProjectSignIn', 'GET', '/projects/{projectId}/sign-in', {
+    projectId: SAMPLE_PROJECT_ID,
+    environment: {
+      id: 'env_dryrun',
+      name: 'default',
+      url: 'https://app.example.com',
+      isDefault: true,
+      authMode: 'public',
+      hasCredentials: false,
+      username: null,
+      enableOtp: false,
+      updatedAt: '2026-09-25T00:00:00.000Z',
+    },
+    signIn: { mode: 'public', account: null, otp: null, manual: null },
+    nextAction: null,
+  } satisfies CliProjectSignInResponse),
+  entry('setProjectSignIn', 'PUT', '/projects/{projectId}/sign-in', (request?: unknown) => {
+    const body = request as { mode?: string } | undefined;
+    const mode = body?.mode ?? 'manual';
+    return {
+      projectId: SAMPLE_PROJECT_ID,
+      environment: {
+        id: 'env_dryrun',
+        name: 'default',
+        url: 'https://app.example.com',
+        isDefault: true,
+        authMode: mode,
+        hasCredentials: mode === 'account',
+        username: mode === 'account' ? 'qa@example.com' : null,
+        enableOtp: mode === 'otp',
+        updatedAt: '2026-09-25T00:00:00.000Z',
+      },
+      signIn: {
+        mode,
+        account: mode === 'account' ? { username: 'qa@example.com', passwordSet: true } : null,
+        otp:
+          mode === 'otp'
+            ? { channels: ['email'], email: 'dryrun@inbox.example', phone: null }
+            : null,
+        manual:
+          mode === 'manual'
+            ? {
+                sessionReuseTtlSeconds: 3600,
+                hasValidSession: false,
+                needsReauth: true,
+                reason: 'never',
+                capturedAt: null,
+                expiresAt: null,
+              }
+            : null,
+      },
+      changed: mode !== 'otp',
+      nextAction: mode === 'manual' ? 'Log in once in the Portal.' : null,
+    } satisfies CliProjectSignInSetResponse;
+  }),
   // Plan-generation surface. All three MUST be registered
   // BEFORE `getProject`: findSample is first-match-wins and the projects/*
   // family shares the `/projects/…` prefix, so the more specific plans

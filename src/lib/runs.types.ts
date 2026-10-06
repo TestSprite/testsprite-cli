@@ -64,10 +64,13 @@ export interface RunEnvironmentRef {
 
 /**
  * Body sent to `POST /api/cli/v1/tests/{testId}/runs/rerun`.
- * No `targetUrl` — rerun replays against the project's configured URL.
+ * Tunnel replay includes the saved environment URL verbatim; ordinary replay
+ * uses the configured URL.
  * `source` must be "cli" (not "cli-rerun" — that is not a valid RUN_SOURCES value).
  */
 export interface RerunRequest {
+  tunnelClientId?: string;
+  targetUrl?: string;
   source: 'cli';
   /** Opt into AI heal-on-drift. Paid + FE only. Server tier-gates and echoes effective value. */
   autoHeal?: boolean;
@@ -114,6 +117,7 @@ export interface RerunAdvisory {
  * `runId` is always non-null (minted synchronously before async invoke).
  */
 export interface RerunResponse {
+  tunnelClientId?: string;
   /** The named test's runId (minted synchronously before async Lambda invoke). */
   runId: string;
   status: 'queued';
@@ -145,6 +149,8 @@ export interface RerunResponse {
  * Mixed FE/BE testIds allowed; BE closure deduped server-side per project.
  */
 export interface BatchRerunRequest {
+  tunnelClientId?: string;
+  targetUrl?: string;
   source: 'cli';
   testIds: string[];
   autoHeal?: boolean;
@@ -208,6 +214,7 @@ export interface BatchRerunClosure {
  *   chunked dispatch requests (see `dedupeRerunAdvisories` in `commands/test.ts`).
  */
 export interface BatchRerunResponse {
+  tunnelClientId?: string;
   accepted: BatchRerunAccepted[];
   deferred: BatchRerunDeferred[];
   conflicts: BatchRerunConflict[];
@@ -221,6 +228,7 @@ export interface BatchRerunResponse {
  * All fields are stamped at trigger time and cannot change for this runId.
  */
 export interface TriggerRunResponse {
+  tunnelClientId?: string;
   runId: string;
   status: 'queued';
   enqueuedAt: string;

@@ -1,3 +1,20 @@
+import { recordTelemetryTunnelOpened } from '../lib/telemetry.js';
+import { parseLoopbackTargetUrl } from '../lib/local-target.js';
+import {
+  resolveEnvironmentRunTarget,
+  readEnvironmentPreflight,
+  ENVIRONMENT_PREFLIGHT_TIMEOUT_MS,
+  assertNoTunnelOptions,
+  severalIdsWithoutTunnel,
+  quoteEnvironmentName,
+  groupEnvironmentTargets,
+  emitEnvironmentDispatchPartial,
+  tunnelScopeError,
+  withEnvironmentTunnel,
+  type EnvironmentTunnelContext,
+  type ResolvedRunTarget,
+  type RunTargetTest,
+} from '../lib/environment-tunnel.js';
 import {
   closeSync,
   createWriteStream,
@@ -87,8 +104,10 @@ import {
 import { PlanGenerationTimeoutError, runGenerationLadder } from '../lib/plan-poll.js';
 import type {
   CliGetPlansResponse,
+  CliGeneratePlansResponse,
   CliAcceptPlansResponse,
   CliPlanProposal,
+  CliGenerationStage,
   CliGenerationStatus,
 } from '../lib/plans.types.js';
 import { resolveWaitFailure, waitMemberError } from '../lib/wait-exit.js';
@@ -212,6 +231,12 @@ export interface CliTest {
   type: 'frontend' | 'backend';
   createdFrom: 'portal' | 'mcp' | 'cli';
   status: CliPublicStatus;
+  statusByEnvironment?: Array<{
+    environmentId: string | null;
+    environmentName: string | null;
+    status: CliPublicStatus;
+  }>;
+  headlineEnvironment?: { id: string | null; name: string | null } | null;
   createdAt: string;
   updatedAt: string;
   /**
@@ -518,6 +543,10 @@ export interface CliFailureContext {
 }
 
 export interface TestDeps {
+  environmentCache?: Parameters<typeof resolveEnvironmentRunTarget>[0]['cache'];
+  creationTargets?: ReadonlyMap<string, ResolvedRunTarget>;
+  createdTests?: ReadonlyMap<string, RunTargetTest>;
+  environmentTunnel?: EnvironmentTunnelContext;
   /** Report an exhausted poll deadline without changing the public output/error shape. */
   onWaitTimeout?: (context: WaitTimeoutTelemetry) => void;
   env?: NodeJS.ProcessEnv;
@@ -644,6 +673,8 @@ export interface TunnelDetach {
   testId: string;
   localPort: number;
   localHost: LoopbackHost;
+  automatic?: boolean;
+  environment?: string;
   reason: TunnelDetachReason;
   /** The borrowed tunnel owner disappeared while this run was non-terminal. */
   ownerGone?: boolean;
@@ -652,13 +683,28 @@ export interface TunnelDetach {
 }
 
 const TUNNEL_INTERRUPT_OPT_OUT_CONSEQUENCE =
-  'Passing --no-cancel-on-interrupt keeps the run executing without its tunnel; it cannot ' +
-  'reach your app and is still billed.';
+  'Passing --no-cancel-on-interrupt keeps the run going in the cloud, and it is still billed. ' +
+  'The tunnel is closed, so steps that still need your machine will fail; the run can still ' +
+  'pass if it no longer needs to load anything from your machine.';
+
+function tunnelInterruptOptOutConsequence(
+  detach: Pick<TunnelDetach, 'cancel' | 'testId' | 'runId'>,
+): string {
+  if (detach.cancel !== 'skipped') return TUNNEL_INTERRUPT_OPT_OUT_CONSEQUENCE;
+  return (
+    `${TUNNEL_INTERRUPT_OPT_OUT_CONSEQUENCE} Check the verdict later with ` +
+    `testsprite test result ${detach.testId} or testsprite test wait ${detach.runId}.`
+  );
+}
 
 function tunnelRerunCommand(detach: TunnelDetach): string {
   return (
-    `testsprite test run ${detach.testId} --local ${detach.localPort}` +
-    (detach.localHost !== DEFAULT_LOCAL_HOST ? ` --local-host ${detach.localHost}` : '') +
+    `testsprite test run ${detach.testId}` +
+    (detach.environment ? ` --env ${quoteEnvironmentName(detach.environment)}` : '') +
+    (detach.automatic
+      ? ''
+      : ` --local ${detach.localPort}` +
+        (detach.localHost !== DEFAULT_LOCAL_HOST ? ` --local-host ${detach.localHost}` : '')) +
     (detach.reason === 'timeout' ? ' --timeout 1800' : '')
   );
 }
@@ -799,7 +845,7 @@ export function tunnelDetachMessage(detach: TunnelDetach, interrupt?: InterruptE
       `machine through a tunnel that closes with this process, so it was cancelled (exit ` +
       `${interrupt?.exitCode ?? 130}). The run may already have been billed; a cancelled run's ` +
       `verdict is discarded. Start a new run with: ${tunnelRerunCommand(detach)}. ` +
-      TUNNEL_INTERRUPT_OPT_OUT_CONSEQUENCE
+      tunnelInterruptOptOutConsequence(detach)
     );
   }
   const cause: Record<TunnelDetachReason, string> = {
@@ -827,7 +873,7 @@ export function tunnelDetachMessage(detach: TunnelDetach, interrupt?: InterruptE
     `${outcome[cancel]}\n` +
     `  Start a new run with: ${tunnelRerunCommand(detach)}.`;
   return cancel === 'cancelled' || cancel === 'skipped'
-    ? `${message}\n  ${TUNNEL_INTERRUPT_OPT_OUT_CONSEQUENCE}`
+    ? `${message}\n  ${tunnelInterruptOptOutConsequence(detach)}`
     : message;
 }
 
@@ -868,7 +914,7 @@ export function tunnelInterruptNextAction(detach: TunnelDetach, err: InterruptEr
       `Run ${detach.runId} was cancelled after ${err.signal} (exit ${err.exitCode}) and its ` +
       `tunnel was closed. ` +
       "The run may already have been billed; a cancelled run's verdict is discarded. " +
-      `Start a new run with: ${rerun}. ${TUNNEL_INTERRUPT_OPT_OUT_CONSEQUENCE}`
+      `Start a new run with: ${rerun}. ${tunnelInterruptOptOutConsequence(detach)}`
     );
   }
   if (detach.cancel === 'already-terminal') {
@@ -882,7 +928,7 @@ export function tunnelInterruptNextAction(detach: TunnelDetach, err: InterruptEr
   if (detach.cancel === 'skipped') {
     return (
       `Start a new run with: ${rerun}, after stopping run ${detach.runId} with: testsprite test ` +
-      `cancel ${detach.runId}. ${TUNNEL_INTERRUPT_OPT_OUT_CONSEQUENCE}`
+      `cancel ${detach.runId}. ${tunnelInterruptOptOutConsequence(detach)}`
     );
   }
   return (
@@ -907,6 +953,7 @@ type CommonOptions = FactoryCommonOptions;
 
 interface ListOptions extends CommonOptions {
   projectId?: string;
+  environment?: string;
   type?: 'frontend' | 'backend';
   createdFrom?: 'portal' | 'mcp' | 'cli';
   /**
@@ -966,9 +1013,14 @@ function resolveApiUrl(opts: CommonOptions, deps: TestDeps = {}): string {
 }
 
 export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<Page<CliTest>> {
-  // Keep malformed filters ahead of authentication, but check credentials
-  // before the required project so a first-time caller sees the setup action.
+  // The CLI error spec (§2) puts bad input (exit 5) ahead of authentication
+  // (exit 3), and the filter validation below keeps that order. `--project` is
+  // the one deliberate exception: with no credentials at all, being sent to
+  // `testsprite setup` beats being told about a flag you cannot use yet, so the
+  // required project is checked only after the client is built. With a key
+  // configured, a missing `--project` still exits 5 as before.
   const projectId = resolveProjectId(opts.projectId, deps);
+  const environment = normalizeEnvironmentName(opts.environment);
 
   const paginationFlags: PaginationFlags = validatePaginationFlags({
     pageSize: opts.pageSize,
@@ -998,29 +1050,88 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
     type: opts.type,
     createdFrom: opts.createdFrom,
     status: opts.status,
+    ...(environment !== undefined ? { environment } : {}),
   };
 
   let page: Page<CliTest>;
-  if (useSinglePage) {
-    page = await fetchSinglePage<CliTest>(
-      client,
-      '/tests',
-      paginationFlags.pageSize!,
-      opts.startingToken,
-      baseQuery,
-    );
-  } else {
-    page = await paginate<CliTest>(
-      async ({ pageSize, cursor }) =>
-        client.get<Page<CliTest>>('/tests', {
-          query: { ...baseQuery, pageSize, cursor },
-        }),
-      paginationFlags,
-    );
+  try {
+    if (useSinglePage) {
+      page = await fetchSinglePage<CliTest>(
+        client,
+        '/tests',
+        paginationFlags.pageSize!,
+        opts.startingToken,
+        baseQuery,
+      );
+    } else {
+      page = await paginate<CliTest>(
+        async ({ pageSize, cursor }) =>
+          client.get<Page<CliTest>>('/tests', {
+            query: { ...baseQuery, pageSize, cursor },
+          }),
+        paginationFlags,
+      );
+    }
+  } catch (err) {
+    if (err instanceof InterruptError) throw err;
+    if (
+      err instanceof ApiError &&
+      err.code === 'VALIDATION_ERROR' &&
+      err.getDetail('field') === 'environment' &&
+      Array.isArray(err.getDetail('available')) &&
+      environment !== undefined
+    ) {
+      const available = (err.getDetail('available') as unknown[]).filter(
+        (name): name is string => typeof name === 'string',
+      );
+      if (available.length > 0 && !err.nextAction.includes(available.join(', '))) {
+        const hint = `Flag \`--env\` is invalid: unknown environment '${environment}'; use one of: ${available.join(', ')}.`;
+        throw new ApiError(
+          {
+            code: err.code,
+            message: err.message,
+            nextAction: err.nextAction ? `${hint} ${err.nextAction}` : hint,
+            requestId: err.requestId,
+            details: err.details,
+          },
+          err.httpStatus,
+          err.retryAfterMs,
+        );
+      }
+    }
+    throw err;
   }
 
+  if (environment !== undefined) {
+    const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    if (opts.output === 'text' && opts.noHeader) {
+      stderr(`Frontend test status requested for environment '${environment}'.`);
+    }
+    if (
+      page.items.length > 0 &&
+      !page.items.some(
+        test => test.headlineEnvironment !== undefined || test.statusByEnvironment !== undefined,
+      )
+    ) {
+      // An older server ignores `environment` and returns unfiltered
+      // statuses; printing them would look like a filtered answer.
+      throw ApiError.fromEnvelope({
+        error: {
+          code: 'UNSUPPORTED',
+          message: 'This server does not support `test list --env` yet.',
+          nextAction: 'Run the command without --env, or retry after the server is upgraded.',
+          requestId: 'local',
+          details: {},
+        },
+      });
+    }
+  }
   out.print(page, data =>
-    renderTestListText(data as Page<CliTest>, { columns: opts.columns, noHeader: opts.noHeader }),
+    renderTestListText(data as Page<CliTest>, {
+      columns: opts.columns,
+      noHeader: opts.noHeader,
+      environment,
+    }),
   );
   return page;
 }
@@ -1070,6 +1181,7 @@ export type CliCreatePriority = (typeof CLI_CREATE_PRIORITIES)[number];
 const MAX_INLINE_CODE_BYTES = 350 * 1024;
 
 interface CreateOptions extends CommonOptions {
+  noWait?: boolean;
   environment?: string;
   projectId?: string;
   type: 'frontend' | 'backend';
@@ -1200,6 +1312,75 @@ async function emitDupNameAdvisoryIfNeeded(
     // Other lookup failures are best-effort and must not block the create.
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function resolveCreationTargets(
+  opts: CommonOptions & { environment?: string; targetUrl?: string; noWait?: boolean },
+  deps: TestDeps,
+  tests: RunTargetTest[],
+): Promise<Map<string, ResolvedRunTarget>> {
+  const targets = new Map<string, ResolvedRunTarget>();
+  if (opts.dryRun || deps.environmentTunnel) return targets;
+  const client = makeClient(opts, deps);
+  const cache = deps.environmentCache ?? new Map();
+  for (const test of new Map(
+    tests.filter(test => test.type !== 'backend').map(test => [test.projectId, test]),
+  ).values()) {
+    const target = await resolveEnvironmentRunTarget({
+      client,
+      knownTest: test,
+      environment: normalizeEnvironmentName(opts.environment),
+      targetUrl: opts.targetUrl,
+      noWait: opts.noWait,
+      cache,
+      stderr: deps.stderr ?? (line => process.stderr.write(`${line}\n`)),
+    });
+    if (target) targets.set(test.projectId, target);
+  }
+  return targets;
+}
+
+/** A late failure must retain created IDs in the command's normal result envelope. */
+async function withCreatedReceipt<T>(
+  opts: CommonOptions,
+  deps: TestDeps,
+  receipt: unknown,
+  operation: (deps: TestDeps) => Promise<T>,
+): Promise<T> {
+  let printed = false;
+  try {
+    return await operation({
+      ...deps,
+      stdout: line => {
+        printed = true;
+        (deps.stdout ?? (text => process.stdout.write(`${text}\n`)))(line);
+      },
+    });
+  } catch (err) {
+    if (!printed) {
+      const error =
+        err instanceof ApiError
+          ? { code: err.code, message: err.message, exitCode: err.exitCode, details: err.details }
+          : {
+              code: 'UNSUPPORTED',
+              message: err instanceof Error ? err.message : String(err),
+              exitCode: err instanceof CLIError ? err.exitCode : 1,
+            };
+      const data = receipt as {
+        testId?: string;
+        results?: Array<{ testId?: string; status: string }>;
+      };
+      const payload = data.results
+        ? {
+            results: data.results.map(row =>
+              row.status === 'created' ? { ...row, status: 'error', error } : row,
+            ),
+          }
+        : { ...data, run: { testId: data.testId, status: 'error', error } };
+      makeOutput(opts.output, deps).print(payload, () => JSON.stringify(payload));
+    }
+    throw err;
   }
 }
 
@@ -1345,7 +1526,7 @@ export async function runCreate(
     body.category = opts.category;
   }
 
-  if (opts.targetUrl !== undefined) {
+  if (opts.targetUrl !== undefined && !parseLoopbackTargetUrl(opts.targetUrl)) {
     assertNotLocal(opts.targetUrl, {
       field: 'target-url',
       helpCommand: 'testsprite test create',
@@ -1379,6 +1560,7 @@ export async function runCreate(
   if (
     opts.type !== 'backend' &&
     opts.targetUrl !== undefined &&
+    !parseLoopbackTargetUrl(opts.targetUrl) &&
     opts.run === true &&
     !opts.dryRun
   ) {
@@ -1394,6 +1576,24 @@ export async function runCreate(
       },
       stderrFn,
     );
+  }
+
+  deps = { ...deps, environmentCache: deps.environmentCache ?? new Map() };
+  if (opts.run && !opts.dryRun && !deps.environmentTunnel) {
+    const targets = await resolveCreationTargets(opts, deps, [{ type: opts.type, projectId }]);
+    if (targets.size) {
+      return withEnvironmentTunnel(
+        { ...opts, maxConcurrency: 1, timeoutSeconds: opts.timeout ?? DEFAULT_RUN_TIMEOUT_SECONDS },
+        deps,
+        [...targets.values()],
+        'test create --run',
+        context =>
+          runCreate(
+            { ...opts, idempotencyKey, wait: true, skipPreflight: true },
+            { ...deps, environmentTunnel: context, creationTargets: targets },
+          ),
+      );
+    }
   }
 
   const client = makeClient(opts, deps);
@@ -1458,27 +1658,32 @@ export async function runCreate(
       // `undefined` when unmapped) via `createContextWithUrl` above.
       runDashboardStderrFn(`Dashboard: ${createContextWithUrl.dashboardUrl}`);
     }
-    await runTestRun(
-      {
-        ...opts,
-        testId: response.testId,
-        idempotencyKey: runIdempotencyKey,
-        timeoutSeconds: opts.timeout ?? DEFAULT_RUN_TIMEOUT_SECONDS,
-        // B2(c): pass through whether --timeout was explicitly set.
-        // opts.timeout is already a parsed number (never undefined here) so we
-        // thread the dedicated flag rather than checking undefined again.
-        timeoutIsDefault: opts.timeoutIsDefault ?? false,
-        wait: opts.wait === true,
-        createContext: createContextWithUrl,
-        // Thread the known type so fast BE runs (terminal on first poll, where
-        // beFallbackUsed would be false) still render `steps: n/a (backend)`.
-        type: opts.type,
-        // The preflight above (or its explicit --skip-preflight opt-out)
-        // already ran against this exact URL before the create POST — never
-        // probe it a second time here.
-        skipPreflight: true,
-      },
-      deps,
+    await withCreatedReceipt(opts, deps, createContextWithUrl, runDeps =>
+      runTestRun(
+        {
+          ...opts,
+          testId: response.testId,
+          idempotencyKey: runIdempotencyKey,
+          timeoutSeconds: opts.timeout ?? DEFAULT_RUN_TIMEOUT_SECONDS,
+          // B2(c): pass through whether --timeout was explicitly set.
+          // opts.timeout is already a parsed number (never undefined here) so we
+          // thread the dedicated flag rather than checking undefined again.
+          timeoutIsDefault: opts.timeoutIsDefault ?? false,
+          wait: opts.wait === true,
+          createContext: createContextWithUrl,
+          // Thread the known type so fast BE runs (terminal on first poll, where
+          // beFallbackUsed would be false) still render `steps: n/a (backend)`.
+          type: opts.type,
+          knownTest: { type: opts.type, projectId },
+          // The preflight above (or its explicit --skip-preflight opt-out)
+          // already ran against this exact URL before the create POST — never
+          // probe it a second time here.
+          skipPreflight:
+            opts.skipPreflight === true ||
+            (opts.targetUrl !== undefined && !parseLoopbackTargetUrl(opts.targetUrl)),
+        },
+        runDeps,
+      ),
     );
     return response;
   }
@@ -2711,7 +2916,7 @@ export interface CliBatchRunResult {
   /** Failure kind if status is `failed` or `blocked`. */
   failureKind?: string | null;
   /** Error envelope when the trigger itself failed (network/auth/validation). */
-  error?: { code: string; message: string; exitCode: number };
+  error?: { code: string; message: string; exitCode: number; details?: Record<string, unknown> };
   /**
    * Portal deep link (R3b), threaded through from the SAME per-item
    * create-time decision `test create-batch`'s own output carries — never
@@ -3070,6 +3275,7 @@ export function isTransientRateLimit(err: ApiError): boolean {
 }
 
 interface CreateFromPlanOptions extends CommonOptions {
+  noWait?: boolean;
   environment?: string;
   /** Path to the JSON file containing one `CliPlanInput`. */
   planFrom: string;
@@ -3182,7 +3388,7 @@ export async function runCreateFromPlan(
   assertChainedRunKeyFits(opts.run, opts.idempotencyKey);
   requireNonEmpty('plan-from', opts.planFrom);
 
-  if (opts.targetUrl !== undefined) {
+  if (opts.targetUrl !== undefined && !parseLoopbackTargetUrl(opts.targetUrl)) {
     assertNotLocal(opts.targetUrl, {
       field: 'target-url',
       helpCommand: 'testsprite test create',
@@ -3248,7 +3454,12 @@ export async function runCreateFromPlan(
   // plans already threw above), so no type gate is needed. The delegated
   // `runTestRun` call in the --run chain below sets `skipPreflight: true`
   // so this exact URL is never probed twice.
-  if (opts.targetUrl !== undefined && opts.run === true && !opts.dryRun) {
+  if (
+    opts.targetUrl !== undefined &&
+    !parseLoopbackTargetUrl(opts.targetUrl) &&
+    opts.run === true &&
+    !opts.dryRun
+  ) {
     await assertTargetUrlReachable(
       opts.targetUrl,
       { skipPreflight: opts.skipPreflight },
@@ -3260,6 +3471,26 @@ export async function runCreateFromPlan(
       },
       stderrFn,
     );
+  }
+
+  deps = { ...deps, environmentCache: deps.environmentCache ?? new Map() };
+  if (opts.run && !opts.dryRun && !deps.environmentTunnel) {
+    const targets = await resolveCreationTargets(opts, deps, [
+      { type: plan.type, projectId: plan.projectId },
+    ]);
+    if (targets.size) {
+      return withEnvironmentTunnel(
+        { ...opts, maxConcurrency: 1, timeoutSeconds: opts.timeout ?? DEFAULT_RUN_TIMEOUT_SECONDS },
+        deps,
+        [...targets.values()],
+        'test create --run',
+        context =>
+          runCreateFromPlan(
+            { ...opts, idempotencyKey, wait: true, skipPreflight: true },
+            { ...deps, environmentTunnel: context, creationTargets: targets },
+          ),
+      );
+    }
   }
 
   const client = makeClient(opts, deps);
@@ -3302,22 +3533,28 @@ export async function runCreateFromPlan(
     if (planDashboardSuppressed) {
       emitDashboardLinkSuppressedAdvisory(response.testId, stderrFn);
     }
-    return runTestRun(
-      {
-        ...opts,
-        testId: response.testId,
-        idempotencyKey: runIdempotencyKey,
-        timeoutSeconds: opts.timeout ?? DEFAULT_RUN_TIMEOUT_SECONDS,
-        // B2(c): thread through whether --timeout was explicitly set so the
-        // first-run hint fires for `test create --plan-from --run --wait`.
-        timeoutIsDefault: opts.timeoutIsDefault ?? false,
-        wait: opts.wait === true,
-        createContext: responseWithDashboardUrl,
-        // Already preflighted above (or explicitly skipped) — don't probe
-        // the same URL twice.
-        skipPreflight: true,
-      },
-      deps,
+    return withCreatedReceipt(opts, deps, responseWithDashboardUrl, runDeps =>
+      runTestRun(
+        {
+          ...opts,
+          testId: response.testId,
+          type: plan.type,
+          knownTest: { type: plan.type, projectId: plan.projectId },
+          idempotencyKey: runIdempotencyKey,
+          timeoutSeconds: opts.timeout ?? DEFAULT_RUN_TIMEOUT_SECONDS,
+          // B2(c): thread through whether --timeout was explicitly set so the
+          // first-run hint fires for `test create --plan-from --run --wait`.
+          timeoutIsDefault: opts.timeoutIsDefault ?? false,
+          wait: opts.wait === true,
+          createContext: responseWithDashboardUrl,
+          // Already preflighted above (or explicitly skipped) — don't probe
+          // the same URL twice.
+          skipPreflight:
+            opts.skipPreflight === true ||
+            (opts.targetUrl !== undefined && !parseLoopbackTargetUrl(opts.targetUrl)),
+        },
+        runDeps,
+      ),
     ).then(() => response);
   }
 
@@ -3601,6 +3838,7 @@ function collectPlanIssues(
 }
 
 interface CreateBatchOptions extends CommonOptions {
+  noWait?: boolean;
   environment?: string;
   /** Path to the JSONL file containing one `CliPlanInput` per line. */
   plans: string;
@@ -3687,7 +3925,7 @@ export async function runCreateBatch(
   ) {
     throw localValidationError('max-concurrency', 'must be an integer between 1 and 100');
   }
-  if (opts.targetUrl !== undefined) {
+  if (opts.targetUrl !== undefined && !parseLoopbackTargetUrl(opts.targetUrl)) {
     assertNotLocal(opts.targetUrl, {
       field: 'target-url',
       helpCommand: 'testsprite test create-batch',
@@ -3746,6 +3984,43 @@ export async function runCreateBatch(
         details: { field: 'plans', sizeBytes: bodyBytes, maxBytes: MAX_BATCH_BODY_BYTES },
       },
     });
+  }
+
+  deps = { ...deps, environmentCache: deps.environmentCache ?? new Map() };
+  if (opts.run && !opts.dryRun && !deps.environmentTunnel) {
+    const targets = await resolveCreationTargets(
+      opts,
+      deps,
+      specs.map(spec => ({ type: spec.type, projectId: spec.projectId })),
+    );
+    if (targets.size) {
+      if ((opts.maxConcurrency ?? 5) > 10)
+        throw localValidationError(
+          'max-concurrency',
+          'tunnel runs support at most 10 concurrent runs (default 5)',
+        );
+      return withEnvironmentTunnel(
+        {
+          ...opts,
+          maxConcurrency: opts.maxConcurrency ?? 5,
+          timeoutSeconds: opts.timeoutSeconds ?? DEFAULT_RUN_TIMEOUT_SECONDS,
+        },
+        deps,
+        [...targets.values()],
+        'test create-batch --run',
+        context =>
+          runCreateBatch(
+            {
+              ...opts,
+              idempotencyKey,
+              wait: true,
+              maxConcurrency: opts.maxConcurrency ?? 5,
+              skipPreflight: true,
+            },
+            { ...deps, environmentTunnel: context, creationTargets: targets },
+          ),
+      );
+    }
   }
 
   const client = makeClient(opts, deps);
@@ -3878,15 +4153,29 @@ export async function runCreateBatch(
     out.print(enrichedResponse, data => renderBatchText(data as CliCreateBatchResponse));
   }
 
+  deps = {
+    ...deps,
+    createdTests: new Map(
+      response.results.flatMap(row => {
+        const spec = specs[row.specIndex];
+        return row.testId && spec
+          ? [[row.testId, { type: spec.type, projectId: spec.projectId }] as const]
+          : [];
+      }),
+    ),
+  };
+
   // --run: fan out a trigger for each created test, then emit results.
   if (opts.run === true) {
-    await runBatchRun(
-      opts,
-      response,
-      client,
-      out,
-      deps,
-      opts.dryRun ? undefined : testIdToDashboardState,
+    await withCreatedReceipt(opts, deps, response, runDeps =>
+      runBatchRun(
+        opts,
+        response,
+        runDeps.environmentTunnel?.client ?? client,
+        makeOutput(opts.output, runDeps),
+        runDeps,
+        opts.dryRun ? undefined : testIdToDashboardState,
+      ),
     );
     // runBatchRun handles its own exit-code logic via CLIError.
     // Return the create response to satisfy the return type; callers that
@@ -3972,6 +4261,63 @@ async function runBatchRun(
     return;
   }
 
+  if (deps.environmentTunnel && deps.creationTargets) {
+    deps.environmentTunnel.targets = new Map(
+      testIds.flatMap(id => {
+        const known = deps.createdTests?.get(id);
+        const target = known ? deps.creationTargets!.get(known.projectId) : undefined;
+        return target ? [[id, target] as const] : [];
+      }),
+    );
+  }
+
+  if (!deps.environmentTunnel) {
+    const targets = new Map<string, ResolvedRunTarget>();
+    const cache = deps.environmentCache ?? new Map();
+    for (const testId of testIds) {
+      const target = await resolveEnvironmentRunTarget({
+        client,
+        testId,
+        knownTest: deps.createdTests?.get(testId),
+        environment: normalizeEnvironmentName(opts.environment),
+        targetUrl: opts.targetUrl,
+        noWait: opts.noWait,
+        verbose: opts.verbose || opts.debug,
+        stderr: stderrFn,
+        cache,
+      });
+      if (target) targets.set(testId, target);
+    }
+    if (targets.size) {
+      const maxConcurrency = opts.maxConcurrency ?? 5;
+      if (maxConcurrency > 10)
+        throw localValidationError(
+          'max-concurrency',
+          'tunnel runs support at most 10 concurrent runs (default 5)',
+        );
+      return withEnvironmentTunnel(
+        {
+          ...opts,
+          requestTimeoutMs: resolveWaitRequestTimeoutMs({ ...opts, wait: true, timeoutSeconds }),
+        },
+        deps,
+        [...targets.values()],
+        'test create-batch --run',
+        context => {
+          context.targets = targets;
+          return runBatchRun(
+            { ...opts, wait: true, maxConcurrency },
+            createResponse,
+            context.client,
+            out,
+            { ...deps, environmentTunnel: context },
+            testIdToDashboardState,
+          );
+        },
+      );
+    }
+  }
+
   // Pre-charge reachability preflight, ONCE for the whole batch
   // before the fan-out — not once per item (mirrors the "fire once per
   // invocation" contract Finding 2 already established for the target-url
@@ -3980,7 +4326,7 @@ async function runBatchRun(
   // `type: "backend"` spec always fails create-time server validation, so
   // it never reaches this fan-out at all — see the `beIndexes` warning in
   // `runCreateBatch`).
-  if (opts.targetUrl !== undefined) {
+  if (opts.targetUrl !== undefined && !parseLoopbackTargetUrl(opts.targetUrl)) {
     await assertTargetUrlReachable(
       opts.targetUrl,
       { skipPreflight: opts.skipPreflight },
@@ -4004,6 +4350,7 @@ async function runBatchRun(
   // matching comment in `runTestRun` for why this replaced the old
   // `v3Enabled`-assumption probe.
   let targetUrlAdvisoryPrinted = false;
+  let fanOutStopped = false;
 
   /**
    * Client-side sliding-window throttle: caps outgoing triggers at
@@ -4033,6 +4380,7 @@ async function runBatchRun(
   // partial reads it because a member's runId is local to triggerOne until
   // the poll settles.
   const dispatchedRunIds = new Map<string, string>();
+  const pendingTriggers = new Set<Promise<unknown>>();
 
   async function triggerOne(testId: string): Promise<CliBatchRunResult> {
     // Mint a fresh idempotency key per run — MUST NOT reuse the create key.
@@ -4110,21 +4458,42 @@ async function runBatchRun(
         await sleepUntilOrInterrupt(clampedWait, shutdown.signal, sleepFn);
       }
 
+      if (fanOutStopped && deps.environmentTunnel) {
+        return { testId, runId: '', status: 'not_dispatched', codeVersion: '' };
+      }
       try {
-        const result = await client.triggerRunWithMeta(
-          testId,
-          {
-            source: 'cli',
-            ...(opts.targetUrl ? { targetUrl: opts.targetUrl } : {}),
-            ...(opts.environment !== undefined ? { environment: opts.environment.trim() } : {}),
-          },
-          // retryOnRateLimit: false — the outer retry loop is the SOLE owner of
-          // rate-limit handling for the batch path. Allowing the HTTP layer to add
-          // up to 3 internal retries per outer attempt would multiply trigger
-          // POSTs per spec (e.g. 50×3 = 150/min), blowing the server's 60/min cap.
-          { idempotencyKey: runIdempotencyKey, retryOnRateLimit: false },
-        );
-        triggerResponse = result.body;
+        const dispatch = client
+          .triggerRunWithMeta(
+            testId,
+            {
+              source: 'cli',
+              ...(opts.targetUrl ? { targetUrl: opts.targetUrl } : {}),
+              ...(deps.environmentTunnel?.targets?.has(testId)
+                ? {
+                    targetUrl: deps.environmentTunnel.targets.get(testId)!.targetUrl,
+                    tunnelClientId: deps.environmentTunnel.clientId,
+                  }
+                : {}),
+              ...(opts.environment !== undefined ? { environment: opts.environment.trim() } : {}),
+            },
+            // retryOnRateLimit: false — the outer retry loop is the SOLE owner of
+            // rate-limit handling for the batch path. Allowing the HTTP layer to add
+            // up to 3 internal retries per outer attempt would multiply trigger
+            // POSTs per spec (e.g. 50×3 = 150/min), blowing the server's 60/min cap.
+            { idempotencyKey: runIdempotencyKey, retryOnRateLimit: false },
+          )
+          .then(async result => {
+            if (result.body.runId) dispatchedRunIds.set(testId, result.body.runId);
+            if (deps.environmentTunnel?.targets?.has(testId))
+              await deps.environmentTunnel.confirm(result.body, [result.body.runId], false);
+            return result;
+          });
+        pendingTriggers.add(dispatch);
+        try {
+          triggerResponse = (await dispatch).body;
+        } finally {
+          pendingTriggers.delete(dispatch);
+        }
         // Fire the response-driven mismatch advisory at most once for the
         // whole batch. Synchronous check-and-set (no `await` between the
         // two) so two members whose triggers resolve in the same tick
@@ -4167,7 +4536,12 @@ async function runBatchRun(
               runId: '',
               status: 'error',
               codeVersion: '',
-              error: { code: err.code, message: err.message, exitCode: err.exitCode },
+              error: {
+                code: err.code,
+                message: err.message,
+                exitCode: err.exitCode,
+                details: err.details,
+              },
             };
           }
 
@@ -4209,11 +4583,21 @@ async function runBatchRun(
             runId: '',
             status: 'error',
             codeVersion: '',
-            error: { code: err.code, message: err.message, exitCode: err.exitCode },
+            error: {
+              code: err.code,
+              message: err.message,
+              exitCode: err.exitCode,
+              details: err.details,
+            },
           };
         }
         // Reuse the same CONFLICT + --wait auto-resume logic as single-test run.
-        if (opts.wait && err instanceof ApiError && err.code === 'CONFLICT') {
+        if (
+          opts.wait &&
+          !deps.environmentTunnel?.targets?.has(testId) &&
+          err instanceof ApiError &&
+          err.code === 'CONFLICT'
+        ) {
           const conflictReason = err.getDetail<string>(
             'reason',
             (v): v is string => typeof v === 'string' && v.length > 0,
@@ -4269,6 +4653,7 @@ async function runBatchRun(
               code: apiErr?.code ?? 'INTERNAL',
               message: err instanceof Error ? err.message : String(err),
               exitCode: apiErr?.exitCode ?? 1,
+              ...(apiErr ? { details: apiErr.details } : {}),
             },
           };
         }
@@ -4280,8 +4665,8 @@ async function runBatchRun(
     // a member's runId is otherwise local until its poll settles.
     if (triggerResponse.runId) dispatchedRunIds.set(testId, triggerResponse.runId);
 
-    if (!opts.wait) {
-      // No-wait path: return the trigger response as-is.
+    if (!opts.wait || (fanOutStopped && deps.environmentTunnel)) {
+      // Retain late trigger receipts without starting another poll during cleanup.
       if (opts.output !== 'json') {
         stderrFn(
           `[batch-run] ${testId} — triggered (runId: ${triggerResponse.runId}, status: ${triggerResponse.status})`,
@@ -4301,6 +4686,16 @@ async function runBatchRun(
     // polling. Math.max(1, ...) would otherwise convert 0 ms → 1 s poll.
     const rem = remainingMs();
     if (opts.wait && rem <= 0) {
+      if (deps.environmentTunnel?.targets?.has(testId)) {
+        fanOutStopped = true;
+        throw new ApiError({
+          code: 'UNSUPPORTED',
+          message: `Timed out after ${timeoutSeconds}s before polling run ${triggerResponse.runId}.`,
+          nextAction: `Inspect cancellation with testsprite test cancel ${triggerResponse.runId}.`,
+          requestId: 'local',
+          details: { runId: triggerResponse.runId },
+        });
+      }
       return {
         testId,
         runId: triggerResponse.runId,
@@ -4321,12 +4716,28 @@ async function runBatchRun(
       finalRun = await pollRunUntilTerminal(client, triggerResponse.runId, {
         timeoutSeconds: remainingSeconds,
         sleep: deps.sleep,
+        onTick: run => deps.environmentTunnel?.onPoll(run),
         shutdown: shutdownOf(deps),
         onTransition: opts.verbose
           ? (msg: string) => stderrFn(`[batch-run][verbose] ${testId}: ${msg}`)
           : undefined,
       });
     } catch (err) {
+      // An unobserved tunnel run still occupies a slot until cleanup settles.
+      if (deps.environmentTunnel?.targets?.has(testId)) {
+        fanOutStopped = true;
+        if (err instanceof TimeoutError) {
+          deps.onWaitTimeout?.({ reason: 'wait_timeout' });
+          throw new ApiError({
+            code: 'UNSUPPORTED',
+            message: err.message,
+            nextAction: `Inspect cancellation with testsprite test cancel ${triggerResponse.runId}.`,
+            requestId: 'local',
+            details: { runId: triggerResponse.runId },
+          });
+        }
+        throw err;
+      }
       // Interrupt rejects the fan-out — see the trigger-stage catch above.
       if (err instanceof InterruptError) throw err;
       if (err instanceof TimeoutError) {
@@ -4370,6 +4781,7 @@ async function runBatchRun(
           code: apiErr?.code ?? 'INTERNAL',
           message: err instanceof Error ? err.message : String(err),
           exitCode: apiErr?.exitCode ?? 1,
+          ...(apiErr ? { details: apiErr.details } : {}),
         },
       };
     }
@@ -4401,7 +4813,7 @@ async function runBatchRun(
   try {
     await new Promise<void>((resolve, reject) => {
       function startNext(): void {
-        while (inFlight < concurrencyLimit && nextIdx < testIds.length) {
+        while (!fanOutStopped && inFlight < concurrencyLimit && nextIdx < testIds.length) {
           const testId = testIds[nextIdx++]!;
           inFlight++;
           triggerOne(testId)
@@ -4411,17 +4823,21 @@ async function runBatchRun(
               startNext();
               if (inFlight === 0 && nextIdx >= testIds.length) resolve();
             })
-            .catch(reject);
+            .catch(err => {
+              fanOutStopped = true;
+              reject(err);
+            });
         }
       }
       startNext();
       if (testIds.length === 0) resolve();
     });
   } catch (fanOutErr) {
+    if (deps.environmentTunnel) await Promise.allSettled([...pendingTriggers]);
     // Graceful detach: leave stdout parseable — settled members keep
     // their real status, unfinished ones are marked running — then rethrow so
     // index.ts exits 128+signum.
-    if (fanOutErr instanceof InterruptError) {
+    if (fanOutErr instanceof InterruptError || deps.environmentTunnel) {
       const settled = new Map(batchRunResults.map(r => [r.testId, r] as const));
       // Members mid-poll have no settled result yet — their runId comes from
       // the dispatchedRunIds map recorded at trigger time.
@@ -4440,12 +4856,16 @@ async function runBatchRun(
       const unfinished = partialResults
         .filter(r => r.status === 'running' && r.runId)
         .map(r => r.runId);
-      if (unfinished.length > 0) {
+      if (unfinished.length > 0 && fanOutErr instanceof InterruptError) {
         fanOutErr.runWaitContext = true;
-        stderrFn(interruptDetachMessage(fanOutErr, unfinished));
-      } else {
         stderrFn(
-          `Interrupted (${fanOutErr.signal}). Already-triggered runs keep executing (and billing) server-side; ` +
+          deps.environmentTunnel
+            ? `Interrupted (${fanOutErr.signal}). The owned tunnel is closing; cancellation will be requested for unfinished tunnel runs.`
+            : interruptDetachMessage(fanOutErr, unfinished),
+        );
+      } else if (fanOutErr instanceof InterruptError) {
+        stderrFn(
+          `Interrupted (${fanOutErr.signal}). ${deps.environmentTunnel ? 'The owned tunnel is closing; inspect already-triggered runs' : 'Already-triggered runs keep executing (and billing) server-side'}; ` +
             `check them with: testsprite test list`,
         );
       }
@@ -6005,7 +6425,49 @@ export async function runResult(
       ? { ...result, analysis: annotateAnalysisTruncation(result.analysis) }
       : result;
 
+  // Print the latest result first: the optional default-environment line below
+  // costs up to two reads, and a slow read or Ctrl-C must not withhold it.
   out.print(printData, data => renderResultText(data as CliLatestResult));
+  if (opts.output !== 'json' && result.environment) {
+    try {
+      const readOptions = {
+        retry: false,
+        signal: AbortSignal.timeout(ENVIRONMENT_PREFLIGHT_TIMEOUT_MS),
+      };
+      const test = await client.get<CliTest>(
+        `/tests/${encodeURIComponent(opts.testId)}`,
+        readOptions,
+      );
+      if (
+        test.projectId &&
+        test.headlineEnvironment?.id !== result.environment.id &&
+        test.statusByEnvironment?.some(status => status.environmentId !== result.environment?.id)
+      ) {
+        // A missing default result lets the headline fall back to another environment.
+        const listing = await client.get<CliProjectEnvListResponse>(
+          `/projects/${encodeURIComponent(test.projectId)}/env`,
+          readOptions,
+        );
+        const defaultEnvironment = listing.environments?.find(environment => environment.isDefault);
+        const defaultStatus = defaultEnvironment?.id
+          ? test.statusByEnvironment.find(status => status.environmentId === defaultEnvironment.id)
+          : undefined;
+        if (
+          defaultEnvironment?.name &&
+          defaultStatus &&
+          defaultStatus.environmentId !== result.environment.id
+        ) {
+          const line =
+            `Default environment ${defaultEnvironment.name}: ${defaultStatus.status} ` +
+            `(testsprite test result ${opts.testId} --history --env ${quoteEnvironmentName(defaultEnvironment.name)})`;
+          out.print(line, text => String(text));
+        }
+      }
+    } catch (err) {
+      if (err instanceof InterruptError) throw err;
+      // Optional context must never prevent displaying the latest result.
+    }
+  }
   return result;
 }
 
@@ -6478,6 +6940,8 @@ const DEFAULT_LOCAL_RUN_TIMEOUT_SECONDS = 1200;
 const MAX_RUN_TIMEOUT_SECONDS = 3600;
 
 interface RunTestRunOptions extends CommonOptions {
+  knownTest?: RunTargetTest;
+  noWait?: boolean;
   testId: string;
   targetUrl?: string;
   /**
@@ -6578,6 +7042,11 @@ interface RunTestWaitOptions extends CommonOptions {
 // ---------------------------------------------------------------------------
 
 interface RunTestRerunOptions extends CommonOptions {
+  knownTests?: ReadonlyMap<string, Pick<CliTest, 'type' | 'projectId'>>;
+  noWait?: boolean;
+  skipPreflight?: boolean;
+  concurrencyIsDefault?: boolean;
+  batchResolved?: boolean;
   /** One or more testIds to rerun. Empty + all=false → validation error (exit 5). */
   testIds: string[];
   /** --all: resolve all tests in the project and batch-rerun them. */
@@ -7119,102 +7588,6 @@ function normalizeEnvironmentName(raw: string | undefined): string | undefined {
   return name;
 }
 
-/** Check a local run's test type and named environment before minting a tunnel. */
-async function preflightLocalRunTest(args: {
-  client: HttpClient;
-  testId: string;
-  environment: string | undefined;
-  localPort: number;
-  opts: Pick<CommonOptions, 'verbose' | 'debug'>;
-  deps: TestDeps;
-  knownTest?: Pick<CliTest, 'type' | 'projectId'>;
-}): Promise<void> {
-  const { client, testId, environment, localPort, opts, deps } = args;
-  let test = args.knownTest;
-  if (test === undefined) {
-    try {
-      test = await client.get<Pick<CliTest, 'type' | 'projectId'>>(
-        `/tests/${encodeURIComponent(testId)}`,
-      );
-    } catch (err) {
-      if (err instanceof InterruptError) throw err;
-      const message = `Cannot read test ${testId} for --local preflight.`;
-      if (err instanceof ApiError) {
-        if (err.httpStatus !== 403 && err.httpStatus !== 404 && !(err instanceof TransportError)) {
-          throw err;
-        }
-        throw new ApiError(
-          {
-            code: err.code,
-            message,
-            nextAction: 'Check the test ID and read:tests permission, then retry.',
-            requestId: err.requestId,
-            details: {},
-          },
-          err.httpStatus,
-        );
-      }
-      if (err instanceof RequestTimeoutError) throw err;
-      throw new CLIError(message);
-    }
-  }
-  if (test.type === 'backend') {
-    throw localValidationError(
-      'local',
-      `backend tests don't open a browser; the tunnel is not used. Run: testsprite test run ${testId}`,
-    );
-  }
-  if (environment === undefined) return;
-
-  let listing: CliProjectEnvListResponse | undefined;
-  try {
-    listing = await client.get<CliProjectEnvListResponse>(
-      `/projects/${encodeURIComponent(test.projectId)}/env`,
-    );
-  } catch (err) {
-    if (err instanceof InterruptError) throw err;
-    if (
-      !(err instanceof TransportError) &&
-      !(err instanceof RequestTimeoutError) &&
-      !(
-        err instanceof ApiError &&
-        (err.httpStatus === 403 || err.httpStatus === 404 || (err.httpStatus ?? 0) >= 500)
-      )
-    ) {
-      throw err;
-    }
-    if (opts.verbose || opts.debug) {
-      const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-      stderr(
-        '[verbose] environment preflight skipped: project environments unavailable; the server will validate this run.',
-      );
-    }
-  }
-  if (listing === undefined) return;
-  const selected = listing.environments.find(row => row.name === environment);
-  if (selected === undefined) {
-    const available = listing.environments.map(row => row.name).sort();
-    throw localValidationError(
-      'env',
-      `unknown environment '${environment}'; use one of: ${available.join(', ')}`,
-      available,
-    );
-  }
-  let isLoopback = false;
-  try {
-    normalizeLocalHost(new URL(selected.url).hostname);
-    isLoopback = true;
-  } catch {
-    // A public environment cannot be reached through this local tunnel.
-  }
-  if (!isLoopback) {
-    throw localValidationError(
-      'local',
-      `This environment has a public URL. Run testsprite test run ${testId} --env ${environment} without --local, or testsprite test run ${testId} --local ${localPort} without --env.`,
-    );
-  }
-}
-
 /**
  * Validate the `--timeout` flag value. Returns a clamped integer in
  * range [1, 3600], or the default when absent.
@@ -7301,6 +7674,38 @@ function warnIfOptOutIgnored(
   );
 }
 
+function assertFreshRunWaitOptions(
+  opts: {
+    wait?: boolean;
+    report?: JUnitReportFormat;
+    reportFile?: string;
+    reportSuiteName?: string;
+    ghOutput?: boolean;
+    summaryFile?: string;
+  },
+  batchPath: boolean,
+): void {
+  assertJUnitReportOptions({ ...opts, wait: opts.wait === true, batchPath });
+  if (opts.ghOutput === true && !opts.wait)
+    throw localValidationError(
+      'gh-output',
+      '--gh-output requires --wait (it reduces the terminal run result). Add --wait.',
+    );
+  if (opts.summaryFile !== undefined && !opts.wait)
+    throw localValidationError(
+      'summary-file',
+      '--summary-file requires --wait (it reduces the terminal run result). Add --wait.',
+    );
+}
+
+function isSameLoopbackPort(url: string, port: number): boolean {
+  try {
+    return parseLoopbackTargetUrl(url)?.port === port;
+  } catch {
+    return false;
+  }
+}
+
 export async function runTestRun(
   opts: RunTestRunOptions,
   deps: TestDeps = {},
@@ -7312,8 +7717,10 @@ export async function runTestRun(
   // must happen before a client is even constructed, because the guarantee
   // this feature sells is that a doomed `--local` run never gets a run row,
   // a credit spend, or a tunnel credential.
-  const isTunnelRun = opts.localPort !== undefined;
-  if (isTunnelRun && opts.targetUrl !== undefined) {
+  let isTunnelRun =
+    opts.localPort !== undefined ||
+    (opts.targetUrl !== undefined && parseLoopbackTargetUrl(opts.targetUrl) !== undefined);
+  if (opts.localPort !== undefined && opts.targetUrl !== undefined) {
     throw localValidationError(
       'local',
       '--local and --target-url are mutually exclusive: --local runs against your own machine ' +
@@ -7321,7 +7728,7 @@ export async function runTestRun(
         'reach. Pass one',
     );
   }
-  if (isTunnelRun && !opts.wait) {
+  if (opts.localPort !== undefined && !opts.wait) {
     // The tunnel's lifetime IS this process's lifetime, so a no-wait tunnel
     // run dooms itself the instant the command returns. The command wiring
     // forces --wait; this covers a programmatic caller that did not.
@@ -7331,17 +7738,42 @@ export async function runTestRun(
         'fail. Remove --local, or let the command wait',
     );
   }
-  if (opts.targetUrl !== undefined) {
+  if (opts.targetUrl !== undefined && !parseLoopbackTargetUrl(opts.targetUrl)) {
     assertNotLocal(opts.targetUrl, {
       field: 'target-url',
       helpCommand: 'testsprite test run',
       hintContext: 'runtime',
     });
   }
-  const localHost: LoopbackHost = opts.localHost ?? DEFAULT_LOCAL_HOST;
-  const localTargetUrl =
+  if (!isTunnelRun && (opts.noWait || opts.type === 'backend' || opts.targetUrl !== undefined))
+    assertNoTunnelOptions(opts);
+  let localHost: LoopbackHost = opts.localHost ?? DEFAULT_LOCAL_HOST;
+  let localTargetUrl =
     opts.localPort !== undefined ? buildLocalTargetUrl(localHost, opts.localPort) : undefined;
-  const effectiveTargetUrl = localTargetUrl ?? opts.targetUrl;
+  let effectiveTargetUrl = localTargetUrl ?? opts.targetUrl;
+
+  if (opts.dryRun && !isTunnelRun && !opts.noWait && opts.targetUrl === undefined) {
+    try {
+      const target = await resolveEnvironmentRunTarget({
+        client: makeClient({ ...opts, dryRun: false }, deps),
+        testId: opts.testId,
+        knownTest: opts.knownTest,
+        environment,
+        dryRun: true,
+        stderr: deps.stderr ?? (line => process.stderr.write(`${line}\n`)),
+      });
+      if (target) {
+        isTunnelRun = true;
+        localHost = target.host;
+        effectiveTargetUrl = target.targetUrl;
+        opts = { ...opts, wait: true };
+      }
+    } catch (err) {
+      if (err instanceof InterruptError) throw err;
+    }
+  }
+
+  if (opts.dryRun && !isTunnelRun) assertNoTunnelOptions(opts);
 
   if (opts.dryRun) {
     const client = makeClient(opts, deps);
@@ -7401,18 +7833,48 @@ export async function runTestRun(
   // D4: under --wait, raise the per-request timeout to cover --timeout so a
   // slow trigger/long-poll under load isn't falsely cut at the 120s default.
   const requestTimeoutMs = resolveWaitRequestTimeoutMs(opts);
-  const clientOpts = { ...opts, requestTimeoutMs };
-  const client = makeClient(clientOpts, deps);
-  if (isTunnelRun) {
-    await preflightLocalRunTest({
+  let clientOpts = { ...opts, requestTimeoutMs };
+  let client: HttpClient;
+  try {
+    client = makeClient(clientOpts, deps);
+  } catch (err) {
+    assertFreshRunWaitOptions(opts, false);
+    throw err;
+  }
+  const resolvedTarget =
+    deps.environmentTunnel?.targets?.get(opts.testId) ??
+    (opts.knownTest ? deps.creationTargets?.get(opts.knownTest.projectId) : undefined) ??
+    (await resolveEnvironmentRunTarget({
       client,
       testId: opts.testId,
+      knownTest: opts.knownTest,
       environment,
-      localPort: opts.localPort!,
-      opts,
-      deps,
-    });
+      localPort: opts.localPort,
+      localHost: opts.localHost,
+      targetUrl: opts.targetUrl,
+      tunnelClientId: opts.tunnelClientId,
+      noWait: opts.noWait,
+      verbose: opts.verbose || opts.debug,
+      stderr: deps.stderr ?? (line => process.stderr.write(`${line}\n`)),
+      cache: deps.environmentCache,
+    }));
+  isTunnelRun = resolvedTarget !== undefined;
+  if (!isTunnelRun) assertNoTunnelOptions(opts);
+  if (resolvedTarget) {
+    localHost = resolvedTarget.host;
+    localTargetUrl = resolvedTarget.targetUrl;
+    effectiveTargetUrl = resolvedTarget.targetUrl;
+    opts = {
+      ...opts,
+      wait: true,
+      timeoutSeconds: opts.timeoutIsDefault
+        ? DEFAULT_LOCAL_RUN_TIMEOUT_SECONDS
+        : opts.timeoutSeconds,
+    };
+    clientOpts = { ...opts, requestTimeoutMs: resolveWaitRequestTimeoutMs(opts) };
+    client = makeClient(clientOpts, deps);
   }
+  assertFreshRunWaitOptions(opts, false);
   const tunnelRequestTimeoutMs = isTunnelRun
     ? resolveRequestTimeoutMs(clientOpts, deps.env ?? process.env)
     : undefined;
@@ -7437,8 +7899,11 @@ export async function runTestRun(
     // refuses rather than advises.
     await assertLocalPortListening(
       localHost,
-      opts.localPort as number,
-      { skipPreflight: opts.skipPreflight },
+      resolvedTarget!.port,
+      {
+        skipPreflight: opts.skipPreflight,
+        ...(resolvedTarget!.automatic ? { environmentName: resolvedTarget!.environmentName } : {}),
+      },
       stderrFn,
     );
     if (isProxyAgentActive()) {
@@ -7448,7 +7913,7 @@ export async function runTestRun(
           'run cannot reach your machine, an egress proxy is the first thing to rule out.',
       );
     }
-  } else if (opts.targetUrl !== undefined) {
+  } else if (opts.targetUrl !== undefined && !parseLoopbackTargetUrl(opts.targetUrl)) {
     await assertTargetUrlReachable(
       opts.targetUrl,
       { skipPreflight: opts.skipPreflight },
@@ -7473,39 +7938,42 @@ export async function runTestRun(
   try {
     if (isTunnelRun) {
       try {
-        tunnelSession = await openTunnelSession(
-          {
-            log: stderrFn,
-            logLevel: opts.debug ? 'debug' : opts.verbose ? 'info' : 'error',
-            onMinted: minted =>
-              stderrFn(`[tunnel] Minted tunnel client ${minted.clientId}; connecting…`),
-            onFatal: () => {
-              // Surfaced to the poll loop through `onTick` below; a remint cannot
-              // rescue this run (see `lib/tunnel-session.ts`).
+        tunnelSession =
+          deps.environmentTunnel?.session ??
+          (await openTunnelSession(
+            {
+              log: stderrFn,
+              logLevel: opts.debug ? 'debug' : opts.verbose ? 'info' : 'error',
+              onMinted: minted =>
+                stderrFn(`[tunnel] Minted tunnel client ${minted.clientId}; connecting…`),
+              onFatal: () => {
+                // Surfaced to the poll loop through `onTick` below; a remint cannot
+                // rescue this run (see `lib/tunnel-session.ts`).
+              },
+              ...(opts.tunnelClientId !== undefined
+                ? { adopt: { clientId: opts.tunnelClientId, expiresAt: '' } }
+                : {}),
             },
-            ...(opts.tunnelClientId !== undefined
-              ? { adopt: { clientId: opts.tunnelClientId, expiresAt: '' } }
-              : {}),
-          },
-          {
-            mint: async ttlSeconds =>
-              withUninterruptibleRequest(clientOpts, deps, tunnelRequestTimeoutMs!, mintClient =>
-                mintClient.mintTunnel({ ...(ttlSeconds ? { ttlSeconds } : {}) }),
+            {
+              mint: async ttlSeconds =>
+                withUninterruptibleRequest(clientOpts, deps, tunnelRequestTimeoutMs!, mintClient =>
+                  mintClient.mintTunnel({ ...(ttlSeconds ? { ttlSeconds } : {}) }),
+                ),
+              destroy: async clientId => deleteTunnelForCleanup(opts, deps, clientId),
+              createClient: shutdownAwareTunnelClientFactory(
+                deps.createTunnelClient ?? (options => new TunnelClient(options)),
+                shutdown.signal,
               ),
-            destroy: async clientId => deleteTunnelForCleanup(opts, deps, clientId),
-            createClient: shutdownAwareTunnelClientFactory(
-              deps.createTunnelClient ?? (options => new TunnelClient(options)),
-              shutdown.signal,
-            ),
-          },
-        );
+            },
+          ));
       } catch (err) {
         // `openTunnelSession` converts a client-start rejection to UNAVAILABLE
         // after it has stopped the client and deleted the binding. Restore the
         // initiating signal so the documented interrupt exit code is retained.
         if (shutdown.signal.aborted) throw shutdown.signal.reason;
-        throw err;
+        throw tunnelScopeError(err);
       }
+      recordTelemetryTunnelOpened(!tunnelSession.adopted);
       if (!tunnelSession.adopted) {
         stderrFn(
           `[tunnel] Reaching ${localTargetUrl as string} through TestSprite (client ${tunnelSession.clientId}).`,
@@ -7641,17 +8109,6 @@ export async function runTestRun(
               throw incompatibleRun('its environment does not match the requested environment');
             }
             retryFlags = `--env ${currentEnvironment.name}`;
-            try {
-              const target = new URL(currentEnvironment.url);
-              const host = normalizeLocalHost(target.hostname);
-              if (target.protocol === 'http:' || target.protocol === 'https:') {
-                const port = target.port || (target.protocol === 'https:' ? '443' : '80');
-                retryFlags += ` --local ${port}`;
-                if (host !== DEFAULT_LOCAL_HOST) retryFlags += ` --local-host ${host}`;
-              }
-            } catch {
-              // Public environments need only --env on a later run.
-            }
           }
 
           // If the caller supplied --target-url, verify the in-flight run targets
@@ -7708,7 +8165,7 @@ export async function runTestRun(
                 `). Auto-resuming wait on in-flight run. ` +
                 `To run it again, cancel it with ` +
                 `testsprite test cancel ${currentRunId}, or wait for it to finish; ` +
-                `then re-trigger${retryFlags ? ` with ${retryFlags}` : ''}.`,
+                `then re-trigger${retryFlags ? ` with testsprite test run ${opts.testId} ${retryFlags}` : ''}.`,
             );
             triggerResponse = {
               runId: currentRunId,
@@ -7750,7 +8207,14 @@ export async function runTestRun(
     if (
       effectiveTargetUrl !== undefined &&
       opts.type !== 'backend' &&
-      triggerResponse.targetUrl !== effectiveTargetUrl
+      triggerResponse.targetUrl !== effectiveTargetUrl &&
+      !(
+        // `--local <port>` never named a URL: the shorthand's host is the CLI's
+        // own default, so an echo that differs only in loopback spelling
+        // (localhost vs 127.0.0.1) is not an unapplied `--target-url`.
+        opts.localPort !== undefined &&
+        isSameLoopbackPort(triggerResponse.targetUrl, resolvedTarget?.port ?? opts.localPort)
+      )
     ) {
       emitTargetUrlMismatchAdvisory(stderrFn, effectiveTargetUrl, triggerResponse.targetUrl);
     }
@@ -7875,8 +8339,10 @@ export async function runTestRun(
         return {
           runId: triggerResponse.runId,
           testId: opts.testId,
-          localPort: opts.localPort as number,
+          localPort: resolvedTarget!.port,
           localHost,
+          automatic: resolvedTarget!.automatic,
+          environment,
           reason,
           ...(borrowedOwnerGone ? { ownerGone: true } : {}),
           cancel: cancel.outcome,
@@ -8172,7 +8638,7 @@ export async function runTestRun(
     // client whose ref'd heartbeat timer keeps the process alive after the
     // command has printed its last line.
     try {
-      await tunnelSession?.close();
+      if (!deps.environmentTunnel) await tunnelSession?.close();
     } finally {
       disarmTunnelLifecycle?.();
     }
@@ -8908,6 +9374,11 @@ export async function runTestWait(
 // ---------------------------------------------------------------------------
 
 interface RunTestRunAllOptions extends CommonOptions {
+  environmentResolutionComplete?: boolean;
+  cancelOnInterrupt?: boolean;
+  timeoutIsDefault?: boolean;
+  noWait?: boolean;
+  concurrencyIsDefault?: boolean;
   /** projectId to run all tests in; may be resolved from --project or TESTSPRITE_PROJECT_ID. */
   projectId?: string;
   /** --filter <substr>: only run tests whose name contains this substring (case-insensitive). */
@@ -8990,6 +9461,7 @@ export async function writeBatchJUnitReportIfRequested(
     projectId?: string;
   },
   results: readonly (JUnitTestResult & {
+    createdAt?: string | null;
     startedAt?: string | null;
     finishedAt?: string | null;
     testTitle?: string | null;
@@ -9008,7 +9480,8 @@ export async function writeBatchJUnitReportIfRequested(
   const enriched: JUnitTestResult[] = results.map(r => ({
     ...r,
     name: nameByTestId?.get(r.testId) ?? (r.testTitle?.trim() ? r.testTitle : undefined) ?? r.name,
-    durationSeconds: r.durationSeconds ?? durationSecondsBetween(r.startedAt, r.finishedAt),
+    durationSeconds:
+      r.durationSeconds ?? durationSecondsBetween(r.startedAt, r.finishedAt, r.createdAt),
   }));
   const xml = buildJUnitReport({
     suiteName,
@@ -9029,7 +9502,7 @@ interface CliBatchRunFreshResult {
   /** Observed on polled runs; used for JUnit report naming when --project omitted. */
   projectId?: string;
   status: string;
-  error?: { code: string; message: string; exitCode: number };
+  error?: { code: string; message: string; exitCode: number; details?: Record<string, unknown> };
   /**
    * Test-case page link for the Test column. Prefers the SERVER-built value
    * captured from the poll (`RunResponse.dashboardUrl`); falls back to the
@@ -9214,15 +9687,47 @@ export async function runTestRunAll(
     report: opts.report,
     reportFile: opts.reportFile,
     reportSuiteName: opts.reportSuiteName,
-    wait: opts.wait,
+    wait: opts.wait || (!opts.dryRun && !opts.noWait),
     batchPath: true,
   });
 
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const out = makeOutput(opts.output, deps);
 
+  if (opts.dryRun && opts.targetUrl === undefined && !opts.noWait) {
+    let target: ResolvedRunTarget | undefined;
+    try {
+      target = await resolveEnvironmentRunTarget({
+        client: makeClient({ ...opts, dryRun: false }, deps),
+        projectId,
+        environment,
+        dryRun: true,
+        stderr: stderrFn,
+      });
+    } catch (err) {
+      if (err instanceof InterruptError) throw err;
+    }
+    if (target) {
+      await runTestRunLocalBatch(
+        {
+          ...opts,
+          all: true,
+          testIds: [],
+          projectId,
+          resolvedTarget: target,
+          skipPreflight: true,
+          cancelOnInterrupt: true,
+          allowEmpty: opts.allowEmpty === true,
+        },
+        deps,
+      );
+      return undefined;
+    }
+  }
+
   // --- Dry-run path ---
   if (opts.dryRun) {
+    assertNoTunnelOptions(opts);
     // This path returns before makeClient() fires the banner, so emit it
     // here — otherwise the canned sample can be mistaken for a live response.
     emitDryRunBanner(stderrFn);
@@ -9255,7 +9760,7 @@ export async function runTestRunAll(
 
   // Probe once before dispatch. A preview still warming up can use
   // --skip-preflight; ambiguous probe results warn without blocking.
-  if (opts.targetUrl !== undefined) {
+  if (opts.targetUrl !== undefined && !parseLoopbackTargetUrl(opts.targetUrl)) {
     await assertTargetUrlReachable(
       opts.targetUrl,
       { skipPreflight: opts.skipPreflight },
@@ -9269,6 +9774,43 @@ export async function runTestRunAll(
   // `--env` gate — see `runTestRun`. Before the test-set enumeration so a
   // gated batch makes no billable call at all.
 
+  const environmentCache = deps.environmentCache ?? new Map();
+  const automaticTarget = opts.environmentResolutionComplete
+    ? undefined
+    : await resolveEnvironmentRunTarget({
+        client,
+        cache: environmentCache,
+        projectId,
+        environment,
+        targetUrl: opts.targetUrl,
+        noWait: opts.noWait,
+        stderr: stderrFn,
+      });
+  if (automaticTarget) {
+    await runTestRunLocalBatch(
+      {
+        ...opts,
+        testIds: [],
+        all: true,
+        projectId,
+        localPort: automaticTarget.port,
+        localHost: automaticTarget.host,
+        resolvedTarget: automaticTarget,
+        timeoutSeconds: opts.timeoutIsDefault
+          ? DEFAULT_LOCAL_RUN_TIMEOUT_SECONDS
+          : opts.timeoutSeconds,
+        skipPreflight: opts.skipPreflight === true,
+        cancelOnInterrupt: opts.cancelOnInterrupt !== false,
+        allowEmpty: opts.allowEmpty === true,
+        maxConcurrency: opts.concurrencyIsDefault ? 5 : opts.maxConcurrency,
+      },
+      { ...deps, environmentCache },
+    );
+    return undefined;
+  }
+  assertNoTunnelOptions(opts);
+
+  assertFreshRunWaitOptions(opts, true);
   // Portal deep links for batch output: every test in the batch belongs to
   // opts.projectId, so per-item dashboardUrl needs no extra wire data. The
   // project-level URL closes out text-mode output ("watch the wave here").
@@ -9624,7 +10166,8 @@ export async function runTestRunAll(
   // deadline check below is the real stop), scaled to the timeout so it never
   // caps a legitimate long wait.
   const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
-  const batchDeadlineMs = Date.now() + opts.timeoutSeconds * 1000;
+  const batchDeadlineMs =
+    deps.environmentTunnel?.deadlineMs ?? Date.now() + opts.timeoutSeconds * 1000;
   // finding 1: reserve a poll window so the deferred-retry loop can't consume the
   // ENTIRE --timeout and leave the fan-out poll with nothing — which would report
   // already-finished runs as timeouts (exit 7) instead of their real verdicts
@@ -9890,6 +10433,10 @@ export async function runTestRunAll(
   const ticker = createTicker(stderrFn, opts.output === 'json' ? false : undefined);
   const concurrencyLimit = opts.maxConcurrency;
   const freshRunResults: CliBatchRunFreshResult[] = [];
+  const reportTiming = new Map<
+    string,
+    Pick<RunResponse, 'createdAt' | 'startedAt' | 'finishedAt'>
+  >();
 
   // Single deadline shared across the whole fan-out (codex): each queued poll
   // gets the time REMAINING against this batch deadline, not a fresh full
@@ -9922,6 +10469,11 @@ export async function runTestRunAll(
           sleep: deps.sleep,
           shutdown: shutdownOf(deps),
           resolveAlternate: lastResortAlternate,
+        });
+        reportTiming.set(runId, {
+          createdAt: finalRun.createdAt,
+          startedAt: finalRun.startedAt,
+          finishedAt: finalRun.finishedAt,
         });
         return {
           testId: entry.testId,
@@ -9968,6 +10520,11 @@ export async function runTestRunAll(
         onTick: (run, elapsedMs) =>
           ticker.update(formatRunProgressLine(run, elapsedMs, `(${entry.testId})`)),
         resolveAlternate,
+      });
+      reportTiming.set(runId, {
+        createdAt: finalRun.createdAt,
+        startedAt: finalRun.startedAt,
+        finishedAt: finalRun.finishedAt,
       });
       return {
         testId: entry.testId,
@@ -10117,7 +10674,13 @@ export async function runTestRunAll(
   const ciSummary = summarizeAcceptedPayload(JSON.stringify(jsonPayload));
   await writeBatchJUnitReportIfRequested(
     opts,
-    [...freshRunResults, ...skippedJUnitResultsFromSummary(ciSummary)],
+    [
+      ...freshRunResults.map(r => ({
+        ...r,
+        ...(r.runId ? reportTiming.get(r.runId) : {}),
+      })),
+      ...skippedJUnitResultsFromSummary(ciSummary, freshRunResults),
+    ],
     freshNameMap,
   );
   out.print(jsonPayload);
@@ -10211,12 +10774,17 @@ export async function runTestRunAll(
 }
 
 interface RunTestRunLocalBatchOptions extends CommonOptions {
+  wait?: boolean;
+  targetUrl?: string;
+  noWait?: boolean;
+  concurrencyIsDefault?: boolean;
+  resolvedTarget?: ResolvedRunTarget;
   testIds: string[];
   all: boolean;
   projectId?: string;
   nameFilter?: string;
-  localPort: number;
-  localHost: LoopbackHost;
+  localPort?: number;
+  localHost?: LoopbackHost;
   skipPreflight: boolean;
   tunnelClientId?: string;
   cancelOnInterrupt: boolean;
@@ -10245,7 +10813,7 @@ interface LocalBatchResult {
   dashboardUrl?: string;
   executionUrl?: string;
   cancel?: TunnelCancelOutcome;
-  error?: { code: string; message: string; exitCode: number };
+  error?: { code: string; message: string; exitCode: number; details?: Record<string, unknown> };
 }
 
 /** One bounded trigger-and-wait pool shares one local tunnel for its full lifetime. */
@@ -10258,7 +10826,11 @@ export async function runTestRunLocalBatch(
   if (
     !Number.isInteger(opts.maxConcurrency) ||
     opts.maxConcurrency < 1 ||
-    opts.maxConcurrency > 10
+    (opts.maxConcurrency > 10 &&
+      !opts.concurrencyIsDefault &&
+      (opts.localPort !== undefined ||
+        opts.resolvedTarget !== undefined ||
+        (opts.targetUrl !== undefined && parseLoopbackTargetUrl(opts.targetUrl) !== undefined)))
   ) {
     throw localValidationError(
       'max-concurrency',
@@ -10267,9 +10839,69 @@ export async function runTestRunLocalBatch(
   }
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const out = makeOutput(opts.output, deps);
-  const targetUrl = buildLocalTargetUrl(opts.localHost, opts.localPort);
+  let targetUrl =
+    opts.resolvedTarget?.targetUrl ??
+    opts.targetUrl ??
+    (opts.localPort !== undefined
+      ? buildLocalTargetUrl(opts.localHost ?? DEFAULT_LOCAL_HOST, opts.localPort)
+      : undefined);
   const projectId = opts.all ? resolveProjectId(opts.projectId, deps) : opts.projectId;
   if (opts.all) requireProjectId(projectId);
+
+  if (
+    opts.localPort === undefined &&
+    targetUrl !== undefined &&
+    !parseLoopbackTargetUrl(targetUrl)
+  ) {
+    if (!opts.all) severalIdsWithoutTunnel();
+    assertNoTunnelOptions(opts);
+  }
+  const dryRunTargets = new Map<string, ResolvedRunTarget>();
+  const automaticDryRun = opts.dryRun && targetUrl === undefined;
+  if (automaticDryRun) {
+    const targets: ResolvedRunTarget[] = [];
+    try {
+      const client = makeClient({ ...opts, dryRun: false }, deps);
+      const cache = deps.environmentCache ?? new Map();
+      if (opts.all) {
+        const target = await resolveEnvironmentRunTarget({
+          client,
+          projectId,
+          environment,
+          noWait: opts.noWait,
+          tunnelClientId: opts.tunnelClientId,
+          dryRun: true,
+          cache,
+          stderr: stderrFn,
+        });
+        if (target) targets.push(target);
+      }
+      for (const testId of opts.testIds) {
+        const target = await resolveEnvironmentRunTarget({
+          client,
+          testId,
+          projectId,
+          environment,
+          noWait: opts.noWait,
+          tunnelClientId: opts.tunnelClientId,
+          dryRun: true,
+          cache,
+          stderr: stderrFn,
+        });
+        if (target) {
+          targets.push(target);
+          dryRunTargets.set(testId, target);
+        }
+      }
+    } catch (err) {
+      if (err instanceof InterruptError) throw err;
+    }
+    if (!targets.length) {
+      assertNoTunnelOptions(opts);
+      severalIdsWithoutTunnel();
+    }
+    targetUrl = targets[0]!.targetUrl;
+  }
 
   if (opts.dryRun) {
     emitDryRunBanner(stderrFn);
@@ -10279,8 +10911,12 @@ export async function runTestRunLocalBatch(
         path: `/api/cli/v1/tests/${testId}/runs`,
         body: {
           source: 'cli',
-          targetUrl,
-          tunnelClientId: opts.tunnelClientId ?? '<minted at run time>',
+          ...(automaticDryRun && !opts.all && !dryRunTargets.has(testId)
+            ? {}
+            : {
+                targetUrl: dryRunTargets.get(testId)?.targetUrl ?? targetUrl,
+                tunnelClientId: opts.tunnelClientId ?? '<minted at run time>',
+              }),
           ...(opts.autoHeal === false ? { autoHeal: false } : {}),
           ...(environment !== undefined ? { environment } : {}),
         },
@@ -10304,28 +10940,6 @@ export async function runTestRunLocalBatch(
   };
   const client = makeClient(clientOpts, deps);
   const tunnelRequestTimeoutMs = resolveRequestTimeoutMs(clientOpts, deps.env ?? process.env);
-  const probeLocalPort = async (): Promise<void> => {
-    await assertLocalPortListening(
-      opts.localHost,
-      opts.localPort,
-      { skipPreflight: opts.skipPreflight },
-      stderrFn,
-    );
-    if (isProxyAgentActive())
-      stderrFn(
-        '[advisory] An HTTP proxy is configured for this process. The tunnel control channel ' +
-          `honours it, but ${TUNNEL_DATA_PLANE_PROXY_BYPASS_DESCRIPTION} — if the ` +
-          'run cannot reach your machine, an egress proxy is the first thing to rule out.',
-      );
-  };
-  // The local port is probed before anything leaves this machine — before the
-  // project's test list is even read — so a dead dev server costs nothing.
-  // `--all --allow-empty` is the exception: it explicitly accepts a project
-  // with nothing to run, and that answer must not depend on a server this
-  // invocation may never use, so its probe waits until there is a test to run.
-  const probeAfterListing = opts.all && opts.allowEmpty;
-  if (!probeAfterListing) await probeLocalPort();
-
   const skipped: Array<{ testId: string; reason: 'backend-test' }> = [];
   let tests: Array<{ id: string; name?: string }> = opts.testIds.map(id => ({ id }));
   const knownTests = new Map<string, Pick<CliTest, 'type' | 'projectId'>>();
@@ -10346,21 +10960,89 @@ export async function runTestRunLocalBatch(
       stderrFn(
         `--filter: skipped ${omitted} test${omitted !== 1 ? 's' : ''} whose name does not contain "${opts.nameFilter}".`,
       );
-    skipped.push(
-      ...filtered
-        .filter(t => t.type !== 'frontend')
-        .map(t => ({ testId: t.id, reason: 'backend-test' as const })),
+    tests = filtered.map(t => {
+      knownTests.set(t.id, { type: t.type, projectId: t.projectId ?? projectId! });
+      return { id: t.id, name: t.name };
+    });
+  }
+  const targets = new Map<string, ResolvedRunTarget>();
+  const cache = new Map();
+  for (const test of tests) {
+    let known = knownTests.get(test.id);
+    if (!known) {
+      try {
+        known = await readEnvironmentPreflight<Pick<CliTest, 'type' | 'projectId'>>(
+          client,
+          `/tests/${encodeURIComponent(test.id)}`,
+        );
+      } catch (err) {
+        if (err instanceof InterruptError) throw err;
+        if (opts.localPort !== undefined) throw err;
+      }
+    }
+    const target =
+      (known?.projectId === projectId && known?.type !== 'backend'
+        ? opts.resolvedTarget
+        : undefined) ??
+      (await resolveEnvironmentRunTarget({
+        client,
+        testId: test.id,
+        knownTest: known,
+        skipTestLookup: true,
+        includeBackend: opts.all || (opts.localPort === undefined && opts.targetUrl === undefined),
+        environment,
+        localPort: opts.localPort,
+        localHost: opts.localHost,
+        targetUrl: opts.targetUrl,
+        noWait: opts.noWait,
+        tunnelClientId: opts.tunnelClientId,
+        verbose: opts.verbose || opts.debug,
+        stderr: stderrFn,
+        cache,
+      }));
+    if (target && known?.type === 'backend') {
+      skipped.push({ testId: test.id, reason: 'backend-test' });
+    } else if (target) targets.set(test.id, target);
+  }
+  const firstTarget = targets.values().next().value as ResolvedRunTarget | undefined;
+  if (!firstTarget && !(opts.all && tests.length === 0) && skipped.length === 0) {
+    assertNoTunnelOptions(opts);
+    if (!opts.all) severalIdsWithoutTunnel();
+    return void (await runTestRunAll(
+      {
+        ...opts,
+        projectId: projectId!,
+        wait: opts.wait === true,
+        environmentResolutionComplete: true,
+      },
+      deps,
+    ));
+  }
+  if (skipped.length)
+    stderrFn(
+      `[advisory] ${skipped.length} backend test(s) skipped — tunnel runs frontend tests only.`,
     );
-    if (skipped.length > 0)
-      stderrFn(
-        `[advisory] ${skipped.length} backend test(s) skipped — --local runs frontend tests only.`,
-      );
-    tests = filtered
-      .filter(t => t.type === 'frontend')
-      .map(t => {
-        knownTests.set(t.id, { type: t.type, projectId: t.projectId ?? projectId! });
-        return { id: t.id, name: t.name };
-      });
+  assertFreshRunWaitOptions({ ...opts, wait: true }, true);
+  tests = tests.filter(test => !skipped.some(row => row.testId === test.id));
+  targetUrl = firstTarget?.targetUrl;
+  opts = { ...opts, maxConcurrency: opts.concurrencyIsDefault ? 5 : opts.maxConcurrency };
+  if (opts.maxConcurrency > 10)
+    throw localValidationError(
+      'max-concurrency',
+      'tunnel runs support at most 10 concurrent runs (default 5)',
+    );
+  for (const target of new Map(
+    [...targets.values()].map(target => [target.targetUrl, target]),
+  ).values()) {
+    await assertLocalPortListening(
+      target.host,
+      target.port,
+      {
+        skipPreflight: opts.skipPreflight,
+        ...(target.automatic ? { environmentName: target.environmentName } : {}),
+      },
+      stderrFn,
+    );
   }
   const results: LocalBatchResult[] = tests.map(t => ({
     testId: t.id,
@@ -10372,6 +11054,7 @@ export async function runTestRunLocalBatch(
   // start/finish timestamps; it stays out of the JSON, which only reports what
   // the server said.
   const clientSeconds = new WeakMap<LocalBatchResult, number>();
+  const reportCreatedAt = new WeakMap<LocalBatchResult, string>();
   const batchSummary = () => {
     const passed = results.filter(r => r.status === 'passed').length;
     const timedOut = results.filter(r => r.status === 'timeout').length;
@@ -10417,7 +11100,11 @@ export async function runTestRunLocalBatch(
       'run',
     );
     await writeBatchJUnitReportIfRequested(opts, [
-      ...results.map(r => ({ ...r, status: r.runId === undefined ? 'skipped' : r.status })),
+      ...results.map(r => ({
+        ...r,
+        createdAt: reportCreatedAt.get(r),
+        status: r.runId === undefined ? 'skipped' : r.status,
+      })),
       ...skipped.map(s => ({ testId: s.testId, status: 'skipped' })),
     ]);
   };
@@ -10481,20 +11168,6 @@ export async function runTestRunLocalBatch(
     });
     return;
   }
-  if (probeAfterListing) await probeLocalPort();
-
-  for (const test of tests) {
-    await preflightLocalRunTest({
-      client,
-      testId: test.id,
-      environment,
-      localPort: opts.localPort,
-      opts,
-      deps,
-      knownTest: knownTests.get(test.id),
-    });
-  }
-
   const shutdown = shutdownOf(deps);
   const disarm = shutdown.arm();
   const poolAbort = new AbortController();
@@ -10556,10 +11229,11 @@ export async function runTestRunLocalBatch(
       // An interrupt while minting or connecting still owes the caller the
       // partial result (every test `not-run`); the session helper has already
       // deleted a minted binding.
-      if (!shutdown.signal.aborted) throw err;
+      if (!shutdown.signal.aborted) throw tunnelScopeError(err);
       setAbort(shutdown.signal.reason);
     }
     if (session !== undefined) {
+      recordTelemetryTunnelOpened(!session.adopted);
       stderrFn(`[tunnel] Reaching ${targetUrl} through TestSprite (client ${session.clientId}).`);
       stderrFn(
         `Running ${results.length} tests through one tunnel, up to ${opts.maxConcurrency} at a time.`,
@@ -10590,7 +11264,7 @@ export async function runTestRunLocalBatch(
           if (shutdown.signal.aborted) throw shutdown.signal.reason;
           if (abortReason !== undefined) return;
           const fatalBeforeTrigger = liveSession.fatalReason();
-          if (fatalBeforeTrigger) {
+          if (fatalBeforeTrigger && targets.has(row.testId)) {
             setAbort(
               new TunnelLostError(fatalBeforeTrigger, '', liveSession.fatalMessage()),
               fatalBeforeTrigger,
@@ -10607,8 +11281,12 @@ export async function runTestRunLocalBatch(
                 row.testId,
                 {
                   source: 'cli',
-                  targetUrl,
-                  tunnelClientId: liveSession.clientId,
+                  ...(targets.has(row.testId)
+                    ? {
+                        targetUrl: targets.get(row.testId)!.targetUrl,
+                        tunnelClientId: liveSession.clientId,
+                      }
+                    : {}),
                   ...(opts.autoHeal === false ? { autoHeal: false as const } : {}),
                   ...(environment !== undefined ? { environment } : {}),
                 },
@@ -10624,7 +11302,7 @@ export async function runTestRunLocalBatch(
           row.runId = response.runId;
           row.status = 'running';
           activeRows.add(index);
-          unsettled.add(row);
+          if (targets.has(row.testId)) unsettled.add(row);
           activeRuns++;
           peakInFlight = Math.max(peakInFlight, activeRuns);
           stderrFn(`[${index + 1}/${results.length}] ${row.testId} → run ${row.runId}`);
@@ -10668,7 +11346,11 @@ export async function runTestRunLocalBatch(
         }
         try {
           if (abortReason !== undefined) return;
-          if (liveSession.adopted && checkBorrowedLiveness === undefined) {
+          if (
+            targets.has(row.testId) &&
+            liveSession.adopted &&
+            checkBorrowedLiveness === undefined
+          ) {
             checkBorrowedLiveness = makeBorrowedTunnelLivenessCheck({
               client: livenessClient!,
               clientId: liveSession.clientId,
@@ -10685,13 +11367,13 @@ export async function runTestRunLocalBatch(
             onTransition: opts.verbose ? msg => stderrFn(`[verbose] ${msg}`) : undefined,
             onTick: (run, elapsedMs) => {
               if (abortReason !== undefined) throw abortReason;
-              if (!isTerminalStatus(run.status)) {
+              if (targets.has(row.testId) && !isTerminalStatus(run.status)) {
                 const fatal = liveSession.fatalReason();
                 if (fatal) throw new TunnelLostError(fatal, row.runId!, liveSession.fatalMessage());
               }
               ticker.update(formatRunProgressLine(run, elapsedMs, `(${row.testId})`));
             },
-            ...(checkBorrowedLiveness
+            ...(targets.has(row.testId) && checkBorrowedLiveness
               ? {
                   resolveAlternate: async (_run, _elapsed, signal) => {
                     await checkBorrowedLiveness!(signal);
@@ -10704,6 +11386,7 @@ export async function runTestRunLocalBatch(
           unsettled.delete(row);
           row.testTitle = finalRun.testTitle ?? row.testTitle;
           row.projectId = finalRun.projectId;
+          reportCreatedAt.set(row, finalRun.createdAt);
           row.startedAt = finalRun.startedAt;
           row.finishedAt = finalRun.finishedAt;
           if (typeof finalRun.dashboardUrl === 'string') row.dashboardUrl = finalRun.dashboardUrl;
@@ -10747,7 +11430,7 @@ export async function runTestRunLocalBatch(
           // An owned run cannot finish once this process closes its tunnel, so a
           // run the batch stops waiting for is cancelled — unless the caller
           // opted out, exactly as the single-run path honours it.
-          if (!liveSession.adopted) {
+          if (!liveSession.adopted && targets.has(row.testId)) {
             const cancel = await cancelDoomedTunnelRun({
               runId: row.runId!,
               enabled: opts.cancelOnInterrupt,
@@ -10871,6 +11554,20 @@ export async function runTestRunLocalBatch(
     );
     const waits = results.filter(r => r.runId && r.status === 'running').map(r => r.runId!);
     if (waits.length) stderrFn(`Runs may still finish: testsprite test wait ${waits.join(' ')}`);
+    if (
+      abortReason instanceof InterruptError &&
+      opts.cancelOnInterrupt === false &&
+      session?.adopted === false &&
+      waits.length
+    ) {
+      stderrFn(
+        tunnelInterruptOptOutConsequence({
+          cancel: 'skipped',
+          testId: results.find(r => r.runId === waits[0])!.testId,
+          runId: waits.join(' '),
+        }),
+      );
+    }
     if (session !== undefined)
       stderrFn(
         `Tunnel ${session.clientId}: ${unfinished.filter(r => r.cancel === 'cancelled').length} run(s) cancelled, ${waits.length} still running.`,
@@ -10955,15 +11652,7 @@ interface CliRerunResult {
  * Batch / `--all`: `POST /tests/batch/rerun` → per-test runIds. With
  * `--wait`, fan-out poll under `--max-concurrency`. `deferred[]` → exit 7.
  */
-export async function runTestRerun(
-  opts: RunTestRerunOptions,
-  deps: TestDeps = {},
-): Promise<RerunResponse | BatchRerunResponse | undefined> {
-  assertIdempotencyKey(opts.idempotencyKey);
-  const environment = normalizeEnvironmentName(opts.environment);
-  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-  const out = makeOutput(opts.output, deps);
-
+function validateRerunOptions(opts: RunTestRerunOptions): boolean {
   // -------------------------------------------------------------------------
   // Input validation
   // -------------------------------------------------------------------------
@@ -11039,7 +11728,7 @@ export async function runTestRerun(
     throw localValidationError('max-concurrency', 'must be an integer between 1 and 100');
   }
 
-  const isSingle = !opts.all && opts.testIds.length === 1;
+  const isSingle = !opts.all && !opts.batchResolved && opts.testIds.length === 1;
   assertJUnitReportOptions({
     report: opts.report,
     reportFile: opts.reportFile,
@@ -11047,6 +11736,114 @@ export async function runTestRerun(
     wait: opts.wait,
     batchPath: !isSingle,
   });
+
+  if (opts.ghOutput === true && (isSingle || !opts.wait))
+    throw localValidationError(
+      'gh-output',
+      '--gh-output requires a batch rerun with --wait (--all or 2+ test ids). Remove --gh-output, or add --all --wait.',
+    );
+  if (opts.summaryFile !== undefined && (isSingle || !opts.wait))
+    throw localValidationError(
+      'summary-file',
+      '--summary-file requires a batch rerun with --wait (--all or 2+ test ids). Remove --summary-file, or add --all --wait.',
+    );
+  return isSingle;
+}
+
+export async function runTestRerun(
+  opts: RunTestRerunOptions,
+  deps: TestDeps = {},
+): Promise<RerunResponse | BatchRerunResponse | undefined> {
+  assertIdempotencyKey(opts.idempotencyKey);
+  validateRerunOptions({ ...opts, wait: opts.wait || (!opts.dryRun && !opts.noWait) });
+  if (opts.dryRun || deps.environmentTunnel || opts.testIds.length === 0 || opts.all)
+    return runTestRerunCore(opts, deps);
+  let client: HttpClient;
+  try {
+    client = makeClient(opts, deps);
+  } catch (err) {
+    validateRerunOptions(opts);
+    throw err;
+  }
+  const stderr = deps.stderr ?? (line => process.stderr.write(`${line}\n`));
+  const targets = new Map<string, ResolvedRunTarget>();
+  const backend: string[] = [];
+  const cache = new Map();
+  for (const testId of opts.testIds) {
+    let knownTest = opts.knownTests?.get(testId);
+    try {
+      if (!knownTest)
+        knownTest = await readEnvironmentPreflight<Pick<CliTest, 'type' | 'projectId'>>(
+          client,
+          `/tests/${encodeURIComponent(testId)}`,
+        );
+    } catch (err) {
+      if (err instanceof InterruptError) throw err;
+    }
+    const target = await resolveEnvironmentRunTarget({
+      client,
+      testId,
+      knownTest,
+      skipTestLookup: true,
+      includeBackend: opts.testIds.length > 1 || opts.batchResolved,
+      environment: normalizeEnvironmentName(opts.environment),
+      noWait: opts.noWait,
+      verbose: opts.verbose || opts.debug,
+      stderr,
+      cache,
+    });
+    if (target && knownTest?.type === 'backend') backend.push(testId);
+    else if (target) targets.set(testId, target);
+  }
+  if (!targets.size) return runTestRerunCore(opts, deps);
+  const maxConcurrency = opts.concurrencyIsDefault ? 5 : opts.maxConcurrency;
+  if (maxConcurrency > 10)
+    throw localValidationError(
+      'max-concurrency',
+      'tunnel runs support at most 10 concurrent runs (default 5)',
+    );
+  return withEnvironmentTunnel(
+    {
+      ...opts,
+      maxConcurrency,
+      requestTimeoutMs: resolveWaitRequestTimeoutMs({ ...opts, wait: true }),
+    },
+    deps,
+    [...targets.values()],
+    'test rerun',
+    context => {
+      context.targets = targets;
+      context.skipped = backend.map(testId => ({ testId, reason: 'backend-test' }));
+      if (backend.length)
+        stderr(
+          `[advisory] ${backend.length} backend test(s) skipped — tunnel runs frontend tests only.`,
+        );
+      return runTestRerunCore(
+        {
+          ...opts,
+          testIds: opts.testIds.filter(id => !backend.includes(id)),
+          batchResolved: opts.batchResolved || opts.testIds.length > 1,
+          wait: true,
+          maxConcurrency,
+        },
+        { ...deps, environmentTunnel: context },
+      );
+    },
+  );
+}
+
+async function runTestRerunCore(
+  opts: RunTestRerunOptions,
+  deps: TestDeps = {},
+): Promise<RerunResponse | BatchRerunResponse | undefined> {
+  assertIdempotencyKey(opts.idempotencyKey);
+  const environment = normalizeEnvironmentName(opts.environment);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const out = makeOutput(opts.output, deps);
+
+  const isSingle = validateRerunOptions(
+    opts.all && !opts.dryRun && !opts.noWait ? { ...opts, wait: true } : opts,
+  );
 
   // -------------------------------------------------------------------------
   // Pre-flight: auto-heal + Free-tier hint (best-effort, non-blocking)
@@ -11103,7 +11900,9 @@ export async function runTestRerun(
 
   // D4: under --wait, raise the per-request timeout to cover --timeout so a
   // slow rerun trigger / long-poll under load isn't cut at the 120s default.
-  const client = makeClient({ ...opts, requestTimeoutMs: resolveWaitRequestTimeoutMs(opts) }, deps);
+  const client =
+    deps.environmentTunnel?.client ??
+    makeClient({ ...opts, requestTimeoutMs: resolveWaitRequestTimeoutMs(opts) }, deps);
   // `--env` gate — see `runTestRun`. Before the type probe and every dispatch.
   const idempotencyKey = opts.idempotencyKey ?? `cli-rerun-${randomUUID()}`;
   if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
@@ -11147,6 +11946,12 @@ export async function runTestRerun(
         testId,
         {
           source: 'cli',
+          ...(deps.environmentTunnel?.targets?.has(testId)
+            ? {
+                tunnelClientId: deps.environmentTunnel.clientId,
+                targetUrl: deps.environmentTunnel.targets.get(testId)!.targetUrl,
+              }
+            : {}),
           // Always send the effective boolean, including an explicit `false`
           // opt-out — the server defaults an ABSENT field to heal-on, so
           // omitting the key on opt-out silently discarded --no-auto-heal.
@@ -11156,6 +11961,7 @@ export async function runTestRerun(
         },
         { idempotencyKey },
       );
+      await deps.environmentTunnel?.confirm(rerunResp, [rerunResp.runId]);
     } catch (err) {
       if (err instanceof ApiError && err.code === 'CONFLICT') {
         const currentRunId = err.getDetail<string>(
@@ -11327,8 +12133,10 @@ export async function runTestRerun(
             sleep: deps.sleep,
             shutdown: shutdownOf(deps),
             onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
-            onTick: (run, elapsedMs) =>
-              ticker.update(formatRunProgressLine(run, elapsedMs, `[${member.role}]`)),
+            onTick: (run, elapsedMs) => {
+              deps.environmentTunnel?.onPoll(run);
+              ticker.update(formatRunProgressLine(run, elapsedMs, `[${member.role}]`));
+            },
             resolveAlternate,
           });
           return { kind: 'terminal', run: finalRun };
@@ -11644,8 +12452,10 @@ export async function runTestRerun(
         sleep: deps.sleep,
         shutdown: shutdownOf(deps),
         onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
-        onTick: (run, elapsedMs) =>
-          ticker.update(formatRunProgressLine(run, elapsedMs, '(replay)')),
+        onTick: (run, elapsedMs) => {
+          deps.environmentTunnel?.onPoll(run);
+          ticker.update(formatRunProgressLine(run, elapsedMs, '(replay)'));
+        },
         resolveAlternate,
       });
     } catch (err) {
@@ -11661,7 +12471,9 @@ export async function runTestRerun(
           return [
             `runId       ${p.runId}`,
             `status      ${p.status} (timed out after ${opts.timeoutSeconds}s)`,
-            `hint        Re-attach with: testsprite test wait ${p.runId}`,
+            deps.environmentTunnel
+              ? `hint        The owned tunnel is closing; inspect cancellation with testsprite test cancel ${p.runId}`
+              : `hint        Re-attach with: testsprite test wait ${p.runId}`,
           ].join('\n');
         });
         throw ApiError.fromEnvelope({
@@ -11669,8 +12481,12 @@ export async function runTestRerun(
             code: 'UNSUPPORTED',
             message:
               `Timed out after ${opts.timeoutSeconds}s waiting for rerun ${rerunResp.runId}. ` +
-              stillRunningAndBillingSubject(rerunResp.runId),
-            nextAction: `Resume polling: testsprite test wait ${rerunResp.runId}, or cancel it: testsprite test cancel ${rerunResp.runId}`,
+              (deps.environmentTunnel
+                ? 'The owned tunnel is closing; cancellation will be requested.'
+                : stillRunningAndBillingSubject(rerunResp.runId)),
+            nextAction: deps.environmentTunnel
+              ? `Inspect cancellation: testsprite test cancel ${rerunResp.runId}. Start a new run: testsprite test run ${testId}${environment ? ` --env ${quoteEnvironmentName(environment)}` : ''}.`
+              : `Resume polling: testsprite test wait ${rerunResp.runId}, or cancel it: testsprite test cancel ${rerunResp.runId}`,
             requestId: 'local',
             details: { runId: rerunResp.runId, timeoutSeconds: opts.timeoutSeconds },
           },
@@ -11686,13 +12502,17 @@ export async function runTestRerun(
           return [
             `runId       ${p.runId}`,
             `status      ${p.status} (request timed out)`,
-            `hint        Re-attach with: testsprite test wait ${p.runId}`,
+            deps.environmentTunnel
+              ? `hint        The owned tunnel is closing; inspect cancellation with testsprite test cancel ${p.runId}`
+              : `hint        Re-attach with: testsprite test wait ${p.runId}`,
             `hint        Cancel with:    testsprite test cancel ${p.runId}`,
           ].join('\n');
         });
         stderrFn(
-          `Request timed out. ${stillRunningAndBillingSubject(rerunResp.runId)} ` +
-            `Re-attach with: testsprite test wait ${rerunResp.runId}, or cancel with: testsprite test cancel ${rerunResp.runId}`,
+          `Request timed out. ${deps.environmentTunnel ? 'The owned tunnel is closing; cancellation will be requested.' : stillRunningAndBillingSubject(rerunResp.runId)} ` +
+            (deps.environmentTunnel
+              ? `Inspect cancellation with testsprite test cancel ${rerunResp.runId}.`
+              : `Re-attach with: testsprite test wait ${rerunResp.runId}, or cancel with: testsprite test cancel ${rerunResp.runId}`),
         );
         throw err;
       }
@@ -11707,11 +12527,17 @@ export async function runTestRerun(
           return [
             `runId       ${p.runId}`,
             `status      ${p.status} (rate limited by the server)`,
-            `hint        Re-attach with: testsprite test wait ${p.runId}`,
+            deps.environmentTunnel
+              ? `hint        The owned tunnel is closing; inspect cancellation with testsprite test cancel ${p.runId}`
+              : `hint        Re-attach with: testsprite test wait ${p.runId}`,
             `hint        Cancel with:    testsprite test cancel ${p.runId}`,
           ].join('\n');
         });
-        stderrFn(rateLimitedDetachMessage(err, [rerunResp.runId]));
+        stderrFn(
+          deps.environmentTunnel
+            ? `The owned tunnel is closing; cancellation will be requested. Inspect with testsprite test cancel ${rerunResp.runId}.`
+            : rateLimitedDetachMessage(err, [rerunResp.runId]),
+        );
         throw err;
       }
       // Graceful detach on SIGINT/SIGTERM — see runTestRun.
@@ -11723,11 +12549,17 @@ export async function runTestRerun(
           return [
             `runId       ${p.runId}`,
             `status      ${p.status} (interrupted)`,
-            `hint        Re-attach with: testsprite test wait ${p.runId}`,
+            deps.environmentTunnel
+              ? `hint        The owned tunnel is closing; inspect cancellation with testsprite test cancel ${p.runId}`
+              : `hint        Re-attach with: testsprite test wait ${p.runId}`,
             `hint        Cancel with:    testsprite test cancel ${p.runId}`,
           ].join('\n');
         });
-        stderrFn(interruptDetachMessage(err, [rerunResp.runId]));
+        stderrFn(
+          deps.environmentTunnel
+            ? `Interrupted (${err.signal}). Cancellation will be requested for ${rerunResp.runId} before the owned tunnel closes.`
+            : interruptDetachMessage(err, [rerunResp.runId]),
+        );
         err.runWaitContext = true;
         throw err;
       }
@@ -11770,6 +12602,7 @@ export async function runTestRerun(
   // Batch / --all rerun path
   // -------------------------------------------------------------------------
   let testIds = opts.testIds;
+  let knownTests = opts.knownTests;
 
   if (opts.all) {
     // Validate --status filter before any network call.
@@ -11835,7 +12668,11 @@ export async function runTestRerun(
     }
 
     testIds = allTests.map(t => t.id);
+    knownTests = new Map(
+      allTests.map(t => [t.id, { type: t.type, projectId: t.projectId ?? opts.projectId! }]),
+    );
     if (testIds.length === 0) {
+      validateRerunOptions(opts);
       stderrFn(`No tests found in project ${opts.projectId} matching filters — nothing to rerun.`);
       out.print({ accepted: [], deferred: [], conflicts: [], closure: { byProject: [] } });
       // Zero-dispatch: emit the CI artifacts and fail with exit 5 unless
@@ -11865,13 +12702,41 @@ export async function runTestRerun(
   // safe) and aggregate accepted/deferred/conflicts/closure into a single
   // synthetic BatchRerunResponse that downstream --wait / exit-code logic
   // can treat as one result.
+  if (opts.all && !deps.environmentTunnel) {
+    return runTestRerun(
+      {
+        ...opts,
+        testIds,
+        idempotencyKey,
+        all: false,
+        batchResolved: true,
+        knownTests,
+        nameFilter: undefined,
+        statusFilter: undefined,
+        skipTerminal: undefined,
+        allowEmpty: undefined,
+      },
+      deps,
+    );
+  }
   const chunks: string[][] = [];
   for (let i = 0; i < testIds.length; i += MAX_BATCH_RERUN_IDS) {
     chunks.push(testIds.slice(i, i + MAX_BATCH_RERUN_IDS));
   }
   if (chunks.length === 0) chunks.push([]); // defensive: empty list handled above
 
-  let chunkResponses: BatchRerunResponse[];
+  if (deps.environmentTunnel?.targets) {
+    const grouped = chunks.flatMap(chunk =>
+      groupEnvironmentTargets(
+        chunk,
+        deps.environmentTunnel!.targets!,
+        deps.environmentTunnel!.maxConcurrency,
+      ),
+    );
+    chunks.splice(0, chunks.length, ...grouped);
+  }
+  let chunkResponses: BatchRerunResponse[] = [];
+  let waitingForCapacity = false;
   try {
     // Dispatch chunks one at a time, NOT via Promise.all. BE producer/
     // teardown closure dedup happens per-request, server-side. Two chunks
@@ -11892,10 +12757,21 @@ export async function runTestRerun(
           ? idempotencyKey.slice(0, 256 - chunkSuffix.length)
           : idempotencyKey;
       const chunkKey = `${chunkBase}${chunkSuffix}`;
+      if (deps.environmentTunnel?.targets?.has(chunk[0]!)) {
+        waitingForCapacity = true;
+        await deps.environmentTunnel.waitForCapacity(chunk.length);
+        waitingForCapacity = false;
+      }
       const chunkResp = await client.triggerBatchRerun(
         {
           source: 'cli',
           testIds: chunk,
+          ...(deps.environmentTunnel?.targets?.has(chunk[0]!)
+            ? {
+                tunnelClientId: deps.environmentTunnel.clientId,
+                targetUrl: deps.environmentTunnel.targets.get(chunk[0]!)!.targetUrl,
+              }
+            : {}),
           // Always send the effective boolean, including an explicit `false`
           // opt-out — see the matching comment on the single-rerun call site.
           autoHeal: effectiveAutoHeal,
@@ -11905,15 +12781,30 @@ export async function runTestRerun(
         { idempotencyKey: chunkKey },
       );
       chunkResponses.push(chunkResp);
+      if (deps.environmentTunnel?.targets?.has(chunk[0]!))
+        await deps.environmentTunnel.confirm(
+          chunkResp,
+          chunkResp.accepted.map(row => row.runId),
+        );
     }
   } catch (err) {
+    if (deps.environmentTunnel && chunkResponses.length)
+      await emitEnvironmentDispatchPartial(
+        chunkResponses,
+        testIds,
+        opts,
+        deps,
+        'rerun',
+        err,
+        deps.environmentTunnel,
+      );
     // D2 (dogfood): the batch endpoint rejects the WHOLE request when any id is
     // unresolvable (unknown, cross-tenant, or never ran cleanly), so one bad id
     // aborts the batch with NOT_FOUND. Replace the bare exit-4 with an
     // actionable hint. (Server-side partial-accept of unknown ids — a
     // `notFound[]` in the batch response so good ids still run — is a tracked
     // backend follow-up.)
-    if (err instanceof ApiError && err.code === 'NOT_FOUND') {
+    if (!waitingForCapacity && err instanceof ApiError && err.code === 'NOT_FOUND') {
       throw ApiError.fromEnvelope({
         error: {
           code: 'NOT_FOUND',
@@ -11937,7 +12828,10 @@ export async function runTestRerun(
     chunkResponses.flatMap(r => r.accepted),
   );
   warnDroppedDuplicateRuns(dedupedAccepted, duplicateAccepted, stderrFn);
-  const batchResp: BatchRerunResponse = {
+  const batchResp: BatchRerunResponse & {
+    skipped?: Array<{ testId: string; reason: 'backend-test' }>;
+  } = {
+    ...(deps.environmentTunnel?.skipped?.length ? { skipped: deps.environmentTunnel.skipped } : {}),
     accepted: dedupedAccepted,
     deferred: chunkResponses.flatMap(r => r.deferred),
     conflicts: chunkResponses.flatMap(r => r.conflicts),
@@ -12009,6 +12903,32 @@ export async function runTestRerun(
     stderrFn(`nextAction: testsprite test rerun ${deferredIds}`);
   }
 
+  const emitRetryPartial = async (error: unknown, responses: BatchRerunResponse[] = []) => {
+    if (!deps.environmentTunnel) return;
+    const retried = new Set(
+      responses
+        .flatMap(response => [...response.accepted, ...response.conflicts, ...response.deferred])
+        .map(row => row.testId),
+    );
+    await emitEnvironmentDispatchPartial(
+      [
+        {
+          accepted,
+          conflicts,
+          deferred: deferred.filter(row => !retried.has(row.testId)),
+          notFound,
+        },
+        ...responses,
+      ],
+      testIds,
+      opts,
+      deps,
+      'rerun',
+      error,
+      deps.environmentTunnel,
+    );
+  };
+
   // D3: budget-driven deferred-retry loop for rerun --all (only under --wait).
   // Re-dispatches still-deferred tests until they all clear OR the --timeout
   // budget is exhausted — a busy pool drains within the user's own timeout
@@ -12018,7 +12938,8 @@ export async function runTestRerun(
   // through to the existing exit-7 path. `maxDeferredAttempts` is a pure runaway
   // backstop (the deadline check below is the real stop), scaled to the timeout.
   const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
-  const batchDeadlineMs = Date.now() + opts.timeoutSeconds * 1000;
+  const batchDeadlineMs =
+    deps.environmentTunnel?.deadlineMs ?? Date.now() + opts.timeoutSeconds * 1000;
   // finding 1: reserve a poll window so the deferred-retry loop can't consume the
   // ENTIRE --timeout and leave the fan-out poll with nothing — which would report
   // already-finished runs as timeouts (exit 7) instead of their real verdicts
@@ -12045,7 +12966,14 @@ export async function runTestRerun(
       stderrFn(
         `[deferred-retry] attempt ${attempt} — retrying ${deferred.length} deferred test${deferred.length !== 1 ? 's' : ''} in ${Math.round(sleepMs / 1000)}s`,
       );
-      await sleepFn(sleepMs);
+      try {
+        if (deps.environmentTunnel)
+          await sleepUntilOrInterrupt(sleepMs, shutdownOf(deps).signal, sleepFn);
+        else await sleepFn(sleepMs);
+      } catch (err) {
+        await emitRetryPartial(err);
+        throw err;
+      }
 
       const remainingAfterSleep = batchDeadlineMs - Date.now();
       if (remainingAfterSleep <= POLL_RESERVE_MS) {
@@ -12062,12 +12990,21 @@ export async function runTestRerun(
         retryChunks.push(retryIds.slice(i, i + MAX_BATCH_RERUN_IDS));
       }
 
-      let retryChunkResponses: BatchRerunResponse[];
+      if (deps.environmentTunnel?.targets) {
+        const grouped = retryChunks.flatMap(chunk =>
+          groupEnvironmentTargets(
+            chunk,
+            deps.environmentTunnel!.targets!,
+            deps.environmentTunnel!.maxConcurrency,
+          ),
+        );
+        retryChunks.splice(0, retryChunks.length, ...grouped);
+      }
+      const retryChunkResponses: BatchRerunResponse[] = [];
       try {
         // Sequential, same reason as the initial dispatch above: concurrent
         // chunks racing on per-request server-side closure dedup can
         // double-trigger a shared BE producer/teardown.
-        retryChunkResponses = [];
         for (let idx = 0; idx < retryChunks.length; idx++) {
           const chunk = retryChunks[idx]!;
           // [P2] Bound the derived key to ≤256 chars. Caller-supplied keys may
@@ -12090,10 +13027,19 @@ export async function runTestRerun(
           // still-deferred, inviting a duplicate rerun on the user's next
           // invocation. The per-request timeout still bounds it; the sleeps +
           // poll stay deadline-aware.
+          if (deps.environmentTunnel?.targets?.has(chunk[0]!))
+            await deps.environmentTunnel.waitForCapacity(chunk.length);
           const retryChunkResp = await client.triggerBatchRerun(
             {
               source: 'cli',
               testIds: chunk,
+              ...(environment !== undefined ? { environment } : {}),
+              ...(deps.environmentTunnel?.targets?.has(chunk[0]!)
+                ? {
+                    tunnelClientId: deps.environmentTunnel.clientId,
+                    targetUrl: deps.environmentTunnel.targets.get(chunk[0]!)!.targetUrl,
+                  }
+                : {}),
               // Always send the effective boolean, including an explicit
               // `false` opt-out — see the matching comment on the initial
               // dispatch call site above.
@@ -12103,8 +13049,17 @@ export async function runTestRerun(
             { idempotencyKey: retryKey },
           );
           retryChunkResponses.push(retryChunkResp);
+          if (deps.environmentTunnel?.targets?.has(chunk[0]!))
+            await deps.environmentTunnel.confirm(
+              retryChunkResp,
+              retryChunkResp.accepted.map(row => row.runId),
+            );
         }
       } catch (err) {
+        if (deps.environmentTunnel) {
+          await emitRetryPartial(err, retryChunkResponses);
+          throw err;
+        }
         if (err instanceof InterruptError) throw err;
         stderrFn(
           `[deferred-retry] attempt ${attempt} failed with error: ${err instanceof Error ? err.message : String(err)}`,
@@ -12314,6 +13269,10 @@ export async function runTestRerun(
   const ticker = createTicker(stderrFn, opts.output === 'json' ? false : undefined);
   const concurrencyLimit = opts.maxConcurrency;
   const rerunResults: CliRerunResult[] = [];
+  const reportTiming = new Map<
+    string,
+    Pick<RunResponse, 'createdAt' | 'startedAt' | 'finishedAt'>
+  >();
   // sleepFn is declared above in the D3 deferred-retry section (shared by fan-out).
 
   async function pollAccepted(entry: BatchRerunAccepted): Promise<CliRerunResult> {
@@ -12335,9 +13294,16 @@ export async function runTestRerun(
         sleep: deps.sleep,
         shutdown: shutdownOf(deps),
         onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
-        onTick: (run, elapsedMs) =>
-          ticker.update(formatRunProgressLine(run, elapsedMs, `(${entry.testId})`)),
+        onTick: (run, elapsedMs) => {
+          deps.environmentTunnel?.onPoll(run);
+          ticker.update(formatRunProgressLine(run, elapsedMs, `(${entry.testId})`));
+        },
         resolveAlternate,
+      });
+      reportTiming.set(entry.runId, {
+        createdAt: finalRun.createdAt,
+        startedAt: finalRun.startedAt,
+        finishedAt: finalRun.finishedAt,
       });
       return {
         testId: entry.testId,
@@ -12353,6 +13319,7 @@ export async function runTestRerun(
           : {}),
       };
     } catch (err) {
+      if (deps.environmentTunnel && err instanceof TunnelLostError) throw err;
       if (err instanceof TimeoutError) {
         deps.onWaitTimeout?.({ reason: 'wait_timeout' });
         return {
@@ -12428,7 +13395,19 @@ export async function runTestRerun(
     // Graceful detach: stdout stays parseable — settled members
     // keep their real status, unfinished ones are marked running — and the
     // honest stderr line names every runId still executing (and billing).
-    if (fanOutErr instanceof InterruptError) {
+    if (deps.environmentTunnel) {
+      ticker.finalize();
+      await emitEnvironmentDispatchPartial(
+        [{ accepted, deferred, conflicts, notFound }],
+        testIds,
+        opts,
+        deps,
+        'rerun',
+        fanOutErr,
+        deps.environmentTunnel,
+      );
+      if (fanOutErr instanceof InterruptError) fanOutErr.runWaitContext = true;
+    } else if (fanOutErr instanceof InterruptError) {
       ticker.finalize(`Batch rerun — interrupted (${fanOutErr.signal})`);
       const settled = new Map(rerunResults.map(r => [r.runId, r] as const));
       const partialResults = accepted.map(
@@ -12441,7 +13420,11 @@ export async function runTestRerun(
       const unfinished = accepted.filter(e => !settled.has(e.runId)).map(e => e.runId);
       if (unfinished.length > 0) {
         fanOutErr.runWaitContext = true;
-        stderrFn(interruptDetachMessage(fanOutErr, unfinished));
+        stderrFn(
+          deps.environmentTunnel
+            ? `Interrupted (${fanOutErr.signal}). Cancellation will be requested for unfinished tunnel runs before the owned tunnel closes.`
+            : interruptDetachMessage(fanOutErr, unfinished),
+        );
       }
     }
     throw fanOutErr;
@@ -12458,6 +13441,7 @@ export async function runTestRerun(
   );
 
   const jsonPayload = {
+    ...(deps.environmentTunnel?.skipped?.length ? { skipped: deps.environmentTunnel.skipped } : {}),
     accepted: rerunResults,
     // [P2] Use post-retry mutable vars, not the stale initial batchResp fields.
     // batchResp.deferred/conflicts reflect only the INITIAL response; after D3
@@ -12493,7 +13477,11 @@ export async function runTestRerun(
     opts.report === 'junit' && opts.reportFile !== undefined
       ? await buildTestNameMap(client, opts.projectId)
       : undefined;
-  await writeBatchJUnitReportIfRequested(opts, rerunResults, rerunNameMap);
+  await writeBatchJUnitReportIfRequested(
+    opts,
+    rerunResults.map(r => ({ ...r, ...(r.runId ? reportTiming.get(r.runId) : {}) })),
+    rerunNameMap,
+  );
   out.print(jsonPayload);
   // CI-native output layer (issue #99): batch-rerun parity with `run --all`.
   // Emitted before the exit-code gates below so the summary file / annotations
@@ -12824,7 +13812,7 @@ const SKIP_PREFLIGHT_HELP =
   'calls when set.';
 
 const TARGET_URL_HELP =
-  "frontend tests only: use the environment already pointing at this URL's origin, or a temporary one TestSprite deletes when the run finishes; with --env, use its settings against this URL";
+  "frontend tests only: use the environment already pointing at this URL's origin, or a temporary one TestSprite deletes when the run finishes; with --env, use its settings against this URL; loopback URLs open a tunnel automatically";
 
 export function createTestCommand(deps: TestDeps = {}): Command {
   const test = new Command('test').description('Inspect TestSprite tests');
@@ -12839,6 +13827,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     // below raises `ApiError(VALIDATION_ERROR)` so JSON consumers can read
     // `error.code` and the exit code matches the catalog.
     .option('--project <id>', 'project id (returned by `testsprite project list`)')
+    .option('--env <name>', 'show frontend test statuses for the named project environment')
     .option('--type <type>', 'filter by test type (frontend|backend)')
     .option('--created-from <source>', 'filter by where the test was authored (portal|mcp|cli)')
     .option(
@@ -12868,6 +13857,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         {
           ...resolveCommonOptions(command, deps.env),
           projectId: cmdOpts.project,
+          environment: cmdOpts.env,
           type: parseEnumFlag(cmdOpts.type, 'type', TEST_TYPES),
           createdFrom: parseEnumFlag(cmdOpts.createdFrom, 'created-from', CREATED_FROMS),
           status: cmdOpts.status,
@@ -12921,9 +13911,13 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       false,
     )
     .option('--wait', 'with --run, poll until terminal status', false)
+    .option('--no-wait', 'detach without opening an automatic environment tunnel')
     .option('--timeout <s>', 'with --run --wait, max seconds to wait')
     .option('--target-url <url>', TARGET_URL_HELP)
-    .option('--env <name>', 'with --run, run against the named project environment')
+    .option(
+      '--env <name>',
+      'with --run, select the named project environment; loopback URLs open a tunnel automatically',
+    )
     .option('--skip-preflight', SKIP_PREFLIGHT_HELP, false)
     .option(
       '--idempotency-key <token>',
@@ -13012,6 +14006,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             planFrom: cmdOpts.planFrom,
             run: cmdOpts.run === true,
             wait: cmdOpts.wait === true,
+            noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
             timeout: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
             // B2(c): capture before parseTimeoutFlag converts undefined → default.
             timeoutIsDefault: cmdOpts.timeout === undefined,
@@ -13040,6 +14035,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           // M3.3 chain flags:
           run: cmdOpts.run === true,
           wait: cmdOpts.wait === true,
+          noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
           timeout: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
           // B2(c): capture before parseTimeoutFlag converts undefined → default.
           timeoutIsDefault: cmdOpts.timeout === undefined,
@@ -13072,11 +14068,12 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         `Separately, CLI run triggers are refused once ${SERVER_INFLIGHT_RUN_CAP} of your runs are already in flight (server default; the refusal reports your account's real cap). Runs from every source count toward it, and a large batch can reach it on its own, so anything already running makes later triggers exit 11 with details.reason "inflight_cap" — not auto-retried, runs have to finish first. With --wait a slot is held until each run finishes, so lowering this flag keeps fewer runs in flight; without --wait it only paces dispatch, and a smaller batch is the lever.`,
     )
     .option('--wait', 'with --run, poll each run until terminal status', false)
+    .option('--no-wait', 'detach without opening an automatic environment tunnel')
     .option('--timeout <s>', 'with --run --wait, per-run max seconds to wait (1-3600, default 600)')
     .option('--target-url <url>', TARGET_URL_HELP)
     .option(
       '--env <name>',
-      'with --run, run each created test against the named project environment',
+      'with --run, select the named project environment for each test; loopback URLs open a tunnel automatically',
     )
     .option('--skip-preflight', SKIP_PREFLIGHT_HELP, false)
     .option(
@@ -13093,6 +14090,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           run: cmdOpts.run === true,
           maxConcurrency: parseNumericFlag(cmdOpts.maxConcurrency, 'max-concurrency'),
           wait: cmdOpts.wait === true,
+          noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
           timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
           targetUrl: cmdOpts.targetUrl,
           environment: cmdOpts.env,
@@ -13417,8 +14415,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
   test
     .command('run [test-id...]')
     .description(
-      'Trigger one test run, or several local frontend runs through one tunnel. With --wait, polls until terminal status.\n' +
-        'Use --all --project <id> for a wave-ordered batch run, or add --local <port> to run its frontend tests through one tunnel.\n' +
+      'Trigger one or several test runs. Saved loopback environments open a tunnel automatically and wait for a verdict.\n' +
+        'Use --all --project <id> for a wave-ordered batch run. Loopback environments share one tunnel.\n' +
         '\nExit codes:\n' +
         '  0  passed (or queued without --wait)\n' +
         '  1  failed / blocked / cancelled\n' +
@@ -13432,50 +14430,52 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         ' 11  rate limited — honor Retry-After, or the in-flight run cap was hit\n' +
         '     (details.reason "inflight_cap"; see: testsprite test run --help)\n' +
         '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>\n' +
-        '\nCtrl-C during an ordinary --wait detaches; an owned --local tunnel cancels unfinished runs by default.\n' +
-        'Stop a detached run with: testsprite test cancel <run-id>',
+        '\nCtrl-C during an ordinary --wait detaches; an owned tunnel cancels unfinished runs by default.\n' +
+        'Stop a detached run with: testsprite test cancel <run-id>\n' +
+        'Local environments: dev servers can take a minute per page through the tunnel.\n' +
+        'For a heavy dev server, test a built server: npm run build, then your framework preview/start command.',
     )
     .option('--target-url <url>', TARGET_URL_HELP)
     .option('--skip-preflight', SKIP_PREFLIGHT_HELP, false)
     .option(
       '--local <port>',
       'run against an app on THIS machine, reached through a TestSprite tunnel. The test runner ' +
-        'navigates to http://127.0.0.1:<port> and its traffic is proxied back to you for as long ' +
+        'navigates to http://localhost:<port> and its traffic is proxied back to you for as long ' +
         'as this command runs. Implies --wait (the tunnel closes when the command exits, so a ' +
         'detached run could not finish). Frontend tests ' +
-        'only; several ids or --all share one tunnel (5 concurrent by default, at most 10). ' +
+        'only; a matching saved environment keeps its host spelling; several ids or --all share one tunnel (5 concurrent by default, at most 10). ' +
         'Before anything is minted or billed, the port is probed and a dead one is refused.',
     )
     .option(
       '--local-host <host>',
-      `with --local, which loopback address to name in the run's target URL — one of ` +
-        `${LOOPBACK_HOSTS.join(', ')} (default ${DEFAULT_LOCAL_HOST}). Use localhost if your app ` +
+      `with --local, override which loopback address to name in the run's target URL — one of ` +
+        `${LOOPBACK_HOSTS.join(', ')} (default: saved matching host, else ${DEFAULT_LOCAL_HOST}). Use localhost if your app ` +
         `only answers on that name, or ::1 for an IPv6-only listener.`,
     )
     .option(
       '--tunnel-client <id>',
-      'with --local, attach to a tunnel already running under `testsprite tunnel start` instead ' +
+      'for a loopback environment or --local, attach to a tunnel already running under `testsprite tunnel start` instead ' +
         'of opening a new one. The id is the non-secret handle that command prints; the tunnel ' +
         'stays owned by that process and is not closed when this run or batch finishes.',
     )
     .option(
       '--no-cancel-on-interrupt',
-      'with --local, skip automatic cancellation when an owned tunnel is about to close or a ' +
+      'with a tunnel, skip automatic cancellation when an owned tunnel is about to close or a ' +
         "borrowed tunnel's owner disappears. An ordinary interrupt of a borrowed run never " +
         'cancels it because its tunnel remains alive.',
     )
     .option(
       '--env <name>',
       'run against the named project environment — its test-account credentials, auto-auth and ' +
-        'OTP settings (names: `testsprite project env list <project-id>`). Combine with --local ' +
-        'to use those credentials against your own machine; without --local, the run opens ' +
+        'OTP settings (names: `testsprite project env list <project-id>`). A loopback environment opens a tunnel automatically. The run opens ' +
         "that environment's URL. Omit --env to keep using " +
         "the project's default environment. Also applies with --all.",
     )
     .option('--wait', 'poll until terminal status or --timeout elapses', false)
+    .option('--no-wait', 'detach without opening an automatic environment tunnel')
     .option(
       '--timeout <s>',
-      'with --wait, max seconds per run (1–3600; default 600, or 1200 with --local)',
+      'with --wait, max seconds per run (1–3600; default 600, or 1200 through a tunnel)',
     )
     .option(
       '--idempotency-key <key>',
@@ -13496,11 +14496,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--max-concurrency <n>',
-      `with --local, max runs in flight through one tunnel (1-10, default 5); with --all --wait without --local, max polls (1-100, default ${DEFAULT_BATCH_RUN_CONCURRENCY})`,
+      `with a tunnel, max runs in flight through one tunnel (1-10, default 5); with --all --wait without a tunnel, max polls (1-100, default ${DEFAULT_BATCH_RUN_CONCURRENCY})`,
     )
     .option(
       '--report <format>',
-      'with a --wait batch (--all or several local ids): write a JUnit XML sidecar report after polling (accepted: junit)',
+      'with a --wait batch (--all or several ids): write a JUnit XML sidecar report after polling (accepted: junit)',
     )
     .option('--report-file <path>', 'output path for --report (atomic write)')
     .option(
@@ -13564,6 +14564,21 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testIdArgs: string[], cmdOpts: RunFlagOpts, command: Command) => {
+      // A literal `testsprite test run list` is someone guessing at a
+      // "list prior runs" subcommand, not naming a test whose id is the
+      // string "list". Left unguarded, this parses as a normal `<test-id>`
+      // and dispatches a run against a test that (almost certainly) does not
+      // exist, wasting a round trip on a typo that a clear message could
+      // have caught locally. Checked first, before any other validation or
+      // network access, so it wins even if other flags (`--all`, etc.) are
+      // also present.
+      if (testIdArgs.length === 1 && testIdArgs[0] === 'list') {
+        throw localValidationError(
+          'test-id',
+          'there is no `test run list` command; to see a test’s prior runs use: ' +
+            'testsprite test result <test-id> --history',
+        );
+      }
       const isAll = cmdOpts.all === true;
       const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
@@ -13595,12 +14610,27 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       // tunnel credential.
       const localPort = cmdOpts.local !== undefined ? parseLocalPort(cmdOpts.local) : undefined;
       const usingLocal = localPort !== undefined;
-      const effectiveWait = usingLocal || cmdOpts.wait === true;
-      if (!usingLocal && testIdArgs.length >= 2) {
-        throw localValidationError(
-          'test-id',
-          'several test ids run through one tunnel with --local <port>. For tests the runner can already reach, use `testsprite test run --all --project <id> [--filter <text>]`, or run them one at a time.',
-        );
+      const effectiveWait =
+        usingLocal ||
+        (cmdOpts.targetUrl !== undefined &&
+          parseLoopbackTargetUrl(cmdOpts.targetUrl) !== undefined) ||
+        cmdOpts.wait === true;
+      const canAutoWait =
+        !resolveCommonOptions(command, deps.env).dryRun &&
+        !(command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false);
+      const explicitLoopbackTarget =
+        cmdOpts.targetUrl !== undefined && parseLoopbackTargetUrl(cmdOpts.targetUrl) !== undefined;
+      if (
+        !usingLocal &&
+        !explicitLoopbackTarget &&
+        ((command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false) ||
+          cmdOpts.targetUrl !== undefined)
+      ) {
+        if (!isAll && testIdArgs.length >= 2) severalIdsWithoutTunnel();
+        assertNoTunnelOptions({
+          tunnelClientId: cmdOpts.tunnelClient,
+          cancelOnInterrupt: cmdOpts.cancelOnInterrupt,
+        });
       }
       const maxConcurrency =
         cmdOpts.maxConcurrency === undefined
@@ -13633,7 +14663,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             'already reach. Pass one',
         );
       }
-      // The three flags below are inert without --local. Silently ignoring
+      // A host override is meaningful only for the port shorthand. Silently ignoring
       // them would leave the caller believing something is in effect that is
       // not — the same rule --filter and the JUnit flags already follow.
       if (!usingLocal && cmdOpts.localHost !== undefined) {
@@ -13643,50 +14673,39 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             'targets). Add --local <port>, or remove --local-host',
         );
       }
-      if (!usingLocal && cmdOpts.tunnelClient !== undefined) {
-        throw localValidationError(
-          'tunnel-client',
-          '--tunnel-client only applies with --local (it attaches the run to an already-running ' +
-            'tunnel). Add --local <port>, or remove --tunnel-client',
-        );
-      }
-      if (!usingLocal && cmdOpts.cancelOnInterrupt === false) {
-        throw localValidationError(
-          'cancel-on-interrupt',
-          '--no-cancel-on-interrupt only applies with --local. An ordinary run is never ' +
-            'cancelled when this command stops waiting — Ctrl-C detaches, and `testsprite test ' +
-            'cancel <run-id>` is the way to stop one',
-        );
-      }
-      const localHost = usingLocal ? normalizeLocalHost(cmdOpts.localHost) : undefined;
+
+      const localHost =
+        usingLocal && cmdOpts.localHost !== undefined
+          ? normalizeLocalHost(cmdOpts.localHost)
+          : undefined;
 
       const report = parseJUnitReportFormat(cmdOpts.report);
       assertJUnitReportOptions({
         report,
         reportFile: cmdOpts.reportFile,
         reportSuiteName: cmdOpts.reportSuiteName,
-        wait: effectiveWait,
-        batchPath: isAll || (usingLocal && testIds.length > 1),
+        wait: effectiveWait || canAutoWait,
+        batchPath: isAll || testIds.length > 1,
       });
       // --gh-output / --summary-file reduce a --wait run's terminal result into
       // the CI summary. They require --wait (without it the command returns after
       // enqueueing, before any terminal result exists) but apply to BOTH a single
       // <test-id> run and the --all batch. Without --wait they would silently
       // no-op — reject loudly (same rule as --filter and the JUnit report flags).
-      if (cmdOpts.ghOutput === true && !effectiveWait) {
+      if (cmdOpts.ghOutput === true && !effectiveWait && !canAutoWait) {
         throw localValidationError(
           'gh-output',
           '--gh-output requires --wait (it reduces the terminal run result). Add --wait.',
         );
       }
-      if (cmdOpts.summaryFile !== undefined && !effectiveWait) {
+      if (cmdOpts.summaryFile !== undefined && !effectiveWait && !canAutoWait) {
         throw localValidationError(
           'summary-file',
           '--summary-file requires --wait (it reduces the terminal run result). Add --wait.',
         );
       }
 
-      if (isAll && !usingLocal) {
+      if (isAll && !usingLocal && cmdOpts.tunnelClient === undefined) {
         // --all path: wave-ordered fresh batch run.
         const projectId = resolveProjectId(cmdOpts.project, deps);
         requireProjectId(
@@ -13711,6 +14730,10 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             projectId,
             nameFilter: cmdOpts.filter,
             wait: effectiveWait,
+            noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
+            concurrencyIsDefault: cmdOpts.maxConcurrency === undefined,
+            timeoutIsDefault: cmdOpts.timeout === undefined,
+            cancelOnInterrupt: cmdOpts.cancelOnInterrupt !== false,
             timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
             maxConcurrency:
               parseNumericFlag(cmdOpts.maxConcurrency, 'max-concurrency') ??
@@ -13762,16 +14785,20 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         );
       }
 
-      if (usingLocal && (isAll || testIds.length > 1)) {
+      if (isAll || testIds.length > 1) {
         await runTestRunLocalBatch(
           {
             ...commonOpts,
             testIds,
+            wait: effectiveWait,
             all: isAll,
             projectId: cmdOpts.project,
             nameFilter: cmdOpts.filter,
-            localPort: localPort!,
-            localHost: localHost ?? DEFAULT_LOCAL_HOST,
+            localPort,
+            localHost,
+            targetUrl: cmdOpts.targetUrl,
+            noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
+            concurrencyIsDefault: cmdOpts.maxConcurrency === undefined,
             skipPreflight: cmdOpts.skipPreflight === true,
             tunnelClientId: cmdOpts.tunnelClient,
             cancelOnInterrupt: cmdOpts.cancelOnInterrupt !== false,
@@ -13807,6 +14834,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           ...(cmdOpts.tunnelClient !== undefined ? { tunnelClientId: cmdOpts.tunnelClient } : {}),
           cancelOnInterrupt: cmdOpts.cancelOnInterrupt !== false,
           wait: effectiveWait,
+          noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
           timeoutSeconds:
             usingLocal && cmdOpts.timeout === undefined
               ? DEFAULT_LOCAL_RUN_TIMEOUT_SECONDS
@@ -13926,6 +14954,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       'with --all: only rerun tests whose name contains this substring (case-insensitive)',
     )
     .option('--wait', 'block until terminal status or --timeout elapses', false)
+    .option('--no-wait', 'detach without opening an automatic environment tunnel')
+    .option('--skip-preflight', 'skip the loopback port probe before opening a tunnel')
     .option(
       '--timeout <s>',
       `with --wait, max seconds to wait (1–3600, default ${DEFAULT_RUN_TIMEOUT_SECONDS})`,
@@ -13946,11 +14976,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       '--env <name>',
       'replay against the named project environment — its test-account credentials, auto-auth and ' +
         'OTP settings (names: `testsprite project env list <project-id>`). Omit to keep using the ' +
-        "project's default environment. Applies to every test of a batch rerun.",
+        "project's default environment. Loopback URLs open a tunnel automatically. Applies to every test of a batch rerun.",
     )
     .option(
       '--max-concurrency <n>',
-      `with --wait, max in-flight polls at once (1-100, default: ${DEFAULT_BATCH_RUN_CONCURRENCY})`,
+      `with a tunnel, max runs in flight (1-10, default 5); otherwise with --wait, max polls (1-100, default ${DEFAULT_BATCH_RUN_CONCURRENCY})`,
     )
     .option(
       '--idempotency-key <key>',
@@ -14008,23 +15038,29 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       const testIds = testIdsArg ?? [];
       const isBatch = cmdOpts.all === true || testIds.length !== 1;
       const report = parseJUnitReportFormat(cmdOpts.report);
+      const canAutoWait =
+        !resolveCommonOptions(command, deps.env).dryRun &&
+        !(command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false);
       assertJUnitReportOptions({
         report,
         reportFile: cmdOpts.reportFile,
         reportSuiteName: cmdOpts.reportSuiteName,
-        wait: cmdOpts.wait === true,
+        wait: cmdOpts.wait === true || canAutoWait,
         batchPath: isBatch,
       });
       // --gh-output / --summary-file reduce the batch-rerun --wait envelope, which
       // only exists on the batch (--all or 2+ ids) --wait path. Anywhere else they
       // would silently no-op — reject loudly (same rule as the JUnit report flags).
-      if (cmdOpts.ghOutput === true && (!isBatch || cmdOpts.wait !== true)) {
+      if (cmdOpts.ghOutput === true && (!isBatch || (cmdOpts.wait !== true && !canAutoWait))) {
         throw localValidationError(
           'gh-output',
           '--gh-output requires a batch rerun with --wait (--all or 2+ test ids). Remove --gh-output, or add --all --wait.',
         );
       }
-      if (cmdOpts.summaryFile !== undefined && (!isBatch || cmdOpts.wait !== true)) {
+      if (
+        cmdOpts.summaryFile !== undefined &&
+        (!isBatch || (cmdOpts.wait !== true && !canAutoWait))
+      ) {
         throw localValidationError(
           'summary-file',
           '--summary-file requires a batch rerun with --wait (--all or 2+ test ids). Remove --summary-file, or add --all --wait.',
@@ -14040,6 +15076,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           statusFilter: cmdOpts.status,
           nameFilter: cmdOpts.filter,
           wait: cmdOpts.wait === true,
+          noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
+          skipPreflight: cmdOpts.skipPreflight === true,
+          concurrencyIsDefault: cmdOpts.maxConcurrency === undefined,
           timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
           autoHeal: cmdOpts.autoHeal !== false,
           autoHealExplicit: false,
@@ -14387,6 +15426,7 @@ interface WaitFlagOpts {
 }
 
 interface RerunFlagOpts {
+  skipPreflight?: boolean;
   all?: boolean;
   project?: string;
   skipTerminal?: boolean;
@@ -14492,6 +15532,7 @@ interface CreateBatchFlagOpts {
 
 interface ListFlagOpts {
   project: string;
+  env?: string;
   type?: string;
   createdFrom?: string;
   status?: string;
@@ -15043,17 +16084,34 @@ const TEST_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliTest>> = [
   { header: 'TYPE', width: 8, render: test => test.type },
   { header: 'FROM', width: 6, render: test => test.createdFrom },
   { header: 'STATUS', width: 9, render: test => test.status },
-  { header: 'UPDATED', width: 0, render: test => test.updatedAt },
+  {
+    header: 'UPDATED',
+    width: rows => Math.max(7, ...rows.map(test => test.updatedAt.length)),
+    render: test => test.updatedAt,
+  },
+  {
+    header: 'ENV',
+    width: rows => Math.max(3, ...rows.map(test => (test.headlineEnvironment?.name ?? '-').length)),
+    render: test => test.headlineEnvironment?.name ?? '-',
+  },
 ];
 
 function renderTestListText(
   page: Page<CliTest>,
-  options: { columns?: string; noHeader?: boolean } = {},
+  options: { columns?: string; noHeader?: boolean; environment?: string } = {},
 ): string {
+  const note =
+    options.environment === undefined || options.noHeader
+      ? []
+      : [`Frontend test status requested for environment '${options.environment}'.`];
   if (page.items.length === 0) {
-    return page.nextToken ? `No tests on this page.\nnextToken: ${page.nextToken}` : 'No tests.';
+    return [
+      ...note,
+      page.nextToken ? `No tests on this page.\nnextToken: ${page.nextToken}` : 'No tests.',
+    ].join('\n');
   }
   const lines = [
+    ...note,
     renderTextTable(page.items, TEST_LIST_COLUMNS, {
       columns: options.columns,
       noHeader: options.noHeader,
@@ -15081,6 +16139,9 @@ function renderTestText(t: CliTest): string {
     `createdFrom: ${t.createdFrom}`,
     `status:      ${t.status}`,
   ];
+  if (t.headlineEnvironment?.name != null) {
+    lines.push(`environment: ${t.headlineEnvironment.name}`);
+  }
   // G1a: surface priority when the backend ships it and it is non-null.
   if (t.priority) {
     lines.push(`priority:    ${t.priority}`);
@@ -15909,28 +16970,238 @@ interface PlanGeneratePartial {
   status: 'running';
   generationStatus: CliGenerationStatus | null;
   proposalsStaged: number;
+  /** Stages this run still had to start when it stopped; `null` when the
+   *  run attached to a stage it did not start and never learned the plan. */
+  stagesRemaining: CliGenerationStage[] | null;
+}
+
+/** Status → the stage it belongs to (idle/failed map to none). */
+function planStageOfStatus(status: CliGenerationStatus): CliGenerationStage | null {
+  switch (status) {
+    case 'exploring':
+      return 'exploration';
+    case 'strategizing':
+      return 'strategy';
+    case 'proposing':
+      return 'proposals';
+    default:
+      return null;
+  }
+}
+
+/**
+ * Follows the ladder from the command layer so the user sees WHERE they are:
+ * one `stage i/N <name> done <elapsed>` line per finished stage, and on an
+ * interruption a "paused during/after stage i/N" line that names what is
+ * left. The ladder itself only starts the next stage while this process is
+ * alive (verified live 2026-08-27), which is exactly why the copy says
+ * "re-run to continue" rather than "work continues".
+ */
+class PlanStageTracker {
+  /** Every stage this run will perform, in order; known from the first
+   *  accepted trigger, unknown (null) when the run only ever attached. */
+  planned: CliGenerationStage[] | null = null;
+  /** The stage this run believes is up next or running. */
+  private current: CliGenerationStage | null = null;
+  /** True once a poll has reported `current` as ACTIVE. `idle` is ambiguous
+   *  (not started yet vs. finished), so a stage is only ever marked done on
+   *  evidence: it was seen running and then stopped, a later stage was seen
+   *  running or accepted, or the run settled with proposals staged. */
+  private currentActive = false;
+  private currentSinceMs = 0;
+  private lastElapsedMs = 0;
+  private readonly done: CliGenerationStage[] = [];
+
+  constructor(private readonly emit: (line: string) => void) {}
+
+  /** An accepted trigger is ground truth: the stage it started is up now,
+   *  and every planned stage before it is finished (even if no poll saw it). */
+  onTrigger(response: CliGeneratePlansResponse): void {
+    if (response.status !== 'accepted' || response.stage === null) return;
+    if (this.planned === null) this.planned = [response.stage, ...response.stagesRemaining];
+    for (const s of this.planned) {
+      if (s === response.stage) break;
+      this.markDone(s);
+    }
+    if (this.current !== response.stage) {
+      this.current = response.stage;
+      this.currentActive = false;
+      this.currentSinceMs = this.lastElapsedMs;
+    }
+  }
+
+  onTick(plans: CliGetPlansResponse, elapsedMs: number): void {
+    this.lastElapsedMs = elapsedMs;
+    // A failed read is not a transition: nothing finished.
+    if (plans.generation.status === 'failed') return;
+    const stage = planStageOfStatus(plans.generation.status);
+    if (stage === this.current) {
+      if (stage !== null && !this.currentActive) {
+        this.currentActive = true;
+        this.currentSinceMs = elapsedMs;
+      }
+      return;
+    }
+    if (this.current !== null) {
+      if (stage === null && this.current === 'proposals') {
+        // The last stage has no "next stage" to prove it finished, and the
+        // server can report idle before the staged batch is visible (the
+        // ladder's billing guard #1 keeps polling through that blip). Only
+        // the settled read with proposals staged marks it done — settle().
+        return;
+      }
+      if (this.currentActive) {
+        this.markDone(this.current, elapsedMs);
+      } else if (stage === null) {
+        // idle before the stage was ever seen running: it has not started
+        // (the ladder's own dwell window). Keep waiting on the same stage.
+        return;
+      } else {
+        // A later stage seen running is as strong as an accepted trigger.
+        this.markDone(this.current);
+      }
+    }
+    this.current = stage;
+    this.currentActive = stage !== null;
+    this.currentSinceMs = elapsedMs;
+  }
+
+  /** The ladder settled with proposals staged: whatever was up is done. */
+  settle(plans: CliGetPlansResponse): void {
+    if (plans.proposals.length === 0) return;
+    if (this.current !== null) {
+      this.markDone(this.current, this.currentActive ? this.lastElapsedMs : undefined);
+    } else if (this.planned !== null) {
+      for (const s of this.planned) this.markDone(s);
+    }
+    this.current = null;
+    this.currentActive = false;
+  }
+
+  private markDone(stage: CliGenerationStage, nowMs?: number): void {
+    if (this.done.includes(stage)) return;
+    this.done.push(stage);
+    const took =
+      nowMs === undefined || stage !== this.current || !this.currentActive
+        ? ''
+        : ` ${formatPlanElapsed(nowMs - this.currentSinceMs)}`;
+    this.emit(`stage ${this.label(stage)} done${took}`);
+  }
+
+  /** `i/N name` when the plan is known, else just the name. */
+  label(stage: CliGenerationStage): string {
+    if (this.planned === null) return stage;
+    const i = this.planned.indexOf(stage);
+    return i === -1 ? stage : `${i + 1}/${this.planned.length} ${stage}`;
+  }
+
+  /** Stages this run has not started. An accepted stage counts as started
+   *  whether or not a poll has reported it running yet: the server has
+   *  committed to it (and, for exploration and proposals, charged for it). */
+  remaining(): CliGenerationStage[] | null {
+    if (this.planned === null) return null;
+    return this.planned.filter(s => !this.done.includes(s) && s !== this.current);
+  }
+
+  /** "during stage 2/3 strategy" / "after stage 1/3 exploration" / "". Whether a
+   *  poll has already reported the stage running is not the user's concern:
+   *  once accepted it runs to completion either way. */
+  position(): string {
+    if (this.current !== null) return `during stage ${this.label(this.current)}`;
+    const last = this.done[this.done.length - 1];
+    return last === undefined ? '' : `after stage ${this.label(last)}`;
+  }
+
+  /** The stuck-fuse line. `tries` is every start request this run sent
+   *  (accepted or "already in progress" alike — the split is internal, and
+   *  an accepted stage counts as started, so "would not start" would
+   *  contradict `position()`/`remaining()`). Deliberately no `Continue:` —
+   *  an immediate re-run repeats the same tries. */
+  stalledLine(tries: number): string {
+    const where = this.current === null ? 'Generation' : `Stage ${this.label(this.current)}`;
+    return (
+      `${where} is not making progress after ${tries} ${tries === 1 ? 'try' : 'tries'}. ` +
+      'Wait a few minutes, then run the same command again; it picks up from here.'
+    );
+  }
+
+  /** "N stages left." / "Nothing left to start." / "" (plan unknown). */
+  leftText(): string {
+    const rem = this.remaining();
+    if (rem === null) return '';
+    if (rem.length === 0) return ' Nothing left to start.';
+    return ` ${rem.length} stage${rem.length === 1 ? '' : 's'} left.`;
+  }
+
+  /** One-line stderr summary for every way the wait can stop early. */
+  pausedLine(projectId: string, lead: string, verb = 'Paused'): string {
+    const pos = this.position();
+    return (
+      `${lead} ${verb}${pos === '' ? '' : ` ${pos}`}.${this.leftText()}\n` +
+      `  Continue: testsprite test plan generate --project ${projectId}`
+    );
+  }
+
+  /** The same story as `pausedLine`, as the single-line JSON `nextAction`. */
+  detachNextAction(projectId: string): string {
+    const pos = this.position();
+    return (
+      `Plan generation paused${pos === '' ? '' : ` ${pos}`}.${this.leftText()} ` +
+      `Continue: testsprite test plan generate --project ${projectId}`
+    );
+  }
+}
+
+/** Plan-generate interrupt outcome consumed by the top-level JSON renderer
+ *  (`buildInterruptEnvelope`), the way `TunnelInterruptDetach` is for tunnels. */
+export interface PlanInterruptDetach {
+  projectId: string;
+  stagesRemaining: CliGenerationStage[] | null;
+  nextAction: string;
+}
+
+function attachPlanInterruptDetach(err: InterruptError, detach: PlanInterruptDetach): void {
+  (err as InterruptError & { planDetach?: PlanInterruptDetach }).planDetach = detach;
 }
 
 function makePlanGeneratePartial(
   projectId: string,
   lastSeen: CliGetPlansResponse | null,
+  stagesRemaining: CliGenerationStage[] | null = null,
 ): PlanGeneratePartial {
   return {
     projectId,
     status: 'running',
     generationStatus: lastSeen?.generation.status ?? null,
     proposalsStaged: lastSeen?.proposals.length ?? 0,
+    stagesRemaining,
   };
 }
 
-function renderPlanGeneratePartialText(partial: PlanGeneratePartial, reason: string): string {
-  const lines = [`projectId   ${partial.projectId}`, `status      running (${reason})`];
-  if (partial.generationStatus !== null) {
+function renderPlanGeneratePartialText(
+  partial: PlanGeneratePartial,
+  reason: string,
+  position = '',
+  verb = 'paused',
+  withContinue = true,
+): string {
+  const lines = [
+    `projectId   ${partial.projectId}`,
+    `status      ${verb} (${reason})${position === '' ? '' : ` ${position}`}`,
+  ];
+  if (position === '' && partial.generationStatus !== null) {
+    // Interrupted before any trigger answered: the only position we have is
+    // the status of the last read, so keep showing it (JSON has it anyway).
     lines.push(`stage       ${partial.generationStatus}`);
   }
-  lines.push(
-    `hint        Re-attach with: testsprite test plan generate --project ${partial.projectId}`,
-  );
+  if (partial.stagesRemaining !== null) {
+    lines.push(
+      `remaining   ${partial.stagesRemaining.length === 0 ? 'none' : partial.stagesRemaining.join(', ')}`,
+    );
+  }
+  if (withContinue) {
+    lines.push(`continue    testsprite test plan generate --project ${partial.projectId}`);
+  }
   return lines.join('\n');
 }
 
@@ -15941,8 +17212,9 @@ function renderPlanGeneratePartialText(partial: PlanGeneratePartial, reason: str
  * proposals) through `runGenerationLadder` and renders the staged
  * proposals. Exit 0 on staged proposals, 1 on a server-side stage failure,
  * 7 on timeout (typed `UNSUPPORTED` envelope — the raw ladder timeout is
- * not a CLI error), 130/143 on Ctrl-C detach (honest: work and charges
- * continue server-side), plus the usual catalog exits for trigger errors
+ * not a CLI error), 130/143 on Ctrl-C (the running stage finishes server-side;
+ * nothing after it starts until a re-run, see PlanStageTracker), plus the
+ * usual catalog exits for trigger errors
  * (412 → 6 with the exact fix command, 402 → 12, 404 → 4, 429 → 11).
  */
 export async function runPlanGenerate(
@@ -16000,6 +17272,10 @@ export async function runPlanGenerate(
   // migration bridge). Closing it needs the id on one of those wires.
   let resolvedProjectId = projectId;
   let lastSeen: CliGetPlansResponse | null = null;
+  // Stage position for the user (text mode only; JSON gets `stagesRemaining`).
+  const stageTracker = new PlanStageTracker(
+    opts.output === 'json' ? () => undefined : (line: string) => ticker.note(line),
+  );
 
   try {
     // Pre-trigger baseline snapshot: one plain GET BEFORE any POST, so the
@@ -16025,25 +17301,27 @@ export async function runPlanGenerate(
       idempotencyKey,
       sleep: deps.sleep,
       shutdown: shutdownOf(deps),
-      onTransition: opts.verbose ? (msg: string) => stderrFn(`[verbose] ${msg}`) : undefined,
+      onTransition: opts.verbose ? (msg: string) => ticker.note(`[verbose] ${msg}`) : undefined,
       onTick: (plans, elapsedMs) => {
         lastSeen = plans;
+        stageTracker.onTick(plans, elapsedMs);
         ticker.update(planTickerLine(plans, elapsedMs));
       },
       onAttach: () => {
-        stderrFn(
+        ticker.note(
           '[advisory] a generation stage is already running for this project (possibly ' +
             'started from the Portal) — attaching to it and polling.',
         );
       },
       onTrigger: (response, acceptedPosts) => {
         resolvedProjectId = response.projectId;
+        stageTracker.onTrigger(response);
         if (response.status === 'nothing_to_start') {
           if (acceptedPosts === 0) {
             // The FIRST trigger found the batch already staged: nothing ran,
             // nothing was charged. Regenerating on purpose is a Portal action
             // for now (design §11) — say so instead of silently no-opping.
-            stderrFn(
+            ticker.note(
               '[advisory] proposals are already staged for this project — showing the ' +
                 'existing batch (nothing new was started or charged). To regenerate, ' +
                 'review and accept or discard the staged batch in the Portal first.',
@@ -16064,13 +17342,11 @@ export async function runPlanGenerate(
               ...(response.stage !== null ? [response.stage] : []),
               ...response.stagesRemaining,
             ];
-            const label = stages.join(' + ');
-            stderrFn(
-              stages.includes('exploration')
-                ? `[hint] this project hasn't been explored yet — the full pipeline will run ` +
-                    `(${label}). Ctrl-C detaches safely; work continues server-side.`
-                : `[hint] running the missing pipeline stages (${label}). ` +
-                    `Ctrl-C detaches safely; work continues server-side.`,
+            const plural = stages.length === 1 ? 'stage' : 'stages';
+            ticker.note(
+              `[hint] ${stages.length} ${plural}: ${stages.join(', ')}.` +
+                `${stages.includes('exploration') ? ' Takes minutes.' : ''}` +
+                ' Ctrl-C is safe; re-run to continue.',
             );
           }
           // …and, when browser exploration is about to run, warn about
@@ -16079,7 +17355,7 @@ export async function runPlanGenerate(
           // it never blocks and never prompts; the CLI cannot know whether
           // the app actually requires login. Both output modes: stderr only.
           if (response.stage === 'exploration') {
-            stderrFn(
+            ticker.note(
               '[warn] exploration signs in only with the test account stored on the ' +
                 "project's default environment. If your app requires login and no test " +
                 'account is configured, the agents will explore only the public pages — ' +
@@ -16093,6 +17369,7 @@ export async function runPlanGenerate(
     });
 
     const plans = result.plans;
+    stageTracker.settle(plans);
     if (plans.generation.status === 'failed') {
       ticker.finalize(planTickerLine(plans, 0).replace(/ \(0s\)$/, ''));
       const payload = { projectId: resolvedProjectId, ...plans };
@@ -16139,46 +17416,66 @@ export async function runPlanGenerate(
     // Typed exit-7 conversion (the design's hard rule): the ladder's raw
     // timeout is NOT a CLI error and would otherwise exit 1. Mirror the
     // wait-site template — partial to stdout, typed envelope thrown.
+    // Every early stop below prints the same partial (stdout, so a redirected
+    // file is never 0-byte) and a stderr line naming the stage position. All
+    // but the stuck fuse add a `Continue:` line — an immediate re-run there
+    // would only repeat the same tries.
+    // The wording is deliberate: only the stage already running finishes on
+    // the server; the next one starts only from a re-run of this command.
+    const remaining = stageTracker.remaining();
+    const position = stageTracker.position();
     if (err instanceof PlanGenerationTimeoutError) {
-      ticker.finalize(`timed out after ${opts.timeoutSeconds}s`);
-      const partial = makePlanGeneratePartial(resolvedProjectId, err.lastPlans ?? lastSeen);
-      out.print(partial, () =>
-        renderPlanGeneratePartialText(partial, `timed out after ${opts.timeoutSeconds}s`),
+      const reason = `timed out after ${opts.timeoutSeconds}s`;
+      ticker.finalize(reason);
+      const partial = makePlanGeneratePartial(
+        resolvedProjectId,
+        err.lastPlans ?? lastSeen,
+        remaining,
       );
+      out.print(partial, () => renderPlanGeneratePartialText(partial, reason, position));
       throw ApiError.fromEnvelope({
         error: {
           code: 'UNSUPPORTED', // exit 7 per errors.md
-          message: `Timed out after ${opts.timeoutSeconds}s waiting for plan generation on project ${resolvedProjectId}.`,
+          // The prefix is the §13.3 discriminator between "slow" and a real
+          // 501 UNSUPPORTED — keep it literal.
+          message:
+            `Timed out after ${opts.timeoutSeconds}s waiting for plan generation on project ` +
+            `${resolvedProjectId}${position === '' ? '' : ` ${position}`}.${stageTracker.leftText()}`,
           nextAction:
-            `Generation continues server-side; re-running the same command re-attaches: ` +
-            `testsprite test plan generate --project ${resolvedProjectId} ` +
-            `(raise --timeout for exploration-heavy first runs).`,
+            `Continue: testsprite test plan generate --project ${resolvedProjectId} ` +
+            '(or raise --timeout)',
           requestId: 'local',
-          details: { projectId: resolvedProjectId, timeoutSeconds: opts.timeoutSeconds },
+          details: {
+            projectId: resolvedProjectId,
+            timeoutSeconds: opts.timeoutSeconds,
+            ...(remaining !== null ? { stagesRemaining: remaining } : {}),
+          },
         },
       });
     }
     if (err instanceof RequestTimeoutError) {
       ticker.finalize('request timed out');
-      const partial = makePlanGeneratePartial(resolvedProjectId, lastSeen);
-      out.print(partial, () => renderPlanGeneratePartialText(partial, 'request timed out'));
-      stderrFn(
-        `Plan generation is still in progress (request timed out). ` +
-          `Re-attach with: testsprite test plan generate --project ${resolvedProjectId}`,
+      const partial = makePlanGeneratePartial(resolvedProjectId, lastSeen, remaining);
+      out.print(partial, () =>
+        renderPlanGeneratePartialText(partial, 'request timed out', position),
       );
+      stderrFn(stageTracker.pausedLine(resolvedProjectId, 'Request timed out.'));
       throw err;
     }
     if (err instanceof InterruptError) {
       ticker.finalize(`interrupted (${err.signal})`);
-      const partial = makePlanGeneratePartial(resolvedProjectId, lastSeen);
+      const partial = makePlanGeneratePartial(resolvedProjectId, lastSeen, remaining);
       out.print(partial, () =>
-        renderPlanGeneratePartialText(partial, `interrupted (${err.signal})`),
+        renderPlanGeneratePartialText(partial, `interrupted (${err.signal})`, position),
       );
-      stderrFn(
-        `Interrupted (${err.signal}). Plan generation keeps running (and billing) on the ` +
-          `server until the current stage finishes.\n` +
-          `  Re-attach with: testsprite test plan generate --project ${resolvedProjectId}`,
-      );
+      stderrFn(stageTracker.pausedLine(resolvedProjectId, `Interrupted (${err.signal}).`));
+      // index.ts builds the JSON INTERRUPTED envelope from this, so it tells
+      // the same story as the line above (not the run-detach "test wait" one).
+      attachPlanInterruptDetach(err, {
+        projectId: resolvedProjectId,
+        stagesRemaining: remaining,
+        nextAction: stageTracker.detachNextAction(resolvedProjectId),
+      });
       throw err;
     }
     if (err instanceof ApiError && err.code === 'RATE_LIMITED') {
@@ -16186,11 +17483,10 @@ export async function runPlanGenerate(
       // a redirected stdout file must never be 0-byte.
       // The original ApiError is rethrown unchanged so exit stays 11.
       ticker.finalize('rate limited by the server');
-      const partial = makePlanGeneratePartial(resolvedProjectId, lastSeen);
-      out.print(partial, () => renderPlanGeneratePartialText(partial, 'rate limited'));
+      const partial = makePlanGeneratePartial(resolvedProjectId, lastSeen, remaining);
+      out.print(partial, () => renderPlanGeneratePartialText(partial, 'rate limited', position));
       stderrFn(
-        `Rate limited by the server (HTTP 429). Any started generation stage keeps running ` +
-          `server-side.\n  Re-attach with: testsprite test plan generate --project ${resolvedProjectId}`,
+        stageTracker.pausedLine(resolvedProjectId, 'Rate limited by the server (HTTP 429).'),
       );
       throw err;
     }
@@ -16206,10 +17502,18 @@ export async function runPlanGenerate(
       // the stage-failed INTERNAL (which already printed its card) never
       // double-prints. Rethrown unchanged.
       ticker.finalize('generation appears stuck');
-      const partial = makePlanGeneratePartial(resolvedProjectId, lastSeen);
-      out.print(partial, () => renderPlanGeneratePartialText(partial, 'appears stuck'));
+      const partial = makePlanGeneratePartial(resolvedProjectId, lastSeen, remaining);
+      out.print(partial, () =>
+        renderPlanGeneratePartialText(partial, 'appears stuck', position, 'stalled', false),
+      );
+      const fuse = err.details as { acceptedPosts: number; triggerPosts?: number };
+      stderrFn(stageTracker.stalledLine(fuse.triggerPosts ?? fuse.acceptedPosts));
       throw err;
     }
+    // Any other error (a 402 on a later stage's trigger, a 412 on a re-POST,
+    // an exhausted retry…) is rendered by index.ts as a plain line: end the
+    // live ticker row first so it never lands on the progress line.
+    ticker.finalize();
     throw withPlanFixNextAction(err, resolvedProjectId);
   }
 }
@@ -16449,12 +17753,13 @@ function createTestPlanCommand(deps: TestDeps): Command {
     .addHelpText(
       'after',
       '\nBehavior:\n' +
-        '  - Only the stages the project is missing actually run; a second call\n' +
-        '    resumes rather than starting over.\n' +
-        '  - Proposals are STAGED on the server for review; nothing is written to disk.\n' +
-        '  - Re-running the command re-attaches to an in-flight stage (409 attaches).\n' +
-        '  - Ctrl-C detaches locally; server-side work and charges continue.\n' +
-        '  - Exit 7 on --timeout: re-run the same command to re-attach.\n' +
+        '  - Runs the stages the project still needs (exploration for frontend,\n' +
+        '    strategy, proposals) and stops when proposals are staged for review.\n' +
+        '    Nothing is written to disk.\n' +
+        '  - Interrupt (exit 130/143/129) or timeout (exit 7): the stage in\n' +
+        '    progress finishes on its own, the rest wait. Run the same command\n' +
+        '    again to continue; it picks up where it left off. A stage that\n' +
+        '    already completed is never charged again.\n' +
         '  - Workspace credits are spent per stage that runs; the result line reports\n' +
         '    what THIS run charged (omitted when nothing new was charged).\n' +
         '    `testsprite usage` shows your balance.\n' +

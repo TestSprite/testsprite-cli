@@ -127,6 +127,8 @@ describe('doctor — Local tunnel', () => {
     // The whole reason the check exists: the remedy is a NEW key, not a
     // re-login, and nothing else in the CLI says so.
     expect(check?.detail).toMatch(/new API key/i);
+    expect(check?.detail).toContain('run:tunnel');
+    expect(check?.detail).not.toContain('predates');
   });
 
   it('warns — never fails — when the environment has no tunnel surface', async () => {

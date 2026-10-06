@@ -22,6 +22,7 @@ function makeTicker(redrawsInPlace = true): Ticker & { lines: string[] } {
       lines.push(line);
     },
     finalize: () => undefined,
+    note: () => undefined,
   };
 }
 

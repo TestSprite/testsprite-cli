@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as InterruptModule from './lib/interrupt.js';
+import type * as TunnelClientModule from './vendor/tunnel-client/index.js';
 
 // Keep the real parser, command, HTTP client, error renderer, and telemetry.
 // Process-wide handlers are outside these in-process invocation tests.
@@ -193,6 +194,10 @@ it.each(['create-batch', 'rerun'] as const)(
             }),
           );
         }
+        if (/\/tests\/[^/]+$/.test(url))
+          return new Response(JSON.stringify({ type: 'frontend', projectId: 'project_alice' }));
+        if (url.endsWith('/projects/project_alice/env'))
+          return new Response(JSON.stringify({ environments: [] }));
         throw interruption;
       }),
     );
@@ -316,6 +321,7 @@ describe('wait timeout telemetry through the entry point', () => {
         'borrowed-client',
         '--skip-preflight',
       ],
+      // Explicit --local remains a local invocation with a borrowed tunnel.
       local: true,
       timeout: true,
     },
@@ -498,6 +504,197 @@ describe('wait timeout telemetry through the entry point', () => {
   });
 });
 
+describe('local telemetry through the entry point', () => {
+  it.each([
+    {
+      args: ['test', 'run', 'test_abc', '--local', '5173', '--target-url', 'https://example.com'],
+      command: 'test run',
+      outcome: 'error',
+      exitCode: 5,
+    },
+    {
+      args: [
+        'project',
+        'create',
+        '--type',
+        'frontend',
+        '--name',
+        'local-app',
+        '--local',
+        '5173',
+        '--skip-preflight',
+      ],
+      command: 'project create',
+      outcome: 'success',
+      exitCode: 0,
+    },
+  ])('records explicit --local for $command ($outcome)', async scenario => {
+    vi.stubEnv('TESTSPRITE_NO_TELEMETRY', '0');
+    vi.stubEnv('DO_NOT_TRACK', '0');
+    const events: unknown[] = [];
+    const requests: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown, init?: RequestInit) => {
+        const path = new URL(String(input)).pathname;
+        requests.push(`${init?.method ?? 'GET'} ${path}`);
+        if (path.endsWith('/telemetry')) {
+          events.push(JSON.parse(String(init?.body)));
+          return new Response(null, { status: 204 });
+        }
+        if (path.endsWith('/projects') && init?.method === 'POST')
+          return new Response(
+            JSON.stringify({
+              projectId: 'project_local',
+              type: 'frontend',
+              name: 'local-app',
+              targetUrl: 'http://localhost:5173',
+              originMode: 'local',
+              createdFrom: 'cli',
+              createdAt: '2026-10-01T00:00:00Z',
+              updatedAt: '2026-10-01T00:00:00Z',
+            }),
+            { status: 201 },
+          );
+        throw new Error(`Unexpected request: ${path}`);
+      }),
+    );
+    process.argv = ['node', 'testsprite', ...scenario.args, '--output', 'json'];
+    await import('./index.js');
+    expect(process.exitCode ?? 0).toBe(scenario.exitCode);
+    expect(events).toEqual([
+      expect.objectContaining({
+        command: scenario.command,
+        outcome: scenario.outcome,
+        exitCode: scenario.exitCode,
+        local: true,
+      }),
+    ]);
+    expect(requests).toEqual(
+      scenario.exitCode === 0
+        ? ['POST /api/cli/v1/projects', 'POST /api/cli/v1/telemetry']
+        : ['POST /api/cli/v1/telemetry'],
+    );
+  });
+
+  it('records an automatically opened saved-environment tunnel without a --local flag', async () => {
+    vi.stubEnv('TESTSPRITE_NO_TELEMETRY', '0');
+    vi.stubEnv('DO_NOT_TRACK', '0');
+    vi.doMock('./vendor/tunnel-client/index.js', async importOriginal => ({
+      ...(await importOriginal<typeof TunnelClientModule>()),
+      TunnelClient: class {
+        async start() {}
+        async stop() {}
+      },
+    }));
+    const events: unknown[] = [];
+    const requests: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown, init?: RequestInit) => {
+        const path = new URL(String(input)).pathname;
+        const method = init?.method ?? 'GET';
+        requests.push(`${method} ${path}`);
+        if (path.endsWith('/telemetry')) {
+          events.push(JSON.parse(String(init?.body)));
+          return new Response(null, { status: 204 });
+        }
+        if (path.endsWith('/tests/test_auto'))
+          return new Response(
+            JSON.stringify({
+              id: 'test_auto',
+              type: 'frontend',
+              projectId: 'project_auto',
+              name: 'auto-test',
+            }),
+          );
+        if (path.endsWith('/projects/project_auto/env'))
+          return new Response(
+            JSON.stringify({
+              environments: [
+                {
+                  id: 'env_auto',
+                  name: 'local-app',
+                  url: 'http://localhost:5173',
+                  isDefault: true,
+                },
+              ],
+            }),
+          );
+        if (method === 'POST' && path.endsWith('/tunnel'))
+          return new Response(
+            JSON.stringify({
+              clientId: 'client_auto',
+              secret: 'fixture-secret',
+              controlUrl: 'ws://tunnel.example/control',
+              tunnelAddr: 'tunnel.example:7400',
+              expiresAt: '2026-10-02T00:00:00Z',
+            }),
+            { status: 201 },
+          );
+        if (method === 'DELETE' && path.endsWith('/tunnel/client_auto'))
+          return new Response(null, { status: 204 });
+        if (method === 'POST' && path.endsWith('/tests/test_auto/runs'))
+          return new Response(
+            JSON.stringify({
+              runId: 'run_auto',
+              status: 'queued',
+              enqueuedAt: '2026-10-01T00:00:00Z',
+              codeVersion: 'v1',
+              targetUrl: 'http://localhost:5173',
+              tunnelClientId: 'client_auto',
+            }),
+          );
+        if (path.endsWith('/runs/run_auto'))
+          return new Response(
+            JSON.stringify({
+              runId: 'run_auto',
+              testId: 'test_auto',
+              projectId: 'project_auto',
+              userId: 'user_auto',
+              status: 'passed',
+              source: 'cli',
+              createdAt: '2026-10-01T00:00:00Z',
+              startedAt: null,
+              finishedAt: '2026-10-01T00:00:01Z',
+              codeVersion: 'v1',
+              targetUrl: 'http://localhost:5173',
+              createdFrom: 'cli',
+              failedStepIndex: null,
+              failureKind: null,
+              error: null,
+              videoUrl: null,
+              stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
+            }),
+          );
+        throw new Error(`Unexpected request: ${method} ${path}`);
+      }),
+    );
+    process.argv = [
+      'node',
+      'testsprite',
+      'test',
+      'run',
+      'test_auto',
+      '--skip-preflight',
+      '--output',
+      'json',
+    ];
+    try {
+      await import('./index.js');
+      expect(process.exitCode ?? 0).toBe(0);
+      expect(events).toEqual([
+        expect.objectContaining({ command: 'test run', outcome: 'success', local: true }),
+      ]);
+      expect(requests).toContain('POST /api/cli/v1/tunnel');
+      expect(requests).toContain('DELETE /api/cli/v1/tunnel/client_auto');
+      expect(JSON.parse(stdout)).toMatchObject({ runId: 'run_auto', status: 'passed' });
+    } finally {
+      vi.doUnmock('./vendor/tunnel-client/index.js');
+    }
+  });
+});
+
 // End-to-end proof that the plain-CLIError catch branch in
 // index.ts now emits the same structured {error:{code,message,...}} envelope
 // as the ApiError/InterruptError/RequestTimeoutError branches, instead of the
@@ -599,5 +796,44 @@ describe('errorOrigin telemetry — server counterpart', () => {
     expect(process.exitCode).toBe(7);
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ errorCode: 'UNSUPPORTED', errorOrigin: 'server' });
+  });
+});
+
+describe('ApiError branch redacts secrets in the JSON error envelope', () => {
+  it('error envelope redacts nested secrets', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              error: {
+                code: 'VALIDATION_ERROR',
+                message: 'Invalid request.',
+                nextAction: 'Fix it.',
+                requestId: 'req_redact',
+                details: {
+                  field: 'password',
+                  echoedCredentials: {
+                    password: 'hunter2-DO-NOT-PRINT',
+                    apiKey: 'sk-should-not-leak',
+                  },
+                },
+              },
+            }),
+            { status: 400 },
+          ),
+      ),
+    );
+    process.argv = ['node', 'testsprite', 'auth', 'whoami', '--output', 'json'];
+    await import('./index.js');
+    expect(process.exitCode).toBe(5);
+    expect(stderr).not.toContain('hunter2-DO-NOT-PRINT');
+    expect(stderr).not.toContain('sk-should-not-leak');
+    const envelope = JSON.parse(stderr.slice(stderr.indexOf('{')));
+    expect(envelope.error.details).toEqual({
+      field: 'password',
+      echoedCredentials: { password: '[REDACTED]', apiKey: '[REDACTED]' },
+    });
   });
 });

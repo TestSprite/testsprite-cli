@@ -243,7 +243,48 @@ Commands:
   env                                Manage a project's environments — named
                                      URL + test-account bundles that \`test run
                                      --env <name>\` selects
+  sign-in                            Inspect or change how an environment signs
+                                     in to the app under test.
   help [command]                     display help for command
+"
+`;
+
+exports[`--help snapshots > project create 1`] = `
+"Usage: testsprite project create [options]
+
+Create a new project
+
+Options:
+  --type <frontend|backend>    project type (required)
+  --name <name>                project name (required)
+  --url <url>                  target URL (public http/https or a loopback http
+                               origin with an explicit port; required for
+                               frontend unless --local is used; also required
+                               for backend on the V3 execution path — see \`auth
+                               status\` for your routing)
+  --local <port>               shorthand for --url http://localhost:<port>
+                               (1-65535; excludes --url; runs open a tunnel
+                               automatically)
+  --skip-preflight             skip the local TCP listener check before project
+                               creation
+  --description <text>         not supported — projects have no description
+                               (test-level descriptions are set on \`test
+                               create\`)
+  --username <user>            optional auth username
+  --password <pw>              optional auth password (use --password-file for
+                               non-interactive)
+  --password-file <path>       read password from file instead of inline flag
+  --instruction <text>         optional FE plan-gen instruction hint
+  --test-id-attributes <list>  comma-separated DOM attributes the engine should
+                               prefer as locators, highest priority first (e.g.
+                               data-element,data-testid). Unique values are
+                               exported as page.locator('[attr="…"]').
+  --idempotency-key <token>    opaque idempotency token. Defaults to a UUIDv4
+                               minted per invocation.
+  -h, --help                   display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
 "
 `;
 
@@ -268,6 +309,92 @@ Options:
   --role <role>              document role: api-doc (API spec, default) | prd
   --name <display-name>      display name for the document (default: file
                              basename)
+  --idempotency-key <token>  opaque idempotency token. Defaults to a UUIDv4
+                             minted per invocation.
+  -h, --help                 display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > project env create 1`] = `
+"Usage: testsprite project env create [options] <project-id>
+
+Create an environment (--name and one of --url / --local are required).
+Exit codes:
+  0  success
+  3  auth error
+  4  project not found
+  5  validation error
+  6  conflict (name already exists) / precondition (OTP or SSO on a local environment)
+  7  unsupported (V2 environments or OTP/SSO in BYOC)
+  10 service unavailable
+  11 rate limited
+  13 SSO feature gated
+  14 client too old
+
+Options:
+  --name <name>                  environment name, unique within the project
+                                 (required)
+  --url <url>                    address runs open (public http/https, or a
+                                 loopback http origin with an explicit port)
+  --local <port>                 shorthand for --url http://localhost:<port>
+                                 (1-65535; excludes --url; frontend only)
+  --skip-preflight               skip the local TCP listener check before
+                                 creating
+  --username <user>              test-account username the browser logs in with
+  --password <pw>                test-account password (prefer --password-file)
+  --password-file <path>         read the password from a file instead of the
+                                 command line
+  --var <KEY=VALUE>              set a custom variable (repeatable); shown in
+                                 plain text by \`env get\` — not for secrets, use
+                                 --username/--password (default: [])
+  --sign-in <mode>               public, account, otp, or manual (aliases:
+                                 none, credentials, sso)
+  --otp-channel <email,sms>      OTP channels: email and/or sms; repeat or
+                                 comma-separate
+  --session-ttl <seconds|never>  SSO session reuse lifetime: 1–2592000 seconds
+                                 or never (manual only)
+  --set-default                  make this the project's default environment
+                                 (default: false)
+  --idempotency-key <token>      opaque idempotency token. Defaults to a UUIDv4
+                                 minted per invocation.
+  -h, --help                     display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > project env update 1`] = `
+"Usage: testsprite project env update [options] <project-id> <name>
+
+Change an environment's URL, credentials or name.
+Exit codes:
+  0  success
+  3  auth error
+  4  project (or environment) not found
+  5  validation error
+  6  conflict (name already exists) / precondition (credentials or --local on an SSO or OTP environment; see \`project sign-in set\`)
+
+Options:
+  --url <url>                new address runs open (public http/https, or a
+                             loopback http origin with an explicit port)
+  --local <port>             shorthand for --url http://localhost:<port>
+                             (1-65535; excludes --url)
+  --skip-preflight           skip the local TCP listener check before the
+                             update
+  --username <user>          new test-account username
+  --password <pw>            new test-account password (prefer --password-file)
+  --password-file <path>     read the new password from a file
+  --clear-credentials        remove stored username and password; disable
+                             account login
+  --var <KEY=VALUE>          merge a custom variable (repeatable); shown in
+                             plain text by \`env get\` — not for secrets, use
+                             --username/--password (default: [])
+  --rename <new-name>        rename the environment (runs keep referring to it
+                             by the new name)
   --idempotency-key <token>  opaque idempotency token. Defaults to a UUIDv4
                              minted per invocation.
   -h, --help                 display help for command
@@ -309,6 +436,96 @@ Options:
                             keys)
   --no-header               suppress the text table header row
   -h, --help                display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > project sign-in 1`] = `
+"Usage: testsprite project sign-in [options] [command]
+
+Inspect or change how an environment signs in to the app under test.
+
+Options:
+  -h, --help                  display help for command
+
+Commands:
+  get [options] <project-id>  Show the environment sign-in mode, credentials
+                              status, OTP channels, or SSO session.
+  set [options] <project-id>  Set the sign-in mode; choose OTP when creating a
+                              new environment.
+  help [command]              display help for command
+"
+`;
+
+exports[`--help snapshots > project sign-in get 1`] = `
+"Usage: testsprite project sign-in get [options] <project-id>
+
+Show the environment sign-in mode, credentials status, OTP channels, or SSO
+session.
+
+Options:
+  --env <name>  environment name (defaults to the project default)
+  -h, --help    display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > project sign-in set 1`] = `
+"Usage: testsprite project sign-in set [options] <project-id>
+
+Set the sign-in mode; choose OTP when creating a new environment.
+
+Options:
+  --mode <mode>                  required: public, account, otp, or manual
+                                 (aliases: none, credentials, sso)
+  --env <name>                   environment name (defaults to the project
+                                 default)
+  --username <user>              test-account username (account only)
+  --password <pw>                test-account password (prefer --password-file;
+                                 account only)
+  --password-file <path>         read the test-account password from a file
+                                 (account only)
+  --session-ttl <seconds|never>  SSO session reuse lifetime: 1–2592000 seconds
+                                 or never (manual only)
+  --idempotency-key <token>      opaque idempotency token. Defaults to a UUIDv4
+                                 minted per invocation.
+  -h, --help                     display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > project update 1`] = `
+"Usage: testsprite project update [options] <project-id>
+
+Update project metadata
+
+Options:
+  --name <name>                new project name
+  --url <url>                  new target URL (public http/https, or a loopback
+                               http origin with an explicit port)
+  --local <port>               shorthand for --url http://localhost:<port>
+                               (1-65535; excludes --url; frontend only)
+  --skip-preflight             skip the local TCP listener check before the
+                               update
+  --username <user>            new auth username
+  --password <pw>              new auth password
+  --password-file <path>       read new password from file
+  --instruction <text>         new FE plan-gen instruction hint
+  --test-id-attributes <list>  comma-separated DOM attributes the engine should
+                               prefer as locators, highest priority first (e.g.
+                               data-element,data-testid); replaces the current
+                               list
+  --clear-test-id-attributes   remove the test-id attribute list (engine falls
+                               back to data-testid) (default: false)
+  --idempotency-key <token>    opaque idempotency token. Defaults to a UUIDv4
+                               minted per invocation.
+  -h, --help                   display help for command
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
@@ -374,8 +591,8 @@ Commands:
     5  validation error (missing --confirm, missing --project with --all, etc.)
   
   Note: a 404 "not found" response is counted as skipped in the summary, not an error.
-  run [options] [test-id...]            Trigger one test run, or several local frontend runs through one tunnel. With --wait, polls until terminal status.
-  Use --all --project <id> for a wave-ordered batch run, or add --local <port> to run its frontend tests through one tunnel.
+  run [options] [test-id...]            Trigger one or several test runs. Saved loopback environments open a tunnel automatically and wait for a verdict.
+  Use --all --project <id> for a wave-ordered batch run. Loopback environments share one tunnel.
   
   Exit codes:
     0  passed (or queued without --wait)
@@ -391,8 +608,10 @@ Commands:
   
   On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
   
-  Ctrl-C during an ordinary --wait detaches; an owned --local tunnel cancels unfinished runs by default.
+  Ctrl-C during an ordinary --wait detaches; an owned tunnel cancels unfinished runs by default.
   Stop a detached run with: testsprite test cancel <run-id>
+  Local environments: dev servers can take a minute per page through the tunnel.
+  For a heavy dev server, test a built server: npm run build, then your framework preview/start command.
   wait [options] <run-id...>            Wait for one or more runs to reach a terminal status.
   
   With several run-ids the runs are polled concurrently under one shared
@@ -542,13 +761,16 @@ Options:
                              --wait to block until terminal. (default: false)
   --wait                     with --run, poll until terminal status (default:
                              false)
+  --no-wait                  detach without opening an automatic environment
+                             tunnel
   --timeout <s>              with --run --wait, max seconds to wait
   --target-url <url>         frontend tests only: use the environment already
                              pointing at this URL's origin, or a temporary one
                              TestSprite deletes when the run finishes; with
-                             --env, use its settings against this URL
-  --env <name>               with --run, run against the named project
-                             environment
+                             --env, use its settings against this URL; loopback
+                             URLs open a tunnel automatically
+  --env <name>               with --run, select the named project environment;
+                             loopback URLs open a tunnel automatically
   --skip-preflight           skip the pre-charge reachability probe for a
                              target URL. The probe runs from this machine, not
                              from the Lambda that executes the test, so it can
@@ -573,7 +795,7 @@ Options:
 Plan file format (--plan-from <file>) — minimal valid example:
 
 {
-  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.13.0/schemas/plan.schema.json",
+  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.14.0/schemas/plan.schema.json",
   "projectId": "prj_abc123",
   "type": "frontend",
   "name": "Login rejects an empty password",
@@ -638,14 +860,18 @@ Options:
                              lever.
   --wait                     with --run, poll each run until terminal status
                              (default: false)
+  --no-wait                  detach without opening an automatic environment
+                             tunnel
   --timeout <s>              with --run --wait, per-run max seconds to wait
                              (1-3600, default 600)
   --target-url <url>         frontend tests only: use the environment already
                              pointing at this URL's origin, or a temporary one
                              TestSprite deletes when the run finishes; with
-                             --env, use its settings against this URL
-  --env <name>               with --run, run each created test against the
-                             named project environment
+                             --env, use its settings against this URL; loopback
+                             URLs open a tunnel automatically
+  --env <name>               with --run, select the named project environment
+                             for each test; loopback URLs open a tunnel
+                             automatically
   --skip-preflight           skip the pre-charge reachability probe for a
                              target URL. The probe runs from this machine, not
                              from the Lambda that executes the test, so it can
@@ -736,6 +962,8 @@ List tests in a project
 
 Options:
   --project <id>            project id (returned by \`testsprite project list\`)
+  --env <name>              show frontend test statuses for the named project
+                            environment
   --type <type>             filter by test type (frontend|backend)
   --created-from <source>   filter by where the test was authored
                             (portal|mcp|cli)
@@ -829,12 +1057,13 @@ Options:
   -h, --help                 display help for command
 
 Behavior:
-  - Only the stages the project is missing actually run; a second call
-    resumes rather than starting over.
-  - Proposals are STAGED on the server for review; nothing is written to disk.
-  - Re-running the command re-attaches to an in-flight stage (409 attaches).
-  - Ctrl-C detaches locally; server-side work and charges continue.
-  - Exit 7 on --timeout: re-run the same command to re-attach.
+  - Runs the stages the project still needs (exploration for frontend,
+    strategy, proposals) and stops when proposals are staged for review.
+    Nothing is written to disk.
+  - Interrupt (exit 130/143/129) or timeout (exit 7): the stage in
+    progress finishes on its own, the rest wait. Run the same command
+    again to continue; it picks up where it left off. A stage that
+    already completed is never charged again.
   - Workspace credits are spent per stage that runs; the result line reports
     what THIS run charged (omitted when nothing new was charged).
     \`testsprite usage\` shows your balance.
@@ -883,6 +1112,10 @@ Options:
                               this substring (case-insensitive)
   --wait                      block until terminal status or --timeout elapses
                               (default: false)
+  --no-wait                   detach without opening an automatic environment
+                              tunnel
+  --skip-preflight            skip the loopback port probe before opening a
+                              tunnel
   --timeout <s>               with --wait, max seconds to wait (1–3600, default
                               600)
   --no-auto-heal              replay the saved script verbatim instead of
@@ -898,10 +1131,12 @@ Options:
                               its test-account credentials, auto-auth and OTP
                               settings (names: \`testsprite project env list
                               <project-id>\`). Omit to keep using the project's
-                              default environment. Applies to every test of a
-                              batch rerun.
-  --max-concurrency <n>       with --wait, max in-flight polls at once (1-100,
-                              default: 50)
+                              default environment. Loopback URLs open a tunnel
+                              automatically. Applies to every test of a batch
+                              rerun.
+  --max-concurrency <n>       with a tunnel, max runs in flight (1-10, default
+                              5); otherwise with --wait, max polls (1-100,
+                              default 50)
   --idempotency-key <key>     opaque key for safe retries (1–256 chars).
                               Printed to stderr at --verbose if auto-generated.
   --report <format>           with batch --wait: write a JUnit XML sidecar
@@ -987,8 +1222,8 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > test run 1`] = `
 "Usage: testsprite test run [options] [test-id...]
 
-Trigger one test run, or several local frontend runs through one tunnel. With --wait, polls until terminal status.
-Use --all --project <id> for a wave-ordered batch run, or add --local <port> to run its frontend tests through one tunnel.
+Trigger one or several test runs. Saved loopback environments open a tunnel automatically and wait for a verdict.
+Use --all --project <id> for a wave-ordered batch run. Loopback environments share one tunnel.
 
 Exit codes:
   0  passed (or queued without --wait)
@@ -1004,14 +1239,17 @@ Exit codes:
 
 On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
 
-Ctrl-C during an ordinary --wait detaches; an owned --local tunnel cancels unfinished runs by default.
+Ctrl-C during an ordinary --wait detaches; an owned tunnel cancels unfinished runs by default.
 Stop a detached run with: testsprite test cancel <run-id>
+Local environments: dev servers can take a minute per page through the tunnel.
+For a heavy dev server, test a built server: npm run build, then your framework preview/start command.
 
 Options:
   --target-url <url>          frontend tests only: use the environment already
                               pointing at this URL's origin, or a temporary one
                               TestSprite deletes when the run finishes; with
-                              --env, use its settings against this URL
+                              --env, use its settings against this URL;
+                              loopback URLs open a tunnel automatically
   --skip-preflight            skip the pre-charge reachability probe for a
                               target URL. The probe runs from this machine, not
                               from the Lambda that executes the test, so it can
@@ -1021,43 +1259,47 @@ Options:
                               calls when set. (default: false)
   --local <port>              run against an app on THIS machine, reached
                               through a TestSprite tunnel. The test runner
-                              navigates to http://127.0.0.1:<port> and its
+                              navigates to http://localhost:<port> and its
                               traffic is proxied back to you for as long as
                               this command runs. Implies --wait (the tunnel
                               closes when the command exits, so a detached run
-                              could not finish). Frontend tests only; several
-                              ids or --all share one tunnel (5 concurrent by
-                              default, at most 10). Before anything is minted
-                              or billed, the port is probed and a dead one is
-                              refused.
-  --local-host <host>         with --local, which loopback address to name in
-                              the run's target URL — one of localhost,
-                              127.0.0.1, ::1 (default 127.0.0.1). Use localhost
-                              if your app only answers on that name, or ::1 for
-                              an IPv6-only listener.
-  --tunnel-client <id>        with --local, attach to a tunnel already running
-                              under \`testsprite tunnel start\` instead of
-                              opening a new one. The id is the non-secret
-                              handle that command prints; the tunnel stays
-                              owned by that process and is not closed when this
-                              run or batch finishes.
-  --no-cancel-on-interrupt    with --local, skip automatic cancellation when an
-                              owned tunnel is about to close or a borrowed
+                              could not finish). Frontend tests only; a
+                              matching saved environment keeps its host
+                              spelling; several ids or --all share one tunnel
+                              (5 concurrent by default, at most 10). Before
+                              anything is minted or billed, the port is probed
+                              and a dead one is refused.
+  --local-host <host>         with --local, override which loopback address to
+                              name in the run's target URL — one of localhost,
+                              127.0.0.1, ::1 (default: saved matching host,
+                              else localhost). Use localhost if your app only
+                              answers on that name, or ::1 for an IPv6-only
+                              listener.
+  --tunnel-client <id>        for a loopback environment or --local, attach to
+                              a tunnel already running under \`testsprite tunnel
+                              start\` instead of opening a new one. The id is
+                              the non-secret handle that command prints; the
+                              tunnel stays owned by that process and is not
+                              closed when this run or batch finishes.
+  --no-cancel-on-interrupt    with a tunnel, skip automatic cancellation when
+                              an owned tunnel is about to close or a borrowed
                               tunnel's owner disappears. An ordinary interrupt
                               of a borrowed run never cancels it because its
                               tunnel remains alive.
   --env <name>                run against the named project environment — its
                               test-account credentials, auto-auth and OTP
                               settings (names: \`testsprite project env list
-                              <project-id>\`). Combine with --local to use those
-                              credentials against your own machine; without
-                              --local, the run opens that environment's URL.
-                              Omit --env to keep using the project's default
-                              environment. Also applies with --all.
+                              <project-id>\`). A loopback environment opens a
+                              tunnel automatically. The run opens that
+                              environment's URL. Omit --env to keep using the
+                              project's default environment. Also applies with
+                              --all.
   --wait                      poll until terminal status or --timeout elapses
                               (default: false)
+  --no-wait                   detach without opening an automatic environment
+                              tunnel
   --timeout <s>               with --wait, max seconds per run (1–3600; default
-                              600, or 1200 with --local)
+                              600, or 1200 through a tunnel)
   --idempotency-key <key>     opaque key for safe retries (1–256 chars); local
                               batches append each test id. Auto-generated keys
                               print to stderr in JSON, verbose or debug mode.
@@ -1070,11 +1312,11 @@ Options:
                               project list\`)
   --filter <substr>           with --all: only run tests whose name contains
                               this substring (case-insensitive)
-  --max-concurrency <n>       with --local, max runs in flight through one
+  --max-concurrency <n>       with a tunnel, max runs in flight through one
                               tunnel (1-10, default 5); with --all --wait
-                              without --local, max polls (1-100, default 50)
-  --report <format>           with a --wait batch (--all or several local ids):
-                              write a JUnit XML sidecar report after polling
+                              without a tunnel, max polls (1-100, default 50)
+  --report <format>           with a --wait batch (--all or several ids): write
+                              a JUnit XML sidecar report after polling
                               (accepted: junit)
   --report-file <path>        output path for --report (atomic write)
   --report-suite-name <name>  optional JUnit <testsuite name=...> override
@@ -1181,7 +1423,7 @@ Commands:
   delete [options] <list-id>               Delete a test list and its schedules (requires --confirm)
   add [options] <list-id> <test-id...>     Add one or more tests to a test list
   remove [options] <list-id> <test-id...>  Remove one or more tests from a test list
-  run [options] <list-id>                  Run a test list (dispatch its cases and return pollable run ids)
+  run [options] <list-id>                  Run a test list (dispatch its cases and return pollable run ids). Loopback environments open a tunnel automatically and wait.
   help [command]                           display help for command
 "
 `;
@@ -1278,16 +1520,22 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > testlist run 1`] = `
 "Usage: testsprite testlist run [options] <list-id>
 
-Run a test list (dispatch its cases and return pollable run ids)
+Run a test list (dispatch its cases and return pollable run ids). Loopback
+environments open a tunnel automatically and wait.
 
 Options:
   --case <test-id>            run only this case (repeatable; default: every
                               case in the list) (default: [])
   --wait                      poll every dispatched run until terminal or
                               --timeout (default: false)
+  --no-wait                   detach without opening an automatic environment
+                              tunnel
+  --skip-preflight            skip the loopback port probe before opening a
+                              tunnel
   --timeout <s>               with --wait, max seconds to wait (1–3600, default
                               600)
-  --max-concurrency <n>       with --wait, max in-flight polls at once (1-50,
+  --max-concurrency <n>       with a tunnel, max runs in flight (1-10, default
+                              5); otherwise with --wait, max polls (1-50,
                               default 10)
   --idempotency-key <key>     caller-supplied idempotency key (1-256 chars)
   --report <format>           with --wait: write a JUnit XML sidecar after
@@ -1402,8 +1650,8 @@ Commands:
                               tunnel
   help [command]              display help for command
 
-\`testsprite test run <id> --local <port>\` opens and closes a tunnel for you for a single
-run. Use these commands when you want one tunnel to serve several runs, or to check on
+Frontend runs automatically open and close a tunnel when the selected environment URL
+is on this machine. Use these commands when you want one tunnel to serve several runs, or to check on
 one that a run reported as down.
 
 A tunnel lives only as long as \`tunnel start\` is running — there is no background
@@ -1412,7 +1660,7 @@ is never written to disk.
 
 Examples:
   testsprite tunnel start                                   # hold a tunnel open (Ctrl-C to stop)
-  testsprite test run <id> --local 5173 --tunnel-client <id>
+  testsprite test run <id> --env <name> --tunnel-client <id>
   testsprite tunnel list
   testsprite tunnel status <id>
   testsprite tunnel stop <id>
@@ -1430,6 +1678,7 @@ Options:
   -h, --help  display help for command
 
 Shows each tunnel client id, connection status, creation time and expiry.
+Includes tunnels automatically opened for environments on this machine.
 
 Exit codes:
   0  listed (possibly empty)
@@ -1456,13 +1705,40 @@ Options:
   -h, --help       display help for command
 
 Prints the client id to stderr as soon as it is minted, before connecting; pass it
-to \`test run --local <port> --tunnel-client <id>\`.
+to \`test run <id> --env <name> --tunnel-client <id>\` for an environment on this machine.
+Frontend runs normally open their own tunnel automatically for a loopback environment URL.
+
+Dev servers can take a minute per page through the tunnel. For a heavy dev server,
+test a built server: \`npm run build\`, then your framework's preview/start command.
 
 Exit codes:
   0  you stopped it (Ctrl-C is the normal way to end this command)
   3  auth error — the key needs the \`run:tunnel\` scope; mint a new key
  10  the tunnel service disconnected the client, or it never connected
  11  rate limited, or too many tunnels are already open for this account
+
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > tunnel status 1`] = `
+"Usage: testsprite tunnel status [options] <client-id>
+
+Report whether a tunnel client of yours is connected
+
+Options:
+  -h, --help  display help for command
+
+\`offline\` means the API answered and said nothing is connected with that id. A failure
+to reach TestSprite is reported as its own error, never as \`offline\`.
+Use the client id printed by a run that automatically opened a tunnel.
+
+Exit codes:
+  0  answered (the answer may be \`offline\`)
+  4  no such tunnel for this account
+ 10  could not reach TestSprite to ask
 
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
@@ -1483,6 +1759,7 @@ Options:
 
 Stopping one that is already gone succeeds. Revoking the credential
 also makes a running \`tunnel start\` exit within ~15 s.
+A run that automatically opened this tunnel loses access to its environment when you stop it.
 Stopping all requires --confirm; --dry-run previews sample ids without it.
 
 Exit codes:

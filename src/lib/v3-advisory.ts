@@ -30,7 +30,6 @@ export function routingLabel(v3Enabled: boolean): 'v3' | 'v2' {
  */
 export const V3_ROUTING_ADVISORY: string[] = [
   '[advisory] V3 routing is on for this account. While these gaps are open:',
-  '  - `--target-url` is ignored on frontend runs (the run uses the project environment)',
   '  - a frontend rerun replays the run it was pointed at, not necessarily the latest saved code',
 ];
 

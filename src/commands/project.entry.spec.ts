@@ -52,6 +52,50 @@ function run(flags: string[], command = ['project', 'create', '--name', 'Local a
 // timeout must sit above that ceiling, or a slow runner fails the test while
 // the child is still inside its own budget.
 describe('local project admission through the CLI entry', { timeout: 20_000 }, () => {
+  it('routes project sign-in get through the real CLI entry', () => {
+    const result = run(['--output', 'json'], ['project', 'sign-in', 'get', 'proj_1']);
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain(
+      'HTTP: https://api.example.com/api/cli/v1/projects/proj_1/sign-in',
+    );
+  });
+
+  it('validates a missing sign-in mode with exit 5 before the sign-in request', () => {
+    const result = run([], ['project', 'sign-in', 'set', 'proj_1']);
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(5);
+    expect(result.stderr).toContain('--mode is required: public, account or manual');
+    expect(result.stderr.match(/HTTP: .*/g)).toEqual([
+      'HTTP: https://api.example.com/api/cli/v1/telemetry',
+    ]);
+  });
+
+  it.each(['constructor', '__proto__', 'toString'])(
+    'rejects inherited sign-in mode %s before an API request',
+    mode => {
+      for (const command of [
+        ['project', 'sign-in', 'set', 'proj_1', '--mode', mode],
+        [
+          'project',
+          'env',
+          'create',
+          'proj_1',
+          '--name',
+          'staging',
+          '--url',
+          'https://example.com',
+          '--sign-in',
+          mode,
+        ],
+      ]) {
+        const result = run([], command);
+        expect(result.error).toBeUndefined();
+        expect(result.status).toBe(5);
+        expect(result.stderr).not.toContain('HTTP: https://api.example.com/api/cli/v1/projects/');
+      }
+    },
+  );
   it.each([
     ['--type', 'frontend', '--local', '3000'],
     ['--type', 'frontend', '--local', '3000', '--url', 'https://example.com'],

@@ -688,3 +688,16 @@ describe('run-scoped execution link in CI output', () => {
     expect(ann).not.toContain('/case/t1');
   });
 });
+
+describe('environment batch skips', () => {
+  it('counts skipped backend IDs alongside accepted runs', () => {
+    const summary = summarizeAcceptedPayload(
+      JSON.stringify({
+        accepted: [{ testId: 'a', runId: 'r', status: 'passed' }],
+        skipped: [{ testId: 'b', reason: 'backend-test' }],
+      }),
+    );
+    expect(summary).toMatchObject({ total: 2, passed: 1, skipped: 1, failed: 0 });
+    expect(summary.runs).toContainEqual({ testId: 'b', status: 'skipped', error: 'backend-test' });
+  });
+});
