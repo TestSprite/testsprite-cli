@@ -614,6 +614,47 @@ describe('runInit — happy path (interactive)', () => {
     expect(captured.stderr.some(line => line.includes('setup identity lookup failed'))).toBe(true);
   });
 
+  it('debug mode reports resolve endpoint profile read failure without failing the command', async () => {
+    const { captured, deps } = makeCapture();
+    const fetchMock = makeOkFetch()!;
+    const actual = await vi.importActual<typeof NodeFs>('node:fs');
+    let fetchCount = 0;
+    const trackingFetch = vi.fn(
+      async (input: Parameters<typeof fetchMock>[0], init?: Parameters<typeof fetchMock>[1]) => {
+        fetchCount++;
+        return fetchMock(input, init);
+      },
+    );
+
+    vi.mocked(readFileSync).mockImplementation((...args) => {
+      // After both configure and whoami fetch calls have completed, fail the subsequent readProfile call in resolveReportedEndpoint
+      if (fetchCount >= 2 && args[0] === credentialsPath) {
+        throw new Error('simulated credentials read error');
+      }
+      return actual.readFileSync(...args);
+    });
+
+    await runInit(
+      makeBaseOpts({ apiKey: 'sk-user-json-test', debug: true, noAgent: true, output: 'json' }),
+      {
+        ...deps,
+        fetchImpl: trackingFetch,
+        credentialsPath,
+        isTTY: false,
+      },
+    );
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
+    expect(parsed.status).toBe('initialized');
+    expect(
+      captured.stderr.some(line =>
+        line.includes(
+          '[debug] resolve endpoint profile read failed: simulated credentials read error',
+        ),
+      ),
+    ).toBe(true);
+  });
+
   it('stops before skill installation when the identity request is interrupted', async () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs, writeCalls, mkdirCalls } = makeMemFs();

@@ -48,13 +48,21 @@ const DEFAULT_API_URL = 'https://api.testsprite.com';
  * configuring staging/dev (codex). On the real path this runs AFTER the profile
  * is written, so the persisted apiUrl is reflected faithfully.
  */
-function resolveReportedEndpoint(opts: InitOptions, deps: InitDeps): string {
+function resolveReportedEndpoint(
+  opts: InitOptions,
+  deps: InitDeps,
+  stderrFn?: (line: string) => void,
+): string {
   const env = deps.env ?? process.env;
   const envApiUrl = normalizeEnvVar(env.TESTSPRITE_API_URL);
   let existing: string | undefined;
   try {
     existing = readProfile(opts.profile, { path: deps.credentialsPath })?.apiUrl;
-  } catch {
+  } catch (err) {
+    if (opts.debug && stderrFn) {
+      const reason = err instanceof Error ? err.message : String(err);
+      stderrFn(`[debug] resolve endpoint profile read failed: ${reason}`);
+    }
     existing = undefined;
   }
   return opts.endpointUrl ?? envApiUrl ?? existing ?? DEFAULT_API_URL;
@@ -424,7 +432,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     throw missingApiKeyError(
       'No API key available in non-interactive mode. ' +
         'Pass --api-key <key>, --from-env (reads TESTSPRITE_API_KEY), or run interactively.',
-      resolveReportedEndpoint(opts, deps),
+      resolveReportedEndpoint(opts, deps, stderrFn),
     );
   }
   // JSON-output guard: an interactive secret prompt writes to stdout and would
@@ -499,7 +507,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
 
     const summary: InitSummary = {
       profile: opts.profile,
-      apiUrl: resolveReportedEndpoint(opts, deps),
+      apiUrl: resolveReportedEndpoint(opts, deps, stderrFn),
       env: 'development',
       scopes: [],
       agent: resolution
@@ -587,7 +595,11 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
         if (Array.isArray(parsed) && parsed.length > 0) {
           capturedInstallResults = parsed;
         }
-      } catch {
+      } catch (err) {
+        if (opts.debug) {
+          const reason = err instanceof Error ? err.message : String(err);
+          stderrFn(`[debug] setup agent install output parse non-JSON: ${reason}`);
+        }
         // ignore non-JSON lines (shouldn't happen in json mode, but be safe)
       }
     };
@@ -643,7 +655,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     profile: opts.profile,
     // Resolved AFTER configure persists the profile → reflects the real endpoint
     // (staging/dev/prod), not a flat prod default (codex).
-    apiUrl: resolveReportedEndpoint(opts, deps),
+    apiUrl: resolveReportedEndpoint(opts, deps, stderrFn),
     env: me.env,
     email: me.email,
     scopes: me.scopes,
