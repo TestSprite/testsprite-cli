@@ -75,6 +75,8 @@ testsprite auth status
 
 Credentials are normally stored at `~/.testsprite/credentials` (INI-style, mode `0600`). With `setup --from-env`, an unwritable or read-only HOME (`EACCES`, `EPERM`, or `EROFS` while saving credentials) produces a stderr warning and setup continues using `TESTSPRITE_API_KEY` for this session. Its JSON summary includes `credentials: { persisted: false, source: "env" }`; successful authentication does not mean the key was saved. Keep `TESTSPRITE_API_KEY` available in every shell/process that invokes the CLI. Agent installation still needs a writable destination; use `--no-agent` when only session authentication is needed. Other setup errors still fail. See [Configuration](#configuration) for profiles, environment overrides, and scopes.
 
+`testsprite setup --debug` reports display-only identity/profile lookup failures and ignored non-JSON agent-install output on stderr. These diagnostics leave setup's existing fallback behavior and JSON summary intact; without `--debug`, these fallbacks remain silent.
+
 For an org-scoped API key, `auth status` additionally prints an `orgs:` line (every organization your account belongs to) and an `org binding:` line (the specific organization this key is bound to). Both are omitted for a personal key or an older backend that doesn't report them.
 
 ### 2. Run your first test

@@ -54,10 +54,29 @@ function resolveReportedEndpoint(opts: InitOptions, deps: InitDeps): string {
   let existing: string | undefined;
   try {
     existing = readProfile(opts.profile, { path: deps.credentialsPath })?.apiUrl;
-  } catch {
+  } catch (error) {
+    emitSetupDebug(
+      opts,
+      deps,
+      'setup summary profile lookup failed; using endpoint fallback',
+      error,
+    );
     existing = undefined;
   }
   return opts.endpointUrl ?? envApiUrl ?? existing ?? DEFAULT_API_URL;
+}
+
+/** Report a display-only fallback without letting diagnostics interrupt setup. */
+function emitSetupDebug(opts: InitOptions, deps: InitDeps, context: string, error?: unknown): void {
+  if (!opts.debug) return;
+  try {
+    const reason =
+      error === undefined ? '' : `: ${error instanceof Error ? error.message : String(error)}`;
+    const write = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    write(`[debug] ${context}${reason}`);
+  } catch {
+    // Setup already recovered; a broken diagnostic sink must not undo that.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -560,10 +579,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     if (err instanceof InterruptError) throw err;
     // Whoami is display-only. If it fails after a successful configure,
     // continue with a minimal placeholder so the summary still prints.
-    if (opts.debug) {
-      const reason = err instanceof Error ? err.message : String(err);
-      stderrFn(`[debug] setup identity lookup failed after configure: ${reason}`);
-    }
+    emitSetupDebug(opts, deps, 'setup identity lookup failed after configure', err);
     me = { userId: '', keyId: '', scopes: [], env: 'production' };
   }
 
@@ -588,7 +604,8 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
           capturedInstallResults = parsed;
         }
       } catch {
-        // ignore non-JSON lines (shouldn't happen in json mode, but be safe)
+        // JSON parser errors can quote the input; do not echo captured install output.
+        emitSetupDebug(opts, deps, 'setup ignored non-JSON agent install output');
       }
     };
 
