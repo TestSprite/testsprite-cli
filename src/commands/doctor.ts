@@ -21,7 +21,13 @@ import {
   makeHttpClient,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
-import { loadConfig, resolveProfileName } from '../lib/config.js';
+import {
+  loadConfig,
+  resolveProfileName,
+  DEFAULT_API_URL,
+  normalizeEnvVar,
+  type Config,
+} from '../lib/config.js';
 import {
   ApiError,
   CLIError,
@@ -80,6 +86,8 @@ export interface DoctorDeps {
   nodeVersion?: string;
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
+  /** Config resolver. Defaults to `loadConfig`; injectable for tests. */
+  loadConfigFn?: typeof loadConfig;
 }
 
 type CommonOptions = FactoryCommonOptions;
@@ -90,12 +98,27 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   const cwd = deps.cwd ?? process.cwd();
   const nodeVersion = deps.nodeVersion ?? process.versions.node;
 
-  const config = loadConfig({
-    profile: opts.profile,
-    endpointUrl: opts.endpointUrl,
-    env,
-    credentialsPath: deps.credentialsPath,
-  });
+  const loadConfigFn = deps.loadConfigFn ?? loadConfig;
+  let config: ReturnType<typeof loadConfig>;
+  // Set when the credentials file exists but the OS refuses the read (e.g. a
+  // Windows ACL locked out by an affected CLI version): degrade, don't crash.
+  let credentialsReadError: string | undefined;
+  try {
+    config = loadConfigFn({
+      profile: opts.profile,
+      endpointUrl: opts.endpointUrl,
+      env,
+      credentialsPath: deps.credentialsPath,
+    });
+  } catch (error) {
+    if (!isFsPermissionError(error)) throw error;
+    credentialsReadError = error.code;
+    config = {
+      profile: resolveProfileName(opts.profile, env),
+      apiUrl: opts.endpointUrl ?? normalizeEnvVar(env.TESTSPRITE_API_URL) ?? DEFAULT_API_URL,
+      apiKey: normalizeEnvVar(env.TESTSPRITE_API_KEY),
+    };
+  }
   const endpointCheck = checkEndpoint(config.apiUrl);
   const hasKey = Boolean(config.apiKey);
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
@@ -103,6 +126,10 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   const connectivity = await checkConnectivity(opts, deps, {
     hasKey,
     endpointOk: endpointCheck.status === 'ok',
+    // Pass the already-resolved config down so the client below never re-reads
+    // the credentials file — with an ACL-bricked file a second read throws the
+    // same EPERM and surfaces as a bogus Connectivity failure.
+    config,
   });
 
   const checks: DoctorCheck[] = [
@@ -110,7 +137,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     checkNodeVersion(nodeVersion),
     { name: 'Profile', status: 'ok', detail: config.profile },
     endpointCheck,
-    checkCredentials(hasKey, config.profile, opts.dryRun ?? false),
+    checkCredentials(hasKey, config.profile, opts.dryRun ?? false, credentialsReadError),
     connectivity.check,
   ];
 
@@ -147,6 +174,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     await checkLocalTunnel(opts, deps, {
       hasKey,
       endpointOk: endpointCheck.status === 'ok',
+      config,
     }),
   );
 
@@ -169,6 +197,17 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     throw new CLIError(`doctor: ${failures} check(s) failed, ${warnings} warning(s)`, 1);
   }
   return report;
+}
+
+/** True for EPERM/EACCES fs errors — the signature of an unreadable credentials file. */
+function isFsPermissionError(error: unknown): error is NodeJS.ErrnoException {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    ((error as { code?: unknown }).code === 'EPERM' ||
+      (error as { code?: unknown }).code === 'EACCES')
+  );
 }
 
 function checkNodeVersion(nodeVersion: string): DoctorCheck {
@@ -196,7 +235,22 @@ function checkEndpoint(apiUrl: string): DoctorCheck {
   }
 }
 
-function checkCredentials(hasKey: boolean, profile: string, dryRun: boolean): DoctorCheck {
+function checkCredentials(
+  hasKey: boolean,
+  profile: string,
+  dryRun: boolean,
+  readError?: string,
+): DoctorCheck {
+  if (readError) {
+    return {
+      name: 'Credentials',
+      status: hasKey ? 'warn' : 'fail',
+      detail:
+        `credentials file exists but cannot be read (${readError}); its ACL may be locked out ` +
+        'by an earlier CLI version — delete the file and re-run `testsprite setup`' +
+        (hasKey ? ' (TESTSPRITE_API_KEY is set, so commands still work)' : ''),
+    };
+  }
   if (hasKey) {
     // Never print any part of the key (security). Confirm presence only.
     return {
@@ -232,7 +286,7 @@ function checkSkill(cwd: string, deps: DoctorDeps): DoctorCheck {
 async function checkConnectivity(
   opts: CommonOptions,
   deps: DoctorDeps,
-  ctx: { hasKey: boolean; endpointOk: boolean },
+  ctx: { hasKey: boolean; endpointOk: boolean; config: Config },
 ): Promise<{
   check: DoctorCheck;
   v3Enabled?: boolean;
@@ -252,6 +306,7 @@ async function checkConnectivity(
       credentialsPath: deps.credentialsPath,
       fetchImpl: deps.fetchImpl,
       stderr: deps.stderr,
+      config: ctx.config,
       shutdownSignal: deps.shutdownSignal,
     });
     const me = await client.get<MeIdentity>('/me', { schema: ME_IDENTITY_SCHEMA });
@@ -302,7 +357,7 @@ async function checkConnectivity(
 async function checkLocalTunnel(
   opts: CommonOptions,
   deps: DoctorDeps,
-  ctx: { hasKey: boolean; endpointOk: boolean },
+  ctx: { hasKey: boolean; endpointOk: boolean; config: Config },
 ): Promise<DoctorCheck> {
   const name = 'Local tunnel';
   if (opts.dryRun) return { name, status: 'warn', detail: 'skipped under --dry-run' };
@@ -326,6 +381,7 @@ async function checkLocalTunnel(
         credentialsPath: deps.credentialsPath,
         fetchImpl: deps.fetchImpl,
         stderr: deps.stderr,
+        config: ctx.config,
         // The retry sleeper listens to the client shutdown signal. Compose
         // the probe deadline with process shutdown so either aborts the fetch.
         shutdownSignal: controller.signal,

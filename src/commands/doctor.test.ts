@@ -6,7 +6,7 @@
  * assert on the rendered report + the exit-on-failure contract.
  */
 
-import { mkdtempSync } from 'node:fs';
+import { chmodSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
@@ -281,6 +281,78 @@ describe('runDoctor — failing checks exit non-zero', () => {
     expect(out).toContain('[FAIL]');
     expect(out).toContain('Credentials');
   });
+
+  it('unreadable credentials file (EPERM) reports the repair path and fails', async () => {
+    const { capture, deps } = makeCapture();
+    const eperm = Object.assign(new Error('read EPERM: permission denied'), { code: 'EPERM' });
+    const rejection = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...healthyDeps(credentialsPath),
+        ...deps,
+        loadConfigFn: () => {
+          throw eperm;
+        },
+      },
+    ).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(CLIError);
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('Credentials');
+    expect(out).toContain('cannot be read (EPERM)');
+    expect(out).toContain('delete the file and re-run `testsprite setup`');
+  });
+
+  it('unreadable credentials file with TESTSPRITE_API_KEY set degrades to a warning', async () => {
+    const { capture, deps } = makeCapture();
+    const eperm = Object.assign(new Error('read EPERM: permission denied'), { code: 'EPERM' });
+    const report = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...healthyDeps(credentialsPath),
+        ...deps,
+        env: { TESTSPRITE_API_KEY: 'sk-user-env' },
+        loadConfigFn: () => {
+          throw eperm;
+        },
+      },
+    );
+    expect(report.failures).toBe(0);
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('[WARN]');
+    expect(out).toContain('cannot be read (EPERM)');
+    expect(out).toContain('TESTSPRITE_API_KEY is set');
+  });
+
+  // POSIX-only premise: chmod 000 yields EACCES on Linux/macOS; Windows file
+  // modes are a no-op so the file stays readable there.
+  it.skipIf(process.platform === 'win32')(
+    'a real unreadable file does not leak EACCES into the Connectivity or Local tunnel checks',
+    async () => {
+      writeProfile('default', { apiKey: 'sk-brick' }, { path: credentialsPath });
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` lives in this suite's `mkdtempSync` temp dir, never user input
+      chmodSync(credentialsPath, 0o000);
+      const { capture, deps } = makeCapture();
+      const report = await runDoctor(
+        { profile: 'default', output: 'text', debug: false },
+        {
+          ...healthyDeps(credentialsPath),
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk-user-env' }, // commands still work without the file
+        },
+      );
+      const out = capture.stdout.join('\n');
+      expect(out).toContain('cannot be read (EACCES)');
+      // The regression this pins: Connectivity and Local tunnel resolved their
+      // client from the pre-resolved config, so neither re-read the file and
+      // reported its EACCES as a bogus API failure.
+      expect(out).not.toContain('EACCES: permission denied');
+      const connectivity = report.checks.find(c => c.name === 'Connectivity');
+      expect(connectivity?.status).toBe('ok');
+      const tunnel = report.checks.find(c => c.name === 'Local tunnel');
+      expect(tunnel?.status).toBe('ok');
+      expect(report.failures).toBe(0);
+    },
+  );
 
   it('invalid endpoint URL fails the API endpoint check', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
