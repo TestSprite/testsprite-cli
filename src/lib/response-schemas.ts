@@ -5,11 +5,8 @@
  * runtime validation, so a drifted or partial server response surfaced as
  * `undefined` output or an opaque TypeError deep inside a command. These
  * schemas are wired (opt-in, via `RequestOptions.schema`) into the typed
- * HttpClient helpers `triggerRun`, `triggerRunWithMeta`, `triggerRerun`,
- * `triggerBatchRerun`, `triggerBatchRunFresh`, `getRun`, `listTestRuns`,
- * `cancelRun`, and — for the account surfaces below — the `client.get` call
- * sites that own a `/me` or usage read. Every other generic
- * `get`/`post`/`put`/`patch`/`delete` caller stays schema-free and opt-in.
+ * HttpClient helpers and selected command reads. Generic requests remain
+ * schema-free unless the caller supplies a schema.
  *
  * Resilience rules (additive server changes must never hard-fail the CLI):
  *
@@ -61,6 +58,7 @@ import type {
   TunnelStatusResponse,
 } from './tunnel.types.js';
 import type { ConflictReason } from './conflict-reason.js';
+import type { CliTestCodeRead } from '../commands/test.js';
 
 /** Deployment environment the bound key belongs to; open on the wire (rule 2). */
 type AccountEnv = 'development' | 'staging' | 'production';
@@ -76,6 +74,23 @@ type AccountEnv = 'development' | 'staging' | 'production';
 function openWireLiteral<TLiteral extends string>(): v.GenericSchema<unknown, TLiteral> {
   return v.custom<TLiteral>(value => typeof value === 'string');
 }
+
+/**
+ * GET /tests/{id}/code. The inline and presigned fixtures in
+ * test/mock-backend/fixtures.ts contain the required identity/source fields.
+ * The code-put auto-fetch fixtures in commands/test.test.ts omit framework;
+ * legacy codeVersion may be null/absent and already uses the explicit
+ * If-Match fallback. Keep etag absence distinct from an explicit null.
+ * A null code body is the draft/no-generated-code branch of runCodeGet.
+ */
+export const CLI_TEST_CODE_SCHEMA: v.GenericSchema<unknown, CliTestCodeRead> = v.looseObject({
+  testId: v.string(),
+  language: v.string(),
+  framework: v.optional(v.string()),
+  code: v.nullable(v.string()),
+  codeVersion: v.nullish(v.string(), null),
+  etag: v.optional(v.nullable(v.string())),
+});
 
 /**
  * Mirrors `RunEnvironmentRef` (runs.types.ts): the environment a run resolved to.
