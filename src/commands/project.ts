@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { createReadStream, readFileSync, statSync, type Stats } from 'node:fs';
+import { createReadStream, statSync, type Stats } from 'node:fs';
 import { basename, extname } from 'node:path';
 import { Readable } from 'node:stream';
 import { Command, Option } from 'commander';
@@ -777,20 +777,18 @@ export async function runCredential(
     throw localValidationError(`--type must be one of: ${CLI_AUTH_TYPES.join(', ')}`);
   }
 
-  // Resolve the credential value (flag or file). Required for every type
-  // except `public` (which clears it).
-  let credential = opts.credential;
-  if (credential === undefined && opts.credentialFile !== undefined) {
-    credential = readFileSync(opts.credentialFile, 'utf8').trim();
-  }
-  if (opts.authType !== 'public' && (credential === undefined || credential === '')) {
-    throw localValidationError(
+  // A credential (flag or file) is required for every type except `public`
+  // (which clears it). Presence only here: --credential-file is read after the
+  // dry-run early return so --dry-run never touches the filesystem.
+  const missingCredential = (): ApiError =>
+    localValidationError(
       '--credential (or --credential-file) is required unless --type is "public"',
     );
+  const credentialSupplied =
+    opts.credential !== undefined ? opts.credential !== '' : opts.credentialFile !== undefined;
+  if (opts.authType !== 'public' && !credentialSupplied) {
+    throw missingCredential();
   }
-
-  const body: Record<string, string> = { authType: opts.authType };
-  if (opts.authType !== 'public' && credential !== undefined) body.credential = credential;
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-cred-${randomUUID()}`;
   if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
@@ -806,6 +804,17 @@ export async function runCredential(
     out.print(sample, data => renderCredentialText(data as CliProjectCredentialResponse));
     return sample;
   }
+
+  let credential = opts.credential;
+  if (credential === undefined && opts.credentialFile !== undefined) {
+    credential = readSecretFileGuarded('credential-file', opts.credentialFile);
+  }
+  if (opts.authType !== 'public' && (credential === undefined || credential === '')) {
+    throw missingCredential();
+  }
+
+  const body: Record<string, string> = { authType: opts.authType };
+  if (opts.authType !== 'public' && credential !== undefined) body.credential = credential;
 
   const client = makeClient(opts, deps);
   const res = await client.put<CliProjectCredentialResponse>(
@@ -887,22 +896,42 @@ export async function runAutoAuth(
     throw localValidationError(`--inject must be one of: ${AUTO_AUTH_INJECTS.join(', ')}`);
   }
 
+  const enabled = opts.disable !== true;
+
+  const idempotencyKey = opts.idempotencyKey ?? `cli-proj-autoauth-${randomUUID()}`;
+  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
+    stderr(`idempotency-key: ${idempotencyKey}`);
+  }
+
+  if (opts.dryRun) {
+    const sample: CliProjectAutoAuthResponse = {
+      projectId: opts.projectId,
+      enabled,
+      method: opts.method,
+      inject: opts.inject,
+    };
+    out.print(sample, data => renderAutoAuthText(data as CliProjectAutoAuthResponse));
+    return sample;
+  }
+
   // Resolve secrets from --*-file variants so they stay out of shell history.
+  // Placed after the dry-run early return so --dry-run never touches the filesystem.
   const password =
     opts.password ??
-    (opts.passwordFile !== undefined ? readFileSync(opts.passwordFile, 'utf8').trim() : undefined);
+    (opts.passwordFile !== undefined
+      ? readSecretFileGuarded('password-file', opts.passwordFile)
+      : undefined);
   const clientSecret =
     opts.clientSecret ??
     (opts.clientSecretFile !== undefined
-      ? readFileSync(opts.clientSecretFile, 'utf8').trim()
+      ? readSecretFileGuarded('client-secret-file', opts.clientSecretFile)
       : undefined);
   const refreshToken =
     opts.refreshToken ??
     (opts.refreshTokenFile !== undefined
-      ? readFileSync(opts.refreshTokenFile, 'utf8').trim()
+      ? readSecretFileGuarded('refresh-token-file', opts.refreshTokenFile)
       : undefined);
 
-  const enabled = opts.disable !== true;
   const body: Record<string, unknown> = { enabled, method: opts.method, inject: opts.inject };
   const maybe = (k: string, v: string | undefined): void => {
     if (v !== undefined) body[k] = v;
@@ -921,22 +950,6 @@ export async function runAutoAuth(
   maybe('refreshToken', refreshToken);
   maybe('scope', opts.scope);
   maybe('region', opts.region);
-
-  const idempotencyKey = opts.idempotencyKey ?? `cli-proj-autoauth-${randomUUID()}`;
-  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
-    stderr(`idempotency-key: ${idempotencyKey}`);
-  }
-
-  if (opts.dryRun) {
-    const sample: CliProjectAutoAuthResponse = {
-      projectId: opts.projectId,
-      enabled,
-      method: opts.method,
-      inject: opts.inject,
-    };
-    out.print(sample, data => renderAutoAuthText(data as CliProjectAutoAuthResponse));
-    return sample;
-  }
 
   const client = makeClient(opts, deps);
   const res = await client.put<CliProjectAutoAuthResponse>(

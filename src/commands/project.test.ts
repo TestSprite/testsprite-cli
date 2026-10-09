@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import type * as NodeFs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -19,6 +20,15 @@ import {
   runUpdate,
   parseTestIdAttributesFlag,
 } from './project.js';
+
+// readSecretFileGuarded reads the secret through the fd it opened, via
+// node:fs's readFileSync(fd, ...) overload. Wrap readFileSync in a pass-through
+// vi.fn so the #282 suite can inject a read failure after a successful open;
+// every other test keeps the real implementation.
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof NodeFs>();
+  return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+});
 
 const PROJECT_FIXTURE: CliProject = {
   id: 'project_b3c91efa',
@@ -2862,5 +2872,264 @@ describe('project compatibility contracts', () => {
     expect(result).not.toBeInstanceOf(ApiError);
     expect(headers).toHaveLength(2);
     expect(headers[0]).toBe(headers[1]);
+  });
+});
+
+describe('#282 — secret --*-file flags are guarded (structured error, exit 5, no raw ENOENT)', () => {
+  const noNetwork = () => {
+    throw new Error('network should not be hit');
+  };
+  const deps = (credentialsPath: string) => ({
+    credentialsPath,
+    fetchImpl: makeFetch(noNetwork),
+    stdout: () => {},
+    stderr: () => {},
+  });
+  const missingPath = () => join(mkdtempSync(join(tmpdir(), 'cli-missing-')), 'no-such-secret.txt');
+
+  it('runCredential --credential-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runCredential(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          authType: 'API key',
+          credentialFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runCredential --credential-file pointing at a directory → VALIDATION_ERROR (exit 5)', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-cred-dir-'));
+    await expect(
+      runCredential(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          authType: 'API key',
+          credentialFile: dir,
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runCredential reads a valid --credential-file (trimmed) and sends it', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-cred-ok-'));
+    const credFile = join(dir, 'cred.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (dir), not user input.
+    writeFileSync(credFile, '  tok-from-file\n');
+    let sentBody: { credential?: string } | undefined;
+    const fetchImpl = makeFetch((_url, init) => {
+      sentBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { status: 200, body: { projectId: 'p1', authType: 'API key', rewroteCount: 1 } };
+    });
+    await runCredential(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'p1',
+        authType: 'API key',
+        credentialFile: credFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    // The on-disk fixture is "  tok-from-file\n"; the shared guard trims it.
+    expect(sentBody?.credential).toBe('tok-from-file');
+  });
+
+  it('runAutoAuth --password-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'password',
+          inject: 'bearer',
+          passwordFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runAutoAuth --client-secret-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'refresh_token',
+          inject: 'bearer',
+          clientSecretFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runAutoAuth --refresh-token-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'refresh_token',
+          inject: 'bearer',
+          refreshTokenFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runCreate --password-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          type: 'frontend',
+          name: 'FE',
+          targetUrl: 'https://example.com',
+          username: 'u',
+          passwordFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runUpdate --password-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          passwordFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runAutoAuth --dry-run with missing --password-file skips filesystem (returns sample)', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    const result = await runAutoAuth(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'p1',
+        method: 'password',
+        inject: 'bearer',
+        passwordFile: missingPath(),
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(fetched).toBe(false);
+    // Dry-run skips file reads; the sample carries the projectId we passed in.
+    expect(result.projectId).toBe('p1');
+  });
+
+  it('runCredential --dry-run with missing --credential-file skips filesystem (returns sample)', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    const result = await runCredential(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'p1',
+        authType: 'API key',
+        credentialFile: missingPath(),
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(fetched).toBe(false);
+    expect(result).toEqual({ projectId: 'p1', authType: 'API key', rewroteCount: 0 });
+  });
+
+  describe('read fails after a successful open', () => {
+    afterEach(() => {
+      // mockReset() on the vi.fn(actual.readFileSync) double puts it back on
+      // the real fs call, so a failure here can't leak into later tests.
+      vi.mocked(readFileSync).mockReset();
+    });
+
+    // Injected rather than built with chmod(0o000): on win32 chmod only maps
+    // the write bit, so a mode-denied file stays readable there. Failing the
+    // fd read directly exercises the same branch on every platform.
+    it('runCredential --credential-file read error → VALIDATION_ERROR (exit 5), no network', async () => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkdtempSync(join(tmpdir(), 'cli-cred-read-'));
+      const f = join(dir, 'secret.txt');
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (dir), not user input.
+      writeFileSync(f, 'tok');
+      const actual = await vi.importActual<typeof NodeFs>('node:fs');
+      // Only the guard's fd-based read fails; path-based reads (e.g. the
+      // credentials file) keep hitting the real filesystem.
+      vi.mocked(readFileSync).mockImplementation(((
+        file: NodeFs.PathOrFileDescriptor,
+        ...rest: unknown[]
+      ) => {
+        if (typeof file === 'number') {
+          throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+        }
+        return (actual.readFileSync as (...a: unknown[]) => unknown)(file, ...rest);
+      }) as typeof readFileSync);
+      await expect(
+        runCredential(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            projectId: 'p1',
+            authType: 'API key',
+            credentialFile: f,
+          },
+          deps(credentialsPath),
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        nextAction: expect.stringContaining('permission denied reading'),
+      });
+    });
   });
 });
