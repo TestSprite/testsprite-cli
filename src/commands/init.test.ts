@@ -21,8 +21,9 @@ import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import { readProfile, writeProfile } from '../lib/credentials.js';
 import type { MeResponse } from './auth.js';
 import type { AgentFs } from './agent.js';
+import { Command } from 'commander';
 import type { InitDeps } from './init.js';
-import { runInit } from './init.js';
+import { runInit, addSetupOptions } from './init.js';
 import {
   TARGETS,
   DEFAULT_SKILLS,
@@ -265,7 +266,7 @@ describe('runInit — session-only environment credentials', () => {
       ]);
       expect([...captured.stdout, ...captured.stderr].join('\n')).not.toContain(key);
       expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
-      // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own temp credentials path, never user input.
+
       expect(existsSync(`${credentialsPath}.tmp.${process.pid}`)).toBe(false);
     },
   );
@@ -294,10 +295,9 @@ describe('runInit — session-only environment credentials', () => {
         ).rejects.toThrow(/temporary credentials.*clean/i);
         expect(captured.stdout).toEqual([]);
         expect(captured.stderr).toEqual([]);
-        // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own temp path, never user input.
+
         expect(existsSync(tmp)).toBe(true);
       } finally {
-        // eslint-disable-next-line security/detect-non-literal-fs-filename -- cleanup of this test's own temp path.
         if (existsSync(tmp)) actual.unlinkSync(tmp);
       }
     },
@@ -319,7 +319,7 @@ describe('runInit — session-only environment credentials', () => {
       fetchImpl: makeOkFetch(),
       isTTY: false,
     });
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own temp path, never user input.
+
     expect(existsSync(tmp)).toBe(false);
     expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
       credentials: { persisted: false, source: 'env' },
@@ -2131,5 +2131,93 @@ describe('runInit -- skipIfConfigured', () => {
 
     // Explicit --api-key must overwrite regardless of skipIfConfigured.
     expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-new');
+  });
+
+  describe('.gitignore safety', () => {
+    it('appends .testsprite/ to .gitignore when inside a git repo', async () => {
+      const { deps } = makeCapture();
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.mkdir(path.join(CWD, '.git'));
+      writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+      const fetchMock = makeOkFetch();
+
+      await runInit(
+        makeBaseOpts({
+          dir: CWD,
+          skipIfConfigured: true,
+          noAgent: true,
+          output: 'json',
+        }),
+        {
+          ...deps,
+          credentialsPath,
+          fetchImpl: fetchMock,
+          fs: agentFs,
+          isTTY: false,
+        },
+      );
+
+      expect(store.get(path.join(CWD, '.gitignore'))).toContain('.testsprite/');
+    });
+
+    it('does not write .gitignore when outside a git repo', async () => {
+      const { deps } = makeCapture();
+      const { fs: agentFs, store } = makeMemFs();
+      // No .git directory created
+      writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+      const fetchMock = makeOkFetch();
+
+      await runInit(
+        makeBaseOpts({
+          dir: CWD,
+          skipIfConfigured: true,
+          noAgent: true,
+          output: 'json',
+        }),
+        {
+          ...deps,
+          credentialsPath,
+          fetchImpl: fetchMock,
+          fs: agentFs,
+          isTTY: false,
+        },
+      );
+
+      expect(store.has(path.join(CWD, '.gitignore'))).toBe(false);
+    });
+
+    it('does not write .gitignore when --no-gitignore is passed even inside a git repo', async () => {
+      const { deps } = makeCapture();
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.mkdir(path.join(CWD, '.git'));
+      writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+      const fetchMock = makeOkFetch();
+
+      await runInit(
+        makeBaseOpts({
+          dir: CWD,
+          skipIfConfigured: true,
+          noAgent: true,
+          noGitignore: true,
+          output: 'json',
+        }),
+        {
+          ...deps,
+          credentialsPath,
+          fetchImpl: fetchMock,
+          fs: agentFs,
+          isTTY: false,
+        },
+      );
+
+      expect(store.has(path.join(CWD, '.gitignore'))).toBe(false);
+    });
+
+    it('registers --no-gitignore option in addSetupOptions', () => {
+      const cmd = new Command();
+      addSetupOptions(cmd, [], 'claude' as AgentTarget);
+      const opt = cmd.options.find(o => o.long === '--no-gitignore');
+      expect(opt).toBeDefined();
+    });
   });
 });

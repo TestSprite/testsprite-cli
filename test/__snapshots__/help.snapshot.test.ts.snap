@@ -97,6 +97,7 @@ Options:
                         none)
   --no-agent            Skip the agent skill install (configure credentials
                         only)
+  --no-gitignore        Skip adding .testsprite/ to .gitignore
   --force               Overwrite an existing skill file (a .bak backup is
                         kept)
   --dir <path>          Project root for the skill install (default: current
@@ -191,6 +192,7 @@ Options:
                         none)
   --no-agent            Skip the agent skill install (configure credentials
                         only)
+  --no-gitignore        Skip adding .testsprite/ to .gitignore
   --force               Overwrite an existing skill file (a .bak backup is
                         kept)
   --dir <path>          Project root for the skill install (default: current
