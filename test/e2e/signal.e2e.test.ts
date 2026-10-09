@@ -26,6 +26,9 @@ const REPO_ROOT = resolve(__dirname, '../..');
 const BIN_PATH = join(REPO_ROOT, 'dist', 'index.js');
 
 const RUN_ID = 'run_sig_e2e_01';
+const PLAN_PROJECT_ID = 'proj_sig_e2e_plan';
+/** The plan-generate interrupt case serves exactly one plans read (the baseline) before hanging. */
+let planBaselineServed = false;
 
 /**
  * Windows has no POSIX signal delivery. `child.kill('SIGINT')` there terminates
@@ -48,8 +51,36 @@ beforeAll(async () => {
     throw new Error('dist/index.js not found — run `npm run test:e2e` which builds first.');
   }
   server = createServer((req, res) => {
-    // Hang every request (long-poll / stalled-backend simulation): the CLI's
-    // abort must cut it. Signal any test waiting for the request to arrive.
+    const url = req.url ?? '';
+    // `test plan generate`: the trigger is accepted and the one
+    // pre-trigger baseline read answers, so the CLI learns the plan and the
+    // signal lands in the first in-ladder poll — which hangs like everything else.
+    if (req.method === 'POST' && url.includes('/plans/generate')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          projectId: PLAN_PROJECT_ID,
+          status: 'accepted',
+          stage: 'exploration',
+          stagesRemaining: ['strategy', 'proposals'],
+        }),
+      );
+      return;
+    }
+    if (req.method === 'GET' && url.includes('/plans') && !planBaselineServed) {
+      planBaselineServed = true;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          generation: { status: 'idle', errorCode: null, errorMessage: null },
+          proposals: [],
+          credits: { charged: [], balance: null },
+        }),
+      );
+      return;
+    }
+    // Hang every other request (long-poll / stalled-backend simulation): the
+    // CLI's abort must cut it. Signal any test waiting for the hang to arrive.
     runRequestWaiters.splice(0).forEach(fn => fn());
     req.on('close', () => res.destroy());
   });
@@ -83,27 +114,24 @@ interface SpawnResult {
 }
 
 /**
- * Spawn `testsprite test wait` against the hanging stub, deliver `signal`
- * once the long-poll request is in flight, and collect the outcome.
+ * Spawn `testsprite test wait` (or the given argv) against the hanging stub,
+ * deliver `signal` once a hanging request is in flight, and collect the outcome.
  */
 async function waitAndInterrupt(
   signal: NodeJS.Signals,
   extraArgs: string[] = [],
+  argv: string[] = ['test', 'wait', RUN_ID, '--timeout', '120'],
 ): Promise<SpawnResult> {
-  const child = spawn(
-    process.execPath,
-    [BIN_PATH, 'test', 'wait', RUN_ID, '--timeout', '120', ...extraArgs],
-    {
-      env: {
-        ...process.env,
-        TESTSPRITE_API_KEY: 'sk-user-e2e-signal',
-        TESTSPRITE_API_URL: baseUrl,
-        TESTSPRITE_NO_SKILL_WARNING: '1',
-        TESTSPRITE_NO_UPDATE_NOTIFIER: '1',
-      },
-      stdio: ['ignore', 'pipe', 'pipe'],
+  const child = spawn(process.execPath, [BIN_PATH, ...argv, ...extraArgs], {
+    env: {
+      ...process.env,
+      TESTSPRITE_API_KEY: 'sk-user-e2e-signal',
+      TESTSPRITE_API_URL: baseUrl,
+      TESTSPRITE_NO_SKILL_WARNING: '1',
+      TESTSPRITE_NO_UPDATE_NOTIFIER: '1',
     },
-  );
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()));
@@ -234,6 +262,50 @@ describe.skipIf(isWindows)('signal e2e — graceful detach during test wait', ()
       clearTimeout(promptTimer);
       idleChild.kill('SIGKILL');
     }
+  }, 30_000);
+
+  it('SIGINT during `test plan generate --output json` — the INTERRUPTED envelope tells the paused-stage story, not the run one', async () => {
+    // The stderr text line and the JSON envelope below it must tell the same
+    // story: a paused plan stage, never a run that "keeps executing" with a
+    // `test wait <runId>` hint — plan generation has no run id. Checked
+    // through the real entrypoint.
+    planBaselineServed = false;
+    const result = await waitAndInterrupt(
+      'SIGINT',
+      ['--output', 'json'],
+      ['test', 'plan', 'generate', '--project', PLAN_PROJECT_ID, '--timeout', '120'],
+    );
+    expect(result.code).toBe(130);
+
+    const partial = JSON.parse(result.stdout) as {
+      projectId: string;
+      status: string;
+      stagesRemaining: string[] | null;
+    };
+    expect(partial.projectId).toBe(PLAN_PROJECT_ID);
+    expect(partial.status).toBe('running');
+    expect(partial.stagesRemaining).toEqual(['strategy', 'proposals']);
+
+    expect(result.stderr).toContain(
+      'Interrupted (SIGINT). Paused during stage 1/3 exploration. 2 stages left.',
+    );
+    const envelopeStart = result.stderr.indexOf('{');
+    expect(envelopeStart).toBeGreaterThan(-1);
+    const envelope = JSON.parse(result.stderr.slice(envelopeStart)) as {
+      error: { code: string; nextAction: string; details: Record<string, unknown> };
+    };
+    expect(envelope.error.code).toBe('INTERRUPTED');
+    expect(envelope.error.nextAction).toBe(
+      'Plan generation paused during stage 1/3 exploration. 2 stages left. ' +
+        `Continue: testsprite test plan generate --project ${PLAN_PROJECT_ID}`,
+    );
+    expect(envelope.error.details).toEqual({
+      signal: 'SIGINT',
+      projectId: PLAN_PROJECT_ID,
+      stagesRemaining: ['strategy', 'proposals'],
+    });
+    expect(result.stderr).not.toContain('keeps executing');
+    expect(result.stderr).not.toContain('test wait');
   }, 30_000);
 
   it('detach then re-attach — the same runId can be waited on again (server unaffected)', async () => {

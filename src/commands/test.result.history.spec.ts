@@ -20,7 +20,8 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { ApiError, RequestTimeoutError } from '../lib/errors.js';
+import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
+import { ShutdownController } from '../lib/interrupt.js';
 import type { ListRunsResponse, RunHistoryItem } from '../lib/runs.types.js';
 import type { CliLatestResult } from './test.js';
 import { runResultHistory, runResult, runSteps, parseDuration, createTestCommand } from './test.js';
@@ -1843,4 +1844,377 @@ describe('runResultHistory — environment', () => {
       test.parseAsync(['result', 'test_abc', '--env', 'demo'], { from: 'user' }),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
+
+  it('history unknown env shows available names', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      calls.push(url);
+      return {
+        status: 400,
+        body: {
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: "Unknown environment 'bogus'.",
+            nextAction: 'Unknown environment. Available environments: default, staging.',
+            requestId: 'req_env',
+            details: {
+              field: 'environment',
+              requested: 'bogus',
+              available: ['default', 'staging'],
+              accepted: ['default', 'staging'],
+            },
+          },
+        },
+      };
+    });
+    let thrown: unknown;
+    try {
+      await runResultHistory(
+        { ...common, output: 'json', testId: 'test_abc', environment: 'bogus' },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      );
+    } catch (e) {
+      thrown = e;
+    }
+    expect(calls).toHaveLength(1);
+    const err = thrown as ApiError;
+    expect(err.code).toBe('VALIDATION_ERROR');
+    expect(err.exitCode).toBe(5);
+    expect(err.nextAction).toContain('default');
+    expect(err.nextAction).toContain('staging');
+    expect(err.getDetail('available')).toEqual(['default', 'staging']);
+  });
+
+  it('history known env with no runs is empty', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    const fetchImpl = makeFetch(() => ({
+      body: makeHistoryResp([], null, { testKind: 'frontend' }),
+    }));
+    const resp = await runResultHistory(
+      { ...common, output: 'text', testId: 'test_abc', environment: 'production' },
+      { credentialsPath, fetchImpl, stdout: l => lines.push(l), stderr: () => {} },
+    );
+    expect(resp.runs).toEqual([]);
+    expect(lines.join('\n')).toContain('No CLI-tracked history');
+  });
+
+  it('v2 environment filter shows the unsupported next action', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      status: 501,
+      body: {
+        error: {
+          code: 'UNSUPPORTED',
+          message: 'Environment filtering requires a V3 project.',
+          nextAction: 'Use a V3 project to filter run history by environment.',
+          requestId: 'req_v2',
+          details: {},
+        },
+      },
+    }));
+    let thrown: unknown;
+    try {
+      await runResultHistory(
+        { ...common, output: 'json', testId: 'test_abc', environment: 'production' },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      );
+    } catch (e) {
+      thrown = e;
+    }
+    const err = thrown as ApiError;
+    expect(err.code).toBe('UNSUPPORTED');
+    expect(err.exitCode).toBe(7);
+    expect(err.nextAction).toBe('Use a V3 project to filter run history by environment.');
+  });
 });
+
+describe('`test run list` — usage guard (not a positional test id)', () => {
+  function commandWithExitOverride(
+    fetchImpl: typeof globalThis.fetch,
+  ): ReturnType<typeof createTestCommand> {
+    const { credentialsPath } = makeCreds();
+    const test = createTestCommand({ credentialsPath, fetchImpl });
+    const disable = (c: { exitOverride: () => unknown; commands: Array<unknown> }) => {
+      c.exitOverride();
+      (c.commands as Array<{ exitOverride: () => unknown; commands: Array<unknown> }>).forEach(
+        disable,
+      );
+    };
+    disable(test as never);
+    return test;
+  }
+
+  it('test run list points to test result --history', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network — the guard must fire before any request');
+    });
+    const test = commandWithExitOverride(fetchImpl as unknown as typeof fetch);
+    let thrown: unknown;
+    try {
+      await test.parseAsync(['run', 'list'], { from: 'user' });
+    } catch (e) {
+      thrown = e;
+    }
+    const err = thrown as ApiError;
+    expect(err.code).toBe('VALIDATION_ERROR');
+    expect(err.exitCode).toBe(5);
+    expect(err.nextAction).toContain('test result <test-id> --history');
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe('runResult — environment context', () => {
+  const common = {
+    profile: 'default',
+    output: 'text' as const,
+    dryRun: false,
+    debug: false,
+    verbose: false,
+    testId: 'test_abc',
+  };
+  const projection = {
+    projectId: 'project_abc',
+    headlineEnvironment: { id: 'env_prod', name: 'sk-prod' },
+    status: 'passed',
+    statusByEnvironment: [
+      { environmentId: 'env_alt', environmentName: 'alt', status: 'failed' },
+      { environmentId: 'env_prod', environmentName: 'sk-prod', status: 'passed' },
+    ],
+  };
+
+  async function show(
+    environment: CliLatestResult['environment'],
+    test: unknown,
+    output: 'text' | 'json' = 'text',
+    project: unknown = {
+      environments: [
+        { id: 'env_alt', name: 'alt', isDefault: false },
+        { id: 'env_prod', name: 'sk-prod', isDefault: true },
+      ],
+    },
+    status: CliLatestResult['status'] = 'passed',
+  ) {
+    const calls: string[] = [];
+    const lines: string[] = [];
+    const stderr: string[] = [];
+    const result = {
+      ...CANNED_LATEST_RESULT,
+      environment,
+      status,
+      ...(status === 'cancelled' ? { verdict: null, executionStatus: 'cancelled' as const } : {}),
+    };
+    const returned = await runResult(
+      { ...common, output },
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch(url => {
+          calls.push(url);
+          if (url.endsWith('/result')) return { body: result };
+          if (url.includes('/projects/'))
+            return project === 'unavailable'
+              ? { status: 500, body: errorEnvelope('INTERNAL') }
+              : { body: project };
+          if (test === 'unavailable') return { status: 500, body: errorEnvelope('INTERNAL') };
+          return { body: test };
+        }),
+        stdout: line => lines.push(line),
+        stderr: line => stderr.push(line),
+      },
+    );
+    return { calls, lines, stderr, result, returned };
+  }
+
+  it('names the shown default environment without an extra status line', async () => {
+    const f = await show({ id: 'env_prod', name: 'sk-prod' }, projection);
+    expect(f.lines.join('\n')).toMatch(/environment:\s+sk-prod/);
+    expect(f.lines.join('\n')).not.toContain('Default environment');
+  });
+
+  it('appends exactly one default status after a result from another environment', async () => {
+    const f = await show({ id: 'env_alt', name: 'alt' }, projection);
+    expect(f.lines.join('\n')).toMatch(/environment:\s+alt/);
+    expect(
+      f.lines
+        .join('\n')
+        .split('\n')
+        .filter(line => line.startsWith('Default environment')),
+    ).toEqual([
+      "Default environment sk-prod: passed (testsprite test result test_abc --history --env 'sk-prod')",
+    ]);
+    expect(f.lines.join('\n')).toMatch(/summary:[\s\S]*Default environment/);
+    expect(f.calls).toHaveLength(3);
+  });
+
+  it('omits the advisory on an old server with no per-environment statuses', async () => {
+    const f = await show(
+      { id: 'env_alt', name: 'alt' },
+      { headlineEnvironment: projection.headlineEnvironment, status: 'passed' },
+    );
+    expect(f.returned).toEqual(f.result);
+    expect(f.lines.join('\n')).not.toContain('Default environment');
+    expect(f.calls).toHaveLength(2);
+    expect(f.stderr).toEqual([]);
+  });
+
+  it('silently ignores a failed extra read without retrying or failing the result', async () => {
+    const f = await show({ id: 'env_alt', name: 'alt' }, 'unavailable');
+    expect(f.returned).toEqual(f.result);
+    expect(f.lines.join('\n')).not.toContain('Default environment');
+    expect(f.calls).toHaveLength(2);
+    expect(f.stderr).toEqual([]);
+  });
+
+  it('does not guess the default when its status partition is absent', async () => {
+    const f = await show(
+      { id: 'env_alt', name: 'alt' },
+      { ...projection, statusByEnvironment: projection.statusByEnvironment.slice(0, 1) },
+    );
+    expect(f.lines.join('\n')).not.toContain('Default environment');
+  });
+
+  it.each(['passed', 'cancelled'] as const)(
+    'does not label a fallback headline as default for a latest %s run',
+    async status => {
+      const f = await show(
+        { id: 'env_alt', name: 'alt' },
+        {
+          ...projection,
+          headlineEnvironment: { id: 'env_other', name: 'other' },
+          statusByEnvironment: [
+            { environmentId: 'env_other', environmentName: 'other', status: 'passed' },
+            { environmentId: 'env_alt', environmentName: 'alt', status: 'passed' },
+          ],
+        },
+        'text',
+        { environments: [{ id: 'env_prod', name: 'sk-prod', isDefault: true }] },
+        status,
+      );
+      expect(f.lines.join('\n')).not.toContain('Default environment');
+      expect(f.calls).toHaveLength(3);
+    },
+  );
+
+  it.each(['unavailable', {}, { environments: [{ id: 'env_prod', name: 'sk-prod' }] }])(
+    'omits context when the project default is unavailable: %s',
+    async project => {
+      const f = await show({ id: 'env_alt', name: 'alt' }, projection, 'text', project);
+      expect(f.returned).toEqual(f.result);
+      expect(f.lines.join('\n')).not.toContain('Default environment');
+      expect(f.calls).toHaveLength(3);
+      expect(f.stderr).toEqual([]);
+    },
+  );
+
+  it.each([true, false])(
+    'ignores a deleted environment with the same name as the default, default has run=%s',
+    async hasDefaultRun => {
+      const f = await show(
+        { id: 'env_alt', name: 'alt' },
+        {
+          ...projection,
+          statusByEnvironment: [
+            { environmentId: 'env_deleted', environmentName: 'sk-prod', status: 'failed' },
+            ...(hasDefaultRun ? [projection.statusByEnvironment[1]] : []),
+            projection.statusByEnvironment[0],
+          ],
+        },
+      );
+      expect(f.lines.join('\n')).not.toContain('Default environment sk-prod: failed');
+      if (hasDefaultRun)
+        expect(f.lines.join('\n')).toContain('Default environment sk-prod: passed');
+      else expect(f.lines.join('\n')).not.toContain('Default environment');
+    },
+  );
+
+  it('keeps JSON byte-identical and performs no extra read', async () => {
+    const f = await show({ id: 'env_alt', name: 'alt' }, projection, 'json');
+    expect(f.lines).toEqual([JSON.stringify(f.result, null, 2)]);
+    expect(f.calls).toHaveLength(1);
+    expect(f.stderr).toEqual([]);
+  });
+
+  it('makes no extra read when an older result has no environment', async () => {
+    const f = await show(undefined, projection);
+    expect(f.calls).toHaveLength(1);
+    expect(f.lines.join('\n')).not.toContain('Default environment');
+  });
+
+  it('shows the scheduled local environment reason carried by a blocked summary', async () => {
+    const reason =
+      'Environment local is on this machine (http://localhost:4900); scheduled runs execute in the cloud and cannot reach it. Run it from this machine with testsprite test run test_abc --env local.';
+    const result: CliLatestResult = {
+      ...CANNED_LATEST_RESULT,
+      status: 'blocked',
+      verdict: 'blocked',
+      failureKind: 'infra',
+      summary: `Blocked before a verdict could be produced: ${reason}`,
+    };
+    for (const output of ['text', 'json'] as const) {
+      const lines: string[] = [];
+      await runResult(
+        { ...common, output },
+        {
+          ...makeCreds(),
+          fetchImpl: makeFetch(() => ({ body: result })),
+          stdout: line => lines.push(line),
+          stderr: () => {},
+        },
+      );
+      if (output === 'json') expect(lines).toEqual([JSON.stringify(result, null, 2)]);
+      else {
+        expect(lines.join('\n')).toContain(reason);
+        expect(lines.join('\n')).toMatch(/failureKind:\s+infra/);
+      }
+    }
+  });
+});
+
+it.each([
+  ['SIGINT', 130, 2],
+  ['SIGTERM', 143, 2],
+  ['SIGINT', 130, 3],
+  ['SIGTERM', 143, 3],
+] as const)(
+  'preserves interrupts during optional result context read: %s (exit %s, request %s)',
+  async (signal, exitCode, interruptRequest) => {
+    const shutdown = new ShutdownController();
+    let calls = 0;
+    const lines: string[] = [];
+    await expect(
+      runResult(
+        { output: 'text', testId: 'test_abc', profile: 'default', debug: false },
+        {
+          ...makeCreds(),
+          shutdown,
+          fetchImpl: makeFetch(() => {
+            calls++;
+            if (calls === 1)
+              return {
+                body: { ...CANNED_LATEST_RESULT, environment: { id: 'env_alt', name: 'alt' } },
+              };
+            if (calls < interruptRequest)
+              return {
+                body: {
+                  projectId: 'project_abc',
+                  headlineEnvironment: { id: 'env_prod', name: 'sk-prod' },
+                  statusByEnvironment: [
+                    { environmentId: 'env_prod', environmentName: 'sk-prod', status: 'passed' },
+                  ],
+                },
+              };
+            shutdown.interrupt(signal);
+            throw shutdown.signal.reason;
+          }),
+          stdout: line => lines.push(line),
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ signal, exitCode });
+    expect(shutdown.signal.reason).toBeInstanceOf(InterruptError);
+    // The already-fetched result is printed before the optional reads start.
+    expect(lines.join('\n')).toContain('alt');
+    expect(lines.join('\n')).not.toContain('Default environment');
+  },
+);

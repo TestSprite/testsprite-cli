@@ -149,6 +149,113 @@ describe('runUpdate', () => {
     expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ name: 'Renamed' });
   });
 
+  it('update forwards --env', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fetchImpl = makeFetch((url, init) => {
+      calls.push({ url, init });
+      return {
+        body: { ...SCHEDULE, environment: 'staging', environmentMode: 'pinned' },
+      };
+    });
+    const output: string[] = [];
+    await runUpdate(
+      { ...BASE, output: 'text', scheduleId: 'sch_1', env: 'staging' },
+      { credentialsPath, fetchImpl, stdout: line => output.push(line), stderr: () => {} },
+    );
+    const patch = calls.find(call => call.init.method === 'PATCH')!;
+    expect(JSON.parse(String(patch.init.body))).toEqual({ environment: 'staging' });
+    expect(output.join('\n')).toContain('environment: staging (pinned)');
+  });
+
+  it('leaves test-list target validation to the backend on update', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Array<Record<string, unknown>> = [];
+    const fetchImpl = makeFetch((_url, init) => {
+      calls.push(JSON.parse(String(init.body)));
+      return {
+        status: 400,
+        body: {
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: 'Test-list schedules inherit their list bindings.',
+            nextAction:
+              'testsprite testlist update tl_1 --project-env <projectId>:<environmentName>',
+            requestId: 'req_1',
+            details: { field: 'environment' },
+          },
+        },
+      };
+    });
+    await expect(
+      runUpdate(
+        { ...BASE, output: 'json', scheduleId: 'sch_1', env: 'staging' },
+        { credentialsPath, fetchImpl, ...sink },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: { field: 'environment' },
+    });
+    expect(calls).toEqual([{ environment: 'staging' }]);
+  });
+
+  it('blank env rejects locally on update', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runUpdate(
+        { ...BASE, output: 'json', scheduleId: 'sch_1', env: '  ' },
+        { credentialsPath, fetchImpl: noNetwork(), ...sink },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'environment', reason: 'blank_value' },
+    });
+  });
+
+  it('refuses a known old server before changing a pinned schedule', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fetchImpl = makeFetch((url, init) => {
+      calls.push({ url, init });
+      return { body: SCHEDULE }; // no environment / environmentMode echoed
+    });
+    await expect(
+      runUpdate(
+        { ...BASE, output: 'json', scheduleId: 'sch_1', env: 'staging' },
+        { credentialsPath, fetchImpl, ...sink },
+      ),
+    ).rejects.toMatchObject({
+      code: 'UNSUPPORTED',
+      exitCode: 7,
+      nextAction: expect.stringContaining('No schedule changes were sent'),
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.init.method).toBe('GET');
+  });
+
+  it('keeps echo verification when a capability read cannot be reached', async () => {
+    const { credentialsPath } = makeCreds();
+    const methods: string[] = [];
+    const fetchImpl = makeFetch((_url, init) => {
+      const method = init.method ?? 'GET';
+      methods.push(method);
+      if (method === 'GET') throw new Error('offline');
+      return { body: { ...SCHEDULE, name: 'Renamed' } };
+    });
+    await expect(
+      runUpdate(
+        { ...BASE, output: 'json', scheduleId: 'sch_1', name: 'Renamed', env: 'staging' },
+        { credentialsPath, fetchImpl, ...sink },
+      ),
+    ).rejects.toMatchObject({
+      code: 'UNSUPPORTED',
+      nextAction: expect.stringContaining('schedule sch_1'),
+      details: { scheduleId: 'sch_1', requestedFields: ['name', 'environment'] },
+    });
+    expect(methods).toEqual(['GET', 'PATCH']);
+  });
+
   it('maps --pause and --resume onto enabled', async () => {
     const { credentialsPath } = makeCreds();
 
@@ -270,6 +377,26 @@ describe('runUpdate', () => {
         { credentialsPath, fetchImpl, ...sink },
       ),
     ).rejects.toBeInstanceOf(ApiError);
+  });
+});
+
+describe('createScheduleCommand — wiring', () => {
+  it('update wires --env onto the request body', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const command = createScheduleCommand({
+      credentialsPath,
+      fetchImpl: makeFetch((url, init) => {
+        calls.push({ url, init });
+        return { body: { ...SCHEDULE, environment: 'staging', environmentMode: 'pinned' } };
+      }),
+      ...sink,
+    });
+
+    await command.parseAsync(['update', 'sch_1', '--env', 'staging'], { from: 'user' });
+
+    const patch = calls.find(c => (c.init.method ?? 'GET') === 'PATCH')!;
+    expect(JSON.parse(String(patch.init.body))).toMatchObject({ environment: 'staging' });
   });
 });
 

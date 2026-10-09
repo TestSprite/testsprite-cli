@@ -200,6 +200,7 @@ describe('createTestCommand — surface', () => {
     expect(flagNames).toEqual(
       expect.arrayContaining([
         '--project',
+        '--env',
         '--type',
         '--created-from',
         '--page-size',
@@ -208,6 +209,7 @@ describe('createTestCommand — surface', () => {
         '--max-items',
       ]),
     );
+    expect(list.options.find(o => o.long === '--env')?.description).toContain('frontend');
   });
 
   it('failure get exposes --out and --failed-only flags (P5)', () => {
@@ -389,6 +391,288 @@ describe('createTestCommand — surface', () => {
 });
 
 describe('runList', () => {
+  it('forwards --env', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const test = createTestCommand({
+      credentialsPath,
+      fetchImpl: makeFetch(url => {
+        seen.push(url);
+        return { body: { items: [], nextToken: null } };
+      }),
+      stdout: () => undefined,
+    });
+    await test.parseAsync(['list', '--project', 'project_alice', '--env', 'staging'], {
+      from: 'user',
+    });
+    expect(new URL(seen[0]!).searchParams.get('environment')).toBe('staging');
+  });
+
+  it('json keeps status and adds statusByEnvironment and headlineEnvironment', async () => {
+    const { credentialsPath } = makeCreds();
+    const row = {
+      ...FE_TEST,
+      statusByEnvironment: [
+        { environmentId: 'env_staging', environmentName: 'staging', status: 'failed' },
+        { environmentId: null, environmentName: null, status: 'passed' },
+      ],
+      headlineEnvironment: { id: 'env_staging', name: 'staging' },
+    };
+    const out: string[] = [];
+    await runList(
+      { profile: 'default', output: 'json', debug: false, projectId: 'project_alice' },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: { items: [row], nextToken: null } })),
+        stdout: line => out.push(line),
+      },
+    );
+    expect(JSON.parse(out.join('\n')).items[0]).toMatchObject({
+      status: 'failed',
+      statusByEnvironment: row.statusByEnvironment,
+      headlineEnvironment: row.headlineEnvironment,
+    });
+  });
+
+  it('json does not invent environment fields for older backends', async () => {
+    const { credentialsPath } = makeCreds();
+    const out: string[] = [];
+    await runList(
+      { profile: 'default', output: 'json', debug: false, projectId: 'project_alice' },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: { items: [FE_TEST], nextToken: null } })),
+        stdout: line => out.push(line),
+      },
+    );
+    const row = JSON.parse(out.join('\n')).items[0] as Record<string, unknown>;
+    expect(row.status).toBe('failed');
+    expect(row).not.toHaveProperty('statusByEnvironment');
+    expect(row).not.toHaveProperty('headlineEnvironment');
+  });
+
+  it('text renders ENV', async () => {
+    const { credentialsPath } = makeCreds();
+    const out: string[] = [];
+    const err: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_alice',
+        environment: 'staging',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({
+          body: {
+            items: [
+              {
+                ...FE_TEST,
+                status: 'ready',
+                statusByEnvironment: [],
+                headlineEnvironment: { id: 'env_secret', name: 'staging' },
+              },
+              BE_TEST,
+            ],
+            nextToken: null,
+          },
+        })),
+        stdout: line => out.push(line),
+        stderr: line => err.push(line),
+      },
+    );
+    const block = out.join('\n');
+    expect(block).toMatch(/STATUS\s+UPDATED\s+ENV/);
+    expect(block).toMatch(/ready\s+2026-05-05\S*\s+staging/);
+    expect(block).toMatch(/passed\s+2026-05-05\S*\s+-/);
+    expect(block).toContain("Frontend test status requested for environment 'staging'.");
+    expect(block).not.toContain('env_secret');
+    expect(err).toEqual([]);
+  });
+
+  it('refuses --env when an older server omits environment status fields', async () => {
+    const { credentialsPath } = makeCreds();
+    const out: string[] = [];
+    const error = await runList(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        environment: 'staging',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: { items: [FE_TEST], nextToken: null } })),
+        stdout: line => out.push(line),
+        stderr: () => {},
+      },
+    ).catch(e => e as ApiError);
+    expect(error).toMatchObject({ code: 'UNSUPPORTED', exitCode: 7 });
+    expect(out).toEqual([]);
+  });
+
+  it('does not warn about the environment filter for an empty list', async () => {
+    const { credentialsPath } = makeCreds();
+    const err: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_alice',
+        environment: 'staging',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: { items: [], nextToken: null } })),
+        stdout: () => {},
+        stderr: line => err.push(line),
+      },
+    );
+    expect(err.filter(line => line.startsWith('Warning:'))).toEqual([]);
+  });
+
+  it('keeps --env --no-header stdout to rows only', async () => {
+    const { credentialsPath } = makeCreds();
+    const out: string[] = [];
+    const err: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_alice',
+        environment: 'staging',
+        columns: 'status,id',
+        noHeader: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({
+          body: {
+            items: [{ ...FE_TEST, statusByEnvironment: [], headlineEnvironment: null }, BE_TEST],
+            nextToken: null,
+          },
+        })),
+        stdout: line => out.push(line),
+        stderr: line => err.push(line),
+      },
+    );
+    expect(out.join('\n').split('\n')).toEqual(['failed     test_fe', 'passed     test_be']);
+    expect(err).toEqual(["Frontend test status requested for environment 'staging'."]);
+  });
+
+  it('blank env rejects locally', async () => {
+    const seen: string[] = [];
+    await expect(
+      runList(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_alice',
+          environment: '  ',
+        },
+        {
+          fetchImpl: makeFetch(url => {
+            seen.push(url);
+            return { body: { items: [], nextToken: null } };
+          }),
+          stdout: () => undefined,
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5, details: { field: 'env' } });
+    expect(seen).toEqual([]);
+  });
+
+  it('unknown env shows available names', async () => {
+    const { credentialsPath } = makeCreds();
+    const error = await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_alice',
+        environment: 'missing',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({
+          status: 400,
+          body: {
+            error: {
+              code: 'VALIDATION_ERROR',
+              message: 'Unknown environment.',
+              nextAction: '',
+              requestId: 'req_1',
+              details: {
+                field: 'environment',
+                available: ['default', 'staging'],
+                accepted: ['default', 'staging'],
+              },
+            },
+          },
+        })),
+        stdout: () => undefined,
+      },
+    ).then(
+      () => {
+        throw new Error('expected unknown environment error');
+      },
+      err => err as ApiError,
+    );
+    expect(error).toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      requestId: 'req_1',
+      details: { field: 'environment', available: ['default', 'staging'] },
+    });
+    expect(error.nextAction).toContain(
+      "unknown environment 'missing'; use one of: default, staging",
+    );
+  });
+
+  it('unknown env keeps a server hint and still shows available names', async () => {
+    const { credentialsPath } = makeCreds();
+    const error = await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_alice',
+        environment: 'missing',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({
+          status: 400,
+          body: {
+            error: {
+              code: 'VALIDATION_ERROR',
+              message: 'Unknown environment.',
+              nextAction: 'Check the environment name.',
+              requestId: 'req_2',
+              details: { field: 'environment', available: ['default', 'staging'] },
+            },
+          },
+        })),
+        stdout: () => undefined,
+      },
+    ).then(
+      () => {
+        throw new Error('expected unknown environment error');
+      },
+      err => err as ApiError,
+    );
+    expect(error.nextAction).toContain(
+      "unknown environment 'missing'; use one of: default, staging",
+    );
+    expect(error.nextAction).toContain('Check the environment name.');
+  });
+
   it('reports missing credentials before a missing project', async () => {
     const credentialsPath = join(mkdtempSync(join(tmpdir(), 'cli-list-auth-')), 'credentials');
     const test = createTestCommand({
@@ -734,6 +1018,47 @@ describe('runList', () => {
     expect(out.join('\n')).not.toContain('UPDATED');
   });
 
+  it('keeps nextToken on stdout under --no-header for a non-empty page', async () => {
+    // `--no-header` suppresses the text-table HEADER row only (its
+    // documented contract) — a script piping `--no-header` output still
+    // needs `nextToken` to keep paging with `--starting-token`.
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { items: [FE_TEST], nextToken: 'more-1' } }));
+    const out: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_alice',
+        pageSize: 25,
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    const block = out.join('\n');
+    expect(block).not.toContain('STATUS');
+    expect(block).toContain('nextToken: more-1');
+  });
+
+  it('still prints "No tests." for an empty page under --no-header', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { items: [], nextToken: null } }));
+    const out: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_alice',
+        pageSize: 25,
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    expect(out.join('\n')).toBe('No tests.');
+  });
+
   it('text mode rejects unknown columns with VALIDATION_ERROR before auth/network access', async () => {
     await expect(
       runList(
@@ -966,6 +1291,26 @@ describe('createTestCommand list — required flag', () => {
 });
 
 describe('runGet', () => {
+  it('renders the headline environment beside the status', async () => {
+    const { credentialsPath } = makeCreds();
+    const out: string[] = [];
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({
+          body: {
+            ...FE_TEST,
+            headlineEnvironment: { id: 'env_hidden', name: 'staging' },
+          },
+        })),
+        stdout: line => out.push(line),
+      },
+    );
+    expect(out.join('\n')).toContain('environment: staging');
+    expect(out.join('\n')).not.toContain('env_hidden');
+  });
+
   it('GETs /tests/{id} and prints the §6.2 fields in text mode', async () => {
     const { credentialsPath } = makeCreds();
     const seen: string[] = [];
@@ -1308,6 +1653,24 @@ const TEST_CODE_INLINE: CliTestCode = {
   etag: 'sha256:abc',
 };
 
+const TEST_CODE_WITH_MOCK_BEARER: CliTestCode = {
+  testId: 'test_fe',
+  language: 'typescript',
+  framework: 'playwright',
+  code: [
+    "import { test, expect } from '@playwright/test';",
+    "test('authenticated request', async ({ request }) => {",
+    "  const res = await request.get('/api/me', {",
+    "    headers: { Authorization: 'Bearer mock-token-abc123' },",
+    '  });',
+    '  expect(res.ok()).toBe(true);',
+    '});',
+    '',
+  ].join('\n'),
+  codeVersion: 'v3',
+  etag: 'sha256:def',
+};
+
 const TEST_CODE_PRESIGNED: CliTestCode = {
   testId: 'test_large',
   language: 'typescript',
@@ -1527,6 +1890,30 @@ describe('backend wait fallback — testTitle overlay used for CI report titles'
   });
 });
 
+describe('writeBatchJUnitReportIfRequested — run timing', () => {
+  it.each([
+    { startedAt: null, createdAt: '2026-08-17T10:00:00.000Z', time: '12.5' },
+    {
+      startedAt: '2026-08-17T10:00:05.000Z',
+      createdAt: '2026-08-17T10:00:00.000Z',
+      time: '7.5',
+    },
+    { startedAt: null, createdAt: undefined, time: '0' },
+  ])('renders testcase and suite time=$time from the run timestamps', async timing => {
+    const dir = mkdtempSync(join(tmpdir(), 'ts-junit-timing-'));
+    const file = join(dir, 'report.xml');
+    await writeBatchJUnitReportIfRequested(
+      { report: 'junit', reportFile: file, projectId: 'project_alice' },
+      [{ testId: 't1', status: 'passed', ...timing, finishedAt: '2026-08-17T10:00:12.500Z' }],
+    );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads the JUnit report this test wrote to its own temp dir, never user input
+    const xml = readFileSync(file, 'utf8');
+    expect(xml).toContain(`skipped="0" time="${timing.time}">`);
+    expect(xml).toContain(`testId="t1" time="${timing.time}">`);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
 describe('writeBatchJUnitReportIfRequested — testcase name precedence', () => {
   let dir: string;
   beforeEach(() => {
@@ -1600,6 +1987,25 @@ describe('runCodeGet', () => {
     expect(seen[0]).toContain('/tests/test_fe/code');
     expect(got).toEqual(TEST_CODE_INLINE);
     expect(JSON.parse(out[0]!)).toEqual(TEST_CODE_INLINE);
+  });
+
+  it('JSON mode round-trips a literal mock Bearer header in stored code byte-identical', async () => {
+    // A generated auth-flow test routinely fixtures a mock bearer header
+    // like this one. `test code get --output json | jq -r .code > t.spec.ts`
+    // -> edit -> `test code put t.spec.ts` must round-trip the exact bytes
+    // the server stored — this is the user's own test source, not server
+    // error prose, so it must never be mistaken for a credential and masked.
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: TEST_CODE_WITH_MOCK_BEARER }));
+    const out: string[] = [];
+    const got = await runCodeGet(
+      { profile: 'default', output: 'json', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    expect(got).toEqual(TEST_CODE_WITH_MOCK_BEARER);
+    const printed = JSON.parse(out[0]!) as CliTestCode;
+    expect(printed.code).toBe(TEST_CODE_WITH_MOCK_BEARER.code);
+    expect(printed.code).toContain('Bearer mock-token-abc123');
   });
 
   it('text mode prints the inline source body byte-exact via rawStdout', async () => {

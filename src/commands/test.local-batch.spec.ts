@@ -63,6 +63,15 @@ function fixture(
         status,
         headers: { 'content-type': 'application/json' },
       });
+    if (method === 'GET' && url.endsWith('/projects/P/env'))
+      return json({
+        environments: [{ name: 'saved', url: targetUrl, isDefault: true, isTemporary: false }],
+      });
+    if (method === 'GET' && url.includes('/tests?'))
+      return json({
+        items: ids.map(id => ({ id, name: id, type: 'frontend', projectId: 'P' })),
+        nextToken: null,
+      });
     if (method === 'POST' && url.endsWith('/tunnel'))
       return json(
         {
@@ -240,7 +249,7 @@ describe('test run local batch', () => {
     expect(f.calls.some(c => c.method === 'POST')).toBe(false);
   });
 
-  it('refuses a public named environment before minting a shared tunnel', async () => {
+  it('runs through a tunnel using a public named environment sign-in config', async () => {
     const f = fixture(['a', 'b'], {
       onCall: call => {
         if (call.method === 'GET' && /\/tests\/(a|b)$/.test(call.url))
@@ -257,13 +266,12 @@ describe('test run local batch', () => {
         return undefined;
       },
     });
-    await expect(
-      f.run('a', 'b', '--local', '5173', '--env', 'staging', '--skip-preflight'),
-    ).rejects.toMatchObject({ exitCode: 5 });
-    expect(f.calls.some(c => c.method === 'POST')).toBe(false);
+    await f.run('a', 'b', '--local', '5173', '--env', 'staging', '--skip-preflight');
+    expect(f.calls.filter(c => c.method === 'POST' && c.url.endsWith('/runs'))).toHaveLength(2);
+    expect(f.calls.at(-1)?.method).toBe('DELETE');
   });
 
-  it('checks the named environment for --all before minting', async () => {
+  it('all-local runs can use a public named environment', async () => {
     const f = fixture([], {
       onCall: call => {
         if (call.method === 'GET' && call.url.includes('/tests?'))
@@ -281,10 +289,18 @@ describe('test run local batch', () => {
         return undefined;
       },
     });
-    await expect(
-      f.run('--all', '--project', 'P', '--local', '5173', '--env', 'staging', '--skip-preflight'),
-    ).rejects.toMatchObject({ exitCode: 5 });
-    expect(f.calls.some(c => c.method === 'POST')).toBe(false);
+    await f.run(
+      '--all',
+      '--project',
+      'P',
+      '--local',
+      '5173',
+      '--env',
+      'staging',
+      '--skip-preflight',
+    );
+    expect(f.calls.filter(c => c.method === 'POST' && c.url.endsWith('/runs'))).toHaveLength(1);
+    expect(f.calls.at(-1)?.method).toBe('DELETE');
   });
 
   it('uses one binding for three tests and reports results in input order', async () => {
@@ -401,10 +417,10 @@ describe('test run local batch', () => {
     );
   });
 
-  it('rejects several ids without local before any request', async () => {
+  it('several ids use a saved loopback environment automatically', async () => {
     const f = fixture(['a', 'b']);
-    await expect(f.run('a', 'b')).rejects.toMatchObject({ exitCode: 5 });
-    expect(f.calls).toEqual([]);
+    await f.run('a', 'b', '--skip-preflight');
+    expect(f.calls.filter(c => c.method === 'POST' && c.url.endsWith('/runs'))).toHaveLength(2);
   });
 
   it('deduplicates ids in first occurrence order and advises for each duplicate', async () => {
@@ -456,7 +472,7 @@ describe('test run local batch', () => {
       {
         method: 'POST',
         path: '/api/cli/v1/tests/<each frontend test in the project>/runs',
-        body: { source: 'cli', targetUrl: f.targetUrl, tunnelClientId: f.clientId },
+        body: { source: 'cli', targetUrl: 'http://localhost:5173', tunnelClientId: f.clientId },
       },
     ]);
   });
@@ -568,6 +584,13 @@ describe('test run local batch', () => {
       expect(f.calls.filter(c => c.method === 'DELETE' && c.url.includes('/tunnel/'))).toHaveLength(
         1,
       );
+      if (noCancel) {
+        expect(f.stderr.join('\n')).toContain('still billed');
+        expect(f.stderr.join('\n')).toContain('steps that still need your machine will fail');
+        expect(f.stderr.join('\n')).toContain('can still pass');
+        expect(f.stderr.join('\n')).toContain('testsprite test result a');
+        expect(f.stderr.join('\n')).toContain('testsprite test wait run_a');
+      }
       const payload = JSON.parse(f.stdout.join(''));
       expect(payload.results.map((r: { status: string }) => r.status)).toEqual([
         noCancel ? 'running' : 'cancelled',
@@ -700,40 +723,45 @@ describe('test run local batch', () => {
     expect(Date.now() - startedAt).toBeLessThan(5_000);
   }, 15_000);
 
-  it('borrows one tunnel without mint or delete and keeps runs on interrupt', async () => {
-    const shutdown = new ShutdownController();
-    const f = fixture(['a', 'b', 'c'], {
-      shutdown,
-      onCall: call => {
-        if (call.method === 'GET' && call.url.includes('/runs/run_')) {
-          shutdown.interrupt('SIGINT');
-          return runningResponse(/run_([^/?]+)/.exec(call.url)![1]!);
-        }
-        return undefined;
-      },
-    });
-    await expect(
-      f.run(
-        'a',
-        'b',
-        'c',
-        '--local',
-        '5173',
-        '--skip-preflight',
-        '--max-concurrency',
-        '2',
-        '--tunnel-client',
-        f.clientId,
-      ),
-    ).rejects.toBeInstanceOf(InterruptError);
-    expect(f.calls.some(c => c.url.endsWith('/tunnel'))).toBe(false);
-    expect(f.calls.some(c => c.method === 'DELETE')).toBe(false);
-    expect(f.calls.some(c => c.url.endsWith('/cancel'))).toBe(false);
-    expect(f.stderr.join('\n')).toContain(
-      `[tunnel] Reaching ${f.targetUrl} through TestSprite (client ${f.clientId}).`,
-    );
-    expect(f.stderr.join('\n')).toContain('testsprite test wait run_');
-  });
+  it.each([false, true])(
+    'borrows one tunnel without mint or delete and keeps runs on interrupt, no-cancel=%s',
+    async noCancel => {
+      const shutdown = new ShutdownController();
+      const f = fixture(['a', 'b', 'c'], {
+        shutdown,
+        onCall: call => {
+          if (call.method === 'GET' && call.url.includes('/runs/run_')) {
+            shutdown.interrupt('SIGINT');
+            return runningResponse(/run_([^/?]+)/.exec(call.url)![1]!);
+          }
+          return undefined;
+        },
+      });
+      await expect(
+        f.run(
+          'a',
+          'b',
+          'c',
+          '--local',
+          '5173',
+          '--skip-preflight',
+          '--max-concurrency',
+          '2',
+          '--tunnel-client',
+          f.clientId,
+          ...(noCancel ? ['--no-cancel-on-interrupt'] : []),
+        ),
+      ).rejects.toBeInstanceOf(InterruptError);
+      expect(f.calls.some(c => c.url.endsWith('/tunnel'))).toBe(false);
+      expect(f.calls.some(c => c.method === 'DELETE')).toBe(false);
+      expect(f.calls.some(c => c.url.endsWith('/cancel'))).toBe(false);
+      expect(f.stderr.join('\n')).toContain(
+        `[tunnel] Reaching ${f.targetUrl} through TestSprite (client ${f.clientId}).`,
+      );
+      expect(f.stderr.join('\n')).toContain('testsprite test wait run_');
+      expect(f.stderr.join('\n')).not.toContain('The tunnel is closed');
+    },
+  );
 
   it('treats a borrowed owner 404 as tunnel loss and shares liveness checks', async () => {
     const f = fixture(['a', 'b', 'c'], {
@@ -1109,13 +1137,13 @@ describe('test run local batch', () => {
     });
   });
 
-  it('refuses a dead local port for --all --local before any request', async () => {
+  it('refuses a dead local port for --all --local before any write', async () => {
     const f = fixture([]);
     // Port 9 (discard) is essentially never listening on a developer machine.
     await expect(f.run('--all', '--project', 'P', '--local', '9')).rejects.toMatchObject({
       exitCode: 5,
     });
-    expect(f.calls).toEqual([]);
+    expect(f.calls.every(call => call.method === 'GET')).toBe(true);
   });
 
   it('honours --allow-empty for an empty project even when the local port is dead', async () => {
@@ -1485,4 +1513,50 @@ describe('test run local batch', () => {
     expect(f.calls.some(c => c.method === 'POST')).toBe(false);
     expect(JSON.parse(f.stdout.join('')).results).toEqual([]);
   });
+});
+
+it('uses createdAt for local batch JUnit when the poll has no startedAt', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'local-batch-junit-timing-')), 'results.xml');
+  const f = fixture(['a', 'b'], {
+    onCall: call =>
+      call.method === 'GET' && call.url.includes('/runs/run_a')
+        ? new Response(
+            JSON.stringify({
+              runId: 'run_a',
+              testId: 'a',
+              projectId: 'P',
+              userId: 'U',
+              status: 'passed',
+              source: 'cli',
+              createdAt: '2026-09-22T00:00:00.000Z',
+              startedAt: null,
+              finishedAt: '2026-09-22T00:00:12.500Z',
+              codeVersion: 'v1',
+              targetUrl: 'http://localhost:5173',
+              createdFrom: 'cli',
+              failedStepIndex: null,
+              failureKind: null,
+              error: null,
+              videoUrl: null,
+              stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        : undefined,
+  });
+  await f.run(
+    'a',
+    'b',
+    '--local',
+    '5173',
+    '--skip-preflight',
+    '--report',
+    'junit',
+    '--report-file',
+    path,
+  );
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads the JUnit report this test wrote to its own temp dir, never user input
+  const xml = readFileSync(path, 'utf8');
+  expect(xml).toContain('skipped="0" time="13.5">');
+  expect(xml).toContain('runId="run_a" time="12.5">');
 });

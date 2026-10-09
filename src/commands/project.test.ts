@@ -88,7 +88,7 @@ describe('createProjectCommand', () => {
     errorSpy.mockRestore();
   });
 
-  it('exposes list, get, create, update, delete, credential, auto-auth, docs and env subcommands', () => {
+  it('exposes project subcommands', () => {
     const project = createProjectCommand();
     const names = project.commands.map(c => c.name()).sort();
     expect(names).toEqual([
@@ -100,6 +100,7 @@ describe('createProjectCommand', () => {
       'env',
       'get',
       'list',
+      'sign-in',
       'update',
     ]);
   });
@@ -117,6 +118,57 @@ describe('createProjectCommand', () => {
 });
 
 describe('runList', () => {
+  it('list shows default environment and count', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: {
+        items: [{ ...PROJECT_FIXTURE, defaultEnvironment: 'staging', environmentCount: 2 }],
+        nextToken: null,
+      },
+    }));
+    const out: string[] = [];
+
+    await runList(
+      { profile: 'default', output: 'text', debug: false, pageSize: 25 },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    const [header, row] = out.join('\n').split('\n');
+    expect(header).toMatch(/DEFAULT ENV\s+ENVS/);
+    expect(row).toMatch(/staging\s+2/);
+  });
+
+  it('list renders dash when the server omits environment fields', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { items: [PROJECT_FIXTURE], nextToken: null },
+    }));
+    const out: string[] = [];
+
+    await runList(
+      { profile: 'default', output: 'text', debug: false, pageSize: 25 },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    const [header, row] = out.join('\n').split('\n');
+    expect(header).toMatch(/DEFAULT ENV\s+ENVS/);
+    expect(row).toMatch(/-\s+-/);
+
+    const selectedOut: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        pageSize: 25,
+        columns: 'name,defaultenv,envs',
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => selectedOut.push(line) },
+    );
+    expect(selectedOut.join('\n')).toMatch(/^Checkout\s+-\s+-$/);
+  });
+
   it('returns the first page when no flags are passed (auto-paging follows nextToken)', async () => {
     const { credentialsPath } = makeCreds();
     let calls = 0;
@@ -643,6 +695,128 @@ describe('createProjectCommand --page-size option parser', () => {
 });
 
 describe('runGet', () => {
+  it('get shows default environment and count', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { ...PROJECT_FIXTURE, defaultEnvironment: 'staging', environmentCount: 2 },
+    }));
+    const out: string[] = [];
+
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, projectId: PROJECT_FIXTURE.id },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    const block = out.join('\n');
+    expect(block).toContain('defaultEnv:  staging');
+    expect(block).toContain('envs:        2');
+    expect(block).toContain(`testsprite project env list ${PROJECT_FIXTURE.id}`);
+  });
+
+  it('get omits environment lines for older servers', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: PROJECT_FIXTURE }));
+    const out: string[] = [];
+
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, projectId: PROJECT_FIXTURE.id },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+
+    const block = out.join('\n');
+    expect(block).not.toContain('Default environment:');
+    expect(block).not.toContain('Environments:');
+    expect(block).not.toContain('testsprite project env list');
+  });
+
+  it('zero environments show 0 and no default', async () => {
+    const { credentialsPath } = makeCreds();
+    const zero = { ...PROJECT_FIXTURE, defaultEnvironment: null, environmentCount: 0 };
+    const fetchImpl = makeFetch(url => ({
+      body: url.endsWith(`/${PROJECT_FIXTURE.id}`) ? zero : { items: [zero], nextToken: null },
+    }));
+    const listOut: string[] = [];
+    const getOut: string[] = [];
+
+    await runList(
+      { profile: 'default', output: 'text', debug: false, pageSize: 25 },
+      { credentialsPath, fetchImpl, stdout: line => listOut.push(line) },
+    );
+    await runGet(
+      { profile: 'default', output: 'text', debug: false, projectId: PROJECT_FIXTURE.id },
+      { credentialsPath, fetchImpl, stdout: line => getOut.push(line) },
+    );
+
+    expect(listOut.join('\n').split('\n')[1]).toMatch(/-\s+0/);
+    expect(getOut.join('\n')).toContain('defaultEnv:  -');
+    expect(getOut.join('\n')).toContain('envs:        0');
+    expect(getOut.join('\n')).not.toContain('testsprite project env list');
+
+    const selectedOut: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        pageSize: 25,
+        columns: 'defaultenv,envs',
+        noHeader: true,
+      },
+      { credentialsPath, fetchImpl, stdout: line => selectedOut.push(line) },
+    );
+    expect(selectedOut.join('\n')).toMatch(/^-\s+0$/);
+  });
+
+  it('json passes environment summary fields through', async () => {
+    const { credentialsPath } = makeCreds();
+    const project = { ...PROJECT_FIXTURE, defaultEnvironment: 'staging', environmentCount: 2 };
+    const fetchImpl = makeFetch(url => ({
+      body: url.endsWith(`/${PROJECT_FIXTURE.id}`)
+        ? project
+        : { items: [project], nextToken: null },
+    }));
+    const listOut: string[] = [];
+    const getOut: string[] = [];
+
+    await runList(
+      { profile: 'default', output: 'json', debug: false, pageSize: 25 },
+      { credentialsPath, fetchImpl, stdout: line => listOut.push(line) },
+    );
+    await runGet(
+      { profile: 'default', output: 'json', debug: false, projectId: PROJECT_FIXTURE.id },
+      { credentialsPath, fetchImpl, stdout: line => getOut.push(line) },
+    );
+
+    expect(JSON.parse(listOut.join('\n')).items[0]).toMatchObject({
+      defaultEnvironment: 'staging',
+      environmentCount: 2,
+    });
+    expect(JSON.parse(getOut.join('\n'))).toMatchObject({
+      defaultEnvironment: 'staging',
+      environmentCount: 2,
+    });
+
+    const olderFetch = makeFetch(url => ({
+      body: url.endsWith(`/${PROJECT_FIXTURE.id}`)
+        ? PROJECT_FIXTURE
+        : { items: [PROJECT_FIXTURE], nextToken: null },
+    }));
+    const olderListOut: string[] = [];
+    const olderGetOut: string[] = [];
+    await runList(
+      { profile: 'default', output: 'json', debug: false, pageSize: 25 },
+      { credentialsPath, fetchImpl: olderFetch, stdout: line => olderListOut.push(line) },
+    );
+    await runGet(
+      { profile: 'default', output: 'json', debug: false, projectId: PROJECT_FIXTURE.id },
+      { credentialsPath, fetchImpl: olderFetch, stdout: line => olderGetOut.push(line) },
+    );
+    expect(JSON.parse(olderListOut.join('\n')).items[0]).not.toHaveProperty('defaultEnvironment');
+    expect(JSON.parse(olderListOut.join('\n')).items[0]).not.toHaveProperty('environmentCount');
+    expect(JSON.parse(olderGetOut.join('\n'))).not.toHaveProperty('defaultEnvironment');
+    expect(JSON.parse(olderGetOut.join('\n'))).not.toHaveProperty('environmentCount');
+  });
+
   it('GETs /projects/{id} and prints the §6.1 fields in text mode', async () => {
     const { credentialsPath } = makeCreds();
     const seen: string[] = [];
@@ -774,32 +948,22 @@ describe('runGet', () => {
 // ---------------------------------------------------------------------------
 
 describe('runCreate', () => {
-  // A loopback --url on CREATE is refused outright: the opt-in for an app on
-  // this machine is `--local <port>` (see project.local.spec.ts), which builds
-  // the loopback URL itself and marks the project `originMode: 'local'`.
-  // `--url http://localhost:…` therefore has no accepted form here — the
-  // refusal points at `--local`. RFC1918 and friends stay rejected either way.
   it.each(['http://localhost:3123', 'http://127.0.0.1:5173', 'http://[::1]:5173'])(
-    'refuses %s as --url and points at --local <port>',
+    'accepts %s as --url and previews the existing local marker',
     async targetUrl => {
-      await expect(
-        runCreate(
-          {
-            profile: 'default',
-            output: 'json',
-            debug: false,
-            dryRun: true,
-            type: 'frontend',
-            name: 'Local App',
-            targetUrl,
-          },
-          { stdout: () => {}, stderr: () => {} },
-        ),
-      ).rejects.toMatchObject({
-        code: 'VALIDATION_ERROR',
-        exitCode: 5,
-        nextAction: expect.stringContaining('Use --local <port> instead of --url'),
-      });
+      const result = await runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: true,
+          type: 'frontend',
+          name: 'Local App',
+          targetUrl,
+        },
+        { stdout: () => {}, stderr: () => {} },
+      );
+      expect(result).toMatchObject({ targetUrl, originMode: 'local' });
     },
   );
 
@@ -1059,6 +1223,43 @@ describe('runCreate', () => {
       ),
     ).rejects.toMatchObject({ exitCode: 5, code: 'VALIDATION_ERROR' });
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('keeps inline password precedence on real and dry-run paths', async () => {
+    const { credentialsPath } = makeCreds();
+    for (const dryRun of [false, true]) {
+      const bodies: unknown[] = [];
+      const stderr: string[] = [];
+      await runCreate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun,
+          type: 'frontend' as const,
+          name: 'Project',
+          targetUrl: 'https://example.com',
+          password: 'inline-secret',
+          passwordFile: '/missing-file-must-not-be-read',
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch((_url, init) => {
+            bodies.push(JSON.parse(String(init.body)));
+            return {
+              body: { ...PROJECT_FIXTURE, projectId: 'proj_abc', updatedFields: ['password'] },
+            };
+          }),
+          stdout: () => {},
+          stderr: line => stderr.push(line),
+        },
+      );
+      expect(bodies).toHaveLength(dryRun ? 0 : 1);
+      if (!dryRun) expect(bodies[0]).toMatchObject({ password: 'inline-secret' });
+      expect(stderr.filter(line => line.startsWith('Warning:'))).toEqual([
+        'Warning: --password takes precedence; --password-file was ignored.',
+      ]);
+    }
   });
 
   it('rejects --description with VALIDATION_ERROR (exit 5), no network — projects have no description', async () => {
@@ -1339,6 +1540,134 @@ describe('runCreate', () => {
 // ---------------------------------------------------------------------------
 
 describe('runUpdate', () => {
+  it('preserves a missing-default conflict after the compatible retry', async () => {
+    const { credentialsPath } = makeCreds();
+    let requests = 0;
+    const nextAction = 'Run testsprite project env set-default proj_abc staging';
+    const error = await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_abc',
+        targetUrl: 'https://new.example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => {
+          requests += 1;
+          return {
+            status: 409,
+            body: {
+              error: {
+                code: 'CONFLICT',
+                message: 'Default environment unavailable',
+                nextAction,
+                requestId: 'req_conflict',
+                details: { reason: 'default-environment-unavailable' },
+              },
+            },
+          };
+        }),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    ).catch(e => e as ApiError);
+    expect(requests).toBe(2);
+    expect(error).toMatchObject({
+      code: 'CONFLICT',
+      exitCode: 6,
+      nextAction,
+      details: { reason: 'default-environment-unavailable' },
+    });
+  });
+
+  it('project update prints the updated default environment', async () => {
+    const { credentialsPath } = makeCreds();
+    const output: string[] = [];
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_abc',
+        targetUrl: 'https://new.example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({
+          body: {
+            projectId: 'proj_abc',
+            updatedFields: ['targetUrl'],
+            environment: { name: 'staging', isDefault: true },
+            effects: ['environment.url', 'project.name'],
+          },
+        })),
+        stdout: line => output.push(line),
+        stderr: () => {},
+      },
+    );
+    expect(output.join('\n')).toContain('environment: staging (default)');
+    expect(output.join('\n')).toContain('Environment URL updated');
+    expect(output.join('\n')).toContain('Project name updated');
+  });
+
+  it('project update never prints the password', async () => {
+    const { credentialsPath } = makeCreds();
+    const output: string[] = [];
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_abc',
+        password: 'sensitive-password',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({
+          body: {
+            projectId: 'proj_abc',
+            environment: { name: 'staging', isDefault: true, password: 'sensitive-password' },
+            effects: ['environment.credentials'],
+          },
+        })),
+        stdout: line => output.push(line),
+        stderr: () => {},
+      },
+    );
+    expect(output.join('\n')).toContain('Environment credentials updated');
+    expect(output.join('\n')).not.toContain('sensitive-password');
+  });
+
+  it('project update keeps old output for older servers', async () => {
+    const { credentialsPath } = makeCreds();
+    const output: string[] = [];
+    await runUpdate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'proj_abc',
+        targetUrl: 'https://new.example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({
+          body: {
+            projectId: 'proj_abc',
+            updatedFields: ['targetUrl'],
+            updatedAt: '2026-05-16T10:00:00.000Z',
+          },
+        })),
+        stdout: line => output.push(line),
+        stderr: () => {},
+      },
+    );
+    expect(output.join('\n')).toBe(
+      'id:            proj_abc\nupdatedFields: targetUrl\nupdatedAt:     2026-05-16T10:00:00.000Z',
+    );
+  });
   it('P7 happy — PATCHes /projects/{id} with the updated fields', async () => {
     const { credentialsPath } = makeCreds();
     const updateResponse: CliUpdateProjectResponse = {
@@ -1559,6 +1888,42 @@ describe('runUpdate', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it('keeps inline password precedence on real and dry-run paths', async () => {
+    const { credentialsPath } = makeCreds();
+    for (const dryRun of [false, true]) {
+      const bodies: unknown[] = [];
+      const stderr: string[] = [];
+      await runUpdate(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun,
+          projectId: 'proj_abc',
+          password: 'inline-secret',
+          passwordFile: '/missing-file-must-not-be-read',
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch((_url, init) => {
+            bodies.push(JSON.parse(String(init.body)));
+            return {
+              body: { ...PROJECT_FIXTURE, projectId: 'proj_abc', updatedFields: ['password'] },
+            };
+          }),
+          stdout: () => {},
+          stderr: line => stderr.push(line),
+        },
+      );
+      expect(bodies).toHaveLength(dryRun ? 0 : 1);
+      if (!dryRun) expect(bodies[0]).toMatchObject({ password: 'inline-secret' });
+      expect(stderr.filter(line => line.startsWith('Warning:'))).toEqual([
+        'Warning: --password takes precedence; --password-file was ignored.',
+      ]);
+    }
+  });
+
   it('P7 — dry-run returns canned shape without network call', async () => {
     resetDryRunBannerForTesting();
     const { credentialsPath } = makeCreds();
@@ -2321,7 +2686,7 @@ describe('runUpdate — --local <port>', () => {
       { credentialsPath, fetchImpl, localPortProbeDeps: { connect }, ...quiet },
     );
     expect(connect).toHaveBeenCalledWith('127.0.0.1', 3000, 2000);
-    expect(bodies[0]).toEqual({ targetUrl: 'http://127.0.0.1:3000', originMode: 'local' });
+    expect(bodies[0]).toEqual({ targetUrl: 'http://localhost:3000', originMode: 'local' });
   });
 
   it('--local-host selects the stored host; --skip-preflight dials nothing', async () => {
@@ -2352,7 +2717,7 @@ describe('runUpdate — --local <port>', () => {
     ).rejects.toMatchObject({
       code: 'VALIDATION_ERROR',
       message:
-        'Nothing is listening on http://127.0.0.1:3000. Start your app first, or pass --skip-preflight.',
+        'Nothing is listening on http://localhost:3000. Start your app first, or pass --skip-preflight.',
     });
     expect(bodies).toEqual([]);
   });
@@ -2381,16 +2746,14 @@ describe('runUpdate — --local <port>', () => {
     expect(connect).not.toHaveBeenCalled();
   });
 
-  it('a loopback --url is refused and redirected to --local, as on create', async () => {
+  it('a loopback --url sends the same local marker as shorthand', async () => {
     const { credentialsPath } = makeCreds();
     const { bodies, fetchImpl } = recording();
-    const error = await runUpdate(
-      { ...base, targetUrl: 'http://localhost:3000' },
+    await runUpdate(
+      { ...base, targetUrl: 'http://localhost:3000', skipPreflight: true },
       { credentialsPath, fetchImpl, ...quiet },
-    ).catch(e => e as ApiError);
-    expect((error as ApiError).details).toMatchObject({ field: 'url' });
-    expect((error as ApiError).nextAction).toContain('Use --local <port> instead of --url');
-    expect(bodies).toEqual([]);
+    );
+    expect(bodies).toEqual([{ targetUrl: 'http://localhost:3000', originMode: 'local' }]);
   });
 
   it('dry-run validates the flags, dials nothing, and prints the run-it-locally hint', async () => {
@@ -2411,7 +2774,104 @@ describe('runUpdate — --local <port>', () => {
     expect(res.updatedFields).toEqual(['targetUrl']);
     expect(connect).not.toHaveBeenCalled();
     expect(bodies).toEqual([]);
-    expect(out.join('\n')).toContain('testsprite test run <test-id> --local 3000');
+    expect(out.join('\n')).toContain('testsprite test run <test-id>');
+  });
+});
+
+describe('project compatibility contracts', () => {
+  it('appends environment columns after the legacy created column', async () => {
+    const { credentialsPath } = makeCreds();
+    const output: string[] = [];
+    await runList(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: { items: [PROJECT_FIXTURE], nextToken: null } })),
+        stdout: line => output.push(line),
+        stderr: () => {},
+      },
+    );
+    const header = output[0]!.split('\n')[0]!;
+    expect(header.indexOf('CREATED')).toBeLessThan(header.indexOf('DEFAULT ENV'));
+  });
+
+  it.each(['create', 'update'] as const)(
+    '%s keeps inline password precedence and warns without reading the file',
+    async operation => {
+      const { credentialsPath } = makeCreds();
+      const bodies: unknown[] = [];
+      const stderr: string[] = [];
+      const deps = {
+        credentialsPath,
+        fetchImpl: makeFetch((_url, init) => {
+          bodies.push(JSON.parse(String(init.body)));
+          return {
+            body:
+              operation === 'create'
+                ? { ...PROJECT_FIXTURE, projectId: PROJECT_FIXTURE.id }
+                : { projectId: PROJECT_FIXTURE.id, updatedFields: ['password'] },
+          };
+        }),
+        stdout: () => {},
+        stderr: (line: string) => stderr.push(line),
+      };
+      const common = {
+        profile: 'default',
+        output: 'json' as const,
+        debug: false,
+        password: 'inline-value',
+        passwordFile: '/file-that-must-not-be-read',
+      };
+      if (operation === 'create')
+        await runCreate(
+          { ...common, type: 'frontend', name: 'Demo', targetUrl: 'https://example.com' },
+          deps,
+        );
+      else await runUpdate({ ...common, projectId: PROJECT_FIXTURE.id }, deps);
+      expect(bodies[0]).toMatchObject({ password: 'inline-value' });
+      expect(stderr.filter(line => line.startsWith('Warning:'))).toEqual([
+        'Warning: --password takes precedence; --password-file was ignored.',
+      ]);
+    },
+  );
+
+  it('project update retries one transient conflict with the same idempotency key', async () => {
+    const { credentialsPath } = makeCreds();
+    const headers: string[] = [];
+    const result = await runUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: PROJECT_FIXTURE.id,
+        name: 'New name',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch((_url, init) => {
+          headers.push(new Headers(init.headers).get('idempotency-key')!);
+          return headers.length === 1
+            ? {
+                status: 409,
+                body: {
+                  error: {
+                    code: 'CONFLICT',
+                    message: 'Retry',
+                    nextAction: 'Retry',
+                    requestId: 'r',
+                    details: {},
+                  },
+                },
+              }
+            : { body: { projectId: PROJECT_FIXTURE.id, updatedFields: ['name'] } };
+        }),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    ).catch(err => err as ApiError);
+    expect(result).not.toBeInstanceOf(ApiError);
+    expect(headers).toHaveLength(2);
+    expect(headers[0]).toBe(headers[1]);
   });
 });
 

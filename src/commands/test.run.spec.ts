@@ -92,6 +92,32 @@ const CURRENT_DEFAULT_ENVIRONMENTS = {
   ],
 };
 
+// Discovery reads must not consume the trigger/poll timing of ordinary-run fixtures.
+function ordinaryRunDiscoveryResponse(
+  input: FetchInput,
+  init: RequestInit = {},
+): Response | undefined {
+  if ((init.method ?? 'GET') !== 'GET') return undefined;
+  const url =
+    typeof input === 'string'
+      ? input
+      : input instanceof URL
+        ? input.toString()
+        : (input as { url: string }).url;
+  const path = new URL(url).pathname;
+  const body = /\/tests\/[^/]+$/.test(path)
+    ? { type: 'frontend', projectId: 'project_1' }
+    : /\/projects\/[^/]+\/env$/.test(path)
+      ? CURRENT_DEFAULT_ENVIRONMENTS
+      : undefined;
+  return body === undefined
+    ? undefined
+    : new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+}
+
 function makeFailedRun(): RunResponse {
   return { ...makePassedRun(), status: 'failed', failedStepIndex: 2, failureKind: 'assertion' };
 }
@@ -214,8 +240,10 @@ describe('runTestRun — no-wait (fire and return)', () => {
     try {
       const { credentialsPath } = makeCreds();
       let abortedAt1250Ms = false;
-      const fetchImpl = (async (_input: FetchInput, init: RequestInit = {}) =>
-        new Promise<Response>((resolve, reject) => {
+      const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+        const discovery = ordinaryRunDiscoveryResponse(input, init);
+        if (discovery) return discovery;
+        return new Promise<Response>((resolve, reject) => {
           const signal = init.signal;
           setTimeout(() => {
             abortedAt1250Ms = signal?.aborted === true;
@@ -230,7 +258,8 @@ describe('runTestRun — no-wait (fire and return)', () => {
             reject(signal?.reason ?? new DOMException('aborted', 'AbortError'));
           if (signal?.aborted) rejectOnAbort();
           else signal?.addEventListener('abort', rejectOnAbort, { once: true });
-        })) as typeof globalThis.fetch;
+        });
+      }) as typeof globalThis.fetch;
 
       const outcomePromise = runTestRun(
         {
@@ -711,19 +740,23 @@ describe('runTestRun — with --wait', () => {
 
   it('wait timeout → UNSUPPORTED error (exit 7) with nextAction containing run-id', async () => {
     const { credentialsPath } = makeCreds();
+    let elapsedMs = 0;
     const fetchImpl = makeFetch(url => {
       if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
         return { body: TRIGGER_RESP };
       }
-      // Always return non-terminal to force timeout
+      if (url.endsWith('/tests/test_xyz'))
+        return { body: { type: 'frontend', projectId: 'project_1' } };
+      if (url.endsWith('/projects/project_1/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
+      // The first running poll advances the clock past the deadline.
+      elapsedMs = 2000;
       return { body: { ...makePassedRun(), status: 'running' as const } };
     });
 
-    // Mock Date.now to force timeout after first check
-    let callCount = 0;
+    // Keep discovery and trigger setup outside the polling deadline advance.
     const base = Date.now();
     const realDateNow = Date.now;
-    Date.now = () => (callCount++ > 4 ? base + 2000 : base);
+    Date.now = () => base + elapsedMs;
 
     try {
       const err = await runTestRun(
@@ -932,7 +965,7 @@ describe('runTestRun — error scenarios', () => {
     expect((err as ApiError).exitCode).toBe(5);
   });
 
-  it('--target-url localhost rejected client-side (no network call)', async () => {
+  it('--target-url loopback with a path is rejected before network access', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn(async () => {
       throw new Error('network should not be hit');
@@ -946,7 +979,7 @@ describe('runTestRun — error scenarios', () => {
         testId: 'test_xyz',
         wait: false,
         timeoutSeconds: 60,
-        targetUrl: 'http://localhost:3000',
+        targetUrl: 'http://localhost:3000/app',
       },
       {
         credentialsPath,
@@ -1011,8 +1044,11 @@ describe('runTestRun — dry-run', () => {
   // a real trigger response) rather than the HTTP-descriptor envelope. This
   // makes `test run --dry-run --output json` consistent with `test rerun --dry-run`.
 
-  it('dry-run: no network call; prints TriggerRunResponse shape', async () => {
-    const { credentialsPath } = makeCreds();
+  it('dry-run keeps credentialless previews offline and prints TriggerRunResponse shape', async () => {
+    const credentialsPath = join(
+      mkdtempSync(join(tmpdir(), 'run-dry-no-creds-')),
+      'missing-credentials',
+    );
     const fetchImpl = vi.fn(async () => {
       throw new Error('should not hit network');
     });
@@ -1677,7 +1713,7 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
       { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
     );
     expect(result).toMatchObject({ runId: 'run_default', status: 'passed' });
-    expect(envReads).toBe(1);
+    expect(envReads).toBe(2);
   });
 
   it('409 adopts a named run only when the current environment id matches', async () => {
@@ -1722,7 +1758,7 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
       { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
     );
     expect(result).toMatchObject({ runId: 'run_staging', status: 'passed' });
-    expect(envReads).toBe(1);
+    expect(envReads).toBe(2);
   });
 
   it.each([
@@ -2083,11 +2119,12 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
   });
 
   it.each([
-    { name: 'staging', url: 'https://default.example.com', localFlag: '' },
-    { name: 'local-dev', url: 'http://127.0.0.1:5173', localFlag: '--local 5173' },
-    { name: 'local-http', url: 'http://127.0.0.1:80', localFlag: '--local 80' },
-    { name: 'local-ipv6', url: 'http://[::1]:5173', localFlag: '--local 5173 --local-host ::1' },
-  ])('auto-resume advice uses the resolved $name environment', async ({ name, url, localFlag }) => {
+    { name: 'staging', url: 'https://default.example.com' },
+    { name: 'local-dev', url: 'http://127.0.0.1:5173' },
+    { name: 'local-http', url: 'http://127.0.0.1:80' },
+    { name: 'local-ipv6', url: 'http://[::1]:5173' },
+    { name: 'local-https', url: 'https://localhost:8443' },
+  ])('auto-resume advice uses the resolved $name environment', async ({ name, url }) => {
     // Finding D (codex round-2): when --target-url is not supplied, the CLI now
     // fetches GET /runs/{currentRunId} to bind the REAL targetUrl to the
     // synthesised triggerResponse (instead of ''). The advisory must include the
@@ -2108,11 +2145,25 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
       targetUrl: url,
       environment: { id: 'env_requested', name },
     };
+    let envReads = 0;
     const fetchImpl = makeFetch(url => {
       if (url.includes('/tests/') && url.includes('/runs')) {
         return { status: 409, body: conflictBody };
       }
       if (url.endsWith('/projects/project_1/env')) {
+        if (++envReads === 1)
+          return {
+            status: 403,
+            body: {
+              error: {
+                code: 'FORBIDDEN',
+                message: 'preflight unavailable',
+                nextAction: 'Retry',
+                requestId: 'r',
+                details: {},
+              },
+            },
+          };
         return {
           body: {
             environments: [
@@ -2149,9 +2200,8 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
     const advisory = stderrLines.join(' ');
     expect(advisory).toContain('run_default_target');
     expect(advisory).toContain(url);
-    expect(advisory).toContain(`--env ${name}`);
-    if (localFlag) expect(advisory).toContain(localFlag);
-    else expect(advisory).not.toContain('--local');
+    expect(advisory).toContain(`testsprite test run test_xyz --env ${name}`);
+    expect(advisory).not.toContain('--local');
     expect(advisory).not.toContain('--target-url');
   });
 });
@@ -2330,7 +2380,7 @@ describe('runTestRun — backend testId fallback (L1888)', () => {
     expect(stderr.join(' ')).toContain('test failure get test_be');
   });
 
-  it('frontend test is untouched — terminal run row resolves with zero testId lookups', async () => {
+  it('terminal frontend run resolves without backend result fallback', async () => {
     const { credentialsPath } = makeCreds();
     const router = beRunRouter({
       type: 'frontend',
@@ -2370,7 +2420,7 @@ describe('runTestRun — backend testId fallback (L1888)', () => {
       },
     );
     expect((result as RunResponse).status).toBe('passed');
-    expect(router.counts.type).toBe(0);
+    expect(router.counts.type).toBe(1);
     expect(router.counts.result).toBe(0);
   });
 });
@@ -2668,7 +2718,7 @@ describe('C2 — backend run renders steps: n/a (backend) in text mode', () => {
     expect(out).not.toContain('0/0');
   });
 
-  it('standalone BE run --wait: text probes /tests/{id} → n/a (backend); JSON never probes', async () => {
+  it('standalone backend run renders n/a in text and preserves the JSON step summary', async () => {
     // Standalone `test run <id>` supplies NO type hint, and the run row is
     // terminal on the first poll (BE rows finalize server-side now), so
     // `beFallbackUsed` stays false. In TEXT mode the card must still read
@@ -2742,9 +2792,9 @@ describe('C2 — backend run renders steps: n/a (backend) in text mode', () => {
     expect(text.out).not.toContain('0/0');
     expect(text.urls.some(u => /\/tests\/be_282$/.test(u))).toBe(true);
 
-    // JSON mode: no extra probe; the wire envelope ships stepSummary verbatim.
+    // JSON mode performs discovery, then ships the wire stepSummary verbatim.
     const json = await runOnce('json');
-    expect(json.urls.some(u => /\/tests\/be_282$/.test(u))).toBe(false);
+    expect(json.urls.filter(u => /\/tests\/be_282$/.test(u))).toHaveLength(1);
     const parsed = JSON.parse(json.out);
     expect(parsed.status).toBe('passed');
     expect(parsed.stepSummary).toEqual({ total: 0, completed: 0, passedCount: 0, failedCount: 0 });
@@ -2930,7 +2980,9 @@ describe('runTestRun --wait: Fix 3 — RequestTimeoutError writes partial JSON t
   it('exit 7 AND stdout contains {runId, status:"running"} when poll throws RequestTimeoutError', async () => {
     const { credentialsPath } = makeCreds();
     let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async (_input, _init) => {
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount += 1;
       if (callCount === 1) {
         // Trigger succeeds
@@ -2995,14 +3047,16 @@ describe('runTestRun --wait: Fix 3 — RequestTimeoutError writes partial JSON t
 describe('runTestRun --wait: TimeoutError writes partial JSON to stdout', () => {
   it('exit 7 AND stdout contains {runId, status:"running"} when --timeout polling deadline is exceeded', async () => {
     const { credentialsPath } = makeCreds();
-    let dateCallCount = 0;
+    let elapsedMs = 0;
     let fetchCallCount = 0;
     const base = Date.now();
     const realDateNow = Date.now;
-    Date.now = () => (++dateCallCount > 6 ? base + 2000 : base);
+    Date.now = () => base + elapsedMs;
 
     try {
-      const fetchImpl: typeof globalThis.fetch = async () => {
+      const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+        const discovery = ordinaryRunDiscoveryResponse(input, init);
+        if (discovery) return discovery;
         ++fetchCallCount;
         if (fetchCallCount === 1) {
           return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -3010,6 +3064,7 @@ describe('runTestRun --wait: TimeoutError writes partial JSON to stdout', () => 
             headers: { 'content-type': 'application/json' },
           });
         }
+        elapsedMs = 2000;
         const runningRun: RunResponse = { ...makePassedRun(), status: 'running' };
         return new Response(JSON.stringify(runningRun), {
           status: 200,
@@ -3070,7 +3125,9 @@ describe('runTestRun --wait: TimeoutError writes partial JSON to stdout', () => 
 describe('runTestRun --wait: Fix 5 — first-run timeout hint', () => {
   function makeTriggerThenPassedFetch(): typeof globalThis.fetch {
     let callCount = 0;
-    return (async (_input, _init) => {
+    return (async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount += 1;
       if (callCount === 1) {
         return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -3177,7 +3234,9 @@ describe('[finding-C] runTestRun --wait RequestTimeoutError — text mode render
   it('text mode: stdout contains runId label line (not raw JSON) on RequestTimeoutError', async () => {
     const { credentialsPath } = makeCreds();
     let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async (_input, _init) => {
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount++;
       if (callCount === 1) {
         return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -3222,7 +3281,9 @@ describe('[finding-C] runTestRun --wait RequestTimeoutError — text mode render
   it('json mode: stdout has merged create-chain envelope when createContext supplied', async () => {
     const { credentialsPath } = makeCreds();
     let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async (_input, _init) => {
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount++;
       if (callCount === 1) {
         return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -3309,7 +3370,9 @@ describe('runTestRun --wait: RATE_LIMITED writes partial JSON to stdout, keeps e
   it('exit 11 (NOT reclassified to 7) AND stdout contains {runId, status:"running"} when poll exhausts RATE_LIMITED retries', async () => {
     const { credentialsPath } = makeCreds();
     let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async () => {
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount += 1;
       if (callCount === 1) {
         return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -3367,7 +3430,9 @@ describe('runTestRun --wait: RATE_LIMITED writes partial JSON to stdout, keeps e
   it('text mode: renders human-readable partial (not raw JSON), still exit 11', async () => {
     const { credentialsPath } = makeCreds();
     let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async () => {
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount += 1;
       if (callCount === 1) {
         return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -3410,7 +3475,9 @@ describe('runTestRun --wait: RATE_LIMITED writes partial JSON to stdout, keeps e
   it('honors Retry-After in the stderr hint when present', async () => {
     const { credentialsPath } = makeCreds();
     let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async () => {
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount += 1;
       if (callCount === 1) {
         return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -4586,6 +4653,7 @@ describe('runTestRunAll — batch fresh run', () => {
     const fetchImpl = makeFetch((url, init) => {
       const method = init.method ?? 'GET';
       if (method === 'POST') return { body: BATCH_FRESH_RESP };
+      if (url.endsWith('/projects/project_be/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
 
       const runId = url.split('/runs/')[1]?.split('?')[0] ?? 'run_unknown';
       runFetches.push(runId);
@@ -5985,7 +6053,7 @@ describe('runTestRunAll — zero-dispatch fails the CI gate', () => {
     const out: string[] = [];
     const fetchImpl = makeFetch(() => ({ body: { ...EMPTY_BATCH, skippedFrontend: ['fe_1'] } }));
     await expect(
-      runTestRunAll(baseOpts({ ghOutput: true, summaryFile }) as never, {
+      runTestRunAll(baseOpts({ ghOutput: true, summaryFile, wait: true }) as never, {
         credentialsPath,
         fetchImpl,
         stdout: (l: string) => out.push(l),
@@ -6418,19 +6486,14 @@ describe('runTestRun --wait — InterruptError graceful detach', () => {
     // Trigger POST resolves; the subsequent GET /runs/{id} long-poll hangs
     // until the composed signal aborts (real-fetch contract).
     const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : (input as { url: string }).url;
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       if (init.method === 'POST') {
         return new Response(JSON.stringify(TRIGGER_RESP), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
       }
-      void url;
       return new Promise<Response>((_resolve, reject) => {
         const signal = init.signal;
         const rejectWithReason = (): void => {
@@ -7034,6 +7097,7 @@ describe('gh-output integration on single-test run --wait (Gap A)', () => {
       },
     ).catch(e => e);
     expect(err).toMatchObject({ exitCode: 1 });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
     const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
       total: number;
       passed: number;
@@ -7180,7 +7244,9 @@ describe('early run receipt', () => {
           stdout: line => stdout.push(line),
           stderr: line => stderr.push(line),
           shutdown: new ShutdownController(),
-          fetchImpl: async (_input, init) => {
+          fetchImpl: async (input, init) => {
+            const discovery = ordinaryRunDiscoveryResponse(input, init);
+            if (discovery) return discovery;
             if (init?.method === 'POST')
               return new Response(JSON.stringify({ ...TRIGGER_RESP, dashboardUrl }));
             enteredPoll();
@@ -8337,4 +8403,112 @@ describe('test run --env', () => {
     expect(text).toContain('environment local-dev');
     expect(text).toContain('targetUrl   http://127.0.0.1:55015');
   });
+});
+
+describe('run output regressions', () => {
+  afterEach(() => vi.restoreAllMocks());
+  it('shows a blocked scheduled local environment reason under --wait', async () => {
+    const reason =
+      'Environment local is on this machine (http://localhost:4900); scheduled runs execute in the cloud and cannot reach it.';
+    const { runId, testId, ...fields } = makePassedRun();
+    const run = {
+      runId,
+      testId,
+      testTitle: null,
+      ...fields,
+      status: 'blocked' as const,
+      failureKind: 'infra',
+      error: reason,
+    };
+    for (const output of ['text', 'json'] as const) {
+      const lines: string[] = [];
+      const err = await runTestRun(
+        {
+          profile: 'default',
+          output,
+          debug: false,
+          testId: 'test_xyz',
+          wait: true,
+          timeoutSeconds: 60,
+        },
+        {
+          ...makeCreds(),
+          fetchImpl: makeFetch((_url, init) => ({
+            body: init.method === 'POST' ? TRIGGER_RESP : run,
+          })),
+          stdout: line => lines.push(line),
+          stderr: () => {},
+          sleep: instantSleep,
+        },
+      ).catch((error: unknown) => error);
+      expect(err).toMatchObject({ exitCode: 1 });
+      if (output === 'json') expect(lines).toEqual([JSON.stringify(run, null, 2)]);
+      else expect(lines.join('\n')).toContain(`error       ${reason}`);
+    }
+  });
+
+  it.each([false, true])(
+    'uses a polled run createdAt for JUnit with final rescue poll=%s without changing JSON',
+    async rescue => {
+      let clock = 1_000;
+      const now = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+      const dir = mkdtempSync(join(tmpdir(), 'batch-junit-timing-'));
+      const reportFile = join(dir, 'report.xml');
+      const lines: string[] = [];
+      await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_1',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+          report: 'junit',
+          reportFile,
+        },
+        {
+          ...makeCreds(),
+          fetchImpl: makeFetch((url, init) => {
+            if (init.method === 'POST') {
+              return {
+                body: {
+                  accepted: [
+                    {
+                      testId: 'test_xyz',
+                      runId: 'run_abc',
+                      enqueuedAt: '2026-05-15T10:00:00.000Z',
+                    },
+                  ],
+                  conflicts: [],
+                  deferred: rescue ? [{ testId: 'later', reason: 'rate_limited' }] : [],
+                  skippedFrontend: [],
+                  skippedIntegration: [],
+                },
+              };
+            }
+            if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
+            return { body: { ...makePassedRun(), startedAt: null } };
+          }),
+          stdout: line => lines.push(line),
+          stderr: () => {},
+          sleep: async () => {
+            if (rescue) clock += 62_000;
+          },
+        },
+      ).catch(err => {
+        if (rescue) expect(err).toMatchObject({ exitCode: 7 });
+        else throw err;
+      });
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads the JUnit report this test wrote to its own temp dir, never user input
+      const xml = readFileSync(reportFile, 'utf8');
+      expect(xml).toContain(`skipped="${rescue ? 1 : 0}" time="30">`);
+      expect(xml).toContain('runId="run_abc" time="30">');
+      const json = JSON.parse(lines[0]!) as { accepted: Record<string, unknown>[] };
+      expect(json.accepted[0]).not.toHaveProperty('createdAt');
+      expect(json.accepted[0]).not.toHaveProperty('durationSeconds');
+      now.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  );
 });

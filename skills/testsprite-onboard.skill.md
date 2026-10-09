@@ -117,8 +117,8 @@ testsprite project docs upload ./prd.md --project <projectId> --role prd   # opt
 testsprite test plan generate --project <projectId>
 ```
 
-Only missing stages run. Frontend exploration can take minutes; Ctrl-C detaches
-while generation continues. If inputs are still processing, wait and re-run.
+Only missing stages run. Frontend exploration can take minutes. If cut off, the
+running stage finishes; re-run to continue. If inputs are processing, wait and re-run.
 
 Review titles and steps against the source. Drop nonexistent flows, duplicates,
 and vague assertions before accepting.
@@ -181,8 +181,8 @@ runs keep working after the token expires. A hardcoded token expires within hour
 key can't be rotated centrally — `test create` emits a `[warn]` on an inlined credential; treat it
 as a must-fix.
 
-Each assertion must name an observable element, text, URL, count, or status.
-Avoid "verify it works" or "check the page loads": vague assertions create false passes.
+Each assertion must name an observable element, text, URL, count, or status;
+vague ones like "verify it works" create false passes.
 
 Aim for ~8–15 tests covering the core flows. Don't pad.
 
