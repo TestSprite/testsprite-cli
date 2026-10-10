@@ -128,8 +128,17 @@ const CREDENTIALS_LOCK_WAIT_MS = 5_000;
 const CREDENTIALS_LOCK_TRANSIENT_WAIT_MS = 1_000;
 const CREDENTIALS_LOCK_STALE_MS = 30_000;
 
+/**
+ * A prototype-less map, so a profile named `__proto__`, `constructor`, or
+ * `toString` (all valid per PROFILE_NAME_RE) is an ordinary key rather than a
+ * lookup that hits — or an assignment that rewrites — Object.prototype.
+ */
+function emptyCredentialsFile(): CredentialsFile {
+  return Object.create(null) as CredentialsFile;
+}
+
 export function parseCredentials(content: string): CredentialsFile {
-  const result: CredentialsFile = {};
+  const result = emptyCredentialsFile();
   let currentEntry: ProfileEntry | null = null;
   for (const rawLine of content.split('\n')) {
     const line = rawLine.trim();
@@ -152,7 +161,7 @@ export function parseCredentials(content: string): CredentialsFile {
     if (eqIndex < 0) continue;
     const rawKey = line.slice(0, eqIndex).trim();
     const rawValue = line.slice(eqIndex + 1).trim();
-    const field = FILE_KEY_TO_FIELD[rawKey];
+    const field = Object.hasOwn(FILE_KEY_TO_FIELD, rawKey) ? FILE_KEY_TO_FIELD[rawKey] : undefined;
     if (field) currentEntry[field] = rawValue;
   }
   return result;
@@ -190,7 +199,7 @@ export function serializeCredentials(file: CredentialsFile): string {
 
 export function readCredentialsFile(options: CredentialsOptions = {}): CredentialsFile {
   const path = resolvePath(options);
-  if (!existsSync(path)) return {};
+  if (!existsSync(path)) return emptyCredentialsFile();
   return parseCredentials(readFileSync(path, 'utf-8'));
 }
 
@@ -200,7 +209,7 @@ export function readProfile(
 ): ProfileEntry | undefined {
   assertValidProfileName(profile);
   const file = readCredentialsFile(options);
-  return file[profile];
+  return Object.hasOwn(file, profile) ? file[profile] : undefined;
 }
 
 export function writeProfile(
@@ -222,7 +231,7 @@ export function deleteProfile(profile: string, options: CredentialsOptions = {})
   if (!existsSync(path)) return false;
   let removed = false;
   mutateCredentialsFile(path, file => {
-    if (!(profile in file)) return undefined;
+    if (!Object.hasOwn(file, profile)) return undefined;
     removed = true;
     delete file[profile];
     return file;

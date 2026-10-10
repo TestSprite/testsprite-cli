@@ -403,6 +403,36 @@ describe('deleteProfile', () => {
   });
 });
 
+describe('profile names that shadow Object.prototype members', () => {
+  // All three pass PROFILE_NAME_RE, so they must behave like any other name.
+  const names = ['__proto__', 'constructor', 'toString', 'hasOwnProperty'];
+
+  it.each(names)('reports %s as missing when it was never written', name => {
+    writeProfile('default', { apiKey: 'sk-d' }, { path: credentialsPath });
+    expect(readProfile(name, { path: credentialsPath })).toBeUndefined();
+    expect(deleteProfile(name, { path: credentialsPath })).toBe(false);
+    expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-d' });
+  });
+
+  it.each(names)('persists, reads back, and deletes a key stored under %s', name => {
+    writeProfile(name, { apiKey: 'sk-proto' }, { path: credentialsPath });
+    expect(readFileSync(credentialsPath, 'utf-8')).toContain(`[${name}]`);
+    expect(readProfile(name, { path: credentialsPath })).toEqual({ apiKey: 'sk-proto' });
+    expect(deleteProfile(name, { path: credentialsPath })).toBe(true);
+    expect(readProfile(name, { path: credentialsPath })).toBeUndefined();
+  });
+
+  it('does not write parsed keys onto Object.prototype or Object', () => {
+    const parsed = parseCredentials(
+      '[__proto__]\napi_key = sk-a\n[constructor]\napi_key = sk-b\n[default]\nconstructor = x\n',
+    );
+    expect(({} as Record<string, unknown>).apiKey).toBeUndefined();
+    expect((Object as unknown as Record<string, unknown>).apiKey).toBeUndefined();
+    expect(Object.keys(parsed).sort()).toEqual(['__proto__', 'constructor', 'default']);
+    expect(parsed['default']).toEqual({});
+  });
+});
+
 describe('ensureRestrictiveMode', () => {
   it('is a no-op when the file is missing', () => {
     expect(() => ensureRestrictiveMode(credentialsPath)).not.toThrow();
