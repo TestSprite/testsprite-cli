@@ -431,7 +431,7 @@ testsprite test update test_xxxxxxxx --dry-run --output json
 
 #### `testsprite test delete <test-id>` / `test delete-batch`
 
-Permanently delete one test (or many) — there is **no restore window**. `--confirm` is required; absent it, the CLI exits 5 with a local validation error.
+Permanently delete one test (or many) — there is **no restore window**. `--confirm` is required; absent it, the CLI exits 5 with a local validation error. `delete-batch` prints a per-test summary (a 404 counts as skipped) and exits 1 when any deletion failed — or 3 when the key was rejected (else 14 when the CLI is too old), since every deletion then fails the same way.
 
 ```bash
 testsprite test delete test_xxxxxxxx --confirm
@@ -959,7 +959,7 @@ One caveat this does not fix: the HTTP layer's own 429 retries (up to 3, honorin
 
 #### `testsprite test cancel <run-id...>`
 
-Cancel one or more in-flight runs — the counterpart to Ctrl-C, which only **detaches** (the server-side run keeps executing and billing) for an ordinary run. An owned `--local` run is the exception: Ctrl-C already cancels it by default (its tunnel closes with the process, so there is nothing left to detach from — see `--no-cancel-on-interrupt` to opt out). A borrowed run also cancels itself if it observes that its tunnel owner disappeared, but an ordinary borrower Ctrl-C remains a detach. A run cancelled before it finished is refunded. Cancelling is idempotent: an already-cancelled run reports `alreadyCancelled` as an advisory, not an error; a run that already reached a terminal verdict is a conflict — the verdict is never overwritten, and no credits are refunded. With one id, prints the run card; with several, prints a `{ cancelled, alreadyCancelled, conflicts, notFound }` summary. Exit codes: any unknown id → 4; else any conflict → 6; else 0.
+Cancel one or more in-flight runs — the counterpart to Ctrl-C, which only **detaches** (the server-side run keeps executing and billing) for an ordinary run. An owned `--local` run is the exception: Ctrl-C already cancels it by default (its tunnel closes with the process, so there is nothing left to detach from — see `--no-cancel-on-interrupt` to opt out). A borrowed run also cancels itself if it observes that its tunnel owner disappeared, but an ordinary borrower Ctrl-C remains a detach. A run cancelled before it finished is refunded. Cancelling is idempotent: an already-cancelled run reports `alreadyCancelled` as an advisory, not an error; a run that already reached a terminal verdict is a conflict — the verdict is never overwritten, and no credits are refunded. With one id, prints the run card; with several, prints a `{ cancelled, alreadyCancelled, conflicts, notFound }` summary. Exit codes: a rejected key on any id → 3, else a too-old CLI on any id → 14, as with a single id; else any unknown id → 4; else any other failed request → 1; else any conflict → 6; else 0.
 
 ```bash
 testsprite test cancel run_01hx3z9p8q4k2y7a

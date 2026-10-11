@@ -82,7 +82,9 @@ function errorBody(code: string, details: Record<string, unknown> = {}) {
   const statusMap: Record<string, number> = {
     NOT_FOUND: 404,
     CONFLICT: 409,
+    AUTH_INVALID: 401,
     AUTH_FORBIDDEN: 403,
+    CLIENT_TOO_OLD: 426,
   };
   return {
     status: statusMap[code] ?? 400,
@@ -416,6 +418,109 @@ describe('runTestCancel — multi-id summary + exit precedence (CXL-11)', () => 
     const summary = JSON.parse(stdoutLines.join('\n')) as CliCancelSummary;
     expect(summary.cancelled).toEqual(['run_ok']);
     expect(summary.conflicts).toEqual([{ runId: 'run_conflict', status: 'passed' }]);
+  });
+
+  it('a rejected key on every id → exits 3 with the typed AUTH_INVALID error, summary still printed', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => errorBody('AUTH_INVALID'));
+    const stdoutLines: string[] = [];
+    const err = await runTestCancel(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runIds: ['run_1', 'run_2'],
+      },
+      { credentialsPath, fetchImpl, stdout: line => stdoutLines.push(line), stderr: () => {} },
+    ).catch(e => e);
+
+    // Same answer the single-id form gives — not the generic per-member 1.
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.exitCode).toBe(3);
+    expect(err.code).toBe('AUTH_INVALID');
+    const summary = JSON.parse(stdoutLines.join('\n')) as CliCancelSummary;
+    expect(summary.errors.map(e => e.runId)).toEqual(['run_1', 'run_2']);
+  });
+
+  it('a too-old CLI (426 CLIENT_TOO_OLD) → exits 14, as with a single id', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => errorBody('CLIENT_TOO_OLD'));
+    const err = await runTestCancel(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runIds: ['run_1', 'run_2'],
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    ).catch(e => e);
+    expect(err.exitCode).toBe(14);
+    expect(err.code).toBe('CLIENT_TOO_OLD');
+  });
+
+  it('auth outranks notFound and conflict: cancelled + 404 + 409 + 401 → exit 3', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      const runId = runIdFromCancelUrl(url)!;
+      if (runId === 'run_ghost') return errorBody('NOT_FOUND');
+      if (runId === 'run_conflict') return errorBody('CONFLICT', { status: 'failed' });
+      if (runId === 'run_denied') return errorBody('AUTH_INVALID');
+      return { body: makeCancelResponse(runId) };
+    });
+    const err = await runTestCancel(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runIds: ['run_ok', 'run_ghost', 'run_conflict', 'run_denied'],
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    ).catch(e => e);
+    expect(err.exitCode).toBe(3);
+    expect(err.code).toBe('AUTH_INVALID');
+  });
+
+  it('auth outranks a too-old CLI: 426 on the first id, 401 on the second → exit 3', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url =>
+      runIdFromCancelUrl(url) === 'run_1' ? errorBody('CLIENT_TOO_OLD') : errorBody('AUTH_INVALID'),
+    );
+    const err = await runTestCancel(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runIds: ['run_1', 'run_2'],
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    ).catch(e => e);
+    expect(err.exitCode).toBe(3);
+    expect(err.code).toBe('AUTH_INVALID');
+  });
+
+  it('a non-batch-wide member error keeps the generic exit 1', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      const runId = runIdFromCancelUrl(url)!;
+      if (runId === 'run_bad') return errorBody('VALIDATION_ERROR');
+      return { body: makeCancelResponse(runId) };
+    });
+    const err = await runTestCancel(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runIds: ['run_ok', 'run_bad'],
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    ).catch(e => e);
+    expect(err.exitCode).toBe(1);
+    expect(err.message).toContain('run_bad');
   });
 });
 
