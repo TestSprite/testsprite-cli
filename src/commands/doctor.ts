@@ -19,6 +19,7 @@ import { Command } from 'commander';
 import {
   assertValidEndpointUrl,
   makeHttpClient,
+  parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import {
@@ -28,13 +29,7 @@ import {
   normalizeEnvVar,
   type Config,
 } from '../lib/config.js';
-import {
-  ApiError,
-  CLIError,
-  InterruptError,
-  RequestTimeoutError,
-  localValidationError,
-} from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
 import { globalShutdown } from '../lib/interrupt.js';
 import type { CliOrgBinding, CliOrgSummary } from '../lib/org-render.js';
@@ -502,20 +497,6 @@ function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): Common
     dryRun: globals.dryRun ?? false,
     requestTimeoutMs: parseRequestTimeoutFlag(globals.requestTimeout),
   };
-}
-
-function parseRequestTimeoutFlag(raw: string | undefined): number | undefined {
-  if (raw === undefined) return undefined;
-  const seconds = Number(raw);
-  if (!Number.isFinite(seconds) || seconds <= 0) {
-    // Match the other commands: a malformed --request-timeout is a validation
-    // error, not a silently-ignored default.
-    throw localValidationError(
-      'request-timeout',
-      `must be a positive number of seconds (got "${raw}")`,
-    );
-  }
-  return Math.round(seconds * 1000);
 }
 
 function makeOutput(mode: OutputMode, deps: DoctorDeps): Output {

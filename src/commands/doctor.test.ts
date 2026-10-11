@@ -89,6 +89,7 @@ function makeDoctorProgram(deps: DoctorDeps = {}): Command {
   const program = new Command();
   program.exitOverride();
   program.option('--output <mode>', 'output', 'text');
+  program.option('--request-timeout <seconds>', 'per-request timeout in seconds');
   program.addCommand(createDoctorCommand(deps));
   return program;
 }
@@ -467,6 +468,22 @@ describe('createDoctorCommand wiring', () => {
       code: 'VALIDATION_ERROR',
       exitCode: 5,
       nextAction: 'Flag `--output` is invalid: must be one of: json, text.',
+    });
+  });
+
+  it('rejects an invalid --request-timeout with the SHARED validation message', async () => {
+    // Guards the drift this repo's shared helper exists to prevent: the doctor
+    // command once carried a private copy whose message differed from every
+    // other command's. Same flag, same bad input, one message.
+    const rejection = await makeDoctorProgram()
+      .parseAsync(['node', 'ts', '--request-timeout', 'abc', 'doctor'])
+      .catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(ApiError);
+    expect(rejection).toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      nextAction:
+        'Flag `--request-timeout` is invalid: "abc" is not valid — must be a positive number of seconds.',
     });
   });
 
