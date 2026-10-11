@@ -109,6 +109,17 @@ describe('runCreate — validation', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   });
 
+  it('rejects a whitespace-only cron', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runCreate({ ...VALID, cron: '   ' }, { credentialsPath, fetchImpl: noNetwork(), ...sink }),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      nextAction: expect.stringContaining('--cron'),
+    });
+  });
+
   it('rejects a missing or unknown target type', async () => {
     const { credentialsPath } = makeCreds();
     const deps = { credentialsPath, fetchImpl: noNetwork(), ...sink };

@@ -395,10 +395,18 @@ export async function runUpdate(
   }
   const environment = normalizeScheduleEnvironmentName(opts.env);
 
+  // Mirror `schedule create`: a supplied --cron is trimmed and must not be
+  // blank. Without this guard, `schedule update --cron ""` slipped past the
+  // check create enforces and PATCHed an empty cadence to the server.
+  const cron = opts.cron === undefined ? undefined : opts.cron.trim();
+  if (cron !== undefined && cron.length === 0) {
+    throw localValidationError('--cron must not be empty or whitespace-only');
+  }
+
   const body: UpdateScheduleRequest = {
     ...(opts.name !== undefined ? { name: opts.name } : {}),
     ...(environment !== undefined ? { environment } : {}),
-    ...(opts.cron !== undefined ? { cron: opts.cron } : {}),
+    ...(cron !== undefined ? { cron } : {}),
     ...(opts.timezone !== undefined ? { timezone: opts.timezone } : {}),
     ...(opts.start !== undefined ? { startAt: opts.start } : {}),
     ...(opts.end !== undefined ? { endAt: opts.end } : {}),
@@ -420,8 +428,8 @@ export async function runUpdate(
   // to `* * * * *` is the same order-of-magnitude mistake as creating one that
   // way, on an existing schedule and for the same bill. Printed before the
   // request so it is visible even if the update then fails.
-  if (opts.cron !== undefined) {
-    stderr(formatScheduleFrequencyAdvisory(opts.cron));
+  if (cron !== undefined) {
+    stderr(formatScheduleFrequencyAdvisory(cron));
   }
 
   const client = makeClient(opts, deps);

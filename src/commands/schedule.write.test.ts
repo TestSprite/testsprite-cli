@@ -213,6 +213,34 @@ describe('runUpdate', () => {
     });
   });
 
+  it('blank --cron rejects locally on update, matching create', async () => {
+    const { credentialsPath } = makeCreds();
+    for (const cron of ['', '   ']) {
+      await expect(
+        runUpdate(
+          { ...BASE, output: 'json', scheduleId: 'sch_1', cron },
+          { credentialsPath, fetchImpl: noNetwork(), ...sink },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        nextAction: '--cron must not be empty or whitespace-only',
+      });
+    }
+  });
+
+  it('trims --cron before patching, matching create', async () => {
+    const { credentialsPath } = makeCreds();
+    const { calls, fetchImpl } = capturing();
+
+    await runUpdate(
+      { ...BASE, output: 'json', scheduleId: 'sch_1', cron: '  0 9 * * *  ' },
+      { credentialsPath, fetchImpl, ...sink },
+    );
+
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ cron: '0 9 * * *' });
+  });
+
   it('refuses a known old server before changing a pinned schedule', async () => {
     const { credentialsPath } = makeCreds();
     const calls: Array<{ url: string; init: RequestInit }> = [];
