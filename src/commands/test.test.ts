@@ -3371,6 +3371,34 @@ describe('runScaffold', () => {
     expect((result as { projectId: string }).projectId).toBe('project_env');
   });
 
+  it('treats a blank TESTSPRITE_PROJECT_ID as unset, like every other command', async () => {
+    for (const blank of ['', '   ']) {
+      const result = await runScaffold(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          scaffoldType: 'frontend',
+          force: false,
+        },
+        { stdout: () => undefined, stderr: () => undefined, env: { TESTSPRITE_PROJECT_ID: blank } },
+      );
+      expect((result as { projectId: string }).projectId).toContain('testsprite project list');
+    }
+  });
+
+  it('trims a padded TESTSPRITE_PROJECT_ID before pre-filling projectId', async () => {
+    const result = await runScaffold(
+      { profile: 'default', output: 'json', debug: false, scaffoldType: 'frontend', force: false },
+      {
+        stdout: () => undefined,
+        stderr: () => undefined,
+        env: { TESTSPRITE_PROJECT_ID: '  project_env  ' },
+      },
+    );
+    expect((result as { projectId: string }).projectId).toBe('project_env');
+  });
+
   it('backend scaffold defines a requests test with a status assertion AND calls it', async () => {
     const out: string[] = [];
     const result = await runScaffold(
