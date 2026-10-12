@@ -2274,3 +2274,115 @@ describe('environment rename validation compatibility', () => {
     });
   });
 });
+
+describe('project env input validation (empty and whitespace projectId)', () => {
+  it('rejects empty and whitespace project-id across all commands in live and dry-run modes', async () => {
+    for (const invalidProjectId of ['', '   ', '\t\n']) {
+      // list
+      await expect(
+        runEnvList(
+          { ...COMMON, projectId: invalidProjectId },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+      await expect(
+        runEnvList(
+          { ...COMMON, projectId: invalidProjectId, dryRun: true },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+
+      // get
+      await expect(
+        runEnvGet(
+          { ...COMMON, projectId: invalidProjectId, name: 'staging' },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+      await expect(
+        runEnvGet(
+          { ...COMMON, projectId: invalidProjectId, name: 'staging', dryRun: true },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+
+      // create
+      await expect(
+        runEnvCreate(
+          {
+            ...COMMON,
+            projectId: invalidProjectId,
+            name: 'staging',
+            url: 'https://staging.example.com',
+          },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+      await expect(
+        runEnvCreate(
+          {
+            ...COMMON,
+            projectId: invalidProjectId,
+            name: 'staging',
+            url: 'https://staging.example.com',
+            dryRun: true,
+          },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+
+      // update
+      await expect(
+        runEnvUpdate(
+          {
+            ...COMMON,
+            projectId: invalidProjectId,
+            name: 'staging',
+            url: 'https://updated.example.com',
+          },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+      await expect(
+        runEnvUpdate(
+          {
+            ...COMMON,
+            projectId: invalidProjectId,
+            name: 'staging',
+            url: 'https://updated.example.com',
+            dryRun: true,
+          },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+
+      // delete
+      await expect(
+        runEnvDelete(
+          { ...COMMON, projectId: invalidProjectId, name: 'staging', confirm: true },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+      await expect(
+        runEnvDelete(
+          { ...COMMON, projectId: invalidProjectId, name: 'staging', confirm: true, dryRun: true },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+
+      // set-default
+      await expect(
+        runEnvSetDefault(
+          { ...COMMON, projectId: invalidProjectId, name: 'staging' },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+      await expect(
+        runEnvSetDefault(
+          { ...COMMON, projectId: invalidProjectId, name: 'staging', dryRun: true },
+          { stdout: () => {}, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    }
+  });
+});

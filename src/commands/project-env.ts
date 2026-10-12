@@ -148,6 +148,18 @@ function envPath(projectId: string, name?: string): string {
   return name === undefined ? base : `${base}/${encodeURIComponent(name)}`;
 }
 
+/** Trim + reject an empty project id before dry-run or network dispatch. */
+function requireProjectId(raw: string | undefined): string {
+  const id = raw?.trim() ?? '';
+  if (id.length === 0) {
+    throw localValidationError(
+      '<project-id> is required and must not be empty or whitespace-only',
+      '<project-id>',
+    );
+  }
+  return id;
+}
+
 /** Trim + reject an empty environment name; the server owns every other rule. */
 function requireEnvName(raw: string | undefined, flag: string): string {
   const name = raw?.trim() ?? '';
@@ -499,6 +511,7 @@ export async function runEnvList(
   opts: EnvListOptions,
   deps: ProjectDeps = {},
 ): Promise<CliProjectEnvListResponse> {
+  const projectId = requireProjectId(opts.projectId);
   const out = makeOutput(opts.output, deps);
   if (opts.dryRun) {
     emitDryRunBanner(stderrOf(deps));
@@ -514,7 +527,7 @@ export async function runEnvList(
     return sample;
   }
   const client = makeClient(opts, deps);
-  const res = await client.get<CliProjectEnvListResponse>(envPath(opts.projectId));
+  const res = await client.get<CliProjectEnvListResponse>(envPath(projectId));
   out.print(envListForPrint(res), data => renderEnvListText(data as CliProjectEnvListResponse));
   return res;
 }
@@ -523,6 +536,7 @@ export async function runEnvGet(
   opts: EnvListOptions & { name: string },
   deps: ProjectDeps = {},
 ): Promise<CliProjectEnvUpdateResponse> {
+  const projectId = requireProjectId(opts.projectId);
   const out = makeOutput(opts.output, deps);
   const name = requireEnvName(opts.name, '<name>');
   if (opts.dryRun) {
@@ -536,7 +550,7 @@ export async function runEnvGet(
   const client = makeClient(opts, deps);
   let res: CliProjectEnvUpdateResponse;
   try {
-    res = await client.get<CliProjectEnvUpdateResponse>(envPath(opts.projectId, name));
+    res = await client.get<CliProjectEnvUpdateResponse>(envPath(projectId, name));
   } catch (err) {
     if (err instanceof ApiError && err.httpStatus === 404 && !err.details.resource)
       throw unsupportedServer('project env get');
@@ -575,6 +589,7 @@ export async function runEnvCreate(
   opts: EnvCreateOptions,
   deps: ProjectDeps = {},
 ): Promise<CliProjectEnvCreateResponse> {
+  const projectId = requireProjectId(opts.projectId);
   const out = makeOutput(opts.output, deps);
   const stderr = stderrOf(deps);
   assertIdempotencyKey(opts.idempotencyKey);
@@ -725,6 +740,7 @@ export async function runEnvUpdate(
   opts: EnvUpdateOptions,
   deps: ProjectDeps = {},
 ): Promise<CliProjectEnvUpdateResponse> {
+  const projectId = requireProjectId(opts.projectId);
   const out = makeOutput(opts.output, deps);
   const stderr = stderrOf(deps);
   assertIdempotencyKey(opts.idempotencyKey);
@@ -877,6 +893,7 @@ export async function runEnvDelete(
   opts: EnvDeleteOptions,
   deps: ProjectDeps = {},
 ): Promise<CliProjectEnvDeleteResponse> {
+  const projectId = requireProjectId(opts.projectId);
   const out = makeOutput(opts.output, deps);
   const stderr = stderrOf(deps);
   assertIdempotencyKey(opts.idempotencyKey);
@@ -898,7 +915,7 @@ export async function runEnvDelete(
 
   const idempotencyKey = mintIdempotencyKey('delete', opts, stderr);
   const client = makeClient(opts, deps);
-  const res = await client.delete<CliProjectEnvDeleteResponse>(envPath(opts.projectId, name), {
+  const res = await client.delete<CliProjectEnvDeleteResponse>(envPath(projectId, name), {
     headers: { 'idempotency-key': idempotencyKey },
   });
   out.print(res, data => `deleted: ${(data as CliProjectEnvDeleteResponse).name}`);
@@ -919,6 +936,7 @@ export async function runEnvSetDefault(
   opts: EnvSetDefaultOptions,
   deps: ProjectDeps = {},
 ): Promise<CliProjectEnvUpdateResponse> {
+  const projectId = requireProjectId(opts.projectId);
   const out = makeOutput(opts.output, deps);
   const stderr = stderrOf(deps);
   assertIdempotencyKey(opts.idempotencyKey);
@@ -939,7 +957,7 @@ export async function runEnvSetDefault(
   const idempotencyKey = mintIdempotencyKey('set-default', opts, stderr);
   const client = makeClient(opts, deps);
   const res = await client.post<CliProjectEnvUpdateResponse>(
-    `${envPath(opts.projectId, name)}/default`,
+    `${envPath(projectId, name)}/default`,
     { body: {}, headers: { 'idempotency-key': idempotencyKey } },
   );
   out.print(envForPrint(res), data =>
