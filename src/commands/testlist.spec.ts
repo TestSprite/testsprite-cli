@@ -1061,9 +1061,10 @@ describe('testlist run — insufficient credits → exit 12 + telemetry facts', 
         await expect(runTestlistGet({ ...base, listId: invalidId, dryRun: true })).rejects.toThrow(ApiError);
         try {
           await runTestlistGet({ ...base, listId: invalidId });
-        } catch (e: any) {
-          expect(e.exitCode).toBe(5);
-          expect(e.code).toBe('VALIDATION_ERROR');
+        } catch (e: unknown) {
+          const err = e as ApiError;
+          expect(err.exitCode).toBe(5);
+          expect(err.code).toBe('VALIDATION_ERROR');
         }
       }
     });
@@ -1074,9 +1075,10 @@ describe('testlist run — insufficient credits → exit 12 + telemetry facts', 
         await expect(runTestlistDelete({ ...base, listId: invalidId, dryRun: true })).rejects.toThrow(ApiError);
         try {
           await runTestlistDelete({ ...base, listId: invalidId, confirm: true });
-        } catch (e: any) {
-          expect(e.exitCode).toBe(5);
-          expect(e.code).toBe('VALIDATION_ERROR');
+        } catch (e: unknown) {
+          const err = e as ApiError;
+          expect(err.exitCode).toBe(5);
+          expect(err.code).toBe('VALIDATION_ERROR');
         }
       }
     });
@@ -1087,9 +1089,10 @@ describe('testlist run — insufficient credits → exit 12 + telemetry facts', 
         await expect(runTestlistUpdate({ ...base, listId: invalidId, name: 'Renamed', dryRun: true })).rejects.toThrow(ApiError);
         try {
           await runTestlistUpdate({ ...base, listId: invalidId, name: 'Renamed' });
-        } catch (e: any) {
-          expect(e.exitCode).toBe(5);
-          expect(e.code).toBe('VALIDATION_ERROR');
+        } catch (e: unknown) {
+          const err = e as ApiError;
+          expect(err.exitCode).toBe(5);
+          expect(err.code).toBe('VALIDATION_ERROR');
         }
       }
     });
