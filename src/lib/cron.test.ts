@@ -30,6 +30,15 @@ describe('runsPerMonth', () => {
     expect(runs('0 3 * * 1-5/2')).toBe(13); // Mon, Wed, Fri
   });
 
+  it('ORs a full-coverage range with the other day field, as standard cron does', () => {
+    // crontab(5): a field is restricted unless it starts with `*`, so 1-7 / 0-6
+    // / 1-31 still OR with the other day field — every day fires.
+    expect(runsPerMonth('0 3 15 * 1-7')).toBeCloseTo(365 / 12, 5);
+    expect(runsPerMonth('0 3 15 * 0-6')).toBeCloseTo(365 / 12, 5);
+    expect(runsPerMonth('0 3 1-31 * 1')).toBeCloseTo(365 / 12, 5);
+    expect(formatScheduleFrequencyAdvisory('0 3 15 * 1-7')).toContain('~30 time(s)/month');
+  });
+
   it('ORs day-of-month with day-of-week when both are restricted', () => {
     // Standard cron fires on day 1 OR any Monday, not on their intersection.
     // A schedule cannot be created with both day fields constrained, so this

@@ -118,9 +118,17 @@ export function runsPerMonth(cron: string): number | null {
 
   const everyDayOfMonth = daysOfMonth.size === DAYS_IN_MONTH_FIELD;
   const everyDayOfWeek = daysOfWeek.size === DAYS_IN_WEEK;
+  // Standard cron decides OR-vs-AND by spelling, not by coverage: a field is
+  // "restricted" unless it starts with `*` (crontab(5)). So `15 * 1-7` fires
+  // every day (the 15th OR any weekday), even though 1-7 covers the whole week.
+  const bothRestricted = !f[2]!.startsWith('*') && !f[4]!.startsWith('*');
 
   let days: number;
-  if (everyDayOfMonth && everyDayOfWeek) {
+  if (bothRestricted) {
+    // A day matching EITHER fires. Adding them can double-count a day that
+    // matches both, which errs high — the safe direction for a cost warning.
+    days = Math.min(daysOfMonth.size + daysOfWeek.size * WEEKS_PER_MONTH, DAYS_PER_MONTH);
+  } else if (everyDayOfMonth && everyDayOfWeek) {
     days = DAYS_PER_MONTH;
   } else if (everyDayOfWeek) {
     // Short months make a high day number fire less often than once a month;
@@ -129,9 +137,7 @@ export function runsPerMonth(cron: string): number | null {
   } else if (everyDayOfMonth) {
     days = daysOfWeek.size * WEEKS_PER_MONTH;
   } else {
-    // Restricting both means a day matching EITHER fires. Adding them can
-    // double-count a day that matches both, which errs high — the safe
-    // direction for a warning about cost.
+    // One side is `*`-prefixed (e.g. `*/2`) and so not OR'd; take the other.
     days = Math.min(daysOfMonth.size + daysOfWeek.size * WEEKS_PER_MONTH, DAYS_PER_MONTH);
   }
 
