@@ -1058,7 +1058,9 @@ describe('testlist run — insufficient credits → exit 12 + telemetry facts', 
     it('get: rejects empty and whitespace list-id', async () => {
       for (const invalidId of ['', '   ', '\t\n']) {
         await expect(runTestlistGet({ ...base, listId: invalidId })).rejects.toThrow(ApiError);
-        await expect(runTestlistGet({ ...base, listId: invalidId, dryRun: true })).rejects.toThrow(ApiError);
+        await expect(runTestlistGet({ ...base, listId: invalidId, dryRun: true })).rejects.toThrow(
+          ApiError,
+        );
         try {
           await runTestlistGet({ ...base, listId: invalidId });
         } catch (e: unknown) {
@@ -1071,8 +1073,12 @@ describe('testlist run — insufficient credits → exit 12 + telemetry facts', 
 
     it('delete: rejects empty and whitespace list-id', async () => {
       for (const invalidId of ['', '   ', '\t\n']) {
-        await expect(runTestlistDelete({ ...base, listId: invalidId, confirm: true })).rejects.toThrow(ApiError);
-        await expect(runTestlistDelete({ ...base, listId: invalidId, dryRun: true })).rejects.toThrow(ApiError);
+        await expect(
+          runTestlistDelete({ ...base, listId: invalidId, confirm: true }),
+        ).rejects.toThrow(ApiError);
+        await expect(
+          runTestlistDelete({ ...base, listId: invalidId, dryRun: true }),
+        ).rejects.toThrow(ApiError);
         try {
           await runTestlistDelete({ ...base, listId: invalidId, confirm: true });
         } catch (e: unknown) {
@@ -1085,8 +1091,12 @@ describe('testlist run — insufficient credits → exit 12 + telemetry facts', 
 
     it('update: rejects empty and whitespace list-id', async () => {
       for (const invalidId of ['', '   ', '\t\n']) {
-        await expect(runTestlistUpdate({ ...base, listId: invalidId, name: 'Renamed' })).rejects.toThrow(ApiError);
-        await expect(runTestlistUpdate({ ...base, listId: invalidId, name: 'Renamed', dryRun: true })).rejects.toThrow(ApiError);
+        await expect(
+          runTestlistUpdate({ ...base, listId: invalidId, name: 'Renamed' }),
+        ).rejects.toThrow(ApiError);
+        await expect(
+          runTestlistUpdate({ ...base, listId: invalidId, name: 'Renamed', dryRun: true }),
+        ).rejects.toThrow(ApiError);
         try {
           await runTestlistUpdate({ ...base, listId: invalidId, name: 'Renamed' });
         } catch (e: unknown) {
@@ -1098,27 +1108,55 @@ describe('testlist run — insufficient credits → exit 12 + telemetry facts', 
     });
 
     it('add: rejects empty and whitespace list-id and test-ids', async () => {
-      await expect(runTestlistAdd({ ...base, listId: '   ', testIds: ['test-1'] })).rejects.toThrow(ApiError);
-      await expect(runTestlistAdd({ ...base, listId: 'list-1', testIds: ['   '] })).rejects.toThrow(ApiError);
-      await expect(runTestlistAdd({ ...base, listId: 'list-1', testIds: ['test-1', ''] })).rejects.toThrow(ApiError);
-      await expect(runTestlistAdd({ ...base, listId: '   ', testIds: ['test-1'], dryRun: true })).rejects.toThrow(ApiError);
-      await expect(runTestlistAdd({ ...base, listId: 'list-1', testIds: ['   '], dryRun: true })).rejects.toThrow(ApiError);
+      await expect(runTestlistAdd({ ...base, listId: '   ', testIds: ['test-1'] })).rejects.toThrow(
+        ApiError,
+      );
+      await expect(runTestlistAdd({ ...base, listId: 'list-1', testIds: ['   '] })).rejects.toThrow(
+        ApiError,
+      );
+      await expect(
+        runTestlistAdd({ ...base, listId: 'list-1', testIds: ['test-1', ''] }),
+      ).rejects.toThrow(ApiError);
+      await expect(
+        runTestlistAdd({ ...base, listId: '   ', testIds: ['test-1'], dryRun: true }),
+      ).rejects.toThrow(ApiError);
+      await expect(
+        runTestlistAdd({ ...base, listId: 'list-1', testIds: ['   '], dryRun: true }),
+      ).rejects.toThrow(ApiError);
     });
 
     it('remove: rejects empty and whitespace list-id and test-ids', async () => {
-      await expect(runTestlistRemove({ ...base, listId: '   ', testIds: ['test-1'] })).rejects.toThrow(ApiError);
-      await expect(runTestlistRemove({ ...base, listId: 'list-1', testIds: ['   '] })).rejects.toThrow(ApiError);
-      await expect(runTestlistRemove({ ...base, listId: 'list-1', testIds: ['test-1', ''] })).rejects.toThrow(ApiError);
-      await expect(runTestlistRemove({ ...base, listId: '   ', testIds: ['test-1'], dryRun: true })).rejects.toThrow(ApiError);
-      await expect(runTestlistRemove({ ...base, listId: 'list-1', testIds: ['   '], dryRun: true })).rejects.toThrow(ApiError);
+      await expect(
+        runTestlistRemove({ ...base, listId: '   ', testIds: ['test-1'] }),
+      ).rejects.toThrow(ApiError);
+      await expect(
+        runTestlistRemove({ ...base, listId: 'list-1', testIds: ['   '] }),
+      ).rejects.toThrow(ApiError);
+      await expect(
+        runTestlistRemove({ ...base, listId: 'list-1', testIds: ['test-1', ''] }),
+      ).rejects.toThrow(ApiError);
+      await expect(
+        runTestlistRemove({ ...base, listId: '   ', testIds: ['test-1'], dryRun: true }),
+      ).rejects.toThrow(ApiError);
+      await expect(
+        runTestlistRemove({ ...base, listId: 'list-1', testIds: ['   '], dryRun: true }),
+      ).rejects.toThrow(ApiError);
     });
 
     it('run: rejects empty and whitespace list-id and cases', async () => {
       await expect(runTestlistRun({ ...runBase, listId: '   ' })).rejects.toThrow(ApiError);
-      await expect(runTestlistRun({ ...runBase, listId: '   ', dryRun: true })).rejects.toThrow(ApiError);
-      await expect(runTestlistRun({ ...runBase, listId: 'list-1', cases: ['   '] })).rejects.toThrow(ApiError);
-      await expect(runTestlistRun({ ...runBase, listId: 'list-1', cases: ['valid-case', ''] })).rejects.toThrow(ApiError);
-      await expect(runTestlistRun({ ...runBase, listId: 'list-1', cases: ['   '], dryRun: true })).rejects.toThrow(ApiError);
+      await expect(runTestlistRun({ ...runBase, listId: '   ', dryRun: true })).rejects.toThrow(
+        ApiError,
+      );
+      await expect(
+        runTestlistRun({ ...runBase, listId: 'list-1', cases: ['   '] }),
+      ).rejects.toThrow(ApiError);
+      await expect(
+        runTestlistRun({ ...runBase, listId: 'list-1', cases: ['valid-case', ''] }),
+      ).rejects.toThrow(ApiError);
+      await expect(
+        runTestlistRun({ ...runBase, listId: 'list-1', cases: ['   '], dryRun: true }),
+      ).rejects.toThrow(ApiError);
     });
   });
 });
