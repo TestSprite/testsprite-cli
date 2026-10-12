@@ -148,6 +148,17 @@ function dryRunStderr(deps: TestListDeps): (line: string) => void {
   return deps.stderr ?? (line => process.stderr.write(`${line}\n`));
 }
 
+function assertValidListId(listId: string | undefined): void {
+  if (listId === undefined || listId.trim() === '') {
+    throw localValidationError(
+      'list-id',
+      'is required and must not be empty or whitespace-only',
+      undefined,
+      'field',
+    );
+  }
+}
+
 // Canned `--dry-run` samples (offline, no network) — the global `--dry-run`
 // contract promises a shape-accurate sample for every command.
 const DRY_RUN_LIST: CliTestList = {
@@ -192,6 +203,7 @@ export async function runTestlistGet(
   opts: CommonOptions & { listId: string },
   deps: TestListDeps = {},
 ): Promise<CliTestListDetail> {
+  assertValidListId(opts.listId);
   const out = makeOutput(opts.output, deps);
   if (opts.dryRun) {
     emitDryRunBanner(dryRunStderr(deps));
@@ -250,6 +262,7 @@ export async function runTestlistUpdate(
   },
   deps: TestListDeps = {},
 ): Promise<CliTestListDetail> {
+  assertValidListId(opts.listId);
   const out = makeOutput(opts.output, deps);
   const hasProjectEnv = opts.projectEnv !== undefined && opts.projectEnv.length > 0;
   if (opts.clearProjectEnv && hasProjectEnv) {
@@ -292,6 +305,7 @@ export async function runTestlistDelete(
   opts: CommonOptions & { listId: string; confirm?: boolean; idempotencyKey?: string },
   deps: TestListDeps = {},
 ): Promise<CliDeleteTestListResponse> {
+  assertValidListId(opts.listId);
   const out = makeOutput(opts.output, deps);
   // Destructive: deleting a list also deletes its schedules (and reaps their
   // EventBridge triggers). Require explicit --confirm — matches the CLI's
@@ -330,9 +344,20 @@ async function mutateCases(
   opts: CommonOptions & { listId: string; testIds: string[]; idempotencyKey?: string },
   deps: TestListDeps,
 ): Promise<CliTestListDetail> {
+  assertValidListId(opts.listId);
   const out = makeOutput(opts.output, deps);
   if (opts.testIds.length === 0) {
     throw localValidationError('test-id', 'at least one test id is required', undefined, 'field');
+  }
+  for (const testId of opts.testIds) {
+    if (!testId || testId.trim() === '') {
+      throw localValidationError(
+        'test-id',
+        'test id must not be empty or whitespace-only',
+        undefined,
+        'field',
+      );
+    }
   }
   if (opts.idempotencyKey !== undefined) assertIdempotencyKey(opts.idempotencyKey);
   const idempotencyKey = opts.idempotencyKey ?? `cli-testlist-${verb}-${randomUUID()}`;
@@ -487,6 +512,19 @@ function assertNoNotFound(resp: CliTestListRunResponse): void {
  * JUnit XML report (`--report junit`). testlist run is V3-only.
  */
 function validateTestlistRunOptions(opts: RunTestlistRunOptions): void {
+  assertValidListId(opts.listId);
+  if (opts.cases !== undefined) {
+    for (const caseId of opts.cases) {
+      if (!caseId || caseId.trim() === '') {
+        throw localValidationError(
+          'case',
+          'case id must not be empty or whitespace-only',
+          undefined,
+          'flag',
+        );
+      }
+    }
+  }
   if (opts.idempotencyKey !== undefined) assertIdempotencyKey(opts.idempotencyKey);
   if (
     !Number.isInteger(opts.maxConcurrency) ||
