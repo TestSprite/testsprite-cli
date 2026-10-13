@@ -57,6 +57,7 @@ import {
   resolveBatchReportProjectId,
   skippedJUnitResultsFromSummary,
   writeJUnitReportFile,
+  assertArtifactPath,
   type JUnitReportFormat,
   parseJUnitReportFormat,
   type JUnitTestResult,
@@ -7793,6 +7794,17 @@ function assertFreshRunWaitOptions(
     );
 }
 
+/** Pre-dispatch: refuse unwritable --report-file / --summary-file before anything is triggered. */
+function assertRunArtifactPaths(opts: {
+  report?: JUnitReportFormat;
+  reportFile?: string;
+  summaryFile?: string;
+}): void {
+  if (opts.report === 'junit' && opts.reportFile !== undefined)
+    assertArtifactPath('report-file', opts.reportFile);
+  if (opts.summaryFile !== undefined) assertArtifactPath('summary-file', opts.summaryFile);
+}
+
 function isSameLoopbackPort(url: string, port: number): boolean {
   try {
     return parseLoopbackTargetUrl(url)?.port === port;
@@ -8028,6 +8040,7 @@ export async function runTestRun(
     client = makeClient(clientOpts, deps);
   }
   assertFreshRunWaitOptions(opts, false);
+  assertRunArtifactPaths(opts);
   const tunnelRequestTimeoutMs = isTunnelRun
     ? resolveRequestTimeoutMs(clientOpts, deps.env ?? process.env)
     : undefined;
@@ -15310,6 +15323,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           '--summary-file requires --wait (it reduces the terminal run result). Add --wait.',
         );
       }
+      assertRunArtifactPaths({
+        report,
+        reportFile: cmdOpts.reportFile,
+        summaryFile: cmdOpts.summaryFile,
+      });
 
       if (isAll && !usingLocal && cmdOpts.tunnelClient === undefined) {
         // --all path: wave-ordered fresh batch run.

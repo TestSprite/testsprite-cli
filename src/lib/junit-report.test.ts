@@ -1,9 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ApiError } from './errors.js';
 import {
+  assertArtifactPath,
   assertJUnitReportOptions,
   buildJUnitReport,
   durationSecondsBetween,
@@ -442,5 +443,37 @@ describe('skippedJUnitResultsFromSummary', () => {
     expect(skippedJUnitResultsFromSummary(summary, [{ testId: 'ran' }])).toEqual([
       { testId: 'deferred', status: 'skipped', skipReason: 'deferred: run in flight' },
     ]);
+  });
+});
+
+describe('assertArtifactPath', () => {
+  it('returns the resolved path when the parent directory exists', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-artifact-'));
+    expect(assertArtifactPath('summary-file', join(dir, 'summary.json'))).toBe(
+      join(dir, 'summary.json'),
+    );
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('refuses a missing parent directory with the flag name', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-artifact-'));
+    expect(() => assertArtifactPath('summary-file', join(dir, 'nope', 's.json'))).toThrow(ApiError);
+    try {
+      assertArtifactPath('report-file', join(dir, 'nope', 'r.xml'));
+    } catch (err) {
+      expect((err as ApiError).details).toMatchObject({ field: 'report-file' });
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('refuses an existing directory as the target', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-artifact-'));
+    mkdirSync(join(dir, 'sub'));
+    expect(() => assertArtifactPath('report-file', join(dir, 'sub'))).toThrow(ApiError);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('refuses an empty path', () => {
+    expect(() => assertArtifactPath('summary-file', '')).toThrow(ApiError);
   });
 });

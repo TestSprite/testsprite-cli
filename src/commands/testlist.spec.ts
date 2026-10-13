@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   runTestlistAdd,
   runTestlistCreate,
@@ -469,6 +469,28 @@ describe('testlist run', () => {
     expect(err).toBeInstanceOf(CLIError);
     expect(err.exitCode).toBe(6);
   });
+
+  it.each([
+    ['--report-file', { report: 'junit', reportFile: 'missing/report.xml' }, 'report-file'],
+    ['--summary-file', { summaryFile: 'missing/summary.json' }, 'summary-file'],
+  ])(
+    'a %s in a missing directory is refused before the list is dispatched',
+    async (_flag, over, field) => {
+      const { env } = makeCreds();
+      const dir = mkdtempSync(join(tmpdir(), 'cli-testlist-preflight-'));
+      const fetchImpl = vi.fn(makeFetch(() => ({ body: { accepted: [] } })));
+      const paths = Object.fromEntries(
+        Object.entries(over).map(([k, v]) => [k, k === 'report' ? v : join(dir, v as string)]),
+      );
+      const err = (await runTestlistRun(
+        { ...runBase, listId: 'list-1', wait: true, ...paths } as never,
+        { env, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+      ).catch(e => e)) as { exitCode: number; details?: { field?: string } };
+      expect(err.exitCode).toBe(5);
+      expect(err.details?.field).toBe(field);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    },
+  );
 
   it('gh-output: an all-conflict --wait run emits annotations + summary before exiting 6', async () => {
     const { env } = makeCreds();

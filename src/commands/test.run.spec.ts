@@ -707,6 +707,34 @@ describe('runTestRun — with --wait', () => {
     expect(printed.status).toBe('passed');
   });
 
+  it('a --summary-file in a missing directory is refused before the run is triggered', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-single-preflight-'));
+    const calls: Array<{ url: string; method: string }> = [];
+    const fetchImpl = makeFetch((url, init) => {
+      calls.push({ url, method: init?.method ?? 'GET' });
+      return { body: TRIGGER_RESP };
+    });
+    await expect(
+      runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: false,
+          testId: 'test_xyz',
+          wait: true,
+          timeoutSeconds: 60,
+          summaryFile: join(dir, 'no-such-subdir', 'summary.json'),
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+      ),
+    ).rejects.toMatchObject({ exitCode: 5, details: { field: 'summary-file' } });
+    // Read-only target resolution may run first; the run itself is never triggered.
+    expect(calls.filter(c => c.method !== 'GET')).toEqual([]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('wait path — failed status → throws CLIError with exitCode 1', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(url => {
@@ -6242,6 +6270,35 @@ describe('runTestRunAll — zero-dispatch fails the CI gate', () => {
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- summaryFile is a mkdtempSync path in this test's own temp dir.
     expect(JSON.parse(readFileSync(summaryFile, 'utf8')).passed).toBe(0);
   });
+
+  it.each([
+    ['--report-file', ['--report', 'junit', '--report-file'], 'junit.xml', 'report-file'],
+    ['--summary-file', ['--summary-file'], 'summary.json', 'summary-file'],
+  ])(
+    'test run --all: a %s in a missing directory is refused before anything is dispatched',
+    async (_flag, flags, file, field) => {
+      vi.resetModules();
+      const { createTestCommand } = await import('./test.js');
+      const { credentialsPath } = makeCreds();
+      const dir = mkdtempSync(join(tmpdir(), 'cli-preflight-'));
+      const fetchImpl = vi.fn(makeFetch(() => ({ body: EMPTY_BATCH })));
+      const command = createTestCommand({
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: () => {},
+        sleep: () => Promise.resolve(),
+      });
+      await expect(
+        command.parseAsync(
+          ['run', '--all', '--project', 'P', '--wait', ...flags, join(dir, 'no-such-subdir', file)],
+          { from: 'user' },
+        ),
+      ).rejects.toMatchObject({ exitCode: 5, details: { field } });
+      expect(fetchImpl).not.toHaveBeenCalled();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  );
 
   it('--allow-empty does NOT green a dispatched-but-failed run', async () => {
     const { credentialsPath } = makeCreds();
