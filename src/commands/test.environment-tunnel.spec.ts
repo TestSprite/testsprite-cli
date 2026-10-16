@@ -1192,6 +1192,13 @@ describe('environment tunnel resolution', () => {
           accepted: [{ testId: 'a', runId: 'run_a' }],
           notRunTestIds: ['b'],
         });
+        if (command === 'rerun')
+          expect(JSON.parse(f.stdout[0]!)).toMatchObject({
+            partial: true,
+            failedChunkTestIds: [],
+            notAttemptedTestIds: ['b'],
+            unconfirmedTestIds: ['b'],
+          });
         // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture-owned temporary file.
         expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({
           total: 2,
@@ -1202,6 +1209,137 @@ describe('environment tunnel resolution', () => {
       } finally {
         now.mockRestore();
       }
+    },
+  );
+
+  it.each([
+    { all: false, output: 'json' as const, failAt: 2 },
+    { all: true, output: 'json' as const, failAt: 2 },
+    { all: false, output: 'json' as const, failAt: 3 },
+    { all: false, output: 'text' as const, failAt: 2 },
+  ])(
+    'preserves tunnel rerun dispatch details for all=$all output=$output failAt=$failAt',
+    async ({ all, output, failAt }) => {
+      const ids = Array.from({ length: 21 }, (_, index) => `test_${index}`);
+      const advisory = { feature: 'autoHeal', message: 'The auto-heal opt-out was not enforced.' };
+      let dispatches = 0;
+      const fixtureOptions = {
+        tests: ids.map(id => ({
+          id,
+          name: id,
+          type: 'frontend',
+          projectId: 'P',
+          status: 'passed',
+          createdFrom: 'cli',
+        })),
+        triggerStatus: undefined as number | undefined,
+        onTrigger: () => {
+          if (++dispatches === failAt) fixtureOptions.triggerStatus = 404;
+        },
+        batchResponse: (body: Record<string, unknown>) => ({
+          advisories: [advisory, advisory],
+          closure: {
+            byProject: [
+              {
+                projectId: 'P',
+                testIds: body.testIds,
+                addedProducers: [],
+                addedTeardowns: [],
+                clearedCaptured: 1,
+              },
+            ],
+          },
+        }),
+      };
+      const f = fixture(fixtureOptions);
+      const summaryFile = join(
+        mkdtempSync(join(tmpdir(), 'env-dispatch-partial-')),
+        'summary.json',
+      );
+      const reportFile = `${summaryFile}.xml`;
+      const error = await runTestRerun(
+        {
+          ...common,
+          output,
+          testIds: all ? [] : ids,
+          all,
+          projectId: 'P',
+          wait: false,
+          timeoutSeconds: 60,
+          maxConcurrency: 10,
+          autoHeal: false,
+          autoHealExplicit: false,
+          skipDependencies: false,
+          summaryFile,
+          report: 'junit',
+          reportFile,
+        },
+        f.deps,
+      ).catch(err => err);
+      expect(error).toMatchObject({ code: 'NOT_FOUND', exitCode: 4, requestId: 'r' });
+      const posts = f.calls.filter(call => call.path === '/tests/batch/rerun');
+      expect(posts).toHaveLength(failAt);
+      expect(posts.every(call => call.body.tunnelClientId === clientId)).toBe(true);
+      const acknowledged = ids.slice(0, (failAt - 1) * 10);
+      const failed = ids.slice((failAt - 1) * 10, failAt * 10);
+      const notAttempted = ids.slice(failAt * 10);
+      expect(f.stdout).toHaveLength(1);
+      if (output === 'json') {
+        const partial = JSON.parse(f.stdout[0]!);
+        expect(partial).toMatchObject({
+          partial: true,
+          failedChunkTestIds: failed,
+          notAttemptedTestIds: notAttempted,
+          unconfirmedTestIds: [...failed, ...notAttempted],
+          notRunTestIds: [...failed, ...notAttempted],
+          advisories: [advisory],
+          closure: {
+            byProject: [
+              {
+                projectId: 'P',
+                testIds: acknowledged,
+                addedProducers: [],
+                addedTeardowns: [],
+                clearedCaptured: failAt - 1,
+              },
+            ],
+          },
+        });
+        expect(partial.accepted.map((row: { runId: string }) => row.runId)).toEqual(
+          acknowledged.map(id => `run_${id}`),
+        );
+      } else {
+        expect(f.stdout[0]).toContain(
+          `Failed request tests (dispatch unconfirmed): ${failed.join(', ')}`,
+        );
+        expect(f.stdout[0]).toContain(`Not attempted by this command: ${notAttempted.join(', ')}`);
+        expect(f.stdout[0]).not.toContain(advisory.message);
+      }
+      expect(f.stderr.filter(line => line === `[advisory] ${advisory.message}`)).toHaveLength(1);
+      const summary = JSON.parse(readFileSync(summaryFile, 'utf8'));
+      expect(summary).toMatchObject({ total: 21, failed: 10, skipped: notAttempted.length });
+      for (const id of failed)
+        expect(summary.runs).toContainEqual({
+          testId: id,
+          status: 'unknown',
+          error: 'dispatch unconfirmed after a failed request; inspect before retrying',
+        });
+      const junit = readFileSync(reportFile, 'utf8');
+      expect(junit).toContain('failures="10"');
+      expect(junit).toContain(`skipped="${notAttempted.length}"`);
+      expect(junit).toContain(
+        '<failure message="dispatch unconfirmed after a failed request; inspect before retrying" type="unknown">',
+      );
+      const cancellations = f.calls.filter(call => call.path.endsWith('/cancel'));
+      // Capacity polling settled earlier runs; cleanup must still cancel every remaining active run.
+      expect(cancellations.map(call => call.path)).toEqual(
+        acknowledged
+          .slice(-10)
+          .slice(failed.length)
+          .map(id => `/runs/run_${id}/cancel`),
+      );
+      expect(f.calls.at(-1)).toMatchObject({ method: 'DELETE', path: `/tunnel/${clientId}` });
+      expect(f.stop).toHaveBeenCalledTimes(1);
     },
   );
 

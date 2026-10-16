@@ -10,7 +10,7 @@ import { TunnelClient, type TunnelClientOptions } from '../vendor/tunnel-client/
 import { assertLocalPortListening } from './local-target.js';
 import { recordTelemetryTunnelOpened } from './telemetry.js';
 import type { HttpClient } from './http.js';
-import type { RunResponse } from './runs.types.js';
+import type { BatchRerunClosure, RerunAdvisory, RunResponse } from './runs.types.js';
 import { Output } from './output.js';
 import { emitCiArtifacts, summarizeAcceptedPayload } from './gh-output.js';
 import { buildJUnitReport, writeJUnitReportFile } from './junit-report.js';
@@ -555,6 +555,12 @@ export function quoteEnvironmentName(name: string): string {
   return "'" + name.replaceAll("'", "'\\''") + "'";
 }
 
+/**
+ * Emit acknowledged tunnel receipts and CI artifacts before propagating a failure.
+ * Optional rerun dispatch details distinguish uncertain requests from unsent work
+ * and retain merged closure data and deduplicated advisories. Tunnel ownership
+ * and cleanup remain with the caller; this function never cancels or closes it.
+ */
 export async function emitEnvironmentDispatchPartial(
   responses: Array<{
     accepted: Array<{ testId: string; runId: string }>;
@@ -574,6 +580,13 @@ export async function emitEnvironmentDispatchPartial(
   label: string,
   error: unknown,
   context: EnvironmentTunnelContext,
+  dispatchDetails?: {
+    unconfirmedTestIds: string[];
+    failedChunkTestIds: string[];
+    notAttemptedTestIds: string[];
+    closure: BatchRerunClosure;
+    advisories: RerunAdvisory[];
+  },
 ): Promise<void> {
   const message = error instanceof Error ? error.message : String(error);
   const timedOut =
@@ -601,21 +614,46 @@ export async function emitEnvironmentDispatchPartial(
     ...(context.skipped?.length ? { skipped: context.skipped } : {}),
     notRunTestIds,
     ...(responses.some(response => response.notFound) ? { notFound } : {}),
+    ...(dispatchDetails
+      ? {
+          partial: true,
+          unconfirmedTestIds: dispatchDetails.unconfirmedTestIds,
+          failedChunkTestIds: dispatchDetails.failedChunkTestIds,
+          notAttemptedTestIds: dispatchDetails.notAttemptedTestIds,
+          closure: dispatchDetails.closure,
+          advisories: dispatchDetails.advisories,
+        }
+      : {}),
   };
   const stderr = deps.stderr ?? (line => process.stderr.write(`${line}\n`));
   new Output(opts.output, { stdout: deps.stdout, stderr: deps.stderr }).print(partial, () =>
-    accepted.map(row => `${row.runId}  ${row.status}`).join('\n'),
+    [
+      ...accepted.map(row => `${row.runId}  ${row.status}`),
+      ...(dispatchDetails
+        ? [
+            `Unconfirmed tests: ${dispatchDetails.unconfirmedTestIds.join(', ') || '(none)'}`,
+            `Failed request tests (dispatch unconfirmed): ${dispatchDetails.failedChunkTestIds.join(', ') || '(none)'}`,
+            `Not attempted by this command: ${dispatchDetails.notAttemptedTestIds.join(', ') || '(none)'}`,
+          ]
+        : []),
+    ].join('\n'),
   );
+  for (const advisory of dispatchDetails?.advisories ?? [])
+    stderr(`[advisory] ${advisory.message}`);
   const summary = summarizeAcceptedPayload(JSON.stringify(partial));
+  const uncertain = new Set(dispatchDetails?.failedChunkTestIds ?? []);
   summary.runs.push(
     ...notRunTestIds.map(testId => ({
       testId,
-      status: 'skipped',
-      error: 'not dispatched before the owned tunnel closed',
+      status: uncertain.has(testId) ? 'unknown' : 'skipped',
+      error: uncertain.has(testId)
+        ? 'dispatch unconfirmed after a failed request; inspect before retrying'
+        : 'not dispatched before the owned tunnel closed',
     })),
   );
   summary.total += notRunTestIds.length;
-  summary.skipped += notRunTestIds.length;
+  summary.failed += uncertain.size;
+  summary.skipped += notRunTestIds.length - uncertain.size;
   emitCiArtifacts(
     summary,
     opts,
@@ -637,7 +675,10 @@ export async function emitEnvironmentDispatchPartial(
             testId: row.testId,
             runId: row.runId,
             status: row.status,
-            error: { code: error instanceof ApiError ? error.code : 'UNSUPPORTED', message },
+            error: {
+              code: error instanceof ApiError ? error.code : 'UNSUPPORTED',
+              message: row.error ?? message,
+            },
           })),
         }),
       );

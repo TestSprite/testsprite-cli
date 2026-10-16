@@ -12797,17 +12797,7 @@ async function runTestRerunCore(
         );
     }
   } catch (err) {
-    if (deps.environmentTunnel && chunkResponses.length)
-      await emitEnvironmentDispatchPartial(
-        chunkResponses,
-        testIds,
-        opts,
-        deps,
-        'rerun',
-        err,
-        deps.environmentTunnel,
-      );
-    else if (chunkResponses.length > 0) {
+    if (chunkResponses.length > 0) {
       // Earlier HTTP requests have already dispatched work. A later request
       // failing does not roll those runs back; preserve their IDs before exit.
       const accepted = chunkResponses.flatMap(response => response.accepted);
@@ -12836,27 +12826,42 @@ async function runTestRerunCore(
         },
         // An errored request may have reached the server; do not claim rollback.
         unconfirmedTestIds: testIds.filter(id => !acknowledged.has(id)),
-        failedChunkTestIds: dispatchingTestIds.filter(id => !acknowledged.has(id)),
+        failedChunkTestIds: waitingForCapacity
+          ? []
+          : dispatchingTestIds.filter(id => !acknowledged.has(id)),
         notAttemptedTestIds: chunks
-          .slice(dispatchingChunkIndex + 1)
+          .slice(dispatchingChunkIndex + (waitingForCapacity ? 0 : 1))
           .flat()
           .filter(id => !acknowledged.has(id)),
       };
-      out.print(partial, () =>
-        [
-          'Batch rerun partially dispatched; a later request failed.',
-          ...accepted.map(row => `${row.runId}  ${row.testId}  dispatched (not awaited)`),
-          `Unconfirmed tests: ${partial.unconfirmedTestIds.join(', ') || '(none)'}`,
-          `Failed request tests (dispatch unconfirmed): ${partial.failedChunkTestIds.join(', ') || '(none)'}`,
-          `Not attempted by this command: ${partial.notAttemptedTestIds.join(', ') || '(none)'}`,
-        ].join('\n'),
-      );
-      emitRerunAdvisories(stderrFn, partial.advisories);
-      if (accepted.length > 0) {
-        const runIds = [...new Set(accepted.map(row => row.runId))];
-        stderrFn(`${runIds.length} run(s) were already accepted and may still be running.`);
-        stderrFn(`Re-attach with: testsprite test wait ${runIds.join(' ')}`);
-        stderrFn(`Cancel with: testsprite test cancel ${runIds.join(' ')}`);
+      if (deps.environmentTunnel) {
+        await emitEnvironmentDispatchPartial(
+          chunkResponses,
+          testIds,
+          opts,
+          deps,
+          'rerun',
+          err,
+          deps.environmentTunnel,
+          partial,
+        );
+      } else {
+        out.print(partial, () =>
+          [
+            'Batch rerun partially dispatched; a later request failed.',
+            ...accepted.map(row => `${row.runId}  ${row.testId}  dispatched (not awaited)`),
+            `Unconfirmed tests: ${partial.unconfirmedTestIds.join(', ') || '(none)'}`,
+            `Failed request tests (dispatch unconfirmed): ${partial.failedChunkTestIds.join(', ') || '(none)'}`,
+            `Not attempted by this command: ${partial.notAttemptedTestIds.join(', ') || '(none)'}`,
+          ].join('\n'),
+        );
+        emitRerunAdvisories(stderrFn, partial.advisories);
+        if (accepted.length > 0) {
+          const runIds = [...new Set(accepted.map(row => row.runId))];
+          stderrFn(`${runIds.length} run(s) were already accepted and may still be running.`);
+          stderrFn(`Re-attach with: testsprite test wait ${runIds.join(' ')}`);
+          stderrFn(`Cancel with: testsprite test cancel ${runIds.join(' ')}`);
+        }
       }
     }
     // A batch request can fail even after earlier chunks succeeded.
