@@ -30,6 +30,10 @@ vi.mock('../lib/local-target.js', async importOriginal => ({
 const clientId = '11111111-2222-3333-4444-555555555555';
 const savedUrl = 'http://127.0.0.1:5173/';
 const common = { profile: 'default', output: 'json' as const, debug: false };
+/**
+ * Build an offline command fixture with configurable API responses and a fake tunnel.
+ * Captured requests, output, and tunnel lifecycle calls expose dispatch and cleanup ordering.
+ */
 function fixture(
   options: {
     url?: string;
@@ -38,6 +42,7 @@ function fixture(
     echo?: boolean;
     mintStatus?: number;
     triggerStatus?: number;
+    cancelStatus?: number;
     batchResponse?: (body: Record<string, unknown>) => Record<string, unknown>;
     envs?: Array<Record<string, unknown>>;
     envsByProject?: Record<string, Array<Record<string, unknown>>>;
@@ -144,7 +149,8 @@ function fixture(
           );
     if (method === 'DELETE' && path === `/tunnel/${clientId}`)
       return new Response(null, { status: 204 });
-    if (method === 'POST' && path.endsWith('/cancel'))
+    if (method === 'POST' && path.endsWith('/cancel')) {
+      if (options.cancelStatus) return error(options.cancelStatus, 'cancellation unavailable');
       return json({
         runId: path.split('/')[2],
         testId: path.split('/')[2]!.replace('run_', ''),
@@ -165,6 +171,7 @@ function fixture(
         stepSummary: { total: 1, completed: 0, passedCount: 0, failedCount: 0 },
         alreadyCancelled: false,
       });
+    }
     if (
       method === 'POST' &&
       (path.endsWith('/runs') || path.endsWith('/rerun') || path.endsWith('/run'))
@@ -1213,13 +1220,14 @@ describe('environment tunnel resolution', () => {
   );
 
   it.each([
-    { all: false, output: 'json' as const, failAt: 2 },
-    { all: true, output: 'json' as const, failAt: 2 },
-    { all: false, output: 'json' as const, failAt: 3 },
-    { all: false, output: 'text' as const, failAt: 2 },
+    { all: false, output: 'json' as const, failAt: 2, cancelStatus: undefined },
+    { all: true, output: 'json' as const, failAt: 2, cancelStatus: undefined },
+    { all: false, output: 'json' as const, failAt: 3, cancelStatus: undefined },
+    { all: false, output: 'text' as const, failAt: 2, cancelStatus: undefined },
+    { all: false, output: 'json' as const, failAt: 3, cancelStatus: 403 },
   ])(
-    'preserves tunnel rerun dispatch details for all=$all output=$output failAt=$failAt',
-    async ({ all, output, failAt }) => {
+    'preserves tunnel rerun dispatch details and recovery hints for all=$all output=$output failAt=$failAt cancelStatus=$cancelStatus',
+    async ({ all, output, failAt, cancelStatus }) => {
       const ids = Array.from({ length: 21 }, (_, index) => `test_${index}`);
       const advisory = { feature: 'autoHeal', message: 'The auto-heal opt-out was not enforced.' };
       let dispatches = 0;
@@ -1233,6 +1241,7 @@ describe('environment tunnel resolution', () => {
           createdFrom: 'cli',
         })),
         triggerStatus: undefined as number | undefined,
+        cancelStatus,
         onTrigger: () => {
           if (++dispatches === failAt) fixtureOptions.triggerStatus = 404;
         },
@@ -1252,6 +1261,15 @@ describe('environment tunnel resolution', () => {
         }),
       };
       const f = fixture(fixtureOptions);
+      const outputBeforeCleanup: string[][] = [];
+      const fetchImpl = f.deps.fetchImpl;
+      f.deps.fetchImpl = vi.fn(async (input, init) => {
+        const url =
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (url.endsWith('/cancel') || init?.method === 'DELETE')
+          outputBeforeCleanup.push([...f.stderr]);
+        return fetchImpl(input, init);
+      });
       const summaryFile = join(
         mkdtempSync(join(tmpdir(), 'env-dispatch-partial-')),
         'summary.json',
@@ -1316,6 +1334,16 @@ describe('environment tunnel resolution', () => {
         expect(f.stdout[0]).not.toContain(advisory.message);
       }
       expect(f.stderr.filter(line => line === `[advisory] ${advisory.message}`)).toHaveLength(1);
+      const runIds = acknowledged.map(id => `run_${id}`).join(' ');
+      const recoveryHints = [
+        `Inspect acknowledged runs with: testsprite test wait ${runIds}`,
+        `Cancel with: testsprite test cancel ${runIds}`,
+      ];
+      expect(outputBeforeCleanup.length).toBeGreaterThan(0);
+      for (const output of outputBeforeCleanup)
+        expect(output).toEqual(expect.arrayContaining(recoveryHints));
+      expect(f.stdout[0]).not.toContain('testsprite test wait');
+      expect(f.stdout[0]).not.toContain('testsprite test cancel');
       const summary = JSON.parse(readFileSync(summaryFile, 'utf8'));
       expect(summary).toMatchObject({ total: 21, failed: 10, skipped: notAttempted.length });
       for (const id of failed)
@@ -1338,6 +1366,10 @@ describe('environment tunnel resolution', () => {
           .slice(failed.length)
           .map(id => `/runs/run_${id}/cancel`),
       );
+      if (cancelStatus)
+        expect(f.stderr.filter(line => line.includes('Could not cancel'))).toHaveLength(
+          cancellations.length,
+        );
       expect(f.calls.at(-1)).toMatchObject({ method: 'DELETE', path: `/tunnel/${clientId}` });
       expect(f.stop).toHaveBeenCalledTimes(1);
     },

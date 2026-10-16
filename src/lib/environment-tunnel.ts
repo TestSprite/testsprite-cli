@@ -560,6 +560,8 @@ export function quoteEnvironmentName(name: string): string {
  * Optional rerun dispatch details distinguish uncertain requests from unsent work
  * and retain merged closure data and deduplicated advisories. Tunnel ownership
  * and cleanup remain with the caller; this function never cancels or closes it.
+ * Recovery commands go to stderr before cleanup so callers can inspect or cancel
+ * acknowledged runs even if automatic cancellation later fails.
  */
 export async function emitEnvironmentDispatchPartial(
   responses: Array<{
@@ -640,6 +642,11 @@ export async function emitEnvironmentDispatchPartial(
   );
   for (const advisory of dispatchDetails?.advisories ?? [])
     stderr(`[advisory] ${advisory.message}`);
+  const runIds = [...new Set(accepted.map(row => row.runId))];
+  if (runIds.length > 0) {
+    stderr(`Inspect acknowledged runs with: testsprite test wait ${runIds.join(' ')}`);
+    stderr(`Cancel with: testsprite test cancel ${runIds.join(' ')}`);
+  }
   const summary = summarizeAcceptedPayload(JSON.stringify(partial));
   const uncertain = new Set(dispatchDetails?.failedChunkTestIds ?? []);
   summary.runs.push(
