@@ -551,6 +551,7 @@ export function groupEnvironmentTargets(
   });
 }
 
+/** Quote an environment name as one POSIX-shell argument in tunnel recovery commands. */
 export function quoteEnvironmentName(name: string): string {
   return "'" + name.replaceAll("'", "'\\''") + "'";
 }
