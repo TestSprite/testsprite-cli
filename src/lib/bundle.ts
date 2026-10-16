@@ -318,7 +318,7 @@ export function applyFailedOnly(ctx: CliFailureContext): CliFailureContext {
  * its separator would turn it into `C:`, which Windows resolves as
  * "current directory on drive C", not the drive root.
  */
-function stripTrailingSeparators(rawPath: string): string {
+export function stripTrailingSeparators(rawPath: string): string {
   if (rawPath.length <= 1) return rawPath;
   let end = rawPath.length;
   while (end > 1 && (rawPath[end - 1] === '/' || rawPath[end - 1] === '\\')) {

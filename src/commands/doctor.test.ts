@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { FS_ENFORCES_MODE_BITS } from '../../test/helpers/fsModeEnforcement.js';
 import { ApiError, CLIError } from '../lib/errors.js';
 import { writeProfile } from '../lib/credentials.js';
 import type { DoctorDeps, DoctorReport } from './doctor.js';
@@ -324,8 +325,10 @@ describe('runDoctor — failing checks exit non-zero', () => {
   });
 
   // POSIX-only premise: chmod 000 yields EACCES on Linux/macOS; Windows file
-  // modes are a no-op so the file stays readable there.
-  it.skipIf(process.platform === 'win32')(
+  // modes are a no-op so the file stays readable there. Under
+  // CAP_DAC_OVERRIDE (containers, root) the premise fails the same way, so
+  // the filesystem is probed instead of assumed.
+  it.skipIf(process.platform === 'win32' || !FS_ENFORCES_MODE_BITS)(
     'a real unreadable file does not leak EACCES into the Connectivity or Local tunnel checks',
     async () => {
       writeProfile('default', { apiKey: 'sk-brick' }, { path: credentialsPath });
