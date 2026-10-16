@@ -1341,3 +1341,73 @@ describe('HttpClient retry-delay sleep bails on shutdown', () => {
     expect(calls).toBe(1);
   });
 });
+
+describe('caller abort during retry backoff', () => {
+  it.each(['transport', 'edge', 'api'] as const)(
+    'preserves the caller reason and cancels the %s retry timer',
+    async kind => {
+      vi.useFakeTimers();
+      try {
+        const caller = new AbortController();
+        const shutdown = new AbortController();
+        const add = vi.spyOn(caller.signal, 'addEventListener');
+        const remove = vi.spyOn(caller.signal, 'removeEventListener');
+        const fetchImpl = vi.fn(async () => {
+          if (kind === 'transport') throw new Error('socket closed');
+          if (kind === 'edge') return new Response('Bad Gateway', { status: 502 });
+          return errorEnvelopeResponse(429, 'RATE_LIMITED', {
+            headers: { 'content-type': 'application/json', 'retry-after': '60' },
+          });
+        });
+        const client = new HttpClient({
+          baseUrl: 'https://api.example.com/api/cli/v1',
+          apiKey: 'sk-user-test',
+          fetchImpl,
+          shutdownSignal: shutdown.signal,
+          random: () => 0,
+        });
+        const result = client.get('/me', { signal: caller.signal }).catch((err: unknown) => err);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(fetchImpl).toHaveBeenCalledOnce();
+        expect(vi.getTimerCount()).toBe(1);
+        const reason = new Error('caller deadline expired');
+        caller.abort(reason);
+        expect(await result).toBe(reason);
+        expect(vi.getTimerCount()).toBe(0);
+        expect(fetchImpl).toHaveBeenCalledOnce();
+        expect(remove.mock.calls).toHaveLength(add.mock.calls.length);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('settles and removes listeners even when an injected sleeper ignores abort', async () => {
+    const caller = new AbortController();
+    const shutdown = new AbortController();
+    const add = vi.spyOn(shutdown.signal, 'addEventListener');
+    const remove = vi.spyOn(shutdown.signal, 'removeEventListener');
+    let entered!: () => void;
+    const sleeping = new Promise<void>(resolve => {
+      entered = resolve;
+    });
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-user-test',
+      fetchImpl: async () => {
+        throw new Error('offline');
+      },
+      shutdownSignal: shutdown.signal,
+      sleep: () => {
+        entered();
+        return new Promise<void>(() => {});
+      },
+    });
+    const result = client.get('/me', { signal: caller.signal }).catch((err: unknown) => err);
+    await sleeping;
+    const reason = new DOMException('Cancelled', 'AbortError');
+    caller.abort(reason);
+    expect(await result).toBe(reason);
+    expect(remove.mock.calls).toHaveLength(add.mock.calls.length);
+  });
+});

@@ -912,7 +912,7 @@ export class HttpClient {
             delayMs: decision.delayMs,
           });
           requestTimeout.clear();
-          await this.sleepBeforeRetry(decision.delayMs);
+          await this.sleepBeforeRetry(decision.delayMs, options.signal);
           continue;
         }
 
@@ -1037,7 +1037,7 @@ export class HttpClient {
             delayMs: decision.delayMs,
           });
           requestTimeout.clear();
-          await this.sleepBeforeRetry(decision.delayMs);
+          await this.sleepBeforeRetry(decision.delayMs, options.signal);
           continue;
         }
 
@@ -1108,7 +1108,7 @@ export class HttpClient {
           delayMs: decision.delayMs,
         });
         requestTimeout.clear();
-        await this.sleepBeforeRetry(decision.delayMs);
+        await this.sleepBeforeRetry(decision.delayMs, options.signal);
       } finally {
         requestTimeout.clear();
         // Remove the manually-added abort listeners now, synchronously —
@@ -1141,30 +1141,26 @@ export class HttpClient {
     return headers;
   }
 
-  /**
-   * Retry-delay sleep that bails the moment the shutdown signal fires: a
-   * RATE_LIMITED `Retry-After: 60` or a transport backoff must not delay the
-   * honest-detach exit by up to a minute — reject with the InterruptError
-   * reason immediately. Mirrors poll.ts::sleepUnlessInterrupted.
-   */
-  private sleepBeforeRetry(ms: number): Promise<void> {
-    const signal = this.shutdownSignal;
-    if (signal == null) return this.sleep(ms);
-    if (signal.aborted) return Promise.reject(signal.reason);
-    return new Promise((resolve, reject) => {
-      const onAbort = (): void => reject(signal.reason);
-      signal.addEventListener('abort', onAbort, { once: true });
-      this.sleep(ms, signal).then(
-        () => {
-          signal.removeEventListener('abort', onAbort);
-          resolve();
-        },
-        err => {
-          signal.removeEventListener('abort', onAbort);
-          reject(err instanceof Error ? err : new Error(String(err)));
-        },
-      );
-    });
+  /** Keep caller deadlines and process shutdown active throughout retry backoff. */
+  private async sleepBeforeRetry(ms: number, callerSignal?: AbortSignal): Promise<void> {
+    const signals = [callerSignal, this.shutdownSignal].filter(
+      (signal): signal is AbortSignal => signal !== undefined,
+    );
+    if (signals.length === 0) return this.sleep(ms);
+    const { signal, cleanup } = composeAbortSignals(signals);
+    let onAbort: (() => void) | undefined;
+    try {
+      if (signal.aborted) throw signal.reason;
+      await new Promise<void>((resolve, reject) => {
+        onAbort = () => reject(signal.reason);
+        signal.addEventListener('abort', onAbort, { once: true });
+        // Also race injected sleepers that do not implement cancellation.
+        this.sleep(ms, signal).then(resolve, reject);
+      });
+    } finally {
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+      cleanup();
+    }
   }
 
   private debug(event: DebugEvent): void {
