@@ -899,6 +899,8 @@ Flags:
 
 A batch rerun returns `accepted[]` (one `runId` per dispatched test) plus `deferred[]` for any test shed by the per-key run-rate limit; under `--wait`, a non-empty `deferred[]` exits 7 with a `nextAction` you can retry with a fresh idempotency key. A batch where **every** requested id lands in `notFound` (no replayable run) exits **4** — nothing was queued, so the run must not pass; a mixed batch surfaces its `notFound` ids as `skipped` rows in the CI summary without failing an otherwise-passing batch.
 
+If a later dispatch request fails after earlier chunks succeeded, the CLI exits non-zero and prints the acknowledged results first. JSON output includes `partial: true`, the earlier `accepted[]` run IDs, and `unconfirmedTestIds` for tests without an acknowledged outcome. Those runs may still be executing; use `test wait <run-id...>` to reattach or `test cancel <run-id...>` to cancel them. This also applies with `--wait`: dispatch failure stops the command before polling. An unconfirmed test is not proof that the server did not dispatch it.
+
 #### `testsprite test flaky <test-id>`
 
 Detect a **flaky** test by replaying it several times and reporting how often it passes. Each attempt is a rerun with auto-heal **off** (a strict verbatim replay), so healed drift can't disguise a nondeterministic pass/fail — this measures the replay stability of the saved script against the configured URL. Each replay is billed as a rerun, same as a fresh run: 0.5 credits for a frontend replay, 0.2 credits for a backend replay (legacy V2 accounts: FE rerun remains free) — so `--runs N` costs roughly N×0.5 credits for a frontend test. A one-line stderr advisory is printed before a backend replay.

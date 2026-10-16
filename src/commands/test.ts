@@ -12737,6 +12737,7 @@ async function runTestRerunCore(
   }
   let chunkResponses: BatchRerunResponse[] = [];
   let waitingForCapacity = false;
+  let dispatchingTestIds: string[] = [];
   try {
     // Dispatch chunks one at a time, NOT via Promise.all. BE producer/
     // teardown closure dedup happens per-request, server-side. Two chunks
@@ -12748,6 +12749,7 @@ async function runTestRerunCore(
     chunkResponses = [];
     for (let idx = 0; idx < chunks.length; idx++) {
       const chunk = chunks[idx]!;
+      dispatchingTestIds = chunk;
       // Bound the per-chunk idempotency key to <=256 chars (mirrors the retry
       // path). A long base key plus the `:chunkN` suffix could otherwise exceed
       // the server cap and be rejected or truncated inconsistently.
@@ -12798,20 +12800,60 @@ async function runTestRerunCore(
         err,
         deps.environmentTunnel,
       );
-    // D2 (dogfood): the batch endpoint rejects the WHOLE request when any id is
-    // unresolvable (unknown, cross-tenant, or never ran cleanly), so one bad id
-    // aborts the batch with NOT_FOUND. Replace the bare exit-4 with an
-    // actionable hint. (Server-side partial-accept of unknown ids — a
-    // `notFound[]` in the batch response so good ids still run — is a tracked
-    // backend follow-up.)
+    else if (chunkResponses.length > 0) {
+      // Earlier HTTP requests have already dispatched work. A later request
+      // failing does not roll those runs back; preserve their IDs before exit.
+      const accepted = chunkResponses.flatMap(response => response.accepted);
+      const deferred = chunkResponses.flatMap(response => response.deferred);
+      const conflicts = chunkResponses.flatMap(response => response.conflicts);
+      const notFound = chunkResponses.flatMap(response => response.notFound ?? []);
+      const acknowledged = new Set([
+        ...accepted.map(row => row.testId),
+        ...deferred.map(row => row.testId),
+        ...conflicts.map(row => row.testId),
+        ...notFound,
+      ]);
+      const partial = {
+        partial: true,
+        accepted,
+        deferred,
+        conflicts,
+        notFound,
+        closure: {
+          byProject: mergeBatchRerunClosureByProject(
+            chunkResponses.flatMap(response => response.closure.byProject),
+          ),
+        },
+        // An errored request may have reached the server; do not claim rollback.
+        unconfirmedTestIds: testIds.filter(id => !acknowledged.has(id)),
+      };
+      out.print(partial, () =>
+        [
+          'Batch rerun partially dispatched; a later request failed.',
+          ...accepted.map(row => `${row.runId}  ${row.testId}  dispatched (not awaited)`),
+          `Unconfirmed tests: ${partial.unconfirmedTestIds.join(', ') || '(none)'}`,
+        ].join('\n'),
+      );
+      if (accepted.length > 0) {
+        const runIds = [...new Set(accepted.map(row => row.runId))];
+        stderrFn(`${runIds.length} run(s) were already accepted and may still be running.`);
+        stderrFn(`Re-attach with: testsprite test wait ${runIds.join(' ')}`);
+        stderrFn(`Cancel with: testsprite test cancel ${runIds.join(' ')}`);
+      }
+    }
+    // A batch request can fail even after earlier chunks succeeded.
     if (!waitingForCapacity && err instanceof ApiError && err.code === 'NOT_FOUND') {
       throw ApiError.fromEnvelope({
         error: {
           code: 'NOT_FOUND',
-          message: `Batch rerun aborted: one or more of the ${testIds.length} requested test${testIds.length !== 1 ? 's' : ''} has no replayable run (unknown/cross-tenant id, or never completed a clean run). The batch endpoint rejects the whole request when any id is unresolvable.`,
+          message: `Batch rerun ${chunkResponses.length ? 'partially dispatched; a later request failed' : 'aborted'}: one or more of the ${dispatchingTestIds.length} tests in the failed request has no replayable run (unknown/cross-tenant id, or never completed a clean run). Earlier accepted runs are not rolled back.`,
           nextAction: `Verify the test ids and drop any that have never run, or trigger fresh runs individually: testsprite test run <id>`,
           requestId: err.requestId ?? 'local',
-          details: { reason: 'batch_contains_unreplayable', testIds },
+          details: {
+            ...err.details,
+            reason: 'batch_contains_unreplayable',
+            testIds: dispatchingTestIds,
+          },
         },
       });
     }
