@@ -90,6 +90,7 @@ function fixture(
       createdFrom: 'cli',
       updatedAt: '2026-10-01',
     };
+  /** Serve configured API fixtures and record requests without contacting a live service. */
   const fetchImpl = vi.fn(async (input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
     const parsed = new URL(
       typeof input === 'string' ? input : input instanceof URL ? input.href : input.url,

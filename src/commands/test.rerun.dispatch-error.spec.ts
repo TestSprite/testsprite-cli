@@ -28,6 +28,10 @@ async function exercise(
   const stdout: string[] = [],
     stderr: string[] = [],
     chunks: string[][] = [];
+  /**
+   * Serve test and environment data offline, acknowledging batches until the selected failure.
+   * Reject unexpected requests so recovery-output tests cannot silently start result polling.
+   */
   const fetchImpl: typeof fetch = async (input, init = {}) => {
     const url = String(input);
     let status = 200;
