@@ -11832,6 +11832,11 @@ export async function runTestRerun(
   );
 }
 
+/**
+ * Resolve and dispatch reruns, then optionally wait for their results.
+ * If dispatch fails after an acknowledged batch, emit recovery data and
+ * advisories before propagating the original failure; do not start polling.
+ */
 async function runTestRerunCore(
   opts: RunTestRerunOptions,
   deps: TestDeps = {},
@@ -12738,6 +12743,7 @@ async function runTestRerunCore(
   let chunkResponses: BatchRerunResponse[] = [];
   let waitingForCapacity = false;
   let dispatchingTestIds: string[] = [];
+  let dispatchingChunkIndex = -1;
   try {
     // Dispatch chunks one at a time, NOT via Promise.all. BE producer/
     // teardown closure dedup happens per-request, server-side. Two chunks
@@ -12750,6 +12756,7 @@ async function runTestRerunCore(
     for (let idx = 0; idx < chunks.length; idx++) {
       const chunk = chunks[idx]!;
       dispatchingTestIds = chunk;
+      dispatchingChunkIndex = idx;
       // Bound the per-chunk idempotency key to <=256 chars (mirrors the retry
       // path). A long base key plus the `:chunkN` suffix could otherwise exceed
       // the server cap and be rejected or truncated inconsistently.
@@ -12819,6 +12826,9 @@ async function runTestRerunCore(
         deferred,
         conflicts,
         notFound,
+        advisories: dedupeRerunAdvisories(
+          chunkResponses.flatMap(response => response.advisories ?? []),
+        ),
         closure: {
           byProject: mergeBatchRerunClosureByProject(
             chunkResponses.flatMap(response => response.closure.byProject),
@@ -12826,14 +12836,22 @@ async function runTestRerunCore(
         },
         // An errored request may have reached the server; do not claim rollback.
         unconfirmedTestIds: testIds.filter(id => !acknowledged.has(id)),
+        failedChunkTestIds: dispatchingTestIds.filter(id => !acknowledged.has(id)),
+        notAttemptedTestIds: chunks
+          .slice(dispatchingChunkIndex + 1)
+          .flat()
+          .filter(id => !acknowledged.has(id)),
       };
       out.print(partial, () =>
         [
           'Batch rerun partially dispatched; a later request failed.',
           ...accepted.map(row => `${row.runId}  ${row.testId}  dispatched (not awaited)`),
           `Unconfirmed tests: ${partial.unconfirmedTestIds.join(', ') || '(none)'}`,
+          `Failed request tests (dispatch unconfirmed): ${partial.failedChunkTestIds.join(', ') || '(none)'}`,
+          `Not attempted by this command: ${partial.notAttemptedTestIds.join(', ') || '(none)'}`,
         ].join('\n'),
       );
+      emitRerunAdvisories(stderrFn, partial.advisories);
       if (accepted.length > 0) {
         const runIds = [...new Set(accepted.map(row => row.runId))];
         stderrFn(`${runIds.length} run(s) were already accepted and may still be running.`);

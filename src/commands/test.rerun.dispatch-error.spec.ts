@@ -1,17 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from '../lib/errors.js';
+import type { RerunAdvisory } from '../lib/runs.types.js';
 import { runTestRerun } from './test.js';
 
 const testIds = Array.from({ length: 51 }, (_, i) => `test_${i}`);
-const tests = testIds.map(id => ({
-  id,
-  name: id,
-  type: 'frontend' as const,
-  projectId: 'project_repro',
-  status: 'passed',
-  createdFrom: 'portal',
-}));
-
+/** Dispatch fake batches, fail the selected request and capture recovery output without polling. */
 async function exercise(
   options: {
     all?: boolean;
@@ -19,8 +12,19 @@ async function exercise(
     text?: boolean;
     failAt?: number;
     errorCode?: 'NOT_FOUND' | 'AUTH_INVALID';
+    count?: number;
+    advisories?: RerunAdvisory[];
   } = {},
 ) {
+  const requestedIds = Array.from({ length: options.count ?? 51 }, (_, i) => `test_${i}`);
+  const tests = requestedIds.map(id => ({
+    id,
+    name: id,
+    type: 'frontend' as const,
+    projectId: 'project_repro',
+    status: 'passed',
+    createdFrom: 'portal',
+  }));
   const stdout: string[] = [],
     stderr: string[] = [],
     chunks: string[][] = [];
@@ -54,6 +58,7 @@ async function exercise(
           deferred: [],
           conflicts: [],
           closure: { byProject: [] },
+          ...(options.advisories ? { advisories: options.advisories } : {}),
         };
       }
     } else if (url.includes('/env')) body = { environments: [] };
@@ -66,7 +71,7 @@ async function exercise(
   };
   const error = await runTestRerun(
     {
-      testIds: options.all ? [] : testIds,
+      testIds: options.all ? [] : requestedIds,
       all: options.all ?? false,
       projectId: 'project_repro',
       knownTests: new Map(tests.map(test => [test.id, test])),
@@ -93,6 +98,50 @@ async function exercise(
 }
 
 describe('batch rerun dispatch failures', () => {
+  it.each([false, true])('preserves deduplicated advisories with text=%s', async text => {
+    const advisory = {
+      feature: 'autoHeal',
+      message: 'The requested auto-heal opt-out was not enforced.',
+    };
+    const { error, stdout, stderr, chunks } = await exercise({
+      count: 101,
+      failAt: 3,
+      text,
+      advisories: [advisory, advisory],
+    });
+    expect(error).toMatchObject({ exitCode: 4, requestId: 'req_failed_chunk' });
+    expect(chunks.map(chunk => chunk.length)).toEqual([50, 50, 1]);
+    expect(stderr.filter(line => line.startsWith('[advisory]'))).toEqual([
+      `[advisory] ${advisory.message}`,
+    ]);
+    if (text) expect(stdout.join('\n')).not.toContain(advisory.message);
+    else expect(JSON.parse(stdout[0]!).advisories).toEqual([advisory]);
+  });
+
+  it.each([
+    { all: false, wait: false },
+    { all: false, wait: true },
+    { all: true, wait: false },
+    { all: true, wait: true },
+  ])('separates failed and unattempted requests for all=$all wait=$wait', async options => {
+    const { error, stdout, chunks } = await exercise({ ...options, count: 101 });
+    expect(chunks.map(chunk => chunk.length)).toEqual([50, 50]);
+    expect(error).toMatchObject({ exitCode: 4 });
+    const payload = JSON.parse(stdout[0]!);
+    expect(payload.accepted).toHaveLength(50);
+    expect(payload.failedChunkTestIds).toEqual(chunks[1]);
+    expect(payload.notAttemptedTestIds).toEqual(['test_100']);
+    expect(payload.unconfirmedTestIds).toEqual([...chunks[1]!, 'test_100']);
+    expect(payload.advisories).toEqual([]);
+  });
+
+  it('distinguishes failed and unattempted requests in text output', async () => {
+    const { stdout, error } = await exercise({ text: true, count: 101 });
+    expect(error).toMatchObject({ exitCode: 4 });
+    expect(stdout.join('\n')).toContain('Failed request tests (dispatch unconfirmed): test_50,');
+    expect(stdout.join('\n')).toContain('Not attempted by this command: test_100');
+  });
+
   it.each([
     { all: false, wait: false },
     { all: false, wait: true },
@@ -114,6 +163,8 @@ describe('batch rerun dispatch failures', () => {
       testIds.slice(0, 50).map(id => `run_${id}`),
     );
     expect(payload.unconfirmedTestIds).toEqual(['test_50']);
+    expect(payload.failedChunkTestIds).toEqual(['test_50']);
+    expect(payload.notAttemptedTestIds).toEqual([]);
     expect(stderr.join('\n')).toContain('testsprite test wait run_test_0');
     expect(stderr.join('\n')).toContain('testsprite test cancel run_test_0');
   });
