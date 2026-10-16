@@ -1267,7 +1267,17 @@ export async function runDocsUpload(
   return result;
 }
 
-/** Read only a diagnostic prefix; the PUT's abort scope remains active until this settles. */
+/**
+ * Decode at most 1,200 bytes of a failed PUT body into a 300-code-unit diagnostic.
+ * The caller keeps the PUT timeout and shutdown scope active while this reads.
+ * Cancel the unread remainder without waiting for remote cleanup, and release
+ * the reader lock on every path.
+ *
+ * @param response Failed PUT response whose body supplies the diagnostic.
+ * @param signal The PUT's composed timeout/shutdown signal.
+ * @returns A bounded prefix, or an empty string for absent or broken diagnostics.
+ * @throws The abort reason or interrupt error so upload error mapping preserves it.
+ */
 async function readUploadErrorSnippet(response: Response, signal: AbortSignal): Promise<string> {
   if (!response.body) return '';
   const reader = response.body.getReader();
@@ -1300,6 +1310,7 @@ async function readUploadErrorSnippet(response: Response, signal: AbortSignal): 
   }
 }
 
+/** Identify fetch/body AbortErrors without classifying ordinary diagnostic failures as aborts. */
 function isAbortError(cause: unknown): boolean {
   return cause instanceof Error && cause.name === 'AbortError';
 }
