@@ -1343,6 +1343,58 @@ describe('HttpClient retry-delay sleep bails on shutdown', () => {
 });
 
 describe('caller abort during retry backoff', () => {
+  it.each([
+    ['transport', 'SIGINT'],
+    ['transport', 'SIGTERM'],
+    ['edge', 'SIGINT'],
+    ['edge', 'SIGTERM'],
+    ['api', 'SIGINT'],
+    ['api', 'SIGTERM'],
+  ] as const)(
+    'preserves shutdown precedence before %s retry backoff (%s)',
+    async (kind, signal) => {
+      vi.useFakeTimers();
+      try {
+        const caller = new AbortController();
+        const shutdown = new AbortController();
+        const reason = new InterruptError(signal);
+        const sleep = vi.fn(async () => {});
+        const fetchImpl = vi.fn(async () => {
+          if (kind === 'transport') throw new Error('socket closed');
+          if (kind === 'edge') return new Response('Bad Gateway', { status: 502 });
+          return errorEnvelopeResponse(429, 'RATE_LIMITED', {
+            headers: { 'content-type': 'application/json', 'retry-after': '60' },
+          });
+        });
+        const client = new HttpClient({
+          baseUrl: 'https://api.example.com/api/cli/v1',
+          apiKey: 'sk-user-test',
+          fetchImpl,
+          shutdownSignal: shutdown.signal,
+          sleep,
+          random: () => 0,
+          onDebug: event => {
+            if (event.kind === 'retry') {
+              // Both signals have fired by the time retry backoff starts.
+              caller.abort(new DOMException('Caller deadline expired', 'TimeoutError'));
+              shutdown.abort(reason);
+            }
+          },
+        });
+        const error = await client
+          .get('/me', { signal: caller.signal })
+          .catch((err: unknown) => err);
+        expect(error).toBe(reason);
+        expect(error).toMatchObject({ exitCode: signal === 'SIGINT' ? 130 : 143 });
+        expect(fetchImpl).toHaveBeenCalledOnce();
+        expect(sleep).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it.each(['transport', 'edge', 'api'] as const)(
     'preserves the caller reason and cancels the %s retry timer',
     async kind => {

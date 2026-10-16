@@ -1143,7 +1143,8 @@ export class HttpClient {
 
   /** Keep caller deadlines and process shutdown active throughout retry backoff. */
   private async sleepBeforeRetry(ms: number, callerSignal?: AbortSignal): Promise<void> {
-    const signals = [callerSignal, this.shutdownSignal].filter(
+    // Match request error handling: an already-fired shutdown outranks a caller deadline.
+    const signals = [this.shutdownSignal, callerSignal].filter(
       (signal): signal is AbortSignal => signal !== undefined,
     );
     if (signals.length === 0) return this.sleep(ms);
