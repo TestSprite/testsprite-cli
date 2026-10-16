@@ -45,6 +45,8 @@ const cases: Array<[string, string[]]> = [
   ['test', ['test', '--help']],
   ['test list', ['test', 'list', '--help']],
   ['test get', ['test', 'get', '--help']],
+  ['test export', ['test', 'export', '--help']],
+  ['test import', ['test', 'import', '--help']],
   ['test code get', ['test', 'code', 'get', '--help']],
   ['test steps', ['test', 'steps', '--help']],
   ['test result', ['test', 'result', '--help']],

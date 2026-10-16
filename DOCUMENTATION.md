@@ -389,6 +389,26 @@ testsprite test create --plan-from ./checkout.plan.json --dry-run --output json
 
 `--plan-from` owns the complete test definition and does not support this setting; a supplied `--step-timeout` is warned about and ignored. Set it later with `test update --step-timeout <ms>`.
 
+#### `testsprite test export <test-id>` / `testsprite test import <file>`
+
+Export one **backend** test definition for version control, review, backup, or migration. The JSON object contains `test` (the supported definition fields projected from `GET /tests/{id}`) and `code` (the `GET /tests/{id}/code` object with inline Python source). Keys are sorted recursively, arrays keep their order, and source whitespace is preserved. A presigned code URL is downloaded without API authentication headers before export, so the artifact contains durable source. There is no separate file-format version.
+
+```bash
+testsprite test export test_backend --out ./login.testsprite.json
+testsprite test export test_backend > ./login.testsprite.json
+testsprite test import ./login.testsprite.json                       # create a copy
+testsprite test import ./login.testsprite.json --project project_new # create in another project
+testsprite test import ./login.testsprite.json --test-id test_backend --idempotency-key restore-login
+```
+
+`test` includes `id`, `projectId`, `type`, `name`, and any returned `description`, `priority`, `stepTimeoutMs`, `produces`, `consumes`, or `category`. Status, run results, timestamps, project display names, and debug details are outside the definition projection. `test.id`, `code.testId`, `code.codeVersion`, and `code.etag` record provenance; creating a copy assigns a new identity and version. Null optional metadata is unset on create. Updating patches the fields present in the file, including explicit null clears; omitted fields remain unchanged. Unknown import fields are rejected before any API request rather than discarded. Frontend export and import fail explicitly: this first version does not restore frontend plans or generated code.
+
+An import creates by default, even if the exported `test.id` is present. `--test-id` explicitly selects update, must identify a backend test in the original project, and uses the saved `code.codeVersion` as `If-Match`. A null, empty, or wildcard version cannot silently force an update. `--expected-version <version>` supplies a reviewed target version and is required when the target differs from the saved `test.id`. `--project` applies only to creation. Definition input must be a regular UTF-8 JSON file of at most 1 MB (an optional BOM is accepted); Python/pytest code must be non-empty and at most 350 KB. Unsupported legacy code languages must be converted before import.
+
+Updates write code first, so a stale version fails with `PRECONDITION_FAILED` (exit 6) before metadata changes. Code and metadata remain two separate API writes. If metadata fails after code succeeds, the CLI reports the partial update on stderr and preserves the underlying error. Retry with the same `--idempotency-key` to replay completed stages safely; changing the key or expected version starts a different operation. The base key is printed on stderr for JSON, verbose, or debug output and accepts at most 247 ASCII characters to leave space for stage suffixes. Create uses `:create`; update uses `:code` and `:metadata`.
+
+Export prints the JSON definition to stdout regardless of display mode unless `--out` is supplied. `--out` uses the code-download path's sibling temporary file and atomic rename: an existing regular file is replaced only after export completes, and failures preserve its bytes. Dry-run export prints a sample without reading the API or writing a file. Dry-run import validates the supplied file and previews mutation responses without credentials or network calls. Definition export is separate from JUnit **result** reports and does not define suites or Test Lists.
+
 #### `testsprite test create-batch`
 
 Bulk-create frontend tests from a JSONL plan-steps file (or a directory of plan files with `--plan-from-dir`). Optional `--run --max-concurrency <N>` fans out triggers. Without `--wait`, each run is dispatched (`status: "queued"`) and the command exits 0 when every trigger is accepted — mirroring single `test run` without `--wait`; a trigger error still exits non-zero. With `--wait`, it polls every run to terminal and exits non-zero if any run does not pass.

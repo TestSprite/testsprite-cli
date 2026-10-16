@@ -185,6 +185,15 @@ import {
 import { loadConfig, resolveProfileName } from '../lib/config.js';
 import { historyRetentionNote } from '../lib/history-retention.js';
 import {
+  definitionMetadata,
+  MAX_DEFINITION_BYTES,
+  MAX_DEFINITION_CODE_BYTES,
+  projectTestDefinition,
+  readDefinitionFileGuarded,
+  stringifyTestDefinition,
+  type TestDefinition,
+} from '../lib/test-definition.js';
+import {
   flakyExitCode,
   renderFlakyText,
   summarizeFlaky,
@@ -228,6 +237,7 @@ export interface CliTest {
    */
   projectName?: string | null;
   name: string;
+  description?: string | null;
   type: 'frontend' | 'backend';
   createdFrom: 'portal' | 'mcp' | 'cli';
   status: CliPublicStatus;
@@ -5372,6 +5382,220 @@ export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Pro
     if (fileSink) await closeOutputFile(fileSink, false).catch(() => undefined);
     throw err;
   }
+}
+
+export interface ExportOptions extends CommonOptions {
+  testId: string;
+  out?: string;
+}
+
+/** Export a single backend definition, including durable source rather than an expiring URL. */
+export async function runExport(opts: ExportOptions, deps: TestDeps = {}): Promise<TestDefinition> {
+  requireNonEmpty('test-id', opts.testId);
+  let sink = !opts.dryRun && opts.out !== undefined ? openOutputFile(opts.out) : null;
+  try {
+    let definition: TestDefinition;
+    if (opts.dryRun) {
+      definition = {
+        test: {
+          id: opts.testId,
+          projectId: 'project_dry_run',
+          type: 'backend',
+          name: 'Backend definition preview',
+        },
+        code: {
+          testId: opts.testId,
+          language: 'python',
+          framework: 'pytest',
+          code: DRY_RUN_PLACEHOLDER_CODE,
+          codeVersion: 'v3',
+        },
+      };
+      if (opts.out !== undefined) {
+        (deps.stderr ?? (line => process.stderr.write(`${line}\n`)))(
+          `[dry-run] would write definition to ${opts.out}`,
+        );
+      }
+    } else {
+      const client = makeClient(opts, deps);
+      const path = `/tests/${encodeURIComponent(opts.testId)}`;
+      const test = await client.get<CliTest>(path);
+      if (test.type !== 'backend') {
+        throw localValidationError(
+          'test-id',
+          'definition export/import currently supports backend tests only; frontend plans cannot be restored by this command',
+        );
+      }
+      if (test.id !== opts.testId) {
+        throw localValidationError('test-id', 'server returned metadata for a different test');
+      }
+      const code = await client.get<CliTestCode>(`${path}/code`);
+      if (code.testId !== opts.testId) {
+        throw localValidationError(
+          'code.testId',
+          'server returned code for a different test',
+          undefined,
+          'field',
+        );
+      }
+      let body = code.code;
+      if (typeof body === 'string' && isPresignedCodeUrl(body)) {
+        const chunks: string[] = [];
+        let bytes = 0;
+        await streamPresignedBody(
+          body,
+          new Output('text', {
+            rawStdout: chunk => {
+              bytes += Buffer.byteLength(chunk, 'utf8');
+              if (bytes > MAX_DEFINITION_CODE_BYTES) {
+                throw localValidationError(
+                  'code.code',
+                  'exceeds the 350 KB code input limit',
+                  undefined,
+                  'field',
+                );
+              }
+              chunks.push(chunk);
+            },
+          }),
+          deps,
+        );
+        body = chunks.join('');
+      }
+      definition = projectTestDefinition(test, { ...code, code: body });
+    }
+    const serialized = stringifyTestDefinition(definition);
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_DEFINITION_BYTES) {
+      throw localValidationError(
+        'definition',
+        'exceeds the 1 MB definition input limit',
+        undefined,
+        'field',
+      );
+    }
+    if (sink) {
+      await makeFileOutput('json', sink).writeChunk(serialized);
+      await closeOutputFile(sink, true);
+      sink = null;
+    } else {
+      (deps.stdout ?? (line => process.stdout.write(`${line}\n`)))(serialized.slice(0, -1));
+    }
+    return definition;
+  } catch (error) {
+    if (sink) await abortOutputFile(sink).catch(() => undefined);
+    throw error;
+  }
+}
+
+export interface ImportOptions extends CommonOptions {
+  file: string;
+  projectId?: string;
+  testId?: string;
+  expectedVersion?: string;
+  idempotencyKey?: string;
+}
+
+export interface ImportResult {
+  testId: string;
+  action: 'created' | 'updated';
+  codeVersion: string;
+}
+
+/** Validate everything locally, then create or explicitly update one backend test. */
+export async function runImport(opts: ImportOptions, deps: TestDeps = {}): Promise<ImportResult> {
+  requireNonEmpty('file', opts.file);
+  const definition = readDefinitionFileGuarded(opts.file);
+  assertIdempotencyKey(opts.idempotencyKey);
+  const key = opts.idempotencyKey ?? `cli-import-${randomUUID()}`;
+  for (const suffix of [':create', ':code', ':metadata']) assertIdempotencyKey(`${key}${suffix}`);
+  if (opts.projectId !== undefined) requireNonEmpty('project', opts.projectId);
+  if (opts.testId !== undefined) requireNonEmpty('test-id', opts.testId);
+  if (opts.testId !== undefined && opts.projectId !== undefined) {
+    throw localValidationError(
+      'project',
+      'is only supported when creating a test; omit --test-id to create',
+    );
+  }
+  if (opts.testId === undefined && opts.expectedVersion !== undefined) {
+    throw localValidationError('expected-version', 'requires --test-id');
+  }
+  const expected = opts.expectedVersion ?? definition.code.codeVersion;
+  if (opts.testId !== undefined) {
+    if (
+      expected === null ||
+      expected === undefined ||
+      !expected.trim() ||
+      expected.trim() === '*'
+    ) {
+      throw localValidationError(
+        'expected-version',
+        'updates require a non-empty saved codeVersion or --expected-version; wildcard force is not supported',
+      );
+    }
+    if (opts.testId !== definition.test.id && opts.expectedVersion === undefined) {
+      throw localValidationError(
+        'expected-version',
+        'is required when updating a different test from the exported test.id',
+      );
+    }
+  }
+  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  // Expose a replayable base key. Each stage derives the same stable suffix on retries.
+  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
+    stderr(`idempotency-key: ${key}`);
+  }
+  const client = makeClient(opts, deps);
+  let result: ImportResult;
+  if (opts.testId === undefined) {
+    const created = await client.post<CliCreateTestResponse>('/tests', {
+      body: {
+        ...definitionMetadata(definition.test, true),
+        projectId: opts.projectId ?? definition.test.projectId,
+        type: 'backend',
+        code: definition.code.code,
+      },
+      headers: { 'idempotency-key': `${key}:create` },
+    });
+    emitResponseWarnings(created.warnings, deps);
+    result = { testId: created.testId, action: 'created', codeVersion: created.codeVersion };
+  } else {
+    const path = `/tests/${encodeURIComponent(opts.testId)}`;
+    if (!opts.dryRun) {
+      const target = await client.get<CliTest>(path);
+      if (
+        target.id !== opts.testId ||
+        target.type !== 'backend' ||
+        target.projectId !== definition.test.projectId
+      ) {
+        throw localValidationError(
+          'test-id',
+          'target must be a backend test in the definition project; use create with --project to migrate',
+        );
+      }
+    }
+    const code = await client.put<CliPutTestCodeResponse>(`${path}/code`, {
+      body: { code: definition.code.code, language: 'python' },
+      headers: { 'idempotency-key': `${key}:code`, 'if-match': expected! },
+    });
+    emitResponseWarnings(code.warnings, deps);
+    try {
+      await client.put<CliUpdateTestResponse>(path, {
+        body: definitionMetadata(definition.test, false),
+        headers: { 'idempotency-key': `${key}:metadata` },
+      });
+    } catch (error) {
+      stderr(
+        `Import partially applied: code for ${opts.testId} was updated to ${code.codeVersion}, but metadata did not complete. Retry with the same --idempotency-key ${key}; inspect the test before changing its expected version.`,
+      );
+      throw error;
+    }
+    result = { testId: opts.testId, action: 'updated', codeVersion: code.codeVersion };
+  }
+  makeOutput(opts.output, deps).print(result, value => {
+    const imported = value as ImportResult;
+    return `${imported.action} ${imported.testId}\ncodeVersion ${imported.codeVersion}`;
+  });
+  return result;
 }
 
 /**
@@ -15161,6 +15385,52 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     );
 
   test.addCommand(createTestCodeCommand(deps));
+  test
+    .command('export <test-id>')
+    .description(
+      'Export one backend test definition as deterministic JSON (metadata and Python source)',
+    )
+    .option('--out <path>', 'write a .testsprite.json file atomically; defaults to stdout')
+    .addHelpText(
+      'after',
+      '\nBackend tests only. This exports definitions for version control; run results are excluded.',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (testId: string, flags: { out?: string }, command: Command) => {
+      await runExport({ ...resolveCommonOptions(command, deps.env), testId, out: flags.out }, deps);
+    });
+  test
+    .command('import <file>')
+    .description(
+      'Create a backend test from an exported definition, or update an explicit --test-id',
+    )
+    .option('--project <id>', 'override the project when creating a test')
+    .option('--test-id <id>', 'update this existing backend test instead of creating')
+    .option(
+      '--expected-version <version>',
+      'explicit codeVersion for an update; defaults to the saved version',
+    )
+    .option(
+      '--idempotency-key <token>',
+      'replayable base token; at most 247 ASCII characters including stage suffix budget',
+    )
+    .addHelpText(
+      'after',
+      '\nBackend tests only. Updates write guarded code before metadata; the two writes are not atomic.\nUse the same idempotency key to retry a partial import. A different target requires --expected-version.',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(
+      async (
+        file: string,
+        flags: Omit<ImportOptions, keyof CommonOptions | 'file'> & { project?: string },
+        command: Command,
+      ) => {
+        await runImport(
+          { ...resolveCommonOptions(command, deps.env), ...flags, projectId: flags.project, file },
+          deps,
+        );
+      },
+    );
   test.addCommand(createTestPlanCommand(deps));
   test.addCommand(createTestFailureCommand(deps));
   test.addCommand(createTestArtifactCommand(deps));
@@ -16064,7 +16334,7 @@ async function readPresignedBody(
     if (shutdownSignal.aborted) throw shutdownSignal.reason;
   } catch (err) {
     if (shutdownSignal.aborted) throw shutdownSignal.reason;
-    if (err instanceof InterruptError) throw err;
+    if (err instanceof InterruptError || err instanceof ApiError) throw err;
     const message = err instanceof Error ? err.message : String(err);
     throw new TransportError(`Failed mid-download of presigned code body: ${message}`);
   }
