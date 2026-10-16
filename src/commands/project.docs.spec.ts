@@ -11,7 +11,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
@@ -961,5 +961,84 @@ describe('project docs upload — command wiring', () => {
     expect(flagNames).toContain('--idempotency-key');
     // The default role is a documented part of the contract.
     expect(upload!.helpInformation()).toMatch(/api-doc.*default|default.*api-doc/i);
+  });
+});
+
+describe('failed PUT response body', () => {
+  it.each(['timeout', 'interrupt'] as const)('keeps %s active after headers arrive', async kind => {
+    const { credentialsPath } = makeCreds();
+    const { path } = makeFile('openapi.json', '{}');
+    const shutdown = new ShutdownController();
+    let reading!: () => void;
+    const started = new Promise<void>(resolve => {
+      reading = resolve;
+    });
+    const { fetchImpl, calls } = makeDocsFetch({
+      putResponse: init =>
+        new Response(
+          new ReadableStream<Uint8Array>(
+            {
+              start(controller) {
+                init.signal!.addEventListener(
+                  'abort',
+                  () => controller.error(init.signal!.reason),
+                  { once: true },
+                );
+              },
+              pull() {
+                reading();
+              },
+            },
+            { highWaterMark: 0 },
+          ),
+          { status: 403 },
+        ),
+    });
+    const io = captureIo();
+    vi.useFakeTimers();
+    try {
+      const result = runDocsUpload(baseOpts({ file: path, requestTimeoutMs: 1000 }), {
+        credentialsPath,
+        fetchImpl,
+        shutdown,
+        stdout: io.stdout,
+        stderr: io.stderr,
+      }).catch((err: unknown) => err);
+      await started;
+      if (kind === 'timeout') await vi.advanceTimersByTimeAsync(1000);
+      else shutdown.interrupt('SIGINT');
+      const error = await result;
+      expect(error).toBeInstanceOf(kind === 'timeout' ? RequestTimeoutError : InterruptError);
+      expect(calls.map(call => call.method)).toEqual(['POST', 'PUT']);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels an oversized error body after a bounded diagnostic prefix', async () => {
+    const { credentialsPath } = makeCreds();
+    const { path } = makeFile('openapi.json', '{}');
+    const cancel = vi.fn();
+    const pull = vi.fn((controller: ReadableStreamDefaultController<Uint8Array>) => {
+      controller.enqueue(new TextEncoder().encode('x'.repeat(4096)));
+    });
+    const { fetchImpl, calls } = makeDocsFetch({
+      putResponse: () =>
+        new Response(new ReadableStream({ pull, cancel }, { highWaterMark: 0 }), { status: 403 }),
+    });
+    const io = captureIo();
+    const error = await runDocsUpload(baseOpts({ file: path }), {
+      credentialsPath,
+      fetchImpl,
+      stdout: io.stdout,
+      stderr: io.stderr,
+    }).catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).message).toContain(`HTTP 403 — ${'x'.repeat(300)}`);
+    expect((error as ApiError).message).not.toContain('x'.repeat(301));
+    expect(pull).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(calls.map(call => call.method)).toEqual(['POST', 'PUT']);
   });
 });

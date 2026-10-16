@@ -1190,9 +1190,8 @@ export async function runDocsUpload(
   const disarm = shutdown.arm();
   if (shutdownSignal.aborted) onShutdownAbort();
   else shutdownSignal.addEventListener('abort', onShutdownAbort, { once: true });
-  let putResponse: Response;
   try {
-    putResponse = await fetchImpl(minted.uploadUrl, {
+    const putResponse = await fetchImpl(minted.uploadUrl, {
       method: 'PUT',
       headers: { 'content-type': contentType, 'content-length': String(stat.size) },
       body: Readable.toWeb(createReadStream(opts.file)) as unknown as RequestInit['body'],
@@ -1206,6 +1205,13 @@ export async function runDocsUpload(
       redirect: 'error',
       signal: controller.signal,
     } as RequestInit);
+    if (!putResponse.ok) {
+      const snippet = await readUploadErrorSnippet(putResponse, controller.signal);
+      throw presignedPutError(
+        `S3 returned HTTP ${putResponse.status}${snippet ? ` — ${snippet}` : ''}`,
+        minted.expiresInSeconds,
+      );
+    }
   } catch (cause) {
     // Interrupt outranks the timeout mapping: a Ctrl-C-aborted fetch must
     // surface as InterruptError (exit 130/143), never as a timeout.
@@ -1213,9 +1219,10 @@ export async function runDocsUpload(
     if (shutdownSignal.aborted) throw shutdownSignal.reason;
     // Any other abort here is ours (the per-request timer): map to the CLI's
     // typed exit-7 timeout, same contract as HttpClient's per-request timeout.
-    if (isAbortError(cause)) {
+    if (controller.signal.aborted || isAbortError(cause)) {
       throw new RequestTimeoutError(requestTimeoutMs);
     }
+    if (cause instanceof ApiError) throw cause;
     throw presignedPutError(
       `network error before S3 responded: ${describeCause(cause)}`,
       minted.expiresInSeconds,
@@ -1224,13 +1231,6 @@ export async function runDocsUpload(
     clearTimeout(timer);
     shutdownSignal.removeEventListener('abort', onShutdownAbort);
     disarm();
-  }
-  if (!putResponse.ok) {
-    const snippet = (await putResponse.text().catch(() => '')).slice(0, 300);
-    throw presignedPutError(
-      `S3 returned HTTP ${putResponse.status}${snippet ? ` — ${snippet}` : ''}`,
-      minted.expiresInSeconds,
-    );
   }
 
   // ── Step 3 of 3: register the uploaded object ─────────────────────────────
@@ -1265,6 +1265,39 @@ export async function runDocsUpload(
   };
   out.print(result, data => renderDocsUploadText(data as CliDocsUploadResult));
   return result;
+}
+
+/** Read only a diagnostic prefix; the PUT's abort scope remains active until this settles. */
+async function readUploadErrorSnippet(response: Response, signal: AbortSignal): Promise<string> {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let bytes = 0;
+  let complete = false;
+  try {
+    // UTF-8 uses at most four bytes per code point. Bound both bytes and text.
+    while (bytes < 1200 && text.length < 300) {
+      const { done, value } = await reader.read();
+      if (done) {
+        complete = true;
+        text += decoder.decode();
+        break;
+      }
+      const prefix = value.subarray(0, 1200 - bytes);
+      bytes += prefix.byteLength;
+      text += decoder.decode(prefix, { stream: true });
+    }
+    return text.slice(0, 300);
+  } catch (cause) {
+    if (signal.aborted) throw signal.reason;
+    if (cause instanceof InterruptError || isAbortError(cause)) throw cause;
+    return ''; // A broken diagnostic body must not hide the known HTTP status.
+  } finally {
+    // Do not let remote stream cleanup delay the already-known error.
+    if (!complete) void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
 }
 
 function isAbortError(cause: unknown): boolean {
