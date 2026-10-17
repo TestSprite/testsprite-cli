@@ -168,3 +168,73 @@ describe('promptSecret (non-TTY behavior)', () => {
     await expect(promptSecret('? ', { input, output })).rejects.toThrow(/cancelled/i);
   });
 });
+
+describe('terminal escape sequences', () => {
+  const ESC = '\x1b';
+
+  it('drops arrow, Home/End and Delete key sequences from a secret, not just the ESC byte', async () => {
+    // Left-arrow twice after pasting, then Home (SS3 form), End (CSI form) and
+    // Delete — what a user checking a pasted key in the prompt actually sends.
+    const typed = `sk-user-abc${ESC}[D${ESC}[D${ESC}OH${ESC}[F${ESC}[3~\n`;
+    const output = new CaptureStream();
+    expect(await promptSecret('Key: ', { input: Readable.from([typed]), output })).toBe(
+      'sk-user-abc',
+    );
+  });
+
+  it('strips bracketed-paste markers around a pasted key', async () => {
+    const pasted = `${ESC}[200~sk-user-abc${ESC}[201~\r`;
+    const output = new CaptureStream();
+    expect(await promptSecret('Key: ', { input: Readable.from([pasted]), output })).toBe(
+      'sk-user-abc',
+    );
+  });
+
+  it('drops a sequence split across two data chunks', async () => {
+    async function* gen() {
+      yield `sk-user-abc${ESC}[`;
+      yield '1;5C'; // Ctrl+Right: CSI with parameters, final byte C
+      yield 'd\n';
+    }
+    const output = new CaptureStream();
+    expect(await promptSecret('Key: ', { input: Readable.from(gen()), output })).toBe(
+      'sk-user-abcd',
+    );
+  });
+
+  it('drops an Alt+key (two-byte) escape and keeps the text around it', async () => {
+    const output = new CaptureStream();
+    expect(await promptText('? ', { input: Readable.from([`ab${ESC}xcd\n`]), output })).toBe(
+      'abcd',
+    );
+  });
+
+  it('applies to promptText too (setup target prompt)', async () => {
+    const output = new CaptureStream();
+    expect(
+      await promptText('? ', { input: Readable.from([`claude${ESC}[A${ESC}[B\n`]), output }),
+    ).toBe('claude');
+  });
+
+  it('still submits on Enter that arrives inside an unterminated sequence', async () => {
+    const output = new CaptureStream();
+    expect(await promptText('? ', { input: Readable.from([`ok${ESC}[12\n`]), output })).toBe('ok');
+  });
+
+  it('writes no mask characters for escape-sequence bytes in raw (TTY) mode', async () => {
+    const input = Readable.from([`ab${ESC}[D${ESC}[200~c${ESC}[201~\r`]) as Readable & {
+      isTTY?: boolean;
+      setRawMode?: (mode: boolean) => void;
+    };
+    const rawModes: boolean[] = [];
+    input.isTTY = true;
+    input.setRawMode = mode => {
+      rawModes.push(mode);
+    };
+    const output = new CaptureStream();
+    expect(await promptSecret('Key: ', { input, output })).toBe('abc');
+    expect(rawModes).toEqual([true, false]);
+    // One '*' per kept character — none for the dropped sequence bytes.
+    expect(output.text()).toBe('Key: ***\n');
+  });
+});

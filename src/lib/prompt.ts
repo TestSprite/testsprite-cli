@@ -50,6 +50,13 @@ function readLine(
     let buffer = '';
     let resolved = false;
     let listening = false;
+    // Where we are inside a terminal escape sequence. Arrow/Home/End/Delete
+    // keys and bracketed-paste markers arrive as ESC-prefixed sequences
+    // (`ESC [ D`, `ESC [ 3 ~`, `ESC [ 200 ~`, `ESC O H`). Dropping only the
+    // ESC byte would keep the printable tail (`[D`) in the answer — in the
+    // API-key prompt that silently corrupts the key. Kept across chunks so a
+    // sequence split between two `data` events is still dropped whole.
+    let escape: 'none' | 'esc' | 'csi' | 'ss3' = 'none';
 
     const onData = (chunk: Buffer | string): void => {
       const str = typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
@@ -79,6 +86,26 @@ function readLine(
             reject(new Error('Prompt cancelled.'));
           }
           return;
+        }
+        // Terminal escape sequences: drop the whole sequence, not just ESC.
+        if (escape === 'esc') {
+          // `ESC [` starts a CSI sequence, `ESC O` an SS3 one; any other byte
+          // completes a two-byte escape (e.g. Alt+key).
+          escape = code === 0x5b ? 'csi' : code === 0x4f ? 'ss3' : 'none';
+          continue;
+        }
+        if (escape === 'csi') {
+          // Parameter / intermediate bytes continue it; a final byte ends it.
+          if (code >= 0x40 && code <= 0x7e) escape = 'none';
+          continue;
+        }
+        if (escape === 'ss3') {
+          escape = 'none';
+          continue;
+        }
+        if (code === 27) {
+          escape = 'esc';
+          continue;
         }
         // Backspace / DEL
         if (code === 127 || code === 8) {
