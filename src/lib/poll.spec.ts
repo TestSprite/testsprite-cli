@@ -9,7 +9,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError, InterruptError } from './errors.js';
 import { ShutdownController } from './interrupt.js';
-import { pollRunUntilTerminal, TimeoutError } from './poll.js';
+import { LONG_POLL_MIN_INTERVAL_MS, pollRunUntilTerminal, TimeoutError } from './poll.js';
 import type { RunClient } from './poll.js';
 import { defaultSleep, sleepUnlessInterrupted } from './poll-support.js';
 import type { RunResponse } from './runs.types.js';
@@ -203,6 +203,95 @@ describe('pollRunUntilTerminal — long-poll happy paths', () => {
     expect(result.status).toBe('passed');
     // Should have slept for retryAfterSeconds (5000 ms)
     expect(sleepCalls).toContain(5000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Long-poll pacing — a read the server did not hold must not be re-issued
+// back-to-back (only Date is faked; the injected sleep advances the clock)
+// ---------------------------------------------------------------------------
+
+describe('pollRunUntilTerminal — long-poll pacing', () => {
+  const T0 = new Date('2026-10-17T00:00:00.000Z');
+
+  /** Client whose every read takes `holdMs` of (fake) wall-clock time. */
+  function clockedClient(
+    responses: RunResponse[] | (() => RunResponse),
+    holdMs: number,
+    reads: number[],
+  ): RunClient {
+    let i = 0;
+    return {
+      getRun: async () => {
+        reads.push(Date.now());
+        vi.advanceTimersByTime(holdMs);
+        if (typeof responses === 'function') return responses();
+        const next = responses[i++];
+        if (!next) throw new Error('Ran out of mock responses');
+        return next;
+      },
+    };
+  }
+
+  const clockSleep = (calls: number[]) => (ms: number) => {
+    calls.push(ms);
+    vi.advanceTimersByTime(ms);
+    return Promise.resolve();
+  };
+
+  it('re-issues a read the server actually held without any client-side sleep', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
+    try {
+      const reads: number[] = [];
+      const sleepCalls: number[] = [];
+      const client = clockedClient(
+        [makeRun('running'), makeRun('running'), makeRun('passed')],
+        25_000,
+        reads,
+      );
+      const result = await pollRunUntilTerminal(client, RUN_ID, {
+        timeoutSeconds: 600,
+        sleep: clockSleep(sleepCalls),
+      });
+      expect(result.status).toBe('passed');
+      expect(sleepCalls).toEqual([]);
+      expect(reads).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('caps the number of reads against a server that ignores ?waitSeconds', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
+    try {
+      const reads: number[] = [];
+      // 1 ms per read: a fast round trip to a server that answers at once.
+      const client = clockedClient(() => makeRun('running'), 1, reads);
+      await expect(
+        pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 10, sleep: clockSleep([]) }),
+      ).rejects.toBeInstanceOf(TimeoutError);
+      // Before the fix this loop issued reads back-to-back for the whole
+      // --timeout (millions against an in-process mock, one per round trip
+      // against a real server): 10,000 reads here. Now: one read per interval.
+      expect(reads.length).toBeLessThanOrEqual(10_000 / LONG_POLL_MIN_INTERVAL_MS);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clamps the pacing sleep to the remaining --timeout', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
+    try {
+      const sleepCalls: number[] = [];
+      const client = clockedClient(() => makeRun('running'), 1, []);
+      await expect(
+        pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 1, sleep: clockSleep(sleepCalls) }),
+      ).rejects.toBeInstanceOf(TimeoutError);
+      // 1 ms spent on the read; the pacing wait is the 999 ms left, not 1999.
+      expect(sleepCalls).toEqual([999]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
