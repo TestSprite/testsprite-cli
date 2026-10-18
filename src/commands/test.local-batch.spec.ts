@@ -9,7 +9,7 @@ import { sanitizeTelemetryExtras, takeTelemetryExtras } from '../lib/telemetry.j
 import type { TunnelClientOptions } from '../vendor/tunnel-client/index.js';
 import { ErrCode } from '../vendor/tunnel-client/index.js';
 import type { RunResponse } from '../lib/runs.types.js';
-import { createTestCommand } from './test.js';
+import { createTestCommand, type CliLatestResult } from './test.js';
 
 type Call = {
   method: string;
@@ -186,6 +186,98 @@ function runningResponse(testId: string): Response {
   );
 }
 
+/** Model a local frontend and a public-environment backend with an unfinalized run row. */
+function mixedBackendFixture(
+  result: Partial<CliLatestResult> = {},
+  options: {
+    finalRunStatus?: 'passed' | 'failed';
+    terminalImmediately?: boolean;
+    resultUnavailable?: boolean;
+    remoteType?: 'frontend' | 'backend';
+  } = {},
+) {
+  let backendPolls = 0;
+  const json = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  return fixture(['fe', 'be'], {
+    sleep: options.finalRunStatus ? async () => {} : ms => new Promise(r => setTimeout(r, ms)),
+    onCall: async call => {
+      if (call.method === 'POST' && call.url.endsWith('/tests/be/runs'))
+        return json({
+          runId: 'run_be',
+          status: 'queued',
+          enqueuedAt: '2026-09-22T00:00:00.000Z',
+          codeVersion: 'v1',
+          targetUrl: 'https://example.com',
+        });
+      if (call.method !== 'GET') return undefined;
+      if (call.url.endsWith('/tests/be'))
+        return json({
+          id: 'be',
+          name: 'Backend checkout',
+          type: options.remoteType ?? 'backend',
+          projectId: 'R',
+        });
+      if (call.url.endsWith('/projects/R/env'))
+        return json({
+          environments: [
+            { name: 'default', url: 'https://example.com', isDefault: true, isTemporary: false },
+          ],
+        });
+      if (call.url.includes('/runs/run_be')) {
+        const run = (await runningResponse('be').json()) as RunResponse;
+        backendPolls++;
+        const status =
+          options.terminalImmediately || backendPolls > 1 ? options.finalRunStatus : undefined;
+        return json({
+          ...run,
+          projectId: 'R',
+          targetUrl: null,
+          ...(status
+            ? {
+                status,
+                finishedAt: '2026-09-22T00:00:02.000Z',
+                stepSummary: {
+                  total: 1,
+                  completed: 1,
+                  passedCount: status === 'passed' ? 1 : 0,
+                  failedCount: status === 'failed' ? 1 : 0,
+                },
+              }
+            : {}),
+        });
+      }
+      if (call.url.endsWith('/tests/be/result')) {
+        if (options.resultUnavailable)
+          return json(
+            { error: { code: 'NOT_FOUND', message: 'Not ready', nextAction: '', requestId: 'r1' } },
+            404,
+          );
+        return json({
+          testId: 'be',
+          status: 'passed',
+          startedAt: '2026-09-22T00:00:01.000Z',
+          finishedAt: '2026-09-22T00:00:02.000Z',
+          runIdIfAvailable: 'run_be',
+          snapshotId: 'snapshot_be',
+          codeVersion: 'v1',
+          targetUrl: null,
+          failedStepIndex: result.status === 'failed' ? 0 : null,
+          failureKind: result.status === 'failed' ? 'assertion' : null,
+          videoUrl: null,
+          failureAnalysisUrl: null,
+          verdict:
+            result.status === 'running' ? null : result.status === 'failed' ? 'failed' : 'passed',
+          executionStatus: result.status === 'running' ? 'running' : 'completed',
+          summary: result.status ?? 'passed',
+          ...result,
+        } satisfies CliLatestResult);
+      }
+      return undefined;
+    },
+  });
+}
+
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllEnvs();
@@ -193,6 +285,132 @@ afterEach(() => {
 });
 
 describe('test run local batch', () => {
+  describe('mixed backend verdict fallback', () => {
+    it.each([
+      { status: 'passed', borrowed: false },
+      { status: 'failed', borrowed: false },
+      { status: 'passed', borrowed: true },
+      { status: 'failed', borrowed: true },
+    ] as const)(
+      'resolves $status with borrowed=$borrowed and writes accurate reports',
+      async ({ status, borrowed }) => {
+        const f = mixedBackendFixture({ status });
+        const dir = mkdtempSync(join(tmpdir(), 'mixed-backend-report-'));
+        const summaryFile = join(dir, 'summary.json');
+        const reportFile = join(dir, 'report.xml');
+        const error = await f
+          .run(
+            'fe',
+            'be',
+            '--wait',
+            '--skip-preflight',
+            '--timeout',
+            '1',
+            '--summary-file',
+            summaryFile,
+            '--report',
+            'junit',
+            '--report-file',
+            reportFile,
+            ...(borrowed ? ['--tunnel-client', f.clientId] : []),
+          )
+          .then(() => undefined)
+          .catch(e => e);
+        if (status === 'passed') expect(error).toBeUndefined();
+        else expect(error).toMatchObject({ exitCode: 1 });
+        const payload = JSON.parse(f.stdout.join(''));
+        expect(payload.results).toEqual([
+          expect.objectContaining({ testId: 'fe', runId: 'run_fe', status: 'passed' }),
+          expect.objectContaining({
+            testId: 'be',
+            runId: 'run_be',
+            status,
+            testTitle: 'Backend checkout',
+            projectId: 'R',
+          }),
+        ]);
+        const summary = JSON.parse(readFileSync(summaryFile, 'utf8'));
+        expect(summary).toMatchObject({
+          total: 2,
+          passed: status === 'passed' ? 2 : 1,
+          failed: status === 'failed' ? 1 : 0,
+          timedOut: 0,
+        });
+        const xml = readFileSync(reportFile, 'utf8');
+        expect(xml).toContain('name="Backend checkout" testId="be" runId="run_be" time="1"');
+        expect(xml).not.toContain('type="timeout"');
+        if (status === 'failed') expect(xml).toContain('<failure message="failed" type="failed">');
+        expect(f.calls.filter(c => c.url.endsWith('/tests/be/result'))).toHaveLength(1);
+        expect(
+          f.calls.find(c => c.method === 'POST' && c.url.endsWith('/tests/be/runs'))?.body,
+        ).toEqual({ source: 'cli' });
+        expect(
+          f.calls.find(c => c.method === 'POST' && c.url.endsWith('/tests/fe/runs'))?.body,
+        ).toMatchObject({ tunnelClientId: f.clientId, targetUrl: f.targetUrl });
+        expect(f.calls.some(c => c.url.endsWith('/cancel'))).toBe(false);
+        expect(f.calls.filter(c => c.method === 'DELETE')).toHaveLength(borrowed ? 0 : 1);
+        expect(f.calls.filter(c => c.method === 'GET' && c.url.includes('/tunnel/'))).toHaveLength(
+          0,
+        );
+      },
+    );
+
+    it('resolves a legacy result with no run ID only when it is fresh enough', async () => {
+      const f = mixedBackendFixture({ runIdIfAvailable: null });
+      await f.run(
+        'be',
+        'fe',
+        '--skip-preflight',
+        '--timeout',
+        '1',
+        '--max-concurrency',
+        '1',
+        '--text-output',
+      );
+      expect(f.stdout.join('')).toContain('passed');
+      expect(f.stderr.join('\n')).toContain('2/2 passed');
+      expect(f.calls.filter(c => c.url.endsWith('/tests/be/result'))).toHaveLength(1);
+    });
+
+    it.each([
+      { runIdIfAvailable: 'run_other' },
+      { runIdIfAvailable: null, finishedAt: '2026-09-21T23:59:59.000Z' },
+      { status: 'running', finishedAt: null },
+    ] satisfies Array<Partial<CliLatestResult>>)(
+      'keeps polling instead of accepting unrelated or incomplete result %j',
+      async result => {
+        const f = mixedBackendFixture(result, { finalRunStatus: 'failed' });
+        await expect(f.run('fe', 'be', '--skip-preflight', '--timeout', '1')).rejects.toMatchObject(
+          { exitCode: 1 },
+        );
+        expect(JSON.parse(f.stdout.join('')).results[1]).toMatchObject({
+          testId: 'be',
+          runId: 'run_be',
+          status: 'failed',
+        });
+        expect(f.calls.filter(c => c.url.endsWith('/tests/be/result'))).toHaveLength(1);
+        expect(f.calls.filter(c => c.url.includes('/runs/run_be'))).toHaveLength(2);
+      },
+    );
+
+    it('keeps the run-row verdict when the result endpoint is unavailable', async () => {
+      const f = mixedBackendFixture({}, { finalRunStatus: 'passed', resultUnavailable: true });
+      await f.run('fe', 'be', '--skip-preflight', '--timeout', '1');
+      expect(JSON.parse(f.stdout.join('')).summary.passed).toBe(2);
+      expect(f.calls.filter(c => c.url.endsWith('/tests/be/result'))).toHaveLength(1);
+    });
+
+    it.each([
+      { finalRunStatus: 'passed', terminalImmediately: true },
+      { finalRunStatus: 'passed', remoteType: 'frontend' },
+    ] as const)('does not fetch an alternate result for the control %j', async options => {
+      const f = mixedBackendFixture({}, options);
+      await f.run('fe', 'be', '--skip-preflight', '--timeout', '1');
+      expect(JSON.parse(f.stdout.join('')).summary.passed).toBe(2);
+      expect(f.calls.filter(c => c.url.endsWith('/result'))).toHaveLength(0);
+    });
+  });
+
   it('keeps the paused-workspace envelope when every local trigger is refused', async () => {
     const f = fixture(['a', 'b'], {
       onCall: call =>

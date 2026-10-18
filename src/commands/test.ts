@@ -11250,6 +11250,7 @@ export async function runTestRunLocalBatch(
       )
         stderrFn(`idempotency-key: ${idempotencyBase}`);
 
+      /** Dispatch and poll one member within its own deadline, retaining per-run fallback state. */
       const runOne = async (index: number) => {
         const row = results[index]!;
         let triggerStartedAtMs: number;
@@ -11360,6 +11361,23 @@ export async function runTestRunLocalBatch(
           const startMs = triggerStartedAtMs;
           const remainingSeconds = (startMs + opts.timeoutSeconds * 1000 - Date.now()) / 1000;
           if (remainingSeconds <= 0) throw new TimeoutError(row.runId!, opts.timeoutSeconds);
+          // Public-environment backend members share this pool with local frontend
+          // runs, but their run rows may never finalize. Reuse the ordinary wait's
+          // correlated fallback without adding result probes to tunnel-bound runs.
+          const resolveBackendAlternate = targets.has(row.testId)
+            ? undefined
+            : makeBackendWaitFallback({
+                client,
+                resolveTestId: () => row.testId,
+                resolveNotBefore: () => response.enqueuedAt,
+              });
+          const resolveAlternate =
+            targets.has(row.testId) && checkBorrowedLiveness
+              ? async (_run: RunResponse, _elapsed: number, signal: AbortSignal) => {
+                  await checkBorrowedLiveness!(signal);
+                  return null;
+                }
+              : resolveBackendAlternate;
           const finalRun = await pollRunUntilTerminal(client, row.runId!, {
             timeoutSeconds: remainingSeconds,
             sleep: deps.sleep,
@@ -11373,14 +11391,7 @@ export async function runTestRunLocalBatch(
               }
               ticker.update(formatRunProgressLine(run, elapsedMs, `(${row.testId})`));
             },
-            ...(targets.has(row.testId) && checkBorrowedLiveness
-              ? {
-                  resolveAlternate: async (_run, _elapsed, signal) => {
-                    await checkBorrowedLiveness!(signal);
-                    return null;
-                  },
-                }
-              : {}),
+            resolveAlternate,
           });
           row.status = finalRun.status as LocalBatchResult['status'];
           unsettled.delete(row);
