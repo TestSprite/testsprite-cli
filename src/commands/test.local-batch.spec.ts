@@ -194,6 +194,7 @@ function mixedBackendFixture(
     terminalImmediately?: boolean;
     resultUnavailable?: boolean;
     remoteType?: 'frontend' | 'backend';
+    backendEnqueuedAt?: string;
   } = {},
 ) {
   let backendPolls = 0;
@@ -207,9 +208,17 @@ function mixedBackendFixture(
         return json({
           runId: 'run_be',
           status: 'queued',
-          enqueuedAt: '2026-09-22T00:00:00.000Z',
+          enqueuedAt: options.backendEnqueuedAt ?? '2026-09-22T00:00:00.000Z',
           codeVersion: 'v1',
           targetUrl: 'https://example.com',
+        });
+      if (call.method === 'POST' && call.url.endsWith('/tests/fe/runs'))
+        return json({
+          runId: 'run_fe',
+          status: 'queued',
+          enqueuedAt: '2026-09-22T00:00:01.000Z',
+          codeVersion: 'v1',
+          targetUrl: 'http://127.0.0.1:5173',
         });
       if (call.method !== 'GET') return undefined;
       if (call.url.endsWith('/tests/be'))
@@ -357,7 +366,11 @@ describe('test run local batch', () => {
     );
 
     it('resolves a legacy result with no run ID only when it is fresh enough', async () => {
-      const f = mixedBackendFixture({ runIdIfAvailable: null });
+      const f = mixedBackendFixture({
+        runIdIfAvailable: null,
+        startedAt: '2026-09-22T00:00:00.100Z',
+        finishedAt: '2026-09-22T00:00:00.500Z',
+      });
       await f.run(
         'be',
         'fe',
@@ -376,11 +389,32 @@ describe('test run local batch', () => {
     it.each([
       { runIdIfAvailable: 'run_other' },
       { runIdIfAvailable: null, finishedAt: '2026-09-21T23:59:59.000Z' },
+      { runIdIfAvailable: null, finishedAt: 'not-a-date' },
       { status: 'running', finishedAt: null },
     ] satisfies Array<Partial<CliLatestResult>>)(
       'keeps polling instead of accepting unrelated or incomplete result %j',
       async result => {
         const f = mixedBackendFixture(result, { finalRunStatus: 'failed' });
+        await expect(f.run('fe', 'be', '--skip-preflight', '--timeout', '1')).rejects.toMatchObject(
+          { exitCode: 1 },
+        );
+        expect(JSON.parse(f.stdout.join('')).results[1]).toMatchObject({
+          testId: 'be',
+          runId: 'run_be',
+          status: 'failed',
+        });
+        expect(f.calls.filter(c => c.url.endsWith('/tests/be/result'))).toHaveLength(1);
+        expect(f.calls.filter(c => c.url.includes('/runs/run_be'))).toHaveLength(2);
+      },
+    );
+
+    it.each(['not-a-date', ''])(
+      'keeps polling when the backend enqueue timestamp is invalid: %j',
+      async backendEnqueuedAt => {
+        const f = mixedBackendFixture(
+          { runIdIfAvailable: null },
+          { finalRunStatus: 'failed', backendEnqueuedAt },
+        );
         await expect(f.run('fe', 'be', '--skip-preflight', '--timeout', '1')).rejects.toMatchObject(
           { exitCode: 1 },
         );

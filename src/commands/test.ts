@@ -7219,7 +7219,8 @@ export function backendResultToRunResponse(
  * just-finished prior run could still be showing. Gate:
  *   - result names our runId         → accept (strongest signal);
  *   - result names a different runId → reject (a different run);
- *   - result has no runId (legacy)   → accept iff finishedAt >= notBefore.
+ *   - result has no runId (legacy)   → require a valid finishedAt, and when
+ *     notBefore is supplied, require a valid floor and finishedAt >= notBefore.
  */
 export function backendResultIsForThisRun(
   result: CliLatestResult,
@@ -7231,10 +7232,11 @@ export function backendResultIsForThisRun(
     return result.runIdIfAvailable === runId;
   }
   if (!result.finishedAt) return false;
-  if (!notBefore) return true;
   const finished = Date.parse(result.finishedAt);
+  if (Number.isNaN(finished)) return false;
+  if (notBefore === undefined) return true;
   const floor = Date.parse(notBefore);
-  if (Number.isNaN(finished) || Number.isNaN(floor)) return true;
+  if (Number.isNaN(floor)) return false;
   return finished >= floor;
 }
 
