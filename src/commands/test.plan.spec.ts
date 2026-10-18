@@ -697,6 +697,52 @@ describe('runPlanGenerate — failed stage', () => {
   });
 });
 
+describe.each(['initial', 'later'] as const)(
+  'runPlanGenerate — %s no-op followed by active generation',
+  position => {
+    it.each(['json', 'text'] as const)(
+      'waits for the final proposals in %s output',
+      async output => {
+        const active = (status: 'strategizing' | 'proposing'): CliGetPlansResponse => ({
+          generation: { status, errorCode: null, errorMessage: null },
+          proposals: [],
+        });
+        const noop = { body: { ...accepted(null, []), status: 'nothing_to_start' } };
+        const backend = makePlanBackend({
+          triggers:
+            position === 'initial' ? [noop] : [{ body: accepted('strategy', ['proposals']) }, noop],
+          reads: [
+            { body: stagedPlans([]) }, // best-effort pre-trigger baseline
+            ...(position === 'later'
+              ? [{ body: active('strategizing') }, { body: stagedPlans([]) }]
+              : []),
+            { body: active('proposing') },
+            { body: stagedPlans() },
+          ],
+        });
+        const capture: Capture = { stdout: [], stderr: [] };
+        await runPlanGenerate(baseOpts({ output }), makeDeps(backend.fetchImpl, capture) as never);
+        const stdout = capture.stdout.join('\n');
+        if (output === 'json') {
+          expect(JSON.parse(stdout)).toMatchObject({
+            generation: { status: 'idle' },
+            proposals: STAGED,
+          });
+        } else {
+          expect(stdout).toContain('3 test-case proposals staged');
+          expect(stdout).not.toContain('0 test-case proposals staged');
+        }
+        expect(backend.calls.filter(call => call.method === 'POST')).toHaveLength(
+          position === 'initial' ? 1 : 2,
+        );
+        expect(backend.calls.filter(call => call.method === 'GET')).toHaveLength(
+          position === 'initial' ? 3 : 5,
+        );
+      },
+    );
+  },
+);
+
 describe('runPlanGenerate — typed exit-7 timeout conversion', () => {
   it('converts the raw ladder timeout into the UNSUPPORTED envelope (exit 7, NOT 1) with a partial on stdout', async () => {
     const backend = makePlanBackend({

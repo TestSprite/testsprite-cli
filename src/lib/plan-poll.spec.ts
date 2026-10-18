@@ -336,6 +336,106 @@ describe('runGenerationLadder — stage progression', () => {
 // Billing guards
 // ---------------------------------------------------------------------------
 
+describe.each(['initial', 'later'] as const)(
+  'runGenerationLadder — %s nothing_to_start observation',
+  position => {
+    /** Prefix a script with a completed strategy when testing the later POST. */
+    function clientAfterNoop(reads: Array<CliGetPlansResponse | ApiError>) {
+      return makeClient(
+        position === 'initial'
+          ? [nothingToStart()]
+          : [accepted('strategy', ['proposals']), nothingToStart()],
+        position === 'initial' ? reads : [plansRead('strategizing'), plansRead('idle'), ...reads],
+      );
+    }
+
+    const expectedPosts = position === 'initial' ? 1 : 2;
+    const prefixReads = position === 'initial' ? 0 : 2;
+
+    it.each(['exploring', 'strategizing', 'proposing'] as const)(
+      'waits for staged plans after the next read reports %s',
+      async status => {
+        const client = clientAfterNoop([plansRead(status), plansRead('idle', STAGED)]);
+        const result = await ladder(client);
+        expect(result.plans.generation.status).toBe('idle');
+        expect(result.plans.proposals).toEqual(STAGED);
+        expect(client.readCount).toBe(prefixReads + 2);
+        expect(client.triggerCount).toBe(expectedPosts);
+      },
+    );
+
+    it('keeps polling an idle visibility gap after observing proposals run', async () => {
+      const client = clientAfterNoop([
+        plansRead('proposing'),
+        plansRead('idle'),
+        plansRead('idle'),
+        plansRead('idle', STAGED),
+      ]);
+      const result = await ladder(client);
+      expect(result.plans.proposals).toEqual(STAGED);
+      expect(client.readCount).toBe(prefixReads + 4);
+      expect(client.triggerCount).toBe(expectedPosts);
+    });
+
+    it('preserves an immediate empty-idle read when another client accepted the batch', async () => {
+      const client = clientAfterNoop([plansRead('idle')]);
+      const result = await ladder(client);
+      expect(result.plans.proposals).toEqual([]);
+      expect(client.readCount).toBe(prefixReads + 1);
+      expect(client.triggerCount).toBe(expectedPosts);
+    });
+
+    it('returns a later failed state instead of the earlier active observation', async () => {
+      const client = clientAfterNoop([
+        plansRead('proposing'),
+        plansRead('failed', [], { errorCode: 'proposal_generation_aborted' }),
+      ]);
+      const result = await ladder(client);
+      expect(result.plans.generation.status).toBe('failed');
+      expect(client.triggerCount).toBe(expectedPosts);
+    });
+
+    it('retains the active observation when the shared deadline expires', async () => {
+      const client = clientAfterNoop([plansRead('proposing')]);
+      const realDateNow = Date.now;
+      let now = realDateNow();
+      Date.now = () => now;
+      try {
+        await expect(
+          ladder(client, {
+            timeoutSeconds: 1,
+            onTick: () => {
+              if (client.triggerCount === expectedPosts) now += 1001;
+            },
+          }),
+        ).rejects.toMatchObject({
+          name: 'PlanGenerationTimeoutError',
+          lastPlans: { generation: { status: 'proposing' } },
+        });
+        expect(client.triggerCount).toBe(expectedPosts);
+      } finally {
+        Date.now = realDateNow;
+      }
+    });
+  },
+);
+
+it('starts the remaining stage after a no-op read observes a new strategy run finish', async () => {
+  const client = makeClient(
+    [nothingToStart(), accepted('proposals', [])],
+    [
+      plansRead('strategizing'),
+      plansRead('idle'),
+      plansRead('proposing'),
+      plansRead('idle', STAGED),
+    ],
+  );
+  const result = await ladder(client);
+  expect(result.plans.proposals).toEqual(STAGED);
+  expect(client.triggerCount).toBe(2);
+  expect(client.triggerKeys).toEqual([IDEMPOTENCY_KEY, IDEMPOTENCY_KEY + ':post2']);
+});
+
 describe('runGenerationLadder — billing guards', () => {
   it('NEVER re-POSTs after the proposals rung (stagesRemaining: [])', async () => {
     // The append listener sets its in-flight flags asynchronously: reads can

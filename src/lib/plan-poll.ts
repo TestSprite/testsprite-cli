@@ -183,8 +183,6 @@ export const MAX_ACCEPTED_TRIGGER_POSTS = PLAN_GENERATION_STAGES.length;
  */
 export const MAX_TRIGGER_POSTS_TOTAL = PLAN_GENERATION_STAGES.length * 2;
 
-type TriggerOutcome = 'accepted' | 'nothing_to_start' | 'attached';
-
 /**
  * Drive the generate ladder to a settled state: trigger the next missing
  * stage, poll, re-trigger between stages, and return the settled plans read.
@@ -273,6 +271,10 @@ async function ladderLoop(
     skippedCategories: null as number | null,
     expectedRemaining: null as CliGenerationStage[] | null,
     proposalsObserved: false,
+    // A no-op can settle on its next idle read (even if another client has
+    // accepted the batch). Observing active generation revokes this shortcut:
+    // the new generation must follow the normal wait and billing guards.
+    noopSettlesIdle: false,
     observedActiveSinceTrigger: false,
     consecutiveIdleGaps: 0,
   };
@@ -302,7 +304,7 @@ async function ladderLoop(
     }
   };
 
-  const doTrigger = async (): Promise<TriggerOutcome> => {
+  const doTrigger = async (): Promise<void> => {
     // Fresh idempotency namespace per POST attempt — ATTACHES INCLUDED: a
     // 409's key is never committed server-side, but reusing it would
     // silently depend on that; a fresh key never can. Transport-level
@@ -317,8 +319,12 @@ async function ladderLoop(
       );
       state.triggerPosts += 1;
       if (response.status === 'nothing_to_start') {
+        state.noopSettlesIdle = true;
+        state.expectedRemaining = null;
+        state.observedActiveSinceTrigger = false;
+        state.consecutiveIdleGaps = 0;
         options.onTrigger?.(response, state.acceptedPosts);
-        return 'nothing_to_start';
+        return;
       }
       state.acceptedPosts += 1;
       if (state.firstTrigger === null) state.firstTrigger = response;
@@ -329,7 +335,7 @@ async function ladderLoop(
       state.observedActiveSinceTrigger = false;
       state.consecutiveIdleGaps = 0;
       options.onTrigger?.(response, state.acceptedPosts);
-      return 'accepted';
+      return;
     } catch (err) {
       if (
         err instanceof ApiError &&
@@ -345,7 +351,7 @@ async function ladderLoop(
         state.expectedRemaining = null;
         state.observedActiveSinceTrigger = false;
         state.consecutiveIdleGaps = 0;
-        return 'attached';
+        return;
       }
       throw err;
     }
@@ -384,19 +390,7 @@ async function ladderLoop(
 
   try {
     // ── initial trigger ──
-    const initial = await doTrigger();
-    if (initial === 'nothing_to_start') {
-      // Proposals already staged — one bounded read, render, done.
-      const plans = await readPlans();
-      lastPlans = plans;
-      options.onTick?.(plans, Date.now() - startMs);
-      return {
-        plans,
-        firstTrigger: state.firstTrigger,
-        acceptedPosts: state.acceptedPosts,
-        skippedCategories: state.skippedCategories,
-      };
-    }
+    await doTrigger();
 
     // ── poll / re-trigger loop ──
     while (true) {
@@ -416,6 +410,7 @@ async function ladderLoop(
         };
       }
       if (isActiveGenerationStatus(status)) {
+        state.noopSettlesIdle = false;
         state.observedActiveSinceTrigger = true;
         // Seeing the proposals stage RUN arms billing guard #1 regardless of
         // who started it — the 409-attach path has no trigger response to
@@ -429,8 +424,9 @@ async function ladderLoop(
       }
 
       // status === 'idle'
-      if (plans.proposals.length > 0) {
-        // Staged batch present — success.
+      if (plans.proposals.length > 0 || state.noopSettlesIdle) {
+        // Staged batch present, or an idle read confirms the no-op. A batch
+        // accepted by another client may be empty; do not regenerate it.
         return {
           plans,
           firstTrigger: state.firstTrigger,
@@ -499,21 +495,9 @@ async function ladderLoop(
         });
       }
 
-      const outcome = await doTrigger();
-      if (outcome === 'nothing_to_start') {
-        // Proposals got staged between our read and the POST (or another
-        // client staged them) — settle on a final read.
-        const finalPlans = await readPlans();
-        lastPlans = finalPlans;
-        options.onTick?.(finalPlans, Date.now() - startMs);
-        return {
-          plans: finalPlans,
-          firstTrigger: state.firstTrigger,
-          acceptedPosts: state.acceptedPosts,
-          skippedCategories: state.skippedCategories,
-        };
-      }
-      // 'accepted' or 'attached' → back to polling.
+      await doTrigger();
+      // Every trigger outcome is checked against the next observed state:
+      // another client may have accepted and regenerated a staged batch.
     }
   } finally {
     clearTimeout(deadlineTimer);
