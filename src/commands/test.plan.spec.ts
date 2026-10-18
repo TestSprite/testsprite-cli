@@ -366,7 +366,8 @@ describe('runPlanGenerate — happy path', () => {
 
   it('the note still prints when zero proposals were staged, worded for nothing staged', () => {
     // Renderer-level: the ladder never settles on idle+empty after the
-    // proposals rung (it polls to staged/failed/timeout), so this branch is
+    // proposals rung (it polls to staged/failed/timeout). The immediate no-op
+    // post-accept exception is covered separately below, so this branch is
     // pinned directly. The skip count matters most here — it points at the
     // strategy rather than inviting a re-run that bills again.
     const text = renderPlanGenerateResultText(stagedPlans([]), PROJECT_ID, 2, 2);
