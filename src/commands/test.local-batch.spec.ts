@@ -18,6 +18,10 @@ type Call = {
   idempotencyKey?: string | null;
 };
 
+/**
+ * Build an offline batch-run CLI fixture with injectable HTTP, tunnel, and timer
+ * behavior, exposing the command runner, captured requests and output, and test IDs.
+ */
 function fixture(
   ids: string[],
   options: {
