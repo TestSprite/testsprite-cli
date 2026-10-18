@@ -207,6 +207,10 @@ function mixedBackendFixture(
     new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
   return fixture(['fe', 'be'], {
     sleep: options.finalRunStatus ? async () => {} : ms => new Promise(r => setTimeout(r, ms)),
+    /**
+     * Override trigger, run, and result responses for the mixed-backend scenario.
+     * Return undefined for requests that should use the base fixture's responses.
+     */
     onCall: async call => {
       if (call.method === 'POST' && call.url.endsWith('/tests/be/runs'))
         return json({
