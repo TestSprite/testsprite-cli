@@ -212,6 +212,16 @@ export async function runGenerationLadder(
   }
 }
 
+/**
+ * Run the generation state machine within one deadline and request-signal
+ * scope. Every trigger outcome is checked against subsequent reads: active
+ * generation keeps polling, while an idle read may settle a no-op response.
+ * Re-trigger only between stages, preserving the proposals billing guards.
+ *
+ * @returns The settled plans read and metadata from accepted triggers.
+ * @throws `PlanGenerationTimeoutError` with the last read when time expires.
+ * @throws Interrupt and API errors after releasing the session's resources.
+ */
 async function ladderLoop(
   client: PlanLadderClient,
   projectId: string,
@@ -304,6 +314,11 @@ async function ladderLoop(
     }
   };
 
+  /**
+   * Attempt the next stage with a fresh POST key, updating counters and
+   * polling guards for accepted, no-op, or in-flight outcomes. The caller
+   * must read the current state afterward; no trigger outcome settles it.
+   */
   const doTrigger = async (): Promise<void> => {
     // Fresh idempotency namespace per POST attempt — ATTACHES INCLUDED: a
     // 409's key is never committed server-side, but reusing it would
