@@ -11371,6 +11371,12 @@ export async function runTestRunLocalBatch(
                 resolveTestId: () => row.testId,
                 resolveNotBefore: () => response.enqueuedAt,
               });
+          /**
+           * Select this member's polling fallback. Borrowed frontend tunnels only
+           * check owner liveness and return null so normal run polling continues;
+           * remote members may return a correlated terminal backend result. Both
+           * callbacks use the poller's abort signal and remaining deadline.
+           */
           const resolveAlternate =
             targets.has(row.testId) && checkBorrowedLiveness
               ? async (_run: RunResponse, _elapsed: number, signal: AbortSignal) => {
