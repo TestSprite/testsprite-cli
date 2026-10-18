@@ -197,6 +197,7 @@ function mixedBackendFixture(
   } = {},
 ) {
   let backendPolls = 0;
+  /** Return API-shaped JSON so the fixture exercises the client's response decoding. */
   const json = (body: unknown, status = 200) =>
     new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
   return fixture(['fe', 'be'], {
