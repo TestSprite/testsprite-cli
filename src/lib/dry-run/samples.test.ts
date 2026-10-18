@@ -13,7 +13,8 @@ describe('sampleJUnitReportXml', () => {
     const xml = sampleJUnitReportXml('proj_dry');
     expect(xml).toContain('<?xml version="1.0" encoding="UTF-8"?>');
     expect(xml).toContain('<testsuite name="testsprite:proj_dry"');
-    expect(xml).toContain('classname="proj_dry"');
+    expect(xml).toContain('classname="proj_dry:test_fresh_wave_01"');
+    expect(xml).toContain('classname="proj_dry:test_fresh_wave_02"');
     expect(xml).toContain('name="test_fresh_wave_01"');
     expect(xml).toContain('name="test_fresh_wave_02"');
     expect(xml).toContain('failures="1"');

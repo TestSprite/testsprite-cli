@@ -58,6 +58,7 @@ function formatTime(seconds: number | undefined): string {
 
 export interface JUnitReportBuildOptions {
   suiteName: string;
+  /** Report scope; each testcase appends its stable testId to this classname. */
   classname: string;
   results: readonly JUnitTestResult[];
 }
@@ -161,13 +162,17 @@ function failureMessage(result: JUnitTestResult): string {
   return result.status;
 }
 
+/**
+ * Render a testcase with a readable name and a stable, per-test classname.
+ * Standard JUnit consumers ignore custom testId/runId attributes when deduplicating.
+ */
 function renderTestcase(result: JUnitTestResult, classname: string): string {
   const outcome = classifyJUnitOutcome(result.status, result.error);
-  // A readable CI test tab keys on `name`: prefer the human test name, fall back
-  // to the id. The UUID is preserved as a `testId` attribute (ignored by
-  // renderers, read by machine consumers) so the switch loses no information.
+  // Distinct tests can share a human name. Include the stable testId in the
+  // standard classname too, even when this report contains no duplicate names,
+  // so retries, reordered results, and subsets retain the same CI identity.
   const name = escapeXml(result.name?.trim() || result.testId);
-  const cls = escapeXml(classname);
+  const cls = escapeXml(`${classname}:${result.testId}`);
   const time = formatTime(result.durationSeconds);
   const idAttr = ` testId="${escapeXml(result.testId)}"`;
   const runAttr = result.runId ? ` runId="${escapeXml(result.runId)}"` : '';

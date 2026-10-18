@@ -198,10 +198,51 @@ describe('buildJUnitReport', () => {
     });
     // A CI test tab shows "Login flow works", not the UUID — the id stays as an attr.
     expect(xml).toContain(
-      '<testcase classname="proj_1" name="Login flow works" testId="test_a" runId="run_a" time="12.5">',
+      '<testcase classname="proj_1:test_a" name="Login flow works" testId="test_a" runId="run_a" time="12.5">',
     );
     // testsuite time is the sum of testcase durations (was always 0 before).
     expect(xml).toContain('skipped="0" time="12.5">');
+  });
+
+  it.each(['passed', 'failed', 'error', 'skipped'])(
+    'keeps same-name %s tests distinct using standard JUnit attributes',
+    status => {
+      const xml = buildJUnitReport({
+        suiteName: 'List',
+        classname: 'testlist:list_1',
+        results: ['test_a', 'test_b'].map(testId =>
+          makeResult({ testId, name: 'Checkout', status, runId: `run_${testId}` }),
+        ),
+      });
+      // CI consumers may ignore the custom testId/runId attributes entirely.
+      const identities = [...xml.matchAll(/<testcase classname="([^"]*)" name="([^"]*)"/g)].map(
+        match => [match[1], match[2]],
+      );
+      expect(identities).toHaveLength(2);
+      expect(new Set(identities.map(identity => JSON.stringify(identity))).size).toBe(2);
+      expect(identities.map(([, name]) => name)).toEqual(['Checkout', 'Checkout']);
+    },
+  );
+
+  it('keeps each standard identity stable across reruns, reordering, and list subsets', () => {
+    const results = ['test_a', 'test_b'].map(testId =>
+      makeResult({ testId, name: 'Checkout', runId: `first_${testId}` }),
+    );
+    const reports = [results, [...results].reverse(), [results[0]!]].map(rows =>
+      buildJUnitReport({ suiteName: 'List', classname: 'testlist:list_1', results: rows }),
+    );
+    reports.push(
+      buildJUnitReport({
+        suiteName: 'List',
+        classname: 'testlist:list_1',
+        results: results.map(row => ({ ...row, runId: `retry_${row.testId}`, status: 'failed' })),
+      }),
+    );
+    for (const xml of reports) {
+      expect(xml).toContain('classname="testlist:list_1:test_a" name="Checkout"');
+    }
+    expect(reports[1]).toContain('classname="testlist:list_1:test_b" name="Checkout"');
+    expect(reports[3]).toContain('classname="testlist:list_1:test_b" name="Checkout"');
   });
 
   it('falls back to time="0" when the run carries no timing', () => {
@@ -322,7 +363,7 @@ describe('buildJUnitReport', () => {
       ],
     });
     expect(xml).toContain('name="test&lt;1&gt;"');
-    expect(xml).toContain('classname="proj&lt;&amp;&gt;"');
+    expect(xml).toContain('classname="proj&lt;&amp;&gt;:test&lt;1&gt;"');
     expect(xml).toContain('message="expected &lt;true&gt; &amp; &quot;ok&quot;"');
   });
 
