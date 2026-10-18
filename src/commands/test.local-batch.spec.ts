@@ -160,6 +160,10 @@ function fixture(
   return { ids, calls, stdout, stderr, terminal, clientId, targetUrl, run };
 }
 
+/**
+ * Return a running response for testId with no finish time and an incomplete
+ * step, so polling fixtures can control when a terminal verdict becomes available.
+ */
 function runningResponse(testId: string): Response {
   return new Response(
     JSON.stringify({
