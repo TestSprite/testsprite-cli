@@ -119,6 +119,72 @@ describe('redactDeep', () => {
     });
   });
 
+  it('redacts string arrays under secret keys', () => {
+    const input = {
+      cookies: ['session=123', 'auth=456'],
+      tokens: ['tok_1', 'tok_2'],
+      secrets: ['s_alpha', 's_beta'],
+      nestedList: [['nested_secret']],
+    };
+    expect(redactDeep(input)).toEqual({
+      cookies: [REDACTED, REDACTED],
+      tokens: [REDACTED, REDACTED],
+      secrets: [REDACTED, REDACTED],
+      nestedList: [['nested_secret']],
+    });
+  });
+
+  it('redacts plural and hyphenated secret key variants', () => {
+    const input = {
+      cookies: 'c_val',
+      'set-cookies': ['c_1', 'c_2'],
+      passwords: ['p1', 'p2'],
+      secrets: 's_val',
+      tokens: 't_val',
+      apikeys: 'k_val',
+      'api-keys': ['k_1', 'k_2'],
+      accessTokens: ['at_1'],
+    };
+    expect(redactDeep(input)).toEqual({
+      cookies: REDACTED,
+      'set-cookies': [REDACTED, REDACTED],
+      passwords: [REDACTED, REDACTED],
+      secrets: REDACTED,
+      tokens: REDACTED,
+      apikeys: REDACTED,
+      'api-keys': [REDACTED, REDACTED],
+      accessTokens: [REDACTED],
+    });
+  });
+
+  it('redacts secrets on objects with a null prototype', () => {
+    const nullProto = Object.assign(Object.create(null), {
+      password: 'hunter2',
+      nested: Object.assign(Object.create(null), { apiKey: 'sk-secret' }),
+      publicData: 'hello',
+    });
+    expect(redactDeep(nullProto)).toEqual({
+      password: REDACTED,
+      nested: { apiKey: REDACTED },
+      publicData: 'hello',
+    });
+  });
+
+  it('preserves non-secret sibling fields in object arrays under secret keys', () => {
+    const input = {
+      credentials: [
+        { username: 'alice', password: 'pw1' },
+        { username: 'bob', password: 'pw2' },
+      ],
+    };
+    expect(redactDeep(input)).toEqual({
+      credentials: [
+        { username: 'alice', password: REDACTED },
+        { username: 'bob', password: REDACTED },
+      ],
+    });
+  });
+
   it('never mutates the input', () => {
     const input = { password: 'hunter2' };
     redactDeep(input);

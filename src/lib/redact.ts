@@ -48,10 +48,14 @@ export const REDACTED = '[REDACTED]';
  */
 const SECRET_KEY_SUFFIXES = [
   'password',
+  'passwords',
   'secret',
+  'secrets',
   'apikey',
+  'apikeys',
   'authorization',
   'cookie',
+  'cookies',
   'credential',
   'credentials',
 ];
@@ -67,13 +71,21 @@ const SECRET_KEY_SUFFIXES = [
  */
 const SECRET_TOKEN_KEYS = new Set([
   'token',
+  'tokens',
   'apitoken',
+  'apitokens',
   'authtoken',
+  'authtokens',
   'accesstoken',
+  'accesstokens',
   'refreshtoken',
+  'refreshtokens',
   'bearertoken',
+  'bearertokens',
   'idtoken',
+  'idtokens',
   'sessiontoken',
+  'sessiontokens',
 ]);
 
 /** Lowercase and strip every non-alphanumeric character for key matching. */
@@ -85,6 +97,14 @@ function isSecretKey(key: string): boolean {
   const normalized = normalizeKey(key);
   if (SECRET_TOKEN_KEYS.has(normalized)) return true;
   return SECRET_KEY_SUFFIXES.some(suffix => normalized.endsWith(suffix));
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
 /**
@@ -115,9 +135,28 @@ function redactSecretLookingSubstrings(value: string): string {
 }
 
 /**
+ * Recursively mask values residing directly or within arrays under a matched secret key.
+ * String leaves become {@link REDACTED}; nested arrays are walked to mask their string
+ * elements; objects are processed via {@link redactDeep} so that non-secret sibling
+ * fields (e.g. `username` in a credentials object) are preserved.
+ */
+function redactSecretValue(val: unknown): unknown {
+  if (typeof val === 'string') {
+    return REDACTED;
+  }
+  if (Array.isArray(val)) {
+    return val.map(item => redactSecretValue(item));
+  }
+  if (isPlainObject(val)) {
+    return redactDeep(val);
+  }
+  return val;
+}
+
+/**
  * Deep-walk `value`, replacing:
- *  - the string value of any object key matching {@link isSecretKey}, at any
- *    depth, arrays included, with {@link REDACTED};
+ *  - string values (and arrays of string values) of any object key matching
+ *    {@link isSecretKey}, at any depth, with {@link REDACTED};
  *  - a `Bearer <token>` substring inside any other string, wherever it
  *    appears (key name irrelevant).
  *
@@ -132,14 +171,14 @@ export function redactDeep<T>(value: T): T {
   if (typeof value === 'string') {
     return redactSecretLookingSubstrings(value) as unknown as T;
   }
-  if (value !== null && typeof value === 'object' && value.constructor === Object) {
+  if (isPlainObject(value)) {
     const result: Record<string, unknown> = {};
-    for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
-      if (VERBATIM_KEYS.has(key) && v !== null && typeof v === 'object' && !Array.isArray(v)) {
+    for (const [key, v] of Object.entries(value)) {
+      if (VERBATIM_KEYS.has(key) && isPlainObject(v)) {
         result[key] = v;
         continue;
       }
-      result[key] = isSecretKey(key) && typeof v === 'string' ? REDACTED : redactDeep(v);
+      result[key] = isSecretKey(key) ? redactSecretValue(v) : redactDeep(v);
     }
     return result as unknown as T;
   }
