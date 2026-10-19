@@ -58,7 +58,7 @@ function formatTime(seconds: number | undefined): string {
 
 export interface JUnitReportBuildOptions {
   suiteName: string;
-  /** Report scope; each testcase appends its stable testId to this classname. */
+  /** Report scope; each testcase appends its delimiter-escaped stable testId. */
   classname: string;
   results: readonly JUnitTestResult[];
 }
@@ -165,6 +165,8 @@ function failureMessage(result: JUnitTestResult): string {
 /**
  * Render a testcase with a readable name and a stable, per-test classname.
  * Standard JUnit consumers ignore custom testId/runId attributes when deduplicating.
+ * Escape percent signs and colons in the ID so the final colon separates it
+ * unambiguously from the scope; preserve the original ID in its custom attribute.
  */
 function renderTestcase(result: JUnitTestResult, classname: string): string {
   const outcome = classifyJUnitOutcome(result.status, result.error);
@@ -172,7 +174,8 @@ function renderTestcase(result: JUnitTestResult, classname: string): string {
   // standard classname too, even when this report contains no duplicate names,
   // so retries, reordered results, and subsets retain the same CI identity.
   const name = escapeXml(result.name?.trim() || result.testId);
-  const cls = escapeXml(`${classname}:${result.testId}`);
+  const identityId = result.testId.replace(/%/g, '%25').replace(/:/g, '%3A');
+  const cls = escapeXml(`${classname}:${identityId}`);
   const time = formatTime(result.durationSeconds);
   const idAttr = ` testId="${escapeXml(result.testId)}"`;
   const runAttr = result.runId ? ` runId="${escapeXml(result.runId)}"` : '';

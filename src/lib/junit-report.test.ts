@@ -49,6 +49,10 @@ describe('durationSecondsBetween', () => {
   });
 });
 
+/**
+ * Create a passed testcase fixture, retaining the caller's ID and any overrides
+ * for status, run metadata, timing, and diagnostics used by report assertions.
+ */
 function makeResult(overrides: Partial<JUnitTestResult> & { testId: string }): JUnitTestResult {
   return {
     status: 'passed',
@@ -224,8 +228,51 @@ describe('buildJUnitReport', () => {
     },
   );
 
-  it('keeps each standard identity stable across reruns, reordering, and list subsets', () => {
-    const results = ['test_a', 'test_b'].map(testId =>
+  it.each(['proj', 'testlist:list'])(
+    'keeps scope and test ID boundaries unambiguous for %s reports',
+    scope => {
+      const reports = [
+        { classname: scope, testId: 'b:c' },
+        { classname: `${scope}:b`, testId: 'c' },
+      ].map(({ classname, testId }, index) =>
+        buildJUnitReport({
+          suiteName: 'Combined CI job',
+          classname,
+          results: [
+            makeResult({ testId, name: 'Checkout', status: 'failed', runId: `run_${index}` }),
+          ],
+        }),
+      );
+      const identities = reports.map(xml =>
+        xml.match(/<testcase classname="([^"]*)" name="([^"]*)"/)!.slice(1),
+      );
+      expect(new Set(identities.map(identity => JSON.stringify(identity))).size).toBe(2);
+      expect(identities.map(([, name]) => name)).toEqual(['Checkout', 'Checkout']);
+      expect(reports[0]).toContain('testId="b:c" runId="run_0"');
+      expect(reports[1]).toContain('testId="c" runId="run_1"');
+      for (const xml of reports) expect(xml).toContain('tests="1" failures="1"');
+    },
+  );
+
+  it('keeps literal escape sequences distinct from test ID delimiters', () => {
+    const xml = buildJUnitReport({
+      suiteName: 'List',
+      classname: 'testlist:list',
+      results: ['b:c', 'b%3Ac', 'b%253Ac'].map(testId => makeResult({ testId, name: 'Checkout' })),
+    });
+    const identities = [...xml.matchAll(/<testcase classname="([^"]*)" name="([^"]*)"/g)].map(
+      match => [match[1], match[2]],
+    );
+    expect(identities).toHaveLength(3);
+    expect(new Set(identities.map(identity => JSON.stringify(identity))).size).toBe(3);
+  });
+
+  it.each([
+    ['test_a', 'test_a'],
+    ['test:a', 'test%3Aa'],
+    ['test%3Aa', 'test%253Aa'],
+  ])('keeps %s stable across reruns, reordering, and list subsets', (testId, identityId) => {
+    const results = [testId, 'test_b'].map(testId =>
       makeResult({ testId, name: 'Checkout', runId: `first_${testId}` }),
     );
     const reports = [results, [...results].reverse(), [results[0]!]].map(rows =>
@@ -239,7 +286,7 @@ describe('buildJUnitReport', () => {
       }),
     );
     for (const xml of reports) {
-      expect(xml).toContain('classname="testlist:list_1:test_a" name="Checkout"');
+      expect(xml).toContain(`classname="testlist:list_1:${identityId}" name="Checkout"`);
     }
     expect(reports[1]).toContain('classname="testlist:list_1:test_b" name="Checkout"');
     expect(reports[3]).toContain('classname="testlist:list_1:test_b" name="Checkout"');

@@ -1328,7 +1328,7 @@ testsprite test run --all --project proj_xxxxxxxx --wait \
 
 Then archive the sidecar with your platform's test-report step (e.g. CircleCI `store_test_results: { path: . }`, GitLab `artifacts: { reports: { junit: testsprite-junit.xml } }`).
 
-JUnit testcases keep the human-readable test name (falling back to `testId`). Their `classname` is `<projectId>:<testId>` for project batches or `testlist:<listId>:<testId>` for test lists. The stable test ID prevents CI consumers from merging distinct tests with the same name, and stays the same across reruns and list subsets within the same scope. The custom `testId` and `runId` attributes remain available. Reports previously used only the scope as `classname`; CI history may therefore treat the first report with the new classname as a new test identity.
+JUnit testcases keep the human-readable test name (falling back to `testId`). Their `classname` is `<projectId>:<escapedTestId>` for project batches or `testlist:<listId>:<escapedTestId>` for test lists. In the test ID component, `%` becomes `%25` and `:` becomes `%3A`, so IDs containing a colon cannot collide with a different scope/ID split; ordinary IDs remain unchanged. The stable test ID prevents CI consumers from merging distinct tests with the same name, and stays the same across reruns and list subsets within the same scope. The custom `testId` and `runId` attributes remain available with their original values. Reports previously used only the scope as `classname`; CI history may therefore treat the first report with the new classname as a new test identity.
 
 ### Full frontend coverage: use a test list
 
