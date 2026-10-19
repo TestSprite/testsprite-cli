@@ -50,7 +50,10 @@ export function durationSecondsBetween(
   return seconds >= 0 ? seconds : undefined;
 }
 
-/** Format a duration for the JUnit `time` attribute (3 dp; absent → `0`). */
+/**
+ * Format a duration for testcase and suite time attributes, rounded to three
+ * decimal places; missing or NaN durations render as zero.
+ */
 function formatTime(seconds: number | undefined): string {
   if (seconds === undefined || Number.isNaN(seconds)) return '0';
   return (Math.round(seconds * 1000) / 1000).toString();
@@ -149,6 +152,10 @@ export function escapeXml(text: string): string {
 
 type JUnitOutcome = 'passed' | 'failure' | 'error' | 'skipped';
 
+/**
+ * Map run statuses to JUnit outcomes: undispatched rows are skipped, execution
+ * or authentication errors are errors, and other non-passing rows are failures.
+ */
 function classifyJUnitOutcome(status: string, error?: JUnitTestResult['error']): JUnitOutcome {
   if (status === 'passed') return 'passed';
   if (isNonDispatchedStatus(status)) return 'skipped';
