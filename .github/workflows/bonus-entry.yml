@@ -180,6 +180,12 @@ jobs:
                 + `- ${issueLine}\n- ${draftLine}\n- ${discordStatus}\n\n`
                 + 'Rewards go to merged PRs judged a genuine improvement, and up to three bonus-eligible PRs count per person. '
                 + `Untick the box to withdraw the entry. This comment refreshes when you edit the PR. [Full rules](${rulesUrl}).`;
+            } else if (previous === 'entered' || previous === 'withdrawn') {
+              // Before the near-miss check: an entrant who unticks usually still
+              // has a Discord username filled in, which would read as a near miss.
+              state = 'withdrawn';
+              text = `This PR is no longer entered for the Season 4 CLI Improvement Bonus (the entry box is unticked). `
+                + `Tick it again before **${close}** to re-enter.`;
             } else if (looksLikeEntry) {
               state = 'maybe';
               text = `Hi @${author}, this looks like it might be a Season 4 CLI Improvement Bonus entry, but the entry box in the description isn't ticked. `
@@ -188,10 +194,6 @@ jobs:
                 + '- [x] I\'m entering this PR for the Season 4 CLI Improvement Bonus\n\n'
                 + 'Discord username: your-username\n```\n\n'
                 + `If this PR isn't an entry, you can ignore this comment. [Full rules](${rulesUrl}).`;
-            } else if (previous === 'entered') {
-              state = 'withdrawn';
-              text = `This PR is no longer entered for the Season 4 CLI Improvement Bonus (the entry box is unticked). `
-                + `Tick it again before **${close}** to re-enter.`;
             } else {
               state = 'none';
             }

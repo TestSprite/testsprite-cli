@@ -349,3 +349,21 @@ test('a PR closed before its queued run gets no writes', async () => {
   const h = await runPr({ state: 'closed' });
   assert.deepEqual(h.calls, []);
 });
+
+test('unticking keeps the withdrawal even when the PR still looks like an entry', async () => {
+  const first = await runPr();
+  const entered = botComment(first.of('createComment')[0].body);
+  // The default body keeps its Discord username, which alone reads as a near miss.
+  const untickedBody = `Closes #42\n\n${UNTICKED}\n\nDiscord username: contributor#1234`;
+  const h = await runPr({ body: untickedBody, labels: [LABEL], comments: [entered] });
+  const withdrawn = h.of('updateComment')[0].body;
+  assert.equal(stateOf(withdrawn), 'withdrawn');
+  assert.deepEqual(
+    h.of('removeLabel').map(args => args.name),
+    [LABEL],
+  );
+
+  // A later edit that is still unticked leaves the withdrawal as it is.
+  const again = await runPr({ body: untickedBody, comments: [botComment(withdrawn)] });
+  assert.deepEqual(again.calls, []);
+});
