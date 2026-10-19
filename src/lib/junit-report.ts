@@ -156,6 +156,10 @@ function classifyJUnitOutcome(status: string, error?: JUnitTestResult['error']):
   return 'failure';
 }
 
+/**
+ * Select the report diagnostic, preferring an explicit error message, then its
+ * code, and finally the run status when neither diagnostic field is available.
+ */
 function failureMessage(result: JUnitTestResult): string {
   if (result.error?.message) return result.error.message;
   if (result.error?.code) return result.error.code;
