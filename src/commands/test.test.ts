@@ -13030,6 +13030,118 @@ describe('test run --all — the project-level closing link prefers the server f
   });
 });
 
+describe('test run --all --wait — pollFreshAccepted failure diagnostics (#448)', () => {
+  const BATCH_DISPATCH = {
+    accepted: [{ testId: 't1', runId: 'r1', enqueuedAt: '2026-09-02T00:00:00.000Z' }],
+    conflicts: [],
+    deferred: [],
+    skippedFrontend: [],
+    skippedIntegration: [],
+  };
+
+  const terminalRunBody = (status: string, overrides: Record<string, unknown> = {}) => ({
+    runId: 'r1',
+    testId: 't1',
+    projectId: 'proj_1',
+    userId: 'u1',
+    status,
+    source: 'cli',
+    createdAt: '2026-06-01T10:00:00.000Z',
+    startedAt: '2026-06-01T10:00:01.000Z',
+    finishedAt: '2026-06-01T10:00:30.000Z',
+    codeVersion: 'v1',
+    targetUrl: 'https://example.com',
+    createdFrom: null,
+    failedStepIndex: null,
+    failureKind: null,
+    error: null,
+    videoUrl: null,
+    stepSummary: { total: 1, completed: 1, passedCount: status === 'passed' ? 1 : 0, failedCount: 0 },
+    ...overrides,
+  });
+
+  async function runAllWait(
+    timeoutSeconds: number,
+    pollBody: Record<string, unknown>,
+  ): Promise<{ accepted: Record<string, unknown>[] }> {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST' && url.includes('/tests/batch/run')) {
+        return { status: 202, body: BATCH_DISPATCH };
+      }
+      if (url.includes('/runs/')) {
+        return { body: pollBody };
+      }
+      return { body: {} };
+    });
+    const out: string[] = [];
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'proj_1',
+        wait: true,
+        timeoutSeconds,
+        maxConcurrency: 1,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: () => undefined,
+        sleep: () => Promise.resolve(),
+      },
+    ).catch(() => undefined);
+    return JSON.parse(out.join('')) as { accepted: Record<string, unknown>[] };
+  }
+
+  it('normal poll copies failureKind, failedStepIndex, and error onto accepted[]', async () => {
+    const payload = await runAllWait(
+      60,
+      terminalRunBody('failed', {
+        failureKind: 'assertion',
+        failedStepIndex: 2,
+        error: 'button not visible',
+      }),
+    );
+    expect(payload.accepted[0]).toMatchObject({
+      testId: 't1',
+      runId: 'r1',
+      status: 'failed',
+      failureKind: 'assertion',
+      failedStepIndex: 2,
+      error: { code: 'INTERNAL', message: 'button not visible', exitCode: 1 },
+    });
+  });
+
+  it('past-deadline last-resort poll copies the same failure diagnostics', async () => {
+    const payload = await runAllWait(
+      0,
+      terminalRunBody('failed', {
+        failureKind: 'timeout',
+        failedStepIndex: 4,
+        error: 'step timed out',
+      }),
+    );
+    expect(payload.accepted[0]).toMatchObject({
+      status: 'failed',
+      failureKind: 'timeout',
+      failedStepIndex: 4,
+      error: { code: 'INTERNAL', message: 'step timed out', exitCode: 1 },
+    });
+  });
+
+  it('passing rows omit failure diagnostics', async () => {
+    const payload = await runAllWait(60, terminalRunBody('passed'));
+    const row = payload.accepted[0]!;
+    expect(row.status).toBe('passed');
+    expect(row).not.toHaveProperty('failureKind');
+    expect(row).not.toHaveProperty('failedStepIndex');
+    expect(row).not.toHaveProperty('error');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // test run / test rerun (no --wait): the server-built dashboard link
 // ---------------------------------------------------------------------------
