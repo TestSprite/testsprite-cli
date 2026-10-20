@@ -87,6 +87,22 @@ type CommonOptions = FactoryCommonOptions;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+/**
+ * Explain that interrupting a remote wait leaves unfinished runs executing and
+ * billing, and name the commands to re-attach or cancel those specific runs.
+ */
+function interruptDetachMessage(err: InterruptError, runIds: string[]): string {
+  const subject =
+    runIds.length === 1
+      ? `Run ${runIds[0]} is still executing on the server and will keep running (and billing) until it finishes.`
+      : `${runIds.length} runs are still executing on the server and will keep running (and billing) until they finish.`;
+  return (
+    `Interrupted (${err.signal}). ${subject}\n` +
+    `  Re-attach with: testsprite test wait ${runIds.join(' ')}\n` +
+    `  Cancel with:    testsprite test cancel ${runIds.join(' ')}`
+  );
+}
+
 function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const g = command.optsWithGlobals() as Partial<CommonOptions> & { requestTimeout?: string };
   return {
@@ -949,6 +965,46 @@ async function runTestlistRunCore(
         err,
         deps.environmentTunnel,
       );
+    else if (err instanceof InterruptError) {
+      // Keep settled outcomes intact and retain every dispatched run ID,
+      // including members that had not acquired a polling slot yet.
+      const settled = new Map(results.map(result => [result.runId, result] as const));
+      const partialResults = resp.accepted.map(
+        (entry): TestlistRunMemberResult =>
+          settled.get(entry.runId) ?? {
+            testId: entry.testId,
+            runId: entry.runId,
+            status: 'running',
+          },
+      );
+      out.print(
+        {
+          accepted: partialResults,
+          conflicts: resp.conflicts,
+          deferred: resp.deferred,
+          ...(resp.notFound && resp.notFound.length > 0 ? { notFound: resp.notFound } : {}),
+          ...(resp.reason ? { reason: resp.reason } : {}),
+          summary: {
+            passed: results.filter(result => result.status === 'passed').length,
+            failed: results.filter(
+              result => result.status !== 'passed' && result.status !== 'timeout',
+            ).length,
+            timedOut: results.filter(result => result.status === 'timeout').length,
+            deferred: resp.deferred.length,
+            conflicts: resp.conflicts.length,
+            total: resp.accepted.length,
+          },
+        },
+        () => partialResults.map(result => `${result.runId}  ${result.status}`).join('\n'),
+      );
+      const unfinished = resp.accepted
+        .filter(entry => !settled.has(entry.runId))
+        .map(entry => entry.runId);
+      if (unfinished.length > 0) {
+        err.runWaitContext = true;
+        stderrFn(interruptDetachMessage(err, unfinished));
+      }
+    }
     throw err;
   }
 

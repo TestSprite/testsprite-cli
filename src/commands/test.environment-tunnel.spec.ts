@@ -1357,6 +1357,39 @@ describe('environment tunnel resolution', () => {
     });
   });
 
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'keeps one owned test-list partial envelope on %s during polling',
+    async signal => {
+      const shutdown = new ShutdownController();
+      const f = fixture({
+        shutdown,
+        poll: () => {
+          shutdown.interrupt(signal);
+          throw shutdown.signal.reason;
+        },
+      });
+      const error = await runTestlistRun(
+        { ...common, listId: 'L', wait: true, timeoutSeconds: 10, maxConcurrency: 5 },
+        f.deps,
+      ).catch((err: unknown) => err);
+
+      expect(error).toBe(shutdown.signal.reason);
+      expect(error).toMatchObject({ exitCode: signal === 'SIGINT' ? 130 : 143 });
+      expect(f.stdout).toHaveLength(1);
+      expect(JSON.parse(f.stdout[0]!)).toMatchObject({
+        accepted: [{ testId: 'a', runId: 'run_a', status: 'running' }],
+        conflicts: [],
+        deferred: [],
+        notRunTestIds: [],
+      });
+      // Owned tunnels retain their existing cleanup behavior; only the remote
+      // non-tunnel path detaches without cancelling runs.
+      expect(f.calls.filter(call => call.path.endsWith('/cancel')).map(call => call.path)).toEqual([
+        '/runs/run_a/cancel',
+      ]);
+    },
+  );
+
   it('uses distinct bounded idempotency keys for loopback test-list groups', async () => {
     const f = fixture({
       tests: [

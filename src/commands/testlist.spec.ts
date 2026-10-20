@@ -13,7 +13,8 @@ import {
   runTestlistUpdate,
   waitRequestTimeoutMs,
 } from './testlist.js';
-import { ApiError, CLIError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
+import { ShutdownController } from '../lib/interrupt.js';
 import { takeTelemetryExtras } from '../lib/telemetry.js';
 import type { CliTestListDetail } from '../lib/testlist.types.js';
 import type { RunResponse } from '../lib/runs.types.js';
@@ -368,6 +369,121 @@ const RUN_ACCEPTED = {
 const runBase = { ...base, wait: false, timeoutSeconds: 600, maxConcurrency: 10 };
 
 describe('testlist run', () => {
+  it.each([
+    { signal: 'SIGINT', exitCode: 130, settledStatus: 'passed', output: 'json' },
+    { signal: 'SIGTERM', exitCode: 143, settledStatus: 'passed', output: 'json' },
+    { signal: 'SIGINT', exitCode: 130, settledStatus: 'failed', output: 'json' },
+    { signal: 'SIGTERM', exitCode: 143, settledStatus: 'error', output: 'json' },
+    { signal: 'SIGINT', exitCode: 130, settledStatus: undefined, output: 'json' },
+    { signal: 'SIGTERM', exitCode: 143, settledStatus: undefined, output: 'json' },
+    { signal: 'SIGINT', exitCode: 130, settledStatus: 'passed', output: 'text' },
+  ] as const)(
+    '$signal preserves interrupted receipts with settled $settledStatus in $output',
+    async ({ signal, exitCode, settledStatus, output }) => {
+      const { env } = makeCreds();
+      const shutdown = new ShutdownController();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const calls: string[] = [];
+      const accepted = [
+        RUN_ACCEPTED.accepted[0]!,
+        { testId: 'case-b', runId: 'run_waiting', enqueuedAt: '2026-08-01T00:00:00.000Z' },
+        { testId: 'case-c', runId: 'run_unpolled', enqueuedAt: '2026-08-01T00:00:00.000Z' },
+      ];
+      const conflicts = [{ testId: 'busy', currentRunId: 'run_busy' }];
+      const deferred = [{ testId: 'later' }];
+      const fetchImpl = makeFetch((url, init) => {
+        const path = new URL(url).pathname.replace('/api/cli/v1', '');
+        calls.push(`${init.method ?? 'GET'} ${path}`);
+        if (path === '/testlist/list-1') return { body: { ...DETAIL, cases: [] } };
+        if (path === '/testlist/list-1/run') {
+          return { body: { accepted, conflicts, deferred, notFound: ['missing'] } };
+        }
+        if (path === '/runs/run_abc' && settledStatus) {
+          if (settledStatus === 'error') return errorBody('AUTH_INVALID', 401);
+          return {
+            body: {
+              ...makeRun(settledStatus),
+              testTitle: 'Login',
+              executionUrl: 'https://dash.example/executions/run_abc',
+            },
+          };
+        }
+        if (path.startsWith('/runs/')) {
+          shutdown.interrupt(signal);
+          throw shutdown.signal.reason;
+        }
+        throw new Error(`Unexpected fixture request: ${url}`);
+      });
+      const error = await runTestlistRun(
+        { ...runBase, listId: 'list-1', wait: true, maxConcurrency: 1, output },
+        {
+          env,
+          fetchImpl,
+          shutdown,
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+          sleep: instantSleep,
+        },
+      ).catch((err: unknown) => err);
+
+      expect(error).toBeInstanceOf(InterruptError);
+      expect(error).toBe(shutdown.signal.reason);
+      expect(error).toMatchObject({ exitCode, signal, runWaitContext: true });
+      expect(stdout).toHaveLength(1);
+      if (output === 'json') {
+        const partial = JSON.parse(stdout[0]!);
+        expect(partial.accepted).toHaveLength(3);
+        const first = partial.accepted[0];
+        expect(first).toMatchObject({
+          testId: 'case-a',
+          runId: 'run_abc',
+          status: settledStatus ?? 'running',
+        });
+        if (settledStatus === 'error') {
+          expect(first.error).toMatchObject({ code: 'AUTH_INVALID', exitCode: 3 });
+        } else if (settledStatus) {
+          expect(first).toMatchObject({
+            testTitle: 'Login',
+            name: 'Login',
+            projectId: 'proj-a',
+            dashboardUrl: makeRun(settledStatus).dashboardUrl,
+            executionUrl: 'https://dash.example/executions/run_abc',
+          });
+        }
+        expect(partial.accepted.slice(1)).toEqual([
+          { testId: 'case-b', runId: 'run_waiting', status: 'running' },
+          { testId: 'case-c', runId: 'run_unpolled', status: 'running' },
+        ]);
+        expect(partial.conflicts).toEqual(conflicts);
+        expect(partial.deferred).toEqual(deferred);
+        expect(partial.notFound).toEqual(['missing']);
+        expect(partial.summary).toEqual({
+          passed: settledStatus === 'passed' ? 1 : 0,
+          failed: settledStatus === 'failed' || settledStatus === 'error' ? 1 : 0,
+          timedOut: 0,
+          deferred: 1,
+          conflicts: 1,
+          total: 3,
+        });
+      } else {
+        expect(stdout[0]).toContain('run_abc  passed');
+        expect(stdout[0]).toContain('run_waiting  running');
+        expect(stdout[0]).toContain('run_unpolled  running');
+      }
+      const unfinishedIds = settledStatus
+        ? 'run_waiting run_unpolled'
+        : 'run_abc run_waiting run_unpolled';
+      const detach = stderr.filter(line => line.includes(`Interrupted (${signal})`));
+      expect(detach).toHaveLength(1);
+      expect(detach[0]).toContain(`testsprite test wait ${unfinishedIds}`);
+      expect(detach[0]).toContain(`testsprite test cancel ${unfinishedIds}`);
+      expect(detach[0]).toContain('billing');
+      expect(calls).not.toContain('GET /runs/run_unpolled');
+      expect(calls.filter(call => call.startsWith('POST'))).toEqual(['POST /testlist/list-1/run']);
+    },
+  );
+
   it('non-wait → POST /testlist/:id/run, prints accepted, no --case → empty body', async () => {
     const { env } = makeCreds();
     let seenUrl = '';
