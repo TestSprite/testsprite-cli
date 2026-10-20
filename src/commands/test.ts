@@ -9094,6 +9094,7 @@ export interface CliCancelResultRow {
   /** Terminal status the run was already in, for a `conflict` row. */
   conflictStatus?: string;
   error?: string;
+  refund?: CancelRunResponse['refund'];
 }
 
 /** JSON payload for a multi-id `test cancel`. */
@@ -9102,6 +9103,8 @@ export interface CliCancelSummary {
   alreadyCancelled: string[];
   conflicts: Array<{ runId: string; status: string }>;
   notFound: string[];
+  /** Refund outcomes reported by successful cancel responses; always present. */
+  refunds: Array<{ runId: string } & NonNullable<CancelRunResponse['refund']>>;
   /**
    * Runs that errored for a reason other than 404/409 (e.g. auth, transport).
    * Always present — an empty array on full success — so machine consumers
@@ -9150,6 +9153,7 @@ export async function runTestCancel(
     if (result.alreadyCancelled) {
       stderrFn(`[advisory] run ${runId} was already cancelled`);
     }
+    warnFailedCancelRefunds(result.refund ? [{ runId, ...result.refund }] : [], stderrFn);
     return result;
   }
 
@@ -9160,6 +9164,7 @@ export async function runTestCancel(
       rows.push({
         runId,
         status: result.alreadyCancelled ? 'alreadyCancelled' : 'cancelled',
+        refund: result.refund,
       });
     } catch (err) {
       if (err instanceof InterruptError) throw err;
@@ -9187,6 +9192,7 @@ export async function runTestCancel(
       .map(r => ({ runId: r.runId, status: r.conflictStatus ?? 'unknown' })),
     notFound: rows.filter(r => r.status === 'notFound').map(r => r.runId),
     errors: errorRows.map(r => ({ runId: r.runId, message: r.error ?? 'unknown error' })),
+    refunds: rows.flatMap(r => (r.refund ? [{ runId: r.runId, ...r.refund }] : [])),
   };
 
   out.print(summary, data => renderCancelSummaryText(data as CliCancelSummary));
@@ -9199,6 +9205,7 @@ export async function runTestCancel(
   if (summary.notFound.length > 0) parts.push(`${summary.notFound.length} not found`);
   if (errorRows.length > 0) parts.push(`${errorRows.length} error`);
   stderrFn(`Cancel summary: ${parts.join(', ')}.`);
+  warnFailedCancelRefunds(summary.refunds, stderrFn);
 
   // Exit precedence (CXL-11): notFound outranks conflict — a caller-side bug
   // (wrong id / wrong tenant) is more actionable to surface than "it already
@@ -9232,32 +9239,44 @@ function renderCancelSummaryText(summary: CliCancelSummary): string {
   for (const c of summary.conflicts) lines.push(`${c.runId}  conflict (${c.status})`);
   for (const runId of summary.notFound) lines.push(`${runId}  notFound`);
   for (const e of summary.errors ?? []) lines.push(`${e.runId}  error (${e.message})`);
+  for (const refund of summary.refunds) {
+    lines.push(`${refund.runId}  ${renderCancelRefundText(refund)}`);
+  }
   return lines.join('\n');
+}
+
+function warnFailedCancelRefunds(
+  refunds: CliCancelSummary['refunds'],
+  stderrFn: (line: string) => void,
+): void {
+  const failed = refunds.filter(refund => refund.status === 'failed').map(refund => refund.runId);
+  if (failed.length > 0) {
+    stderrFn(
+      `[warning] Refund failed for runs: ${failed.join(' ')}; cancellation succeeded, but credits were not returned; contact TestSprite support.`,
+    );
+  }
 }
 
 function renderCancelResponseText(response: CancelRunResponse): string {
   const runCard = renderRunResponseText(response);
   if (!response.refund) return runCard;
 
-  let refundLine: string;
-  switch (response.refund.status) {
+  return `${runCard}\n${renderCancelRefundText(response.refund)}`;
+}
+
+function renderCancelRefundText(refund: NonNullable<CancelRunResponse['refund']>): string {
+  switch (refund.status) {
     case 'refunded':
-      refundLine =
-        response.refund.amount === undefined
-          ? 'refund      credits returned'
-          : `refund      credits returned: ${response.refund.amount}`;
-      break;
+      return refund.amount === undefined
+        ? 'refund      credits returned'
+        : `refund      credits returned: ${refund.amount}`;
     case 'not_charged':
-      refundLine = 'refund      run was never charged; nothing to return';
-      break;
+      return 'refund      run was never charged; nothing to return';
     case 'failed':
-      refundLine =
-        'refund      failed — cancellation succeeded, but credits were not returned; contact TestSprite support';
-      break;
+      return 'refund      failed — cancellation succeeded, but credits were not returned; contact TestSprite support';
     default:
-      refundLine = `refund      ${String(response.refund.status)}`;
+      return `refund      ${String(refund.status)}`;
   }
-  return `${runCard}\n${refundLine}`;
 }
 
 export function createTestCancelCommand(deps: TestDeps): Command {
