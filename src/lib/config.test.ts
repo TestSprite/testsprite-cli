@@ -7,7 +7,7 @@ import { defaultConfigPath, loadConfig } from './config.js';
 import { writeProfile } from './credentials.js';
 
 vi.mock('node:fs', async importOriginal => ({
-  ...(await importOriginal<typeof import('node:fs')>()),
+  ...(await importOriginal<typeof fs>()),
 }));
 
 let tmpRoot: string;
@@ -67,9 +67,9 @@ describe('loadConfig', () => {
         apiUrl: 'https://env.example.com',
       });
       expect(read).not.toHaveBeenCalled();
-      expect(() =>
-        loadConfig({ env: { TESTSPRITE_API_KEY: 'sk-env' }, credentialsPath }),
-      ).toThrow(permissionError);
+      expect(() => loadConfig({ env: { TESTSPRITE_API_KEY: 'sk-env' }, credentialsPath })).toThrow(
+        permissionError,
+      );
       expect(read).toHaveBeenCalledTimes(1);
     } finally {
       read.mockRestore();
