@@ -10,7 +10,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const binary = join(root, 'dist/index.js');
 const batch = {
   accepted: [{ testId: 'test_new', runId: 'run_new', enqueuedAt: '2026-06-09T10:00:00Z' }],
-  conflicts: [{ testId: 'test_busy', currentRunId: 'run_busy', reason: 'run_in_flight' }],
+  conflicts: [{ testId: 'test_busy', currentRunId: 'run_busy', reason: 'in_flight' }],
   deferred: [],
   skippedFrontend: ['test_frontend'],
   skippedIntegration: [{ testId: 'test_integration' }],
@@ -148,10 +148,10 @@ async function runBatch(stage: Stage, signal: 'SIGINT' | 'SIGTERM', output: 'jso
   let stdout = '';
   let stderr = '';
   let idleCritical: unknown;
-  child.stdout.on('data', (chunk: Buffer) => {
+  child.stdout!.on('data', (chunk: Buffer) => {
     stdout += chunk.toString();
   });
-  child.stderr.on('data', (chunk: Buffer) => {
+  child.stderr!.on('data', (chunk: Buffer) => {
     stderr += chunk.toString();
   });
   child.on('message', (message: { idle?: boolean; critical?: boolean }) => {

@@ -3675,7 +3675,7 @@ describe('runTestRunAll — batch fresh run', () => {
       let armedAtRead = false;
       const response: BatchRunFreshResponse = {
         ...BATCH_FRESH_RESP,
-        conflicts: [{ testId: 'test_busy', currentRunId: 'run_busy', reason: 'run_in_flight' }],
+        conflicts: [{ testId: 'test_busy', currentRunId: 'run_busy', reason: 'in_flight' }],
         skippedFrontend: ['test_frontend'],
         skippedIntegration: [{ testId: 'test_integration' }],
       };
