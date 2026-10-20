@@ -15602,9 +15602,12 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '  7  timeout — resume with: testsprite test wait <run-id>, ' +
         'or stop it with: testsprite test cancel <run-id>\n' +
         ' 10  transport/network failure (UNAVAILABLE). If it printed a runId with status\n' +
-        '     running, that run keeps executing: re-attach with testsprite test wait\n' +
+        '     running, that run is still executing: check it with testsprite test wait\n' +
         '     <run-id> (running this command again triggers and bills a new run).\n' +
-        '     Otherwise retry the command\n' +
+        '     With --local or a local environment, the tunnel closed with this command\n' +
+        '     and test wait cannot reopen it: follow the printed next step. If its\n' +
+        '     cancellation was skipped, the run can still finish, but steps that need\n' +
+        '     your machine can fail. Otherwise retry the command\n' +
         ' 11  rate limited — honor Retry-After\n' +
         ' 12  insufficient credits (non-retriable; top up)\n' +
         ' 13  feature gated / workspace paused\n' +
