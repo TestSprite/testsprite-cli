@@ -1772,3 +1772,95 @@ describe('test wait — stderr progress line', () => {
     }
   });
 });
+
+describe('runTestWait — failure recovery hint for a run that is terminal on the first poll', () => {
+  // Backend run rows finalize server-side, so the wait fallback (which already
+  // knew the type) rarely fires; the run row itself comes back failed/blocked.
+  async function waitTerminal(args: {
+    output: 'text' | 'json';
+    runStatus: RunResponse['status'];
+    type?: string;
+    typeLookupFails?: boolean;
+  }) {
+    const { credentialsPath } = makeCreds();
+    const router = beWaitRouter({
+      type: args.type,
+      runStatus: args.runStatus,
+      result: () => makeBeResult(),
+    });
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const err = await runTestWait(
+      {
+        profile: 'default',
+        output: args.output,
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(url =>
+          args.typeLookupFails && /\/tests\/test_xyz(\?|$)/.test(url)
+            ? errorBody('INTERNAL')
+            : router.handler(url),
+        ),
+        stdout: line => stdout.push(line),
+        stderr: line => stderr.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    const hint = stderr.find(line => line.startsWith('Run finished')) ?? '';
+    return { err, hint, stdout, counts: router.counts };
+  }
+
+  it.each(['failed', 'blocked'] as const)(
+    'JSON: a %s backend run points at test failure get <test-id> (one type lookup)',
+    async runStatus => {
+      const { err, hint, counts } = await waitTerminal({ output: 'json', runStatus });
+      expect(err.exitCode).toBe(1);
+      expect(hint).toContain(`status: ${runStatus}`);
+      expect(hint).toContain("'testsprite test failure get test_xyz'");
+      expect(hint).not.toContain('artifact get');
+      expect(counts.type).toBe(1);
+    },
+  );
+
+  it('JSON: text and JSON now give the same hint for the same failed backend run', async () => {
+    const text = await waitTerminal({ output: 'text', runStatus: 'failed' });
+    const json = await waitTerminal({ output: 'json', runStatus: 'failed' });
+    expect(json.hint).toBe(text.hint);
+  });
+
+  it('JSON: stdout is still the run row verbatim — the lookup only feeds the stderr hint', async () => {
+    const { stdout } = await waitTerminal({ output: 'json', runStatus: 'failed' });
+    expect(JSON.parse(stdout.join('\n'))).toMatchObject(makeRun('failed'));
+  });
+
+  it('JSON: a passed run makes no type lookup', async () => {
+    const { err, counts } = await waitTerminal({ output: 'json', runStatus: 'passed' });
+    expect(err.status).toBe('passed');
+    expect(counts.type).toBe(0);
+  });
+
+  it('JSON: a failed frontend run keeps the run-scoped artifact hint', async () => {
+    const { hint, counts } = await waitTerminal({
+      output: 'json',
+      runStatus: 'failed',
+      type: 'frontend',
+    });
+    expect(hint).toContain("'testsprite test artifact get run_abc'");
+    expect(counts.type).toBe(1);
+  });
+
+  it('JSON: a failed type lookup falls back to the artifact hint without changing the exit code', async () => {
+    const { err, hint } = await waitTerminal({
+      output: 'json',
+      runStatus: 'failed',
+      typeLookupFails: true,
+    });
+    expect(err.exitCode).toBe(1);
+    expect(hint).toContain("'testsprite test artifact get run_abc'");
+  });
+});

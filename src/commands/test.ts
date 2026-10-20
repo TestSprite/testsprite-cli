@@ -7678,13 +7678,20 @@ export function renderRunResponseText(
 
 /**
  * Best-effort resolve whether a finished run's test is a backend test, for the
- * text run-card's step line + failure hint only. Returns true with no
- * network call when already known (create-chain `--type`, or the BE wait
- * fallback fired). Otherwise, in TEXT mode only, issues one `GET /tests/{id}`;
- * ordinary lookup errors → false (render the numeric step summary as before).
- * Interrupts propagate. JSON mode
- * never probes — its envelope carries `stepSummary` verbatim and has no
- * "n/a (backend)" concept, so it is already correct.
+ * text run-card's step line and the stderr recovery hint after a failed or
+ * blocked run. Returns true with no network call when already known
+ * (create-chain `--type`, a backend rerun's closure, or the BE wait fallback
+ * fired), and returns `knownType === 'backend'` with no call when an earlier
+ * read already fetched the test. Otherwise issues one `GET /tests/{id}`; ordinary lookup errors →
+ * false (numeric step summary and the run-scoped `test artifact get` hint, as
+ * before). Interrupts propagate.
+ *
+ * Text mode always probes, for the card. JSON mode probes only when the run
+ * failed or was blocked: its envelope carries `stepSummary` verbatim and has no
+ * "n/a (backend)" concept, so the card needs no type there — but the recovery
+ * hint on stderr does. A backend failure bundle is addressed by testId
+ * (`test failure get`), so a JSON caller that skipped the probe was pointed at
+ * `test artifact get <run-id>`, which has no bundle for a backend run.
  *
  * This closes the standalone-path gap: `test run <id>` / `test wait <run-id>`
  * never supply a type hint, and now that BE run rows finalize server-side
@@ -7696,9 +7703,13 @@ async function resolveRunCardIsBackend(
   testId: string | undefined,
   output: string,
   alreadyKnown: boolean,
+  status: string,
+  knownType?: CliTest['type'],
 ): Promise<boolean> {
   if (alreadyKnown) return true;
-  if (output === 'json' || !testId) return false;
+  if (knownType !== undefined) return knownType === 'backend';
+  if (!testId) return false;
+  if (output === 'json' && !isFailureHintStatus(status)) return false;
   try {
     const test = await client.get<CliTest>(`/tests/${encodeURIComponent(testId)}`);
     return test.type === 'backend';
@@ -7706,6 +7717,11 @@ async function resolveRunCardIsBackend(
     if (err instanceof InterruptError) throw err;
     return false; // best-effort — fall back to the numeric step summary.
   }
+}
+
+/** Statuses that print a failure-bundle recovery hint on stderr. */
+function isFailureHintStatus(status: string): boolean {
+  return status === 'failed' || status === 'blocked';
 }
 
 /**
@@ -8769,12 +8785,13 @@ export async function runTestRun(
 
     // BE detection: type hint (create-chain) OR beFallbackUsed (slow runs); on
     // the standalone `test run <id>` path neither is set, so probe the test type
-    // once (text mode only, best-effort).
+    // once (best-effort; JSON mode only when the run failed or was blocked).
     const isBackend = await resolveRunCardIsBackend(
       client,
       opts.testId,
       opts.output,
       beFallbackUsed || opts.type === 'backend',
+      finalRun.status,
     );
 
     const finalRunWithUrl = withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps));
@@ -9544,13 +9561,15 @@ export async function runTestWait(
 
   ticker.finalize(formatRunProgressLine(finalRun, Date.now() - startMs));
 
-  // `test wait` has no type hint; probe the test type once (text mode only,
-  // best-effort) so a backend run's card reads `n/a (backend)`.
+  // `test wait` has no type hint; probe the test type once (best-effort) so a
+  // backend run's card reads `n/a (backend)` and its failure hint names
+  // `test failure get` (JSON mode probes only for a failed/blocked run).
   const isBackend = await resolveRunCardIsBackend(
     client,
     finalRun.testId,
     opts.output,
     beFallbackUsed,
+    finalRun.status,
   );
 
   out.print(withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)), data =>
@@ -12683,6 +12702,7 @@ export async function runTestRerun(
   const targets = new Map<string, ResolvedRunTarget>();
   const backend: string[] = [];
   const cache = new Map();
+  const readTests = new Map(opts.knownTests ?? []);
   for (const testId of opts.testIds) {
     let knownTest = opts.knownTests?.get(testId);
     try {
@@ -12694,6 +12714,7 @@ export async function runTestRerun(
     } catch (err) {
       if (err instanceof InterruptError) throw err;
     }
+    if (knownTest) readTests.set(testId, knownTest);
     const target = await resolveEnvironmentRunTarget({
       client,
       testId,
@@ -12709,7 +12730,13 @@ export async function runTestRerun(
     if (target && knownTest?.type === 'backend') backend.push(testId);
     else if (target) targets.set(testId, target);
   }
-  if (!targets.size) return runTestRerunCore(opts, deps);
+  // A single rerun hands the type it just read to the core, so the run card and
+  // failure hint after --wait don't fetch the same test a second time.
+  if (!targets.size)
+    return runTestRerunCore(
+      opts.testIds.length === 1 && readTests.size > 0 ? { ...opts, knownTests: readTests } : opts,
+      deps,
+    );
   const maxConcurrency = opts.concurrencyIsDefault ? 5 : opts.maxConcurrency;
   if (maxConcurrency > 10)
     throw localValidationError(
@@ -13298,8 +13325,10 @@ async function runTestRerunCore(
       }
 
       if (exitCodeForRunStatus(namedResult.status) !== 0) {
+        // Only a backend rerun has a closure, and a backend failure bundle is
+        // addressed by testId — there is no run-scoped bundle for namedRunId.
         stderrFn(
-          `Run finished with status: ${namedResult.status}. Use 'testsprite test artifact get ${namedRunId}' to download the failure bundle.`,
+          `Run finished with status: ${namedResult.status}. Backend failure artifacts are addressed by testId — use 'testsprite test failure get ${testId}' to download the bundle.`,
         );
         throw new CLIError(`Run ${namedRunId} finished with status: ${namedResult.status}`, 1);
       }
@@ -13483,10 +13512,19 @@ async function runTestRerunCore(
 
     ticker.finalize(formatRunProgressLine(finalRun, Date.now() - replayStartMs, '(replay)'));
 
-    // Probe the test type once (text mode only, best-effort) so a backend
-    // rerun's card reads `n/a (backend)` even when the fallback never fired
-    // (BE run rows finalize server-side now).
-    const isBackend = await resolveRunCardIsBackend(client, testId, opts.output, beFallbackUsed);
+    // A closure in the rerun response already marks a backend rerun; otherwise
+    // probe the test type once (best-effort; JSON mode only for a failed/blocked
+    // run) so a backend rerun's card reads `n/a (backend)` and its failure hint
+    // names `test failure get`, even when the fallback never fired (BE run rows
+    // finalize server-side now).
+    const isBackend = await resolveRunCardIsBackend(
+      client,
+      testId,
+      opts.output,
+      beFallbackUsed || isBERerun,
+      finalRun.status,
+      opts.knownTests?.get(testId)?.type,
+    );
 
     out.print(withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)), data =>
       renderRunResponseText(data as RunResponse, { isBackend }),
