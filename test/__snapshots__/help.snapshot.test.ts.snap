@@ -658,9 +658,9 @@ Commands:
   Exit codes:
     0  all targeted tests deleted (or --dry-run)
     1  one or more deletions failed (server error)
-    3  auth error (the key was rejected — every deletion fails the same way)
+    3  auth error (a rejected key on any id — outranks 1 and 14)
     5  validation error (missing --confirm, missing --project with --all, etc.)
-    14 client too old (every deletion fails the same way)
+    14 client too old (on any id — outranks 1)
   
   Note: a 404 "not found" response is counted as skipped in the summary, not an error.
   run [options] [test-id...]            Trigger one or several test runs. Saved loopback environments open a tunnel automatically and wait for a verdict.

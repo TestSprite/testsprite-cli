@@ -431,7 +431,7 @@ testsprite test update test_xxxxxxxx --dry-run --output json
 
 #### `testsprite test delete <test-id>` / `test delete-batch`
 
-Permanently delete one test (or many) — there is **no restore window**. `--confirm` is required; absent it, the CLI exits 5 with a local validation error. `delete-batch` prints a per-test summary (a 404 counts as skipped) and exits 1 when any deletion failed — or 3 when the key was rejected (else 14 when the CLI is too old), since every deletion then fails the same way.
+Permanently delete one test (or many) — there is **no restore window**. `--confirm` is required; absent it, the CLI exits 5 with a local validation error. `delete-batch` prints a per-test summary (a 404 counts as skipped) and exits 1 when any deletion failed — or 3 when the key was rejected for any test (else 14 when the CLI is too old for any), even if other tests were deleted first; the summary still lists every test.
 
 ```bash
 testsprite test delete test_xxxxxxxx --confirm

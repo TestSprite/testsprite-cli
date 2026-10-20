@@ -15016,9 +15016,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '\nExit codes:\n' +
         '  0  all targeted tests deleted (or --dry-run)\n' +
         '  1  one or more deletions failed (server error)\n' +
-        '  3  auth error (the key was rejected — every deletion fails the same way)\n' +
+        '  3  auth error (a rejected key on any id — outranks 1 and 14)\n' +
         '  5  validation error (missing --confirm, missing --project with --all, etc.)\n' +
-        '  14 client too old (every deletion fails the same way)\n' +
+        '  14 client too old (on any id — outranks 1)\n' +
         '\nNote: a 404 "not found" response is counted as skipped in the summary, not an error.',
     )
     .option('--confirm', 'required: explicit confirmation for the destructive operation', false)
