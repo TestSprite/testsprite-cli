@@ -28,6 +28,7 @@ import {
   normalizeEnvVar,
   type Config,
 } from '../lib/config.js';
+import { readCredentialsFile } from '../lib/credentials.js';
 import {
   ApiError,
   CLIError,
@@ -119,6 +120,19 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
       apiKey: normalizeEnvVar(env.TESTSPRITE_API_KEY),
     };
   }
+  // Complete overrides let loadConfig skip the store. Doctor still diagnoses
+  // the file itself, without making its permissions block those overrides.
+  if (!credentialsReadError) {
+    try {
+      readCredentialsFile({ path: deps.credentialsPath });
+    } catch (error) {
+      if (!isFsPermissionError(error)) throw error;
+      credentialsReadError = error.code;
+    }
+  }
+  const hasCompleteOverrides =
+    normalizeEnvVar(env.TESTSPRITE_API_KEY) !== undefined &&
+    (opts.endpointUrl ?? normalizeEnvVar(env.TESTSPRITE_API_URL)) !== undefined;
   const endpointCheck = checkEndpoint(config.apiUrl);
   const hasKey = Boolean(config.apiKey);
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
@@ -137,7 +151,13 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     checkNodeVersion(nodeVersion),
     { name: 'Profile', status: 'ok', detail: config.profile },
     endpointCheck,
-    checkCredentials(hasKey, config.profile, opts.dryRun ?? false, credentialsReadError),
+    checkCredentials(
+      hasKey,
+      config.profile,
+      opts.dryRun ?? false,
+      credentialsReadError,
+      hasCompleteOverrides,
+    ),
     connectivity.check,
   ];
 
@@ -240,15 +260,16 @@ function checkCredentials(
   profile: string,
   dryRun: boolean,
   readError?: string,
+  hasCompleteOverrides = false,
 ): DoctorCheck {
   if (readError) {
     return {
       name: 'Credentials',
-      status: hasKey ? 'warn' : 'fail',
+      status: hasCompleteOverrides ? 'warn' : 'fail',
       detail:
         `credentials file exists but cannot be read (${readError}); its ACL may be locked out ` +
         'by an earlier CLI version — delete the file and re-run `testsprite setup`' +
-        (hasKey ? ' (TESTSPRITE_API_KEY is set, so commands still work)' : ''),
+        (hasCompleteOverrides ? ' (TESTSPRITE_API_KEY is set, so commands still work)' : ''),
     };
   }
   if (hasKey) {
