@@ -8888,8 +8888,10 @@ export async function runTestRun(
         throw err;
       }
       // The deadline passed while the API was still unreachable: the same
-      // partial-envelope contract as a timeout, and the SAME error is rethrown
-      // so it exits 10 (UNAVAILABLE), not 7.
+      // partial-envelope contract as a timeout, exiting 10 (UNAVAILABLE), not 7.
+      // Without an owned tunnel the run keeps executing, so the SAME error is
+      // rethrown with its re-attach hint; an owned tunnel closes with this
+      // process, so its error points at a fresh run instead.
       if (err instanceof UnreachableAtDeadlineError) {
         ticker.finalize(`Run ${triggerResponse.runId}: API unreachable at the --timeout deadline`);
         const detach = await settleTunnelDetach('poll-error');
@@ -8910,8 +8912,20 @@ export async function runTestRun(
           lines.push(...detachHintLines(p.runId, detach));
           return lines.join('\n');
         });
-        if (detach) stderrFn(tunnelDetachMessage(detach));
-        throw err;
+        if (detach === undefined) throw err;
+        stderrFn(tunnelDetachMessage(detach));
+        throw new ApiError(
+          {
+            code: 'UNAVAILABLE', // exit 10
+            message:
+              `${err.message} Run ${triggerResponse.runId} could not have finished ` +
+              `without this process holding its tunnel open.`,
+            nextAction: `Start a new run with: ${tunnelRerunCommand(detach)}; a retry mints a fresh tunnel.`,
+            requestId: err.requestId,
+            details: err.details,
+          },
+          err.httpStatus,
+        );
       }
       if (err instanceof TimeoutError) {
         ticker.finalize(`Run ${triggerResponse.runId} — timed out after ${opts.timeoutSeconds}s`);
@@ -13802,8 +13816,9 @@ async function runTestRerunCore(
       });
     } catch (err) {
       // The deadline passed while the API was still unreachable: same partial
-      // and hints as a timeout, and the SAME error is rethrown so it exits 10
-      // (UNAVAILABLE), not 7.
+      // and hints as a timeout, exiting 10 (UNAVAILABLE), not 7. Without an
+      // owned tunnel the SAME error is rethrown with its re-attach hint; an
+      // owned tunnel is closing, so its error points at cancellation instead.
       if (err instanceof UnreachableAtDeadlineError) {
         ticker.finalize(`Run ${rerunResp.runId}: API unreachable at the --timeout deadline`);
         const partial = { runId: rerunResp.runId, status: 'running' as const };
@@ -13818,7 +13833,17 @@ async function runTestRerunCore(
             `hint        Cancel with:    testsprite test cancel ${p.runId}`,
           ].join('\n');
         });
-        throw err;
+        if (!deps.environmentTunnel) throw err;
+        throw new ApiError(
+          {
+            code: 'UNAVAILABLE', // exit 10
+            message: `${err.message} The owned tunnel is closing; cancellation will be requested.`,
+            nextAction: `Inspect cancellation: testsprite test cancel ${rerunResp.runId}. Start a new run: testsprite test run ${testId}${environment ? ` --env ${quoteEnvironmentName(environment)}` : ''}.`,
+            requestId: err.requestId,
+            details: err.details,
+          },
+          err.httpStatus,
+        );
       }
       if (err instanceof TimeoutError) {
         deps.onWaitTimeout?.({ reason: 'wait_timeout' });

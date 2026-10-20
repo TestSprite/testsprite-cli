@@ -70,7 +70,9 @@ export class TimeoutError extends Error {
  * outages were waited out, so a caller that only knows `ApiError` keeps its
  * transport-failure handling. Single-run wait paths also print the
  * `{runId, status}` partial and the re-attach hint for it, as they do for
- * `TimeoutError`, since the run keeps executing server-side.
+ * `TimeoutError`, since the run keeps executing server-side. Paths that own a
+ * tunnel replace the hint: the tunnel closes with the process, so the run is
+ * cancelled rather than resumable.
  */
 export class UnreachableAtDeadlineError extends ApiError {
   readonly runId: string;
@@ -80,8 +82,8 @@ export class UnreachableAtDeadlineError extends ApiError {
         code: 'UNAVAILABLE',
         message:
           `Could not reach the TestSprite API when the ${timeoutSeconds}s --timeout ended ` +
-          `(last error: ${lastFailure.message}). Run ${runId} keeps executing server-side.`,
-        nextAction: `When the network is back, re-attach with: testsprite test wait ${runId}, or cancel it: testsprite test cancel ${runId}`,
+          `(last error: ${lastFailure.message}).`,
+        nextAction: `Run ${runId} keeps executing server-side. When the network is back, re-attach with: testsprite test wait ${runId}, or cancel it: testsprite test cancel ${runId}`,
         requestId: lastFailure.requestId,
         details: { runId, timeoutSeconds },
       },
