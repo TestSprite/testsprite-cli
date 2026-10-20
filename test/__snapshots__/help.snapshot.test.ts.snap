@@ -1151,7 +1151,10 @@ Exit codes:
   5  validation error (e.g., bad URL, or positional + --all both set)
   6  conflict (already running — see nextAction for the active runId)
   7  timeout — resume with: testsprite test wait <run-id>, or stop it with: testsprite test cancel <run-id>
- 10  transport/network failure (UNAVAILABLE) — retry the command
+ 10  transport/network failure (UNAVAILABLE). If it printed a runId with status
+     running, that run keeps executing: re-attach with testsprite test wait
+     <run-id> (running this command again triggers and bills a new run).
+     Otherwise retry the command
  11  rate limited — honor Retry-After
  12  insufficient credits (non-retriable; top up)
  13  feature gated / workspace paused

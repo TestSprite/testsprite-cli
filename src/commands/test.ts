@@ -15601,7 +15601,10 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '  6  conflict (already running — see nextAction for the active runId)\n' +
         '  7  timeout — resume with: testsprite test wait <run-id>, ' +
         'or stop it with: testsprite test cancel <run-id>\n' +
-        ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
+        ' 10  transport/network failure (UNAVAILABLE). If it printed a runId with status\n' +
+        '     running, that run keeps executing: re-attach with testsprite test wait\n' +
+        '     <run-id> (running this command again triggers and bills a new run).\n' +
+        '     Otherwise retry the command\n' +
         ' 11  rate limited — honor Retry-After\n' +
         ' 12  insufficient credits (non-retriable; top up)\n' +
         ' 13  feature gated / workspace paused\n' +
