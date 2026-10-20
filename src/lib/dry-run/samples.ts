@@ -1164,9 +1164,14 @@ const ENTRIES: DryRunSampleEntry[] = [
     return {
       ...schedule,
       ...(typeof patch.name === 'string' ? { name: patch.name } : {}),
+      ...(typeof patch.environment === 'string'
+        ? { environment: patch.environment, environmentMode: 'pinned' as const }
+        : {}),
       ...(typeof patch.enabled === 'boolean' ? { enabled: patch.enabled } : {}),
       ...(typeof patch.cron === 'string' ? { cron: patch.cron } : {}),
       ...(typeof patch.timezone === 'string' ? { timezone: patch.timezone } : {}),
+      ...(typeof patch.startAt === 'string' ? { startAt: patch.startAt } : {}),
+      ...(typeof patch.endAt === 'string' || patch.endAt === null ? { endAt: patch.endAt } : {}),
       ...(typeof patch.sendTo === 'string' ? { sendTo: patch.sendTo } : {}),
       updatedAt: '2026-05-16T00:00:00.000Z',
     };

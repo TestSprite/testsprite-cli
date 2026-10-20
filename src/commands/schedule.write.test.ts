@@ -430,6 +430,38 @@ describe('get → update round trip', () => {
     // of having one.
     expect(runsPerMonth(fetched.cron!)).not.toBeNull();
   });
+
+  it('previews environment pinning under --dry-run without UNSUPPORTED refusal', async () => {
+    const out: string[] = [];
+    const stderr: string[] = [];
+    const result = await runUpdate(
+      { ...BASE, output: 'text', scheduleId: 'sch_1', env: 'staging', dryRun: true },
+      { stdout: l => out.push(l), stderr: l => stderr.push(l) },
+    );
+    expect(result.environment).toBe('staging');
+    expect(result.environmentMode).toBe('pinned');
+    expect(out.join('\n')).toContain('staging (pinned)');
+  });
+
+  it('echoes start and end dates under --dry-run in json output', async () => {
+    const out: string[] = [];
+    const result = await runUpdate(
+      {
+        ...BASE,
+        output: 'json',
+        scheduleId: 'sch_1',
+        start: '2027-01-01T00:00:00.000Z',
+        end: '2027-06-01T00:00:00.000Z',
+        dryRun: true,
+      },
+      { stdout: l => out.push(l), stderr: () => {} },
+    );
+    expect(result.startAt).toBe('2027-01-01T00:00:00.000Z');
+    expect(result.endAt).toBe('2027-06-01T00:00:00.000Z');
+    const json = JSON.parse(out.join('\n'));
+    expect(json.startAt).toBe('2027-01-01T00:00:00.000Z');
+    expect(json.endAt).toBe('2027-06-01T00:00:00.000Z');
+  });
 });
 
 describe('runDelete', () => {

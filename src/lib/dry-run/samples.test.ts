@@ -1054,6 +1054,23 @@ describe('schedule samples', () => {
     expect(body.name).toBe('Renamed');
   });
 
+  it('echoes environment, startAt and endAt in updateSchedule sample', () => {
+    const body = findSample('PATCH', '/schedules/sch_1', {
+      environment: 'staging',
+      startAt: '2027-01-01T00:00:00.000Z',
+      endAt: '2027-06-01T00:00:00.000Z',
+    })?.body() as {
+      environment?: string;
+      environmentMode?: string;
+      startAt?: string;
+      endAt?: string | null;
+    };
+    expect(body.environment).toBe('staging');
+    expect(body.environmentMode).toBe('pinned');
+    expect(body.startAt).toBe('2027-01-01T00:00:00.000Z');
+    expect(body.endAt).toBe('2027-06-01T00:00:00.000Z');
+  });
+
   it('leaves fields the patch did not mention at their sample values', () => {
     const body = findSample('PATCH', '/schedules/sch_1', { enabled: false })?.body() as {
       name?: string;
