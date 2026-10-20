@@ -4550,6 +4550,22 @@ async function runBatchRun(
         await sleepUntilOrInterrupt(clampedWait, shutdown.signal, sleepFn);
       }
 
+      // A slot can become available exactly when the clamped sleep exhausts
+      // the --wait budget. Recheck after acquisition before starting a run.
+      if (opts.wait && remainingMs() <= 0) {
+        return {
+          testId,
+          runId: '',
+          status: 'timeout',
+          codeVersion: '',
+          error: {
+            code: 'UNSUPPORTED',
+            message: `Timed out after ${timeoutSeconds}s before trigger attempt for ${testId}.`,
+            exitCode: 7,
+          },
+        };
+      }
+
       if (fanOutStopped && deps.environmentTunnel) {
         return { testId, runId: '', status: 'not_dispatched', codeVersion: '' };
       }
