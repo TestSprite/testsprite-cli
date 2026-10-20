@@ -7930,6 +7930,11 @@ export async function runTestRun(
 
   if (opts.dryRun) {
     const client = makeClient(opts, deps);
+    // The client no longer emits the banner at construction (it is lazy on
+    // the first dry-run response); this branch prints a canned response
+    // without any fetch, so emit it explicitly. assertNoTunnelOptions ran
+    // above, so the banner cannot precede a validation error.
+    emitDryRunBanner(deps.stderr ?? (line => process.stderr.write(`${line}\n`)));
     const out = makeOutput(opts.output, deps);
     const idempotencyKey = opts.idempotencyKey ?? `dry-run-${randomUUID()}`;
     // P3-14: use the dry-run sample (TriggerRunResponse shape) so `test run
@@ -12461,6 +12466,10 @@ async function runTestRerunCore(
 
   if (opts.dryRun) {
     const client = makeClient(opts, deps);
+    // The client no longer emits the banner at construction (it is lazy on
+    // the first dry-run response); this branch prints a canned envelope
+    // without any fetch, so emit it explicitly.
+    emitDryRunBanner(stderrFn);
     const idempotencyKey = opts.idempotencyKey ?? `dry-run-${randomUUID()}`;
     if (isSingle) {
       const testId = opts.testIds[0]!;
@@ -17861,7 +17870,11 @@ export async function runPlanGenerate(
     // Zero network, zero charges: resolve both canned samples directly
     // (no fetch — even the canned dry-run fetch is bypassed, matching the
     // `test run --dry-run` convention) and render the settled success shape.
+    // The client no longer emits the banner at construction (it is lazy on
+    // the first dry-run response), so emit it explicitly here — a canned
+    // response is produced below.
     const client = makeClient(opts, deps);
+    emitDryRunBanner(stderrFn);
     const plans = findSampleOrThrow(
       'GET',
       `/api/cli/v1/projects/${encodeURIComponent(projectId)}/plans`,
@@ -18243,6 +18256,11 @@ export async function runPlanAccept(
     const staged = plans.proposals;
     const selected = selectPlanProposals(staged, onlyIds);
     const ids = selected.map(p => p.proposalId);
+    // The client no longer emits the banner at construction (it is lazy on
+    // the first dry-run response); this branch produces a canned response
+    // without any fetch, so emit it explicitly — after the --only validation
+    // above, so the banner cannot precede a validation error.
+    emitDryRunBanner(stderrFn);
     const response = findSampleOrThrow(
       'POST',
       `/api/cli/v1/projects/${encodeURIComponent(projectId)}/plans/accept`,
