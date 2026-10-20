@@ -3509,3 +3509,145 @@ describe('create run environment', () => {
     expect(stderr.filter(line => line === 'batch-run summary: 1/1 triggered')).toHaveLength(2);
   });
 });
+
+describe('create-batch conflict attachment compatibility', () => {
+  it.each([
+    {
+      name: 'matching named environment',
+      requestedEnv: 'staging',
+      storedEnv: 'env_staging',
+      ok: true,
+    },
+    {
+      name: 'different named environment',
+      requestedEnv: 'staging',
+      storedEnv: 'env_default',
+      ok: false,
+    },
+    {
+      name: 'missing stored environment',
+      requestedEnv: 'staging',
+      storedEnv: undefined,
+      ok: false,
+    },
+    { name: 'null stored environment', storedEnv: null, ok: false },
+    { name: 'matching default environment', storedEnv: 'env_default', ok: true },
+    { name: 'different default environment', storedEnv: 'env_staging', ok: false },
+    { name: 'matching target', targetUrl: 'https://example.com', ok: true },
+    { name: 'different target', targetUrl: 'https://other.example.com', ok: false },
+    {
+      name: 'unreadable run with target',
+      targetUrl: 'https://example.com',
+      unreadable: true,
+      ok: false,
+    },
+    { name: 'legacy unreadable run without flags', unreadable: true, ok: true },
+    {
+      name: 'unreadable environment listing',
+      storedEnv: 'env_default',
+      listingError: true,
+      ok: false,
+    },
+  ])('$name', async scenario => {
+    const { credentialsPath } = makeCreds();
+    const ids = ['test_attach_a', 'test_attach_b'];
+    const output: string[] = [];
+    const reads = new Map<string, number>();
+    let verificationListings = 0;
+    const fetchImpl = makeFetch((url, init) => {
+      const path = new URL(url).pathname;
+      const notFound = {
+        status: 404,
+        body: {
+          error: {
+            code: 'NOT_FOUND',
+            message: 'Unavailable',
+            nextAction: '',
+            requestId: 'req_attach',
+          },
+        },
+      };
+      if (path.endsWith('/tests/batch')) return { body: makeBatchCreateResponse(ids) };
+      if (path.endsWith('/env')) {
+        if (reads.size > 0) {
+          verificationListings++;
+          if (scenario.listingError) return notFound;
+        }
+        return {
+          body: {
+            environments: [
+              { id: 'env_default', name: 'default', url: 'https://example.com', isDefault: true },
+              { id: 'env_staging', name: 'staging', url: 'https://example.com', isDefault: false },
+            ],
+          },
+        };
+      }
+      const id = ids.find(testId => path.includes(testId));
+      if (id && init.method === 'POST')
+        return {
+          status: 409,
+          body: {
+            error: {
+              code: 'CONFLICT',
+              message: 'Already running',
+              nextAction: '',
+              requestId: 'req_attach',
+              details: { reason: 'run_in_flight', currentRunId: `run_${id}` },
+            },
+          },
+        };
+      if (id && path.includes('/runs/run_')) {
+        const count = (reads.get(id) ?? 0) + 1;
+        reads.set(id, count);
+        if (scenario.unreadable && count === 1) return notFound;
+        return {
+          body: {
+            ...makePassedRun(id, `run_${id}`),
+            ...(scenario.storedEnv === null
+              ? { environment: null }
+              : scenario.storedEnv
+                ? { environment: { id: scenario.storedEnv, name: 'stored' } }
+                : {}),
+          },
+        };
+      }
+      if (id) return { body: { testId: id, projectId: 'project_alice', type: 'frontend' } };
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    const invocation = runCreateBatch(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        plans: writePlansJsonl([FE_SPEC, FE_SPEC]),
+        run: true,
+        wait: true,
+        environment: scenario.requestedEnv,
+        targetUrl: scenario.targetUrl,
+        skipPreflight: true,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => output.push(line),
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    );
+    if (scenario.ok) await invocation;
+    else await expect(invocation).rejects.toMatchObject({ exitCode: 6 });
+    const rows = JSON.parse(output.join('')).results;
+    expect(rows).toHaveLength(2);
+    for (const id of ids) {
+      const row = rows.find((r: { testId: string }) => r.testId === id);
+      if (scenario.ok) expect(row).toMatchObject({ runId: `run_${id}`, status: 'passed' });
+      else {
+        expect(row).toMatchObject({ status: 'error', error: { code: 'CONFLICT', exitCode: 6 } });
+        expect(row.error.message).toContain(`testsprite test wait run_${id}`);
+        expect(reads.get(id)).toBe(1);
+      }
+    }
+    if (scenario.storedEnv) expect(verificationListings).toBe(1);
+  });
+});
