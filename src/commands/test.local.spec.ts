@@ -19,6 +19,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import type { JUnitReportFlagOptions } from '../lib/junit-report.js';
+import { UnreachableAtDeadlineError } from '../lib/poll.js';
 import { TunnelLostError } from '../lib/tunnel-session.js';
 import { takeTelemetryExtras } from '../lib/telemetry.js';
 import type { TunnelClientOptions } from '../vendor/tunnel-client/index.js';
@@ -1377,6 +1378,8 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
 describe('test run --local — every poll exit settles the charged run', () => {
   async function capturePollExit(options: {
     timeoutSeconds?: number;
+    /** Use the default timer-based sleep (driven by fake timers) instead of an instant one. */
+    usesTimerSleep?: boolean;
     respond?: (
       call: Call,
       init: RequestInit,
@@ -1410,7 +1413,7 @@ describe('test run --local — every poll exit settles the charged run', () => {
           }),
           stdout: line => stdout.push(line),
           stderr: line => stderr.push(line),
-          sleep: async () => {},
+          ...(options.usesTimerSleep === true ? {} : { sleep: async () => {} }),
           createTunnelClient: fakeTunnel().factory,
         },
       );
@@ -1476,13 +1479,15 @@ describe('test run --local — every poll exit settles the charged run', () => {
     });
   });
 
-  it('also cancels and rethrows an unclassified exhausted 503 poll error unchanged', async () => {
+  it('also cancels and rethrows an unclassified exhausted 500 poll error unchanged', async () => {
     vi.useFakeTimers();
     try {
       const pending = capturePollExit({
         respond: call => {
+          // A 500 still ends the wait after its retries; a 503 is an outage
+          // the poll waits out until --timeout (next test).
           if (call.method === 'GET' && call.url.includes('/runs/')) {
-            return apiErrorResponse(503, 'UNAVAILABLE', 'poll backend unavailable');
+            return apiErrorResponse(500, 'INTERNAL', 'poll backend failed');
           }
           return undefined;
         },
@@ -1498,10 +1503,40 @@ describe('test run --local — every poll exit settles the charged run', () => {
       expect(result.stderr).toMatch(/Polling stopped/i);
       expect(result.stderr).toMatch(/Cancelled it/i);
       expect(result.thrown).toMatchObject({
+        code: 'INTERNAL',
+        exitCode: 1,
+        message: 'poll backend failed',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels, reports a partial and exits 10 when a 503 outage outlasts --timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = capturePollExit({
+        usesTimerSleep: true,
+        respond: call => {
+          if (call.method === 'GET' && call.url.includes('/runs/')) {
+            return apiErrorResponse(503, 'UNAVAILABLE', 'poll backend unavailable');
+          }
+          return undefined;
+        },
+      });
+      await vi.advanceTimersByTimeAsync(60_000);
+      const result = await pending;
+
+      expect(result.calls.filter(call => call.url.includes('/cancel'))).toHaveLength(1);
+      expect(result.partial).toMatchObject({ runId: 'run_abc', status: 'cancelled' });
+      expect(result.stderr).toMatch(/Cancelled it/i);
+      expect(result.thrown).toBeInstanceOf(UnreachableAtDeadlineError);
+      expect(result.thrown).toMatchObject({
         code: 'UNAVAILABLE',
         exitCode: 10,
-        message: 'poll backend unavailable',
+        details: { runId: 'run_abc', timeoutSeconds: 30 },
       });
+      expect((result.thrown as Error).message).toContain('poll backend unavailable');
     } finally {
       vi.useRealTimers();
     }
