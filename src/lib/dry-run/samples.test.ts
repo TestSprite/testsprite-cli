@@ -1022,10 +1022,14 @@ describe('findSample', () => {
 });
 
 describe('schedule samples', () => {
-  it('resolves every schedule route', () => {
+  it('resolves every schedule route and matches real base schedule shape', () => {
     expect(findSample('GET', '/schedules')?.operationId).toBe('listSchedules');
     expect(findSample('POST', '/schedules')?.operationId).toBe('createSchedule');
-    expect(findSample('GET', '/schedules/sch_1')?.operationId).toBe('getSchedule');
+    const getSample = findSample('GET', '/schedules/sch_1');
+    expect(getSample?.operationId).toBe('getSchedule');
+    const getBody = getSample?.body() as { environment?: unknown; environmentMode?: unknown };
+    expect(getBody.environment).toBeNull();
+    expect(getBody.environmentMode).toBe('inherit');
     expect(findSample('PATCH', '/schedules/sch_1')?.operationId).toBe('updateSchedule');
     expect(findSample('DELETE', '/schedules/sch_1')?.operationId).toBe('deleteSchedule');
   });
@@ -1054,11 +1058,11 @@ describe('schedule samples', () => {
     expect(body.name).toBe('Renamed');
   });
 
-  it('echoes environment, startAt and endAt in updateSchedule sample', () => {
+  it('echoes environment, startAt and endAt in updateSchedule sample using ISO strings', () => {
     const body = findSample('PATCH', '/schedules/sch_1', {
       environment: 'staging',
-      startAt: '2027-01-01T00:00:00.000Z',
-      endAt: '2027-06-01T00:00:00.000Z',
+      startAt: '2027-01-01',
+      endAt: '2027-06-01',
     })?.body() as {
       environment?: string;
       environmentMode?: string;
@@ -1067,8 +1071,8 @@ describe('schedule samples', () => {
     };
     expect(body.environment).toBe('staging');
     expect(body.environmentMode).toBe('pinned');
-    expect(body.startAt).toBe('2027-01-01T00:00:00.000Z');
-    expect(body.endAt).toBe('2027-06-01T00:00:00.000Z');
+    expect(body.startAt).toBe(new Date('2027-01-01').toISOString());
+    expect(body.endAt).toBe(new Date('2027-06-01').toISOString());
   });
 
   it('leaves fields the patch did not mention at their sample values', () => {

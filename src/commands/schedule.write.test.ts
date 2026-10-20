@@ -443,24 +443,24 @@ describe('get → update round trip', () => {
     expect(out.join('\n')).toContain('staging (pinned)');
   });
 
-  it('echoes start and end dates under --dry-run in json output', async () => {
+  it('echoes start and end dates under --dry-run in json output normalized as ISO strings', async () => {
     const out: string[] = [];
     const result = await runUpdate(
       {
         ...BASE,
         output: 'json',
         scheduleId: 'sch_1',
-        start: '2027-01-01T00:00:00.000Z',
-        end: '2027-06-01T00:00:00.000Z',
+        start: '2027-01-01',
+        end: '2027-06-01',
         dryRun: true,
       },
       { stdout: l => out.push(l), stderr: () => {} },
     );
-    expect(result.startAt).toBe('2027-01-01T00:00:00.000Z');
-    expect(result.endAt).toBe('2027-06-01T00:00:00.000Z');
+    expect(result.startAt).toBe(new Date('2027-01-01').toISOString());
+    expect(result.endAt).toBe(new Date('2027-06-01').toISOString());
     const json = JSON.parse(out.join('\n'));
-    expect(json.startAt).toBe('2027-01-01T00:00:00.000Z');
-    expect(json.endAt).toBe('2027-06-01T00:00:00.000Z');
+    expect(json.startAt).toBe(new Date('2027-01-01').toISOString());
+    expect(json.endAt).toBe(new Date('2027-06-01').toISOString());
   });
 });
 

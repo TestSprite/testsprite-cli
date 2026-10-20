@@ -170,6 +170,8 @@ const schedule: CliSchedule = {
   enabled: true,
   targetType: 'project',
   targetId: SAMPLE_PROJECT_ID,
+  environment: null,
+  environmentMode: 'inherit',
   cron: '0 3 * * *',
   timezone: 'UTC',
   startAt: '2026-05-01T00:00:00.000Z',
@@ -1161,6 +1163,14 @@ const ENTRIES: DryRunSampleEntry[] = [
   // reached the body, rather than showing an unrelated canned schedule.
   entry('updateSchedule', 'PATCH', '/schedules/{scheduleId}', (req?: unknown) => {
     const patch = req != null && typeof req === 'object' ? (req as Record<string, unknown>) : {};
+    const parseIso = (val: unknown): string | null | undefined => {
+      if (val === null) return null;
+      if (typeof val !== 'string') return undefined;
+      const d = new Date(val);
+      return Number.isNaN(d.getTime()) ? val : d.toISOString();
+    };
+    const startAt = parseIso(patch.startAt);
+    const endAt = parseIso(patch.endAt);
     return {
       ...schedule,
       ...(typeof patch.name === 'string' ? { name: patch.name } : {}),
@@ -1170,8 +1180,8 @@ const ENTRIES: DryRunSampleEntry[] = [
       ...(typeof patch.enabled === 'boolean' ? { enabled: patch.enabled } : {}),
       ...(typeof patch.cron === 'string' ? { cron: patch.cron } : {}),
       ...(typeof patch.timezone === 'string' ? { timezone: patch.timezone } : {}),
-      ...(typeof patch.startAt === 'string' ? { startAt: patch.startAt } : {}),
-      ...(typeof patch.endAt === 'string' || patch.endAt === null ? { endAt: patch.endAt } : {}),
+      ...(startAt !== undefined ? { startAt } : {}),
+      ...(endAt !== undefined ? { endAt } : {}),
       ...(typeof patch.sendTo === 'string' ? { sendTo: patch.sendTo } : {}),
       updatedAt: '2026-05-16T00:00:00.000Z',
     };
