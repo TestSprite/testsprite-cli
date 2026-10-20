@@ -7322,7 +7322,7 @@ function isTerminalPublicStatus(status: CliPublicStatus): boolean {
 
 /** Minimal client surface the backend-test wait fallback needs. */
 interface ResultReadClient {
-  get<T>(path: string, options?: { signal?: AbortSignal }): Promise<T>;
+  get<T>(path: string, options?: { signal?: AbortSignal; retryOnRateLimit?: boolean }): Promise<T>;
 }
 
 /**
@@ -7693,6 +7693,12 @@ export function renderRunResponseText(
  * (`test failure get`), so a JSON caller that skipped the probe was pointed at
  * `test artifact get <run-id>`, which has no bundle for a backend run.
  *
+ * The lookup only picks wording, so it must never hold back the run envelope
+ * or the exit code: it gets a {@link RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS} deadline
+ * and `retryOnRateLimit: false` (a 429 with `Retry-After` would otherwise be
+ * honoured for up to ~2 minutes — see `emitDupNameAdvisoryIfNeeded`), and
+ * either outcome falls back like any other lookup error.
+ *
  * This closes the standalone-path gap: `test run <id>` / `test wait <run-id>`
  * never supply a type hint, and now that BE run rows finalize server-side
  * (backend-v2.0 #551/#555) the wait fallback rarely fires — so a backend run
@@ -7710,14 +7716,24 @@ async function resolveRunCardIsBackend(
   if (knownType !== undefined) return knownType === 'backend';
   if (!testId) return false;
   if (output === 'json' && !isFailureHintStatus(status)) return false;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS);
   try {
-    const test = await client.get<CliTest>(`/tests/${encodeURIComponent(testId)}`);
+    const test = await client.get<CliTest>(`/tests/${encodeURIComponent(testId)}`, {
+      signal: ac.signal,
+      retryOnRateLimit: false,
+    });
     return test.type === 'backend';
   } catch (err) {
     if (err instanceof InterruptError) throw err;
     return false; // best-effort — fall back to the numeric step summary.
+  } finally {
+    clearTimeout(timer);
   }
 }
+
+/** Deadline for {@link resolveRunCardIsBackend}'s best-effort type lookup. */
+export const RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS = 5_000;
 
 /** Statuses that print a failure-bundle recovery hint on stderr. */
 function isFailureHintStatus(status: string): boolean {
