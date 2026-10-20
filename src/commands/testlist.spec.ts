@@ -19,6 +19,7 @@ import { takeTelemetryExtras } from '../lib/telemetry.js';
 import type { CliTestListDetail } from '../lib/testlist.types.js';
 import type { RunResponse } from '../lib/runs.types.js';
 
+/** Adapt a synchronous route fixture to fetch-compatible JSON responses. */
 function makeFetch(
   handler: (url: string, init: RequestInit) => { status?: number; body: unknown },
 ): typeof globalThis.fetch {
@@ -37,6 +38,7 @@ function makeFetch(
   }) as typeof globalThis.fetch;
 }
 
+/** Provide isolated test credentials through the environment without disk writes. */
 function makeCreds(
   apiKey = 'sk-user-test',
   apiUrl = 'http://localhost:13599',
@@ -80,6 +82,7 @@ const base = {
   dryRun: false,
 };
 
+/** Build a facade error response for command error and interruption assertions. */
 function errorBody(code: string, status: number) {
   return { status, body: { error: { code, message: code, requestId: 'r', details: {} } } };
 }
@@ -337,6 +340,7 @@ describe('testlist commands', () => {
 
 const instantSleep = () => Promise.resolve();
 
+/** Build a run response whose terminal status can vary across wait scenarios. */
 function makeRun(status: string): RunResponse {
   return {
     runId: 'run_abc',

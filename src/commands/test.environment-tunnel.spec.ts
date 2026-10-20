@@ -30,6 +30,10 @@ vi.mock('../lib/local-target.js', async importOriginal => ({
 const clientId = '11111111-2222-3333-4444-555555555555';
 const savedUrl = 'http://127.0.0.1:5173/';
 const common = { profile: 'default', output: 'json' as const, debug: false };
+/**
+ * Build an offline environment/tunnel fixture with configurable API responses.
+ * Capture requests and output, and inject shutdown events for interruption tests.
+ */
 function fixture(
   options: {
     url?: string;
@@ -1697,6 +1701,7 @@ describe('environment tunnel compatibility regressions', () => {
 });
 
 describe('creation tunnel preflight receipts', () => {
+  /** Write fixture plans with the requested test types for batch tunnel scenarios. */
   function plansFile(types: Array<'frontend' | 'backend'> = ['frontend', 'frontend']) {
     const plans = join(mkdtempSync(join(tmpdir(), 'creation-preflight-')), 'plans.jsonl');
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture-owned temporary directory.

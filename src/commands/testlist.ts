@@ -624,6 +624,11 @@ export async function runTestlistRun(
   );
 }
 
+/**
+ * Dispatch selected list members and optionally collect their terminal results.
+ * On interruption, emit acknowledged runs and settled outcomes before rethrowing;
+ * tunnel execution retains its separate cancellation and partial-output handling.
+ */
 async function runTestlistRunCore(
   opts: RunTestlistRunOptions,
   deps: TestListDeps = {},
