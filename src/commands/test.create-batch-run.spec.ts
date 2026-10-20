@@ -26,6 +26,7 @@ import {
   BATCH_RUN_RATE_LIMIT,
   BATCH_RUN_RATE_MAX_OUTER_RETRIES,
   DEFAULT_BATCH_RUN_CONCURRENCY,
+  PLAN_TEMPLATE_TEXT,
   createTestCommand,
   isTransientRateLimit,
   runCreate,
@@ -3650,6 +3651,61 @@ describe('create run chain flags without --run (#376)', () => {
     }
     expect(calls()).toBe(0);
   });
+
+  it('the run helpers treat a timeout without timeoutIsDefault as given', async () => {
+    const files = fixtures();
+    const { deps, calls } = refusingDeps(files);
+    const common = { profile: 'default', output: 'json' as const, debug: false };
+    const codeFileOpts = {
+      ...common,
+      projectId: 'project_1',
+      type: 'frontend' as const,
+      name: 'example',
+      codeFile: files.codeFile,
+    };
+    for (const invoke of [
+      () => runCreate({ ...codeFileOpts, timeout: 30 }, deps),
+      () => runCreateFromPlan({ ...common, planFrom: files.planFile, timeout: 30 }, deps),
+    ]) {
+      const err = await invoke().catch(e => e);
+      expect(err).toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'timeout' },
+      });
+    }
+    expect(calls()).toBe(0);
+    // Control: the CLI's parsed default (timeoutIsDefault: true) is not a given --timeout.
+    // No fetchImpl here, so --dry-run answers from its canned sample.
+    const dryDeps = { credentialsPath: files.credentialsPath, stdout: () => {}, stderr: () => {} };
+    await expect(
+      runCreate({ ...codeFileOpts, dryRun: true, timeout: 600, timeoutIsDefault: true }, dryDeps),
+    ).resolves.toBeDefined();
+    await expect(
+      runCreateFromPlan(
+        { ...common, planFrom: files.planFile, dryRun: true, timeout: 600, timeoutIsDefault: true },
+        dryDeps,
+      ),
+    ).resolves.toBeDefined();
+  });
+
+  it.each([
+    { label: '--wait', flags: ['--wait'] },
+    { label: '--timeout', flags: ['--timeout', '30'] },
+  ])(
+    'create --plan-template $label still prints the template and exits 0 (it ignores every other flag)',
+    async ({ flags }) => {
+      const files = fixtures();
+      const { deps, calls } = refusingDeps(files);
+      const out: string[] = [];
+      const command = createTestCommand({ ...deps, stdout: line => out.push(line) });
+      await expect(
+        command.parseAsync(['create', '--plan-template', ...flags], { from: 'user' }),
+      ).resolves.toBe(command);
+      expect(out.join('\n')).toBe(PLAN_TEMPLATE_TEXT);
+      expect(calls()).toBe(0);
+    },
+  );
 
   it('control: the same flags with --run are accepted and reach the run', async () => {
     const files = fixtures();

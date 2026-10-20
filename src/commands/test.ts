@@ -1508,7 +1508,7 @@ export async function runCreate(
   }
   assertRunChainFlagsNeedRun(opts.run, {
     wait: opts.wait,
-    timeout: opts.timeoutIsDefault === false,
+    timeout: opts.timeout !== undefined && opts.timeoutIsDefault !== true,
   });
   normalizeEnvironmentName(opts.environment);
   // P1-2: validate idempotency key before any I/O — non-ASCII chars cause a
@@ -3505,7 +3505,7 @@ export async function runCreateFromPlan(
   }
   assertRunChainFlagsNeedRun(opts.run, {
     wait: opts.wait,
-    timeout: opts.timeoutIsDefault === false,
+    timeout: opts.timeout !== undefined && opts.timeoutIsDefault !== true,
   });
   normalizeEnvironmentName(opts.environment);
   assertIdempotencyKey(opts.idempotencyKey);
@@ -14604,10 +14604,6 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       if (cmdOpts.env !== undefined && cmdOpts.run !== true) {
         throw localValidationError('env', '--env requires --run');
       }
-      assertRunChainFlagsNeedRun(cmdOpts.run, {
-        wait: cmdOpts.wait === true,
-        timeout: cmdOpts.timeout !== undefined,
-      });
       // Pure-local, no network/credentials, no other flag is
       // consulted. Checked first so `--plan-template` never trips the
       // --plan-from/--code-file mutual-exclusivity guard below.
@@ -14615,6 +14611,10 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         runPlanTemplate(resolveCommonOptions(command, deps.env), deps);
         return;
       }
+      assertRunChainFlagsNeedRun(cmdOpts.run, {
+        wait: cmdOpts.wait === true,
+        timeout: cmdOpts.timeout !== undefined,
+      });
       // --plan-from and --code-file are mutually exclusive. Dispatch
       // here so each `run*` function stays single-purpose. If neither
       // is set, the existing runCreate path enforces --code-file.
