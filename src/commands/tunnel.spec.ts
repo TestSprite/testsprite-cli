@@ -138,6 +138,61 @@ function fakeTunnel() {
 }
 
 describe('tunnel start', () => {
+  it('retries tunnel DELETE after ECONNRESET during Ctrl-C cleanup', async () => {
+    const shutdown = new ShutdownController();
+    const tunnel = fakeTunnel();
+    let deleteAttempts = 0;
+    let signalOnline: () => void = () => {};
+
+    const online = new Promise<void>(resolve => {
+      signalOnline = resolve;
+    });
+
+    const baseFetch = makeFetch(method =>
+      method === 'POST' ? { status: 201, body: MINT_BODY } : { status: 204 },
+    );
+
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const method = (init?.method ?? 'GET').toUpperCase();
+
+      if (method === 'DELETE' && String(input).includes('/tunnel/')) {
+        deleteAttempts += 1;
+
+        if (deleteAttempts === 1) {
+          throw new Error('ECONNRESET');
+        }
+      }
+
+      return baseFetch(input, init);
+    };
+
+    const running = runTunnelStart(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...makeCreds(),
+        fetchImpl,
+        shutdown,
+        stdout: () => signalOnline(),
+        stderr: () => {},
+        createTunnelClient: tunnel.factory,
+      },
+    );
+
+    await Promise.race([
+      online,
+      running.then(() => {
+        throw new Error('Tunnel exited before reaching online state');
+      }),
+    ]);
+
+    shutdown.interrupt('SIGINT');
+    await running;
+
+    expect(deleteAttempts).toBe(2);
+    expect(tunnel.calls.start).toBe(1);
+    expect(tunnel.calls.stop).toBe(1);
+  });
+
   it('prints the minted id on stderr before constructing the tunnel client in JSON mode', async () => {
     const events: string[] = [];
     const stdout: string[] = [];
