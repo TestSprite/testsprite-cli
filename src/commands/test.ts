@@ -11302,6 +11302,15 @@ export async function runTestRunAll(
     'run',
   );
 
+  // A rejected credential is batch-wide and must not be masked by undispatched
+  // tests. Other failures still yield to the deferred gate below.
+  if (freshRunResults.some(r => r.error?.exitCode === 3)) {
+    const authFailure = resolveWaitFailure(freshRunResults, {
+      timeoutSeconds: opts.timeoutSeconds,
+    });
+    if (authFailure) throw authFailure;
+  }
+
   // Rate-deferred tests were never dispatched → the batch is incomplete (exit 7),
   // mirroring `test rerun --all`. Checked before the failed-run throw so the
   // operator learns to retry the deferred set.
