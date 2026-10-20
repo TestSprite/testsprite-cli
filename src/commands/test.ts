@@ -9153,7 +9153,7 @@ export async function runTestCancel(
     if (result.alreadyCancelled) {
       stderrFn(`[advisory] run ${runId} was already cancelled`);
     }
-    warnFailedCancelRefunds(result.refund ? [{ runId, ...result.refund }] : [], stderrFn);
+    warnFailedCancelRefunds(result.refund ? [{ ...result.refund, runId }] : [], stderrFn);
     return result;
   }
 
@@ -9192,7 +9192,7 @@ export async function runTestCancel(
       .map(r => ({ runId: r.runId, status: r.conflictStatus ?? 'unknown' })),
     notFound: rows.filter(r => r.status === 'notFound').map(r => r.runId),
     errors: errorRows.map(r => ({ runId: r.runId, message: r.error ?? 'unknown error' })),
-    refunds: rows.flatMap(r => (r.refund ? [{ runId: r.runId, ...r.refund }] : [])),
+    refunds: rows.flatMap(r => (r.refund ? [{ ...r.refund, runId: r.runId }] : [])),
   };
 
   out.print(summary, data => renderCancelSummaryText(data as CliCancelSummary));

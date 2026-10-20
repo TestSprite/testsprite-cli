@@ -407,6 +407,41 @@ describe('runTestCancel — multi-id summary + exit precedence (CXL-11)', () => 
   );
 
   it.each([
+    { output: 'json' as const, runIds: ['run_actual'] },
+    { output: 'json' as const, runIds: ['run_actual', 'run_legacy'] },
+    { output: 'text' as const, runIds: ['run_actual', 'run_legacy'] },
+  ])(
+    'keeps requested refund IDs authoritative for $runIds in $output mode',
+    async ({ output, runIds }) => {
+      const { credentialsPath } = makeCreds();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      // The response validator preserves unknown refund fields for forward compatibility.
+      const refund = { status: 'failed' as const, runId: 'run_unrelated' };
+      const result = await runTestCancel(
+        { profile: 'default', output, debug: false, dryRun: false, runIds },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(url => {
+            const runId = runIdFromCancelUrl(url)!;
+            return { body: makeCancelResponse(runId, runId === 'run_actual' ? { refund } : {}) };
+          }),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+        },
+      );
+      expect(stderr.join('\n')).toContain('Refund failed for runs: run_actual;');
+      expect(stderr.join('\n')).not.toContain('run_unrelated');
+      if (runIds.length > 1) {
+        expect((result as CliCancelSummary).refunds).toEqual([
+          { runId: 'run_actual', status: 'failed' },
+        ]);
+        expect(stdout.join('\n')).not.toContain('run_unrelated');
+      }
+    },
+  );
+
+  it.each([
     { code: 'NOT_FOUND', exitCode: 4 },
     { code: 'CONFLICT', exitCode: 6 },
     { code: 'AUTH_FORBIDDEN', exitCode: 1 },
