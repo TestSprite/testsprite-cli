@@ -27,12 +27,18 @@
  *  triggered the run (every caller but `test wait`, see
  *  `PollOptions.isFirstContact`). Before that, the single-retry rule above
  *  keeps a wrong endpoint failing fast. 429 and INTERNAL keep their handling.
+ *  Stalled read once the endpoint has answered (no answer within the
+ *  long-poll window plus `READ_STALL_GRACE_MS`, counted again after each retry
+ *  wait inside the read) → abort it and handle it as an outage, so the next
+ *  read opens a fresh connection instead of waiting for undici's 300s headers
+ *  timeout while the run may already be finished.
  *  Deadline exceeded → throw `TimeoutError` (exit 7), or
  *  `UnreachableAtDeadlineError` (exit 10) when the last read was still an
  *  outage.
  */
 
-import { ApiError, InterruptError } from './errors.js';
+import { ApiError, InterruptError, TransportError } from './errors.js';
+import { composeAbortSignals } from './http.js';
 import type { ShutdownHandle } from './interrupt.js';
 import { defaultSleep, isAbortError, sleepUnlessInterrupted } from './poll-support.js';
 import type { RunResponse } from './runs.types.js';
@@ -49,7 +55,12 @@ export { isTerminalStatus } from './runs.types.js';
 export interface RunClient {
   getRun(
     runId: string,
-    options?: { waitSeconds?: number; signal?: AbortSignal },
+    options?: {
+      waitSeconds?: number;
+      signal?: AbortSignal;
+      /** Called before each retry wait inside the read; see `RequestOptions.onRetryWait`. */
+      onRetryWait?: (delayMs: number) => void;
+    },
   ): Promise<RunResponse>;
 }
 
@@ -91,6 +102,21 @@ export class UnreachableAtDeadlineError extends ApiError {
     );
     this.name = 'UnreachableAtDeadlineError';
     this.runId = runId;
+  }
+}
+
+/**
+ * A poll read that got no answer within its stall budget: the connection most
+ * likely died without an error (a Wi-Fi switch, a VPN reconnect, a laptop
+ * sleep). A transport failure (UNAVAILABLE), so the loop handles it like any
+ * other outage once the endpoint has answered.
+ */
+export class ReadStalledError extends TransportError {
+  readonly budgetMs: number;
+  constructor(budgetMs: number) {
+    super(`no answer for ${Math.round(budgetMs / 1000)}s`);
+    this.name = 'ReadStalledError';
+    this.budgetMs = budgetMs;
   }
 }
 
@@ -156,6 +182,13 @@ export interface PollOptions {
 }
 
 const LONG_POLL_WAIT_SECONDS = 25;
+/**
+ * How long past its long-poll window a read may stay unanswered before it
+ * counts as stalled (ms). The server answers a `waitSeconds` read when the
+ * window ends, so 20s of silence beyond it (45s for the 25s window) means the
+ * connection is gone rather than slow.
+ */
+const READ_STALL_GRACE_MS = 20_000;
 /** Backoff schedule for the non-long-poll fallback path (ms). */
 const BACKOFF_SCHEDULE_MS = [2000, 4000, 8000, 15000];
 /**
@@ -336,15 +369,29 @@ async function pollIterations(
     const remainingMs = deadlineMs - now;
     const remainingSeconds = Math.ceil(remainingMs / 1000);
 
+    const waitSeconds = useBackoff ? undefined : Math.min(remainingSeconds, LONG_POLL_WAIT_SECONDS);
+    const readRun = (
+      signal: AbortSignal,
+      onRetryWait?: (delayMs: number) => void,
+    ): Promise<RunResponse> =>
+      client.getRun(runId, {
+        ...(waitSeconds === undefined ? {} : { waitSeconds }),
+        signal,
+        ...(onRetryWait === undefined ? {} : { onRetryWait }),
+      });
+
     let run: RunResponse;
     const requestStartedMs = now;
     try {
-      if (useBackoff) {
-        run = await client.getRun(runId, { signal: sessionSignal });
-      } else {
-        const waitSeconds = Math.min(remainingSeconds, LONG_POLL_WAIT_SECONDS);
-        run = await client.getRun(runId, { waitSeconds, signal: sessionSignal });
-      }
+      // The stall guard is armed once the endpoint has answered: before that,
+      // a silent endpoint is a misconfiguration for the deadline to report.
+      run = hasEndpointAnswered
+        ? await readWithStallGuard(
+            sessionSignal,
+            (waitSeconds ?? 0) * 1000 + READ_STALL_GRACE_MS,
+            readRun,
+          )
+        : await readRun(sessionSignal);
       // Successful GET resets the consecutive-error counter.
       consecutiveErrors = 0;
       notYetVisibleRetries = 0;
@@ -375,7 +422,8 @@ async function pollIterations(
       const isOutage = err.code === 'UNAVAILABLE' && hasEndpointAnswered;
       outageFailure = isOutage ? err : undefined;
       if (isOutage) {
-        outageStartedMs ??= Date.now();
+        // A stalled read went quiet when it started, not when the guard fired.
+        outageStartedMs ??= Date.now() - (err instanceof ReadStalledError ? err.budgetMs : 0);
         const delayMs = outageRetryDelay(err, outageRetries);
         outageRetries += 1;
         onTransition?.(
@@ -536,4 +584,41 @@ function outageRetryDelay(failure: ApiError, outageRetries: number): number {
   );
   if (retryAfterSec !== undefined) return Math.max(0, retryAfterSec * 1000);
   return backoffScheduleDelay(outageRetries);
+}
+
+/**
+ * Run one poll read that is aborted after `budgetMs` without an answer, on top
+ * of the session signal (deadline and Ctrl-C). Without it, a read on a
+ * connection that died silently waits for undici's 300s headers timeout,
+ * because the wait client raises its own per-request timeout to cover
+ * `--timeout`. A stall surfaces as `ReadStalledError`, so the loop handles it
+ * as an outage and the next read opens a fresh connection. Each retry wait
+ * inside the read (`onRetryWait`: a transport backoff, a 429's Retry-After)
+ * restarts the budget after the wait, so the guard never cuts a retry short
+ * and never retries faster than `http.ts`. Composed with listeners, not
+ * `AbortSignal.any`, for the reason documented on `composeAbortSignals`.
+ */
+async function readWithStallGuard<T>(
+  sessionSignal: AbortSignal,
+  budgetMs: number,
+  read: (signal: AbortSignal, onRetryWait: (delayMs: number) => void) => Promise<T>,
+): Promise<T> {
+  const stall = new AbortController();
+  // Cleared in `finally` as soon as the read settles.
+  let stallTimer = setTimeout(() => stall.abort(), budgetMs);
+  const restartAfterRetryWait = (delayMs: number): void => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => stall.abort(), delayMs + budgetMs);
+  };
+  const readAbort = composeAbortSignals([sessionSignal, stall.signal]);
+  try {
+    return await read(readAbort.signal, restartAfterRetryWait);
+  } catch (err) {
+    // The session signal (deadline, Ctrl-C) keeps its own meaning.
+    if (stall.signal.aborted && !sessionSignal.aborted) throw new ReadStalledError(budgetMs);
+    throw err;
+  } finally {
+    clearTimeout(stallTimer);
+    readAbort.cleanup();
+  }
 }

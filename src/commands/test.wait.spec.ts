@@ -1352,6 +1352,60 @@ describe('runTestWait: network outage mid-wait', () => {
     expect(fetchCalls).toBe(8);
     expect(stdoutLines).toEqual([]);
   });
+
+  it('aborts a long-poll read that never answers after 45s and reconnects, instead of waiting ~300s', async () => {
+    vi.useFakeTimers();
+    const { credentialsPath } = makeCreds();
+    // Poll read 1 answers; poll read 2 is a dead socket (no answer, no error)
+    // until its signal aborts; poll read 3, on a fresh connection, is the
+    // verdict. Other requests (the backend-result lookup) answer normally.
+    let pollReads = 0;
+    let secondReadAbortedAtMs: number | undefined;
+    const startMs = Date.now();
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (!url.includes('/runs/run_abc')) return jsonRunResponse('running');
+      pollReads += 1;
+      if (pollReads === 2) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => {
+              secondReadAbortedAtMs = Date.now() - startMs;
+              reject(init.signal!.reason);
+            },
+            { once: true },
+          );
+        });
+      }
+      return jsonRunResponse(pollReads === 1 ? 'running' : 'passed');
+    };
+    const stderrLines: string[] = [];
+
+    const pending = runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        verbose: true,
+        runId: 'run_abc',
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await pending;
+
+    expect(result.status).toBe('passed');
+    expect(pollReads).toBe(3);
+    // Read 2 starts at 2s (the long-poll floor after an instant answer) and is
+    // aborted 45s later.
+    expect(secondReadAbortedAtMs).toBe(47_000);
+    expect(stderrLines.join('\n')).toContain(
+      '[verbose] Cannot reach the TestSprite API (no answer for 45s); run run_abc keeps executing server-side.',
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
