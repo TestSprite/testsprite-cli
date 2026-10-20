@@ -1,9 +1,14 @@
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import * as fs from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultConfigPath, loadConfig } from './config.js';
 import { writeProfile } from './credentials.js';
+
+vi.mock('node:fs', async importOriginal => ({
+  ...(await importOriginal<typeof import('node:fs')>()),
+}));
 
 let tmpRoot: string;
 let credentialsPath: string;
@@ -42,33 +47,34 @@ describe('loadConfig', () => {
     },
   );
 
-  it.skipIf(process.platform === 'win32')(
-    'uses complete overrides without reading an unreadable credentials file',
-    () => {
-      writeFileSync(credentialsPath, '[default]\napi_key = sk-file\n');
-      chmodSync(credentialsPath, 0);
-      try {
-        expect(() => readFileSync(credentialsPath)).toThrowError(
-          expect.objectContaining({ code: 'EACCES' }),
-        );
-        expect(
-          loadConfig({
-            env: { TESTSPRITE_API_KEY: 'sk-env', TESTSPRITE_API_URL: 'https://env.example.com' },
-            credentialsPath,
-          }),
-        ).toEqual({
-          profile: 'default',
-          apiKey: 'sk-env',
-          apiUrl: 'https://env.example.com',
-        });
-        expect(() =>
-          loadConfig({ env: { TESTSPRITE_API_KEY: 'sk-env' }, credentialsPath }),
-        ).toThrowError(expect.objectContaining({ code: 'EACCES' }));
-      } finally {
-        chmodSync(credentialsPath, 0o600);
-      }
-    },
-  );
+  it('uses complete overrides without reading an unreadable credentials file', () => {
+    writeFileSync(credentialsPath, '[default]\napi_key = sk-file\n');
+    const readFileSync = fs.readFileSync;
+    const permissionError = Object.assign(new Error('Permission denied'), { code: 'EACCES' });
+    const read = vi.spyOn(fs, 'readFileSync').mockImplementation((...args) => {
+      if (args[0] === credentialsPath) throw permissionError;
+      return readFileSync(...args);
+    });
+    try {
+      expect(
+        loadConfig({
+          env: { TESTSPRITE_API_KEY: 'sk-env', TESTSPRITE_API_URL: 'https://env.example.com' },
+          credentialsPath,
+        }),
+      ).toEqual({
+        profile: 'default',
+        apiKey: 'sk-env',
+        apiUrl: 'https://env.example.com',
+      });
+      expect(read).not.toHaveBeenCalled();
+      expect(() =>
+        loadConfig({ env: { TESTSPRITE_API_KEY: 'sk-env' }, credentialsPath }),
+      ).toThrow(permissionError);
+      expect(read).toHaveBeenCalledTimes(1);
+    } finally {
+      read.mockRestore();
+    }
+  });
 
   it.each([
     { env: { TESTSPRITE_API_KEY: 'sk-env' }, endpointUrl: undefined },
