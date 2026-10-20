@@ -10985,13 +10985,10 @@ export async function runTestRunAll(
   // NOTE: batchDeadlineMs is set in the D3 deferred-retry loop above and reused here.
 
   function freshPollFailureFields(finalRun: RunResponse): Partial<CliBatchRunFreshResult> {
+    if (finalRun.status === 'passed') return {};
     return {
-      ...(finalRun.status !== 'passed'
-        ? {
-            failureKind: finalRun.failureKind,
-            failedStepIndex: finalRun.failedStepIndex,
-          }
-        : {}),
+      failureKind: finalRun.failureKind,
+      failedStepIndex: finalRun.failedStepIndex,
       ...(finalRun.error
         ? { error: { code: 'INTERNAL', message: finalRun.error, exitCode: 1 } }
         : {}),

@@ -13140,6 +13140,16 @@ describe('test run --all --wait — pollFreshAccepted failure diagnostics (#448)
     expect(row).not.toHaveProperty('failedStepIndex');
     expect(row).not.toHaveProperty('error');
   });
+
+  it('passing rows omit error even when the poll body carries a stray error string', async () => {
+    const payload = await runAllWait(
+      60,
+      terminalRunBody('passed', { error: 'stale message must not surface' }),
+    );
+    const row = payload.accepted[0]!;
+    expect(row.status).toBe('passed');
+    expect(row).not.toHaveProperty('error');
+  });
 });
 
 // ---------------------------------------------------------------------------
