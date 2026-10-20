@@ -10094,8 +10094,9 @@ export async function runTestRunAll(
   // --- Dry-run path ---
   if (opts.dryRun) {
     assertNoTunnelOptions(opts);
-    // This path returns before makeClient() fires the banner, so emit it
-    // here — otherwise the canned sample can be mistaken for a live response.
+    // This path returns without making any dry-run request, so emit the
+    // banner here — otherwise the canned sample can be mistaken for a live
+    // response.
     emitDryRunBanner(stderrFn);
     const idempotencyKey = opts.idempotencyKey ?? `dry-run-${randomUUID()}`;
     const batchRunSample = findSample('POST', '/api/cli/v1/tests/batch/run')?.body();

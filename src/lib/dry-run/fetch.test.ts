@@ -49,4 +49,16 @@ describe('createDryRunFetch', () => {
     const res = await fetch('https://api.testsprite.com/api/cli/v1/projects?pageSize=2');
     expect(res.status).toBe(200);
   });
+
+  it('fires onFirstRequest exactly once, on the first request', async () => {
+    let calls = 0;
+    const cbFetch = createDryRunFetch(() => {
+      calls += 1;
+    });
+    expect(calls).toBe(0);
+    await cbFetch('https://api.testsprite.com/api/cli/v1/me');
+    expect(calls).toBe(1);
+    await cbFetch('https://api.testsprite.com/api/cli/v1/projects');
+    expect(calls).toBe(1);
+  });
 });

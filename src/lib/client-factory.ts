@@ -336,14 +336,18 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
   if (opts.dryRun) {
     const dryRunEndpoint = opts.endpointUrl ?? DRY_RUN_DEFAULT_ENDPOINT;
     // Validate even under --dry-run so a typo in --endpoint-url is caught
-    // offline (no creds, no network). Validate BEFORE the banner so a rejected
-    // endpoint doesn't first announce a "sample response".
+    // offline (no creds, no network). A rejected endpoint throws here, before
+    // any dry-run response is produced, so no banner is announced first.
     assertValidEndpointUrl(dryRunEndpoint);
-    emitDryRunBanner(stderr);
+    // The banner is emitted lazily on the first dry-run response (via the
+    // fetch below), not at client construction — so a command that fails
+    // local validation after building the client never announces a "sample
+    // response" it will not produce.
+    const emitBannerOnce = () => emitDryRunBanner(stderr);
     return {
       baseUrl: facadeBaseUrl(dryRunEndpoint),
       apiKey: DRY_RUN_API_KEY,
-      fetchImpl: deps.fetchImpl ?? createDryRunFetch(),
+      fetchImpl: deps.fetchImpl ?? createDryRunFetch(emitBannerOnce),
       onDebug: opts.debug ? (event: DebugEvent) => stderr(formatDryRunDebug(event)) : undefined,
       onTransition: opts.verbose ? (msg: string) => stderr(`[verbose] ${msg}`) : undefined,
       env,

@@ -22,8 +22,16 @@ const JSON_HEADERS = {
   'x-request-id': SAMPLE_DRY_RUN_REQUEST_ID,
 };
 
-export function createDryRunFetch(): FetchImpl {
+export function createDryRunFetch(onFirstRequest?: () => void): FetchImpl {
+  let firstRequestFired = false;
   return async (input, init) => {
+    // Fire once, on the first dry-run request, so callers can lazily announce
+    // the dry-run only when a canned response is actually being produced —
+    // never before local validation has had a chance to fail.
+    if (!firstRequestFired) {
+      firstRequestFired = true;
+      onFirstRequest?.();
+    }
     const url = resolveUrl(input);
     const method = (init?.method ?? 'GET').toUpperCase();
 
