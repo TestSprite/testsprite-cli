@@ -15210,6 +15210,16 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           '--filter only applies with --all (it narrows which project tests run). Remove --filter, or add --all with --project <id> or TESTSPRITE_PROJECT_ID.',
         );
       }
+      // --allow-empty softens the zero-dispatch gate of a batch (--all, or
+      // several ids through a tunnel, where backend ids are skipped). A single
+      // <test-id> never reaches that gate, so the flag would be SILENTLY
+      // ignored there (mirrors `test rerun --allow-empty`). Reject early.
+      if (cmdOpts.allowEmpty === true && !isAll && new Set(testIdArgs).size === 1) {
+        throw localValidationError(
+          'allow-empty',
+          '--allow-empty only applies with --all or several test ids (it permits a batch that dispatches zero tests). Remove --allow-empty, or add --all with --project <id> or TESTSPRITE_PROJECT_ID.',
+        );
+      }
       // --local resolution. Every one of these refuses BEFORE any network
       // call, which is the contract `--local` is sold on: a mistake in the
       // invocation must never reach a run row, a credit spend, or a minted

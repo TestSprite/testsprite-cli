@@ -614,6 +614,24 @@ describe('environment tunnel resolution', () => {
     ).toEqual(['/tests/a/runs']);
     expect(f.stderr.join('\n')).toContain('1 backend test(s) skipped');
   });
+  it('several-id automatic tunnel: --allow-empty still softens an all-backend zero dispatch', async () => {
+    // Every id is a backend test, so the tunnel batch dispatches nothing: exit 5
+    // without the flag, exit 0 with it. Unlike a single <test-id> (#376), the
+    // flag is live here.
+    const tests = [
+      { id: 'a', type: 'backend', projectId: 'P' },
+      { id: 'b', type: 'backend', projectId: 'P' },
+    ];
+    const gated = fixture({ tests });
+    await expect(gated.run('run', 'a', 'b', '--skip-preflight')).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.stringContaining('pass --allow-empty to exit 0 intentionally'),
+    });
+    const allowed = fixture({ tests });
+    await allowed.run('run', 'a', 'b', '--skip-preflight', '--allow-empty');
+    expect(allowed.calls.some(c => c.method === 'POST')).toBe(false);
+    expect(allowed.stderr.join('\n')).toContain('--allow-empty set — exiting 0');
+  });
   it('rerun --all keeps the batch envelope and emits one idempotency key', async () => {
     const f = fixture();
     await runTestRerun(
