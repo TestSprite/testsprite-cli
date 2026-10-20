@@ -261,14 +261,15 @@ describe('runInstall — fresh install', () => {
 // ---------------------------------------------------------------------------
 
 describe('runInstall — idempotency (skipped)', () => {
-  it('re-run with identical content → action skipped, no extra write', async () => {
+  it.each(['\n', '\r\n'])('equivalent %j content skips without writing', async newline => {
     const { store, fs: agentFs, writeCalls, seedFile } = makeMemFs();
     const { capture, deps } = makeCapture();
 
     // Pre-seed with the canonical content
     const { path: relPath, content } = renderForTarget('claude', 'testsprite-verify');
     const abs = path.resolve(CWD, relPath);
-    seedFile(abs, content);
+    const existing = content.replace(/\n/g, newline);
+    seedFile(abs, existing);
 
     const writeCountBefore = writeCalls.length;
 
@@ -289,7 +290,7 @@ describe('runInstall — idempotency (skipped)', () => {
     expect(writeCalls.length).toBe(writeCountBefore);
     expect(capture.stdout.join('\n')).toContain('skipped');
     // Content unchanged
-    expect(store.get(abs)).toBe(content);
+    expect(store.get(abs)).toBe(existing);
   });
 });
 
@@ -1954,7 +1955,7 @@ describe('runInstall — codex managed-section: replace (sentinels already prese
 });
 
 describe('runInstall — codex managed-section: unchanged (byte-identical section)', () => {
-  it('reports section-unchanged and makes no write when content matches', async () => {
+  it.each(['\n', '\r\n'])('matching %j section makes no write', async newline => {
     const { store, fs: agentFs, seedFile, writeCalls } = makeMemFs();
     const { deps: deps1 } = makeCapture();
 
@@ -1967,7 +1968,7 @@ describe('runInstall — codex managed-section: unchanged (byte-identical sectio
     );
 
     // Re-read from the store to get the canonical content
-    const canonicalContent = store.get(agentsAbs)!;
+    const canonicalContent = store.get(agentsAbs)!.replace(/\n/g, newline);
     // Re-seed to simulate no change
     seedFile(agentsAbs, canonicalContent);
 
@@ -2910,6 +2911,33 @@ describe('runStatus — agent status (issue #123)', () => {
     expect(rows).toHaveLength(Object.keys(TARGETS).length * DEFAULT_SKILLS.length);
     expect(thrown).toBeUndefined();
   });
+
+  it.each(['claude', 'cursor', 'windsurf'] as AgentTarget[])(
+    'CRLF artifacts read ok and real edits remain modified (%s)',
+    async target => {
+      const { fs: agentFs, seedFile } = makeMemFs();
+      const canonical = renderForTarget(target, 'testsprite-verify').content.replace(/\n/g, '\r\n');
+      const abs = path.resolve(CWD, pathFor(target, 'testsprite-verify'));
+      seedFile(abs, canonical);
+      const clean = await statusRows(agentFs);
+      expect(clean.thrown).toBeUndefined();
+      expect(
+        clean.rows.find(r => r.target === target && r.skill === 'testsprite-verify')?.state,
+      ).toBe('ok');
+      seedFile(abs, canonical + '<!-- local edit -->\r\n');
+      const edited = await statusRows(agentFs);
+      expect((edited.thrown as CLIError).exitCode).toBe(1);
+      expect(
+        edited.rows.find(r => r.target === target && r.skill === 'testsprite-verify')?.state,
+      ).toBe('modified');
+      await expect(
+        runInstall(
+          { ...BASE_OPTS, target: [target], skills: ['testsprite-verify'], force: false },
+          { cwd: CWD, fs: agentFs, ...makeCapture().deps },
+        ),
+      ).rejects.toMatchObject({ exitCode: 6 });
+    },
+  );
 
   // Inverse of the sweep above: on a compactBody target the FULL body is not
   // canonical, so an artifact carrying its hash must still read stale.
