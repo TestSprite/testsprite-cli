@@ -79,6 +79,7 @@ import {
   requireEnum,
   requireString,
 } from '../lib/validate.js';
+import { requireNonEmpty } from '../lib/args.js';
 import {
   isStandingRateLimit,
   REQUEST_TIMEOUT_DEFAULT_MS,
@@ -1867,12 +1868,6 @@ function resolveAbsolute(path: string): string {
  */
 function stripBom(raw: string): string {
   return raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
-}
-
-function requireNonEmpty(flagName: string, value: string): void {
-  if (typeof value !== 'string' || value.trim().length === 0) {
-    throw localValidationError(flagName, 'is required');
-  }
 }
 
 /**
@@ -5351,6 +5346,7 @@ interface GetOptions extends CommonOptions {
 }
 
 export async function runGet(opts: GetOptions, deps: TestDeps = {}): Promise<CliTest> {
+  requireNonEmpty('test-id', opts.testId);
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
 
@@ -5390,6 +5386,7 @@ interface CodeGetOptions extends CommonOptions {
  * any, is left untouched.
  */
 export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Promise<CliTestCode> {
+  requireNonEmpty('test-id', opts.testId);
   // Dry-run: no fetch, no fs. Print the canned shape to stdout and, if
   // the user passed `--out`, log on stderr what would have been written.
   // We deliberately do NOT validate the `--out` path here in dry-run —
@@ -6295,6 +6292,7 @@ export async function runOpen(
   deps: TestDeps = {},
   opener: (url: string) => void = openInBrowser,
 ): Promise<{ dashboardUrl: string }> {
+  requireNonEmpty('test-id', opts.testId);
   const out = makeOutput(opts.output, deps);
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
@@ -6340,6 +6338,7 @@ export async function runSteps(
   opts: StepsOptions,
   deps: TestDeps = {},
 ): Promise<Page<CliTestStep>> {
+  requireNonEmpty('test-id', opts.testId);
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
@@ -6485,6 +6484,7 @@ export async function runResult(
   opts: ResultOptions,
   deps: TestDeps = {},
 ): Promise<CliLatestResult> {
+  requireNonEmpty('test-id', opts.testId);
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
@@ -6637,6 +6637,7 @@ export async function runResultHistory(
   opts: ResultHistoryOptions,
   deps: TestDeps = {},
 ): Promise<ListRunsResponse> {
+  requireNonEmpty('test-id', opts.testId);
   const out = makeOutput(opts.output, deps);
 
   // Validate page size BEFORE makeClient: local validation must win over
@@ -6878,6 +6879,7 @@ export async function runFailureSummary(
   opts: FailureSummaryOptions,
   deps: TestDeps = {},
 ): Promise<CliFailureSummary> {
+  requireNonEmpty('test-id', opts.testId);
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
 
@@ -6939,6 +6941,7 @@ export async function runFailureGet(
   opts: FailureGetOptions,
   deps: TestDeps = {},
 ): Promise<FailureGetResult> {
+  requireNonEmpty('test-id', opts.testId);
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
 

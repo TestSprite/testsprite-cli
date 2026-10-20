@@ -13,6 +13,7 @@ import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '..
 import { formatScheduleFrequencyAdvisory, runsPerMonth } from '../lib/cron.js';
 import { renderTextTable, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
+import { requireNonEmpty } from '../lib/args.js';
 import { historyRetentionNote, type HistoryRetentionMeta } from '../lib/history-retention.js';
 
 /** A schedule as returned by the API. */
@@ -198,6 +199,7 @@ export async function runList(
 // ---------------------------------------------------------------------------
 
 export async function runGet(opts: GetOptions, deps: ScheduleDeps = {}): Promise<CliSchedule> {
+  requireNonEmpty('schedule-id', opts.scheduleId);
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
 
@@ -471,6 +473,7 @@ export async function runDelete(
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   assertIdempotencyKey(opts.idempotencyKey);
+  requireNonEmpty('schedule-id', opts.scheduleId);
 
   if (!opts.confirm && !opts.dryRun) {
     throw ApiError.fromEnvelope({
@@ -511,6 +514,7 @@ export async function runRunList(
   opts: RunListOptions,
   deps: ScheduleDeps = {},
 ): Promise<ScheduleRunListResponse> {
+  requireNonEmpty('schedule-id', opts.scheduleId);
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
 
