@@ -4801,8 +4801,9 @@ async function runBatchRun(
       };
     }
     // Pass only the REMAINING seconds into pollRunUntilTerminal so trigger
-    // retries don't restart the timeout clock from zero.
-    const remainingSeconds = Math.floor(rem / 1000) || 1;
+    // retries don't restart the timeout clock from zero. Preserve fractional
+    // seconds so the poll deadline matches the original per-spec deadline.
+    const remainingSeconds = rem / 1000;
     let finalRun: RunResponse;
     try {
       finalRun = await pollRunUntilTerminal(client, triggerResponse.runId, {
