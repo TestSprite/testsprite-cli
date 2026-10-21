@@ -996,6 +996,7 @@ describe('failed PUT response body', () => {
     });
     const io = captureIo();
     vi.useFakeTimers();
+    let settled = false;
     try {
       const result = runDocsUpload(baseOpts({ file: path, requestTimeoutMs: 1000 }), {
         credentialsPath,
@@ -1003,12 +1004,23 @@ describe('failed PUT response body', () => {
         shutdown,
         stdout: io.stdout,
         stderr: io.stderr,
-      }).catch((err: unknown) => err);
+      }).catch((err: unknown) => {
+        settled = true;
+        return err;
+      });
       await started;
-      if (kind === 'timeout') await vi.advanceTimersByTimeAsync(1000);
-      else shutdown.interrupt('SIGINT');
+      if (kind === 'timeout') {
+        await vi.advanceTimersByTimeAsync(999);
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+      } else shutdown.interrupt('SIGINT');
       const error = await result;
       expect(error).toBeInstanceOf(kind === 'timeout' ? RequestTimeoutError : InterruptError);
+      expect(error).toMatchObject(
+        kind === 'timeout'
+          ? { code: 'REQUEST_TIMEOUT', exitCode: 7, timeoutMs: 1000 }
+          : { code: 'INTERRUPTED', exitCode: 130 },
+      );
       expect(calls.map(call => call.method)).toEqual(['POST', 'PUT']);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
