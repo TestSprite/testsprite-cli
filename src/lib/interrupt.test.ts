@@ -3,6 +3,7 @@ import { writeSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { InterruptError } from './errors.js';
 import {
+  INTERRUPT_EXIT_BACKSTOP_MS,
   SIGINT_EXIT_CODE,
   ShutdownController,
   TERMINATION_EXIT_CODES,
@@ -321,16 +322,60 @@ describe('installBrokenPipeGuard', () => {
     return Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
   }
 
-  it('exits 0 on stdout EPIPE (clean SIGPIPE-equivalent for `| head`)', () => {
+  function installDisarmed(exitCode: () => number | string | undefined) {
     const stdout = new EventEmitter();
     const stderr = new EventEmitter();
     const exit = vi.fn();
     const shutdown = new ShutdownController();
-    installBrokenPipeGuard({ stdout, stderr, exit, shutdown });
+    let fire: (() => void) | undefined;
+    const unref = vi.fn();
+    const setTimer = vi.fn((callback: () => void, _delayMs: number) => {
+      fire = callback;
+      return { unref };
+    });
+    installBrokenPipeGuard({ stdout, stderr, exit, shutdown, setTimer, exitCode });
+    return { stdout, exit, shutdown, setTimer, unref, fire: () => fire?.() };
+  }
 
-    stdout.emit('error', makeEpipe());
-    expect(exit).toHaveBeenCalledWith(0);
-    expect(shutdown.signal.aborted).toBe(false);
+  it('exits 0 on stdout EPIPE (clean SIGPIPE-equivalent for `| head`)', () => {
+    const guard = installDisarmed(() => undefined);
+
+    guard.stdout.emit('error', makeEpipe());
+    guard.fire();
+    expect(guard.exit).toHaveBeenCalledWith(0);
+    expect(guard.shutdown.signal.aborted).toBe(false);
+  });
+
+  it('disarmed: a failing verdict set after EPIPE keeps its exit code', () => {
+    // index.ts sets the verdict's code only after an async telemetry flush,
+    // so the EPIPE lands first. The guard must not exit 0 in between.
+    const verdict: { code?: number } = {};
+    const guard = installDisarmed(() => verdict.code);
+
+    guard.stdout.emit('error', makeEpipe());
+    expect(guard.exit).not.toHaveBeenCalled();
+    verdict.code = 1;
+    guard.fire();
+    expect(guard.exit).toHaveBeenCalledExactlyOnceWith(1);
+  });
+
+  it('disarmed: arms one unref-ed backstop so the event loop can drain first', () => {
+    const guard = installDisarmed(() => undefined);
+
+    guard.stdout.emit('error', makeEpipe());
+    guard.stdout.emit('error', makeEpipe());
+    expect(guard.setTimer).toHaveBeenCalledOnce();
+    expect(guard.setTimer).toHaveBeenCalledWith(expect.any(Function), INTERRUPT_EXIT_BACKSTOP_MS);
+    expect(guard.unref).toHaveBeenCalledOnce();
+    expect(guard.exit).not.toHaveBeenCalled();
+  });
+
+  it('disarmed: a non-numeric exit code falls back to 0', () => {
+    const guard = installDisarmed(() => 'oops');
+
+    guard.stdout.emit('error', makeEpipe());
+    guard.fire();
+    expect(guard.exit).toHaveBeenCalledWith(0);
   });
 
   it('armed scope: stdout EPIPE requests graceful cleanup instead of exiting immediately', async () => {
@@ -365,6 +410,33 @@ describe('installBrokenPipeGuard', () => {
     await lifetime;
     expect(cleanup).toHaveBeenCalledOnce();
     expect(shutdown.isArmed).toBe(false);
+  });
+
+  it('armed scope: a failing verdict after EPIPE is never overridden by the guard', async () => {
+    const stdout = new EventEmitter();
+    const stderr = new EventEmitter();
+    const exit = vi.fn();
+    const setTimer = vi.fn(() => ({ unref: vi.fn() }));
+    const shutdown = new ShutdownController();
+    const disarm = shutdown.arm();
+    const verdict: { code?: number } = {};
+    installBrokenPipeGuard({
+      stdout,
+      stderr,
+      exit,
+      shutdown,
+      setTimer,
+      exitCode: () => verdict.code,
+    });
+
+    stdout.emit('error', makeEpipe());
+    // The tunnel lifetime's teardown runs, then the run's verdict propagates.
+    disarm();
+    verdict.code = 1;
+    await Promise.resolve();
+    expect(exit).not.toHaveBeenCalled();
+    expect(setTimer).not.toHaveBeenCalled();
+    expect(shutdown.received).toBe('EPIPE');
   });
 
   it('re-throws a non-EPIPE stdout error instead of silently swallowing it', () => {
