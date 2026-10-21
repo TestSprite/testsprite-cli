@@ -60,6 +60,7 @@ import {
   parseJUnitReportFormat,
   type JUnitTestResult,
 } from '../lib/junit-report.js';
+import { decodeWithBom, readTextFileBomAware } from '../lib/text-file.js';
 import {
   ApiError,
   CLIError,
@@ -1815,7 +1816,7 @@ function readCodeFileGuarded(path: string): string {
 
 function readCodeFile(path: string): string {
   try {
-    return stripBom(readFileSync(resolveAbsolute(path), 'utf8'));
+    return readTextFileBomAware(resolveAbsolute(path));
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT') {
@@ -1831,17 +1832,6 @@ function readCodeFile(path: string): string {
 
 function resolveAbsolute(path: string): string {
   return isAbsolute(path) ? path : resolve(process.cwd(), path);
-}
-
-/**
- * Drop a leading UTF-8 BOM (U+FEFF) from a freshly-read file. PowerShell 5.1's
- * default `Set-Content -Encoding utf8` writes a BOM; without this strip,
- * `JSON.parse` fails with an invisible "Unexpected token" error that renders
- * as a blank character on most consoles. Most JSON parsers strip BOM at this
- * boundary — we just bring this one in line.
- */
-function stripBom(raw: string): string {
-  return raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
 }
 
 function requireNonEmpty(flagName: string, value: string): void {
@@ -2105,7 +2095,7 @@ function parsePlanStepsFile(path: string): unknown {
  * that window, since a swap of the path afterward can no longer change what
  * gets read.
  *
- * Returns `{ ok: true, raw }` on success (BOM already stripped) or
+ * Returns `{ ok: true, raw }` on success (UTF-8/UTF-16 BOM decoded) or
  * `{ ok: false, sizeBytes }` when the file is over `maxBytes` — the
  * oversize case is handed back rather than turned into an error here
  * because each caller throws its own `PAYLOAD_TOO_LARGE` envelope (distinct
@@ -2206,7 +2196,7 @@ function readCappedFileGuarded(
       // A lower bound for a pipe or a growing file: reading stopped here.
       return { ok: false, sizeBytes: bytes.length };
     }
-    return { ok: true, raw: stripBom(bytes.toString('utf8')) };
+    return { ok: true, raw: decodeWithBom(bytes) };
   } finally {
     closeSync(fd);
   }
@@ -5264,7 +5254,7 @@ function readPlansFromDirGuarded(dir: string, stderrFn: (line: string) => void):
 
     let raw: string;
     try {
-      raw = stripBom(readFileSync(filePath, 'utf8'));
+      raw = readTextFileBomAware(filePath);
     } catch (err) {
       // Hard I/O error (permission denied etc.): re-throw so the user knows the
       // directory is unreadable — this is not a "skip" case.
@@ -6171,7 +6161,7 @@ export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<C
     const absolute = resolveAbsolute(opts.plans);
     let content: string;
     try {
-      content = readFileSync(absolute, 'utf8');
+      content = readTextFileBomAware(absolute);
     } catch {
       throw localValidationError('plans', `cannot read file: ${absolute}`);
     }
