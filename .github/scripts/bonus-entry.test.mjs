@@ -41,6 +41,10 @@ async function runPr({
   state = 'open',
   // The event payload; defaults to the live PR. A queued run can carry an older one.
   payload,
+  // A workflow_dispatch sweep: no PR in the payload, these open PRs listed instead.
+  sweep,
+  // PR numbers whose pulls.get throws during a sweep.
+  failOn = [],
 } = {}) {
   const calls = [];
   const info = [];
@@ -57,9 +61,14 @@ async function runPr({
   const rest = {
     pulls: {
       get: async ({ pull_number }) => {
+        if (sweep) {
+          if (failOn.includes(pull_number)) throw Object.assign(new Error('boom'), { status: 500 });
+          return { data: { ...structuredClone(livePr), number: pull_number } };
+        }
         assert.equal(pull_number, 7);
         return { data: structuredClone(livePr) };
       },
+      list: () => {},
     },
     issues: {
       get: async ({ issue_number }) => {
@@ -81,6 +90,7 @@ async function runPr({
   const github = {
     rest,
     paginate: async method => {
+      if (method === rest.pulls.list) return sweep;
       assert.equal(method, rest.issues.listComments);
       return comments;
     },
@@ -101,10 +111,12 @@ async function runPr({
   };
   const context = {
     repo: { owner: 'TestSprite', repo: 'testsprite-cli' },
-    payload: { pull_request: payload ?? livePr },
+    payload: sweep ? {} : { pull_request: payload ?? livePr },
   };
+  const warnings = [];
   const core = {
     info: message => info.push(message),
+    warning: message => warnings.push(message),
     setFailed: message => failures.push(message),
   };
   const saved = {};
@@ -122,7 +134,7 @@ async function runPr({
     }
   }
   const of = name => calls.filter(([method]) => method === name).map(([, args]) => args);
-  return { calls, of, info, failures };
+  return { calls, of, info, failures, warnings };
 }
 
 const stateOf = body => /<!-- hob:s4-bonus:state:(\w+) -->/.exec(body)?.[1];
@@ -366,4 +378,43 @@ test('unticking keeps the withdrawal even when the PR still looks like an entry'
   // A later edit that is still unticked leaves the withdrawal as it is.
   const again = await runPr({ body: untickedBody, comments: [botComment(withdrawn)] });
   assert.deepEqual(again.calls, []);
+});
+
+test('the job token may write to PRs: a PR comment needs pull-requests write', () => {
+  assert.match(workflow, /^  pull-requests: write$/m);
+  assert.match(workflow, /^  issues: write /m);
+});
+
+test('a manual run sweeps every open PR not opened by a bot', async () => {
+  const h = await runPr({
+    sweep: [
+      { number: 11, user: { type: 'User' } },
+      { number: 12, user: { type: 'Bot' } },
+      { number: 13, user: { type: 'User' } },
+    ],
+  });
+  assert.deepEqual(h.of('createComment').map(args => args.issue_number), [11, 13]);
+  assert.deepEqual(h.of('addLabels').map(args => args.issue_number), [11, 13]);
+  assert.equal(h.failures.length, 0);
+});
+
+test('a sweep keeps going past a failing PR and fails the run at the end', async () => {
+  const h = await runPr({
+    sweep: [
+      { number: 11, user: { type: 'User' } },
+      { number: 12, user: { type: 'User' } },
+      { number: 13, user: { type: 'User' } },
+    ],
+    failOn: [12],
+  });
+  assert.deepEqual(h.of('createComment').map(args => args.issue_number), [11, 13]);
+  assert.equal(h.warnings.length, 1);
+  assert.match(h.warnings[0], /PR #12/);
+  assert.deepEqual(h.failures, ['Bonus entry sweep failed for: #12']);
+});
+
+test('a sweep is gated like a PR event and serialised on its own group', () => {
+  assert.match(workflow, /^  workflow_dispatch:$/m);
+  assert.match(workflow, /github\.event_name == 'workflow_dispatch' \|\|/);
+  assert.match(workflow, /group: bonus-entry-\$\{\{ github\.event\.pull_request\.number \|\| 'sweep' \}\}/);
 });
