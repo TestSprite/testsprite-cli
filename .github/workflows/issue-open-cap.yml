@@ -1,5 +1,6 @@
 # Open-issue cap: a community contributor can have at most OPEN_CAP issues of
-# their own open at once. A new (or reopened) issue over the cap is closed with
+# their own open at once. An issue someone else has claimed doesn't count: the
+# work has moved to them, so it no longer ties up the opener. A new (or reopened) issue over the cap is closed with
 # a comment listing the open ones; the author can open it again once one of
 # those is closed (merged PR with `Closes #N`, or closed by us). An issue the
 # bot closed can't be reopened by its author, so reopen only covers an issue
@@ -64,15 +65,18 @@ jobs:
             }
             if (isMaintainer) return;
 
+            const claimedByOthers = i => (i.assignees || []).length > 0
+              && !i.assignees.some(a => a.login === author);
             const others = (await github.paginate(github.rest.issues.listForRepo, {
               owner, repo, state: 'open', creator: author, per_page: 100,
-            })).filter(i => !i.pull_request && i.number !== issue.number);
+            })).filter(i => !i.pull_request && i.number !== issue.number && !claimedByOthers(i));
             if (others.length < cap) return;
 
             const list = others.map(i => `- ${owner}/${repo}#${i.number} — ${i.title}`).join('\n');
             await github.rest.issues.createComment({ owner, repo, issue_number: issue.number,
-              body: `Thanks @${author}! You already have ${others.length} open issues, and each contributor can have at most ${cap} open at a time, `
-                  + `so I've closed this one. Once one of yours is closed (its PR merged, or closed by a maintainer), `
-                  + `open it again as a new issue.\n\nYour open issues (${others.length}/${cap}):\n${list}` });
+              body: `Thanks @${author}! You already have ${others.length} open issues, and each contributor can have at most ${cap} open at a time `
+                  + `(an issue someone else has claimed doesn't count), so I've closed this one. Once one of yours is closed `
+                  + `(its PR merged, or closed by a maintainer) or claimed by someone else, open it again as a new issue.`
+                  + `\n\nYour open issues (${others.length}/${cap}):\n${list}` });
             await github.rest.issues.update({ owner, repo, issue_number: issue.number,
               state: 'closed', state_reason: 'not_planned' });

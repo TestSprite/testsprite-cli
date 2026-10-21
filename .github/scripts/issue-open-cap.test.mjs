@@ -99,6 +99,16 @@ test('up to three open issues, and PRs, are left alone', async () => {
   assert.equal(of('update').length, 0);
 });
 
+test('an issue claimed by someone else does not count, one claimed by the author does', async () => {
+  const claimedByOther = { number: 13, title: 'Issue 13', assignees: [{ login: 'someone-else' }] };
+  const claimedBySelf = { number: 14, title: 'Issue 14', assignees: [{ login: 'contributor' }] };
+  const under = await runIssue({ open: [...issueItems([11, 12]), claimedByOther] });
+  assert.equal(under('update').length, 0);
+  const over = await runIssue({ open: [...issueItems([11, 12]), claimedBySelf] });
+  assert.equal(over('update').length, 1);
+  assert.match(over('createComment')[0].body, /#14 — Issue 14/);
+});
+
 test('maintainers are exempt, by permission or by association when the lookup fails', async () => {
   for (const permission of ['write', 'maintain', 'admin']) {
     const of = await runIssue({ open: issueItems([11, 12, 13]), permission });

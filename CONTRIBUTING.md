@@ -25,9 +25,12 @@ Discussions**, so the issue tracker stays a clean, actionable list.
   output, new dependencies, and refactors, follow **issue-first**:
   1. Find an existing issue, or open a new one describing the change.
      Community contributors can have at most **3 open issues of their own**
-     at a time; the bot closes a fourth with a list of the open ones. An issue
-     stops counting once it is closed (its PR merged with `Closes #123`, or
-     closed by a maintainer); then open it again as a new issue.
+     at a time. This counts issues you opened that are still open, unless
+     someone else has claimed them; your PRs and other people's issues don't
+     count. An issue stops counting once it is closed (its PR merged with
+     `Closes #123`, closed by a maintainer, or closed by you) or claimed by
+     someone else. A fourth is closed by the bot with a list of the three; you
+     can't reopen it, so open it again as a new issue once you're under the cap.
   2. If the issue is new, wait for triage — we check proposals against
      [VISION.md](./VISION.md) and the [standing policies](#standing-scope-policies)
      below before any code is written, so you don't invest in something
