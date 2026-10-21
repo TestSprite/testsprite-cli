@@ -244,6 +244,8 @@ const MAX_ATTEMPTS_UNAVAILABLE = 4;
 const MAX_ATTEMPTS_RATE_LIMITED = 3;
 const MAX_ATTEMPTS_CONFLICT = 2;
 const MAX_ATTEMPTS_INTERNAL = 2;
+const MAX_REDIRECTS = 20;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 // Cap server-directed RATE_LIMITED waits so a hostile or misconfigured
 // `Retry-After` (e.g. 86400) can't hang the CLI inside the retry sleep.
@@ -874,12 +876,16 @@ export class HttpClient {
 
       try {
         try {
-          response = await this.fetchImpl(url, {
-            method,
-            headers: this.buildHeaders(requestId, options),
-            body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
-            signal: effectiveSignal,
-          });
+          response = await this.fetchSameOrigin(
+            url,
+            {
+              method,
+              headers: this.buildHeaders(requestId, options),
+              body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+              signal: effectiveSignal,
+            },
+            requestId,
+          );
         } catch (err) {
           // Distinguish a client-side request timeout from a caller-supplied abort.
           //
@@ -912,6 +918,9 @@ export class HttpClient {
             errorCode: 'TRANSPORT',
             durationMs: Date.now() - startedAt,
           });
+          // Redirect policy failures are permanent; retrying cannot make the
+          // destination safe and could repeat an already accepted mutation.
+          if (err instanceof RedirectError) throw err;
           const decision = allowTransportRetry
             ? transportRetryDecision(attempt, this.random)
             : { retry: false, delayMs: 0 };
@@ -1137,6 +1146,65 @@ export class HttpClient {
     }
   }
 
+  /** Follow redirects explicitly so credentials never leave the original origin. */
+  private async fetchSameOrigin(
+    url: string,
+    init: RequestInit,
+    requestId: string,
+  ): Promise<Response> {
+    const origin = new URL(url).origin;
+    let currentUrl = url;
+    let currentInit = { ...init, redirect: 'manual' as const };
+    for (let redirects = 0; ; redirects += 1) {
+      const response = await this.fetchImpl(currentUrl, currentInit);
+      const location = response.headers.get('location');
+      if (!REDIRECT_STATUSES.has(response.status) || location === null) return response;
+
+      // Release every intermediate body, including rejected redirects, while
+      // keeping the caller's single timeout/signal across the entire chain.
+      await response.body?.cancel();
+      let target: URL;
+      try {
+        target = new URL(location, currentUrl);
+      } catch {
+        throw new RedirectError(`Invalid redirect target from ${origin}.`, requestId);
+      }
+      if (target.origin !== origin) {
+        throw new RedirectError(
+          `Refused cross-origin redirect from ${origin} to ${target.origin}.`,
+          requestId,
+        );
+      }
+      if (target.username || target.password) {
+        throw new RedirectError(`Refused redirect containing credentials at ${origin}.`, requestId);
+      }
+      if (redirects >= MAX_REDIRECTS) {
+        throw new RedirectError(`Too many redirects from ${origin}.`, requestId);
+      }
+
+      // Match Fetch's HTTP-redirect method/body rules. Retained bodies are
+      // JSON strings, so 307/308 replay does not require buffering a stream.
+      const method = currentInit.method?.toUpperCase() ?? 'GET';
+      if (
+        ((response.status === 301 || response.status === 302) && method === 'POST') ||
+        (response.status === 303 && method !== 'GET' && method !== 'HEAD')
+      ) {
+        const headers = new Headers(currentInit.headers);
+        for (const name of [
+          'content-encoding',
+          'content-language',
+          'content-location',
+          'content-type',
+          'content-length',
+        ]) {
+          headers.delete(name);
+        }
+        currentInit = { ...currentInit, method: 'GET', body: undefined, headers };
+      }
+      currentUrl = target.href;
+    }
+  }
+
   private buildHeaders(requestId: string, options: RequestOptions): Record<string, string> {
     const headers: Record<string, string> = {
       'x-request-id': requestId,
@@ -1199,6 +1267,14 @@ export class HttpClient {
    */
   async request<T>(method: string, path: string, options: RequestOptions<T> = {}): Promise<T> {
     return this.requestWithMeta<T>(method, path, options).then(r => r.body);
+  }
+}
+
+class RedirectError extends TransportError {
+  override readonly nextAction =
+    'Check the configured API endpoint and its redirect configuration. This request was not retried.';
+  constructor(message: string, requestId: string) {
+    super(message, requestId);
   }
 }
 
