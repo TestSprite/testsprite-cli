@@ -41,16 +41,18 @@ Discussions**, so the issue tracker stays a clean, actionable list.
      claimed issues**; the bot refuses further claims until a slot is free.
      It replies with your open assignment count. If you opened the issue,
      it is reserved for you for **48 hours** after it is accepted: only you
-     can claim it in that window. An issue someone has already claimed can't
-     be claimed by anyone else until it is released.
+     can claim it in that window, and to keep it you need a linked PR (a
+     draft is fine) within those same 48 hours. After that anyone can claim
+     it. An issue someone has already claimed can't be claimed by anyone else
+     until it is released.
   4. Open your PR with a same-repository issue reference in its description:
      `Closes #123`, `Fixes #123`, or `Resolves #123`. For an umbrella issue
      that should stay open, use `Part of #123`, `Refs #123`, or
      `Related to #123`. The bot also accepts `Close`/`Closed`, `Fix`/`Fixed`,
      `Resolve`/`Resolved`, and `Ref`/`Reference`/`References` (case-insensitive,
      with an optional colon before `#123`).
-- **Claim lifetime:** the bot warns after 48 hours and releases a claim after
-  72 hours unless you have an open PR whose description references the issue
+- **Claim lifetime:** the bot warns after 24 hours and releases a claim after
+  48 hours unless you have an open PR whose description references the issue
   as in step 4 (a bare `#123` mention does not count). Draft PRs count, so
   opening a draft early holds the claim while you work. You can `/assign` again
   if the issue is still free.
