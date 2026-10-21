@@ -22,16 +22,8 @@ const JSON_HEADERS = {
   'x-request-id': SAMPLE_DRY_RUN_REQUEST_ID,
 };
 
-export function createDryRunFetch(onFirstRequest?: () => void): FetchImpl {
-  let firstRequestFired = false;
+export function createDryRunFetch(): FetchImpl {
   return async (input, init) => {
-    // Fire once, on the first dry-run request, so callers can lazily announce
-    // the dry-run only when a canned response is actually being produced —
-    // never before local validation has had a chance to fail.
-    if (!firstRequestFired) {
-      firstRequestFired = true;
-      onFirstRequest?.();
-    }
     const url = resolveUrl(input);
     const method = (init?.method ?? 'GET').toUpperCase();
 
@@ -66,6 +58,27 @@ export function createDryRunFetch(onFirstRequest?: () => void): FetchImpl {
       return new Response(body, { status: 500, headers: JSON_HEADERS });
     }
     return new Response(JSON.stringify(sample.body()), { status: 200, headers: JSON_HEADERS });
+  };
+}
+
+/**
+ * Wrap a dry-run fetch implementation so `onFirstResponse` fires exactly
+ * once — after the first request actually returns a response. The client
+ * factory applies this to whichever fetch is in use (the default canned
+ * fetch or an injected test fetch), so the dry-run banner is announced
+ * lazily: never at client construction, and never when local validation
+ * fails before any dry-run response is produced. If the wrapped fetch
+ * rejects, no banner fires.
+ */
+export function withDryRunBannerOnce(fetch: FetchImpl, onFirstResponse: () => void): FetchImpl {
+  let fired = false;
+  return async (input, init) => {
+    const res = await fetch(input, init);
+    if (!fired) {
+      fired = true;
+      onFirstResponse();
+    }
+    return res;
   };
 }
 
