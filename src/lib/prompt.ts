@@ -91,7 +91,8 @@ function readLine(
         if (escape === 'esc') {
           // `ESC [` starts a CSI sequence, `ESC O` an SS3 one; any other byte
           // completes a two-byte escape (e.g. Alt+key).
-          escape = code === 0x5b ? 'csi' : code === 0x4f ? 'ss3' : 'none';
+          // A second ESC (Alt+arrow prefix) starts the next sequence.
+          escape = code === 0x5b ? 'csi' : code === 0x4f ? 'ss3' : code === 27 ? 'esc' : 'none';
           continue;
         }
         if (escape === 'csi') {
@@ -100,7 +101,8 @@ function readLine(
           continue;
         }
         if (escape === 'ss3') {
-          escape = 'none';
+          // Parameterized SS3 (ESC O 1;5P): read through the final byte.
+          if (code >= 0x40 && code <= 0x7e) escape = 'none';
           continue;
         }
         if (code === 27) {

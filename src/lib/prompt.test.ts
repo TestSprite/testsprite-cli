@@ -221,6 +221,20 @@ describe('terminal escape sequences', () => {
     expect(await promptText('? ', { input: Readable.from([`ok${ESC}[12\n`]), output })).toBe('ok');
   });
 
+  it('drops an Alt+arrow sequence prefixed by a second ESC', async () => {
+    const output = new CaptureStream();
+    expect(await promptText('? ', { input: Readable.from([`key${ESC}${ESC}[D\r`]), output })).toBe(
+      'key',
+    );
+  });
+
+  it('drops a parameterized SS3 sequence through its final byte', async () => {
+    const output = new CaptureStream();
+    expect(await promptText('? ', { input: Readable.from([`a${ESC}O1;5Pb\r`]), output })).toBe(
+      'ab',
+    );
+  });
+
   it('writes no mask characters for escape-sequence bytes in raw (TTY) mode', async () => {
     const input = Readable.from([`ab${ESC}[D${ESC}[200~c${ESC}[201~\r`]) as Readable & {
       isTTY?: boolean;
