@@ -1325,6 +1325,7 @@ These apply to every command:
 | `--profile <name>`            | Pick a named profile (default: `default`)                                                          |
 | `--endpoint-url <url>`        | Override the API host                                                                              |
 | `--output json\|text`         | JSON is the stable automation contract; text is human-friendly                                     |
+| `--output csv\|ndjson`        | List commands only; see [CSV and NDJSON for lists](#csv-and-ndjson-for-lists)                      |
 | `--request-timeout <seconds>` | Per-request wall-clock timeout (default 120, range 1–600)                                          |
 | `--verbose`                   | Human-readable HTTP retry / backoff / polling messages to stderr                                   |
 | `--debug`                     | Method / URL / request-id / latency / retry decisions to stderr (the API key is never included)    |
@@ -1450,6 +1451,23 @@ RUN_ID=$(testsprite test run test_xxxxxxxx --output json | jq -r '.runId')
 # Wait on it and branch on the exit code
 testsprite test wait "$RUN_ID" --timeout 600 --output json || echo "run did not pass"
 ```
+
+### CSV and NDJSON for lists
+
+`project list`, `test list` and `test result --history` also take `--output csv` and `--output ndjson`. Other commands reject both (exit 5) before sending any request.
+
+```bash
+# A spreadsheet of a project's tests
+testsprite test list --project proj_xxxxxxxx --output csv > tests.csv
+
+# One run per line, filtered without buffering a JSON array
+testsprite test result test_xxxxxxxx --history --output ndjson | jq -c 'select(.status == "failed")'
+```
+
+- **stdout carries rows only.** Pagination hints (`nextToken: ...`, `Next page: --cursor ...`) and notes go to stderr.
+- **`ndjson`** prints each item exactly as `--output json` has it, one compact object per line. An empty list prints nothing.
+- **`csv`** is RFC 4180: a header row of field names, then one record per item, each ending in CRLF. A field with a comma, double quote or line break is double-quoted, with `"` doubled. Array fields are comma-joined. A nested field gets a column only when one value stands for it: `headlineEnvironment` and a run's `environment` hold the environment name. `test list` leaves out `statusByEnvironment`, `planSteps` and `details`; use `ndjson` for those.
+- **Formula-injection guard.** A CSV cell whose value starts with `=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`, so Excel or Sheets shows it as text instead of running it as a formula. That `'` is part of the CSV contract, not of the value: strip one leading `'` from such a cell to get the raw value back. NDJSON is not escaped.
 
 ## Continuous integration
 

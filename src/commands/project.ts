@@ -22,7 +22,15 @@ import {
   type LocalPortProbeDeps,
   type StoredLocalTarget,
 } from '../lib/local-target.js';
-import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
+import {
+  GLOBAL_OPTS_HINT,
+  Output,
+  resolveListOutput,
+  resolveOutputMode,
+  type CsvColumns,
+  type ListFormat,
+  type OutputMode,
+} from '../lib/output.js';
 import { readSecretFileGuarded } from '../lib/secret-file.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
@@ -136,6 +144,8 @@ export interface ProjectDeps {
   fetchImpl?: FetchImpl;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
+  /** Verbatim stdout writer for `--output csv|ndjson` rows; see `OutputStreams.rawStdout`. */
+  rawStdout?: (text: string) => void | Promise<void>;
   localPortProbeDeps?: LocalPortProbeDeps;
   /** Graceful-detach coordinator; tests inject their own. */
   shutdown?: ShutdownHandle;
@@ -144,6 +154,8 @@ export interface ProjectDeps {
 type CommonOptions = FactoryCommonOptions;
 
 interface ListOptions extends CommonOptions {
+  /** `--output csv|ndjson`; `output` is then `json`. */
+  format?: ListFormat;
   pageSize?: number;
   startingToken?: string;
   maxItems?: number;
@@ -190,6 +202,16 @@ export async function runList(
     );
   }
 
+  if (opts.format !== undefined) {
+    await out.printRows(opts.format, page.items, PROJECT_CSV_COLUMNS);
+    // stdout carries rows only; the cursor goes where `--output text` hints go.
+    if (page.nextToken) {
+      (deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`)))(
+        `nextToken: ${page.nextToken}`,
+      );
+    }
+    return page;
+  }
   out.print(page, data => {
     const p = data as Page<CliProject>;
     return renderProjectListText(p, { columns: opts.columns, noHeader: opts.noHeader });
@@ -1462,7 +1484,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       // the contract-mandated exit code 5.
       await runList(
         {
-          ...resolveCommonOptions(command, deps.env),
+          ...resolveCommonOptions(command, deps.env, { listFormats: true }),
           pageSize: parseFlag(cmdOpts.pageSize, 'page-size'),
           startingToken: cmdOpts.startingToken,
           maxItems: parseFlag(cmdOpts.maxItems, 'max-items'),
@@ -1883,14 +1905,20 @@ function parseFlag(raw: string | undefined, flagName: string): number | undefine
   return n;
 }
 
-function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
+function resolveCommonOptions(
+  command: Command,
+  env?: NodeJS.ProcessEnv,
+  { listFormats = false }: { listFormats?: boolean } = {},
+): CommonOptions & { format?: ListFormat } {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
   // P2-8: validate --output before allowing silent fallback to 'text'.
   return {
     profile: resolveProfileName(globals.profile, env),
-    output: resolveOutputMode(globals.output),
+    ...(listFormats
+      ? resolveListOutput(globals.output)
+      : { output: resolveOutputMode(globals.output) }),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
     verbose: globals.verbose ?? false,
@@ -1909,8 +1937,25 @@ function makeClient(opts: CommonOptions, deps: ProjectDeps): HttpClient {
 }
 
 function makeOutput(mode: OutputMode, deps: ProjectDeps): Output {
-  return new Output(mode, { stdout: deps.stdout, stderr: deps.stderr });
+  return new Output(mode, { stdout: deps.stdout, stderr: deps.stderr, rawStdout: deps.rawStdout });
 }
+
+/** `project list --output csv` columns; see {@link CsvColumns}. */
+const PROJECT_CSV_COLUMNS: CsvColumns<CliProject> = {
+  id: true,
+  name: true,
+  type: true,
+  createdFrom: true,
+  createdAt: true,
+  updatedAt: true,
+  orgId: true,
+  orgName: true,
+  targetUrl: true,
+  defaultEnvironment: true,
+  environmentCount: true,
+  originMode: true,
+  testIdAttributes: true,
+};
 
 /**
  * Master column set — includes ORG so `--columns` validation and explicit

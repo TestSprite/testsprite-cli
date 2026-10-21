@@ -17,6 +17,20 @@ export function isOutputMode(value: unknown): value is OutputMode {
 }
 
 /**
+ * Row formats `--output` accepts on list commands only (issue #164). They are
+ * not {@link OutputMode}s: every other command rejects them while resolving
+ * its options, before any request is sent.
+ */
+export type ListFormat = 'csv' | 'ndjson';
+
+/** The commands that accept a {@link ListFormat}, for help and error text. */
+export const LIST_FORMAT_COMMANDS = 'project list, test list, test result --history';
+
+export function isListFormat(value: unknown): value is ListFormat {
+  return value === 'csv' || value === 'ndjson';
+}
+
+/**
  * Resolve a raw `--output` flag value to a concrete {@link OutputMode}.
  *
  * `undefined` (flag omitted) resolves to the default `'text'`. Any other
@@ -33,7 +47,87 @@ export function isOutputMode(value: unknown): value is OutputMode {
 export function resolveOutputMode(raw: unknown): OutputMode {
   if (raw === undefined) return 'text';
   if (isOutputMode(raw)) return raw;
+  if (isListFormat(raw)) {
+    throw localValidationError(
+      'output',
+      `${raw} is only supported by list commands (${LIST_FORMAT_COMMANDS}); use json or text here`,
+      ['json', 'text'],
+    );
+  }
   throw localValidationError('output', 'must be one of: json, text', ['json', 'text']);
+}
+
+/**
+ * {@link resolveOutputMode} for a list command, which also accepts a
+ * {@link ListFormat}. A row format resolves to `output: 'json'` so the
+ * command's machine-output gates (no text-only hints or column checks) apply
+ * unchanged; the command branches on `format` only where it prints.
+ */
+export function resolveListOutput(raw: unknown): { output: OutputMode; format?: ListFormat } {
+  if (isListFormat(raw)) return { output: 'json', format: raw };
+  if (raw === undefined || isOutputMode(raw)) return { output: resolveOutputMode(raw) };
+  throw localValidationError('output', 'must be one of: json, text, csv, ndjson', [
+    'json',
+    'text',
+    'csv',
+    'ndjson',
+  ]);
+}
+
+/**
+ * CSV columns for a list row type, keyed by every field of `T` so a field
+ * added to the wire type fails typecheck until it is given a column (`true`
+ * copies the value, a function derives the cell) or left out (`false`, for a
+ * nested shape one cell cannot hold). Headers are the field names, in key
+ * order, so they always match the `--output json` / `ndjson` field names.
+ */
+export type CsvColumns<T> = { readonly [K in keyof T]-?: boolean | ((row: T) => unknown) };
+
+/**
+ * Cells starting with one of these are run as a formula when the file is
+ * opened in Excel or Sheets, and test names / failure text are user-supplied.
+ */
+const CSV_FORMULA_TRIGGER = /^[=+\-@\t\r]/;
+
+/**
+ * One CSV field: `null` / absent is empty, an array is comma-joined, and an
+ * object is its JSON. A value starting with `=`, `+`, `-`, `@`, a tab or a CR
+ * gets a leading `'` (the OWASP formula-injection guard, part of the
+ * documented contract), then RFC 4180 quoting applies: a field with a comma,
+ * double quote, CR or LF is wrapped in double quotes with `"` doubled.
+ */
+export function csvField(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  let text: string;
+  if (Array.isArray(value)) text = value.join(',');
+  else if (typeof value === 'object') text = JSON.stringify(value);
+  else text = String(value);
+  if (CSV_FORMULA_TRIGGER.test(text)) text = `'${text}`;
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+/** RFC 4180 table: a header record, then one record per row, each ended by CRLF. */
+export function renderCsv<T>(rows: readonly T[], columns: CsvColumns<T>): string {
+  const fields = (Object.keys(columns) as Array<keyof T & string>).filter(
+    key => columns[key] !== false,
+  );
+  const records = [fields.map(csvField).join(',')];
+  for (const row of rows) {
+    records.push(
+      fields
+        .map(key => {
+          const column = columns[key];
+          return csvField(typeof column === 'function' ? column(row) : row[key]);
+        })
+        .join(','),
+    );
+  }
+  return records.map(record => `${record}\r\n`).join('');
+}
+
+/** One compact JSON object per line, no wrapping array; empty for no rows. */
+export function renderNdjson(rows: readonly unknown[]): string {
+  return rows.map(row => `${JSON.stringify(row)}\n`).join('');
 }
 
 /**
@@ -120,6 +214,20 @@ export class Output {
       return;
     }
     this.stdoutWrite(textRenderer(data));
+  }
+
+  /**
+   * Write list rows to stdout as CSV or NDJSON, verbatim (CSV records end in
+   * CRLF, which the line writer would not preserve). Like `print`, success
+   * data is never redacted.
+   */
+  async printRows<T>(
+    format: ListFormat,
+    rows: readonly T[],
+    columns: CsvColumns<T>,
+  ): Promise<void> {
+    const text = format === 'csv' ? renderCsv(rows, columns) : renderNdjson(rows);
+    if (text !== '') await this.rawStdoutWrite(text);
   }
 
   /**
