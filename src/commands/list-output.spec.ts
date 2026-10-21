@@ -5,7 +5,7 @@
  * rejects both formats (exit 5) before sending a request.
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
@@ -33,8 +33,8 @@ function makeFetch(handler: (url: string) => unknown) {
 
 function makeCreds(): { credentialsPath: string } {
   const dir = mkdtempSync(join(tmpdir(), 'cli-list-output-'));
-  mkdirSync(dir, { recursive: true });
   const credentialsPath = join(dir, 'credentials');
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture: `credentialsPath` sits under this function's own mkdtempSync() directory.
   writeFileSync(
     credentialsPath,
     '[default]\napi_url = http://localhost:13509\napi_key = sk-user-test\n',
