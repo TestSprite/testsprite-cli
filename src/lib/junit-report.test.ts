@@ -64,6 +64,16 @@ describe('escapeXml', () => {
   it('leaves plain text unchanged', () => {
     expect(escapeXml('test_abc123')).toBe('test_abc123');
   });
+
+  it('strips characters that are illegal in XML 1.0', () => {
+    expect(escapeXml('boom\x00\x08\x1b')).toBe('boom');
+    expect(escapeXml('a\x0bb\x0cc\x0ed\x1ff')).toBe('abcdf');
+    expect(escapeXml('x\uFFFEy\uFFFFz')).toBe('xyz');
+  });
+
+  it('keeps tab, newline and carriage return, which XML 1.0 allows', () => {
+    expect(escapeXml('a\tb\nc\rd')).toBe('a\tb\nc\rd');
+  });
 });
 
 describe('parseJUnitReportFormat', () => {
@@ -324,6 +334,29 @@ describe('buildJUnitReport', () => {
     expect(xml).toContain('name="test&lt;1&gt;"');
     expect(xml).toContain('classname="proj&lt;&amp;&gt;"');
     expect(xml).toContain('message="expected &lt;true&gt; &amp; &quot;ok&quot;"');
+  });
+
+  it('produces a parser-acceptable report when messages carry XML 1.0-illegal characters', () => {
+    const xml = buildJUnitReport({
+      suiteName: 'Suite\x1bName',
+      classname: 'proj_1',
+      results: [
+        makeResult({
+          testId: 'test_bad',
+          status: 'failed',
+          error: { code: 'ASSERT', message: 'boom\x00\x08\x1b went off', exitCode: 1 },
+        }),
+      ],
+    });
+    // A conforming XML 1.0 parser rejects a document containing any of these
+    // characters, whether in an attribute value or a text node — the report
+    // must contain none of them (the failure element carries the message in
+    // both positions) while the readable text survives.
+    // eslint-disable-next-line no-control-regex
+    expect(xml).not.toMatch(/[\x00-\x08\x0b\x0c\x0e-\x1f\uFFFE\uFFFF]/);
+    expect(xml).toContain('name="SuiteName"');
+    expect(xml).toContain('message="boom went off"');
+    expect(xml).toContain('message: boom went off');
   });
 
   it('aggregates mixed outcomes', () => {
