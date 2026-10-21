@@ -72,7 +72,14 @@ export interface SkillSpec {
  * (not in a `*.codex.md` asset) because it is one line; see {@link CodexContribution}.
  */
 export const ONBOARD_CODEX_LINE =
-  '**First-time setup:** if this repo has no TestSprite tests yet, seed a *broad* first suite across its main user flows — not just one test — each with a concrete, observable assertion, before reporting setup as done.';
+  '**First-time setup:** if this repo has no TestSprite tests yet, seed a *broad* first suite across its main user flows — not just one test — each with a concrete, observable assertion, before reporting setup as done. Try `testsprite test plan generate --project <id>` then `test plan accept` first; author plans by hand only if generation is unavailable.';
+
+/**
+ * `testsprite-ci` codex contribution — one always-on line; the full onboarding
+ * flow lives in the own-file body and the docs.
+ */
+export const CI_CODEX_LINE =
+  '**CI gate:** to run TestSprite on every pull request, use `testsprite ci init github --project <id> --env <name>`, finish the `REPLACE ME` step for how PRs deploy (platform-deployed previews → `on: deployment_status`; the workflow deploys → keep `pull_request`), set the `TESTSPRITE_API_KEY` secret, then prove it on one real, non-draft pull request. If the GitHub App already gates the project, ask before adding a second gate.';
 
 /**
  * The skill registry. Each entry owns its name, description (drift-guarded by a
@@ -92,18 +99,25 @@ export const SKILLS: Record<string, SkillSpec> = {
   'testsprite-onboard': {
     name: 'testsprite-onboard',
     description:
-      'Stand up a complete, runnable TestSprite test suite for the current repo at first use — create a project (with a target URL and auth), derive a coherent set of tests from the codebase, batch-create them, and smoke-run a few to a green verdict so the user immediately has something worth running. Use ONLY when a repo has no TestSprite tests yet (a fresh project), right after `testsprite setup`, or when the user asks to "set up / bootstrap / seed tests". This is first-run setup, NOT change verification — once a project already has tests, use the testsprite-verify skill instead.',
+      'Stand up a complete, runnable TestSprite test suite for the current repo at first use — create a project (with a target URL and auth), generate a coherent set of tests (or derive and batch-create them from the codebase), and smoke-run a few to a green verdict so the user has something worth running. Use ONLY when a repo has no TestSprite tests yet (a fresh project), right after `testsprite setup`, or when the user asks to "set up / bootstrap / seed tests". This is first-run setup, NOT change verification — once a project already has tests, use the testsprite-verify skill instead.',
     bodyFile: 'testsprite-onboard.skill.md',
     codex: { kind: 'line', text: ONBOARD_CODEX_LINE },
+  },
+  'testsprite-ci': {
+    name: 'testsprite-ci',
+    description:
+      'Gate pull requests with TestSprite in CI — work out how the repo deploys pull-request previews (platform-deployed → `on: deployment_status`; deployed in the workflow → `on: pull_request`), pick the environment the gate signs in with, generate the workflow with `testsprite ci init github`, finish its placeholder step, set the `TESTSPRITE_API_KEY` secret, and prove the gate on one real pull request. Use when the user asks to add TestSprite to CI or GitHub Actions, run the tests on every PR, or block merges on them. NOT for seeding a first suite (testsprite-onboard) or checking one change (testsprite-verify).',
+    bodyFile: 'testsprite-ci.skill.md',
+    codex: { kind: 'line', text: CI_CODEX_LINE },
   },
 };
 
 /**
  * Skills installed by `setup` and by `agent install` when no `--skill` subset is
  * given. Order is significant for the codex aggregate (verify first, then the
- * onboard line as a short addendum).
+ * onboard and ci lines as short addenda).
  */
-export const DEFAULT_SKILLS = ['testsprite-verify', 'testsprite-onboard'] as const;
+export const DEFAULT_SKILLS = ['testsprite-verify', 'testsprite-onboard', 'testsprite-ci'] as const;
 
 // ---------------------------------------------------------------------------
 // Back-compat single-skill exports (= the canonical `testsprite-verify` skill)

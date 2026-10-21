@@ -285,9 +285,9 @@ describe('project create local output and errors', () => {
         'Local project: TestSprite will reach http://localhost:3000 only through a tunnel from this machine.',
       );
       expect(text).toContain('Next: write a plan and run it locally:');
-      expect(text).toContain(
-        '  testsprite test create --project project_local --plan-from plan.json',
-      );
+      expect(text).toContain('  testsprite test create --plan-template > plan.json');
+      expect(text).toContain('  testsprite test create --plan-from plan.json');
+      expect(text).not.toContain('--project project_local --plan-from');
       expect(text).toContain('  testsprite test run <test-id>');
       expect(text).toContain(
         'Portal runs of this project stay blocked (free) until you set a public URL with: testsprite project update project_local --url https://...',
@@ -360,7 +360,9 @@ describe('local project setup guidance', () => {
   it('tells the caller to put the new project ID inside the plan file', async () => {
     const h = harness();
     expect(await h.run([...CREATE, '--local', '3000'])).toBeUndefined();
-    expect(h.stdout.join('\n')).toContain('In plan.json, set projectId to project_local.');
+    expect(h.stdout.join('\n')).toContain(
+      'In plan.json, set projectId to project_local and edit the steps.',
+    );
   });
 
   it('names --url when an invalid local host should use a public URL', async () => {

@@ -1,4 +1,4 @@
-# Sweep open issue claims hourly: warn at 72 hours and release at 96 hours
+# Sweep open issue claims hourly: warn at 48 hours and release at 72 hours
 # unless the assignee has an open PR linked to the issue. This is separate
 # from stale.yml because stale tracks inactivity in days and exempts the
 # labels used by the contributor claim flow.
@@ -23,8 +23,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CLAIM_TTL_HOURS: '96'
-  CLAIM_WARN_HOURS: '72'
+  CLAIM_TTL_HOURS: '72'
+  CLAIM_WARN_HOURS: '48'
   CLAIM_TTL_SINCE: '2026-09-24T00:00:00Z'
   DRY_RUN: ${{ inputs.dry_run == true && 'true' || 'false' }}
 

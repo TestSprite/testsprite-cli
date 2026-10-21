@@ -46,8 +46,8 @@ export function evaluateClaim({ events, login, issueNumber, now, since, warn, tt
 }
 
 export async function run({ github, context, core, env, now = new Date() }) {
-  const ttl = readHours(env.CLAIM_TTL_HOURS, 96);
-  const warn = readHours(env.CLAIM_WARN_HOURS, 72);
+  const ttl = readHours(env.CLAIM_TTL_HOURS, 72);
+  const warn = readHours(env.CLAIM_WARN_HOURS, 48);
   const since = new Date(env.CLAIM_TTL_SINCE);
   if (
     !Number.isFinite(ttl) ||

@@ -20,6 +20,7 @@ The full reference for the TestSprite CLI: install verification, manual setup, e
   - [Local frontend testing and tunnels](#local-frontend-testing-and-tunnels)
   - [Test lists (`testlist`)](#test-lists-testlist)
   - [Schedules (`schedule`)](#schedules-schedule)
+  - [CI gate (`ci run`)](#ci-gate-ci-run)
   - [CI integration (`ci init`)](#ci-integration-ci-init)
   - [Account & diagnostics](#account--diagnostics)
 - [Configuration](#configuration)
@@ -77,17 +78,31 @@ Credentials are normally stored at `~/.testsprite/credentials` (INI-style, mode 
 
 For an org-scoped API key, `auth status` additionally prints an `orgs:` line (every organization your account belongs to) and an `org binding:` line (the specific organization this key is bound to). Both are omitted for a personal key or an older backend that doesn't report them.
 
-### 2. Run your first test
+### 2. Create a project
 
 ```bash
-# Describe a behavior, trigger it, and wait for a verdict — in one call
+# Prints the project id used in every command below
+testsprite project create --type frontend --name "My App" --url https://your-app.com
+```
+
+### 3. Get your first tests
+
+Two ways in. Let TestSprite propose a first set (it explores your app, or reads an API spec you upload first; generating the proposals uses credits, and nothing runs until you accept them and start a run) — or describe one test yourself.
+
+```bash
+# Option A — propose, review, accept, run
+testsprite test plan generate --project <projectId>
+testsprite test plan accept --project <projectId>
+testsprite test run --all --project <projectId> --wait
+
+# Option B — write one plan yourself, then trigger it and wait for a verdict in one call
+testsprite test create --plan-template > ./checkout.plan.json   # set projectId to <projectId>, edit the steps
 testsprite test create \
-  --project proj_xxxxxxxx --type frontend \
   --plan-from ./checkout.plan.json \
   --run --wait --timeout 600 --output json
 ```
 
-Exit `0` means the run passed; exit `1` means it failed. When it fails, pull the bundle (next section).
+Exit `0` means the run passed; exit `1` means it failed. When it fails, pull the bundle (next section). Everything Option A can tell you — credits per stage, what a backend project needs uploaded first, Ctrl-C behavior, every precondition error — is in [Generate commands](#generate-commands). An app running only on this machine (`project create --local <port>`) takes Option B: generation cannot reach it, and you run the test with `test run <test-id>`, which opens the tunnel to the project's saved local environment (`--local <port>` also works).
 
 ## The complete agent loop
 
@@ -132,6 +147,8 @@ testsprite agent status             # check installed skills against this CLI ve
 
 Supported targets: `claude` (GA), `codex` (experimental), `cursor` (experimental), `cline` (experimental), `antigravity` (experimental), `kiro` (experimental), `windsurf` (experimental), `copilot` (experimental).
 
+Three skills are installed by default (`--skill <name>` narrows the set): **`testsprite-verify`** — run the relevant tests after a change, before reporting it done; **`testsprite-onboard`** — seed a repo that has no tests yet with a first suite; **`testsprite-ci`** — put the tests on every pull request: work out how the repo deploys previews, generate the workflow with `ci init github`, finish its placeholder step, set the secret, and prove the gate on one real pull request (see [CI integration](#ci-integration-ci-init)). Each lands in its own file (one managed section for `codex`).
+
 Omitting `--target` installs for the agents the project shows it uses — the calling agent when the environment names one, together with every agent whose own configuration is already in the repo. Both kinds of evidence count, so being called by one agent does not limit the install to that agent. A non-interactive shell (CI, agent subprocess) installs that set with an `[info]` note on stderr naming it; a terminal prompts with it pre-filled — press enter to accept, or give a comma-separated list to narrow it. An unrecognised name is refused outright (exit 5) and nothing is written; re-run to try again. With nothing detected it falls back to `claude` and says so.
 
 `setup`'s prompt is deliberately more forgiving than this one — it re-asks on an unrecognised name and takes `none` to skip. Neither command writes anything before its prompt, so the difference is not about what a refusal would leave behind: `setup` is the onboarding command, usually run once and often by an agent, where a re-run costs a whole round trip; `agent install` is a repair command already being run by hand, where re-running it is the obvious next thing to do. Both prompts accept a name in any case (`Cursor` and `cursor` are the same answer).
@@ -167,14 +184,14 @@ A **plan file** is the JSON document `test create --plan-from <file>` ingests to
 
 Get this exact skeleton without hand-copying it from this file: `testsprite test create --plan-template` (pure-local, prints to stdout — see [`test create`](#testsprite-test-create)). The same example is embedded in `test create --help`. **The `$schema` value above is pinned to the CLI version that generated this page (`v0.4.0`)** — `--plan-template`'s live output always pins to your actually-installed version instead, so on a later release the two will differ; run the command yourself rather than trusting this snippet's `$schema` value verbatim.
 
-| Field         | Required | Type                                                            | Notes                                                                                                                                                                                                                            |
-| ------------- | -------- | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `projectId`   | yes      | string                                                          | Returned by `testsprite project list`. Non-empty, not whitespace-only.                                                                                                                                                           |
-| `type`        | yes      | `"frontend"`                                                    | `--plan-from` only accepts `frontend` — a `backend`-typed plan is rejected pre-flight with a `nextAction` pointing at `test create --type backend --code-file <path>` (backend tests are authored from a code file, not a plan). |
-| `name`        | yes      | string                                                          | An assertable behavior statement (subject + verb + outcome), not a noun fragment.                                                                                                                                                |
-| `description` | no       | string                                                          | One-sentence elaboration of `name` — the condition plus the expected outcome.                                                                                                                                                    |
-| `priority`    | no       | `"p0"` \| `"p1"` \| `"p2"` \| `"p3"`                            | p0 = must-pass, p1 = important paths, p2 = edge cases, p3 = cosmetic.                                                                                                                                                            |
-| `planSteps`   | yes      | `Array<{ type: "action" \| "assertion", description: string }>` | **1–200 steps**, describing user intent in plain language, not selectors.                                                                                                                                                        |
+| Field         | Required | Type                                                                      | Notes                                                                                                                                                                                                                            |
+| ------------- | -------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `projectId`   | yes      | string                                                                    | Returned by `testsprite project list`. Non-empty, not whitespace-only.                                                                                                                                                           |
+| `type`        | yes      | `"frontend"`                                                              | `--plan-from` only accepts `frontend` — a `backend`-typed plan is rejected pre-flight with a `nextAction` pointing at `test create --type backend --code-file <path>` (backend tests are authored from a code file, not a plan). |
+| `name`        | yes      | string                                                                    | An assertable behavior statement (subject + verb + outcome), not a noun fragment.                                                                                                                                                |
+| `description` | no       | string                                                                    | One-sentence elaboration of `name` — the condition plus the expected outcome.                                                                                                                                                    |
+| `priority`    | no       | `"p0"` \| `"p1"` \| `"p2"` \| `"p3"` \| `"high"` \| `"medium"` \| `"low"` | p0 = must-pass, p1 = important paths, p2 = edge cases, p3 = cosmetic. `high`/`medium`/`low` (any case) are stored as p0/p1/p2, like the Portal's High/Medium/Low; `p3` is treated as low.                                        |
+| `planSteps`   | yes      | `Array<{ type: "action" \| "assertion", description: string }>`           | **1–200 steps**, describing user intent in plain language, not selectors.                                                                                                                                                        |
 
 **Size cap:** the whole file must be **≤ 256 KB** (`test create-batch` caps the aggregate batch at 5 MB / 50 specs). Both caps are enforced client-side before any network call.
 
@@ -775,7 +792,7 @@ Batch `--report` flags apply only to `test run --all --wait` (and batch `test re
 
 The `[advisory]` about `--target-url` on V3-routed accounts is now **response-driven**: the CLI reads the run's actual trigger response rather than guessing from account flags, so it fires only when the override genuinely did not take effect (newer backends apply `--target-url` to fresh frontend runs on V3; older ones ignore it and the advisory says so). The CLI auto-mints an idempotency key (printed to stderr under `--output json`, `--verbose`, or `--debug`); pass `--idempotency-key <uuid>` to control it explicitly.
 
-**`--wait` exit-code precedence (shared across `test run --all`, batch `test rerun`, and `testlist run`).** When a fan-out poll ends with a mix of outcomes, the process exit code is resolved through one shared precedence table — batch-wide non-retriable first: auth (3) and client-too-old (14), then per-run non-retriable (12 insufficient credits, 13 feature-gated), then per-run errors (4/5/6), then transient (11 rate-limited, 10 unavailable), then timeout (7), then the generic failure (1). A per-member poll error now surfaces its real code instead of folding into 7/1. Batch conflicts are **reason-aware**: a `run_in_flight` conflict with a known `runId` is auto-resumed under `--wait` (the CLI polls the in-flight run to its verdict instead of exiting 6), and other causes — a view-only mirror project, an un-runnable/local environment, an unknown id, a billing refusal (`insufficient_credits` / `billing_hold`, carrying the server's message), a dispatch error — are named individually rather than reported as a blanket "already in flight". A batch where **nothing** dispatched, nothing was rate-deferred, and every conflict is `insufficient_credits` exits `12` (`INSUFFICIENT_CREDITS`, with the billing `nextAction`) — the same shape a single `test run` answers — instead of a generic conflict `6`; a newer backend answers that case with the 402 envelope directly and the CLI maps it identically. A batch refused **entirely** for a billing hold is answered by the current backend with the standard `403` `FEATURE_GATED` envelope (`details.reason: 'billing_hold'`, plus the hold `state`) — surfaced as `FEATURE_GATED`, exit `13`, with the server's `nextAction`, exactly like a single `test run`; only a mixed batch (some cases dispatched) carries per-case `billing_hold` conflicts, and an older backend that folds every case into such conflicts still exits `6` with the hold named in the message. Rate-deferred tests are retried on a time budget: retries continue until `--timeout` minus a reserved final poll window (60 s, or a third of the timeout for short timeouts), rather than a fixed attempt count.
+**`--wait` exit-code precedence (shared across `test run --all`, batch `test rerun`, and `testlist run`).** When a fan-out poll ends with a mix of outcomes, the process exit code is resolved through one shared precedence table — batch-wide non-retriable first: auth (3) and client-too-old (14), then per-run non-retriable (12 insufficient credits, 13 feature-gated), then per-run errors (4/5/6), then transient (11 rate-limited, 10 unavailable), then timeout (7), then the generic failure (1). A per-member poll error now surfaces its real code instead of folding into 7/1. Batch conflicts are **reason-aware**: a `run_in_flight` conflict with a known `runId` is auto-resumed under `--wait` (the CLI polls the in-flight run to its verdict instead of exiting 6) — but only after the same check the single run makes: the in-flight run must be on the requested `--env` (or the project default) and, with `--target-url`, against that URL, or it stays a hard conflict rather than another environment's verdict reported as this batch's — and other causes — a view-only mirror project, an un-runnable/local environment, an unknown id, a billing refusal (`insufficient_credits` / `billing_hold`, carrying the server's message), a dispatch error — are named individually rather than reported as a blanket "already in flight". A batch where **nothing** dispatched, nothing was rate-deferred, and every conflict is `insufficient_credits` exits `12` (`INSUFFICIENT_CREDITS`, with the billing `nextAction`) — the same shape a single `test run` answers — instead of a generic conflict `6`; a newer backend answers that case with the 402 envelope directly and the CLI maps it identically. A batch refused **entirely** for a billing hold is answered by the current backend with the standard `403` `FEATURE_GATED` envelope (`details.reason: 'billing_hold'`, plus the hold `state`) — surfaced as `FEATURE_GATED`, exit `13`, with the server's `nextAction`, exactly like a single `test run`; only a mixed batch (some cases dispatched) carries per-case `billing_hold` conflicts, and an older backend that folds every case into such conflicts still exits `6` with the hold named in the message. Rate-deferred tests are retried on a time budget: retries continue until `--timeout` minus a reserved final poll window (60 s, or a third of the timeout for short timeouts), rather than a fixed attempt count.
 
 #### Local frontend testing and tunnels
 
@@ -1063,65 +1080,201 @@ Outside `--dry-run` the cost line appears only when the API priced the run — n
 
 Exit codes on top of the [shared set](#exit-codes): **7** schedules are not available on this account, **13** not available on your plan (`create` also uses 13 when the plan limit is reached), **4** schedule — or, for `create`, the target — not found, **6** idempotency conflict. Every subcommand's `--help` embeds its own list.
 
+### CI gate (`ci run`)
+
+`ci run` runs a project's tests and waits for the verdicts with CI defaults. In a GitHub Actions pull request it tests **that pull request's preview deployment**, the way a GitHub App run does:
+
+```bash
+testsprite ci run --project proj_xxxxxxxx --env staging --target-url "$PREVIEW_URL"
+testsprite ci run --project proj_xxxxxxxx --env staging                      # a fixed environment (nightly, shared dev)
+testsprite ci run --project proj_xxxxxxxx --filter checkout --fail-on-skipped
+testsprite ci run --project proj_xxxxxxxx --summary-file testsprite-summary.json
+```
+
+`--project` defaults to `TESTSPRITE_PROJECT_ID`. All project tests are selected unless `--filter <substr>` narrows them (case-insensitive substring); `--all` is optional. `--env <name>` names the environment whose sign-in the run uses; the name must be one of the project's environments (`testsprite project env list <id>`), and an unknown name is refused **before** anything dispatches or charges, even with `--allow-empty`. That check fails closed: an environment list that cannot be read is that error (a bad key exits **3**, a backend that is down **10**), never a run that goes on to dispatch unchecked; only a backend answering that the project has no environment surface (a V2 project, or an older backend without the route) leaves the name to the batch's own validation. `--target-url <url>` is the address to test — a pull request's preview deployment, or a local app through an automatic tunnel (see [`test run`](#testsprite-test-run-test-id)); `--skip-preflight` skips its reachability probe when the preview is still warming up. Backend tests use the URL in their own code, not `--target-url`.
+
+**One execution.** Every selected test is seeded into one execution and the server paces dispatch under the project's execution settings, exactly as for a GitHub App run — a CI run is one row in the Portal, never a first batch plus a rate-deferred retry. A backend that cannot honor this is refused with exit **7** (`admission-not-honored`) after the outputs are published; the batch is never silently cut to the per-key budget.
+
+**In a pull request.** Under GitHub Actions, `ci run` reads the pull request from the job: a `pull_request` event names it, and a `deployment_status` event (the platform-deploys-every-PR shape) only names the commit, so the PR is looked up with the job's `GITHUB_TOKEN` (`pull-requests: read`). With `--env X --target-url U`, the run then happens in a temporary clone of X pointed at U, named `github-pr-<N>` — the GitHub App's own mechanism, so the Portal shows `github-pr-<N>` as the run's environment, links the run back to the pull request ("View on Github"), and releases the environment when the run finishes. X must sign in with a username and password or not at all: a recorded (SSO) session cannot be cloned and is refused before anything is charged. A draft pull request, or a deployment that belongs to no open pull request, is skipped with a `::notice::` and exit **0** — there is nothing to gate; the step outputs are still written, as zeros, so a later step reading them gets a number. Outside a pull request (a push, a schedule, a shell), `--env X --target-url U` keeps `test run`'s semantics: X's sign-in against U, recorded under X.
+
+**`ci run` does not filter deployments — the workflow does.** A `deployment_status` event fires for every state of every deployment (`pending`, `failure`, `success`, …) and for every environment (preview and production alike). `ci run` reads only the deployment's commit; it never looks at `state` or `environment`. A hand-written workflow therefore needs the job's `if:` to select the deployments worth gating, or a failed deployment is gated against a URL that never came up and a production deploy is gated like a preview:
+
+```yaml
+on: deployment_status
+jobs:
+  testsprite:
+    if: >-
+      github.event.deployment_status.state == 'success' &&
+      github.event.deployment.environment != 'production'
+    steps:
+      - run: testsprite ci run --env staging --target-url "${{ github.event.deployment_status.environment_url }}"
+        env:
+          TESTSPRITE_API_KEY: ${{ secrets.TESTSPRITE_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+```
+
+(Vercel marks its Production deployments with `production_environment: false`, so filter on the environment name, not on that flag.)
+
+Failed or blocked tests exit **1**; a polled run that times out exits **7**. Tests that never dispatched — conflicts, deferred tests left after retrying, unsupported frontend tests, and assembled integration tests — share one `skipped` counter. They warn by default; `--fail-on-skipped` makes any skipped test fail the gate. Missing test ids always exit **4**. A batch where nothing dispatched exits **5**; `--allow-empty` accepts an empty selection (no tests, a filter that matched nothing, runs already in flight elsewhere) but never a batch the backend refused.
+
+CI polls only runs accepted by this invocation. An already-running conflict is skipped even if its `currentRunId` is available: that run may target another deployment. `--timeout <seconds>` defaults to 600 (1–3600); `--max-concurrency <n>` limits simultaneous polls (1–100). Idempotency keys are auto-minted; pass `--idempotency-key <key>` to control them.
+
+The JSON envelope's `summary`, `--summary-file`, GitHub job summary, annotations, and step outputs all use the same `CiSummary`: `{total, passed, failed, skipped, timedOut, runs[]}`. On a backend that serves execution reports, `ci run` also fetches the **execution report** for the batch's execution — the same content the GitHub App posts as its PR comment (verdict headline, AI narrative, per-test rows with error details, suggested fix prompts and screenshots, evaluation notes) — polling until it is ready for up to `--execution-report-timeout <seconds>` (default 60). When it arrives, the job summary is that report's Markdown instead of the results table, `summary.executionReport` carries the structured report (in the JSON envelope and `--summary-file`), and two step outputs name the files it was written to under `$RUNNER_TEMP`: `execution-report-file` (JSON) and `execution-report-markdown-file` (Markdown) — so a later step can `jq` the fix prompts or post the Markdown as a PR comment with its own token. When the CLI's own counts disagree with the report's (a run it could not read or that timed out, a test refused before dispatch, a retry error — things the execution does not contain; a red run whose failures the report also shows agrees), the summary opens with a one-line **CI gate** warning stating the local counts and appends the rows the report cannot carry, so the summary never reads "all passed" under a red check. `--no-execution-report` keeps the job summary to the local results table and reads and writes nothing for the report. A run that timed out means the execution is not finished, so no report is read; otherwise the step can take up to `--timeout` plus `--execution-report-timeout`. Ctrl-C/SIGTERM while waiting for the report stops the wait: the finished batch's summary and outputs are still written with the local table, then the CLI exits with the signal's code (130/143). The two report files under `$RUNNER_TEMP` are written owner-only (`0600`). Screenshot URLs in the report are presigned public links. Note the audience: the job summary is readable by everyone who can read the repository (on a public repository, by anyone), whereas the App's PR comment only exists where the App is installed; the report's narrative, error details, fix prompts and screenshots are the same unredacted content in both places, so treat the summary as you would the PR comment. Without a report (an older backend, or not ready in time) the results table is written as before and nothing else changes. Under Actions, the job summary and annotations enable automatically; `--gh-output` forces them elsewhere. When `GITHUB_OUTPUT` is set, `total`, `passed`, `failed`, `skipped` and `timedOut` are appended as step outputs. Every output is written before the exit code is decided, refusals included.
+
+JUnit is opt-in: `--report junit --report-file results.xml` (optional `--report-suite-name`). It carries the same rows as the summary — every test that did not dispatch is a skipped `<testcase>` with its reason — so a partial batch can never read as a full one. Upload reports in a subsequent `if: always()` step. `--dry-run` previews dispatch without starting runs or writing result files (a credentialed dry run may read environment metadata). PR comments are not yet part of `ci run`.
+
 ### CI integration (`ci init`)
 
-`ci init github` writes a ready-to-run GitHub Actions workflow to `.github/workflows/testsprite.yml` so you don't hand-copy one. The generated workflow delegates to the published [`TestSprite/testsprite-action@v1`](https://github.com/TestSprite/testsprite-action) — the action installs the CLI, runs the tests, emits `::error::` annotations + a job-summary table, uploads a JUnit report, and (by default) **fails the job when tests are skipped** rather than reporting a partial run green. The scaffold stays thin because that logic lives in one maintained place.
+`ci init github` writes `.github/workflows/testsprite.yml`: a PR gate that runs the project's tests against **each pull request's preview deployment** with `testsprite ci run`. The workflow calls the CLI directly; `ci run` owns waiting, skipped counts, the PR context and the exit code, so the YAML only moves data. Everything `ci init` writes is fixed and snapshot-tested; the only part it cannot know is how your PR gets a preview, so that is one placeholder step you replace before committing.
 
 ```bash
 # Scaffold — auto-detects your project if the key has exactly one
 testsprite ci init github
 testsprite ci init github --project proj_xxxxxxxx      # pin a specific project
-testsprite ci init github --filter checkout            # only tests whose name matches
+testsprite ci init github --env staging                # sign in with this environment's settings
+testsprite ci init github --timeout 1800               # how long ci run waits for a verdict
 testsprite ci init github --dry-run                    # preview the file, write nothing
-testsprite ci init github --force                      # overwrite an existing workflow (keeps a .bak)
+testsprite ci init github --force                      # overwrite an existing workflow
 
 # Optionally set the repo secret in the same step (needs gh installed + authenticated)
 testsprite ci init github --set-secret --repo owner/name
 ```
 
-The generated workflow pins the CLI version (not `latest`), sets `permissions: contents: read`, skips pull requests from forks (which run without repository secrets, so the check would be permanently red), and triggers `push` only on the repo's default branch. The API key comes from a `TESTSPRITE_API_KEY` repo secret; `ci init` prints the exact `gh secret set TESTSPRITE_API_KEY` command to add it, and `--set-secret` runs it for you when the [`gh` CLI](https://cli.github.com) is installed and authenticated (the key is passed on stdin, never the process list), degrading to the printed instruction otherwise — it never fails the scaffold. `--project` is optional only when the key owns exactly one project; with zero or several, pass it explicitly (a validation error names the fix). The endpoint is resolved from your profile (or `--endpoint-url`), so a workflow scaffolded against a non-prod backend targets that backend; if that endpoint is a loopback/private address a GitHub-hosted runner can't reach, `ci init` warns (it still writes the file — self-hosted runners are legitimate). By default `ci init` refuses to overwrite an existing workflow; `--force` keeps a `.bak` of the old one first. Every run accepts the global `--output json|text` and `--dry-run`.
+**Replace the placeholder step.** The step marked `REPLACE ME` fails the job until you do. Pick the shape that matches how your PRs deploy:
 
-> The generated gate uses the project's configured environment by default. To test a PR preview, pass its URL to `test run --all --target-url <url>` in the workflow. The gate does not check out or build the PR's code; pair it with your usual build/test checks.
+- **A — your platform deploys every PR** (for example the Vercel or Netlify git integration): change the trigger to `on: deployment_status`, delete the placeholder step, and keep the rest. A repository that deploys **several** projects gets one deployment per project for the same commit (Vercel names them `Preview – <project>`); pin the one to gate with `&& github.event.deployment.environment == 'Preview – <project>'` in the `if:`, or the gate tests whichever project's URL arrives. The run step reads the URL from `github.event.deployment_status.environment_url`, and `ci run` finds the pull request behind the deployment's commit with `GITHUB_TOKEN`; a deployment that belongs to no open pull request is skipped with a notice. The job only runs for successful, non-production deployments (it checks both `production_environment` and the environment name, because Vercel reports `production_environment: false` on its production deployments). This shape needs the repository to actually receive deployment events from your platform; confirm it with one real pull request.
+- **B — you deploy in the workflow**: keep `on: pull_request`, replace the placeholder's commands with your deploy, and end it with `echo "url=<preview address>" >> "$GITHUB_OUTPUT"`. Your platform token goes in its own repo secret.
 
-#### `testsprite ci doctor` / `testsprite ci connect`
+The two finished shapes, with the template's comments left out (the generated file carries them):
 
-A workflow triggered by deployments (`on: deployment_status`) only fires if the repo actually **receives** GitHub Deployment events. Those records are written by whatever deploys your app — Vercel's own GitHub App writes them when the project is git-linked to the repo — and GitHub broadcasts the event to every subscriber. When the platform isn't linked, nothing is written, so nothing ever fires: no error, no annotation, no check. The gate is simply silent, which is far harder to notice than a red one.
-
-`ci doctor` turns that invisible state into a verdict by reading the repo's deployment history through `gh` (the same soft dependency `--set-secret` already uses, so it carries your own GitHub credentials — needed for a private repo):
-
-```bash
-testsprite ci doctor                      # infers the repo from the `origin` remote
-testsprite ci doctor --repo owner/name    # or name it explicitly
-testsprite ci doctor --wait               # keep checking until a NEW deployment record lands
+```yaml
+# A — the platform deploys every pull request (Vercel / Netlify git integration)
+name: TestSprite
+on:
+  deployment_status:
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  gate:
+    concurrency:
+      group: testsprite-${{ github.event.pull_request.number || github.event.deployment.sha }}
+      cancel-in-progress: true
+    if: >-
+      github.event_name == 'deployment_status' &&
+      github.event.deployment_status.state == 'success' &&
+      !github.event.deployment.production_environment &&
+      github.event.deployment.environment != 'production'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TESTSPRITE_API_KEY: ${{ secrets.TESTSPRITE_API_KEY }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm i -g @testsprite/testsprite-cli@latest
+      - name: Run TestSprite tests on this PR's preview
+        env:
+          PREVIEW_URL: ${{ github.event.deployment_status.environment_url }}
+        run: >-
+          testsprite ci run
+          --project "proj_xxxxxxxx"
+          --env "default"
+          --target-url "$PREVIEW_URL"
+          --fail-on-skipped
+          --summary-file testsprite-summary.json
+      - name: Upload TestSprite report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testsprite-results
+          path: testsprite-summary.json
+          if-no-files-found: ignore
 ```
 
-| Verdict           | Meaning                                                                                                                                                                                            | Exit |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- |
-| `linked`          | Recent **preview** deployment events reach this repo — a gate will fire.                                                                                                                           | 0    |
-| `none`            | No events at all. Either the platform isn't linked, **or** it is linked and hasn't deployed yet — the two are indistinguishable from GitHub's side, so the output names both rather than guessing. | 1    |
-| `production-only` | Events exist, but none for a preview environment. A PR gate keys on preview deployments, so it would never run on a pull request — enable preview deployments on your platform.                    | 1    |
-| `stale`           | The newest **preview** event is months old; the link may have been removed since. Production deploys don't freshen this — a repo shipping daily can still have a dead preview link.                | 1    |
+```yaml
+# B — the workflow deploys the preview itself (Vercel CLI shown)
+name: TestSprite
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  gate:
+    concurrency:
+      group: testsprite-${{ github.event.pull_request.number || github.event.deployment.sha }}
+      cancel-in-progress: true
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TESTSPRITE_API_KEY: ${{ secrets.TESTSPRITE_API_KEY }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm i -g @testsprite/testsprite-cli@latest
+      - name: Get this PR's preview URL
+        id: preview
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          url=$(npx vercel@59 deploy --token "$VERCEL_TOKEN" --yes)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+      - name: Run TestSprite tests on this PR's preview
+        env:
+          PREVIEW_URL: ${{ steps.preview.outputs.url || github.event.deployment_status.environment_url }}
+        run: >-
+          testsprite ci run
+          --project "proj_xxxxxxxx"
+          --env "default"
+          --target-url "$PREVIEW_URL"
+          --fail-on-skipped
+          --summary-file testsprite-summary.json
+      - name: Upload TestSprite report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testsprite-results
+          path: testsprite-summary.json
+          if-no-files-found: ignore
+```
 
-A failure to _read_ the history (no `gh` on PATH, not authenticated) exits **10**, deliberately distinct from the verdicts above: "I couldn't check" must not be reported as "not linked", or you'd go fix the wrong thing.
+The last step runs `testsprite ci run --project <id> --env <name> --target-url <preview>`. In a pull request, the run uses a temporary copy of that environment pointed at the preview (named `github-pr-<N>`, like GitHub App runs, and released when the run finishes), so the Portal shows which pull request it tested.
 
-`--wait` is the post-connect check: it baselines the history on its first read and succeeds (exit 0) as soon as a **new** deployment record arrives — whatever its environment, because a new record is the hard fact that events reach this repo. (A push to the default branch deploys as _production_; that still proves the link is live, and the printed verdict tells you whether a PR gate additionally needs previews.) A transient `gh` failure mid-watch is retried rather than aborting; exit 10 is reserved for a wait that never managed a single successful read.
+What the generated workflow fixes in place: it installs `@testsprite/testsprite-cli@latest` (results are decided by the backend, which is not versioned with the CLI, so a pinned client would only freeze old behaviour); it requests `contents: read` and `pull-requests: read`; it skips fork pull requests (they run without repository secrets) and draft pull requests (it runs again on `ready_for_review`); it passes `--fail-on-skipped`, so a test that never ran fails the gate instead of warning; under shape B a new push to the pull request cancels the previous job; under shape A the concurrency group is **per commit** (Vercel sets the deployment's `ref` to the commit SHA, so there is no branch to key on) and a new push does not cancel the previous commit's job — either way, cancelling only stops that job's CLI; the TestSprite run it started keeps executing and reports in the Portal, and the new push starts its own run. The group is declared on the job, so deployment events the `if:` drops (`pending`, `inactive`, another project's deployment of the same commit) never cancel a running gate; and it uploads `ci run`'s summary file even when the job fails.
 
-`ci connect` is the fix for `none`. It runs the platform's **own** CLI as a subprocess (`npx vercel link` → `vercel git connect`, pinned to `vercel@59`), so nothing needs pre-installing and **your Vercel credentials stay with the Vercel CLI** — this command never asks for, stores, or transmits a platform token. Every step is non-interactive, and it never passes `--yes` to the Vercel CLI: on an unlinked directory `vercel link --yes` would _create_ a project named after the current directory and wire the repo to it — a stray project `ci doctor` would then happily report as `linked`. Instead:
+> **Forks and shape A.** A `deployment_status` event runs the workflow file **at the deployed commit**, with the repository's secrets, and the event does not say whether that commit came from a fork. The `if:` can skip fork pull requests on `pull_request` events, not on deployments. If your hosting platform deploys pull requests from forks, turn that off on the platform (Vercel: fork protection / require authorization for fork deployments), or a fork's edit of the workflow runs with your `TESTSPRITE_API_KEY`.
 
-- Directory already linked (`.vercel/project.json` exists) → straight to `vercel git connect`.
-- Not linked → requires `--project <name>` (an **existing** Vercel project) and runs `vercel link --project <name>`.
-- Not linked and no `--project` → refuses, and tells you to either pass the flag or run `npx vercel link` yourself to pick interactively.
+`--env` names the environment whose sign-in each pull-request run uses (list them with `testsprite project env list <project-id>`); an unknown name is refused. Without `--env`, the project's default environment is written into the workflow **by name**, so changing the default later never silently changes what the gate runs. Prefer an environment with test-account or no sign-in: a recorded (SSO/manual) session cannot follow a preview's address, so `ci init` warns when you pick one. `--timeout` is written into the `ci run` line only when you pass it. `--path` must be a `.yml` or `.yaml` file directly under `.github/workflows/` — GitHub never runs a workflow anywhere else, so other paths are refused. If another workflow in that directory already mentions TestSprite, `ci init` warns that each pull request may run (and be billed for) its tests twice; it does not block. An existing file with the same content is left alone; different content needs `--force`, which overwrites it and keeps the previous file as `<path>.bak` — the preview step is hand-edited, so re-apply that edit after regenerating (the output names the backup).
 
-What it cannot do, it says plainly: installing the Vercel GitHub App is a browser OAuth, and an organization that restricts third-party apps needs an admin — in both cases it relays the platform CLI's own message (including the structured `reason` / next-step output Vercel's non-interactive mode emits), rather than paraphrasing the fix away. Heads-up: `vercel link` itself writes `.vercel/`, may add a `VERCEL_OIDC_TOKEN` line to `.env.local`, and may update `.gitignore` — the Vercel CLI's own behavior.
+The API key comes from a `TESTSPRITE_API_KEY` repo secret; `ci init` prints the exact `gh secret set TESTSPRITE_API_KEY` command to add it, and `--set-secret` runs it for you when the [`gh` CLI](https://cli.github.com) is installed and authenticated (the key is passed on stdin, never the process list), degrading to the printed instruction otherwise — it never fails the scaffold. `--project` is optional only when the key owns exactly one project; with zero or several, pass it explicitly (a validation error names the fix). The endpoint is resolved from your profile (or `--endpoint-url`); a non-production endpoint is written into the workflow as `TESTSPRITE_API_URL`, and if it is a loopback/private address a GitHub-hosted runner can't reach, `ci init` warns (it still writes the file — self-hosted runners are legitimate). Every run accepts the global `--output json|text` and `--dry-run`; `--dry-run` makes no network call and uses placeholders for anything it would look up.
 
-Linking only affects **future** pushes, so the loop closes with a push and a re-check — on a branch, so the deployment lands as a preview (the kind a PR gate keys on):
+> Backend tests use the base URL inside their generated code, not the preview URL. To block merges on the gate, make the `testsprite-tests` check a required status check in your branch protection. The job is named `testsprite-tests` rather than `test` or `e2e` because GitHub matches required status checks by job name alone, across every workflow in the repository, so the name must not collide with a job you already have.
+
+#### Checking that deployment events reach the repo
+
+A workflow triggered by deployments (`on: deployment_status`) only fires if the repo actually **receives** GitHub Deployment events — written by whatever deploys your app (Vercel's GitHub App writes them when the project is git-linked). When the platform is not linked, nothing is written and the gate stays silent, with no error anywhere. Read the history yourself:
 
 ```bash
-testsprite ci connect
-git checkout -b verify-testsprite-ci
-git commit --allow-empty -m "verify testsprite ci" && git push -u origin HEAD
-testsprite ci doctor --wait
+gh api repos/OWNER/REPO/deployments --jq '.[] | "\(.environment) \(.ref[0:8]) \(.created_at)"'
 ```
+
+Judge preview and production records separately — a PR gate keys on preview deployments, so production-only means "enable preview deploys on the platform". A newest preview months old is stale. If `gh` is missing or unauthenticated, that is "could not check", not "not linked". History is evidence, not configuration: no records can mean "linked but not deployed yet", and old records can mean "unlinked since" — the proof is one real pull request. To link a Vercel project, use the Vercel dashboard (project → Settings → Git) or Vercel's own CLI, `npx vercel link --project <name> --non-interactive` then `npx vercel git connect --non-interactive` (never `--yes`; `vercel link` writes `.env.local` and may edit `.gitignore`). Linking only affects future pushes, so push a commit on a branch afterwards and check for a new preview record. The `testsprite-ci` agent skill (`testsprite agent install`) walks a coding agent through exactly this.
+
+> `testsprite ci doctor` and `testsprite ci connect` (0.13.0) are **deprecated**: hidden from `--help`, still working with the same exit codes, and each run prints a one-line notice naming the commands above. They will be removed in a later release.
 
 **Self-hosted pipeline?** You don't need any of this — report each deploy to GitHub yourself and every trigger path works identically, because they all consume the same event:
 
@@ -1228,10 +1381,18 @@ run and diagnose failures. Each event carries only:
 - `local=true` for an explicit `--local` invocation (including borrowed/refused runs and project creation) or an automatically opened tunnel; tunnel runs also record `localConcurrencyLimit` and `localPeakInFlight`, the chosen limit and maximum number of active tunnel runs;
 - for `ci init`: `platform`, whether `--force` was passed, whether a workflow
   file already existed at the target path (`workflowExisted`), and whether the
-  project came from `--project` or auto-detection (`projectResolved`).
+  project came from `--project` or auto-detection (`projectResolved`);
+- for `ci run`: `ciRunOutcome` — what the gate did (`gated`; `skipped_draft` /
+  `skipped_no_pr` when there was nothing to gate; `refused_admission` /
+  `refused_env` / `refused_preview_name` / `refused_loopback` / `refused_billing` /
+  `refused_other` when it was refused before or at dispatch; `empty` when nothing was selected),
+  `executionId` — the server's UUID for the execution a gated run belongs to, so
+  the event can be joined to that execution's report (never a URL), and
+  `reportReady` — whether the execution report reached the job summary or the
+  local table was written instead.
 
 It **never** sends: your API key, target URLs, free-form flag or argument values, test or
-run ids, repository names, or error **messages**. The event is a fixed
+run ids (other than the `ci run` execution id above — the server's own UUID, which names nothing about you or your code), repository names, or error **messages**. The event is a fixed
 allowlist; timeout seconds and the local concurrency limit are bounded numeric controls. It is bounded to ~1s and fully best-effort — it never delays beyond that,
 never changes a command's behavior or exit code, and is skipped entirely when no
 API key is configured or under `--dry-run`.
@@ -1254,11 +1415,11 @@ every `/api/cli/v1` response. When the running CLI is below that floor, a
 one-line upgrade advisory is printed to stderr (same opt-outs as the update
 notice; it never changes the exit status). Under GitHub Actions
 (`GITHUB_ACTIONS=true`) the same observation is surfaced once per job as a
-`::warning title=TestSprite::` annotation instead — a `ci init`-generated
-workflow pins `cli-version`, so the job keeps running that version until the
-workflow is regenerated (`testsprite ci init github --force`); the annotation
-fires only when the pinned version has fallen below the backend floor, never
-merely behind the newest npm release (the registry check is skipped in CI). A
+`::warning title=TestSprite::` annotation instead — a workflow that pins an
+old CLI keeps running it until the pin is updated (`ci init` workflows install
+`@latest`); the annotation fires only when the running version has fallen below
+the backend floor, never merely behind the newest npm release (the registry
+check is skipped in CI). A
 backend may also reject a too-old client outright with HTTP 426 - surfaced as
 `CLIENT_TOO_OLD`, exit `14`, non-retriable, with upgrade guidance.
 
@@ -1296,43 +1457,44 @@ Run TestSprite as a required check in any CI system: install the CLI, authentica
 
 ### GitHub Actions (fastest)
 
-Don't hand-write YAML — scaffold it:
+Scaffold a PR gate that tests each pull request's preview deployment:
 
 ```bash
-testsprite ci init github
+testsprite ci init github --env <environment>
 ```
 
-This writes `.github/workflows/testsprite.yml` delegating to the maintained [`TestSprite/testsprite-action@v1`](https://github.com/TestSprite/testsprite-action), which installs the CLI, runs the tests, emits `::error::` annotations plus a job-summary table (each test's title linked to its Portal page and its run linked to the result page), uploads a JUnit report, and **fails the job on a skipped/partial run** instead of reporting it green. See [CI integration (`ci init`)](#ci-integration-ci-init) for every flag and the repo-secret setup.
+This writes `.github/workflows/testsprite.yml`, which installs the CLI and runs `testsprite ci run` against the pull request's preview. Replace its one placeholder step with where your preview URL comes from (your platform's deployment event, or a deploy step in the workflow). See [CI integration (`ci init`)](#ci-integration-ci-init) for both shapes, every flag and the repo-secret setup.
 
 ### Any CI (generic recipe)
 
 The CLI needs only two environment variables — no `~/.testsprite/credentials` file — so it drops into any runner. Store your key as a secret and export it:
 
 ```bash
-# 1. Install (pin a version in CI — avoid `latest`)
-npm install -g @testsprite/testsprite-cli@<version>
+# 1. Install the current CLI
+npm install -g @testsprite/testsprite-cli@latest
 
 # 2. Authenticate from the environment (a masked secret in your CI)
 export TESTSPRITE_API_KEY="…"                          # required
 export TESTSPRITE_API_URL="https://api.testsprite.com" # only for a non-prod endpoint
 
 # 3. Run every test in a project to a verdict — the exit code gates the job
-testsprite test run --all --project proj_xxxxxxxx --wait \
-  --report junit --report-file testsprite-junit.xml \
+testsprite ci run --project proj_xxxxxxxx \
   --summary-file testsprite-summary.json
 ```
 
-- **`--wait`** blocks until every run is terminal (or `--timeout`, default 600 s), so the exit code reflects the real verdict — `0` only when all tests passed.
-- **`--report junit --report-file <path>`** writes a JUnit XML sidecar. Any CI that ingests JUnit — CircleCI `store_test_results`, GitLab `artifacts:reports:junit`, Jenkins JUnit plugin, Azure Pipelines `PublishTestResults` — then shows per-test results, timings, and rerun-failed from it.
+- **Waiting is automatic.** The command follows accepted runs to a terminal verdict (or `--timeout`, default 600 s). Skipped tests warn by default; add `--fail-on-skipped` for a strict gate.
+- **`--report junit --report-file <path>`** optionally writes a JUnit XML sidecar for dispatched runs. Skipped tests are currently omitted from JUnit; the unified summary includes them.
 - **`--summary-file <path>`** writes a compact machine summary (`{ total, passed, failed, skipped, timedOut, runs[] }`) you can read from any step — `failed` counts only dispatched runs that failed; tests that never dispatched (deferred / conflicted / not found / skipped) count under `skipped`. **`--gh-output`** additionally emits a job-summary table and annotations (`::error::` for failures/timeouts, `::warning::` for never-dispatched tests); it auto-enables under `GITHUB_ACTIONS=true`, so you rarely pass it by hand.
 
-Then archive the sidecar with your platform's test-report step (e.g. CircleCI `store_test_results: { path: . }`, GitLab `artifacts: { reports: { junit: testsprite-junit.xml } }`).
+Archive any requested reports with a step that also runs after failure (`if: always()` in GitHub Actions).
 
-JUnit testcases keep the human-readable test name (falling back to `testId`). Their `classname` is `<projectId>:<escapedTestId>` for project batches or `testlist:<listId>:<escapedTestId>` for test lists. In the test ID component, `%` becomes `%25` and `:` becomes `%3A`, so IDs containing a colon cannot collide with a different scope/ID split; ordinary IDs remain unchanged. The stable test ID prevents CI consumers from merging distinct tests with the same name, and stays the same across reruns and list subsets within the same scope. The custom `testId` and `runId` attributes remain available with their original values. Reports previously used only the scope as `classname`; CI history may therefore treat the first report with the new classname as a new test identity.
+JUnit testcases use the trimmed human-readable test name, falling back to `testId`. The `classname` remains the project ID for project batches or `testlist:<listId>` for test lists. Only when names collide within one report, the CLI appends a short test ID to each colliding name, for example `Checkout [12345678]`. The prefix starts at eight characters (or the full ID when shorter) and expands when necessary to distinguish IDs or avoid an existing title; a numeric suffix resolves any remaining collision. Unique names and reports without collisions remain unchanged, byte for byte. A subset that no longer contains the collision uses the original readable name again. The custom `testId` and `runId` attributes, outcomes, durations, and summary counts are unchanged.
 
 ### Full frontend coverage: use a test list
 
 > ⚠️ On a V2 project, `test run --all --project <id>` uses the backend-only batch engine, so frontend tests are skipped and reported under `skippedFrontend`; a batch `--target-url` request is unsupported (exit 7). On a V3 project, `--all` includes frontend and backend tests and `--target-url` applies to frontend tests. For a gate spanning several projects, group the tests into a **test list** and run that:
+
+`ci run` folds a V2 project's frontend skips into its one `skipped` count and warns about them; it never counts them as failures. For an explicitly curated set, including tests spanning several projects, use a **test list**:
 
 ```bash
 testsprite testlist run tl_xxxxxxxx --wait \
@@ -1343,12 +1505,13 @@ A test list is the addressable unit for a mixed FE/BE, multi-project CI gate; ea
 
 ### Gating on the outcome
 
-Under `--wait` the exit code **is** the gate:
+For `ci run`, the exit code **is** the gate:
 
 | Exit              | CI meaning                                                                                                                                                                                                                                 |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `0`               | every test passed                                                                                                                                                                                                                          |
-| `1`               | at least one test failed or was blocked                                                                                                                                                                                                    |
+| `0`               | accepted runs passed; skipped tests are allowed unless `--fail-on-skipped` is set (or an empty run was explicitly allowed)                                                                                                                 |
+| `1`               | at least one test failed or was blocked, or `--fail-on-skipped` rejected skipped tests                                                                                                                                                     |
+| `4`               | a requested test id was not found                                                                                                                                                                                                          |
 | `7`               | a run timed out — raise `--timeout`                                                                                                                                                                                                        |
 | `5`               | the invocation dispatched **zero** tests (empty project, or a `--filter` that matched nothing). This is deliberate — a gate that greens on zero tests is worse than no gate. Pass `--allow-empty` when an empty run is genuinely expected. |
 | `3` / `12` / `13` | auth / out-of-credits / paid-feature-gated — a config problem, not a test failure                                                                                                                                                          |

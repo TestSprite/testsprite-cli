@@ -18,6 +18,7 @@ import {
   summarizeAcceptedPayload,
   summarizeSingleRun,
   type CiSummary,
+  emitExecutionReportOutputs,
 } from './gh-output.js';
 
 const PAYLOAD = JSON.stringify({
@@ -40,6 +41,33 @@ const PAYLOAD = JSON.stringify({
 });
 
 describe('summarizeAcceptedPayload', () => {
+  it('CI folds unsupported buckets without changing the lower-level default', () => {
+    const payload = JSON.stringify({
+      accepted: [{ testId: 'a', status: 'passed' }],
+      skippedFrontend: ['fe'],
+      skippedIntegration: [{ testId: 'integration' }],
+      conflicts: [{ testId: 'gone', reason: 'not_found' }],
+    });
+    const legacy = summarizeAcceptedPayload(payload);
+    expect(legacy).toMatchObject({ total: 2, passed: 1, skipped: 1 });
+    expect(legacy.runs[1]!.status).toBe('conflict');
+    const ci = summarizeAcceptedPayload(payload, { foldSkippedBuckets: true });
+    expect(ci).toMatchObject({ total: 4, passed: 1, failed: 0, skipped: 3 });
+    expect(ci.runs[1]!.status).toBe('not_found');
+    expect(ci.runs.map(row => row.testId)).toEqual(['a', 'gone', 'fe', 'integration']);
+  });
+
+  it('CI annotations carry the actual conflict reason and actionable message', () => {
+    const summary = summarizeAcceptedPayload(
+      JSON.stringify({
+        conflicts: [{ testId: 'local', reason: 'local_address', message: 'Choose a public URL' }],
+      }),
+      { foldSkippedBuckets: true },
+    );
+    expect(summary.runs[0]!.error).toBe('Choose a public URL (not dispatched)');
+    expect(summary).toMatchObject({ total: 1, failed: 0, skipped: 1 });
+  });
+
   it('reduces accepted[] rows into counts and rows', () => {
     const summary = summarizeAcceptedPayload(PAYLOAD);
     expect(summary).toMatchObject({ total: 3, passed: 1, failed: 1, timedOut: 1 });
@@ -699,5 +727,107 @@ describe('environment batch skips', () => {
     );
     expect(summary).toMatchObject({ total: 2, passed: 1, skipped: 1, failed: 0 });
     expect(summary.runs).toContainEqual({ testId: 'b', status: 'skipped', error: 'backend-test' });
+  });
+});
+
+describe('emitGithubOutputs — server-rendered markdown', () => {
+  const summary: CiSummary = summarizeAcceptedPayload(PAYLOAD);
+
+  it('writes the given markdown to the step summary instead of the local table', () => {
+    const appended: { path: string; content: string }[] = [];
+    emitGithubOutputs(
+      summary,
+      { GITHUB_STEP_SUMMARY: '/tmp/step.md' },
+      {
+        stdout: () => undefined,
+        stderr: () => undefined,
+        appendFile: (path, content) => appended.push({ path, content }),
+      },
+      { markdown: '> [!TIP]\n> ### All checks passed\n' },
+    );
+    expect(appended).toEqual([
+      { path: '/tmp/step.md', content: '> [!TIP]\n> ### All checks passed\n' },
+    ]);
+  });
+
+  it('without markdown the local table is written, byte-identical to before', () => {
+    const appended: { path: string; content: string }[] = [];
+    emitGithubOutputs(
+      summary,
+      { GITHUB_STEP_SUMMARY: '/tmp/step.md' },
+      {
+        stdout: () => undefined,
+        stderr: () => undefined,
+        appendFile: (path, content) => appended.push({ path, content }),
+      },
+    );
+    expect(appended[0]?.content).toContain('## TestSprite results');
+  });
+});
+
+describe('emitExecutionReportOutputs', () => {
+  const ready = {
+    report: {
+      projectId: 'p',
+      executionId: 'exec/1',
+      projectName: 'Shop',
+      orgId: null,
+      stats: { passed: 1, failed: 0, blocked: 0, total: 1 },
+      allPassed: true,
+      narrative: null,
+      whatCouldBeBetter: null,
+      recommendedNextStep: null,
+      tests: [],
+      resultUrl: 'https://portal.example.com/x',
+    },
+    markdown: '# report\n',
+  };
+
+  it('writes both files under RUNNER_TEMP and names them in GITHUB_OUTPUT', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-exec-report-'));
+    const outputPath = join(dir, 'outputs');
+    const stderr: string[] = [];
+    const written = emitExecutionReportOutputs(ready, {
+      env: { GITHUB_OUTPUT: outputPath, RUNNER_TEMP: dir },
+      stderr: l => stderr.push(l),
+    });
+    // The execution id is sanitised into a file name; the real id stays in the JSON.
+    expect(written).toEqual({
+      jsonPath: join(dir, 'testsprite-execution-report-exec_1.json'),
+      markdownPath: join(dir, 'testsprite-execution-report-exec_1.md'),
+    });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync files.
+    expect(JSON.parse(readFileSync(written!.jsonPath, 'utf8'))).toEqual(ready.report);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync files.
+    expect(readFileSync(written!.markdownPath, 'utf8')).toBe('# report\n');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync files.
+    expect(readFileSync(outputPath, 'utf8')).toBe(
+      `execution-report-file=${written!.jsonPath}\nexecution-report-markdown-file=${written!.markdownPath}\n`,
+    );
+    expect(stderr).toHaveLength(0);
+  });
+
+  it('is a no-op without GITHUB_OUTPUT (nothing downstream can read the paths)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-exec-report-noop-'));
+    const stderr: string[] = [];
+    expect(
+      emitExecutionReportOutputs(ready, { env: { RUNNER_TEMP: dir }, stderr: l => stderr.push(l) }),
+    ).toBeUndefined();
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own mkdtempSync path.
+    expect(existsSync(join(dir, 'testsprite-execution-report-exec_1.md'))).toBe(false);
+  });
+
+  it('reports a write failure on stderr and returns nothing, never throws', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-exec-report-fail-'));
+    const stderr: string[] = [];
+    expect(
+      emitExecutionReportOutputs(ready, {
+        env: { GITHUB_OUTPUT: join(dir, 'outputs'), RUNNER_TEMP: join(dir, 'missing') },
+        stderr: l => stderr.push(l),
+      }),
+    ).toBeUndefined();
+    expect(stderr).toEqual([expect.stringContaining('execution report files not written')]);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own mkdtempSync path.
+    expect(existsSync(join(dir, 'outputs'))).toBe(false);
   });
 });

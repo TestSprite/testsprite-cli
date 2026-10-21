@@ -233,6 +233,38 @@ describe('content integrity', () => {
       // Load-bearing onboard string: the skill body must reference setup
       expect(content).toContain('testsprite');
     });
+
+    it(`${target} testsprite-ci file lands and has correct structure`, () => {
+      const tmpDir = freshTmpDir();
+      runCli(['agent', 'install', `--target=${target}`, '--dir', tmpDir, '--output', 'json']);
+
+      const filePath = join(tmpDir, pathFor(target, 'testsprite-ci'));
+      expect(existsSync(filePath), `ci file must exist at ${filePath}`).toBe(true);
+      const content = readFileSync(filePath, 'utf8');
+
+      // Frontmatter check for the ci skill (same wrappers as onboard)
+      if (target === 'claude' || target === 'antigravity' || target === 'kiro') {
+        expect(content.startsWith('---'), `${target}/ci: should start with ---`).toBe(true);
+        expect(content).toContain('name: testsprite-ci');
+      } else if (target === 'cursor') {
+        expect(content.startsWith('---'), `cursor/ci: should start with ---`).toBe(true);
+        expect(content).toContain('alwaysApply: false');
+      } else if (target === 'cline') {
+        expect(content.startsWith('---'), `cline/ci: must NOT start with ---`).toBe(false);
+      } else if (target === 'windsurf') {
+        expect(content.startsWith('---'), `windsurf/ci: should start with ---`).toBe(true);
+        expect(content).toContain('trigger: model_decision');
+        expect(content.length, 'windsurf/ci: must fit the rules-file budget').toBeLessThan(12_000);
+      } else if (target === 'copilot') {
+        expect(content.startsWith('---'), `copilot/ci: should start with ---`).toBe(true);
+        expect(content).toContain("applyTo: '**'");
+      }
+
+      // Load-bearing ci strings: the flow the skill drives
+      expect(content).toContain('testsprite ci init github');
+      expect(content).toContain('deployment_status');
+      expect(content).toContain('TESTSPRITE_API_KEY');
+    });
   }
 
   // codex: ONE managed section containing BOTH verify body and onboard one-liner
@@ -919,7 +951,11 @@ describe('matrix coverage guard', () => {
   });
 
   it('SKILLS matches the documented, e2e-covered set (update this list when adding a skill)', () => {
-    expect(Object.keys(SKILLS)).toEqual(['testsprite-verify', 'testsprite-onboard']);
+    expect(Object.keys(SKILLS)).toEqual([
+      'testsprite-verify',
+      'testsprite-onboard',
+      'testsprite-ci',
+    ]);
   });
 });
 

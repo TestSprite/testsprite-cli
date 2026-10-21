@@ -74,6 +74,7 @@ const cases: Array<[string, string[]]> = [
   ['testlist remove', ['testlist', 'remove', '--help']],
   ['testlist run', ['testlist', 'run', '--help']],
   ['ci', ['ci', '--help']],
+  ['ci run', ['ci', 'run', '--help']],
   ['ci init', ['ci', 'init', '--help']],
   ['tunnel', ['tunnel', '--help']],
   ['tunnel start', ['tunnel', 'start', '--help']],

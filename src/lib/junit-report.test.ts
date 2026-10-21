@@ -202,7 +202,7 @@ describe('buildJUnitReport', () => {
     });
     // A CI test tab shows "Login flow works", not the UUID — the id stays as an attr.
     expect(xml).toContain(
-      '<testcase classname="proj_1:test_a" name="Login flow works" testId="test_a" runId="run_a" time="12.5">',
+      '<testcase classname="proj_1" name="Login flow works" testId="test_a" runId="run_a" time="12.5">',
     );
     // testsuite time is the sum of testcase durations (was always 0 before).
     expect(xml).toContain('skipped="0" time="12.5">');
@@ -224,72 +224,126 @@ describe('buildJUnitReport', () => {
       );
       expect(identities).toHaveLength(2);
       expect(new Set(identities.map(identity => JSON.stringify(identity))).size).toBe(2);
-      expect(identities.map(([, name]) => name)).toEqual(['Checkout', 'Checkout']);
+      expect(identities).toEqual([
+        ['testlist:list_1', 'Checkout [test_a]'],
+        ['testlist:list_1', 'Checkout [test_b]'],
+      ]);
     },
   );
 
-  it.each(['proj', 'testlist:list'])(
-    'keeps scope and test ID boundaries unambiguous for %s reports',
-    scope => {
-      const reports = [
-        { classname: scope, testId: 'b:c' },
-        { classname: `${scope}:b`, testId: 'c' },
-      ].map(({ classname, testId }, index) =>
-        buildJUnitReport({
-          suiteName: 'Combined CI job',
-          classname,
-          results: [
-            makeResult({ testId, name: 'Checkout', status: 'failed', runId: `run_${index}` }),
-          ],
-        }),
-      );
-      const identities = reports.map(xml =>
-        xml.match(/<testcase classname="([^"]*)" name="([^"]*)"/)!.slice(1),
-      );
-      expect(new Set(identities.map(identity => JSON.stringify(identity))).size).toBe(2);
-      expect(identities.map(([, name]) => name)).toEqual(['Checkout', 'Checkout']);
-      expect(reports[0]).toContain('testId="b:c" runId="run_0"');
-      expect(reports[1]).toContain('testId="c" runId="run_1"');
-      for (const xml of reports) expect(xml).toContain('tests="1" failures="1"');
-    },
-  );
-
-  it('keeps literal escape sequences distinct from test ID delimiters', () => {
+  it('leaves the complete non-colliding report byte-identical to the original format', () => {
     const xml = buildJUnitReport({
-      suiteName: 'List',
-      classname: 'testlist:list',
-      results: ['b:c', 'b%3Ac', 'b%253Ac'].map(testId => makeResult({ testId, name: 'Checkout' })),
+      suiteName: 'Suite "A"',
+      classname: 'project<&>',
+      results: [
+        makeResult({
+          testId: 'a',
+          name: '  Login & logout  ',
+          runId: 'run_a',
+          durationSeconds: 1.25,
+        }),
+        makeResult({
+          testId: 'b',
+          name: 'Checkout',
+          status: 'failed',
+          runId: 'run_b',
+          durationSeconds: 2,
+        }),
+        makeResult({ testId: 'fallback', name: '  ' }),
+      ],
     });
-    const identities = [...xml.matchAll(/<testcase classname="([^"]*)" name="([^"]*)"/g)].map(
-      match => [match[1], match[2]],
+    // Full XML baseline from the scope-only renderer, including whitespace and trailing LF.
+    expect(xml).toBe(
+      [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<testsuites>',
+        '  <testsuite name="Suite &quot;A&quot;" tests="3" failures="1" errors="0" skipped="0" time="3.25">',
+        '    <testcase classname="project&lt;&amp;&gt;" name="Login &amp; logout" testId="a" runId="run_a" time="1.25">',
+        '    </testcase>',
+        '    <testcase classname="project&lt;&amp;&gt;" name="Checkout" testId="b" runId="run_b" time="2">',
+        '      <failure message="failed" type="failed">status: failed\nrunId: run_b</failure>',
+        '    </testcase>',
+        '    <testcase classname="project&lt;&amp;&gt;" name="fallback" testId="fallback" time="0">',
+        '    </testcase>',
+        '  </testsuite>',
+        '</testsuites>',
+        '',
+      ].join('\n'),
     );
-    expect(identities).toHaveLength(3);
-    expect(new Set(identities.map(identity => JSON.stringify(identity))).size).toBe(3);
   });
 
-  it.each([
-    ['test_a', 'test_a'],
-    ['test:a', 'test%3Aa'],
-    ['test%3Aa', 'test%253Aa'],
-  ])('keeps %s stable across reruns, reordering, and list subsets', (testId, identityId) => {
-    const results = [testId, 'test_b'].map(testId =>
+  it('uses short IDs for collisions and leaves unique names and classnames unchanged', () => {
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: '12345678-abcd', name: 'Checkout' }),
+        makeResult({ testId: '87654321-dcba', name: 'Checkout' }),
+        makeResult({ testId: 'unique-id', name: 'Login' }),
+      ],
+    });
+    expect(xml).toContain('classname="proj_1" name="Checkout [12345678]"');
+    expect(xml).toContain('classname="proj_1" name="Checkout [87654321]"');
+    expect(xml).toContain('classname="proj_1" name="Login"');
+    expect(xml).toContain('testId="12345678-abcd"');
+  });
+
+  it('disambiguates shared short prefixes without changing an existing suffix-like title', () => {
+    const rows = [
+      makeResult({ testId: '12345678-a', name: 'Checkout' }),
+      makeResult({ testId: '12345678-b', name: 'Checkout' }),
+      makeResult({ testId: 'unique', name: 'Checkout [12345678-a]' }),
+    ];
+    for (const results of [rows, [...rows].reverse()]) {
+      const xml = buildJUnitReport({ suiteName: 'List', classname: 'testlist:list_1', results });
+      const names = [...xml.matchAll(/<testcase classname="testlist:list_1" name="([^"]*)"/g)].map(
+        match => match[1],
+      );
+      expect(new Set(names).size).toBe(3);
+      expect(xml).toContain('name="Checkout [12345678-a-2]" testId="12345678-a"');
+      expect(xml).toContain('name="Checkout [12345678-b]" testId="12345678-b"');
+      expect(xml).toContain('name="Checkout [12345678-a]" testId="unique"');
+    }
+  });
+
+  it('detects collisions after trimming and test ID fallback, then escapes the final name', () => {
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'a<&>', name: '  Checkout & pay ' }),
+        makeResult({ testId: 'b', name: 'Checkout & pay' }),
+        makeResult({ testId: 'fallback', name: ' ' }),
+        makeResult({ testId: 'c', name: 'fallback' }),
+      ],
+    });
+    expect(xml).toContain('name="Checkout &amp; pay [a&lt;&amp;&gt;]" testId="a&lt;&amp;&gt;"');
+    expect(xml).toContain('name="Checkout &amp; pay [b]"');
+    expect(xml).toContain('name="fallback [fallback]"');
+    expect(xml).toContain('name="fallback [c]"');
+  });
+
+  it('keeps collision suffixes stable for reordered retries and removes them in a unique subset', () => {
+    const rows = ['test_a', 'test_b'].map(testId =>
       makeResult({ testId, name: 'Checkout', runId: `first_${testId}` }),
     );
-    const reports = [results, [...results].reverse(), [results[0]!]].map(rows =>
-      buildJUnitReport({ suiteName: 'List', classname: 'testlist:list_1', results: rows }),
-    );
-    reports.push(
-      buildJUnitReport({
-        suiteName: 'List',
-        classname: 'testlist:list_1',
-        results: results.map(row => ({ ...row, runId: `retry_${row.testId}`, status: 'failed' })),
-      }),
-    );
-    for (const xml of reports) {
-      expect(xml).toContain(`classname="testlist:list_1:${identityId}" name="Checkout"`);
+    for (const results of [
+      rows,
+      [...rows].reverse().map(row => ({ ...row, runId: `retry_${row.testId}`, status: 'failed' })),
+    ]) {
+      const xml = buildJUnitReport({ suiteName: 'List', classname: 'testlist:list_1', results });
+      for (const row of rows) {
+        expect(xml).toContain(
+          `classname="testlist:list_1" name="Checkout [${row.testId}]" testId="${row.testId}"`,
+        );
+      }
     }
-    expect(reports[1]).toContain('classname="testlist:list_1:test_b" name="Checkout"');
-    expect(reports[3]).toContain('classname="testlist:list_1:test_b" name="Checkout"');
+    const subset = buildJUnitReport({
+      suiteName: 'List',
+      classname: 'testlist:list_1',
+      results: [rows[0]!],
+    });
+    expect(subset).toContain('classname="testlist:list_1" name="Checkout" testId="test_a"');
   });
 
   it('falls back to time="0" when the run carries no timing', () => {
@@ -410,7 +464,7 @@ describe('buildJUnitReport', () => {
       ],
     });
     expect(xml).toContain('name="test&lt;1&gt;"');
-    expect(xml).toContain('classname="proj&lt;&amp;&gt;:test&lt;1&gt;"');
+    expect(xml).toContain('classname="proj&lt;&amp;&gt;"');
     expect(xml).toContain('message="expected &lt;true&gt; &amp; &quot;ok&quot;"');
   });
 

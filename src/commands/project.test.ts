@@ -2864,3 +2864,186 @@ describe('project compatibility contracts', () => {
     expect(headers[0]).toBe(headers[1]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// A project created without a coding agent must not dead-end. After
+// a real create in text mode, one [hint] on stderr points at the generate →
+// accept path (with the hand-authored fallback). JSON callers already hold the
+// id, and --dry-run would embed the canned sample id, so neither gets it.
+// ---------------------------------------------------------------------------
+describe('first-suite signpost after `project create`', () => {
+  it('text mode, frontend: [hint] names test plan generate + accept with the real id, plus the hand-authored fallback', async () => {
+    const { credentialsPath } = makeCreds();
+    const createdProject: CliProject = {
+      ...PROJECT_FIXTURE,
+      id: 'proj_fe_signpost',
+      type: 'frontend',
+      name: 'Signpost FE',
+    };
+    const fetchImpl = makeFetch(() => ({ body: createdProject }));
+    const stderrLines: string[] = [];
+
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        type: 'frontend',
+        name: 'Signpost FE',
+        targetUrl: 'https://example.com',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+    );
+
+    const hint = stderrLines.find(l => l.startsWith('[hint]'));
+    expect(hint).toBeDefined();
+    expect(hint).toContain('testsprite test plan generate --project proj_fe_signpost');
+    expect(hint).toContain('testsprite test plan accept --project proj_fe_signpost');
+    expect(hint).toContain('testsprite test create --plan-template');
+    // A frontend project is explored directly; no document upload step.
+    expect(hint).not.toContain('docs upload');
+  });
+
+  it('text mode, backend: the hint puts `project docs upload` BEFORE generate', async () => {
+    const { credentialsPath } = makeCreds();
+    const createdProject: CliProject = {
+      ...PROJECT_FIXTURE,
+      id: 'proj_be_signpost',
+      type: 'backend',
+      name: 'Signpost BE',
+    };
+    const fetchImpl = makeFetch(() => ({ body: createdProject }));
+    const stderrLines: string[] = [];
+
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        type: 'backend',
+        name: 'Signpost BE',
+        targetUrl: 'https://api.example.com',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+    );
+
+    const hint = stderrLines.find(l => l.startsWith('[hint]'));
+    expect(hint).toBeDefined();
+    expect(hint).toContain('testsprite project docs upload');
+    expect(hint).toContain('--project proj_be_signpost');
+    expect(hint).toContain('testsprite test plan generate --project proj_be_signpost');
+    expect(hint!.indexOf('project docs upload')).toBeLessThan(hint!.indexOf('test plan generate'));
+    expect(hint).toContain('testsprite test create --plan-template');
+  });
+
+  it('json mode: no hint — the caller already holds the project id', async () => {
+    const { credentialsPath } = makeCreds();
+    const createdProject: CliProject = { ...PROJECT_FIXTURE, id: 'proj_json', type: 'frontend' };
+    const fetchImpl = makeFetch(() => ({ body: createdProject }));
+    const stderrLines: string[] = [];
+
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        type: 'frontend',
+        name: 'JSON FE',
+        targetUrl: 'https://example.com',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+    );
+
+    expect(stderrLines.some(l => l.startsWith('[hint]'))).toBe(false);
+  });
+
+  it('--dry-run: no hint — the command would embed the canned sample id', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not hit network in dry-run');
+    });
+    const stderrLines: string[] = [];
+
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: true,
+        type: 'frontend',
+        name: 'Dry FE',
+        targetUrl: 'https://example.com',
+      },
+      {
+        credentialsPath,
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        stdout: () => {},
+        stderr: line => stderrLines.push(line),
+      },
+    );
+
+    expect(stderrLines.some(l => l.startsWith('[hint]'))).toBe(false);
+  });
+});
+
+describe('first-suite signpost for a `--local` project', () => {
+  // Plan generation cannot reach an app on this machine (the backend refuses a
+  // local-origin project before any charge), and the text record already ends
+  // with the hand-written-plan next steps. So no second `[hint]` block: the
+  // record's own block is the one next step, and it must name the right host.
+  async function createLocal(localHost?: string) {
+    const { credentialsPath } = makeCreds();
+    const createdProject: CliProject = {
+      ...PROJECT_FIXTURE,
+      id: 'proj_local_signpost',
+      type: 'frontend',
+      name: 'Local FE',
+    };
+    const fetchImpl = makeFetch(() => ({ body: createdProject }));
+    const connect = vi.fn(async () => {});
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        type: 'frontend',
+        name: 'Local FE',
+        local: '3000',
+        ...(localHost !== undefined ? { localHost } : {}),
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        localPortProbeDeps: { connect },
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    return { stdout: stdoutLines.join('\n'), stderr: stderrLines.join('\n') };
+  }
+
+  it('text mode, --local: no [hint] block; the record names the hand-written plan and the local run', async () => {
+    const { stdout, stderr } = await createLocal();
+    expect(stderr).not.toContain('[hint]');
+    expect(stderr).not.toContain('plan generate');
+    expect(stdout).toContain('testsprite test create --plan-template > plan.json');
+    expect(stdout).toContain('set projectId to proj_local_signpost');
+    expect(stdout).toContain('testsprite test create --plan-from plan.json');
+    expect(stdout).not.toContain('--project proj_local_signpost --plan-from');
+    // The run picks the project's saved local environment up itself, so no flags.
+    expect(stdout).toContain('testsprite test run <test-id>');
+    expect(stdout).not.toContain('--local-host');
+  });
+
+  it.each(['::1', 'localhost'])(
+    'a non-default --local-host (%s) needs no extra run flag: the saved environment carries it',
+    async localHost => {
+      const { stdout, stderr } = await createLocal(localHost);
+      expect(stdout).toContain('testsprite test run <test-id>');
+      expect(stdout).not.toContain('test run <test-id> --local');
+      expect(stderr).not.toContain('[hint]');
+    },
+  );
+});

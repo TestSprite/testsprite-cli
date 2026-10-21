@@ -127,6 +127,8 @@ const CREDENTIALS_LOCK_WAIT_MS = 5_000;
 // problem and is surfaced as such.
 const CREDENTIALS_LOCK_TRANSIENT_WAIT_MS = 1_000;
 const CREDENTIALS_LOCK_STALE_MS = 30_000;
+// How long a transient Windows error on replacing the credentials file is retried.
+const CREDENTIALS_RENAME_TRANSIENT_WAIT_MS = 2_000;
 
 export function parseCredentials(content: string): CredentialsFile {
   const result: CredentialsFile = {};
@@ -340,8 +342,7 @@ function writeCredentialsAtomic(path: string, file: CredentialsFile): void {
   try {
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmp` is `${path}.tmp.${pid}`, derived from the same internal credentials-file path; same baselined risk profile as the other fs calls in this file.
     writeFileSync(tmp, serializeCredentials(file), { mode: 0o600, encoding: 'utf8' });
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- both operands derive from the internal credentials-file path (see above).
-    renameSync(tmp, path);
+    renameCredentialsFile(tmp, path);
   } catch (error) {
     try {
       // eslint-disable-next-line security/detect-non-literal-fs-filename -- best-effort cleanup of the temp file this function just created; same internal path.
@@ -358,6 +359,25 @@ function writeCredentialsAtomic(path: string, file: CredentialsFile): void {
     rethrowCredentialsWriteError(error);
   }
   ensureRestrictiveMode(path);
+}
+
+/**
+ * Replace the credentials file with the temp file. On Windows a transient
+ * EPERM/EBUSY/EACCES (another program briefly holding the file) is retried for a
+ * short window; anything else, or an error that persists, is thrown.
+ */
+function renameCredentialsFile(tmp: string, path: string): void {
+  const deadline = Date.now() + CREDENTIALS_RENAME_TRANSIENT_WAIT_MS;
+  while (true) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- both operands derive from the internal credentials-file path (see writeCredentialsAtomic).
+      renameSync(tmp, path);
+      return;
+    } catch (error) {
+      if (!isWindowsLockContention(error) || Date.now() >= deadline) throw error;
+      sleepSync(CREDENTIALS_LOCK_RETRY_MS);
+    }
+  }
 }
 
 function acquireCredentialsLock(path: string): CredentialsLock {

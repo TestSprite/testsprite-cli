@@ -646,12 +646,12 @@ describe('SKILLS registry', () => {
 // ---------------------------------------------------------------------------
 
 describe('DEFAULT_SKILLS', () => {
-  it('equals ["testsprite-verify", "testsprite-onboard"]', () => {
-    expect(DEFAULT_SKILLS).toEqual(['testsprite-verify', 'testsprite-onboard']);
+  it('equals ["testsprite-verify", "testsprite-onboard", "testsprite-ci"]', () => {
+    expect(DEFAULT_SKILLS).toEqual(['testsprite-verify', 'testsprite-onboard', 'testsprite-ci']);
   });
 
-  it('has exactly two entries', () => {
-    expect(DEFAULT_SKILLS.length).toBe(2);
+  it('has exactly three entries', () => {
+    expect(DEFAULT_SKILLS.length).toBe(3);
   });
 });
 
@@ -981,5 +981,23 @@ describe('render marker placement (own-file targets)', () => {
     expect(() => renderOwnFileWithMarker('claude', 'testsprite-unknown', 'marker')).toThrow(
       'unknown skill',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The two ALWAYS-ON trigger strings (the SKILL.md description an
+// agent reads to decide whether to load the skill, and the codex AGENTS.md
+// one-liner) must name the generate path, since the body already leads with
+// it. The windsurf 12 000-char gate above bounds how long the description may
+// grow.
+// ---------------------------------------------------------------------------
+describe('the always-on onboard trigger strings name generation', () => {
+  it('testsprite-onboard description says the suite can be generated', () => {
+    expect(SKILLS['testsprite-onboard']!.description).toMatch(/generate/i);
+  });
+
+  it('ONBOARD_CODEX_LINE names test plan generate and test plan accept', () => {
+    expect(ONBOARD_CODEX_LINE).toContain('testsprite test plan generate');
+    expect(ONBOARD_CODEX_LINE).toContain('test plan accept');
   });
 });

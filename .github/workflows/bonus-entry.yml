@@ -1,0 +1,226 @@
+# Season 4 CLI Improvement Bonus entry bot. A PR enters the bonus by ticking
+# the entry checkbox in its description (the "Season 4 CLI Improvement Bonus"
+# section of PULL_REQUEST_TEMPLATE.md). The bot keeps one sticky comment per PR:
+#   - box ticked: confirms the entry, adds the bonus label, and lists what the
+#     PR still needs to be counted (a linked issue assigned to the author, out
+#     of draft by the close, a Discord username or a note that we'll reach the
+#     author on the PR);
+#   - box unticked but the PR looks like a hackathon entry (a `[Hackathon]`
+#     title, a linked issue labelled `hackathon` or titled `[Hackathon]`, or a
+#     Discord username filled in): asks instead of silently leaving it out;
+#   - box unticked after an entry was confirmed: records the withdrawal and
+#     removes the label.
+# The bot only records entries; maintainers decide eligibility after the close.
+# After BONUS_CLOSES_AT it makes no changes, so the record freezes at the close.
+# Remove this workflow and the template section once Season 4 is paid out.
+#
+# Runs with NO checkout: metadata-only, so it is safe under pull_request_target
+# (required for fork PRs to get a write-capable token; see
+# check-pr-target-checkout.mjs). Bot identity: same App-token-first /
+# GITHUB_TOKEN-fallback pattern as pr-triage.yml.
+name: Season 4 bonus entry
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize, ready_for_review, converted_to_draft]
+
+permissions:
+  pull-requests: read # read the live PR and its closing issue references
+  issues: write # sticky comment + label (PR comments and labels ride the issues API)
+
+concurrency:
+  group: bonus-entry-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  LABEL: 's4-cli-bonus'
+  MARKER: '<!-- hob:s4-bonus -->'
+  # Oct 29, 11:59 PM PT (PDT, UTC-7) — the published close of the CLI window.
+  BONUS_CLOSES_AT: '2026-10-30T06:59:59Z'
+
+jobs:
+  entry:
+    if: >-
+      github.repository == 'TestSprite/testsprite-cli' &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    steps:
+      # Mint an App token so comments post as testsprite-hob[bot]; until the
+      # App + secrets exist this no-ops and writes fall back to GITHUB_TOKEN.
+      - id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.TESTSPRITE_HOB_APP_ID || secrets.ALFHEIM_AGENT_APP_ID }}
+          private-key: ${{ secrets.TESTSPRITE_HOB_PRIVATE_KEY || secrets.ALFHEIM_AGENT_PRIVATE_KEY }}
+          # Every write below is an `issues.*` call (comments and labels, even
+          # on a PR number), which GitHub gates on the Issues permission.
+          permission-issues: write
+
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const label = process.env.LABEL;
+            const marker = process.env.MARKER;
+            const closesAt = new Date(process.env.BONUS_CLOSES_AT);
+            if (Number.isNaN(closesAt.getTime())) {
+              core.setFailed('Invalid BONUS_CLOSES_AT');
+              return;
+            }
+            if (Date.now() > closesAt.getTime()) {
+              core.info('The Season 4 CLI bonus window has closed; leaving entries as recorded.');
+              return;
+            }
+
+            // A queued run carries the PR as it was when its event fired. Read it
+            // fresh so back-to-back edits settle on the latest description and labels.
+            const { data: pr } = await github.rest.pulls.get(
+              { owner, repo, pull_number: context.payload.pull_request.number });
+            if (pr.state !== 'open') {
+              core.info(`PR #${pr.number} is no longer open.`);
+              return;
+            }
+            const author = pr.user.login;
+
+            const appClient = process.env.APP_TOKEN
+              ? new (github.constructor)({ auth: process.env.APP_TOKEN })
+              : null;
+            // Prefer the App identity; fall back to github-actions[bot] when the
+            // App is absent or lacks the permission (403/404).
+            async function write(fn) {
+              if (appClient) {
+                try { return await fn(appClient.rest); }
+                catch (e) { if (e.status !== 403 && e.status !== 404) throw e; }
+              }
+              return await fn(github.rest);
+            }
+
+            // HTML comments are template guidance, never an entry.
+            const body = (pr.body || '').replace(/<!--[\s\S]*?-->/g, '');
+            const box = /^[ \t]*[-*+][ \t]+\[([ xX])\][ \t]+I['’]m entering this PR for the Season 4 CLI Improvement Bonus/m.exec(body);
+            const ticked = Boolean(box) && box[1] !== ' ';
+            const discordLine = /^[ \t]*(?:[-*+][ \t]+)?\**Discord(?:[ \t]+(?:username|handle|user[ \t]*name))?\**[ \t]*:\**(.*)$/im.exec(body);
+            const discord = (discordLine ? discordLine[1] : '').replace(/[*_`]/g, '').trim();
+            const hasDiscord = discord !== '' && !/^(?:<.*>|-+|n\/?a|none|tbd)$/i.test(discord);
+
+            // Linked issues, the same way the issue-link gate (pr-triage.yml)
+            // finds them: GitHub-computed closing references, plus body keywords
+            // (including non-closing ones such as "Part of #N").
+            const gql = await github.graphql(
+              `query($owner:String!,$repo:String!,$num:Int!){
+                repository(owner:$owner,name:$repo){
+                  pullRequest(number:$num){
+                    closingIssuesReferences(first:10){
+                      nodes{ number title labels(first:20){ nodes{ name } } assignees(first:10){ nodes{ login } } }
+                    }
+                  }
+                }
+              }`, { owner, repo, num: pr.number });
+            const linkedIssues = gql.repository.pullRequest.closingIssuesReferences.nodes.map(n => ({
+              number: n.number,
+              title: n.title || '',
+              labels: n.labels.nodes.map(l => l.name),
+              assignees: n.assignees.nodes.map(a => a.login),
+            }));
+            const bodyRefs = [...body
+              .matchAll(/\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|part\s+of|refs?|references?|related\s+to)\s*:?\s+#(\d+)/gi)]
+              .map(m => Number(m[1]))
+              .filter(n => !linkedIssues.some(i => i.number === n))
+              .slice(0, 5);
+            for (const num of bodyRefs) {
+              try {
+                const { data } = await github.rest.issues.get({ owner, repo, issue_number: num });
+                if (data.pull_request) continue; // "#N" pointed at a PR, not an issue
+                linkedIssues.push({
+                  number: num,
+                  title: data.title || '',
+                  labels: (data.labels || []).map(l => (typeof l === 'string' ? l : l.name)),
+                  assignees: (data.assignees || []).map(a => a.login),
+                });
+              } catch (e) { /* unknown number — ignore */ }
+            }
+
+            const hackathonTitle = /^\s*\[hackathon\]/i;
+            const looksLikeEntry =
+              hackathonTitle.test(pr.title || '') ||
+              hasDiscord ||
+              linkedIssues.some(i => i.labels.includes('hackathon') || hackathonTitle.test(i.title));
+            const issueOk = linkedIssues.some(i => i.assignees.includes(author));
+
+            const comments = await github.paginate(github.rest.issues.listComments,
+              { owner, repo, issue_number: pr.number, per_page: 100 });
+            // Anyone can paste the marker, so only a comment by this bot is the sticky one.
+            const botLogins = ['github-actions[bot]', 'testsprite-hob[bot]'];
+            const sticky = comments.find(c => botLogins.includes(c.user?.login) && (c.body || '').includes(marker));
+            const previous = /<!-- hob:s4-bonus:state:(\w+) -->/.exec(sticky?.body || '')?.[1];
+
+            const rulesUrl = 'https://www.testsprite.com/hackathon-s4';
+            const close = 'Oct 29, 11:59 PM PT';
+            let state;
+            let text;
+            if (ticked) {
+              state = 'entered';
+              const issueLine = issueOk
+                ? '✅ A linked issue assigned to you.'
+                : linkedIssues.length > 0
+                  ? '⬜ A linked issue assigned to you: the issue this PR links isn\'t assigned to you yet. Claim it by commenting `/assign` on it.'
+                  : '⬜ A linked issue assigned to you: add `Closes #123` (or `Part of #123` for an umbrella issue) to the description.';
+              const draftLine = pr.draft
+                ? `⬜ Out of draft: this PR is still a draft. Mark it ready for review before ${close}.`
+                : '✅ Out of draft.';
+              const discordStatus = hasDiscord
+                ? '✅ A Discord username in the description.'
+                : 'ℹ️ No Discord username in the description. Add one so we can reach you, or we\'ll reach you here on the PR.';
+              text = `🏆 **Season 4 CLI Improvement Bonus: entry recorded.** Thanks, @${author}!\n\n`
+                + `To be counted, this PR needs the following by **${close}**:\n\n`
+                + `- ${issueLine}\n- ${draftLine}\n- ${discordStatus}\n\n`
+                + 'Rewards go to merged PRs judged a genuine improvement, and up to three bonus-eligible PRs count per person. '
+                + `Untick the box to withdraw the entry. This comment refreshes when you edit the PR. [Full rules](${rulesUrl}).`;
+            } else if (previous === 'entered' || previous === 'withdrawn') {
+              // Before the near-miss check: an entrant who unticks usually still
+              // has a Discord username filled in, which would read as a near miss.
+              state = 'withdrawn';
+              text = `This PR is no longer entered for the Season 4 CLI Improvement Bonus (the entry box is unticked). `
+                + `Tick it again before **${close}** to re-enter.`;
+            } else if (looksLikeEntry) {
+              state = 'maybe';
+              text = `Hi @${author}, this looks like it might be a Season 4 CLI Improvement Bonus entry, but the entry box in the description isn't ticked. `
+                + `To enter, edit the description so it includes this section, with the box ticked, before **${close}**:\n\n`
+                + '```markdown\n## Season 4 CLI Improvement Bonus\n\n'
+                + '- [x] I\'m entering this PR for the Season 4 CLI Improvement Bonus\n\n'
+                + 'Discord username: your-username\n```\n\n'
+                + `If this PR isn't an entry, you can ignore this comment. [Full rules](${rulesUrl}).`;
+            } else {
+              state = 'none';
+            }
+
+            if (state !== 'none') {
+              const full = `${marker}\n<!-- hob:s4-bonus:state:${state} -->\n${text}`;
+              if (!sticky) {
+                await write(rest => rest.issues.createComment({ owner, repo, issue_number: pr.number, body: full }));
+              } else if (sticky.body !== full) {
+                await write(rest => rest.issues.updateComment({ owner, repo, comment_id: sticky.id, body: full }));
+              }
+            }
+
+            const hasLabel = (pr.labels || []).some(l => l.name === label);
+            if (state === 'entered' && !hasLabel) {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name: label });
+              } catch (e) {
+                if (e.status !== 404) throw e;
+                await write(rest => rest.issues.createLabel({
+                  owner, repo, name: label, color: 'fbca04',
+                  description: 'Entered for the Season 4 CLI Improvement Bonus',
+                }));
+              }
+              await write(rest => rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: [label] }));
+            }
+            if (state !== 'entered' && hasLabel) {
+              await write(rest => rest.issues.removeLabel({ owner, repo, issue_number: pr.number, name: label })).catch(() => {});
+            }
+            core.info(`Season 4 bonus entry: state=${state} ticked=${ticked} issueOk=${issueOk} draft=${pr.draft} discord=${hasDiscord}`);

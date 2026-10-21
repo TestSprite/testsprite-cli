@@ -892,8 +892,8 @@ describe('runList', () => {
 
     const json = JSON.parse(capture.stdout.join('\n')) as ListResult[];
     expect(Array.isArray(json)).toBe(true);
-    // 8 targets × 2 default skills = 16 rows
-    expect(json).toHaveLength(16);
+    // 8 targets × 3 default skills = 24 rows
+    expect(json).toHaveLength(24);
     const targets = json.map(r => r.target);
     expect(targets).toContain('claude');
     expect(targets).toContain('cursor');
@@ -1349,7 +1349,7 @@ describe('runInstall — all own-file targets', () => {
 // ---------------------------------------------------------------------------
 
 describe('runInstall — dry-run all own-file targets', () => {
-  it('writes nothing for any of the seven own-file targets (default 2 skills = 14 would-write lines)', async () => {
+  it('writes nothing for any of the seven own-file targets (default 3 skills = 21 would-write lines)', async () => {
     const { store, fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -1369,9 +1369,9 @@ describe('runInstall — dry-run all own-file targets', () => {
     const stderrOut = capture.stderr.join('\n');
     // Banner appears once
     expect(stderrOut).toContain('[dry-run] no files written');
-    // 7 targets × 2 default skills = 14 would-write lines
+    // 7 targets × 3 default skills = 21 would-write lines
     const wouldWriteLines = stderrOut.split('\n').filter(l => l.includes('would write'));
-    expect(wouldWriteLines.length).toBe(14);
+    expect(wouldWriteLines.length).toBe(21);
   });
 });
 
@@ -2559,14 +2559,14 @@ describe('runInstall — multi-skill: default install writes BOTH skills (own-fi
     );
 
     const json = JSON.parse(capture.stdout.join('\n')) as InstallResult[];
-    expect(json.length).toBe(2);
+    expect(json.length).toBe(3);
     for (const r of json) {
       expect(Array.isArray(r.skills)).toBe(true);
       expect(r.skills.length).toBe(1);
     }
   });
 
-  it('text output FORMAT is unchanged: one row per result (target padEnd(12) action padEnd(12) path), 2 rows for default install', async () => {
+  it('text output FORMAT is unchanged: one row per result (target padEnd(12) action padEnd(12) path), 3 rows for default install', async () => {
     const { fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -2584,7 +2584,7 @@ describe('runInstall — multi-skill: default install writes BOTH skills (own-fi
 
     const lines = capture.stdout.join('\n').split('\n').filter(Boolean);
     // 2 results → 2 lines
-    expect(lines.length).toBe(2);
+    expect(lines.length).toBe(3);
     // Each line has target, action, and path
     for (const line of lines) {
       expect(line).toContain('claude');
@@ -2788,7 +2788,7 @@ describe('runInstall — multi-skill: unknown --skill exits 5', () => {
 });
 
 describe('runInstall — multi-skill: multi-target own-file with default skills', () => {
-  it('default install to claude + cursor writes 4 files (2 targets × 2 skills)', async () => {
+  it('default install to claude + cursor writes 6 files (2 targets × 3 skills)', async () => {
     const { store, fs: agentFs, writeCalls } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -2818,21 +2818,23 @@ describe('runInstall — multi-skill: multi-target own-file with default skills'
     }
 
     const json = JSON.parse(capture.stdout.join('\n')) as InstallResult[];
-    expect(json.length).toBe(4);
+    expect(json.length).toBe(6);
     expect(json.every(r => r.action === 'written')).toBe(true);
   });
 });
 
 describe('runInstall — SKILLS registry / DEFAULT_SKILLS contract', () => {
-  it('DEFAULT_SKILLS contains exactly testsprite-verify and testsprite-onboard', () => {
+  it('DEFAULT_SKILLS contains exactly testsprite-verify, testsprite-onboard and testsprite-ci', () => {
     expect(DEFAULT_SKILLS).toContain('testsprite-verify');
     expect(DEFAULT_SKILLS).toContain('testsprite-onboard');
-    expect(DEFAULT_SKILLS.length).toBe(2);
+    expect(DEFAULT_SKILLS).toContain('testsprite-ci');
+    expect(DEFAULT_SKILLS.length).toBe(3);
   });
 
-  it('SKILLS registry contains both skills with required fields', () => {
+  it('SKILLS registry contains all three skills with required fields', () => {
     expect(SKILLS['testsprite-verify']).toBeDefined();
     expect(SKILLS['testsprite-onboard']).toBeDefined();
+    expect(SKILLS['testsprite-ci']).toBeDefined();
     for (const [name, spec] of Object.entries(SKILLS)) {
       expect(spec.name).toBe(name);
       expect(typeof spec.description).toBe('string');

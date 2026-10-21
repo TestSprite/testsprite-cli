@@ -61,7 +61,7 @@ function formatTime(seconds: number | undefined): string {
 
 export interface JUnitReportBuildOptions {
   suiteName: string;
-  /** Report scope; each testcase appends its delimiter-escaped stable testId. */
+  /** Shared project or test-list scope, preserved as the testcase classname. */
   classname: string;
   results: readonly JUnitTestResult[];
 }
@@ -174,19 +174,57 @@ function failureMessage(result: JUnitTestResult): string {
 }
 
 /**
- * Render a testcase with a readable name and a stable, per-test classname.
- * Standard JUnit consumers ignore custom testId/runId attributes when deduplicating.
- * Escape percent signs and colons in the ID so the final colon separates it
- * unambiguously from the scope; preserve the original ID in its custom attribute.
+ * Preserve readable names unless they collide within this report. Colliding rows
+ * receive an eight-character test-ID prefix, extended when prefixes overlap.
+ * Reserve original titles before allocating suffixes so an unrelated title is
+ * never renamed. A numeric fallback handles full-ID/title collisions, and sorting
+ * by test ID makes allocation independent of result order and ephemeral run IDs.
  */
-function renderTestcase(result: JUnitTestResult, classname: string): string {
+function resolveTestcaseNames(results: readonly JUnitTestResult[]): string[] {
+  const names = results.map(result => result.name?.trim() || result.testId);
+  const groups = new Map<string, number[]>();
+  names.forEach((name, index) => {
+    const group = groups.get(name) ?? [];
+    group.push(index);
+    groups.set(name, group);
+  });
+  const used = new Set(names);
+  for (const name of [...groups.keys()].sort()) {
+    const indices = groups.get(name)!;
+    if (indices.length < 2) continue;
+    const ids = indices.map(index => results[index]!.testId);
+    indices.sort((a, b) => {
+      const left = results[a]!.testId;
+      const right = results[b]!.testId;
+      return left < right ? -1 : left > right ? 1 : a - b;
+    });
+    for (const index of indices) {
+      const id = results[index]!.testId;
+      const characters = Array.from(id);
+      let length = Math.min(8, characters.length);
+      let prefix = characters.slice(0, length).join('');
+      while (
+        length < characters.length &&
+        (ids.some(other => other !== id && other.startsWith(prefix)) ||
+          used.has(`${name} [${prefix}]`))
+      ) {
+        prefix = characters.slice(0, ++length).join('');
+      }
+      let candidate = `${name} [${prefix}]`;
+      let ordinal = 2;
+      while (used.has(candidate)) candidate = `${name} [${prefix}-${ordinal++}]`;
+      names[index] = candidate;
+      used.add(candidate);
+    }
+  }
+  return names;
+}
+
+/** Render one testcase with its collision-resolved name and original report scope. */
+function renderTestcase(result: JUnitTestResult, classname: string, resolvedName: string): string {
   const outcome = classifyJUnitOutcome(result.status, result.error);
-  // Distinct tests can share a human name. Include the stable testId in the
-  // standard classname too, even when this report contains no duplicate names,
-  // so retries, reordered results, and subsets retain the same CI identity.
-  const name = escapeXml(result.name?.trim() || result.testId);
-  const identityId = result.testId.replace(/%/g, '%25').replace(/:/g, '%3A');
-  const cls = escapeXml(`${classname}:${identityId}`);
+  const name = escapeXml(resolvedName);
+  const cls = escapeXml(classname);
   const time = formatTime(result.durationSeconds);
   const idAttr = ` testId="${escapeXml(result.testId)}"`;
   const runAttr = result.runId ? ` runId="${escapeXml(result.runId)}"` : '';
@@ -254,7 +292,10 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
   }
 
   const suiteName = escapeXml(opts.suiteName);
-  const testcases = results.map(r => renderTestcase(r, opts.classname)).join('\n');
+  const names = resolveTestcaseNames(results);
+  const testcases = results
+    .map((r, index) => renderTestcase(r, opts.classname, names[index]!))
+    .join('\n');
 
   return [
     XML_DECL,

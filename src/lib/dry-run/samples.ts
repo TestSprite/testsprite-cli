@@ -44,6 +44,7 @@ import type {
   BatchRunFreshResponse,
   ListRunsResponse,
   CancelRunResponse,
+  ExecutionReportResponse,
 } from '../runs.types.js';
 import type {
   CliAcceptPlansResponse,
@@ -202,7 +203,7 @@ const tests: CliTest[] = [
     createdFrom: 'portal',
     status: 'failed',
     // G1a — priority label shown on one row so dry-run learners see the field.
-    priority: 'p1',
+    priority: 'Medium',
     createdAt: '2026-04-20T11:00:00.000Z',
     updatedAt: '2026-05-05T12:34:56.000Z',
     details: {
@@ -407,6 +408,47 @@ const failureSummary: CliFailureSummary = {
   snapshotId: SAMPLE_SNAPSHOT_ID,
   rootCauseHypothesis: failureContext.failure.rootCauseHypothesis,
   recommendedFixTarget: failureContext.failure.recommendedFixTarget,
+};
+
+const SAMPLE_EXECUTION_ID = 'exec_dryrun0001';
+
+/** A ready execution report: one failed and one passed row, the App's Markdown shape in miniature. */
+const executionReportSample: ExecutionReportResponse = {
+  ready: true,
+  report: {
+    projectId: SAMPLE_PROJECT_ID,
+    executionId: SAMPLE_EXECUTION_ID,
+    projectName: 'Sample project',
+    orgId: null,
+    stats: { passed: 1, failed: 1, blocked: 0, total: 2 },
+    allPassed: false,
+    narrative: 'Dry-run sample: one regression in checkout, login passed.',
+    whatCouldBeBetter: 'Add coverage for password reset.',
+    recommendedNextStep: 'Fix the checkout selector and rerun.',
+    tests: [
+      {
+        id: SAMPLE_RUN_ID,
+        title: 'Checkout applies a coupon',
+        slug: 'CHK-002',
+        status: 'FAILED',
+        screenshotUrl: null,
+        error: 'AssertionError: expected the order total to drop',
+        fix: 'Apply the coupon before computing the total.',
+      },
+      {
+        id: `${SAMPLE_RUN_ID}-2`,
+        title: 'Login with a valid account',
+        slug: 'AUTH-001',
+        status: 'PASSED',
+        screenshotUrl: null,
+        error: null,
+        fix: null,
+      },
+    ],
+    resultUrl: `https://www.testsprite.com/dashboard-v3/projects/${SAMPLE_PROJECT_ID}/execution/${SAMPLE_EXECUTION_ID}`,
+  },
+  markdown:
+    '> [!WARNING]\n> ### Ran into trouble — 1 failed\n>\n> Dry-run sample: one regression in checkout, login passed.\n',
 };
 
 const passedRunSample: RunResponse = {
@@ -768,6 +810,14 @@ const ENTRIES: DryRunSampleEntry[] = [
   entry('getTestCode', 'GET', '/tests/{testId}/code', testCode),
   entry('listTestSteps', 'GET', '/tests/{testId}/steps', pageOf(testSteps)),
   entry('getTestResult', 'GET', '/tests/{testId}/result', latestResult),
+  // Execution report — static `executions/` prefix, four segments, so no
+  // `/tests/{testId}/…` pattern can shadow it; kept beside the other reads.
+  entry(
+    'getExecutionReport',
+    'GET',
+    '/tests/executions/{executionId}/report',
+    executionReportSample,
+  ),
   // `/failure/summary` MUST come before `/failure` so the regex matcher
   // doesn't shadow it with the bundle endpoint.
   entry('getTestFailureSummary', 'GET', '/tests/{testId}/failure/summary', failureSummary),
