@@ -1,5 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Output, isOutputMode, resolveOutputMode } from './output.js';
+import {
+  Output,
+  csvField,
+  isListFormat,
+  isOutputMode,
+  renderCsv,
+  renderNdjson,
+  resolveListOutput,
+  resolveOutputMode,
+  type CsvColumns,
+} from './output.js';
 import { ApiError } from './errors.js';
 
 describe('isOutputMode', () => {
@@ -43,6 +53,107 @@ describe('resolveOutputMode', () => {
       expect(apiErr.exitCode).toBe(5);
       expect(apiErr.nextAction).toContain('must be one of: json, text');
     }
+  });
+});
+
+describe('csv / ndjson list formats (issue #164)', () => {
+  function validationError(fn: () => unknown): ApiError {
+    try {
+      fn();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ApiError);
+      return err as ApiError;
+    }
+    throw new Error('expected a VALIDATION_ERROR');
+  }
+
+  it('isListFormat accepts csv and ndjson only', () => {
+    expect(isListFormat('csv')).toBe(true);
+    expect(isListFormat('ndjson')).toBe(true);
+    expect(isListFormat('json')).toBe(false);
+    expect(isListFormat('CSV')).toBe(false);
+  });
+
+  it('a non-list command rejects csv / ndjson with exit 5 naming the list commands', () => {
+    for (const format of ['csv', 'ndjson']) {
+      const err = validationError(() => resolveOutputMode(format));
+      expect(err.code).toBe('VALIDATION_ERROR');
+      expect(err.exitCode).toBe(5);
+      expect(err.nextAction).toContain(`${format} is only supported by list commands`);
+      expect(err.nextAction).toContain('project list, test list, test result --history');
+    }
+  });
+
+  it('a list command resolves csv / ndjson to a format with json gates', () => {
+    expect(resolveListOutput('csv')).toEqual({ output: 'json', format: 'csv' });
+    expect(resolveListOutput('ndjson')).toEqual({ output: 'json', format: 'ndjson' });
+    expect(resolveListOutput('json')).toEqual({ output: 'json' });
+    expect(resolveListOutput(undefined)).toEqual({ output: 'text' });
+    const err = validationError(() => resolveListOutput('yaml'));
+    expect(err.exitCode).toBe(5);
+    expect(err.nextAction).toContain('must be one of: json, text, csv, ndjson');
+  });
+
+  it('csvField applies RFC 4180 quoting', () => {
+    expect(csvField('plain')).toBe('plain');
+    expect(csvField('a,b')).toBe('"a,b"');
+    expect(csvField('say "hi"')).toBe('"say ""hi"""');
+    expect(csvField('line1\nline2')).toBe('"line1\nline2"');
+    expect(csvField('line1\r\nline2')).toBe('"line1\r\nline2"');
+    expect(csvField(null)).toBe('');
+    expect(csvField(undefined)).toBe('');
+    expect(csvField(false)).toBe('false');
+    expect(csvField(3)).toBe('3');
+    expect(csvField(['data-testid', 'data-qa'])).toBe('"data-testid,data-qa"');
+    expect(csvField({ a: 1 })).toBe('"{""a"":1}"');
+  });
+
+  it('csvField prefixes a formula-leading value with a single quote before quoting', () => {
+    expect(csvField('=HYPERLINK("http://evil","x")')).toBe(`"'=HYPERLINK(""http://evil"",""x"")"`);
+    expect(csvField('=1+1')).toBe("'=1+1");
+    expect(csvField('+1')).toBe("'+1");
+    expect(csvField('-1')).toBe("'-1");
+    expect(csvField('@SUM(A1)')).toBe("'@SUM(A1)");
+    expect(csvField('\tcmd')).toBe("'\tcmd");
+    expect(csvField('\rcmd')).toBe(`"'\rcmd"`);
+    // Only a leading trigger counts.
+    expect(csvField('a=b')).toBe('a=b');
+  });
+
+  it('renderCsv writes a header and CRLF-terminated records in column order', () => {
+    interface Row {
+      id: string;
+      tags?: string[];
+      nested: { name: string } | null;
+      hidden: unknown;
+    }
+    const columns: CsvColumns<Row> = {
+      id: true,
+      tags: true,
+      nested: row => row.nested?.name,
+      hidden: false,
+    };
+    const rows: Row[] = [
+      { id: 'r1', tags: ['a', 'b'], nested: { name: 'staging' }, hidden: 'x' },
+      { id: '=r2', nested: null, hidden: 'y' },
+    ];
+    expect(renderCsv(rows, columns)).toBe(`id,tags,nested\r\nr1,"a,b",staging\r\n'=r2,,\r\n`);
+    expect(renderCsv([], columns)).toBe('id,tags,nested\r\n');
+  });
+
+  it('renderNdjson writes one compact object per line and nothing for no rows', () => {
+    expect(renderNdjson([{ a: 1 }, { b: '=x' }])).toBe('{"a":1}\n{"b":"=x"}\n');
+    expect(renderNdjson([])).toBe('');
+  });
+
+  it('Output.printRows writes verbatim to rawStdout and skips an empty ndjson write', async () => {
+    const chunks: string[] = [];
+    const out = new Output('json', { rawStdout: text => void chunks.push(text) });
+    const columns: CsvColumns<{ id: string }> = { id: true };
+    await out.printRows('csv', [{ id: 'a' }], columns);
+    await out.printRows('ndjson', [], columns);
+    await out.printRows('ndjson', [{ id: 'b' }], columns);
+    expect(chunks).toEqual(['id\r\na\r\n', '{"id":"b"}\n']);
   });
 });
 

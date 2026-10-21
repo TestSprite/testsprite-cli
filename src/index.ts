@@ -34,7 +34,7 @@ import {
   installBrokenPipeGuard,
   installSignalHandlers,
 } from './lib/interrupt.js';
-import { Output, isOutputMode } from './lib/output.js';
+import { LIST_FORMAT_COMMANDS, Output, isListFormat, isOutputMode } from './lib/output.js';
 import { maybeInstallProxyAgent } from './lib/proxy.js';
 import { redactDeep } from './lib/redact.js';
 import {
@@ -73,7 +73,11 @@ program
   .name('testsprite')
   .description('Official TestSprite command-line interface')
   .version(VERSION)
-  .option('--output <mode>', 'Output format (json|text)', 'text')
+  .option(
+    '--output <mode>',
+    `Output format (json|text; csv|ndjson on ${LIST_FORMAT_COMMANDS})`,
+    'text',
+  )
   .option('--profile <name>', 'Configuration profile to use')
   .option('--endpoint-url <url>', 'Override the API endpoint host')
   .option(
@@ -315,7 +319,12 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
   if (!isPlanTemplate) {
     maybeEmitSkillNudge({
       commandPath,
-      output: isOutputMode(globals.output) ? globals.output : 'text',
+      // csv / ndjson are machine output, so they get json's quiet behavior.
+      output: isListFormat(globals.output)
+        ? 'json'
+        : isOutputMode(globals.output)
+          ? globals.output
+          : 'text',
       dryRun: globals.dryRun ?? false,
       profile: resolveProfileName(globals.profile),
       cwd: process.cwd(),
@@ -334,6 +343,7 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
   // advisory must never delay the real command.
   if (
     globals.output !== 'json' &&
+    !isListFormat(globals.output) &&
     globals.dryRun !== true &&
     commandPath !== 'completion' &&
     !isPlanTemplate
