@@ -381,8 +381,8 @@ test('unticking keeps the withdrawal even when the PR still looks like an entry'
 });
 
 test('the job token may write to PRs: a PR comment needs pull-requests write', () => {
-  assert.match(workflow, /^  pull-requests: write$/m);
-  assert.match(workflow, /^  issues: write /m);
+  assert.match(workflow, /^ {2}pull-requests: write$/m);
+  assert.match(workflow, /^ {2}issues: write /m);
 });
 
 test('a manual run sweeps every open PR not opened by a bot', async () => {
@@ -393,8 +393,14 @@ test('a manual run sweeps every open PR not opened by a bot', async () => {
       { number: 13, user: { type: 'User' } },
     ],
   });
-  assert.deepEqual(h.of('createComment').map(args => args.issue_number), [11, 13]);
-  assert.deepEqual(h.of('addLabels').map(args => args.issue_number), [11, 13]);
+  assert.deepEqual(
+    h.of('createComment').map(args => args.issue_number),
+    [11, 13],
+  );
+  assert.deepEqual(
+    h.of('addLabels').map(args => args.issue_number),
+    [11, 13],
+  );
   assert.equal(h.failures.length, 0);
 });
 
@@ -407,14 +413,20 @@ test('a sweep keeps going past a failing PR and fails the run at the end', async
     ],
     failOn: [12],
   });
-  assert.deepEqual(h.of('createComment').map(args => args.issue_number), [11, 13]);
+  assert.deepEqual(
+    h.of('createComment').map(args => args.issue_number),
+    [11, 13],
+  );
   assert.equal(h.warnings.length, 1);
   assert.match(h.warnings[0], /PR #12/);
   assert.deepEqual(h.failures, ['Bonus entry sweep failed for: #12']);
 });
 
 test('a sweep is gated like a PR event and serialised on its own group', () => {
-  assert.match(workflow, /^  workflow_dispatch:$/m);
+  assert.match(workflow, /^ {2}workflow_dispatch:$/m);
   assert.match(workflow, /github\.event_name == 'workflow_dispatch' \|\|/);
-  assert.match(workflow, /group: bonus-entry-\$\{\{ github\.event\.pull_request\.number \|\| 'sweep' \}\}/);
+  assert.match(
+    workflow,
+    /group: bonus-entry-\$\{\{ github\.event\.pull_request\.number \|\| 'sweep' \}\}/,
+  );
 });
