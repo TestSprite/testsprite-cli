@@ -1,0 +1,76 @@
+# Open-issue cap: a community contributor can have at most OPEN_CAP issues of
+# their own open at once. A new (or reopened) issue over the cap is closed with
+# a comment listing the open ones; the author can reopen it or open it again
+# once one of those is closed (merged PR with `Closes #N`, or closed by us).
+# Maintainers and bots are exempt. Separate from the claim cap in
+# issue-triage.yml, which limits issues ASSIGNED to someone.
+name: Issue open cap
+
+on:
+  issues:
+    types: [opened, reopened]
+
+permissions:
+  issues: write # comment + close; nothing else
+
+env:
+  OPEN_CAP: '3'
+
+# One run per author at a time, so two issues opened together are counted in
+# order instead of both seeing the other as the third.
+concurrency:
+  group: issue-open-cap-${{ github.event.issue.user.login }}
+  cancel-in-progress: false
+
+jobs:
+  cap:
+    # Public repo only, like the sibling bots.
+    if: >-
+      github.repository == 'TestSprite/testsprite-cli' &&
+      github.event.issue.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    steps:
+      # Same App-token-first / GITHUB_TOKEN-fallback identity as issue-triage.yml.
+      - id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.TESTSPRITE_HOB_APP_ID || secrets.ALFHEIM_AGENT_APP_ID }}
+          private-key: ${{ secrets.TESTSPRITE_HOB_PRIVATE_KEY || secrets.ALFHEIM_AGENT_PRIVATE_KEY }}
+          permission-issues: write
+
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
+          script: |
+            const cap = parseInt(process.env.OPEN_CAP, 10);
+            const { owner, repo } = context.repo;
+            const issue = context.payload.issue;
+            const author = issue.user.login;
+
+            // A maintainer reopening someone's issue is not the author opening a new one.
+            if (context.payload.action === 'reopened' && context.payload.sender?.login !== author) return;
+
+            // Maintainer = write access or above; author_association is only the
+            // fallback (private org members arrive as CONTRIBUTOR).
+            let isMaintainer;
+            try {
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: author });
+              isMaintainer = ['admin', 'maintain', 'write'].includes(data.permission);
+            } catch {
+              isMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(issue.author_association);
+            }
+            if (isMaintainer) return;
+
+            const others = (await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', creator: author, per_page: 100,
+            })).filter(i => !i.pull_request && i.number !== issue.number);
+            if (others.length < cap) return;
+
+            const list = others.map(i => `- ${owner}/${repo}#${i.number} — ${i.title}`).join('\n');
+            await github.rest.issues.createComment({ owner, repo, issue_number: issue.number,
+              body: `Thanks @${author}! You already have ${others.length} open issues, and each contributor can have at most ${cap} open at a time, `
+                  + `so I've closed this one. Once one of yours is closed (its PR merged, or closed by a maintainer), `
+                  + `reopen this issue or open it again.\n\nYour open issues (${others.length}/${cap}):\n${list}` });
+            await github.rest.issues.update({ owner, repo, issue_number: issue.number,
+              state: 'closed', state_reason: 'not_planned' });

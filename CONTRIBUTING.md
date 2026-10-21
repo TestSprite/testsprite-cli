@@ -24,6 +24,10 @@ Discussions**, so the issue tracker stays a clean, actionable list.
 - **Code changes**, including small fixes, new commands or flags, changed
   output, new dependencies, and refactors, follow **issue-first**:
   1. Find an existing issue, or open a new one describing the change.
+     Community contributors can have at most **3 open issues of their own**
+     at a time; the bot closes a fourth with a list of the open ones. An issue
+     stops counting once it is closed (its PR merged with `Closes #123`, or
+     closed by a maintainer); then reopen yours or open it again.
   2. If the issue is new, wait for triage — we check proposals against
      [VISION.md](./VISION.md) and the [standing policies](#standing-scope-policies)
      below before any code is written, so you don't invest in something
@@ -35,7 +39,10 @@ Discussions**, so the issue tracker stays a clean, actionable list.
      "I'll take this". It ignores quoted text and code. You can release a
      claim with `/unassign`. Community contributors can hold at most **3 open
      claimed issues**; the bot refuses further claims until a slot is free.
-     It replies with your open assignment count.
+     It replies with your open assignment count. If you opened the issue,
+     it is reserved for you for **48 hours** after it is accepted: only you
+     can claim it in that window. An issue someone has already claimed can't
+     be claimed by anyone else until it is released.
   4. Open your PR with a same-repository issue reference in its description:
      `Closes #123`, `Fixes #123`, or `Resolves #123`. For an umbrella issue
      that should stay open, use `Part of #123`, `Refs #123`, or
