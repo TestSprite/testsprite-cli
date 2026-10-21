@@ -52,6 +52,16 @@ function makeFakeFs(seed: Record<string, string> = {}): CiFs & { files: Map<stri
   const files = new Map<string, string>(Object.entries(seed));
   return {
     files,
+    async lstat(target) {
+      if (files.has(target)) return { isFile: true, isSymbolicLink: false };
+      if ([...files.keys()].some(file => file.startsWith(`${target}${sep}`))) {
+        return { isFile: false, isSymbolicLink: false };
+      }
+      return null;
+    },
+    async realpath(target) {
+      return target;
+    },
     async writeFile(target, data, opts) {
       if (opts?.exclusive && files.has(target)) {
         const err = new Error('EEXIST') as NodeJS.ErrnoException;

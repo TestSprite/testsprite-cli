@@ -12,6 +12,7 @@ import { loadConfig, resolveProfileName } from '../lib/config.js';
 import { type FetchImpl, type HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import type { Page } from '../lib/pagination.js';
+import { inspectTargetPath, type TargetPathFs } from '../lib/target-path.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import {
   classifyLinkage,
@@ -67,10 +68,11 @@ const DEFAULT_API_URL = 'https://api.testsprite.com';
 
 /**
  * Minimal fs seam (mirrors `agent.ts`'s `AgentFs` semantics: exclusive writes to
- * refuse clobbering, recursive mkdir to create parent dirs). Kept local so `ci`
- * doesn't couple to the agent-install internals.
+ * refuse clobbering, recursive mkdir to create parent dirs). Path inspection
+ * shares the agent installer's component walk.
  */
-export interface CiFs {
+export interface CiFs extends TargetPathFs {
+  realpath(target: string): Promise<string>;
   writeFile(target: string, data: string, opts?: { exclusive?: boolean }): Promise<void>;
   mkdir(dir: string): Promise<void>;
   readFile(target: string): Promise<string>;
@@ -79,6 +81,18 @@ export interface CiFs {
 }
 
 const defaultCiFs: CiFs = {
+  async lstat(target) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- inspect each component before writing the caller-selected workflow path.
+      const stat = await nodeFs.lstat(target);
+      return { isFile: stat.isFile(), isSymbolicLink: stat.isSymbolicLink() };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  },
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- resolve the repository and workflow symlink for containment validation.
+  realpath: target => nodeFs.realpath(target),
   // `target`/`dir` are the workflow output path (default `.github/workflows/testsprite.yml`,
   // or the caller's `--path`), resolved from cwd — a scaffold target the user is writing into
   // their own repo, never external/network input. Same risk profile as agent-install scaffolding.
@@ -628,6 +642,29 @@ async function runCiInitScaffold(
   if (opts.project) assertSafeWorkflowValue('project', opts.project);
   if (opts.env) assertSafeWorkflowValue('env', opts.env);
   const { relPath, absPath } = resolveWorkflowPath(opts.workflowPath, cwd);
+  const allowInternalSymlink = async (target: string): Promise<void> => {
+    let resolved: string;
+    let root: string;
+    try {
+      [root, resolved] = await Promise.all([fs.realpath(cwd), fs.realpath(target)]);
+    } catch {
+      throw new CLIError(
+        `cannot resolve symlink at "${target}"; refusing to write the workflow.`,
+        5,
+      );
+    }
+    const relative = path.relative(root, resolved);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new CLIError(
+        `refusing to write through symlink "${target}": "${resolved}" is outside the repository.`,
+        5,
+      );
+    }
+  };
+  await inspectTargetPath(fs, cwd, relPath, allowInternalSymlink);
+  if (opts.force) {
+    await inspectTargetPath(fs, cwd, `${relPath}.bak`, allowInternalSymlink);
+  }
 
   const projectId = await resolveProjectId(opts, deps);
   const resolvedEnv = await resolveEnvironment(opts, deps, projectId);
