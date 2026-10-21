@@ -27,7 +27,7 @@ Discussions**, so the issue tracker stays a clean, actionable list.
      Community contributors can have at most **3 open issues of their own**
      at a time; the bot closes a fourth with a list of the open ones. An issue
      stops counting once it is closed (its PR merged with `Closes #123`, or
-     closed by a maintainer); then reopen yours or open it again.
+     closed by a maintainer); then open it again as a new issue.
   2. If the issue is new, wait for triage — we check proposals against
      [VISION.md](./VISION.md) and the [standing policies](#standing-scope-policies)
      below before any code is written, so you don't invest in something

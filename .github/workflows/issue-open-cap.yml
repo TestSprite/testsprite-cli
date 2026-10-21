@@ -1,7 +1,9 @@
 # Open-issue cap: a community contributor can have at most OPEN_CAP issues of
 # their own open at once. A new (or reopened) issue over the cap is closed with
-# a comment listing the open ones; the author can reopen it or open it again
-# once one of those is closed (merged PR with `Closes #N`, or closed by us).
+# a comment listing the open ones; the author can open it again once one of
+# those is closed (merged PR with `Closes #N`, or closed by us). An issue the
+# bot closed can't be reopened by its author, so reopen only covers an issue
+# its author closed themselves.
 # Maintainers and bots are exempt. Separate from the claim cap in
 # issue-triage.yml, which limits issues ASSIGNED to someone.
 name: Issue open cap
@@ -71,6 +73,6 @@ jobs:
             await github.rest.issues.createComment({ owner, repo, issue_number: issue.number,
               body: `Thanks @${author}! You already have ${others.length} open issues, and each contributor can have at most ${cap} open at a time, `
                   + `so I've closed this one. Once one of yours is closed (its PR merged, or closed by a maintainer), `
-                  + `reopen this issue or open it again.\n\nYour open issues (${others.length}/${cap}):\n${list}` });
+                  + `open it again as a new issue.\n\nYour open issues (${others.length}/${cap}):\n${list}` });
             await github.rest.issues.update({ owner, repo, issue_number: issue.number,
               state: 'closed', state_reason: 'not_planned' });
