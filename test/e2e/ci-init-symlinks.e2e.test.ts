@@ -24,8 +24,6 @@ afterEach(async () => {
   if (fixture) await rm(fixture, { recursive: true, force: true });
 });
 
-// Cover escaping ancestors, final files and backups, internal links, dangling
-// links, and a symlinked cwd. All requests stay on loopback with dummy credentials.
 describe.skipIf(process.platform === 'win32')('ci init symlink containment', () => {
   async function setup() {
     fixture = await realpath(await mkdtemp(join(tmpdir(), 'testsprite-ci-path-')));
@@ -44,9 +42,9 @@ describe.skipIf(process.platform === 'win32')('ci init symlink containment', () 
     await new Promise<void>(done => server.listen(0, '127.0.0.1', done));
     const address = server.address() as { port: number };
     try {
-      const env = { ...process.env, HOME: home, USERPROFILE: home };
+      const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home };
       for (const key of Object.keys(env)) {
-        if (key.startsWith('TESTSPRITE_')) delete env[key as keyof typeof env];
+        if (key.startsWith('TESTSPRITE_')) delete env[key];
       }
       return await execute(
         process.execPath,
