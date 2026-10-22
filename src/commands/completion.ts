@@ -16,7 +16,7 @@
 import { Command } from 'commander';
 import { localValidationError } from '../lib/errors.js';
 
-export const SUPPORTED_SHELLS = ['bash', 'zsh', 'fish'] as const;
+export const SUPPORTED_SHELLS = ['bash', 'zsh', 'fish', 'powershell'] as const;
 export type Shell = (typeof SUPPORTED_SHELLS)[number];
 
 export interface CompletionSpec {
@@ -55,6 +55,8 @@ export function renderCompletion(shell: Shell, spec: CompletionSpec): string {
       return renderZsh(spec);
     case 'fish':
       return renderFish(spec);
+    case 'powershell':
+      return renderPowerShell(spec);
   }
 }
 
@@ -125,15 +127,32 @@ function renderFish(spec: CompletionSpec): string {
   return lines.join('\n');
 }
 
+function renderPowerShell(spec: CompletionSpec): string {
+  const lines = [
+    `# ${spec.program} PowerShell completion. Enable with: testsprite completion powershell | Out-String | Invoke-Expression`,
+    `Register-ArgumentCompleter -Native -CommandName ${spec.program} -ScriptBlock {`,
+    '  param($wordToComplete, $commandAst, $cursorPosition)',
+    `  $commands = @(${spec.commands.map(c => "'" + c + "'").join(', ')})`,
+    '  if ($wordToComplete -like "-*") {',
+    `    $flags = @(${spec.globalFlags.map(f => "'" + f + "'").join(', ')})`,
+    '    $flags | Where-Object { $_ -like "$wordToComplete*" }',
+    '    return',
+    '  }',
+    '  $commands | Where-Object { $_ -like "$wordToComplete*" }',
+    '}',
+  ];
+  return lines.join('\n');
+}
+
 export function createCompletionCommand(
   getSpec: () => CompletionSpec,
   deps: CompletionDeps = {},
 ): Command {
   return new Command('completion')
-    .description('Print a shell completion script (bash|zsh|fish)')
+    .description('Print a shell completion script (bash|zsh|fish|powershell)')
     .argument(
       '[shell]',
-      'Shell to generate for (bash|zsh|fish); auto-detected from $SHELL when omitted',
+      'Shell to generate for (bash|zsh|fish|powershell); auto-detected from $SHELL when omitted',
     )
     .addHelpText(
       'after',
