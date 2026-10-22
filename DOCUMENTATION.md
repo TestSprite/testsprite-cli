@@ -410,6 +410,8 @@ testsprite test create --plan-from ./checkout.plan.json --dry-run --output json
 
 Bulk-create frontend tests from a JSONL plan-steps file (or a directory of plan files with `--plan-from-dir`). Optional `--run --max-concurrency <N>` fans out triggers. Without `--wait`, each run is dispatched (`status: "queued"`) and the command exits 0 when every trigger is accepted — mirroring single `test run` without `--wait`; a trigger error still exits non-zero. With `--wait`, it polls every run to terminal and exits non-zero if any run does not pass.
 
+With `--run`, each trigger's idempotency key is derived from the batch key (`<key>:run:<testId>`), so retrying the command with the same `--idempotency-key` — or the auto-minted one printed to stderr under `--output json`, `--verbose` or `--debug` — returns the runs the first attempt already started instead of starting new, billed ones. Several-id `test run` batches do the same with `<key>:<testId>`. A trigger routed through a tunnel also carries the tunnel's client id (`<key>:<clientId>:<testId>`): a retry through the same tunnel (adopted with `--tunnel-client`) gets its runs back, while a retry through a new tunnel starts new runs, since the old ones cannot reach the app without their tunnel. A key too long to fit its suffix within 256 characters is shortened, with a digest of the full key kept so it stays unique.
+
 ```bash
 testsprite test create-batch --plans ./plans.jsonl --run --max-concurrency 4 --output json
 testsprite test create-batch --plan-from-dir ./plans/ --dry-run --output json

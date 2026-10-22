@@ -26,6 +26,7 @@ import {
   type CliTestStep,
   type TestDeps,
   backendResultIsForThisRun,
+  deriveIdempotencyKey,
   backendResultToRunResponse,
   makeBackendWaitFallback,
   createTestCommand,
@@ -1752,6 +1753,28 @@ const RESULT_PASSED: CliLatestResult = {
   executionStatus: 'completed',
   summary: 'Test passed.',
 };
+
+describe('deriveIdempotencyKey', () => {
+  it('appends the suffix to a key that fits', () => {
+    expect(deriveIdempotencyKey('ci-build-42', ':run:test_f1')).toBe('ci-build-42:run:test_f1');
+    const exact = 'k'.repeat(256 - ':a'.length);
+    expect(deriveIdempotencyKey(exact, ':a')).toBe(`${exact}:a`);
+  });
+
+  it('keeps long keys that differ only in their tail distinct within 256 characters', () => {
+    const shared = 'k'.repeat(250);
+    const first = deriveIdempotencyKey(`${shared}-job-1`, ':run:test_f1');
+    const second = deriveIdempotencyKey(`${shared}-job-2`, ':run:test_f1');
+
+    expect(first).not.toBe(second);
+    for (const key of [first, second]) {
+      expect(key).toHaveLength(256);
+      expect(key.endsWith(':run:test_f1')).toBe(true);
+    }
+    // Deterministic, so a retry with the same long key still re-sends it.
+    expect(deriveIdempotencyKey(`${shared}-job-1`, ':run:test_f1')).toBe(first);
+  });
+});
 
 describe('backendResultIsForThisRun — auto-resume stale-verdict floor (finding 2)', () => {
   // The orphaned-row case the whole fallback exists for: a terminal result for
