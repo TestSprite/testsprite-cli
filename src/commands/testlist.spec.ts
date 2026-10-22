@@ -617,6 +617,55 @@ describe('testlist run', () => {
     expect(res.accepted).toHaveLength(1);
   });
 
+  it('--wait: a credits refusal beside a passing run is not a pass — exit 6', async () => {
+    const { env } = makeCreds();
+    const stderr: string[] = [];
+    const fetchImpl = makeFetch((_url, init) =>
+      (init.method ?? 'GET') === 'POST'
+        ? {
+            body: {
+              ...RUN_ACCEPTED,
+              conflicts: [{ testId: 'case-b', reason: 'insufficient_credits' }],
+            },
+          }
+        : { body: makeRun('passed') },
+    );
+    const err = (await runTestlistRun(
+      { ...runBase, listId: 'list-1', wait: true },
+      { env, fetchImpl, stdout: () => {}, stderr: l => stderr.push(l), sleep: instantSleep },
+    ).catch(e => e)) as CLIError;
+    expect(err).toBeInstanceOf(CLIError);
+    expect(err.exitCode).toBe(6);
+    expect(err.message).toContain('1 case(s) not run');
+    expect(stderr.join('\n')).toContain(
+      '1/1 passed, 0 failed/blocked, 0 timed out, 1 not run (conflict)',
+    );
+  });
+
+  it('--wait: an in-flight case beside a passing run is not a pass — exit 6, names the run to follow', async () => {
+    const { env } = makeCreds();
+    const polled: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST')
+        return {
+          body: {
+            ...RUN_ACCEPTED,
+            conflicts: [{ testId: 'case-b', currentRunId: 'run_b_inflight' }],
+          },
+        };
+      polled.push(url);
+      return { body: makeRun('passed') };
+    });
+    const err = (await runTestlistRun(
+      { ...runBase, listId: 'list-1', wait: true },
+      { env, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    ).catch(e => e)) as CLIError;
+    expect(err.exitCode).toBe(6);
+    expect(err.message).toContain('testsprite test wait run_b_inflight');
+    // Only this invocation's own run is polled; another run's verdict is never adopted.
+    expect(polled.every(u => !u.includes('run_b_inflight'))).toBe(true);
+  });
+
   it('--wait with a failed run → exit 1', async () => {
     const { env } = makeCreds();
     const fetchImpl = makeFetch((_url, init) => {

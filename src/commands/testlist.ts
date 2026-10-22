@@ -958,7 +958,8 @@ async function runTestlistRunCore(
   const failed = results.filter(r => r.status !== 'passed' && r.status !== 'timeout').length;
   const timedOut = results.filter(r => r.status === 'timeout').length;
   stderrFn(
-    `Test-list run complete: ${passed}/${resp.accepted.length} passed, ${failed} failed/blocked, ${timedOut} timed out`,
+    `Test-list run complete: ${passed}/${resp.accepted.length} passed, ${failed} failed/blocked, ${timedOut} timed out` +
+      (resp.conflicts.length > 0 ? `, ${resp.conflicts.length} not run (conflict)` : ''),
   );
 
   const jsonPayload = {
@@ -1042,6 +1043,24 @@ async function runTestlistRunCore(
   if (failure) throw failure;
 
   assertNoNotFound(resp);
+
+  // A mixed batch (some cases dispatched, some refused or already in flight)
+  // must not pass on the dispatched runs alone: the conflicted cases were never
+  // run by this invocation. Exit 6, as `test run --all --wait` does for a hard
+  // conflict beside accepted runs (the all-conflict branch above only fires
+  // when nothing was accepted).
+  if (resp.conflicts.length > 0) {
+    const pollIds = resp.conflicts
+      .map(c => c.currentRunId)
+      .filter((id): id is string => Boolean(id));
+    throw new CLIError(
+      `${resp.conflicts.length} case(s) not run: ${summarizeConflicts(resp.conflicts)}` +
+        (pollIds.length > 0
+          ? `. Poll in-flight runs: testsprite test wait ${pollIds.join(' ')}`
+          : ''),
+      6,
+    );
+  }
   return resp;
 }
 
