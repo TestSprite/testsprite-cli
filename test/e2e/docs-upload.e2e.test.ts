@@ -56,6 +56,7 @@ let baseUrl = '';
 let seen: SeenRequest[] = [];
 /** Per-test overrides for the stub's responses. */
 let putStatus = 200;
+let stallPutBody = false;
 let registerStatus = 201;
 
 beforeAll(async () => {
@@ -86,6 +87,10 @@ beforeAll(async () => {
       if (req.method === 'PUT' && path.startsWith('/s3/')) {
         if (putStatus !== 200) {
           res.writeHead(putStatus, { 'content-type': 'application/xml' });
+          if (stallPutBody) {
+            res.flushHeaders();
+            return;
+          }
           res.end('<Error><Code>AccessDenied</Code></Error>');
           return;
         }
@@ -146,6 +151,7 @@ afterAll(async () => {
 afterEach(() => {
   seen = [];
   putStatus = 200;
+  stallPutBody = false;
   registerStatus = 201;
 });
 
@@ -155,7 +161,12 @@ interface SpawnResult {
   stderr: string;
 }
 
-function uploadViaCli(file: string, extraArgs: string[] = []): Promise<SpawnResult> {
+/** Run the built CLI against the local fixture; optionally kill a hung regression. */
+function uploadViaCli(
+  file: string,
+  extraArgs: string[] = [],
+  watchdogMs?: number,
+): Promise<SpawnResult> {
   return new Promise<SpawnResult>(resolveRun => {
     const child = spawn(
       process.execPath,
@@ -182,13 +193,15 @@ function uploadViaCli(file: string, extraArgs: string[] = []): Promise<SpawnResu
           TESTSPRITE_NO_TELEMETRY: '1',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: watchdogMs,
+        killSignal: 'SIGKILL',
       },
     );
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString()));
     child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
-    child.on('exit', code => resolveRun({ code, stdout, stderr }));
+    child.on('close', code => resolveRun({ code, stdout, stderr }));
   });
 }
 
@@ -262,6 +275,25 @@ describe('docs upload e2e — three-step flow against a local facade + S3 stub',
     expect(result.stderr).toMatch(/re-run/i);
     expect(seen.map(r => r.method)).toEqual(['POST', 'PUT']);
   }, 30_000);
+
+  it('stalled 403 body exits 7 with REQUEST_TIMEOUT and never registers', async () => {
+    putStatus = 403;
+    stallPutBody = true;
+    const file = makeFixtureFile('openapi.yaml', Buffer.from('openapi: 3.1.0\n'));
+
+    // A broken implementation is killed by the watchdog, yielding null instead of exit 7.
+    const result = await uploadViaCli(
+      file,
+      ['--request-timeout', '1', '--idempotency-key', 'stalled-body-e2e'],
+      5000,
+    );
+    expect(result.code).toBe(7);
+    expect(JSON.parse(result.stderr)).toMatchObject({
+      error: { code: 'REQUEST_TIMEOUT', details: { timeoutMs: 1000 } },
+    });
+    expect(result.stdout).toBe('');
+    expect(seen.map(r => r.method)).toEqual(['POST', 'PUT']);
+  }, 10_000);
 
   it('DOCS-E2E-3: register failure → server exit code (4), step-3 wording, PUT already happened', async () => {
     registerStatus = 404;
