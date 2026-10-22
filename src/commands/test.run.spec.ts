@@ -8840,3 +8840,76 @@ describe('run output regressions', () => {
     },
   );
 });
+
+describe('run --all --wait: auth takes precedence over rate-deferred tests', () => {
+  it.each([
+    { verdict: 'auth', deferred: true, exitCode: 3 },
+    { verdict: 'auth', deferred: false, exitCode: 3 },
+    { verdict: 'passed', deferred: true, exitCode: 7 },
+    { verdict: 'failed', deferred: true, exitCode: 7 },
+  ])(
+    '$verdict with deferred=$deferred exits $exitCode',
+    async ({ verdict, deferred, exitCode }) => {
+      const { credentialsPath } = makeCreds();
+      const output: string[] = [];
+      let dispatches = 0;
+      const fetchImpl = makeFetch((url, init) => {
+        if (init.method === 'POST') {
+          return {
+            status: 202,
+            body: {
+              accepted:
+                dispatches++ === 0
+                  ? [{ testId: 'test_xyz', runId: 'run_abc', enqueuedAt: TRIGGER_RESP.enqueuedAt }]
+                  : [],
+              deferred: deferred ? [{ testId: 'test_deferred' }] : [],
+              conflicts: [],
+              skippedFrontend: [],
+              skippedIntegration: [],
+            } satisfies BatchRunFreshResponse,
+          };
+        }
+        if (verdict === 'auth')
+          return {
+            status: 401,
+            body: {
+              error: {
+                code: 'AUTH_INVALID',
+                message: 'Replace invalid credentials',
+                nextAction: 'Log in again',
+                requestId: 'req_auth_deferred',
+              },
+            },
+          };
+        if (url.endsWith('/runs/run_abc')) {
+          return { body: { ...makePassedRun(), status: verdict } };
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      });
+      await expect(
+        runTestRunAll(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            projectId: 'project_1',
+            wait: true,
+            timeoutSeconds: 60,
+            maxConcurrency: 2,
+            environmentResolutionComplete: true,
+          },
+          {
+            credentialsPath,
+            fetchImpl,
+            sleep: instantSleep,
+            stdout: line => output.push(line),
+            stderr: () => undefined,
+          },
+        ),
+      ).rejects.toMatchObject({ exitCode });
+      const envelope = JSON.parse(output[0]!);
+      expect(envelope.accepted).toHaveLength(1);
+      expect(envelope.deferred).toHaveLength(deferred ? 1 : 0);
+    },
+  );
+});
