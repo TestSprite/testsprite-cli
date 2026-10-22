@@ -371,7 +371,8 @@ const SKIP_HINT = 'Skip this check entirely with --skip-preflight.';
 const VERCEL_PROTECTION_HINT =
   "Turn off Vercel Authentication for preview deployments in the Vercel project's Deployment " +
   'Protection settings, or create a Protection Bypass for Automation secret and pass it in the ' +
-  'URL: --target-url "<preview>/?x-vercel-protection-bypass=<secret>&x-vercel-set-bypass-cookie=true".';
+  'URL: --target-url "<preview>?x-vercel-protection-bypass=<secret>&x-vercel-set-bypass-cookie=true" ' +
+  '(use "&" instead of "?" when the preview URL already has a query).';
 
 /**
  * Run the preflight and either throw (refuse), print an `[advisory]` line
