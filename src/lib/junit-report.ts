@@ -135,10 +135,22 @@ export function resolveBatchReportProjectId(
 }
 
 /**
+ * Characters XML 1.0 forbids anywhere in a document: the `Char` production
+ * allows only #x9, #xA, #xD, [#x20-#xD7FF], [#xE000-#xFFFD] and
+ * [#x10000-#x10FFFF]. No entity can represent the excluded characters, so
+ * they are stripped rather than escaped — a single one in a free-text run
+ * message (LLM / server supplied) makes strict parsers reject the whole
+ * report. Tab, newline and carriage return are legal and preserved.
+ */
+// eslint-disable-next-line no-control-regex
+const XML_1_0_ILLEGAL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g;
+
+/**
  * Escape text for inclusion in XML element bodies and double-quoted attributes.
  */
 export function escapeXml(text: string): string {
   return text
+    .replace(XML_1_0_ILLEGAL_CHARS, '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
