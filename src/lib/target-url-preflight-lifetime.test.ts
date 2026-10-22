@@ -4,6 +4,7 @@ import { InterruptError } from './errors.js';
 import { ShutdownController } from './interrupt.js';
 import { probeTargetUrl } from './target-url-preflight.js';
 
+/** Lets tests settle DNS after a chosen deadline or interruption. */
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;
