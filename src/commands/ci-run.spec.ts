@@ -1,6 +1,8 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createCiCommand, runCiRun, type CiRunOptions } from './ci.js';
@@ -267,6 +269,143 @@ function harness(
 // Shared by the pull-request-context and telemetry suites.
 const SHA = 'a'.repeat(40);
 const PREVIEW = 'https://gym-web-abc123-team.vercel.app';
+
+/* eslint-disable security/detect-non-literal-fs-filename -- All paths belong to this suite's isolated temporary directory. */
+describe('ci run loopback targets through the CLI entry', () => {
+  function run(args: string[]) {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-run-entry-'));
+    dirs.push(dir);
+    const output = join(dir, 'outputs');
+    writeFileSync(output, 'previous=value\n');
+    const preload = `
+globalThis.fetch = async (input, init = {}) => {
+  const path = new URL(String(input)).pathname.replace('/api/cli/v1', '');
+  const method = init.method ?? 'GET';
+  const body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined;
+  process.stderr.write('FETCH ' + JSON.stringify({ path, method, body }) + '\\n');
+  if (path === '/telemetry') return new Response(null, { status: 204 });
+  let response;
+  if (method === 'GET' && path === '/projects/project-1/env') {
+    response = { environments: [{ name: 'staging', url: 'http://localhost:3000', isDefault: true }] };
+  } else if (method === 'POST' && path === '/tests/batch/run') {
+    response = {
+      accepted: [], conflicts: [], deferred: [], skippedFrontend: ['fe'], skippedIntegration: [],
+      admission: body.admission, targetUrl: body.targetUrl
+    };
+  } else if (method === 'GET' && path === '/tests') {
+    response = { items: [{ id: 'fe', name: 'Checkout' }], nextToken: null };
+  } else if (method === 'GET' && path === '/tests/fe') {
+    response = { id: 'fe', type: 'frontend', name: 'Checkout' };
+  } else {
+    throw new Error('Unexpected request: ' + method + ' ' + path);
+  }
+  return new Response(JSON.stringify(response), { headers: { 'content-type': 'application/json' } });
+};`;
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        `data:text/javascript,${encodeURIComponent(preload)}`,
+        fileURLToPath(new URL('../../dist/index.js', import.meta.url)),
+        'ci',
+        'run',
+        '--project',
+        'project-1',
+        ...args,
+      ],
+      {
+        encoding: 'utf8',
+        timeout: 10_000,
+        env: {
+          ...process.env,
+          HOME: dir,
+          USERPROFILE: dir,
+          TESTSPRITE_API_KEY: 'sk-user-test',
+          TESTSPRITE_API_URL: 'https://api.example.com',
+          TESTSPRITE_NO_TELEMETRY: '0',
+          DO_NOT_TRACK: '0',
+          TESTSPRITE_NO_UPDATE_NOTIFIER: '1',
+          GITHUB_ACTIONS: 'true',
+          GITHUB_EVENT_NAME: undefined,
+          GITHUB_EVENT_PATH: undefined,
+          GITHUB_OUTPUT: output,
+          GITHUB_STEP_SUMMARY: undefined,
+        },
+      },
+    );
+    expect(result.error).toBeUndefined();
+    return {
+      ...result,
+      outputs: readFileSync(output, 'utf8'),
+      calls: result.stderr
+        .split('\n')
+        .filter(line => line.startsWith('FETCH '))
+        .map(
+          line =>
+            JSON.parse(line.slice(6)) as {
+              path: string;
+              method: string;
+              body?: Record<string, unknown>;
+            },
+        ),
+    };
+  }
+
+  it.each<[string, string[]]>([
+    ['localhost', ['--target-url', 'http://localhost:3000']],
+    ['IPv4 loopback', ['--target-url', 'http://127.0.0.1:3000']],
+    ['IPv6 loopback', ['--target-url', 'http://[::1]:3000']],
+    ['named environment', ['--env', 'staging']],
+    ['default environment', []],
+    ['explicit dry run', ['--target-url', 'http://localhost:3000', '--dry-run']],
+    ['environment dry run', ['--env', 'staging', '--dry-run']],
+    ['explicit concurrency', ['--target-url', 'http://localhost:3000', '--max-concurrency', '5']],
+  ])('refuses %s before opening a tunnel or dispatching', (_label, args) => {
+    const result = run(args);
+    expect(result.status, result.stderr).toBe(5);
+    expect(result.stderr).toContain('test run --all --env <name> --wait');
+    expect(result.stderr).not.toMatch(
+      /--max-concurrency|--local|opening a tunnel|Would open a tunnel/,
+    );
+    expect(result.outputs).toBe(
+      'previous=value\ntotal=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\n',
+    );
+    expect(
+      result.calls.filter(call => call.path !== '/telemetry').every(call => call.method === 'GET'),
+    ).toBe(true);
+    if (!args.includes('--dry-run')) {
+      expect(result.calls.find(call => call.path === '/telemetry')?.body).toMatchObject({
+        ciRunOutcome: 'refused_loopback',
+      });
+    }
+  });
+
+  it.each([false, true])(
+    'a public override of a loopback environment keeps the CI gate, strict=%s',
+    strict => {
+      const result = run([
+        '--env',
+        'staging',
+        '--target-url',
+        PREVIEW,
+        '--skip-preflight',
+        '--allow-empty',
+        ...(strict ? ['--fail-on-skipped'] : []),
+      ]);
+      expect(result.status, result.stderr).toBe(strict ? 1 : 0);
+      expect(result.outputs).toContain('total=1\npassed=0\nfailed=0\nskipped=1\ntimedOut=0\n');
+      expect(
+        result.calls.filter(call => call.method === 'POST' && call.path !== '/telemetry'),
+      ).toMatchObject([
+        {
+          path: '/tests/batch/run',
+          body: { admission: 'all', targetUrl: PREVIEW },
+        },
+      ]);
+    },
+  );
+});
+/* eslint-enable security/detect-non-literal-fs-filename */
 
 function githubEnv(
   h: ReturnType<typeof harness>,

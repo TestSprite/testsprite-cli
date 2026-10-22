@@ -10025,6 +10025,22 @@ async function finishZeroDispatchBatch(params: {
   );
 }
 
+function refuseCiLoopbackTarget(deps: TestDeps): never {
+  recordTelemetryExtras({ ciRunOutcome: 'refused_loopback' });
+  emitCiStepOutputs(
+    { total: 0, passed: 0, failed: 0, skipped: 0, timedOut: 0, runs: [] },
+    {
+      env: deps.env ?? process.env,
+      stderr: deps.stderr ?? (line => process.stderr.write(`${line}\n`)),
+    },
+  );
+  throw localValidationError(
+    'target-url',
+    'ci run requires a publicly reachable target URL. For a local app, use ' +
+      'testsprite test run --all --env <name> --wait (with --project <id> if needed)',
+  );
+}
+
 /**
  * `test run --all --project <id>` — M4 piece-2.
  *
@@ -10060,6 +10076,10 @@ export async function runTestRunAll(
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const out = makeOutput(opts.output, deps);
 
+  if (opts.ci && opts.targetUrl !== undefined && parseLoopbackTargetUrl(opts.targetUrl)) {
+    refuseCiLoopbackTarget(deps);
+  }
+
   if (opts.dryRun && opts.targetUrl === undefined && !opts.noWait) {
     let target: ResolvedRunTarget | undefined;
     try {
@@ -10068,12 +10088,13 @@ export async function runTestRunAll(
         projectId,
         environment,
         dryRun: true,
-        stderr: stderrFn,
+        stderr: opts.ci ? () => undefined : stderrFn,
       });
     } catch (err) {
       if (err instanceof InterruptError) throw err;
     }
     if (target) {
+      if (opts.ci) refuseCiLoopbackTarget(deps);
       await runTestRunLocalBatch(
         {
           ...opts,
@@ -10150,9 +10171,10 @@ export async function runTestRunAll(
         environment,
         targetUrl: opts.targetUrl,
         noWait: opts.noWait,
-        stderr: stderrFn,
+        stderr: opts.ci ? () => undefined : stderrFn,
       });
   if (automaticTarget) {
+    if (opts.ci) refuseCiLoopbackTarget(deps);
     await runTestRunLocalBatch(
       {
         ...opts,
