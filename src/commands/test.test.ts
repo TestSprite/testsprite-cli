@@ -12,6 +12,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { FS_ENFORCES_MODE_BITS } from '../../test/helpers/fsModeEnforcement.js';
 import type { Command } from 'commander';
 import type { RunResponse } from '../lib/runs.types.js';
 import { ApiError, InterruptError } from '../lib/errors.js';
@@ -10624,7 +10625,9 @@ describe('capped-file guard: --steps / --plan-from / --plans open once, then siz
       });
     });
 
-    it.skipIf(process.platform === 'win32')(
+    // The chmod-000 premise also fails under CAP_DAC_OVERRIDE (containers):
+    // the file stays readable, so probe the filesystem instead of assuming.
+    it.skipIf(process.platform === 'win32' || !FS_ENFORCES_MODE_BITS)(
       'an unreadable file reports VALIDATION_ERROR "permission denied" (POSIX only — chmod is not meaningful on Windows)',
       async () => {
         const { credentialsPath } = makeCreds();
@@ -10666,7 +10669,7 @@ describe('capped-file guard: --steps / --plan-from / --plans open once, then siz
       },
     );
 
-    it.skipIf(process.platform === 'win32')(
+    it.skipIf(process.platform === 'win32' || !FS_ENFORCES_MODE_BITS)(
       'a directory the process cannot even traverse into reports the dedicated "permission denied reading" wording (POSIX only)',
       async () => {
         const { credentialsPath } = makeCreds();
@@ -10783,7 +10786,7 @@ describe('capped-file guard: --steps / --plan-from / --plans open once, then siz
       });
     });
 
-    it.skipIf(process.platform === 'win32')(
+    it.skipIf(process.platform === 'win32' || !FS_ENFORCES_MODE_BITS)(
       'an unreadable file reports VALIDATION_ERROR "permission denied" (POSIX only — chmod is not meaningful on Windows)',
       async () => {
         const { credentialsPath } = makeCreds();
@@ -10889,7 +10892,7 @@ describe('capped-file guard: --steps / --plan-from / --plans open once, then siz
       });
     });
 
-    it.skipIf(process.platform === 'win32')(
+    it.skipIf(process.platform === 'win32' || !FS_ENFORCES_MODE_BITS)(
       'an unreadable file reports VALIDATION_ERROR "permission denied" (POSIX only — chmod is not meaningful on Windows)',
       async () => {
         const { credentialsPath } = makeCreds();
