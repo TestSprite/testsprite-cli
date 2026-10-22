@@ -10752,6 +10752,7 @@ export async function runTestRunAll(
   // resolvable in-flight run stay hard (nothing to wait on).
   // An in-flight run may belong to another deployment/environment. CI can
   // only use runs accepted by this invocation to judge its own change.
+  const metadataConflicts = conflicts;
   const resumableConflicts = opts.ci ? [] : conflicts.filter(c => c.currentRunId);
   const hardConflicts = opts.ci ? conflicts : conflicts.filter(c => !c.currentRunId);
   // Only hard conflicts remain "conflicts" for the final accounting/exit; the
@@ -10785,6 +10786,8 @@ export async function runTestRunAll(
     }
     return listing;
   };
+  // Keep the metadata stage graceful even between tracked HTTP requests.
+  const disarmResolve = shutdownOf(deps).arm();
   const resumedOrRefused = await Promise.all(
     resumableConflicts.map(
       async (c): Promise<{ entry: BatchRunFreshAccepted } | { refused: RunConflict }> => {
@@ -10851,7 +10854,37 @@ export async function runTestRunAll(
         return { entry: { testId: c.testId, runId: inFlightRunId, enqueuedAt: notBefore } };
       },
     ),
-  );
+  )
+    .catch((err: unknown) => {
+      if (err instanceof InterruptError) {
+        const partialResults: CliBatchRunFreshResult[] = accepted.map(e => ({
+          testId: e.testId,
+          runId: e.runId,
+          status: 'running',
+        }));
+        out.print(
+          {
+            accepted: partialResults,
+            conflicts: metadataConflicts,
+            deferred,
+            skippedFrontend,
+            skippedIntegration,
+          },
+          () => partialResults.map(r => `${r.runId}  ${r.status}`).join('\n'),
+        );
+        if (accepted.length > 0) {
+          err.runWaitContext = true;
+          stderrFn(
+            interruptDetachMessage(
+              err,
+              accepted.map(e => e.runId),
+            ),
+          );
+        }
+      }
+      throw err;
+    })
+    .finally(disarmResolve);
   const resumableEntries: BatchRunFreshAccepted[] = [];
   for (const outcome of resumedOrRefused) {
     if ('entry' in outcome) {
