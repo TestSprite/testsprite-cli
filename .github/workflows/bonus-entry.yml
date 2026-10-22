@@ -14,6 +14,10 @@
 # After BONUS_CLOSES_AT it makes no changes, so the record freezes at the close.
 # Remove this workflow and the template section once Season 4 is paid out.
 #
+# A manual run (workflow_dispatch) sweeps every open PR, to backfill PRs whose
+# runs failed before a fix landed: re-running a pull_request_target run reuses
+# the workflow file as it was then.
+#
 # Runs with NO checkout: metadata-only, so it is safe under pull_request_target
 # (required for fork PRs to get a write-capable token; see
 # check-pr-target-checkout.mjs). Bot identity: same App-token-first /
@@ -23,13 +27,16 @@ name: Season 4 bonus entry
 on:
   pull_request_target:
     types: [opened, edited, reopened, synchronize, ready_for_review, converted_to_draft]
+  workflow_dispatch:
 
 permissions:
-  pull-requests: read # read the live PR and its closing issue references
+  # write, not read: GitHub refuses a comment on a PR number without it, even
+  # through the issues API (403 "Resource not accessible by integration").
+  pull-requests: write
   issues: write # sticky comment + label (PR comments and labels ride the issues API)
 
 concurrency:
-  group: bonus-entry-${{ github.event.pull_request.number }}
+  group: bonus-entry-${{ github.event.pull_request.number || 'sweep' }}
   cancel-in-progress: false
 
 env:
@@ -42,8 +49,9 @@ jobs:
   entry:
     if: >-
       github.repository == 'TestSprite/testsprite-cli' &&
-      github.event.pull_request.state == 'open' &&
-      github.event.pull_request.user.type != 'Bot'
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.pull_request.state == 'open' &&
+        github.event.pull_request.user.type != 'Bot'))
     runs-on: ubuntu-latest
     steps:
       # Mint an App token so comments post as testsprite-hob[bot]; until the
@@ -76,10 +84,12 @@ jobs:
               return;
             }
 
+            // One PR per call: the event's PR, or each open PR in a manual sweep.
+            async function processPr(number) {
             // A queued run carries the PR as it was when its event fired. Read it
             // fresh so back-to-back edits settle on the latest description and labels.
             const { data: pr } = await github.rest.pulls.get(
-              { owner, repo, pull_number: context.payload.pull_request.number });
+              { owner, repo, pull_number: number });
             if (pr.state !== 'open') {
               core.info(`PR #${pr.number} is no longer open.`);
               return;
@@ -224,3 +234,20 @@ jobs:
               await write(rest => rest.issues.removeLabel({ owner, repo, issue_number: pr.number, name: label })).catch(() => {});
             }
             core.info(`Season 4 bonus entry: state=${state} ticked=${ticked} issueOk=${issueOk} draft=${pr.draft} discord=${hasDiscord}`);
+            }
+
+            if (context.payload.pull_request) {
+              await processPr(context.payload.pull_request.number);
+            } else {
+              // Manual sweep: every open PR not opened by a bot. One PR's failure
+              // never stops the rest; the run fails at the end if any did.
+              const open = await github.paginate(github.rest.pulls.list,
+                { owner, repo, state: 'open', per_page: 100 });
+              const failed = [];
+              for (const p of open.filter(p => p.user?.type !== 'Bot')) {
+                try { await processPr(p.number); }
+                catch (e) { failed.push(p.number); core.warning(`PR #${p.number}: ${e.message}`); }
+              }
+              core.info(`Swept ${open.length} open PRs; ${failed.length} failed.`);
+              if (failed.length) core.setFailed(`Bonus entry sweep failed for: ${failed.map(n => `#${n}`).join(', ')}`);
+            }
