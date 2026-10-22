@@ -4060,6 +4060,84 @@ describe('runTestRerun --all --skip-terminal (dogfood L1796)', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   });
 
+  // An empty --status (e.g. `--status "$STATUSES"` with the variable unset) used
+  // to be read as "no filter" and rerun EVERY test in the project, spending
+  // credits on tests the operator meant to exclude.
+  it.each([
+    ['empty string', ''],
+    ['whitespace only', '   '],
+    ['separators only', ' , ,'],
+  ])(
+    'exit 5 (VALIDATION_ERROR) and nothing dispatched when --all --status is %s',
+    async (_label, statusFilter) => {
+      const creds = makeCreds();
+      const dispatched: string[] = [];
+      const requests: string[] = [];
+      const recordingFetch = makeFilterFetch(dispatched);
+      const fetchImpl = (async (
+        input: Parameters<typeof globalThis.fetch>[0],
+        init?: RequestInit,
+      ) => {
+        requests.push(String(input));
+        return recordingFetch(input, init);
+      }) as typeof globalThis.fetch;
+
+      await expect(
+        runTestRerun(
+          {
+            testIds: [],
+            all: true,
+            projectId: 'project_abc',
+            statusFilter,
+            wait: false,
+            timeoutSeconds: 600,
+            autoHeal: false,
+            autoHealExplicit: false,
+            skipDependencies: false,
+            maxConcurrency: 10,
+            output: 'json',
+            profile: 'default',
+            dryRun: false,
+            debug: false,
+            verbose: false,
+          },
+          { ...creds, sleep: instantSleep, fetchImpl, stderr: () => {} },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        details: expect.objectContaining({ field: 'status' }),
+      });
+      expect(dispatched).toEqual([]);
+      expect(requests).toEqual([]);
+    },
+  );
+
+  it('--dry-run --all refuses an empty --status the same way the real sweep does', async () => {
+    const creds = makeCreds();
+    await expect(
+      runTestRerun(
+        {
+          testIds: [],
+          all: true,
+          projectId: 'project_abc',
+          statusFilter: '',
+          wait: false,
+          timeoutSeconds: 600,
+          autoHeal: false,
+          autoHealExplicit: false,
+          skipDependencies: false,
+          maxConcurrency: 10,
+          output: 'json',
+          profile: 'default',
+          dryRun: true,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, sleep: instantSleep, stderr: () => {}, stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
   it('rerun command exposes --skip-terminal and --status flags', async () => {
     const { createTestCommand } = await import('./test.js');
     const test = createTestCommand();
