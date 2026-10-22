@@ -87,13 +87,15 @@ describe.skipIf(process.platform === 'win32')('ci init symlink containment', () 
     }
   }
 
-  for (const location of [
-    '.github',
-    '.github/workflows',
-    '.github/workflows/testsprite.yml',
-    '.github/workflows/testsprite.yml.bak',
-  ]) {
-    it(`refuses external ${location} before writing`, async () => {
+  for (const [location, force] of [
+    ['.github', false],
+    ['.github', true],
+    ['.github/workflows', false],
+    ['.github/workflows', true],
+    ['.github/workflows/testsprite.yml', true],
+    ['.github/workflows/testsprite.yml.bak', true],
+  ] as const) {
+    it(`refuses external ${location} ${force ? 'with' : 'without'} --force before writing`, async () => {
       const { repo, outside, home } = await setup();
       const target =
         location.endsWith('.yml') || location.endsWith('.bak')
@@ -105,7 +107,7 @@ describe.skipIf(process.platform === 'win32')('ci init symlink containment', () 
       if (location.endsWith('.bak'))
         await writeFile(join(repo, '.github/workflows/testsprite.yml'), 'original workflow');
       await symlink(target, link);
-      const result = await run(repo, home, true);
+      const result = await run(repo, home, force);
       expect(result.code, result.stderr).toBe(5);
       expect(result.stderr).toContain(target);
       expect(await readdir(outside)).toEqual(target === outside ? [] : ['sentinel']);
