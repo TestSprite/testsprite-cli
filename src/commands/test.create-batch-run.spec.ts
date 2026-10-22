@@ -690,6 +690,103 @@ describe('runCreateBatch --run --wait: --timeout per-run', () => {
     errorSpy.mockRestore();
   });
 
+  it.each([
+    { terminal: 'passed', retry: false, expectedExit: 0 },
+    { terminal: 'failed', retry: false, expectedExit: 1 },
+    { terminal: 'passed', retry: true, expectedExit: 0 },
+    { terminal: 'failed', retry: true, expectedExit: 1 },
+  ])(
+    'observes $terminal within the original fractional budget (retry: $retry)',
+    async ({ terminal, retry, expectedExit }) => {
+      const { credentialsPath } = makeCreds();
+      const plans = writePlansJsonl([FE_SPEC]);
+      const testId = 'test_fractional';
+      const runId = 'run_fractional';
+      const startMs = Date.now();
+      let now = startMs;
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+      const finishMs = startMs + (retry ? 2500 : 1500);
+      const timeoutSeconds = retry ? 3 : 2;
+      let triggers = 0;
+      const pollTimes: number[] = [];
+      const stdout: string[] = [];
+      const fetchImpl = makeFetch((url, init) => {
+        if (url.includes('/tests/batch')) {
+          return { body: makeBatchCreateResponse([testId]) };
+        }
+        if (url.endsWith(`/tests/${testId}/runs`) && init.method === 'POST') {
+          triggers++;
+          if (retry && triggers === 1) {
+            return {
+              status: 429,
+              body: {
+                error: {
+                  code: 'RATE_LIMITED',
+                  message: 'Run trigger rate limit exceeded: 60 triggers per minute per key.',
+                  nextAction: 'Wait and retry.',
+                  requestId: 'req_fractional',
+                  details: { retryAfterSeconds: 1 },
+                },
+              },
+            };
+          }
+          now += 250;
+          return { body: makeTriggerResponse(testId, runId) };
+        }
+        if (url.includes(`/runs/${runId}`)) {
+          // Honor the long-poll contract: return at completion or waitSeconds,
+          // whichever comes first. Trigger latency consumed 250 ms of the budget.
+          const waitMs = Number(new URL(url).searchParams.get('waitSeconds')) * 1000;
+          now = Math.min(finishMs, now + waitMs);
+          pollTimes.push(now - startMs);
+          const run =
+            terminal === 'passed' ? makePassedRun(testId, runId) : makeFailedRun(testId, runId);
+          return {
+            body: now >= finishMs ? run : { ...run, status: 'running', finishedAt: null },
+          };
+        }
+        throw new Error(`Unexpected fixture request: ${url}`);
+      });
+
+      try {
+        const result = await runCreateBatch(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            plans,
+            run: true,
+            wait: true,
+            maxConcurrency: 1,
+            timeoutSeconds,
+          },
+          {
+            credentialsPath,
+            fetchImpl,
+            stdout: line => stdout.push(line),
+            stderr: () => {},
+            sleep: async ms => {
+              now += ms;
+            },
+          },
+        ).then(
+          () => ({ exitCode: 0 }),
+          (error: CLIError) => ({ exitCode: error.exitCode }),
+        );
+
+        expect(result.exitCode).toBe(expectedExit);
+        expect(JSON.parse(stdout.join('')).results).toMatchObject([
+          { testId, runId, status: terminal },
+        ]);
+        expect(triggers).toBe(retry ? 2 : 1);
+        expect(pollTimes).toEqual([finishMs - startMs]);
+        expect(now - startMs).toBeLessThan(timeoutSeconds * 1000);
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
+
   it('one slow run hits timeout while other completes; overall exit is 1 (not 7, mixed)', async () => {
     // test_d1: passes quickly (poll returns terminal on first call — returns
     // *before* mockNow crosses the deadline)
@@ -2021,6 +2118,115 @@ describe('MAJOR 1: HTTP-layer does not retry RATE_LIMITED for triggerRunWithMeta
     // Each outer attempt fired exactly 1 POST (not 3 HTTP-layer sub-retries).
     expect(triggerCallCount).toBeGreaterThan(0);
   });
+});
+
+describe('runCreateBatch: deadline at throttle-window expiry', () => {
+  it.each([
+    { count: 50, timeout: 60, wait: true, posts: 1, polls: 0, sleeps: [1000, 59000] },
+    { count: 50, timeout: 2, wait: true, posts: 1, polls: 0, sleeps: [1000, 1000] },
+    { count: 50, timeout: 61, wait: true, posts: 2, polls: 1, sleeps: [1000, 59050] },
+    { count: 49, timeout: 60, wait: true, posts: 2, polls: 1, sleeps: [1000] },
+    { count: 50, timeout: 60, wait: false, posts: 2, polls: 0, sleeps: [1000, 59050] },
+  ])(
+    '$count specs, timeout $timeout, wait $wait: sends $posts attempts for the last member',
+    async ({ count, timeout, wait, posts, polls, sleeps }) => {
+      const { credentialsPath } = makeCreds();
+      const testIds = Array.from({ length: count }, (_, i) => `test_window_${i}`);
+      const lastId = testIds[count - 1]!;
+      const plans = writePlansJsonl(testIds.map(() => FE_SPEC));
+      const startMs = Date.now();
+      let now = startMs;
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+      const lastPostTimes: number[] = [];
+      const sleepCalls: number[] = [];
+      let lastPolls = 0;
+      const stdout: string[] = [];
+      const fetchImpl = makeFetch((url, init) => {
+        if (url.includes('/tests/batch')) {
+          return { body: makeBatchCreateResponse(testIds) };
+        }
+        const trigger = /\/tests\/(test_window_\d+)\/runs$/.exec(url);
+        if (trigger?.[1] && init.method === 'POST') {
+          const testId = trigger[1];
+          if (testId === lastId) {
+            lastPostTimes.push(now - startMs);
+            if (lastPostTimes.length === 1) {
+              return {
+                status: 429,
+                body: {
+                  error: {
+                    code: 'RATE_LIMITED',
+                    message: 'Run trigger rate limit exceeded: 60 triggers per minute per key.',
+                    nextAction: 'Wait and retry.',
+                    requestId: 'req_window',
+                    details: { retryAfterSeconds: 1 },
+                  },
+                },
+              };
+            }
+          }
+          return { body: makeTriggerResponse(testId, `run_${testId}`) };
+        }
+        const poll = /\/runs\/run_(test_window_\d+)/.exec(url);
+        if (poll?.[1]) {
+          const testId = poll[1];
+          if (testId === lastId) lastPolls++;
+          return { body: makePassedRun(testId, `run_${testId}`) };
+        }
+        throw new Error(`Unexpected fixture request: ${url}`);
+      });
+
+      try {
+        const result = await runCreateBatch(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            plans,
+            run: true,
+            wait,
+            maxConcurrency: 1,
+            timeoutSeconds: timeout,
+          },
+          {
+            credentialsPath,
+            fetchImpl,
+            stdout: line => stdout.push(line),
+            stderr: () => {},
+            sleep: async ms => {
+              sleepCalls.push(ms);
+              now += ms;
+            },
+          },
+        ).then(
+          () => ({ exitCode: 0 }),
+          (error: CLIError) => ({ exitCode: error.exitCode }),
+        );
+        const timedOut = posts === 1;
+        expect(lastPostTimes).toHaveLength(posts);
+        expect(lastPostTimes).toEqual(posts === 1 ? [0] : [0, count === 50 ? 60050 : 1000]);
+        expect(lastPolls).toBe(polls);
+        expect(sleepCalls).toEqual(sleeps);
+        expect(result.exitCode).toBe(timedOut ? 1 : 0);
+        const printed = JSON.parse(stdout.join('')) as {
+          results: Array<{ testId: string; runId: string; status: string }>;
+        };
+        expect(printed.results).toHaveLength(count);
+        expect(printed.results.find(row => row.testId === lastId)).toMatchObject({
+          testId: lastId,
+          runId: timedOut ? '' : `run_${lastId}`,
+          status: timedOut ? 'timeout' : wait ? 'passed' : 'queued',
+        });
+        expect(
+          printed.results
+            .filter(row => row.testId !== lastId)
+            .every(row => row.status === (wait ? 'passed' : 'queued')),
+        ).toBe(true);
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
 });
 
 // MAJOR 2: Sleeps clamped to --wait deadline; expiring deadline returns timeout

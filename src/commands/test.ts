@@ -4550,6 +4550,22 @@ async function runBatchRun(
         await sleepUntilOrInterrupt(clampedWait, shutdown.signal, sleepFn);
       }
 
+      // A slot can become available exactly when the clamped sleep exhausts
+      // the --wait budget. Recheck after acquisition before starting a run.
+      if (opts.wait && remainingMs() <= 0) {
+        return {
+          testId,
+          runId: '',
+          status: 'timeout',
+          codeVersion: '',
+          error: {
+            code: 'UNSUPPORTED',
+            message: `Timed out after ${timeoutSeconds}s before trigger attempt for ${testId}.`,
+            exitCode: 7,
+          },
+        };
+      }
+
       if (fanOutStopped && deps.environmentTunnel) {
         return { testId, runId: '', status: 'not_dispatched', codeVersion: '' };
       }
@@ -4801,8 +4817,9 @@ async function runBatchRun(
       };
     }
     // Pass only the REMAINING seconds into pollRunUntilTerminal so trigger
-    // retries don't restart the timeout clock from zero.
-    const remainingSeconds = Math.floor(rem / 1000) || 1;
+    // retries don't restart the timeout clock from zero. Preserve fractional
+    // seconds so the poll deadline matches the original per-spec deadline.
+    const remainingSeconds = rem / 1000;
     let finalRun: RunResponse;
     try {
       finalRun = await pollRunUntilTerminal(client, triggerResponse.runId, {
