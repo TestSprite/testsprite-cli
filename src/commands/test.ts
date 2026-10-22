@@ -9653,6 +9653,9 @@ interface CliBatchRunFreshResult {
   /** Poll-observed run timing → JUnit `testcase time`. Absent on timeout/error. */
   startedAt?: string | null;
   finishedAt?: string | null;
+  /** Terminal poll diagnostics; absent on passing rows. */
+  failureKind?: string | null;
+  failedStepIndex?: number | null;
 }
 
 /**
@@ -10981,6 +10984,17 @@ export async function runTestRunAll(
   // the documented `--timeout` ceiling.
   // NOTE: batchDeadlineMs is set in the D3 deferred-retry loop above and reused here.
 
+  function freshPollFailureFields(finalRun: RunResponse): Partial<CliBatchRunFreshResult> {
+    if (finalRun.status === 'passed') return {};
+    return {
+      failureKind: finalRun.failureKind,
+      failedStepIndex: finalRun.failedStepIndex,
+      ...(finalRun.error
+        ? { error: { code: 'INTERNAL', message: finalRun.error, exitCode: 1 } }
+        : {}),
+    };
+  }
+
   async function pollFreshAccepted(entry: BatchRunFreshAccepted): Promise<CliBatchRunFreshResult> {
     const runId = entry.runId;
     const remainingMs = batchDeadlineMs - Date.now();
@@ -11023,9 +11037,7 @@ export async function runTestRunAll(
           ...(typeof finalRun.executionUrl === 'string'
             ? { executionUrl: finalRun.executionUrl }
             : {}),
-          ...(opts.ci && finalRun.error
-            ? { error: { code: 'INTERNAL', message: finalRun.error, exitCode: 1 } }
-            : {}),
+          ...freshPollFailureFields(finalRun),
         };
       } catch (err) {
         if (err instanceof InterruptError) throw err;
@@ -11085,9 +11097,7 @@ export async function runTestRunAll(
         ...(typeof finalRun.executionUrl === 'string'
           ? { executionUrl: finalRun.executionUrl }
           : {}),
-        ...(opts.ci && finalRun.error
-          ? { error: { code: 'INTERNAL', message: finalRun.error, exitCode: 1 } }
-          : {}),
+        ...freshPollFailureFields(finalRun),
         startedAt: finalRun.startedAt,
         finishedAt: finalRun.finishedAt,
       };
