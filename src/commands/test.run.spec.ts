@@ -5,6 +5,7 @@
  * sleep injection is wired through `TestDeps.sleep` to avoid real delays.
  */
 
+import * as dns from 'node:dns';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7102,6 +7103,82 @@ describe('runTestRun — --target-url reachability preflight wiring', () => {
   // tests are governed purely by the injected `fetchImpl` mock — no real
   // DNS lookups, no network flakiness.
   const LITERAL_IP_TARGET = 'http://203.0.113.10';
+
+  it('interrupting stalled DNS rejects before any probe HTTP request or trigger POST', async () => {
+    const { credentialsPath } = makeCreds();
+    const shutdown = new ShutdownController();
+    const fetchImpl = vi.fn();
+    const stderr = vi.fn();
+    const rejected = vi.fn();
+    vi.useFakeTimers();
+    const lookup = vi.spyOn(dns.promises, 'lookup').mockImplementation(() => new Promise(() => {}));
+    try {
+      const pending = runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: false,
+          testId: 'test_xyz',
+          wait: false,
+          timeoutSeconds: 60,
+          targetUrl: 'https://preview.example.test',
+        },
+        { credentialsPath, fetchImpl, shutdown, stdout: () => {}, stderr },
+      ).catch(rejected);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lookup).toHaveBeenCalledWith('preview.example.test', { all: true });
+      shutdown.interrupt('SIGINT');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(rejected).toHaveBeenCalledWith(shutdown.signal.reason);
+      await pending;
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(stderr.mock.calls.some(([line]) => line.includes('[advisory]'))).toBe(false);
+      expect(shutdown.hasCriticalOperations).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      lookup.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('a stalled DNS timeout advises and still dispatches the run', async () => {
+    const { credentialsPath } = makeCreds();
+    const targetUrl = 'https://preview.example.test';
+    const fetchImpl = vi.fn(makeFetch(() => ({ body: { ...TRIGGER_RESP, targetUrl } })));
+    const stderr = vi.fn();
+    const settled = vi.fn();
+    vi.useFakeTimers();
+    const lookup = vi.spyOn(dns.promises, 'lookup').mockImplementation(() => new Promise(() => {}));
+    try {
+      const pending = runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_xyz',
+          wait: false,
+          timeoutSeconds: 60,
+          targetUrl,
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr },
+      ).then(settled);
+      await vi.advanceTimersByTimeAsync(7_999);
+      expect(fetchImpl).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run_abc' }));
+      await pending;
+      expect(fetchImpl).toHaveBeenCalledOnce();
+      expect(fetchImpl).toHaveBeenCalledWith(
+        expect.stringContaining('/tests/test_xyz/runs'),
+        expect.objectContaining({ method: 'POST' }),
+      );
+      expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/\[advisory\].*DNS.*8s/));
+    } finally {
+      lookup.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 
   it('a gateway-error response (502) refuses before the trigger POST — exit 5, no run row', async () => {
     const { credentialsPath } = makeCreds();
