@@ -277,6 +277,15 @@ export function skippedJUnitResultsFromSummary(
  * a full batch has run. The write itself re-checks (the directory can vanish in
  * between).
  */
+function errorCode(err: unknown): string {
+  return (err as NodeJS.ErrnoException | undefined)?.code ?? 'unknown error';
+}
+
+function isAbsentPathError(err: unknown): boolean {
+  const code = errorCode(err);
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
 export function assertArtifactPath(field: 'report-file' | 'summary-file', rawPath: string): string {
   if (typeof rawPath !== 'string' || rawPath.length === 0) {
     throw localValidationError(field, 'must be a non-empty file path');
@@ -290,8 +299,13 @@ export function assertArtifactPath(field: 'report-file' | 'summary-file', rawPat
   let parentStat;
   try {
     parentStat = statSync(parent);
-  } catch {
-    throw localValidationError(field, `parent directory does not exist: ${parent}`);
+  } catch (err) {
+    if (isAbsentPathError(err))
+      throw localValidationError(field, `parent directory does not exist: ${parent}`);
+    throw localValidationError(
+      field,
+      `cannot access parent directory ${parent}: ${errorCode(err)}`,
+    );
   }
   if (!parentStat.isDirectory()) {
     throw localValidationError(field, `parent path is not a directory: ${parent}`);
@@ -300,8 +314,11 @@ export function assertArtifactPath(field: 'report-file' | 'summary-file', rawPat
   let targetStat;
   try {
     targetStat = statSync(resolved);
-  } catch {
-    return resolved;
+  } catch (err) {
+    // Only a missing target is fine (it will be created); anything else (EACCES, ELOOP...) would fail the
+    // write after the run was dispatched, which is exactly what this pre-flight exists to prevent.
+    if (isAbsentPathError(err)) return resolved;
+    throw localValidationError(field, `cannot access ${resolved}: ${errorCode(err)}`);
   }
   if (targetStat.isDirectory()) {
     throw localValidationError(field, `must point to a file, not a directory: ${resolved}`);
