@@ -28,13 +28,14 @@ import {
   InterruptError,
   RequestTimeoutError,
   extractNodeErrorCode,
+  localValidationError,
 } from './lib/errors.js';
 import {
   armInterruptExitBackstop,
   installBrokenPipeGuard,
   installSignalHandlers,
 } from './lib/interrupt.js';
-import { Output, isOutputMode } from './lib/output.js';
+import { Output, isOutputMode, parseFieldsFlag, setJsonFields } from './lib/output.js';
 import { maybeInstallProxyAgent } from './lib/proxy.js';
 import { redactDeep } from './lib/redact.js';
 import {
@@ -74,6 +75,10 @@ program
   .description('Official TestSprite command-line interface')
   .version(VERSION)
   .option('--output <mode>', 'Output format (json|text)', 'text')
+  .option(
+    '--fields <list>',
+    'With --output json, keep only these comma-separated fields. Dot paths reach nested keys, and a path through a list applies to every item (e.g. items.id,items.name,nextToken).',
+  )
   .option('--profile <name>', 'Configuration profile to use')
   .option('--endpoint-url <url>', 'Override the API endpoint host')
   .option(
@@ -287,10 +292,23 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     planTemplate?: boolean;
     local?: string;
     localHost?: string;
+    fields?: string;
   };
   const commandPath = commandPathOf(actionCommand);
   // Record which leaf command ran, for the telemetry emit around parseAsync.
   ranCommandPath = commandPath;
+  // `--fields` trims JSON success output; in text mode it would be silently
+  // ignored, so refuse it there. An invalid --output value is left for the
+  // command's own resolveOutputMode to report.
+  if (globals.fields !== undefined) {
+    if (isOutputMode(globals.output) && globals.output !== 'json') {
+      throw localValidationError(
+        'fields',
+        'only applies to --output json (use --columns to choose text table columns)',
+      );
+    }
+    setJsonFields(parseFieldsFlag(globals.fields));
+  }
   // Preserve explicit --local attempts, including refusals and borrowed tunnels;
   // only flag presence is recorded. Automatic tunnel paths record the same fact.
   if (globals.local !== undefined) recordTelemetryExtras({ local: true });

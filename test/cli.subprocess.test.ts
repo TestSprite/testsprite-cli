@@ -609,6 +609,43 @@ describe('invalid --output is rejected uniformly (exit 5)', () => {
   }, 30_000);
 });
 
+describe('--fields trims --output json success output', () => {
+  it('keeps only the requested fields of every list item plus the cursor', async () => {
+    const result = await runCli([
+      '--dry-run',
+      '--output',
+      'json',
+      'test',
+      'list',
+      '--project',
+      'p1',
+      '--fields',
+      'items.id,items.status,nextToken',
+    ]);
+    expect(result.exitCode).toBe(0);
+    const parsed = JSON.parse(result.stdout) as {
+      items: Record<string, unknown>[];
+      nextToken?: unknown;
+    };
+    expect(parsed.items.length).toBeGreaterThan(0);
+    for (const item of parsed.items) expect(Object.keys(item).sort()).toEqual(['id', 'status']);
+    expect(Object.keys(parsed).sort()).toEqual(['items', 'nextToken']);
+  }, 30_000);
+
+  it('warns on stderr about a field that matched nothing, stdout still valid JSON', async () => {
+    const result = await runCli(['--dry-run', '--output', 'json', '--fields', 'nmae', 'usage']);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({});
+    expect(result.stderr).toContain('[warn] --fields "nmae" matched nothing in this output');
+  }, 30_000);
+
+  it('is rejected in text mode (exit 5) instead of being silently ignored', async () => {
+    const result = await runCli(['--dry-run', '--fields', 'id', 'usage']);
+    expect(result.exitCode).toBe(5);
+    expect(result.stderr).toContain('only applies to --output json');
+  }, 30_000);
+});
+
 describe('a malformed --profile is rejected (exit 5), not silently corrupting credentials', () => {
   // A profile name becomes an INI section header (`[name]`). `prod]` would
   // serialise to `[prod]]`, which the parser cannot read back — `setup` would

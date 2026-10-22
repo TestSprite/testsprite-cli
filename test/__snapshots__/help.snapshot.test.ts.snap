@@ -50,7 +50,7 @@ Options:
                   destroyed.
   -h, --help      display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -64,7 +64,7 @@ List the agent targets and skills this CLI can install and where each lands
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -115,7 +115,7 @@ exports[`--help snapshots > auth logout 1`] = `
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -126,7 +126,7 @@ exports[`--help snapshots > auth whoami 1`] = `
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -171,7 +171,7 @@ Options:
                        omitted)
   -h, --help           display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -353,7 +353,7 @@ Options:
                                minted per invocation.
   -h, --help                   display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -383,7 +383,7 @@ Options:
                              minted per invocation.
   -h, --help                 display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -432,7 +432,7 @@ Options:
                                  minted per invocation.
   -h, --help                     display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -469,7 +469,7 @@ Options:
                              minted per invocation.
   -h, --help                 display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -482,7 +482,7 @@ Get a project by id
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -507,7 +507,7 @@ Options:
   --no-header               suppress the text table header row
   -h, --help                display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -539,7 +539,7 @@ Options:
   --env <name>  environment name (defaults to the project default)
   -h, --help    display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -565,7 +565,7 @@ Options:
                                  minted per invocation.
   -h, --help                     display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -597,7 +597,7 @@ Options:
                                minted per invocation.
   -h, --help                   display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -779,7 +779,7 @@ Arguments:
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -794,7 +794,7 @@ Options:
                 source body; json mode: wire envelope)
   -h, --help    display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -893,7 +893,7 @@ BE dependency authoring:
   --category teardown  marks a final-wave cleanup test.
   These flags are backend-only; supplying with --type frontend is an error (exit 5).
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -955,7 +955,7 @@ Options:
                              per invocation; pin one yourself for safe retries.
   -h, --help                 display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -973,7 +973,7 @@ Options:
                  \`test steps <id>\` for the full run trail.
   -h, --help     display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1008,7 +1008,7 @@ Notes:
     this measures replay stability of the saved script against the configured URL.
   • \`--output json\` emits a machine-readable stability report for CI gating.
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1021,7 +1021,7 @@ Get a test by id
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1051,7 +1051,7 @@ Options:
   --no-header               suppress the text table header row
   -h, --help                display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1104,7 +1104,7 @@ Notes:
   - Nothing staged → exit 6 with a pointer at \`test plan generate\`.
 
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1142,7 +1142,7 @@ Behavior:
 Next step: review the printed table, then \`testsprite test plan accept\`.
 
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1247,7 +1247,7 @@ Dry-run shape notes:
     omit \`closure\` (or return it as null) since there is no dependency expansion.
   • \`autoHeal\` defaults true for FE reruns; BE reruns ignore the field entirely.
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1285,7 +1285,7 @@ Options:
   --no-header         with --history: suppress the text table header row
   -h, --help          display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1455,7 +1455,7 @@ Concurrency limits:
   - --max-concurrency here bounds the --wait poll fan-out, not dispatch, so it
     has no effect on the cap. A smaller batch does.
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1473,7 +1473,7 @@ Options:
                             latest run.
   -h, --help                display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1508,7 +1508,7 @@ Options:
   --idempotency-key <key>  caller-supplied idempotency key (1-256 chars)
   -h, --help               display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1525,7 +1525,7 @@ Options:
   --idempotency-key <key>        caller-supplied idempotency key (1-256 chars)
   -h, --help                     display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1541,7 +1541,7 @@ Options:
   --idempotency-key <key>  caller-supplied idempotency key (1-256 chars)
   -h, --help               display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1554,7 +1554,7 @@ Get a test list with its cases
 Options:
   -h, --help  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1569,7 +1569,7 @@ Options:
   --no-header       suppress the text table header row
   -h, --help        display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1583,7 +1583,7 @@ Options:
   --idempotency-key <key>  caller-supplied idempotency key (1-256 chars)
   -h, --help               display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1624,7 +1624,7 @@ Options:
                               timedOut, runs[]} to this file
   -h, --help                  display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1642,7 +1642,7 @@ Options:
   --idempotency-key <key>        caller-supplied idempotency key (1-256 chars)
   -h, --help                     display help for command
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1655,6 +1655,10 @@ Official TestSprite command-line interface
 Options:
   -V, --version                output the version number
   --output <mode>              Output format (json|text) (default: "text")
+  --fields <list>              With --output json, keep only these
+                               comma-separated fields. Dot paths reach nested
+                               keys, and a path through a list applies to every
+                               item (e.g. items.id,items.name,nextToken).
   --profile <name>             Configuration profile to use
   --endpoint-url <url>         Override the API endpoint host
   --verbose                    Emit human-readable HTTP retry / backoff /
@@ -1758,7 +1762,7 @@ Exit codes:
  10  could not reach TestSprite
 
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1789,7 +1793,7 @@ Exit codes:
  11  rate limited, or too many tunnels are already open for this account
 
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1812,7 +1816,7 @@ Exit codes:
  10  could not reach TestSprite to ask
 
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
@@ -1842,7 +1846,7 @@ Exit codes:
  10  could not reach TestSprite
 
 
-Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+Global options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
 "
 `;
