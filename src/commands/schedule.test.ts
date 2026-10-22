@@ -426,4 +426,21 @@ describe('runGet', () => {
       ),
     ).rejects.toBeInstanceOf(ApiError);
   });
+
+  it('rejects empty and whitespace-only schedule id with VALIDATION_ERROR before network access', async () => {
+    const fetchImpl = vi.fn();
+    for (const invalidId of ['', '   ']) {
+      await expect(
+        runGet(
+          { ...BASE, output: 'json', scheduleId: invalidId },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, stdout: () => {} },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'schedule-id', reason: 'is required' },
+      });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });

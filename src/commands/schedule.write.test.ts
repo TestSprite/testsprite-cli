@@ -1,7 +1,7 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { runsPerMonth } from '../lib/cron.js';
 import { ApiError } from '../lib/errors.js';
 import {
@@ -486,6 +486,23 @@ describe('runDelete', () => {
 
     expect(out.join('\n')).toContain('deleted: sch_1');
   });
+
+  it('rejects empty and whitespace-only schedule id with VALIDATION_ERROR before network access', async () => {
+    const fetchImpl = vi.fn();
+    for (const invalidId of ['', '   ']) {
+      await expect(
+        runDelete(
+          { ...BASE, output: 'json', scheduleId: invalidId, confirm: true },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, ...sink },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'schedule-id', reason: 'is required' },
+      });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
 
 describe('runRunList', () => {
@@ -560,5 +577,22 @@ describe('runRunList', () => {
     );
 
     expect(result.runs).toEqual([]);
+  });
+
+  it('rejects empty and whitespace-only schedule id with VALIDATION_ERROR before network access', async () => {
+    const fetchImpl = vi.fn();
+    for (const invalidId of ['', '   ']) {
+      await expect(
+        runRunList(
+          { ...BASE, output: 'json', scheduleId: invalidId },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, ...sink },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'schedule-id', reason: 'is required' },
+      });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });

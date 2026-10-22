@@ -931,6 +931,23 @@ describe('runGet', () => {
 
     expect(seen[0]).toContain('odd%2Fid%3Fweird');
   });
+
+  it('rejects empty and whitespace-only project id with VALIDATION_ERROR before network access', async () => {
+    const fetchImpl = vi.fn();
+    for (const invalidId of ['', '   ']) {
+      await expect(
+        runGet(
+          { profile: 'default', output: 'json', debug: false, projectId: invalidId },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'project-id', reason: 'is required' },
+      });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2382,6 +2399,23 @@ describe('runDelete', () => {
     const block = out.join('\n');
     expect(block).toContain('projectId proj_text');
     expect(block).toContain('deletedAt 2026-05-16T10:00:00.000Z');
+  });
+
+  it('rejects empty and whitespace-only project id with VALIDATION_ERROR before network access', async () => {
+    const fetchImpl = vi.fn();
+    for (const invalidId of ['', '   ']) {
+      await expect(
+        runDelete(
+          { profile: 'default', output: 'json', debug: false, projectId: invalidId, confirm: true },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'project-id', reason: 'is required' },
+      });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
 
