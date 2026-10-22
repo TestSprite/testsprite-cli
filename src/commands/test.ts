@@ -70,8 +70,9 @@ import {
   isAuthCode,
   localValidationError,
 } from '../lib/errors.js';
+import { emptyProjectHint, emptyProjectNextStep, type LocalHint } from '../lib/first-suite-hint.js';
 import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
-import { defaultSleep } from '../lib/poll-support.js';
+import { defaultSleep, sleepUnlessInterrupted } from '../lib/poll-support.js';
 import {
   assertIdempotencyKey,
   requireArrayLength,
@@ -97,6 +98,7 @@ import {
 import { isTerminalStatus, pollRunUntilTerminal, TimeoutError } from '../lib/poll.js';
 import {
   batchOutcomeCounts,
+  ciRefusalOutcome,
   recordBatchOutcome,
   recordTelemetryExtras,
   type WaitTimeoutTelemetry,
@@ -111,6 +113,7 @@ import type {
   CliGenerationStatus,
 } from '../lib/plans.types.js';
 import { resolveWaitFailure, waitMemberError } from '../lib/wait-exit.js';
+import { resolveCiRunFailure } from '../lib/ci-run.js';
 import type {
   RunResponse,
   RunStatus,
@@ -128,7 +131,9 @@ import type {
   BatchRunFreshResponse,
   BatchRunFreshAccepted,
   CancelRunResponse,
+  CiGithubTrigger,
   RunEnvironmentRef,
+  ExecutionReport,
 } from '../lib/runs.types.js';
 import { RUN_SOURCES } from '../lib/runs.types.js';
 import { classifyBillingRefusal } from '../lib/billing-refusal.js';
@@ -140,6 +145,7 @@ import {
   isPausedRefusal,
   pausedConflictError,
   summarizeConflicts,
+  type RunConflict,
 } from '../lib/conflict-reason.js';
 import { isProxyAgentActive } from '../lib/proxy.js';
 import type { CliProjectEnvironment, CliProjectEnvListResponse } from './project-env.js';
@@ -177,10 +183,13 @@ import { emitTargetUrlMismatchAdvisory } from '../lib/v3-advisory.js';
 import {
   emitCiArtifacts,
   isNonDispatchedStatus,
+  emitCiStepOutputs,
+  reconcileExecutionReportMarkdown,
   summarizeAcceptedPayload,
   summarizeSingleRun,
   type CiRunRow,
   type CiSummary,
+  emitExecutionReportOutputs,
 } from '../lib/gh-output.js';
 import { loadConfig, resolveProfileName } from '../lib/config.js';
 import { historyRetentionNote } from '../lib/history-retention.js';
@@ -229,6 +238,11 @@ export interface CliTest {
   projectName?: string | null;
   name: string;
   type: 'frontend' | 'backend';
+  /**
+   * Assembled integration test (backend). Absent on older backends — treated
+   * as false. Listed as `backend/int` so it is not mistaken for a plain test.
+   */
+  isIntegration?: boolean;
   createdFrom: 'portal' | 'mcp' | 'cli';
   status: CliPublicStatus;
   statusByEnvironment?: Array<{
@@ -262,7 +276,7 @@ export interface CliTest {
    */
   details?: Partial<CliTestStatusDetails>;
   /**
-   * G1a — test priority label, e.g. "p0" | "p1" | "p2" | "p3".
+   * G1a — test priority label as stored ("High" | "Medium" | "Low").
    * Optional on the wire: pre-G1a backends omit the field; `null` means
    * no priority has been set. Text mode surfaces it only when truthy.
    */
@@ -1133,6 +1147,21 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
       environment,
     }),
   );
+  // An EMPTY project — nothing narrowed the page, no further page —
+  // is where a new user without a coding agent stalls. One stderr hint, text
+  // mode only, so stdout stays exactly "No tests." for pipes.
+  if (
+    opts.output !== 'json' &&
+    page.items.length === 0 &&
+    !page.nextToken &&
+    opts.startingToken === undefined &&
+    opts.type === undefined &&
+    opts.createdFrom === undefined &&
+    opts.status === undefined
+  ) {
+    const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    stderrFn(emptyProjectHint(projectId));
+  }
   return page;
 }
 
@@ -1169,6 +1198,43 @@ export interface CliCreateTestResponse {
 export const CLI_CREATE_PRIORITIES = ['p0', 'p1', 'p2', 'p3'] as const;
 export type CliCreatePriority = (typeof CLI_CREATE_PRIORITIES)[number];
 
+/** Priority spellings accepted as input; reads return High/Medium/Low. */
+export const CLI_PRIORITY_INPUTS = [...CLI_CREATE_PRIORITIES, 'high', 'medium', 'low'] as const;
+
+const PRIORITY_WIRE: Readonly<Record<string, 'p0' | 'p1' | 'p2'>> = {
+  p0: 'p0',
+  high: 'p0',
+  p1: 'p1',
+  medium: 'p1',
+  p2: 'p2',
+  low: 'p2',
+  p3: 'p2',
+};
+
+/**
+ * Normalise a priority input (p0-p3 or high/medium/low, any case) to the
+ * p0/p1/p2 wire value every backend accepts; p3 folds into p2 (Low).
+ * Returns undefined for anything else.
+ */
+export function normalizePriority(raw: unknown): 'p0' | 'p1' | 'p2' | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const key = raw.trim().toLowerCase();
+  // Own-property lookup: inherited names such as `constructor` must not pass as priorities.
+  return Object.hasOwn(PRIORITY_WIRE, key) ? PRIORITY_WIRE[key] : undefined;
+}
+
+/** Throws the standard enum error unless `raw` is an accepted priority input. */
+function assertPriorityInput(field: string, raw: unknown, kind: 'field' | 'flag' = 'field'): void {
+  if (normalizePriority(raw) === undefined) {
+    throw localValidationError(
+      field,
+      `must be one of: ${CLI_PRIORITY_INPUTS.join(', ')} (case-insensitive)`,
+      [...CLI_PRIORITY_INPUTS],
+      kind,
+    );
+  }
+}
+
 /**
  * 350 KB inline-code cap. Mirrors `MAX_INLINE_CODE_BYTES` in the backend
  * (`CliTestsController`), which is sized to fit a full test row inside
@@ -1187,7 +1253,7 @@ interface CreateOptions extends CommonOptions {
   type: 'frontend' | 'backend';
   name: string;
   description?: string;
-  priority?: CliCreatePriority;
+  priority?: string;
   /** Per-test timeout applied by the execution engine to every step. */
   stepTimeoutMs?: number;
   /** Source path to the test code. Read into memory; capped at 350 KB. */
@@ -1454,11 +1520,7 @@ export async function runCreate(
       'backend',
     ]);
   }
-  if (opts.priority !== undefined && !CLI_CREATE_PRIORITIES.includes(opts.priority)) {
-    throw localValidationError('priority', `must be one of: ${CLI_CREATE_PRIORITIES.join(', ')}`, [
-      ...CLI_CREATE_PRIORITIES,
-    ]);
-  }
+  if (opts.priority !== undefined) assertPriorityInput('priority', opts.priority);
 
   // M4 piece-2: --produces/--needs/--category are backend-only. FE plans have
   // no wave model; fail-fast client-side to match the backend's 400 reject and
@@ -1506,7 +1568,7 @@ export async function runCreate(
     type: opts.type,
     name: opts.name,
     description: opts.description,
-    priority: opts.priority,
+    priority: normalizePriority(opts.priority),
     code,
   };
   if (opts.stepTimeoutMs !== undefined) {
@@ -1882,6 +1944,12 @@ interface PlanPutOptions extends CommonOptions {
    * `codeVersion`, so this is the only consistency knob.
    */
   expectedStepCount?: number;
+  /**
+   * Replace even when the server would drop structured fields
+   * (action / selector / inputValue) from steps whose text changed. Also
+   * skips the default step-count fence.
+   */
+  force?: boolean;
   /** Caller-supplied idempotency token; UUIDv4 minted client-side if absent. */
   idempotencyKey?: string;
   /**
@@ -1906,10 +1974,9 @@ interface PlanPutOptions extends CommonOptions {
  * trip and matches the piece-6 spec's "server-side routing" decision.
  *
  * Concurrency: FE has no `codeVersion`, so updates are last-writer-
- * wins by default. Pass `--expected-step-count <N>` to set
- * `If-Match-Step-Count`; the server rejects with 412 if the current
- * array length differs. Useful for defensive callers who want to
- * detect concurrent edits without a separate read.
+ * wins unless `--expected-step-count <N>` is passed, which sets
+ * `If-Match-Step-Count`; the server rejects with 412 if the array length
+ * differs.
  *
  * Idempotency: `cli-plan-put-<uuid>` is the default key, surfaced to
  * stderr so a transport retry can pin it.
@@ -1969,13 +2036,29 @@ export async function runPlanPut(
     );
   }
 
-  const response = await client.put<CliPutPlanStepsResponse>(
-    `/tests/${encodeURIComponent(opts.testId)}/plan-steps`,
-    {
-      body: { planSteps },
-      headers,
-    },
-  );
+  let response: CliPutPlanStepsResponse;
+  try {
+    response = await client.put<CliPutPlanStepsResponse>(
+      `/tests/${encodeURIComponent(opts.testId)}/plan-steps`,
+      {
+        body: opts.force === true ? { planSteps, force: true } : { planSteps },
+        headers,
+      },
+    );
+  } catch (err) {
+    if (err instanceof ApiError && err.getDetail('reason') === 'structured_loss') {
+      const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+      const losing = err.getDetail('losing');
+      const indexes = err.getDetail('stepIndexes');
+      const where = Array.isArray(indexes)
+        ? ` (step ${indexes.map(i => (typeof i === 'number' ? i + 1 : String(i))).join(', ')})`
+        : '';
+      stderr(
+        `${typeof losing === 'number' ? losing : 'Some'} step(s) would lose their structured fields${where}.`,
+      );
+    }
+    throw err;
+  }
   out.print(response, data => renderPlanPutText(data as CliPutPlanStepsResponse));
   return response;
 }
@@ -2275,7 +2358,7 @@ interface UpdateOptions extends CommonOptions {
   /** Optional new description (`null` is reserved for "clear"; CLI surfaces both). */
   description?: string;
   /** Optional new priority. Enum-validated CLI-side. */
-  priority?: CliCreatePriority;
+  priority?: string;
   /** Set the per-test timeout applied by the execution engine to every step. */
   stepTimeoutMs?: number;
   /** Clear the per-test step timeout and restore execution engine defaults. */
@@ -2330,11 +2413,7 @@ export async function runUpdate(
   if (opts.description !== undefined && opts.description.length > 2000) {
     throw localValidationError('description', 'must be at most 2000 characters');
   }
-  if (opts.priority !== undefined && !CLI_CREATE_PRIORITIES.includes(opts.priority)) {
-    throw localValidationError('priority', `must be one of: ${CLI_CREATE_PRIORITIES.join(', ')}`, [
-      ...CLI_CREATE_PRIORITIES,
-    ]);
-  }
+  if (opts.priority !== undefined) assertPriorityInput('priority', opts.priority);
   if (opts.stepTimeoutMs !== undefined && opts.clearStepTimeout === true) {
     throw localValidationError(
       'step-timeout',
@@ -2393,7 +2472,7 @@ export async function runUpdate(
   const body: Record<string, string | string[] | number | null> = {};
   if (hasName) body.name = opts.name!;
   if (hasDescription) body.description = opts.description!;
-  if (hasPriority) body.priority = opts.priority!;
+  if (hasPriority) body.priority = normalizePriority(opts.priority)!;
   if (hasProduces) body.produces = opts.produces!;
   if (hasNeeds) body.consumes = opts.needs!;
   if (hasCategory) body.category = opts.category!;
@@ -2743,6 +2822,15 @@ function renderBulkDeleteText(bulk: CliBulkDeleteSummary): string {
 export interface CliPlanStep {
   type: 'action' | 'assertion';
   description: string;
+  /**
+   * Read-only view fields: structured steps carry the engine-level action
+   * the Portal recorded. Optional because older backends omit them; they are
+   * never part of a create / `plan put` request body.
+   */
+  action?: string;
+  selector?: string;
+  inputValue?: string;
+  structured?: boolean;
 }
 
 const PLAN_STEP_TYPES: ReadonlyArray<CliPlanStep['type']> = ['action', 'assertion'];
@@ -2762,7 +2850,7 @@ export interface CliPlanInput {
   type: 'frontend' | 'backend';
   name: string;
   description?: string;
-  priority?: CliCreatePriority;
+  priority?: string;
   planSteps: CliPlanStep[];
 }
 
@@ -3444,7 +3532,7 @@ export async function runCreateFromPlan(
     type: plan.type,
     name: plan.name,
     description: plan.description,
-    priority: plan.priority,
+    priority: normalizePriority(plan.priority),
     planSteps: plan.planSteps,
   };
 
@@ -3731,7 +3819,7 @@ function assertPlanShape(
     );
   }
   if (obj.priority !== undefined) {
-    requireEnum(`${prefix}priority`, obj.priority, CLI_CREATE_PRIORITIES);
+    assertPriorityInput(`${prefix}priority`, obj.priority);
   }
 
   // `planSteps` missing is the single most common agent
@@ -3812,7 +3900,7 @@ function collectPlanIssues(
     issues.push({ field: `${prefix}description`, reason: 'must be a string when present' });
   }
   if (obj.priority !== undefined) {
-    check(() => requireEnum(`${prefix}priority`, obj.priority, CLI_CREATE_PRIORITIES));
+    check(() => assertPriorityInput(`${prefix}priority`, obj.priority));
   }
   check(() =>
     requireArrayLength(`${prefix}planSteps`, obj.planSteps, {
@@ -3972,7 +4060,11 @@ export async function runCreateBatch(
     stderrFn(`idempotency-key: ${idempotencyKey}`);
   }
 
-  const body = { tests: specs };
+  const body = {
+    tests: specs.map(spec =>
+      spec.priority === undefined ? spec : { ...spec, priority: normalizePriority(spec.priority) },
+    ),
+  };
   const bodyBytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
   if (bodyBytes > MAX_BATCH_BODY_BYTES) {
     throw ApiError.fromEnvelope({
@@ -7453,7 +7545,7 @@ function withRunDashboardUrl(run: RunResponse, apiUrl: string): RunResponse {
  * atomic — no per-step breakdown exists; showing `0/0 (passed=0, failed=0)`
  * reads like a no-op rather than a passing/failing atomic result).
  */
-function renderRunResponseText(
+export function renderRunResponseText(
   run: RunResponse,
   { isBackend = false }: { isBackend?: boolean } = {},
 ): string {
@@ -7500,6 +7592,9 @@ function renderRunResponseText(
     // exact no-op wording the backend branch exists to avoid. A zeroed summary
     // is an absent breakdown, not a breakdown of zero steps, so say that.
     lines.push(`steps       n/a (no per-step breakdown reported)`);
+  }
+  if (run.replay?.path === 'refused') {
+    lines.push(`replay      refused${run.replay.reason ? ` (${run.replay.reason})` : ''}`);
   }
   // Closing pointer: where to inspect this run in the Portal (video, steps,
   // screenshots). Present only when withRunDashboardUrl could resolve it.
@@ -7704,6 +7799,64 @@ function isSameLoopbackPort(url: string, port: number): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The environment half of the 409 auto-resume gate, shared by the single run
+ * and the `--all` batch: may the in-flight run stand in for the run this
+ * invocation asked for? Resolves to the `--env` flag naming the verified
+ * environment for a later retry (undefined when the run recorded none), or
+ * throws `incompatibleRun(reason)`.
+ *
+ * `undefined` (no key at all) is a V2 run or a backend that predates
+ * environments on run reads; `null` is a V3 row that explicitly names no
+ * environment, OR one whose environment lookup failed and was swallowed
+ * server-side. Only the former may attach unverified — treating `null` the
+ * same way would let a failed lookup slip through the gate it exists to
+ * enforce.
+ */
+async function verifyInFlightRunEnvironment(
+  inFlightRun: RunResponse,
+  environment: string | undefined,
+  listEnvironments: (projectId: string) => Promise<CliProjectEnvListResponse>,
+  incompatibleRun: (reason: string) => ApiError,
+): Promise<string | undefined> {
+  const inFlightEnvironment = inFlightRun.environment;
+  if (inFlightEnvironment === undefined) {
+    if (environment !== undefined) {
+      // --env was requested but this in-flight run has nothing recorded to
+      // verify it against.
+      throw incompatibleRun('its environment could not be verified');
+    }
+    // Restored 0.12.0 path: no environment recorded, none requested — attach.
+    return undefined;
+  }
+  if (
+    inFlightEnvironment === null ||
+    typeof inFlightEnvironment.id !== 'string' ||
+    inFlightEnvironment.id.length === 0
+  ) {
+    throw incompatibleRun('its environment could not be verified');
+  }
+  let currentEnvironment: CliProjectEnvironment | undefined;
+  try {
+    const listing = await listEnvironments(inFlightRun.projectId);
+    currentEnvironment = listing.environments.find(row =>
+      environment === undefined ? row.isDefault : row.name === environment,
+    );
+  } catch (listErr) {
+    if (listErr instanceof InterruptError) throw listErr;
+    throw incompatibleRun('its environment could not be verified');
+  }
+  if (typeof currentEnvironment?.id !== 'string' || currentEnvironment.id.length === 0) {
+    // The listing succeeded but named nothing we can compare against — that
+    // is unverified, not a proven mismatch.
+    throw incompatibleRun('its environment could not be verified');
+  }
+  if (currentEnvironment.id !== inFlightEnvironment.id) {
+    throw incompatibleRun('its environment does not match the requested environment');
+  }
+  return `--env ${currentEnvironment.name}`;
 }
 
 export async function runTestRun(
@@ -8051,7 +8204,6 @@ export async function runTestRun(
           const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
           // Set only when a verified environment names a concrete retry — the
           // no-environment-recorded attach path has nothing to name.
-          let retryFlags: string | undefined;
           const incompatibleRun = (reason: string): ApiError =>
             new ApiError({
               code: 'CONFLICT',
@@ -8067,49 +8219,15 @@ export async function runTestRun(
             if (readErr instanceof InterruptError) throw readErr;
             throw incompatibleRun('its environment could not be verified');
           }
-          const inFlightEnvironment = inFlightRun.environment;
-          // `undefined` (no key at all) is a V2 run or a backend that predates
-          // environments on run reads; `null` is a V3 row that explicitly names no
-          // environment, OR one whose environment lookup failed and was
-          // swallowed server-side. Only the former may attach unverified —
-          // treating `null` the same way would let a failed lookup slip
-          // through the gate it exists to enforce.
-          if (inFlightEnvironment === undefined) {
-            if (environment !== undefined) {
-              // --env was requested but this in-flight run has nothing
-              // recorded to verify it against.
-              throw incompatibleRun('its environment could not be verified');
-            }
-            // Restored 0.12.0 path: no environment recorded, none requested — attach.
-          } else if (
-            inFlightEnvironment === null ||
-            typeof inFlightEnvironment.id !== 'string' ||
-            inFlightEnvironment.id.length === 0
-          ) {
-            throw incompatibleRun('its environment could not be verified');
-          } else {
-            let currentEnvironment: CliProjectEnvironment | undefined;
-            try {
-              const listing = await client.get<CliProjectEnvListResponse>(
-                `/projects/${encodeURIComponent(inFlightRun.projectId)}/env`,
-              );
-              currentEnvironment = listing.environments.find(row =>
-                environment === undefined ? row.isDefault : row.name === environment,
-              );
-            } catch (listErr) {
-              if (listErr instanceof InterruptError) throw listErr;
-              throw incompatibleRun('its environment could not be verified');
-            }
-            if (typeof currentEnvironment?.id !== 'string' || currentEnvironment.id.length === 0) {
-              // The listing succeeded but named nothing we can compare against —
-              // that is unverified, not a proven mismatch.
-              throw incompatibleRun('its environment could not be verified');
-            }
-            if (currentEnvironment.id !== inFlightEnvironment.id) {
-              throw incompatibleRun('its environment does not match the requested environment');
-            }
-            retryFlags = `--env ${currentEnvironment.name}`;
-          }
+          const retryFlags = await verifyInFlightRunEnvironment(
+            inFlightRun,
+            environment,
+            projectId =>
+              client.get<CliProjectEnvListResponse>(
+                `/projects/${encodeURIComponent(projectId)}/env`,
+              ),
+            incompatibleRun,
+          );
 
           // If the caller supplied --target-url, verify the in-flight run targets
           // the same URL. A mismatch means we would be reporting a different
@@ -9373,7 +9491,7 @@ export async function runTestWait(
 // M4 piece-2 — `test run --all --project <id>` (fresh wave-ordered batch run)
 // ---------------------------------------------------------------------------
 
-interface RunTestRunAllOptions extends CommonOptions {
+export interface RunTestRunAllOptions extends CommonOptions {
   environmentResolutionComplete?: boolean;
   cancelOnInterrupt?: boolean;
   timeoutIsDefault?: boolean;
@@ -9389,6 +9507,14 @@ interface RunTestRunAllOptions extends CommonOptions {
   timeoutSeconds: number;
   /** --max-concurrency: bounds the --wait poll fan-out. */
   maxConcurrency: number;
+  /** Internal CI policy. The public `ci run` entry point always enables wait. */
+  ci?: {
+    failOnSkipped?: boolean;
+    /** How long `ci run` waits for the execution report before falling back to the local table. */
+    executionReportTimeoutSeconds?: number;
+    /** `--no-execution-report`: never read the report; the job summary is the local table. */
+    executionReport?: boolean;
+  };
   /** Caller-supplied idempotency token; auto-minted if absent. */
   idempotencyKey?: string;
   /** --report junit: write a JUnit XML sidecar after batch --wait completes. */
@@ -9414,6 +9540,18 @@ interface RunTestRunAllOptions extends CommonOptions {
   environment?: string;
   /** Per-run URL override for every frontend test in the batch. */
   targetUrl?: string;
+  /**
+   * `ci run`: `'all'` asks the server to seed every selected case into one
+   * execution and pace dispatch itself, so a CI run is one execution (and,
+   * with `previewName`, one environment row) instead of a first batch plus a
+   * client-side retry. A backend that read the field echoes it; a missing
+   * echo is refused the way an unconfirmed `targetUrl` is.
+   */
+  admission?: 'budget' | 'all';
+  /** `ci run` in a pull request: run in a temporary clone of `environment` at `targetUrl`. */
+  previewName?: string;
+  /** `ci run` in GitHub Actions: where the run came from, for the Portal's PR link. */
+  githubTrigger?: CiGithubTrigger;
   /** Skip the pre-charge target URL reachability probe. */
   skipPreflight?: boolean;
 }
@@ -9552,6 +9690,197 @@ async function cancelRunsBestEffort(
   }
 }
 
+/**
+ * One line telling a backend-project batch what the integration phase will do
+ * after the wave. Undefined when the backend sent no summary (older backend,
+ * frontend project, or nothing to say).
+ */
+function formatIntegrationSummary(
+  integration: BatchRunFreshResponse['integration'],
+): string | undefined {
+  if (integration === undefined || !integration.runsAfterWave) return undefined;
+  const parts: string[] = [];
+  if (integration.existing > 0) {
+    parts.push(
+      `${integration.existing} existing integration test${integration.existing !== 1 ? 's' : ''} run after this wave (0.2 credits each)`,
+    );
+  }
+  if (integration.mayGenerate) parts.push('new ones may be generated on a first run');
+  if (parts.length === 0) return undefined;
+  return `Integration phase: ${parts.join('; ')}.`;
+}
+
+/** The server's execution report plus its rendered Markdown, once `ready`. */
+interface ExecutionReportReady {
+  report: ExecutionReport;
+  markdown: string;
+}
+
+const EXECUTION_REPORT_DEFAULT_TIMEOUT_SECONDS = 60;
+const EXECUTION_REPORT_DEFAULT_RETRY_SECONDS = 5;
+
+/**
+ * Fetch the execution report — the content the GitHub App posts as its PR
+ * comment — for the one execution this CI batch dispatched into.
+ *
+ * Best-effort by contract: the local results table is the fallback, so an
+ * older backend (404), a report that is not ready within the budget, a
+ * report for some other execution, or any other failure returns `undefined`
+ * with one stderr line. An interrupt while waiting (the request or the retry
+ * sleep — the scope is armed across both, so a first signal is a graceful
+ * stop, not an immediate exit) also falls back, and is handed back in
+ * `interrupted`: the batch is already finished, so its summary and outputs are
+ * written first, then the caller rethrows it so the exit is the signal's
+ * code. Reads nothing when `--no-execution-report`
+ * was passed, when a run timed out (the execution is not terminal, so the
+ * report could only arrive late), or unless EVERY accepted row names the same
+ * execution (an older backend omits the id; a batch spanning several
+ * executions gets one report per execution as a follow-up — a report for one
+ * of them would read as the whole batch's).
+ */
+async function fetchExecutionReport(
+  client: HttpClient,
+  accepted: readonly { executionId?: string }[],
+  results: readonly { status: string }[],
+  opts: RunTestRunAllOptions,
+  deps: TestDeps,
+  stderrFn: (line: string) => void,
+): Promise<{ ready?: ExecutionReportReady; interrupted?: InterruptError }> {
+  if (opts.ci?.executionReport === false || accepted.length === 0) return {};
+  const executionIds = new Set(accepted.map(a => a.executionId));
+  if (executionIds.size !== 1) return {};
+  const executionId = [...executionIds][0];
+  if (typeof executionId !== 'string' || executionId.length === 0) return {};
+  if (results.some(r => r.status === 'timeout')) {
+    stderrFn(
+      '[ci run] a run timed out, so the execution is not finished; the job summary uses the local results table',
+    );
+    return {};
+  }
+  const timeoutSeconds =
+    opts.ci?.executionReportTimeoutSeconds ?? EXECUTION_REPORT_DEFAULT_TIMEOUT_SECONDS;
+  const deadlineMs = Date.now() + timeoutSeconds * 1000;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutSeconds * 1000);
+  const sleepFn = deps.sleep ?? defaultSleep;
+  const shutdown = shutdownOf(deps);
+  // Every `pollRunUntilTerminal` has disarmed by now, so without this scope a
+  // SIGINT/SIGTERM during the retry sleep would take the signal handler's
+  // disarmed path and exit at once — no summary, no outputs.
+  const disarm = shutdown.arm();
+  try {
+    for (;;) {
+      // No automatic retries: the deadline below is the only retry policy.
+      const res = await client.getExecutionReport(executionId, { signal: ac.signal, retry: false });
+      if (res.ready && res.report && typeof res.markdown === 'string') {
+        if (res.report.executionId !== executionId) {
+          stderrFn(
+            `[ci run] execution report names execution ${res.report.executionId}, not ${executionId}; the job summary uses the local results table`,
+          );
+          return {};
+        }
+        return { ready: { report: res.report, markdown: res.markdown } };
+      }
+      const remainingMs = deadlineMs - Date.now();
+      if (remainingMs <= 0) break;
+      const retrySeconds = Math.max(
+        1,
+        res.retryAfterSeconds ?? EXECUTION_REPORT_DEFAULT_RETRY_SECONDS,
+      );
+      // Interruptible: a SIGINT/SIGTERM here means "stop waiting for the
+      // report", not "drop the finished batch's summary and outputs".
+      await sleepUnlessInterrupted(
+        sleepFn,
+        Math.min(remainingMs, retrySeconds * 1000),
+        shutdown.signal,
+      );
+      if (Date.now() >= deadlineMs) break;
+    }
+    stderrFn(
+      `[ci run] execution report not ready within ${timeoutSeconds}s; the job summary uses the local results table`,
+    );
+  } catch (err) {
+    if (err instanceof InterruptError) {
+      stderrFn(
+        '[ci run] interrupted while waiting for the execution report; the job summary uses the local results table',
+      );
+      return { interrupted: err };
+    }
+    stderrFn(
+      `[ci run] execution report unavailable (${err instanceof Error ? err.message : String(err)}); the job summary uses the local results table`,
+    );
+  } finally {
+    clearTimeout(timer);
+    disarm();
+  }
+  return {};
+}
+
+/** Publish all CI surfaces from one summary before applying the CI gate. */
+async function finishCiBatch(
+  payload: Omit<BatchRunFreshResponse, 'accepted'> & { accepted: CliBatchRunFreshResult[] },
+  opts: RunTestRunAllOptions,
+  deps: TestDeps,
+  nameByTestId?: ReadonlyMap<string, string>,
+  executionError?: unknown,
+  /** The accepted rows with poll timing, for the JUnit report only. */
+  junitResults: CliBatchRunFreshResult[] = payload.accepted,
+  /** The server's execution report, when the backend provided one in time. */
+  executionReport?: ExecutionReportReady,
+): Promise<void> {
+  // A CI gate that dispatched nothing is its own funnel outcome (green only
+  // with --allow-empty); the gated case is recorded by the caller, which holds
+  // the execution id.
+  if (payload.accepted.length === 0) recordTelemetryExtras({ ciRunOutcome: 'empty' });
+  const summary = summarizeAcceptedPayload(JSON.stringify(payload), {
+    foldSkippedBuckets: true,
+    notFoundNote: 'test not found (not dispatched)',
+  });
+  if (executionReport) summary.executionReport = executionReport.report;
+  const io = {
+    env: deps.env ?? process.env,
+    stdout: deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`)),
+    stderr: deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`)),
+  };
+  makeOutput(opts.output, deps).print(
+    { ...payload, summary },
+    () =>
+      `CI run: ${summary.passed}/${summary.total} passed, ${summary.failed} failed, ` +
+      `${summary.skipped} skipped, ${summary.timedOut} timed out`,
+  );
+  emitCiArtifacts(summary, opts, io, 'ci run', {
+    markdown: executionReport
+      ? reconcileExecutionReportMarkdown(summary, executionReport)
+      : undefined,
+  });
+  emitCiStepOutputs(summary, io);
+  if (executionReport) emitExecutionReportOutputs(executionReport, io);
+  let reportError: unknown;
+  try {
+    // Same rows as `test run --all`: every non-dispatched member is a skipped
+    // testcase, so the report never claims a partial batch ran in full.
+    await writeBatchJUnitReportIfRequested(
+      opts,
+      [...junitResults, ...skippedJUnitResultsFromSummary(summary, payload.accepted)],
+      nameByTestId,
+    );
+  } catch (err) {
+    reportError = err;
+    io.stderr(
+      `[ci run] could not write the JUnit report: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (executionError) throw executionError;
+  const failure = resolveCiRunFailure(
+    summary,
+    payload.accepted,
+    { ...opts, failOnSkipped: opts.ci?.failOnSkipped },
+    payload.conflicts,
+  );
+  if (failure) throw failure;
+  if (reportError) throw reportError;
+}
+
 /** Human explanation for a zero-dispatch batch, from what the engine skipped. */
 function zeroDispatchReason(
   skippedFrontend: readonly string[],
@@ -9604,8 +9933,39 @@ async function finishZeroDispatchBatch(params: {
   deps: TestDeps;
   stderrFn: (line: string) => void;
   label?: string;
+  /**
+   * True only when the project genuinely has nothing — no test was
+   * skipped and no filter narrowed the set. The message then also says where
+   * a first suite comes from. Never inferred from the humanized `reason`.
+   */
+  emptyProject?: boolean;
+  /**
+   * The RESOLVED project id (`--project` or `TESTSPRITE_PROJECT_ID`).
+   * `opts.projectId` is only the flag, so reading it here dropped the hint for
+   * a caller relying on the environment variable.
+   */
+  projectId?: string;
+  /** Set by `test run --all --local`, the one batch path that knows the app is local. */
+  local?: LocalHint;
 }): Promise<void> {
-  const { reason, skipped, allowEmpty, opts, deps, stderrFn, label = 'run' } = params;
+  const {
+    reason,
+    skipped,
+    allowEmpty,
+    opts,
+    deps,
+    stderrFn,
+    label = 'run',
+    emptyProject = false,
+    projectId,
+    local,
+  } = params;
+  // Text mode only: under --output json neither the error envelope's message
+  // nor stderr carries the sentence (review feedback).
+  const nextStep =
+    emptyProject && projectId !== undefined && opts.output !== 'json'
+      ? emptyProjectNextStep(projectId, local)
+      : undefined;
   const runs: CiRunRow[] =
     skipped.length > 0
       ? skipped.map(testId => ({ testId, status: 'skipped', error: reason }))
@@ -9652,11 +10012,15 @@ async function finishZeroDispatchBatch(params: {
   }
   if (allowEmpty) {
     stderrFn(`[${label}] 0 tests dispatched (${reason}); --allow-empty set — exiting 0.`);
+    if (nextStep !== undefined) stderrFn(`[hint] ${nextStep}`);
     return;
   }
+  // The pointer rides inside the message so it prints AFTER "Error:", in
+  // reading order — a CLIError has no nextAction slot of its own.
   throw new CLIError(
     `No tests were dispatched — ${reason}. A CI gate that passes on zero tests is unsafe; ` +
-      `pass --allow-empty to exit 0 intentionally.`,
+      `pass --allow-empty to exit 0 intentionally.` +
+      (nextStep !== undefined ? ` ${nextStep}` : ''),
     5,
   );
 }
@@ -9676,6 +10040,8 @@ export async function runTestRunAll(
   const environment = normalizeEnvironmentName(opts.environment);
   const projectId = resolveProjectId(opts.projectId, deps);
   requireProjectId(projectId);
+  // Carry the resolved id into reports, including when it came from the env.
+  opts = { ...opts, projectId };
   if (
     !Number.isInteger(opts.maxConcurrency) ||
     opts.maxConcurrency < 1 ||
@@ -9748,13 +10114,13 @@ export async function runTestRunAll(
       idempotencyKey,
       ...(opts.wait ? { thenPoll: '/api/cli/v1/runs/<run-id>?waitSeconds=25' } : {}),
     };
-    if (opts.report === 'junit' && opts.reportFile !== undefined) {
+    if (!opts.ci && opts.report === 'junit' && opts.reportFile !== undefined) {
       await writeJUnitReportFile(
         opts.reportFile,
         sampleJUnitReportXml(opts.projectId, opts.reportSuiteName),
       );
     }
-    out.print(opts.targetUrl !== undefined ? envelope : (batchRunSample ?? envelope));
+    out.print(opts.ci || opts.targetUrl !== undefined ? envelope : (batchRunSample ?? envelope));
     return undefined;
   }
 
@@ -9852,15 +10218,61 @@ export async function runTestRunAll(
     ...(opts.autoHeal === false ? { autoHeal: false as const } : {}),
     ...(environment !== undefined ? { environment } : {}),
     ...(opts.targetUrl !== undefined ? { targetUrl: opts.targetUrl } : {}),
+    ...(opts.admission !== undefined ? { admission: opts.admission } : {}),
+    ...(opts.previewName !== undefined ? { previewName: opts.previewName } : {}),
+    ...(opts.githubTrigger !== undefined ? { githubTrigger: opts.githubTrigger } : {}),
   };
+
+  /**
+   * The fields a dispatch leg must see echoed back. An older backend strips
+   * what it does not know and runs anyway — against the wrong target, with a
+   * cut batch, or as a plain override where a preview environment was asked
+   * for — so each is confirmed exactly, on every leg.
+   */
+  function unhonoredDispatchFields(
+    response: BatchRunFreshResponse,
+  ): Array<{ field: string; reason: string; message: string; nextAction: string }> {
+    const out: Array<{ field: string; reason: string; message: string; nextAction: string }> = [];
+    if (opts.targetUrl !== undefined && response.targetUrl !== opts.targetUrl) {
+      out.push({
+        field: 'targetUrl',
+        reason: 'target-url-not-honored',
+        message:
+          'This backend did not confirm --target-url on the batch run; the accepted runs may have used another URL.',
+        nextAction:
+          'Use a backend that supports batch target URL overrides, or retry without --target-url.',
+      });
+    }
+    if (opts.admission !== undefined && response.admission !== opts.admission) {
+      out.push({
+        field: 'admission',
+        reason: 'admission-not-honored',
+        message:
+          'This backend did not confirm the single-execution admission mode; the batch may have been cut to the per-key budget.',
+        nextAction: 'Use a backend that supports ci run (v0.20.0 or later).',
+      });
+    }
+    if (opts.previewName !== undefined && response.previewName !== opts.previewName) {
+      out.push({
+        field: 'previewName',
+        reason: 'preview-not-honored',
+        message:
+          'This backend did not confirm the CI preview environment; the accepted runs may have run as a plain target override instead of in github-pr-<N>.',
+        nextAction: 'Use a backend that supports ci run (v0.20.0 or later).',
+      });
+    }
+    return out;
+  }
 
   async function assertBatchTargetEcho(
     response: BatchRunFreshResponse,
     previouslyAccepted: readonly BatchRunFreshAccepted[],
   ): Promise<void> {
-    if (opts.targetUrl === undefined || response.targetUrl === opts.targetUrl) return;
-    const message =
-      'This backend did not confirm --target-url on the batch run; the accepted runs may have used another URL.';
+    const unhonored = unhonoredDispatchFields(response);
+    if (unhonored.length === 0) return;
+    const { field, reason, message, nextAction } = unhonored[0]!;
+    // Every unhonored echo means a backend that predates the CI contract.
+    if (opts.ci) recordTelemetryExtras({ ciRunOutcome: 'refused_admission' });
     // Only this response's runs are unconfirmed. Runs an earlier leg confirmed
     // keep running against the right URL; they are reported as not awaited,
     // never cancelled.
@@ -9878,7 +10290,7 @@ export async function runTestRunAll(
 
     if (opts.wait) {
       const notAwaited =
-        'Not awaited: the batch stopped because a later dispatch did not confirm --target-url. ' +
+        `Not awaited: the batch stopped because a later dispatch did not confirm ${field}. ` +
         'This run was confirmed and is still running; read it with testsprite test wait <run-id>.';
       const summary = summarizeAcceptedPayload(
         JSON.stringify({
@@ -9899,16 +10311,14 @@ export async function runTestRunAll(
         summary.failed = 1;
         summary.runs.push({ testId: '(batch)', status: 'error', error: message });
       }
-      emitCiArtifacts(
-        summary,
-        opts,
-        {
-          env: deps.env ?? process.env,
-          stdout: deps.stdout ?? (line => process.stdout.write(`${line}\n`)),
-          stderr: stderrFn,
-        },
-        'run',
-      );
+      const io = {
+        env: deps.env ?? process.env,
+        stdout: deps.stdout ?? (line => process.stdout.write(`${line}\n`)),
+        stderr: stderrFn,
+      };
+      emitCiArtifacts(summary, opts, io, 'run');
+      // `ci run` promises its step outputs before the exit code, refusal included.
+      if (opts.ci) emitCiStepOutputs(summary, io);
       try {
         await writeBatchJUnitReportIfRequested(
           opts,
@@ -9931,10 +10341,9 @@ export async function runTestRunAll(
       error: {
         code: 'UNSUPPORTED',
         message,
-        nextAction:
-          'Use a backend that supports batch target URL overrides, or retry without --target-url.',
+        nextAction,
         requestId: 'local',
-        details: { field: 'targetUrl', reason: 'target-url-not-honored' },
+        details: { field, reason },
       },
     });
   }
@@ -9964,13 +10373,18 @@ export async function runTestRunAll(
       stderrFn(
         `No tests found in project ${projectId} matching --filter "${opts.nameFilter}" — nothing to run.`,
       );
-      out.print({
+      const emptyResponse: BatchRunFreshResponse = {
         accepted: [],
         conflicts: [],
         deferred: [],
         skippedFrontend: [],
         skippedIntegration: [],
-      } satisfies BatchRunFreshResponse);
+      };
+      if (opts.ci) {
+        await finishCiBatch({ ...emptyResponse, accepted: [] }, opts, deps);
+        return undefined;
+      }
+      out.print(emptyResponse);
       // Zero-dispatch (a --filter that matched nothing): emit the CI artifacts
       // and fail unless --allow-empty, so a renamed test can't turn a filtered
       // gate permanently green. Returns here only under --allow-empty.
@@ -9991,19 +10405,44 @@ export async function runTestRunAll(
   // When no --filter, omit testIds → server runs ALL tests in the project
   // (BE tests on the legacy V2 wave engine; FE + BE on the V3 unified engine).
 
-  const batchResp = await client.triggerBatchRunFresh(
-    {
-      projectId,
-      ...(testIds !== undefined ? { testIds } : {}),
-      ...dispatchFields,
-    },
-    { idempotencyKey },
-  );
+  let batchResp: BatchRunFreshResponse;
+  try {
+    batchResp = await client.triggerBatchRunFresh(
+      {
+        projectId,
+        ...(testIds !== undefined ? { testIds } : {}),
+        ...dispatchFields,
+      },
+      { idempotencyKey },
+    );
+  } catch (err) {
+    // A whole-batch refusal under `ci run` is a funnel outcome — every API
+    // refusal gets one (validation by the server's `details.reason`, 402/403
+    // as billing, the rest as other).
+    if (opts.ci && err instanceof ApiError) {
+      recordTelemetryExtras({ ciRunOutcome: ciRefusalOutcome(err) });
+    }
+    throw err;
+  }
   // Shared across every dispatch this invocation makes — see the `reported` param.
   const optOutReported = new Set<string>();
   warnIfOptOutIgnored(opts.autoHeal, batchResp.autoHeal, stderrFn, 'these runs', optOutReported);
 
   await assertBatchTargetEcho(batchResp, []);
+  if (opts.ci && batchResp.accepted.length > 0) {
+    // Recorded as soon as the dispatch is confirmed, not after the wait: a job
+    // cancelled mid-wait (a re-push under shape B's concurrency group, a manual
+    // cancel, the runner's timeout) exits through InterruptError, and the
+    // `abort` event must still say the gate dispatched and which execution
+    // keeps running. `reportReady` is added once the report wait finishes.
+    const dispatchedExecutionIds = new Set(batchResp.accepted.map(a => a.executionId));
+    const dispatchedExecutionId =
+      dispatchedExecutionIds.size === 1 ? [...dispatchedExecutionIds][0] : undefined;
+    recordTelemetryExtras({
+      ciRunOutcome: 'gated',
+      ...(typeof dispatchedExecutionId === 'string' ? { executionId: dispatchedExecutionId } : {}),
+    });
+  }
 
   // Project-level "watch it here" link. A V3 backend sends it (string, or
   // `null` when no single page exists — e.g. a `--all` that fanned out over
@@ -10021,7 +10460,9 @@ export async function runTestRunAll(
   let accepted = batchResp.accepted.slice();
   let deferred = batchResp.deferred.slice();
   let conflicts = batchResp.conflicts.slice();
-  const { skippedFrontend, skippedIntegration } = batchResp;
+  const skippedFrontend = batchResp.skippedFrontend.slice();
+  const skippedIntegration = batchResp.skippedIntegration.slice();
+  let retryError: unknown;
 
   // Print advisory for skipped FE tests.
   if (skippedFrontend.length > 0) {
@@ -10046,6 +10487,9 @@ export async function runTestRunAll(
     stderrFn(`Rate-deferred testIds (retry later): ${deferred.map(d => d.testId).join(' ')}`);
   }
 
+  const integrationLine = formatIntegrationSummary(batchResp.integration);
+  if (integrationLine !== undefined) stderrFn(integrationLine);
+
   stderrFn(
     `Dispatched ${accepted.length} test${accepted.length !== 1 ? 's' : ''}` +
       `${skippedFrontend.length > 0 ? ` (${skippedFrontend.length} FE skipped)` : ''}` +
@@ -10069,6 +10513,7 @@ export async function runTestRunAll(
       deferred,
       skippedFrontend,
       skippedIntegration,
+      ...(batchResp.integration !== undefined ? { integration: batchResp.integration } : {}),
     };
     out.print(printResp, data => {
       const r = data as BatchRunFreshResponse;
@@ -10148,6 +10593,11 @@ export async function runTestRunAll(
         opts,
         deps,
         stderrFn,
+        emptyProject:
+          skippedFrontend.length === 0 &&
+          skippedIntegration.length === 0 &&
+          opts.nameFilter === undefined,
+        projectId,
       });
     }
     // [P2] Return post-retry state so programmatic callers and the create-chain
@@ -10241,6 +10691,7 @@ export async function runTestRunAll(
         (err.code === 'UNSUPPORTED' || err.code === 'PRECONDITION_FAILED')
       )
         throw err;
+      if (opts.ci) retryError = err;
       // If the retry itself errors, surface it and stop retrying.
       stderrFn(
         `[deferred-retry] attempt ${attempt} failed with error: ${err instanceof Error ? err.message : String(err)}`,
@@ -10264,6 +10715,8 @@ export async function runTestRunAll(
     const newlyAccepted = retryResp.accepted;
     const newlyDeferred = retryResp.deferred;
     const newlyConflicted = retryResp.conflicts;
+    skippedFrontend.push(...retryResp.skippedFrontend);
+    skippedIntegration.push(...retryResp.skippedIntegration);
 
     if (newlyAccepted.length > 0) {
       stderrFn(
@@ -10288,7 +10741,7 @@ export async function runTestRunAll(
     }
     deferred = newlyDeferred;
     if (deferred.length === 0) {
-      stderrFn(`[deferred-retry] attempt ${attempt}: all previously-deferred tests accepted.`);
+      stderrFn(`[deferred-retry] attempt ${attempt}: no tests remain rate-deferred.`);
     }
   }
 
@@ -10297,8 +10750,10 @@ export async function runTestRunAll(
   // (auto-resume) — the "concurrent job already started this test" case should
   // wait for that run's result, not fail the batch. Conflicts without a
   // resolvable in-flight run stay hard (nothing to wait on).
-  const resumableConflicts = conflicts.filter(c => c.currentRunId);
-  const hardConflicts = conflicts.filter(c => !c.currentRunId);
+  // An in-flight run may belong to another deployment/environment. CI can
+  // only use runs accepted by this invocation to judge its own change.
+  const resumableConflicts = opts.ci ? [] : conflicts.filter(c => c.currentRunId);
+  const hardConflicts = opts.ci ? conflicts : conflicts.filter(c => !c.currentRunId);
   // Only hard conflicts remain "conflicts" for the final accounting/exit; the
   // resumable ones become polled results below.
   conflicts = hardConflicts;
@@ -10316,27 +10771,98 @@ export async function runTestRunAll(
   // many-in-flight-conflicts scenario finding 1 is about, so a serial N round-trip
   // fetch (with no deadline bound) would eat the budget finding 1's fix protects.
   const resolveSignal = AbortSignal.timeout(Math.max(1, batchDeadlineMs - Date.now()));
-  const resumableEntries: BatchRunFreshAccepted[] = await Promise.all(
-    resumableConflicts.map(async c => {
-      const inFlightRunId = c.currentRunId as string;
-      // Conservative default if the run can't be read: floor at NOW (never the
-      // epoch) so the fallback still can't accept an older run's result.
-      let notBefore = new Date().toISOString();
-      let startedBy: string | undefined;
-      try {
-        const inFlight = await client.getRun(inFlightRunId, { signal: resolveSignal });
-        if (inFlight.createdAt) notBefore = inFlight.createdAt;
-        startedBy = inFlight.source || inFlight.createdFrom || undefined;
-      } catch (err) {
-        if (err instanceof InterruptError) throw err;
-        // keep the conservative now() floor (fetch failed or the signal aborted)
-      }
-      stderrFn(
-        `[auto-resume] ${c.testId} — polling in-flight run ${inFlightRunId}${startedBy ? ` (started by ${startedBy})` : ''} to a verdict instead of failing`,
+  // One environment listing per project for the whole batch (the gate below
+  // compares environment ids, not names, so it needs the project's list).
+  const envListings = new Map<string, Promise<CliProjectEnvListResponse>>();
+  const listEnvironments = (projectId: string): Promise<CliProjectEnvListResponse> => {
+    let listing = envListings.get(projectId);
+    if (!listing) {
+      listing = client.get<CliProjectEnvListResponse>(
+        `/projects/${encodeURIComponent(projectId)}/env`,
+        { signal: resolveSignal },
       );
-      return { testId: c.testId, runId: inFlightRunId, enqueuedAt: notBefore };
-    }),
+      envListings.set(projectId, listing);
+    }
+    return listing;
+  };
+  const resumedOrRefused = await Promise.all(
+    resumableConflicts.map(
+      async (c): Promise<{ entry: BatchRunFreshAccepted } | { refused: RunConflict }> => {
+        const inFlightRunId = c.currentRunId as string;
+        // The same gate the single run applies before adopting a 409: an
+        // in-flight run on another environment (a PR gate's `github-pr-N`
+        // clone, say) or another target URL is somebody else's run, and its
+        // verdict must not be reported as this invocation's. Refused runs stay
+        // hard conflicts — polled by nobody here — instead of being attached.
+        const refused = (reason: string): { refused: RunConflict } => ({
+          refused: {
+            ...c,
+            reason: 'in_flight',
+            message: `not attached: ${reason}`,
+          },
+        });
+        // Conservative default if the run can't be read: floor at NOW (never the
+        // epoch) so the fallback still can't accept an older run's result.
+        let notBefore = new Date().toISOString();
+        let startedBy: string | undefined;
+        let inFlight: RunResponse | undefined;
+        try {
+          inFlight = await client.getRun(inFlightRunId, { signal: resolveSignal });
+          if (inFlight.createdAt) notBefore = inFlight.createdAt;
+          startedBy = inFlight.source || inFlight.createdFrom || undefined;
+        } catch (err) {
+          if (err instanceof InterruptError) throw err;
+          // keep the conservative now() floor (fetch failed or the signal aborted)
+        }
+        if (inFlight) {
+          try {
+            await verifyInFlightRunEnvironment(
+              inFlight,
+              opts.environment,
+              listEnvironments,
+              reason =>
+                new ApiError({
+                  code: 'CONFLICT',
+                  message: reason,
+                  nextAction: `testsprite test wait ${inFlightRunId}`,
+                  requestId: '',
+                  details: { reason: 'run_in_flight', currentRunId: inFlightRunId },
+                }),
+            );
+          } catch (err) {
+            if (err instanceof InterruptError) throw err;
+            if (err instanceof ApiError && err.code === 'CONFLICT') return refused(err.message);
+            throw err;
+          }
+          if (opts.targetUrl !== undefined && inFlight.targetUrl !== opts.targetUrl) {
+            return refused(
+              `it targets ${inFlight.targetUrl || 'an unreported URL'}, not ${opts.targetUrl}`,
+            );
+          }
+        } else if (opts.environment !== undefined || opts.targetUrl !== undefined) {
+          // An environment or target was asked for and the run could not be
+          // read: unverified, so not ours to attach to (fail closed, as the
+          // single run does).
+          return refused('its environment could not be verified');
+        }
+        stderrFn(
+          `[auto-resume] ${c.testId} — polling in-flight run ${inFlightRunId}${startedBy ? ` (started by ${startedBy})` : ''} to a verdict instead of failing`,
+        );
+        return { entry: { testId: c.testId, runId: inFlightRunId, enqueuedAt: notBefore } };
+      },
+    ),
   );
+  const resumableEntries: BatchRunFreshAccepted[] = [];
+  for (const outcome of resumedOrRefused) {
+    if ('entry' in outcome) {
+      resumableEntries.push(outcome.entry);
+    } else {
+      stderrFn(
+        `[auto-resume] ${outcome.refused.testId} — in-flight run ${outcome.refused.currentRunId} ${outcome.refused.message?.replace(/^not attached: /, '')}; not attaching (testsprite test wait ${outcome.refused.currentRunId} to follow it)`,
+      );
+      conflicts.push(outcome.refused);
+    }
+  }
 
   // --wait: fan-out poll each accepted run by its runId, PLUS each auto-resumed
   // in-flight run. Every accepted entry carries a real runId (the backend routes
@@ -10360,14 +10886,19 @@ export async function runTestRunAll(
       deferred,
       skippedFrontend,
       skippedIntegration,
+      ...(batchResp.integration !== undefined ? { integration: batchResp.integration } : {}),
     };
-    out.print(finalResp);
+    if (!opts.ci) out.print(finalResp);
     recordBatchOutcome({
       accepted: accepted.length,
       conflicts,
       deferred: deferred.length,
       skipped: skippedFrontend.length + skippedIntegration.length,
     });
+    if (opts.ci) {
+      await finishCiBatch({ ...finalResp, accepted: [] }, opts, deps, undefined, retryError);
+      return { ...batchResp, ...finalResp };
+    }
     // Nothing to poll: surface deferred (rate-limit → exit 7) or all-conflict (exit 6),
     // mirroring the non-wait path so `--wait` never silently exits 0 on a no-op batch.
     // Emit the deferred/conflict summary + annotations first so CI shows them (the
@@ -10425,6 +10956,11 @@ export async function runTestRunAll(
       opts,
       deps,
       stderrFn,
+      emptyProject:
+        skippedFrontend.length === 0 &&
+        skippedIntegration.length === 0 &&
+        opts.nameFilter === undefined,
+      projectId,
     });
     // [P2] Return post-retry state (reached only under --allow-empty).
     return { ...batchResp, accepted, deferred, conflicts };
@@ -10487,9 +11023,20 @@ export async function runTestRunAll(
           ...(typeof finalRun.executionUrl === 'string'
             ? { executionUrl: finalRun.executionUrl }
             : {}),
+          ...(opts.ci && finalRun.error
+            ? { error: { code: 'INTERNAL', message: finalRun.error, exitCode: 1 } }
+            : {}),
         };
       } catch (err) {
         if (err instanceof InterruptError) throw err;
+        if (opts.ci && err instanceof ApiError) {
+          return {
+            testId: entry.testId,
+            runId,
+            status: 'error',
+            error: { code: err.code, message: err.message, exitCode: err.exitCode },
+          };
+        }
         if (err instanceof TimeoutError) deps.onWaitTimeout?.({ reason: 'wait_timeout' });
         // fall through to the timeout result below
       }
@@ -10537,6 +11084,9 @@ export async function runTestRunAll(
           : {}),
         ...(typeof finalRun.executionUrl === 'string'
           ? { executionUrl: finalRun.executionUrl }
+          : {}),
+        ...(opts.ci && finalRun.error
+          ? { error: { code: 'INTERNAL', message: finalRun.error, exitCode: 1 } }
           : {}),
         startedAt: finalRun.startedAt,
         finishedAt: finalRun.finishedAt,
@@ -10658,6 +11208,7 @@ export async function runTestRunAll(
     deferred,
     skippedFrontend,
     skippedIntegration,
+    ...(batchResp.integration !== undefined ? { integration: batchResp.integration } : {}),
     summary: {
       passed,
       failed,
@@ -10672,18 +11223,19 @@ export async function runTestRunAll(
       ? await buildTestNameMap(client, opts.projectId)
       : undefined;
   const ciSummary = summarizeAcceptedPayload(JSON.stringify(jsonPayload));
-  await writeBatchJUnitReportIfRequested(
-    opts,
-    [
-      ...freshRunResults.map(r => ({
-        ...r,
-        ...(r.runId ? reportTiming.get(r.runId) : {}),
-      })),
-      ...skippedJUnitResultsFromSummary(ciSummary, freshRunResults),
-    ],
-    freshNameMap,
-  );
-  out.print(jsonPayload);
+  // JUnit rows carry the poll timing the stdout envelope deliberately omits.
+  const timedResults = freshRunResults.map(r => ({
+    ...r,
+    ...(r.runId ? reportTiming.get(r.runId) : {}),
+  }));
+  if (!opts.ci) {
+    await writeBatchJUnitReportIfRequested(
+      opts,
+      [...timedResults, ...skippedJUnitResultsFromSummary(ciSummary, freshRunResults)],
+      freshNameMap,
+    );
+    out.print(jsonPayload);
+  }
   recordBatchOutcome({
     accepted: accepted.length,
     conflicts,
@@ -10691,6 +11243,50 @@ export async function runTestRunAll(
     skipped: skippedFrontend.length + skippedIntegration.length,
     results: freshRunResults,
   });
+  if (opts.ci) {
+    // The report is read before the envelope prints so it lands in `--output
+    // json`, `--summary-file` and the job summary alike.
+    const { ready: executionReport, interrupted } = await fetchExecutionReport(
+      client,
+      accepted,
+      freshRunResults,
+      opts,
+      deps,
+      stderrFn,
+    );
+    // Telemetry: the gate ran; name the execution (when the batch names exactly
+    // one) so the event joins to the server's report, and whether that report
+    // made it into the job summary.
+    const gatedExecutionIds = new Set(accepted.map(a => a.executionId));
+    const gatedExecutionId = gatedExecutionIds.size === 1 ? [...gatedExecutionIds][0] : undefined;
+    if (accepted.length > 0) {
+      recordTelemetryExtras({
+        ciRunOutcome: 'gated',
+        ...(typeof gatedExecutionId === 'string' ? { executionId: gatedExecutionId } : {}),
+        reportReady: executionReport !== undefined,
+      });
+    }
+    let gateError: unknown;
+    try {
+      await finishCiBatch(
+        jsonPayload,
+        opts,
+        deps,
+        freshNameMap,
+        retryError,
+        timedResults,
+        executionReport,
+      );
+    } catch (err) {
+      gateError = err;
+    }
+    // The summary and outputs are written either way; a signal that cut the
+    // report wait short still ends the process with its own exit code (130/143),
+    // never the gate's 0.
+    if (interrupted) throw interrupted;
+    if (gateError !== undefined) throw gateError;
+    return { ...batchResp, accepted, deferred, conflicts, skippedFrontend, skippedIntegration };
+  }
   // CI-native output layer (issue #99): emitted before the gate throws below so
   // the artifacts land even when the batch exits non-zero. The summary file is a
   // machine artifact written regardless of --output mode; stdout stays owned by
@@ -11165,6 +11761,18 @@ export async function runTestRunLocalBatch(
       opts,
       deps,
       stderrFn,
+      // A project with only backend tests is not empty: they were skipped, not absent.
+      emptyProject: opts.all && skipped.length === 0 && opts.nameFilter === undefined,
+      projectId,
+      local: {
+        // An automatic target was resolved from a saved environment; its port
+        // is that environment's, so the suggestion names the environment.
+        ...(opts.resolvedTarget?.automatic ? {} : { host: opts.localHost, port: opts.localPort }),
+        targetUrl: opts.targetUrl,
+        environment:
+          opts.environment ??
+          (opts.resolvedTarget?.automatic ? opts.resolvedTarget.environmentName : undefined),
+      },
     });
     return;
   }
@@ -13888,7 +14496,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .option('--type <type>', 'frontend|backend')
     .option('--name <name>', 'human-readable test name (becomes `title` in storage)')
     .option('--description <text>', 'optional human description (≤ 2000 chars)')
-    .option('--priority <prio>', 'optional priority — one of: p0, p1, p2, p3')
+    .option('--priority <prio>', 'optional priority: p0/high, p1/medium, p2/low (p3 = low)')
     .option(
       '--step-timeout <ms>',
       'per-test step timeout in milliseconds (1-60000); applied by the execution engine to every step of this test',
@@ -14027,8 +14635,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           type: parseEnumFlag(cmdOpts.type, 'type', TEST_TYPES) as 'frontend' | 'backend',
           name: cmdOpts.name,
           description: cmdOpts.description,
-          priority: parseEnumFlag(cmdOpts.priority, 'priority', CLI_CREATE_PRIORITIES) as
-            CliCreatePriority | undefined,
+          priority: parsePriorityFlag(cmdOpts.priority),
           stepTimeoutMs: parseStepTimeoutFlag(cmdOpts.stepTimeout, 'step-timeout'),
           codeFile: cmdOpts.codeFile,
           idempotencyKey: cmdOpts.idempotencyKey,
@@ -14289,7 +14896,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .description('Update test metadata — name, description, priority, step timeout')
     .option('--name <name>', 'new human-readable test name')
     .option('--description <text>', 'new human description (≤ 2000 chars)')
-    .option('--priority <prio>', 'new priority — one of: p0, p1, p2, p3')
+    .option('--priority <prio>', 'new priority: p0/high, p1/medium, p2/low (p3 = low)')
     .option(
       '--step-timeout <ms>',
       'per-test step timeout in milliseconds (1-60000); applied by the execution engine to every step of this test',
@@ -14333,8 +14940,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           testId,
           name: cmdOpts.name,
           description: cmdOpts.description,
-          priority: parseEnumFlag(cmdOpts.priority, 'priority', CLI_CREATE_PRIORITIES) as
-            CliCreatePriority | undefined,
+          priority: parsePriorityFlag(cmdOpts.priority),
           stepTimeoutMs: parseStepTimeoutFlag(cmdOpts.stepTimeout, 'step-timeout'),
           clearStepTimeout: cmdOpts.clearStepTimeout === true,
           produces: cmdOpts.produces,
@@ -15607,6 +16213,12 @@ function parseEnumFlag<T extends string>(
   return raw as T;
 }
 
+function parsePriorityFlag(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  assertPriorityInput('priority', raw, 'flag');
+  return raw;
+}
+
 function parseNumericFlag(raw: string | undefined, flagName: string): number | undefined {
   if (raw === undefined) return undefined;
   const n = Number(raw);
@@ -16070,6 +16682,10 @@ async function readPresignedBody(
   }
 }
 
+function renderTestTypeCell(test: CliTest): string {
+  return test.isIntegration === true ? `${test.type}/int` : test.type;
+}
+
 const TEST_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliTest>> = [
   {
     header: 'ID',
@@ -16081,7 +16697,11 @@ const TEST_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliTest>> = [
     width: rows => Math.max(4, ...rows.map(test => test.name.length)),
     render: test => test.name,
   },
-  { header: 'TYPE', width: 8, render: test => test.type },
+  {
+    header: 'TYPE',
+    width: rows => Math.max(8, ...rows.map(test => renderTestTypeCell(test).length)),
+    render: renderTestTypeCell,
+  },
   { header: 'FROM', width: 6, render: test => test.createdFrom },
   { header: 'STATUS', width: 9, render: test => test.status },
   {
@@ -16096,7 +16716,7 @@ const TEST_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliTest>> = [
   },
 ];
 
-function renderTestListText(
+export function renderTestListText(
   page: Page<CliTest>,
   options: { columns?: string; noHeader?: boolean; environment?: string } = {},
 ): string {
@@ -16161,8 +16781,18 @@ function renderTestText(t: CliTest): string {
       const type = typeof fields.type === 'string' ? fields.type : 'step';
       const description =
         typeof fields.description === 'string' ? fields.description : '(no description)';
-      lines.push(`  ${index + 1}. [${type}] ${description}`);
+      const mark = fields.structured === true ? '*' : ' ';
+      lines.push(`${mark} ${index + 1}. [${type}] ${description}`);
     });
+    const structuredCount = planSteps.filter(
+      step =>
+        typeof step === 'object' && step !== null && (step as CliPlanStep).structured === true,
+    ).length;
+    if (structuredCount > 0) {
+      lines.push(
+        `* ${structuredCount} step(s) carry structured fields; \`plan put\` keeps them only for unchanged steps.`,
+      );
+    }
   }
   if (typeof t.stepTimeoutMs === 'number') {
     lines.push(`stepTimeout: ${t.stepTimeoutMs} ms (applies to every step)`);
@@ -17695,7 +18325,11 @@ function createTestPlanCommand(deps: TestDeps): Command {
     )
     .option(
       '--expected-step-count <n>',
-      'optional defensive concurrency check; server rejects with 412 when the current length differs',
+      'pin the step count the server must still have; 412 when it differs',
+    )
+    .option(
+      '--force',
+      'replace even if steps edited in the Portal would lose their structured fields',
     )
     .option(
       '--idempotency-key <token>',
@@ -17727,6 +18361,7 @@ function createTestPlanCommand(deps: TestDeps): Command {
           testId,
           stepsFile: cmdOpts.steps,
           expectedStepCount: parseNumericFlag(cmdOpts.expectedStepCount, 'expected-step-count'),
+          force: cmdOpts.force === true ? true : undefined,
           idempotencyKey: cmdOpts.idempotencyKey,
           dryRunSimulateError:
             simulateError === 'PRECONDITION_FAILED' ? 'PRECONDITION_FAILED' : undefined,
@@ -17838,6 +18473,7 @@ interface PlanAcceptFlagOpts {
 interface PlanPutFlagOpts {
   steps: string;
   expectedStepCount?: string;
+  force?: boolean;
   idempotencyKey?: string;
   dryRunSimulateError?: string;
 }

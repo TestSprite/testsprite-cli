@@ -186,6 +186,18 @@ describe('findSample', () => {
     expect(failure?.operationId).toBe('getTestFailure');
   });
 
+  it('resolves /tests/executions/{id}/report without the /tests/{testId} family catching it', () => {
+    const report = findSample(
+      'GET',
+      'https://api.testsprite.com/api/cli/v1/tests/executions/exec_1/report',
+    );
+    expect(report?.operationId).toBe('getExecutionReport');
+    // Four segments never match the two-segment `getTest` pattern either way.
+    expect(
+      findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests/executions')?.operationId,
+    ).toBe('getTest');
+  });
+
   it('resolves /tests/{id}/failure/summary distinct from /failure (M2.1 piece 3)', () => {
     // The summary endpoint must match BEFORE the bundle endpoint so a
     // dry-run user practising `failure summary` doesn't get the bundle
@@ -586,6 +598,17 @@ describe('findSample', () => {
             expiresAt: expect.any(String),
           });
           break;
+        case 'getExecutionReport':
+          expect(body).toMatchObject({
+            ready: true,
+            markdown: expect.any(String),
+            report: expect.objectContaining({
+              executionId: expect.any(String),
+              stats: expect.objectContaining({ total: expect.any(Number) }),
+              tests: expect.any(Array),
+            }),
+          });
+          break;
         default:
           throw new Error(`Unexpected operationId in samples: ${e.operationId}`);
       }
@@ -735,8 +758,8 @@ describe('findSample', () => {
     expect(e?.operationId).toBe('getTest');
     const body = e?.body() as Record<string, unknown>;
     expect('priority' in body).toBe(true);
-    // First test in the sample has priority 'p1'.
-    expect(body.priority).toBe('p1');
+    // First test in the sample has priority 'Medium' (reads return High/Medium/Low).
+    expect(body.priority).toBe('Medium');
   });
 
   it('listTests sample items carry priority field (G1a)', () => {

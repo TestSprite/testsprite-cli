@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, CLIError, InterruptError, RequestTimeoutError } from './errors.js';
 import { VERSION } from '../version.js';
 import {
+  ciRefusalOutcome,
   batchOutcomeCounts,
   buildCiContext,
   buildTelemetryEvent,
@@ -810,6 +811,50 @@ describe('sanitizeTelemetryExtras', () => {
     expect(sanitizeTelemetryExtras({ platform: 'gitlab' })).toEqual({});
     expect(sanitizeTelemetryExtras({ projectResolved: 'guess' })).toEqual({});
     expect(sanitizeTelemetryExtras({ force: 'true' })).toEqual({});
+  });
+
+  it('ci run facts: the outcome enum, a UUID execution id and the report flag — nothing looser', () => {
+    const executionId = '7ceab81a-a20a-4141-aa89-f6886bdbb11c';
+    expect(
+      sanitizeTelemetryExtras({ ciRunOutcome: 'gated', executionId, reportReady: true }),
+    ).toEqual({ ciRunOutcome: 'gated', executionId, reportReady: true });
+    for (const outcome of [
+      'skipped_draft',
+      'skipped_no_pr',
+      'refused_admission',
+      'refused_env',
+      'refused_preview_name',
+      'refused_loopback',
+      'refused_billing',
+      'refused_other',
+      'empty',
+    ]) {
+      expect(sanitizeTelemetryExtras({ ciRunOutcome: outcome })).toEqual({ ciRunOutcome: outcome });
+    }
+    expect(sanitizeTelemetryExtras({ ciRunOutcome: 'passed' })).toEqual({});
+    // An execution id is the server's UUID or nothing: never a URL, a slug or a test id.
+    expect(sanitizeTelemetryExtras({ executionId: 'exec-1' })).toEqual({});
+    expect(sanitizeTelemetryExtras({ executionId: executionId.toUpperCase() })).toEqual({});
+    expect(
+      sanitizeTelemetryExtras({
+        executionId: `https://portal.example.com/execution/${executionId}`,
+      }),
+    ).toEqual({});
+    expect(sanitizeTelemetryExtras({ reportReady: 'yes' })).toEqual({});
+  });
+
+  it('ciRefusalOutcome: every API refusal gets a value', () => {
+    expect(
+      ciRefusalOutcome({ code: 'VALIDATION_ERROR', details: { reason: 'preview-name-taken' } }),
+    ).toBe('refused_preview_name');
+    expect(
+      ciRefusalOutcome({ code: 'VALIDATION_ERROR', details: { reason: 'private-or-local' } }),
+    ).toBe('refused_loopback');
+    expect(ciRefusalOutcome({ code: 'VALIDATION_ERROR', details: {} })).toBe('refused_other');
+    expect(ciRefusalOutcome({ code: 'INSUFFICIENT_CREDITS' })).toBe('refused_billing');
+    expect(ciRefusalOutcome({ code: 'FEATURE_GATED' })).toBe('refused_billing');
+    expect(ciRefusalOutcome({ code: 'RATE_LIMITED' })).toBe('refused_other');
+    expect(ciRefusalOutcome({ code: 'AUTH_ERROR' })).toBe('refused_other');
   });
 });
 

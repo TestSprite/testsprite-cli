@@ -170,8 +170,8 @@ language; you don't write browser code.
   agent what to verify; "date range" tells it nothing.
 - `description` — the condition + expected outcome in one sentence; disambiguates
   a short name.
-- `priority` — `p0` (must-pass) / `p1` (important paths) / `p2` (edge) / `p3`
-  (cosmetic). Pick honestly.
+- `priority` — `p0`/`high` (must-pass), `p1`/`medium` (important paths),
+  `p2`/`low` (edge); `p3` is treated as low. Pick honestly.
 - `planSteps` — `Array<{ type: 'action' | 'assertion', description: string }>`,
   max 200 steps / 256 KB. Describe user intent, not selectors.
 

@@ -7,7 +7,7 @@ import {
   parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
-import { CLIError, localValidationError } from '../lib/errors.js';
+import { ApiError, CLIError, localValidationError } from '../lib/errors.js';
 import { loadConfig, resolveProfileName } from '../lib/config.js';
 import { type FetchImpl, type HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
@@ -22,9 +22,14 @@ import {
   type LinkageStatus,
   type LinkageVerdict,
 } from '../lib/ci-linkage.js';
-import { recordTelemetryExtras } from '../lib/telemetry.js';
-import { VERSION } from '../version.js';
+import { ciRefusalOutcome, recordTelemetryExtras } from '../lib/telemetry.js';
 import type { CliProject } from './project.js';
+import { runTestRunAll, type RunTestRunAllOptions, type TestDeps } from './test.js';
+import { emitCiStepOutputs, type CiSummary } from '../lib/gh-output.js';
+import { previewEnvironmentName, readGithubRunContext } from '../lib/github-context.js';
+import type { CiGithubTrigger } from '../lib/runs.types.js';
+import { parseJUnitReportFormat } from '../lib/junit-report.js';
+import type { CliProjectEnvListResponse } from './project-env.js';
 
 // ── constants ────────────────────────────────────────────────────────────────
 
@@ -35,14 +40,24 @@ type Platform = (typeof SUPPORTED_PLATFORMS)[number];
 /** Default location a GitHub Actions workflow must live to be picked up. */
 const DEFAULT_WORKFLOW_PATH = '.github/workflows/testsprite.yml';
 
+/** Where GitHub Actions picks workflows up from; `--path` must stay inside it. */
+const WORKFLOWS_DIR = '.github/workflows';
+
 /** Default terminal-verdict wait, matching the CLI's own `test run` default. */
 const DEFAULT_TIMEOUT_SECONDS = 600;
 
 /** The repo secret the generated workflow reads the API key from. */
 const API_KEY_SECRET_NAME = 'TESTSPRITE_API_KEY';
 
-/** The published composite action the workflow delegates to, pinned to a tag. */
-const ACTION_REF = 'TestSprite/testsprite-action@v1';
+/**
+ * The CLI the generated workflow installs. Always `latest`: what a run means is
+ * decided by the backend, which is not versioned with the CLI, so a pinned
+ * client only freezes old semantics and is never bumped in practice.
+ */
+const CLI_PACKAGE_SPEC = '@testsprite/testsprite-cli@latest';
+
+/** The machine summary `ci run` writes, and the artifact the workflow uploads. */
+const SUMMARY_FILE = 'testsprite-summary.json';
 
 /** The CLI's built-in production endpoint (mirrors `config.ts`). Used to decide
  * whether the generated workflow needs an explicit `endpoint-url`. */
@@ -59,6 +74,8 @@ export interface CiFs {
   writeFile(target: string, data: string, opts?: { exclusive?: boolean }): Promise<void>;
   mkdir(dir: string): Promise<void>;
   readFile(target: string): Promise<string>;
+  /** Entry names in `dir`; rejects with ENOENT when the directory is absent. */
+  readdir(dir: string): Promise<string[]>;
 }
 
 const defaultCiFs: CiFs = {
@@ -72,13 +89,15 @@ const defaultCiFs: CiFs = {
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- parent dir of the scaffold output path (above).
     await nodeFs.mkdir(dir, { recursive: true });
   },
-  // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads back the scaffold output path for the --force backup, same path as writeFile.
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads back the scaffold output path (identical-content check) or a sibling workflow in the same dir.
   readFile: target => nodeFs.readFile(target, 'utf8'),
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- lists the workflows dir that holds the scaffold output path.
+  readdir: dir => nodeFs.readdir(dir),
 };
 
 /** Injectable subprocess runner (defaults to a real `spawnSync`), so tests never
- * shell out. Runs `git` (default-branch detection), `gh` (optional secret set,
- * deployment history) and `npx vercel` (`ci connect`). */
+ * shell out. Runs `git` (repo slug), `gh` (optional secret set, deployment
+ * history) and `npx vercel` (`ci connect`). */
 export type SpawnImpl = (
   cmd: string,
   args: string[],
@@ -94,7 +113,7 @@ const defaultSpawn: SpawnImpl = (cmd, args, opts) =>
     windowsHide: true,
   });
 
-export interface CiDeps {
+export interface CiDeps extends Pick<TestDeps, 'shutdown' | 'onWaitTimeout'> {
   env?: NodeJS.ProcessEnv;
   credentialsPath?: string;
   fetchImpl?: FetchImpl;
@@ -114,8 +133,10 @@ type CommonOptions = FactoryCommonOptions;
 export interface CiInitOptions extends CommonOptions {
   platform: string;
   project?: string;
-  filter?: string;
-  timeoutSeconds: number;
+  /** `--env`: the environment whose sign-in each PR run uses (default: the project's default). */
+  env?: string;
+  /** `--timeout`, written into the `ci run` line only when given. */
+  timeoutSeconds?: number;
   workflowPath: string;
   force: boolean;
   setSecret: boolean;
@@ -126,18 +147,22 @@ export interface CiInitOptions extends CommonOptions {
 export interface CiInitSummary {
   platform: Platform;
   path: string;
-  action: string;
   projectId: string;
+  /** The environment written into `ci run --env`. */
+  environment: string;
   wrote: boolean;
   /** Distinguishes the two `wrote: false` cases a scripted caller can't otherwise
    * tell apart: `preview` (a --dry-run) vs `unchanged` (the file was already
    * byte-identical). `written` is the wrote-true case. */
   status: 'written' | 'unchanged' | 'preview';
-  backupPath: string | null;
-  filter: string | null;
   endpointUrl: string | null;
   endpointWarning: string | null;
-  timeoutSeconds: number;
+  /** `--timeout` as written into the workflow; null when `ci run`'s default applies. */
+  timeoutSeconds: number | null;
+  /** Other workflows in `.github/workflows/` that already mention TestSprite. */
+  otherTestspriteWorkflows: string[];
+  /** `--force` over an edited file: where the previous file was kept. */
+  backupPath?: string;
   secret: {
     name: string;
     attempted: boolean;
@@ -179,18 +204,30 @@ export function parseTimeoutSeconds(raw: unknown): number {
   return n;
 }
 
+const DEFAULT_EXECUTION_REPORT_TIMEOUT_SECONDS = 60;
+
+/** `--execution-report-timeout <s>`: same bounds as `--timeout`, its own default. */
+export function parseExecutionReportTimeoutSeconds(raw: unknown): number {
+  if (raw === undefined) return DEFAULT_EXECUTION_REPORT_TIMEOUT_SECONDS;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 3600) {
+    throw localValidationError(
+      'execution-report-timeout',
+      'must be an integer between 1 and 3600 seconds',
+    );
+  }
+  return n;
+}
+
 /**
  * Reject a value that will be interpolated into a double-quoted YAML scalar in
  * the generated workflow. `"` breaks the scalar, a newline breaks the mapping,
  * and `` ` ``/`$` (which also covers `${{ … }}`, evaluated by Actions before the
- * job runs) or `\` could change what the workflow does. A filter is a substring
- * of a test name and a project id/URL never needs any of these, so refusing is
+ * job runs) or `\` could change what the workflow does. A project id, an
+ * environment name and an endpoint URL never need any of these, so refusing is
  * safe and keeps the scaffold from ever emitting a workflow GitHub can't parse.
  */
-function assertSafeWorkflowValue(
-  field: 'filter' | 'project' | 'endpoint-url',
-  value: string,
-): void {
+function assertSafeWorkflowValue(field: 'project' | 'env' | 'endpoint-url', value: string): void {
   if (/[\r\n"`$\\]/.test(value)) {
     throw localValidationError(
       field,
@@ -221,76 +258,137 @@ function resolveEndpointUrl(opts: CiInitOptions, deps: CiDeps): string | undefin
 }
 
 /**
- * The repo's default branch, so the `push` trigger fires there and not on every
- * feature-branch push (each run costs credits). Best-effort via `git`; falls
- * back to `main` on any failure (not a git repo yet, no `origin`, git absent).
- */
-function detectDefaultBranch(cwd: string, spawn: SpawnImpl): string {
-  try {
-    const res = spawn('git', ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], { cwd });
-    if (!res.error && res.status === 0) {
-      const ref = (res.stdout ?? '').trim().replace(/^origin\//, '');
-      if (ref && !/[\r\n"`$\\[\]]/.test(ref)) return ref;
-    }
-  } catch {
-    /* fall through to the default */
-  }
-  return 'main';
-}
-
-/**
- * Build the GitHub Actions workflow. It delegates to the published
- * `TestSprite/testsprite-action` (design A) rather than inlining the CLI, so the
- * partial-run guard (`allow-partial: false` by default), the JUnit upload, the
- * annotations, and the CLI-version pin all come from one maintained place.
+ * Build the GitHub Actions workflow. It calls the CLI directly (`ci run`), which
+ * owns every judgement — waiting, skipped counts, the exit code, the PR
+ * context — so the yml only moves data.
+ *
+ * One template covers both ways a PR gets a preview, because they differ only
+ * in where the URL comes from. The trigger, `if:` and concurrency already accept
+ * both events; the single placeholder step is the part only the repo owner can
+ * write, and it fails loudly until replaced so the gate can never run against a
+ * URL nobody chose.
  */
 export function buildGithubWorkflow(input: {
   projectId: string;
-  filter?: string;
-  timeoutSeconds: number;
+  environment: string;
+  timeoutSeconds?: number;
   endpointUrl?: string;
-  cliVersion: string;
-  defaultBranch: string;
+  workflowPath: string;
 }): string {
   assertSafeWorkflowValue('project', input.projectId);
-  if (input.filter) assertSafeWorkflowValue('filter', input.filter);
+  assertSafeWorkflowValue('env', input.environment);
   if (input.endpointUrl) assertSafeWorkflowValue('endpoint-url', input.endpointUrl);
 
-  const withLines = [
-    `          api-key: \${{ secrets.${API_KEY_SECRET_NAME} }}`,
-    `          project: "${input.projectId}"`,
-    `          cli-version: "${input.cliVersion}"`,
-    `          timeout: "${input.timeoutSeconds}"`,
-    ...(input.filter ? [`          filter: "${input.filter}"`] : []),
-    ...(input.endpointUrl ? [`          endpoint-url: "${input.endpointUrl}"`] : []),
+  const envLines = [
+    `      ${API_KEY_SECRET_NAME}: \${{ secrets.${API_KEY_SECRET_NAME} }}`,
+    '      # ci run looks up the PR behind a deployment_status event with this token.',
+    '      GITHUB_TOKEN: ${{ github.token }}',
+    ...(input.endpointUrl ? [`      TESTSPRITE_API_URL: "${input.endpointUrl}"`] : []),
   ];
+  const runLines = [
+    '          testsprite ci run',
+    `          --project "${input.projectId}"`,
+    `          --env "${input.environment}"`,
+    '          --target-url "$PREVIEW_URL"',
+    // A gate must not go green on tests that never ran (a deferred or
+    // refused test is "skipped", which only warns by default).
+    '          --fail-on-skipped',
+    ...(input.timeoutSeconds !== undefined ? [`          --timeout ${input.timeoutSeconds}`] : []),
+    `          --summary-file ${SUMMARY_FILE}`,
+  ];
+  // Leave room for the CLI's own deadline plus install/deploy time.
+  const jobMinutes = Math.max(
+    45,
+    Math.ceil((input.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS) / 60) + 15,
+  );
 
-  return `# Generated by \`testsprite ci init github\`. Gates this repo on TestSprite tests.
-# The run, the JUnit report, the annotations, and the skipped-test guard all live
-# in ${ACTION_REF}; regenerate with \`testsprite ci init github --force\`.
-# Note: tests run against the project's CONFIGURED environment, not this PR's code
-# (there is no checkout) — a green check means the tests passed, not that the diff is safe.
+  return `# Generated by \`testsprite ci init github\`. Regenerate with --force (the previous file is kept as a .bak).
+# Runs this project's TestSprite tests against each pull request's preview deployment.
+# Before committing, replace the placeholder step marked "REPLACE ME" below.
 name: TestSprite
 
 on:
-  push:
-    branches: ["${input.defaultBranch}"]
+  # B. You deploy in this workflow: keep this trigger.
+  # A. Your platform deploys every PR (e.g. the Vercel git integration):
+  #    replace the pull_request trigger with \`deployment_status:\`.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
-# The job only needs to read the checkout metadata.
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
-  testsprite:
+  testsprite-tests:
+    # B (pull_request): a new push to the pull request cancels the previous job.
+    # A (deployment_status): one group per COMMIT — Vercel sets deployment.ref to
+    # the commit sha, so a new push does not cancel the previous commit's job.
+    # Job-level, so events the if: below drops (pending, inactive, another
+    # project's deployment of the same commit) never cancel a running gate.
+    # Cancelling only stops this job's CLI: the TestSprite run it started keeps
+    # executing and reports in the Portal; the new push starts its own run.
+    concurrency:
+      group: testsprite-\${{ github.event.pull_request.number || github.event.deployment.sha }}
+      cancel-in-progress: true
+    # pull_request: skip fork PRs (they get no repository secrets) and draft PRs.
+    # deployment_status: only successful, non-production deployments. Vercel leaves
+    # production_environment false on production deployments, so the name is checked too
+    # (GitHub compares strings case-insensitively).
+    # deployment_status runs the workflow file AT THE DEPLOYED COMMIT, with this
+    # repository's secrets, and the event does not say whether that commit came
+    # from a fork. If your platform deploys pull requests from forks, turn that
+    # off there (e.g. Vercel's fork protection) or a fork's edit of this file
+    # runs with your TESTSPRITE_API_KEY.
+    # A repository that deploys SEVERAL projects (Vercel names them
+    # "Preview – <project>") gets one deployment_status per project for the
+    # same commit; pin the one to gate by adding
+    #   && github.event.deployment.environment == 'Preview – <project>'
+    # to the deployment_status branch below.
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       !github.event.pull_request.draft) ||
+      (github.event_name == 'deployment_status' &&
+       github.event.deployment_status.state == 'success' &&
+       !github.event.deployment.production_environment &&
+       github.event.deployment.environment != 'production')
     runs-on: ubuntu-latest
-    # Fork PRs run without repository secrets, so the API key would be empty and
-    # this check permanently red. Skip forks (a maintainer's push still runs it).
-    if: \${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    timeout-minutes: ${jobMinutes}
+    env:
+${envLines.join('\n')}
     steps:
-      - uses: ${ACTION_REF}
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
         with:
-${withLines.join('\n')}
+          node-version: '22'
+
+      - run: npm i -g ${CLI_PACKAGE_SPEC}
+
+      # REPLACE ME — where does this PR's preview URL come from? Pick one:
+      # A. Your platform deploys every PR: delete this step (and switch the trigger
+      #    above). The next step then reads the URL from the deployment event.
+      # B. You deploy in this workflow: replace the run lines with your deploy
+      #    commands and end with:  echo "url=<preview address>" >> "$GITHUB_OUTPUT"
+      - name: Get this PR's preview URL
+        id: preview
+        run: |
+          echo "::error::Replace the placeholder step in ${input.workflowPath} (see the comment above it)."
+          exit 1
+
+      - name: Run TestSprite tests on this PR's preview
+        env:
+          PREVIEW_URL: \${{ steps.preview.outputs.url || github.event.deployment_status.environment_url }}
+        run: >-
+${runLines.join('\n')}
+
+      - name: Upload TestSprite report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testsprite-results
+          path: ${SUMMARY_FILE}
+          if-no-files-found: ignore
 `;
 }
 
@@ -325,19 +423,102 @@ async function resolveProjectId(opts: CiInitOptions, deps: CiDeps): Promise<stri
   return only.id;
 }
 
-/** Walk `<path>.bak`, `.bak.1`, … until a free slot; write the prior content there. */
-async function backupExisting(fs: CiFs, target: string, prior: string): Promise<string> {
-  for (let i = 0; i < 100; i++) {
-    const candidate = i === 0 ? `${target}.bak` : `${target}.bak.${i}`;
+/**
+ * The environment written into `ci run --env`: its sign-in is what every PR run
+ * is cloned from. An explicit `--env` must exist (a typo would otherwise fail
+ * on every PR); without one the project's default is named explicitly, so a
+ * later change of the default never silently changes what this workflow runs.
+ * Under `--dry-run` nothing is looked up, so `authMode` is unknown.
+ */
+async function resolveEnvironment(
+  opts: CiInitOptions,
+  deps: CiDeps,
+  projectId: string,
+): Promise<{ name: string; authMode?: string }> {
+  const requested = opts.env?.trim();
+  if (opts.env !== undefined && !requested) {
+    throw localValidationError(
+      'env',
+      'must be a non-empty environment name (list them with: testsprite project env list <project-id>)',
+    );
+  }
+  if (opts.dryRun) return { name: requested ?? '<your-env-name>' };
+
+  const client = makeClient(opts, deps);
+  const listed = await client.get<CliProjectEnvListResponse>(
+    `/projects/${encodeURIComponent(projectId)}/env`,
+  );
+  const environments = listed.environments ?? [];
+  const names = environments.map(e => e.name).join(', ') || '(none)';
+  if (requested !== undefined) {
+    const match = environments.find(e => e.name === requested);
+    if (!match) {
+      throw localValidationError(
+        'env',
+        `no environment named "${requested}" in project ${projectId} — available: ${names}`,
+      );
+    }
+    return { name: match.name, authMode: match.authMode };
+  }
+  const fallback = environments.find(e => e.isDefault);
+  if (!fallback) {
+    throw localValidationError(
+      'env',
+      `project ${projectId} has no default environment — pass --env <name> (available: ${names})`,
+    );
+  }
+  return { name: fallback.name, authMode: fallback.authMode };
+}
+
+/**
+ * `--path` relative to the repo, with forward slashes. GitHub only runs
+ * workflows from `.github/workflows/*.yml|yaml`; anywhere else the file is
+ * written and silently never runs, so it is refused.
+ */
+function resolveWorkflowPath(raw: string, cwd: string): { relPath: string; absPath: string } {
+  // `join`, not `resolve`: the latter would prepend the drive letter on
+  // Windows and no longer line up with the caller's own `cwd`-based paths.
+  const absPath = path.isAbsolute(raw) ? path.normalize(raw) : path.join(cwd, raw);
+  const relPath = path.relative(cwd, absPath).split(path.sep).join('/');
+  const dir = path.posix.dirname(relPath);
+  if (dir !== WORKFLOWS_DIR || !/\.ya?ml$/.test(relPath)) {
+    throw localValidationError(
+      'path',
+      `must be a .yml or .yaml file directly under ${WORKFLOWS_DIR}/ (GitHub never runs a workflow anywhere else)`,
+      undefined,
+      'field',
+    );
+  }
+  return { relPath, absPath };
+}
+
+/**
+ * Other workflows that already mention TestSprite (the CLI, or one of our
+ * actions). Two gates on one PR run every test twice and are billed twice, so
+ * the caller warns; it never blocks, because two workflows can be deliberate.
+ */
+async function findOtherTestspriteWorkflows(
+  fs: CiFs,
+  absDir: string,
+  absTarget: string,
+): Promise<string[]> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(absDir);
+  } catch {
+    return [];
+  }
+  const hits: string[] = [];
+  for (const name of entries.sort()) {
+    const abs = path.join(absDir, name);
+    if (abs === absTarget || !/\.ya?ml$/.test(name)) continue;
     try {
-      await fs.writeFile(candidate, prior, { exclusive: true });
-      return candidate;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'EEXIST') continue;
-      throw err;
+      if (/testsprite/i.test(await fs.readFile(abs))) hits.push(`${WORKFLOWS_DIR}/${name}`);
+    } catch {
+      /* unreadable or a directory: nothing to report */
     }
   }
-  throw new CLIError('Could not find a free .bak slot to back up the existing workflow.', 1);
+  return hits;
 }
 
 /**
@@ -405,7 +586,7 @@ export async function runCiInit(opts: CiInitOptions, deps: CiDeps = {}): Promise
   const platform = opts.platform as Platform;
 
   // Telemetry facts for this invocation (see lib/telemetry.ts — low-cardinality
-  // only: never the path, the project id, or the filter). `workflowExisted` is
+  // only: never the path, the project id, or the environment name). `workflowExisted` is
   // learned only once the write is attempted, so it is filled in below and the
   // whole set is recorded on every exit path, including a thrown error.
   let workflowExisted: boolean | undefined;
@@ -439,28 +620,35 @@ async function runCiInitScaffold(
   const stdout = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const fs = deps.fs ?? defaultCiFs;
-  const spawn = deps.spawn ?? defaultSpawn;
   const cwd = deps.cwd ?? process.cwd();
   const out = new Output(opts.output, { stdout, stderr });
 
-  // Validate the caller's own inputs up front — BEFORE the project-list round
-  // trip — so a bad --filter/--project fails fast without a wasted request.
-  if (opts.filter) assertSafeWorkflowValue('filter', opts.filter);
+  // Validate the caller's own inputs up front — BEFORE any round trip — so a
+  // bad --project/--env/--path fails fast without a wasted request.
   if (opts.project) assertSafeWorkflowValue('project', opts.project);
+  if (opts.env) assertSafeWorkflowValue('env', opts.env);
+  const { relPath, absPath } = resolveWorkflowPath(opts.workflowPath, cwd);
 
   const projectId = await resolveProjectId(opts, deps);
+  const resolvedEnv = await resolveEnvironment(opts, deps, projectId);
+  const environment = resolvedEnv.name;
+  // A recorded (SSO/manual) session is bound to the environment's own address,
+  // so it cannot sign in on a preview; the backend refuses those PR runs before
+  // charging. Writing the workflow is still allowed — the user may change the
+  // environment's sign-in later — but say so now rather than on the first PR.
+  if (resolvedEnv.authMode === 'manual') {
+    stderr(
+      `[warn] environment "${environment}" signs in with a recorded SSO session, which cannot follow a preview's address — PR runs against it will be refused. Prefer an environment with a test account or no sign-in (testsprite project env list ${projectId}).`,
+    );
+  }
   const endpointUrl = resolveEndpointUrl(opts, deps);
-  const defaultBranch = detectDefaultBranch(cwd, spawn);
   const workflow = buildGithubWorkflow({
     projectId,
-    filter: opts.filter,
+    environment,
     timeoutSeconds: opts.timeoutSeconds,
     endpointUrl,
-    cliVersion: VERSION,
-    defaultBranch,
+    workflowPath: relPath,
   });
-  const relPath = opts.workflowPath;
-  const absPath = path.isAbsolute(relPath) ? relPath : path.join(cwd, relPath);
 
   // A loopback / private endpoint pinned into a committed workflow is
   // unreachable from a GitHub-hosted runner (the check reds on first push with
@@ -479,15 +667,26 @@ async function runCiInitScaffold(
     }
   }
 
+  const otherTestspriteWorkflows = await findOtherTestspriteWorkflows(
+    fs,
+    path.dirname(absPath),
+    absPath,
+  );
+  if (otherTestspriteWorkflows.length > 0) {
+    stderr(
+      `[warn] ${otherTestspriteWorkflows.join(', ')} already run${otherTestspriteWorkflows.length === 1 ? 's' : ''} TestSprite — with this workflow too, each PR may run (and be billed for) its tests twice.`,
+    );
+  }
+
   const baseSummary = {
     platform,
     path: relPath,
-    action: ACTION_REF,
     projectId,
-    filter: opts.filter ?? null,
+    environment,
     endpointUrl: endpointUrl ?? null,
     endpointWarning,
-    timeoutSeconds: opts.timeoutSeconds,
+    timeoutSeconds: opts.timeoutSeconds ?? null,
+    otherTestspriteWorkflows,
   };
 
   // --dry-run: preview to stderr, emit the summary, and make no writes / no gh call.
@@ -499,7 +698,6 @@ async function runCiInitScaffold(
       ...baseSummary,
       wrote: false,
       status: 'preview',
-      backupPath: null,
       secret: { name: API_KEY_SECRET_NAME, attempted: false, set: false, reason: null },
     };
     out.print(summary, d => renderCiInitText(d as CiInitSummary));
@@ -508,8 +706,9 @@ async function runCiInitScaffold(
 
   await fs.mkdir(path.dirname(absPath));
 
-  let backupPath: string | null = null;
   let wrote = true;
+
+  let backupPath: string | null = null;
   try {
     await fs.writeFile(absPath, workflow, { exclusive: true });
     onExisted(false);
@@ -527,19 +726,21 @@ async function runCiInitScaffold(
     onExisted(true);
     const prior = await fs.readFile(absPath);
     if (prior === workflow) {
-      // Already exactly what we'd write — no rewrite, no `.bak` churn. This also
-      // makes re-running (with or without --force) on identical content a no-op
-      // rather than an error, so it never burns a backup slot.
+      // Already exactly what we'd write: no rewrite, and re-running (with or
+      // without --force) on identical content is a no-op rather than an error.
       wrote = false;
     } else if (!opts.force) {
       throw localValidationError(
         'path',
-        `${relPath} already exists — re-run with --force to overwrite (a .bak backup is kept)`,
+        `${relPath} already exists — re-run with --force to overwrite it (git keeps the old version)`,
         undefined,
         'field',
       );
     } else {
-      backupPath = await backupExisting(fs, absPath, prior);
+      // The template needs a hand edit (the preview step), so a --force to
+      // change one flag must not silently discard it: keep the old file.
+      backupPath = `${absPath}.bak`;
+      await fs.writeFile(backupPath, prior, { exclusive: false });
       await fs.writeFile(absPath, workflow, { exclusive: false });
     }
   }
@@ -555,7 +756,8 @@ async function runCiInitScaffold(
     ...baseSummary,
     wrote,
     status: wrote ? 'written' : 'unchanged',
-    backupPath: backupPath ? path.relative(cwd, backupPath) : null,
+    // Relative like `path`, and forward-slashed on every OS for the same reason.
+    ...(backupPath !== null ? { backupPath: `${relPath}.bak` } : {}),
     secret: { name: API_KEY_SECRET_NAME, ...secret },
   };
   out.print(summary, d => renderCiInitText(d as CiInitSummary));
@@ -1055,38 +1257,285 @@ export function renderCiInitText(s: CiInitSummary): string {
       : s.status === 'preview'
         ? `Would write ${s.path}`
         : `${s.path} is already up to date`;
-  lines.push(`${verb} (${s.action}, project ${s.projectId}).`);
-  if (s.backupPath) lines.push(`Backed up the previous file to ${s.backupPath}.`);
+  lines.push(`${verb} (project ${s.projectId}, environment ${s.environment}).`);
+  if (s.backupPath)
+    lines.push(`The previous file was kept as ${s.backupPath}; re-apply your edits.`);
   lines.push('');
   lines.push('Next steps:');
+  lines.push(`  1. Replace the "REPLACE ME" step in ${s.path} with where this PR's preview URL`);
+  lines.push('     comes from (the comment on it shows both options). Until then the check fails.');
   if (s.secret.set) {
-    lines.push(`  ✓ ${s.secret.name} repo secret set via gh.`);
-    lines.push(`  → Commit and push ${s.path}, then open a PR to see the check.`);
+    lines.push(`  2. ✓ ${s.secret.name} repo secret set via gh.`);
   } else {
-    lines.push(`  1. Add the ${s.secret.name} repo secret (the workflow reads the key from it):`);
+    lines.push(`  2. Add the ${s.secret.name} repo secret (the workflow reads the key from it):`);
     lines.push(`       gh secret set ${s.secret.name}          # paste your key when prompted`);
     lines.push('     …or in the GitHub UI: Settings → Secrets and variables → Actions.');
-    lines.push(`  2. Commit and push ${s.path}, then open a PR to see the check.`);
   }
+  lines.push(`  3. Commit and push ${s.path}, then open a PR and confirm the check runs`);
+  lines.push("     against that PR's preview. To block merges on it, make it a required check.");
   return lines.join('\n');
 }
 
 // ── command builder ──────────────────────────────────────────────────────────
 
+export type CiRunOptions = Omit<
+  RunTestRunAllOptions,
+  'wait' | 'ci' | 'admission' | 'previewName' | 'githubTrigger'
+> & {
+  failOnSkipped?: boolean;
+  /** `--execution-report-timeout`: how long to wait for the execution report (default 60). */
+  executionReportTimeoutSeconds?: number;
+  /** `--no-execution-report`: job summary stays the local table; nothing is read or written for the report. */
+  executionReport?: boolean;
+};
+
+/**
+ * `ci run` = `test run --all --wait` with CI's defaults, plus what only a CI
+ * job can add:
+ *
+ *  - `admission: 'all'` — one request, one execution, server-side pacing (as
+ *    for a GitHub App run), so a PR run is one row in the Portal and, in a
+ *    pull request, one `github-pr-<N>` environment. The backend echoes the
+ *    field; a backend that cannot honour it is refused (exit 7), never
+ *    silently cut to the per-key budget and retried.
+ *  - In a pull request (read off the Actions event, or looked up from the
+ *    deployment's commit), `--env X --target-url U` runs in a temporary clone
+ *    of X at U named `github-pr-<N>`, and the run is stamped with the PR so
+ *    the Portal links back to it — the GitHub App's own mechanism.
+ *  - Outside a pull request the run keeps `test run`'s semantics: X's sign-in
+ *    against U, recorded under X.
+ */
+export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise<void> {
+  const env = deps.env ?? process.env;
+  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  if (opts.targetUrl !== undefined && opts.targetUrl.trim() === '') {
+    throw localValidationError('target-url', 'must be a non-empty URL');
+  }
+  // An unknown environment name is a configuration error, not an empty
+  // selection: refused here, before anything dispatches or charges, so it
+  // can never read as a green `--allow-empty` run.
+  try {
+    await assertCiEnvironmentExists(opts, deps);
+  } catch (err) {
+    // The CLI's own "no such environment" refusal is `refused_env`; any API
+    // refusal while listing (401, 402, 429, …) takes the shared mapping.
+    if (err instanceof ApiError && err.code === 'VALIDATION_ERROR' && err.details.field === 'env') {
+      recordTelemetryExtras({ ciRunOutcome: 'refused_env' });
+    } else if (err instanceof ApiError) {
+      recordTelemetryExtras({ ciRunOutcome: ciRefusalOutcome(err) });
+    }
+    throw err;
+  }
+
+  const github = await readGithubRunContext(env, { fetchImpl: deps.fetchImpl });
+  let previewName: string | undefined;
+  let githubTrigger: CiGithubTrigger | undefined;
+  if (github.kind === 'pull_request') {
+    if (github.draft) {
+      recordTelemetryExtras({ ciRunOutcome: 'skipped_draft' });
+      skipCiRun(
+        `Skipping draft pull request #${github.trigger.prNumber}; the gate runs once it is ready for review.`,
+        { env, stderr },
+      );
+      return;
+    }
+    githubTrigger = github.trigger;
+    // The clone needs a template to clone and an address to point at.
+    if (opts.targetUrl !== undefined && opts.environment !== undefined) {
+      previewName = previewEnvironmentName(github.trigger.prNumber);
+    }
+  } else if (github.kind === 'no_pull_request' && github.event === 'deployment_status') {
+    // A deployment that belongs to no pull request has nothing to gate.
+    recordTelemetryExtras({ ciRunOutcome: 'skipped_no_pr' });
+    skipCiRun(`Skipping: ${github.reason}; nothing to gate.`, { env, stderr });
+    return;
+  }
+
+  await runTestRunAll(
+    {
+      ...opts,
+      timeoutSeconds: parseTimeoutSeconds(opts.timeoutSeconds),
+      wait: true,
+      ci: {
+        failOnSkipped: opts.failOnSkipped,
+        executionReportTimeoutSeconds: opts.executionReportTimeoutSeconds,
+        ...(opts.executionReport === false ? { executionReport: false } : {}),
+      },
+      admission: 'all',
+      ...(previewName !== undefined ? { previewName } : {}),
+      ...(githubTrigger !== undefined ? { githubTrigger } : {}),
+    },
+    deps,
+  );
+}
+
+/**
+ * A `ci run` that has nothing to gate (a draft PR, a deployment with no pull
+ * request) exits 0 with a `::notice::` — and still writes its step outputs, as
+ * zeros, so a later step reading `steps.<id>.outputs.passed` sees a number
+ * rather than an empty string. Nothing was dispatched, so nothing else (job
+ * summary, summary file, report) is written: those describe runs.
+ */
+function skipCiRun(
+  notice: string,
+  io: { env: NodeJS.ProcessEnv; stderr: (line: string) => void },
+): void {
+  io.stderr(`::notice title=TestSprite::${notice}`);
+  const nothing: CiSummary = { total: 0, passed: 0, failed: 0, skipped: 0, timedOut: 0, runs: [] };
+  emitCiStepOutputs(nothing, io);
+}
+
+/**
+ * Strict `--env`: the name must be one of the project's environments, read
+ * off the same list `test run` reads before a batch. Fails closed: a list that
+ * cannot be read is an error with that error's own exit code (bad key → 3,
+ * backend down → 10, interrupted → the signal's code) — never a run that goes
+ * on to dispatch and charge against an environment nobody checked. The one
+ * read that is NOT an error is a backend answering that this project has no
+ * environment surface at all (a V2 project's `UNSUPPORTED`, or an older
+ * backend's 404 for the route): there is no list to check against, and the
+ * batch's own `environment` validation is the only authority left. Nothing to
+ * check without a name, and a dry run makes no request.
+ */
+async function assertCiEnvironmentExists(opts: CiRunOptions, deps: TestDeps): Promise<void> {
+  const environment = opts.environment?.trim();
+  const projectId = opts.projectId ?? (deps.env ?? process.env).TESTSPRITE_PROJECT_ID;
+  if (!environment || !projectId || opts.dryRun) return;
+  let listed: { environments?: Array<{ name?: unknown }> };
+  try {
+    listed = await makeHttpClient(opts, {
+      env: deps.env,
+      credentialsPath: deps.credentialsPath,
+      fetchImpl: deps.fetchImpl,
+      stderr: deps.stderr,
+    }).get<{ environments?: Array<{ name?: unknown }> }>(
+      `/projects/${encodeURIComponent(projectId)}/env`,
+    );
+  } catch (err) {
+    if (err instanceof ApiError && (err.code === 'UNSUPPORTED' || err.httpStatus === 404)) {
+      return;
+    }
+    throw err;
+  }
+  const names = (listed.environments ?? [])
+    .map(e => e.name)
+    .filter((n): n is string => typeof n === 'string');
+  if (names.includes(environment)) return;
+  throw localValidationError(
+    'env',
+    `no environment named "${environment}" in project ${projectId} — available: ${names.join(', ') || '(none)'}`,
+  );
+}
+
 export function createCiCommand(deps: CiDeps = {}): Command {
-  const ci = new Command('ci').description('Scaffold CI integration for TestSprite');
+  const ci = new Command('ci').description('Run tests in CI and scaffold CI integration');
+
+  ci.command('run')
+    .description('Run project tests, wait for results, and apply the CI gate')
+    .allowExcessArguments(false)
+    .option('--project <id>', 'project id (defaults to TESTSPRITE_PROJECT_ID)')
+    .option('--all', 'run all project tests (already the default)')
+    .option('--filter <substr>', 'only run tests whose name contains this substring')
+    .option(
+      '--env <name>',
+      'the environment whose sign-in the run uses (unknown names fail). In a pull request, with --target-url, the run happens in a temporary clone of it at the preview address, named github-pr-<N> like a GitHub App run',
+    )
+    .option(
+      '--target-url <url>',
+      "frontend tests: the address to test, typically this pull request's preview deployment",
+    )
+    .option('--skip-preflight', 'skip the pre-charge reachability probe for --target-url', false)
+    .option('--timeout <s>', 'max seconds to wait for results (1-3600)', '600')
+    .option(
+      '--execution-report-timeout <s>',
+      'max seconds to wait for the execution report that fills the job summary (1-3600)',
+      '60',
+    )
+    .option(
+      '--no-execution-report',
+      'keep the job summary to the local results table; read and write no execution report',
+    )
+    .option('--max-concurrency <n>', 'maximum concurrent polls (1-100)', '50')
+    .option('--idempotency-key <key>', 'idempotency key for the batch dispatch')
+    .option('--fail-on-skipped', 'fail if any requested test was not run (default: warn)')
+    .option('--allow-empty', 'allow zero dispatched tests (default: exit 5)')
+    .option('--gh-output', 'force GitHub annotations and job summary outside Actions')
+    .option('--summary-file <path>', 'write the unified CI summary JSON to this file')
+    .option('--report <format>', 'also write a report (junit); disabled by default')
+    .option('--report-file <path>', 'JUnit report destination (requires --report junit)')
+    .option('--report-suite-name <name>', 'JUnit suite name (default: testsprite:<projectId>)')
+    .addHelpText(
+      'after',
+      '\nAlways waits for results. Failed tests and timeouts fail the gate.\n' +
+        'Skipped tests warn unless --fail-on-skipped; missing test ids and unknown\n' +
+        'environments always fail. Every selected test is seeded into ONE execution\n' +
+        'and the server paces dispatch, as for a GitHub App run.\n' +
+        'In GitHub Actions the pull request is read from the event (a deployment_status\n' +
+        'event is looked up by commit with GITHUB_TOKEN); draft PRs and deployments\n' +
+        'with no pull request are skipped with a notice and zero step outputs. The run\n' +
+        'is stamped with the PR, so the Portal links back to it. ci run does not read\n' +
+        "the deployment's state or environment: filter deployment_status events with\n" +
+        "the job's `if:` (state == 'success', not production), or a failed or\n" +
+        'production deployment is gated too.\n' +
+        'Writes total, passed, failed, skipped, timedOut to GITHUB_OUTPUT when present.\n' +
+        'On a supporting backend the job summary is the execution report — the same content\n' +
+        'the GitHub App posts as its PR comment — and execution-report-file /\n' +
+        'execution-report-markdown-file name its JSON and Markdown for later steps.\n' +
+        'Reports and outputs are emitted before the exit code is decided.\n' +
+        'Backend tests use the URL in their own code, not --target-url. PR comments are not yet supported.\n',
+    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (cmdOpts, command: Command) => {
+      await runCiRun(
+        {
+          ...resolveCommonOptions(command),
+          projectId: cmdOpts.project,
+          nameFilter: cmdOpts.filter,
+          environment: cmdOpts.env,
+          targetUrl: cmdOpts.targetUrl,
+          skipPreflight: cmdOpts.skipPreflight === true,
+          timeoutSeconds: parseTimeoutSeconds(cmdOpts.timeout),
+          executionReportTimeoutSeconds: parseExecutionReportTimeoutSeconds(
+            cmdOpts.executionReportTimeout,
+          ),
+          // Commander's `--no-execution-report` sets `executionReport: false`
+          // (true when absent).
+          executionReport: cmdOpts.executionReport !== false,
+          maxConcurrency: Number(cmdOpts.maxConcurrency),
+          idempotencyKey: cmdOpts.idempotencyKey,
+          failOnSkipped: cmdOpts.failOnSkipped === true,
+          allowEmpty: cmdOpts.allowEmpty === true,
+          ghOutput: cmdOpts.ghOutput === true,
+          summaryFile: cmdOpts.summaryFile,
+          report: parseJUnitReportFormat(cmdOpts.report),
+          reportFile: cmdOpts.reportFile,
+          reportSuiteName: cmdOpts.reportSuiteName,
+        },
+        deps,
+      );
+    });
 
   ci.command('init <platform>')
     .description('Write a CI workflow that runs your TestSprite tests (platform: github)')
     .option('--project <id>', 'project id to run (auto-detected if you have exactly one)')
-    .option('--filter <substr>', 'only run tests whose name contains this substring')
+    .option(
+      '--env <name>',
+      "environment whose sign-in each PR run uses (default: the project's default environment, written out by name)",
+    )
     .option(
       '--timeout <s>',
-      'max seconds to wait for a terminal verdict (1-3600)',
-      String(DEFAULT_TIMEOUT_SECONDS),
+      "max seconds ci run waits for a terminal verdict (1-3600; omitted: ci run's default)",
     )
-    .option('--path <file>', 'output path for the workflow', DEFAULT_WORKFLOW_PATH)
-    .option('--force', 'overwrite an existing workflow (a .bak backup is kept)', false)
+    .option(
+      '--path <file>',
+      `workflow file to write, under ${WORKFLOWS_DIR}/ (.yml or .yaml)`,
+      DEFAULT_WORKFLOW_PATH,
+    )
+    .option(
+      '--force',
+      'overwrite an existing workflow with different content (keeps a .bak)',
+      false,
+    )
     .option(
       '--set-secret',
       `set the ${API_KEY_SECRET_NAME} repo secret via gh (if installed + authenticated); OVERWRITES an existing secret of that name`,
@@ -1103,8 +1552,9 @@ export function createCiCommand(deps: CiDeps = {}): Command {
         ...common,
         platform,
         project: cmdOpts.project,
-        filter: cmdOpts.filter,
-        timeoutSeconds: parseTimeoutSeconds(cmdOpts.timeout),
+        env: cmdOpts.env,
+        timeoutSeconds:
+          cmdOpts.timeout === undefined ? undefined : parseTimeoutSeconds(cmdOpts.timeout),
         workflowPath: cmdOpts.path ?? DEFAULT_WORKFLOW_PATH,
         force: cmdOpts.force ?? false,
         setSecret: cmdOpts.setSecret ?? false,
@@ -1113,7 +1563,11 @@ export function createCiCommand(deps: CiDeps = {}): Command {
       await runCiInit(opts, deps);
     });
 
-  ci.command('doctor')
+  // `ci doctor` and `ci connect` are hidden and deprecated (step 1 of 2).
+  // Platform checks and linking belong to the agent skill (`testsprite-ci`),
+  // which reads the same deployment history and runs the platform's own CLI.
+  // Behaviour and exit codes are unchanged until the commands are removed.
+  ci.command('doctor', { hidden: true })
     .description(
       'Check that deployment events reach this repo — the precondition a deployment-gated workflow rests on',
     )
@@ -1140,6 +1594,7 @@ export function createCiCommand(deps: CiDeps = {}): Command {
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts, command: Command) => {
+      emitCiDeprecationNotice('doctor', deps);
       const common = resolveCommonOptions(command, deps.env);
       await runCiDoctor(
         {
@@ -1154,7 +1609,7 @@ export function createCiCommand(deps: CiDeps = {}): Command {
       );
     });
 
-  ci.command('connect')
+  ci.command('connect', { hidden: true })
     .description('Link your deploy platform (Vercel) to this repo so deployment events are emitted')
     .option(
       '--project <name>',
@@ -1174,9 +1629,30 @@ export function createCiCommand(deps: CiDeps = {}): Command {
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts, command: Command) => {
+      emitCiDeprecationNotice('connect', deps);
       const common = resolveCommonOptions(command, deps.env);
       await runCiConnect({ ...common, project: cmdOpts.project }, deps);
     });
 
   return ci;
+}
+
+/**
+ * One stderr line per run of a deprecated `ci` subcommand, naming the
+ * equivalent commands (stdout stays clean for JSON pipelines). The
+ * replacements are not `testsprite` commands, so this does not reuse
+ * `emitDeprecationNotice`.
+ */
+export const CI_DEPRECATION_NOTICES = {
+  doctor:
+    '[deprecated] `testsprite ci doctor` will be removed in a later release. Read the deployment history yourself: ' +
+    '`gh api repos/<owner>/<repo>/deployments` — judge preview and production records separately; a real pull request is the proof.',
+  connect:
+    "[deprecated] `testsprite ci connect` will be removed in a later release. Run the platform's own CLI: " +
+    '`npx vercel link --project <name> --non-interactive`, then `npx vercel git connect --non-interactive` (or link the repo in the Vercel dashboard).',
+} as const;
+
+function emitCiDeprecationNotice(cmd: keyof typeof CI_DEPRECATION_NOTICES, deps: CiDeps): void {
+  const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+  stderr(CI_DEPRECATION_NOTICES[cmd]);
 }
