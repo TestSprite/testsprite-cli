@@ -18,10 +18,27 @@
  *  exception class but the CLI wire-code is RATE_LIMITED per
  *  the CLI error spec). Up to 3 attempts via `http.ts`, then throw (exit 11).
  *  5xx → single retry honoring Retry-After, second 5xx throws (exit 9).
- *  Deadline exceeded → throw `TimeoutError`.
+ *  Outage once the endpoint has answered (a `TransportError`, or a 503
+ *  UNAVAILABLE, after `http.ts` spent its own retries) → re-read on the
+ *  backoff schedule above, or after the server's Retry-After, until the
+ *  deadline. The run keeps executing server-side, so a Wi-Fi roam, a VPN
+ *  reconnect or a deploy window must not end the wait. The endpoint has
+ *  answered once a read succeeds, or from the start when the command just
+ *  triggered the run (every caller but `test wait`, see
+ *  `PollOptions.isFirstContact`). Before that, the single-retry rule above
+ *  keeps a wrong endpoint failing fast. 429 and INTERNAL keep their handling.
+ *  Stalled read once the endpoint has answered (no answer within the
+ *  long-poll window plus `READ_STALL_GRACE_MS`, counted again after each retry
+ *  wait inside the read) → abort it and handle it as an outage, so the next
+ *  read opens a fresh connection instead of waiting for undici's 300s headers
+ *  timeout while the run may already be finished.
+ *  Deadline exceeded → throw `TimeoutError` (exit 7), or
+ *  `UnreachableAtDeadlineError` (exit 10) when the last read was still an
+ *  outage.
  */
 
-import { ApiError, InterruptError } from './errors.js';
+import { ApiError, InterruptError, TransportError } from './errors.js';
+import { composeAbortSignals } from './http.js';
 import type { ShutdownHandle } from './interrupt.js';
 import { defaultSleep, isAbortError, sleepUnlessInterrupted } from './poll-support.js';
 import type { RunResponse } from './runs.types.js';
@@ -38,7 +55,12 @@ export { isTerminalStatus } from './runs.types.js';
 export interface RunClient {
   getRun(
     runId: string,
-    options?: { waitSeconds?: number; signal?: AbortSignal },
+    options?: {
+      waitSeconds?: number;
+      signal?: AbortSignal;
+      /** Called before each retry wait inside the read; see `RequestOptions.onRetryWait`. */
+      onRetryWait?: (delayMs: number) => void;
+    },
   ): Promise<RunResponse>;
 }
 
@@ -49,6 +71,52 @@ export class TimeoutError extends Error {
     super(`Timed out after ${timeoutSeconds}s waiting for run ${runId}`);
     this.name = 'TimeoutError';
     this.runId = runId;
+  }
+}
+
+/**
+ * Thrown when the deadline passes while the API is still unreachable: the last
+ * read was a network failure or a 503 after the endpoint had answered. It is
+ * the UNAVAILABLE `ApiError` (exit 10) the wait would have ended with before
+ * outages were waited out, so a caller that only knows `ApiError` keeps its
+ * transport-failure handling. Single-run wait paths also print the
+ * `{runId, status}` partial and the re-attach hint for it, as they do for
+ * `TimeoutError`, since the run keeps executing server-side. Paths that own a
+ * tunnel replace the hint: the tunnel closes with the process, so the run is
+ * cancelled rather than resumable.
+ */
+export class UnreachableAtDeadlineError extends ApiError {
+  readonly runId: string;
+  constructor(runId: string, timeoutSeconds: number, lastFailure: ApiError) {
+    super(
+      {
+        code: 'UNAVAILABLE',
+        message:
+          `Could not reach the TestSprite API when the ${timeoutSeconds}s --timeout ended ` +
+          `(last error: ${lastFailure.message}).`,
+        nextAction: `Run ${runId} keeps executing server-side. When the network is back, re-attach with: testsprite test wait ${runId}, or cancel it: testsprite test cancel ${runId}`,
+        requestId: lastFailure.requestId,
+        details: { runId, timeoutSeconds },
+      },
+      lastFailure.httpStatus,
+    );
+    this.name = 'UnreachableAtDeadlineError';
+    this.runId = runId;
+  }
+}
+
+/**
+ * A poll read that got no answer within its stall budget: the connection most
+ * likely died without an error (a Wi-Fi switch, a VPN reconnect, a laptop
+ * sleep). A transport failure (UNAVAILABLE), so the loop handles it like any
+ * other outage once the endpoint has answered.
+ */
+export class ReadStalledError extends TransportError {
+  readonly budgetMs: number;
+  constructor(budgetMs: number) {
+    super(`no answer for ${Math.round(budgetMs / 1000)}s`);
+    this.name = 'ReadStalledError';
+    this.budgetMs = budgetMs;
   }
 }
 
@@ -103,9 +171,24 @@ export interface PollOptions {
    * Absent (tests, non-wait callers): behavior is unchanged.
    */
   shutdown?: ShutdownHandle;
+  /**
+   * True when this poll is the command's first request to the API
+   * (`test wait <run-id>`): until one read succeeds, a network failure fails
+   * fast, since the endpoint itself may be wrong. Every other caller polls a
+   * run it just triggered, so the endpoint has answered and an outage is
+   * waited out from the first read on. Defaults to false.
+   */
+  isFirstContact?: boolean;
 }
 
 const LONG_POLL_WAIT_SECONDS = 25;
+/**
+ * How long past its long-poll window a read may stay unanswered before it
+ * counts as stalled (ms). The server answers a `waitSeconds` read when the
+ * window ends, so 20s of silence beyond it (45s for the 25s window) means the
+ * connection is gone rather than slow.
+ */
+const READ_STALL_GRACE_MS = 20_000;
 /** Backoff schedule for the non-long-poll fallback path (ms). */
 const BACKOFF_SCHEDULE_MS = [2000, 4000, 8000, 15000];
 
@@ -115,6 +198,8 @@ const BACKOFF_SCHEDULE_MS = [2000, 4000, 8000, 15000];
  *
  * @returns The final `RunResponse` when terminal.
  * @throws `TimeoutError` when `timeoutSeconds` elapses before terminal.
+ * @throws `UnreachableAtDeadlineError` (exit 10) when it elapses during an
+ *   outage.
  * @throws `ApiError` for `NOT_FOUND` (exit 4), `RATE_LIMITED` (exit 11),
  *   and unrecoverable server errors.
  */
@@ -244,6 +329,22 @@ async function pollIterations(
   let consecutiveErrors = 0;
   // 404 not_yet_visible retry budget (one soft retry per event).
   let notYetVisibleRetries = 0;
+  // Once the endpoint has answered (the command's trigger reached it, or a
+  // read succeeded), an UNAVAILABLE read is an outage to wait out rather than
+  // a misconfiguration to report.
+  let hasEndpointAnswered = options.isFirstContact !== true;
+  // The current outage: the last read's failure (undefined once a read gets
+  // any answer), when the outage began, and how many re-reads it has cost so
+  // far (indexes the backoff schedule).
+  let outageFailure: ApiError | undefined;
+  let outageStartedMs: number | undefined;
+  let outageRetries = 0;
+  // The deadline outcome: exit 10 when the last read was still an outage,
+  // exit 7 otherwise.
+  const deadlineError = (): TimeoutError | UnreachableAtDeadlineError =>
+    outageFailure !== undefined
+      ? new UnreachableAtDeadlineError(runId, timeoutSeconds, outageFailure)
+      : new TimeoutError(runId, timeoutSeconds);
 
   while (true) {
     // Interrupt outranks the deadline: a Ctrl-C that raced the timeout must
@@ -251,23 +352,45 @@ async function pollIterations(
     if (shutdownSignal?.aborted) throw shutdownSignal.reason;
     const now = Date.now();
     if (now >= deadlineMs) {
-      throw new TimeoutError(runId, timeoutSeconds);
+      throw deadlineError();
     }
 
     const remainingMs = deadlineMs - now;
     const remainingSeconds = Math.ceil(remainingMs / 1000);
 
+    const waitSeconds = useBackoff ? undefined : Math.min(remainingSeconds, LONG_POLL_WAIT_SECONDS);
+    const readRun = (
+      signal: AbortSignal,
+      onRetryWait?: (delayMs: number) => void,
+    ): Promise<RunResponse> =>
+      client.getRun(runId, {
+        ...(waitSeconds === undefined ? {} : { waitSeconds }),
+        signal,
+        ...(onRetryWait === undefined ? {} : { onRetryWait }),
+      });
+
     let run: RunResponse;
     try {
-      if (useBackoff) {
-        run = await client.getRun(runId, { signal: sessionSignal });
-      } else {
-        const waitSeconds = Math.min(remainingSeconds, LONG_POLL_WAIT_SECONDS);
-        run = await client.getRun(runId, { waitSeconds, signal: sessionSignal });
-      }
+      // The stall guard is armed once the endpoint has answered: before that,
+      // a silent endpoint is a misconfiguration for the deadline to report.
+      run = hasEndpointAnswered
+        ? await readWithStallGuard(
+            sessionSignal,
+            (waitSeconds ?? 0) * 1000 + READ_STALL_GRACE_MS,
+            readRun,
+          )
+        : await readRun(sessionSignal);
       // Successful GET resets the consecutive-error counter.
       consecutiveErrors = 0;
       notYetVisibleRetries = 0;
+      hasEndpointAnswered = true;
+      if (outageStartedMs !== undefined) {
+        const outageSeconds = Math.round((Date.now() - outageStartedMs) / 1000);
+        onTransition?.(`Reconnected after ${outageSeconds}s; still waiting for run ${runId}`);
+      }
+      outageFailure = undefined;
+      outageStartedMs = undefined;
+      outageRetries = 0;
     } catch (err) {
       // Interrupt classification precedes the timeout mapping: the composed
       // signal makes the fetch reject on Ctrl-C, and that abort must surface
@@ -275,11 +398,30 @@ async function pollIterations(
       if (err instanceof InterruptError) throw err;
       if (shutdownSignal?.aborted) throw shutdownSignal.reason;
       // An AbortError from the session controller means the deadline passed
-      // while the fetch was in flight — surface as TimeoutError.
+      // while the fetch was in flight: surface as the deadline outcome.
       if (isAbortError(err)) {
-        throw new TimeoutError(runId, timeoutSeconds);
+        throw deadlineError();
       }
       if (!(err instanceof ApiError)) throw err;
+
+      // Outage after the endpoint has answered: re-read until the deadline.
+      // The loop-top deadline check then ends a wait whose outage outlasts
+      // --timeout as `UnreachableAtDeadlineError`.
+      const isOutage = err.code === 'UNAVAILABLE' && hasEndpointAnswered;
+      outageFailure = isOutage ? err : undefined;
+      if (isOutage) {
+        // A stalled read went quiet when it started, not when the guard fired.
+        outageStartedMs ??= Date.now() - (err instanceof ReadStalledError ? err.budgetMs : 0);
+        const delayMs = outageRetryDelay(err, outageRetries);
+        outageRetries += 1;
+        onTransition?.(
+          `Cannot reach the TestSprite API (${err.message}); run ${runId} keeps executing ` +
+            `server-side. Retrying in ${Math.round(delayMs / 1000)}s until the --timeout deadline`,
+        );
+        const remaining = deadlineMs - Date.now();
+        await sleep(Math.min(delayMs, Math.max(0, remaining)));
+        continue;
+      }
 
       // 400 VALIDATION_ERROR on waitSeconds → fall back to backoff.
       if (err.code === 'VALIDATION_ERROR' && !useBackoff) {
@@ -316,7 +458,8 @@ async function pollIterations(
         throw err; // http.ts already honored Retry-After + capped at 3.
       }
 
-      // 5xx (INTERNAL / UNAVAILABLE) — single retry.
+      // 5xx (INTERNAL, or UNAVAILABLE before the endpoint has answered):
+      // single retry.
       if (err.code === 'INTERNAL' || err.code === 'UNAVAILABLE') {
         consecutiveErrors += 1;
         if (consecutiveErrors >= 2) throw err; // second error propagates.
@@ -405,4 +548,57 @@ function backoffScheduleDelay(index: number): number {
   const base = BACKOFF_SCHEDULE_MS[Math.min(index, BACKOFF_SCHEDULE_MS.length - 1)]!;
   const jitter = base * 0.2 * (Math.random() * 2 - 1); // ±20%
   return Math.max(0, Math.round(base + jitter));
+}
+
+/**
+ * How long to wait before the next read through an outage: the server's own
+ * answer when a 503 says when to come back (the `Retry-After` header, already
+ * clamped to [1s, 300s] by `http.ts`, or the envelope's `retryAfterSec`), the
+ * backoff schedule otherwise. The caller caps the wait at the deadline.
+ */
+function outageRetryDelay(failure: ApiError, outageRetries: number): number {
+  if (failure.retryAfterMs !== undefined) return failure.retryAfterMs;
+  const retryAfterSec = failure.getDetail<number>(
+    'retryAfterSec',
+    (value): value is number => typeof value === 'number',
+  );
+  if (retryAfterSec !== undefined) return Math.max(0, retryAfterSec * 1000);
+  return backoffScheduleDelay(outageRetries);
+}
+
+/**
+ * Run one poll read that is aborted after `budgetMs` without an answer, on top
+ * of the session signal (deadline and Ctrl-C). Without it, a read on a
+ * connection that died silently waits for undici's 300s headers timeout,
+ * because the wait client raises its own per-request timeout to cover
+ * `--timeout`. A stall surfaces as `ReadStalledError`, so the loop handles it
+ * as an outage and the next read opens a fresh connection. Each retry wait
+ * inside the read (`onRetryWait`: a transport backoff, a 429's Retry-After)
+ * restarts the budget after the wait, so the guard never cuts a retry short
+ * and never retries faster than `http.ts`. Composed with listeners, not
+ * `AbortSignal.any`, for the reason documented on `composeAbortSignals`.
+ */
+async function readWithStallGuard<T>(
+  sessionSignal: AbortSignal,
+  budgetMs: number,
+  read: (signal: AbortSignal, onRetryWait: (delayMs: number) => void) => Promise<T>,
+): Promise<T> {
+  const stall = new AbortController();
+  // Cleared in `finally` as soon as the read settles.
+  let stallTimer = setTimeout(() => stall.abort(), budgetMs);
+  const restartAfterRetryWait = (delayMs: number): void => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => stall.abort(), delayMs + budgetMs);
+  };
+  const readAbort = composeAbortSignals([sessionSignal, stall.signal]);
+  try {
+    return await read(readAbort.signal, restartAfterRetryWait);
+  } catch (err) {
+    // The session signal (deadline, Ctrl-C) keeps its own meaning.
+    if (stall.signal.aborted && !sessionSignal.aborted) throw new ReadStalledError(budgetMs);
+    throw err;
+  } finally {
+    clearTimeout(stallTimer);
+    readAbort.cleanup();
+  }
 }

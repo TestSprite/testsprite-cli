@@ -735,6 +735,58 @@ describe('HttpClient error mapping', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(4);
   });
 
+  it('reports each retry wait through onRetryWait just before it sleeps', async () => {
+    const events: string[] = [];
+    const responses: Array<() => Response> = [
+      () => errorEnvelopeResponse(429, 'RATE_LIMITED', { headers: { 'retry-after': '2' } }),
+      () => {
+        throw new Error('ECONNRESET');
+      },
+      () => errorEnvelopeResponse(503, 'UNAVAILABLE'),
+      () => jsonResponse({ ok: true }),
+    ];
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => responses[calls++]!();
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl,
+      random: () => 0,
+      sleep: ms => {
+        events.push(`sleep ${ms}`);
+        return Promise.resolve();
+      },
+    });
+
+    await client.get('/me', { onRetryWait: delayMs => events.push(`wait ${delayMs}`) });
+
+    // 429 honours Retry-After (2s); the transport and 503 retries back off 500ms, then 1s.
+    expect(events).toEqual([
+      'wait 2000',
+      'sleep 2000',
+      'wait 500',
+      'sleep 500',
+      'wait 1000',
+      'sleep 1000',
+    ]);
+  });
+
+  it('getRun passes onRetryWait through to the request', async () => {
+    const waits: number[] = [];
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () =>
+      calls++ === 0
+        ? errorEnvelopeResponse(503, 'UNAVAILABLE')
+        : jsonResponse({ runId: 'run_1', status: 'running' });
+    const client = makeClient(fetchImpl);
+
+    await client
+      .getRun('run_1', { waitSeconds: 25, onRetryWait: delayMs => waits.push(delayMs) })
+      .catch(() => undefined);
+
+    expect(waits).toEqual([250]);
+  });
+
   it('does not retry transport errors for keyless writes', async () => {
     const fetchImpl = vi.fn(async () => {
       throw new Error('ECONNRESET');
