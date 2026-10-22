@@ -1,9 +1,18 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ApiError } from './errors.js';
 import {
+  assertArtifactPath,
   assertJUnitReportOptions,
   buildJUnitReport,
   durationSecondsBetween,
@@ -442,5 +451,75 @@ describe('skippedJUnitResultsFromSummary', () => {
     expect(skippedJUnitResultsFromSummary(summary, [{ testId: 'ran' }])).toEqual([
       { testId: 'deferred', status: 'skipped', skipReason: 'deferred: run in flight' },
     ]);
+  });
+});
+
+describe('assertArtifactPath', () => {
+  it('returns the resolved path when the parent directory exists', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-artifact-'));
+    expect(assertArtifactPath('summary-file', join(dir, 'summary.json'))).toBe(
+      join(dir, 'summary.json'),
+    );
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('refuses a missing parent directory with the flag name', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-artifact-'));
+    expect(() => assertArtifactPath('summary-file', join(dir, 'nope', 's.json'))).toThrow(ApiError);
+    expect(() => assertArtifactPath('report-file', join(dir, 'nope', 'r.xml'))).toThrow(
+      expect.objectContaining({ details: expect.objectContaining({ field: 'report-file' }) }),
+    );
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reports an unreadable target instead of treating it as absent', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-artifact-'));
+    // a <-> b symlink loop: stat fails with ELOOP, which must not pass as "file not created yet"
+    symlinkSync(join(dir, 'b'), join(dir, 'a'));
+    symlinkSync(join(dir, 'a'), join(dir, 'b'));
+    expect(() => assertArtifactPath('report-file', join(dir, 'a'))).toThrow(
+      expect.objectContaining({
+        details: expect.objectContaining({
+          field: 'report-file',
+          reason: expect.stringMatching(/^cannot access .*ELOOP$/),
+        }),
+      }),
+    );
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'reports a permission error on the parent instead of "does not exist"',
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), 'cli-artifact-'));
+      mkdirSync(join(dir, 'locked', 'out'), { recursive: true });
+      chmodSync(join(dir, 'locked'), 0o000);
+      try {
+        expect(() =>
+          assertArtifactPath('summary-file', join(dir, 'locked', 'out', 's.json')),
+        ).toThrow(
+          expect.objectContaining({
+            details: expect.objectContaining({
+              field: 'summary-file',
+              reason: expect.stringMatching(/^cannot access parent directory .*EACCES$/),
+            }),
+          }),
+        );
+      } finally {
+        chmodSync(join(dir, 'locked'), 0o755);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('refuses an existing directory as the target', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-artifact-'));
+    mkdirSync(join(dir, 'sub'));
+    expect(() => assertArtifactPath('report-file', join(dir, 'sub'))).toThrow(ApiError);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('refuses an empty path', () => {
+    expect(() => assertArtifactPath('summary-file', '')).toThrow(ApiError);
   });
 });
