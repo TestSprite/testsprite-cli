@@ -1,6 +1,5 @@
 /* eslint-disable security/detect-non-literal-fs-filename -- Every filesystem path belongs to the isolated mkdtemp fixture; symlinks deliberately exercise the real CLI boundary. */
 import { execFile } from 'node:child_process';
-import { createServer } from 'node:http';
 import {
   mkdtemp,
   mkdir,
@@ -17,6 +16,7 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 
 const binary = resolve('dist/index.js');
+const fetchFixture = resolve('test/helpers/ci-init-fetch.mjs');
 const execute = promisify(execFile);
 let fixture: string;
 
@@ -34,57 +34,47 @@ describe.skipIf(process.platform === 'win32')('ci init symlink containment', () 
     return { repo, outside, home };
   }
 
-  async function run(cwd: string, home: string, force = false, workflowPath?: string) {
-    const server = createServer((_req, res) => {
-      res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ environments: [{ name: 'staging', isDefault: true }] }));
-    });
-    await new Promise<void>(done => server.listen(0, '127.0.0.1', done));
-    const address = server.address() as { port: number };
-    try {
-      const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home };
-      for (const key of Object.keys(env)) {
-        if (key.startsWith('TESTSPRITE_')) delete env[key];
-      }
-      return await execute(
-        process.execPath,
-        [
-          binary,
-          '--endpoint-url',
-          `http://127.0.0.1:${address.port}`,
-          'ci',
-          'init',
-          'github',
-          '--project',
-          'dummy-project',
-          '--env',
-          'staging',
-          ...(force ? ['--force'] : []),
-          ...(workflowPath ? ['--path', workflowPath] : []),
-        ],
-        {
-          cwd,
-          env: {
-            ...env,
-            TESTSPRITE_API_KEY: 'sk-user-local-only',
-            TESTSPRITE_NO_TELEMETRY: '1',
-            TESTSPRITE_NO_UPDATE_NOTIFIER: '1',
-          },
-          timeout: 10000,
-        },
-      ).then(
-        result => ({ ...result, code: 0 }),
-        error => ({
-          stdout: error.stdout as string,
-          stderr: error.stderr as string,
-          code: error.code as number,
-        }),
-      );
-    } finally {
-      await new Promise<void>((done, reject) =>
-        server.close(error => (error ? reject(error) : done())),
-      );
+  function run(cwd: string, home: string, force = false, workflowPath?: string) {
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home };
+    for (const key of Object.keys(env)) {
+      if (key.startsWith('TESTSPRITE_')) delete env[key];
     }
+    return execute(
+      process.execPath,
+      [
+        '--import',
+        fetchFixture,
+        binary,
+        '--endpoint-url',
+        'http://127.0.0.1:9',
+        'ci',
+        'init',
+        'github',
+        '--project',
+        'dummy-project',
+        '--env',
+        'staging',
+        ...(force ? ['--force'] : []),
+        ...(workflowPath ? ['--path', workflowPath] : []),
+      ],
+      {
+        cwd,
+        env: {
+          ...env,
+          TESTSPRITE_API_KEY: 'sk-user-local-only',
+          TESTSPRITE_NO_TELEMETRY: '1',
+          TESTSPRITE_NO_UPDATE_NOTIFIER: '1',
+        },
+        timeout: 10000,
+      },
+    ).then(
+      result => ({ ...result, code: 0 }),
+      error => ({
+        stdout: error.stdout as string,
+        stderr: error.stderr as string,
+        code: error.code as number,
+      }),
+    );
   }
 
   for (const [location, force] of [
