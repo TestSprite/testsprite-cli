@@ -885,6 +885,27 @@ describe('ci run — pull request context and single-execution admission', () =>
     expect(h.deps.fetchImpl).not.toHaveBeenCalled();
   });
 
+  it('refuses a preview behind Vercel Deployment Protection before dispatching', async () => {
+    const h = harness();
+    // A literal IP skips the probe's DNS step. The redirect is what a
+    // protected preview answers a visitor with no Vercel session.
+    const protectedPreview = 'http://203.0.113.10';
+    const original = h.deps.fetchImpl.getMockImplementation()!;
+    h.deps.fetchImpl.mockImplementation(async (input, init) => {
+      if (String(input) === protectedPreview) {
+        return new Response(null, {
+          status: 302,
+          headers: { location: 'https://vercel.com/sso-api?url=preview&nonce=1' },
+        });
+      }
+      return original(input, init);
+    });
+    await expect(
+      runCiRun({ ...h.opts, targetUrl: protectedPreview }, h.deps),
+    ).rejects.toMatchObject({ exitCode: 5, details: { reason: 'target-protected' } });
+    expect(h.dispatches()).toEqual([]);
+  });
+
   it('wires --target-url and --skip-preflight through Commander', async () => {
     const h = harness();
     const program = new Command().addCommand(createCiCommand(h.deps));
