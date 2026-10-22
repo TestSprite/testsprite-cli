@@ -7345,6 +7345,46 @@ describe('runCreate', () => {
       false,
     );
   });
+
+  it('Fix 4 — emits debug log when duplicate-name advisory lookup fails in debug mode', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('// test code');
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'GET' && url.includes('/tests')) {
+        return {
+          status: 403,
+          body: {
+            error: {
+              code: 'AUTH_FORBIDDEN',
+              message: 'Forbidden',
+              nextAction: '',
+              requestId: 'r1',
+              details: {},
+            },
+          },
+        };
+      }
+      return { body: SAMPLE_RESPONSE };
+    });
+
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: true,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'another test',
+        codeFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+    );
+
+    expect(
+      stderrLines.some(l => l.includes('[debug] duplicate-name advisory lookup failed: Forbidden')),
+    ).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
