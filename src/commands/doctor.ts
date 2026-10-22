@@ -33,6 +33,7 @@ import {
   CLIError,
   InterruptError,
   RequestTimeoutError,
+  TransportError,
   localValidationError,
 } from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
@@ -43,6 +44,7 @@ import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '..
 import type { MeIdentityWire } from '../lib/response-schemas.js';
 import { ME_IDENTITY_SCHEMA } from '../lib/response-schemas.js';
 import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
+import { isTransportFailure } from '../lib/transport-failure.js';
 import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 import { VERSION } from '../version.js';
 import { SUPPORTED_NODE_RANGE, shouldRejectNodeVersion } from '../version-guard.js';
@@ -175,6 +177,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
       hasKey,
       endpointOk: endpointCheck.status === 'ok',
       config,
+      reachedApi: connectivity.reachedApi,
     }),
   );
 
@@ -292,13 +295,25 @@ async function checkConnectivity(
   v3Enabled?: boolean;
   organizations?: CliOrgSummary[];
   org?: CliOrgBinding;
+  /** False when the request never produced an answer from the API. */
+  reachedApi: boolean;
 }> {
   const name = 'Connectivity';
-  if (opts.dryRun) return { check: { name, status: 'warn', detail: 'skipped under --dry-run' } };
+  if (opts.dryRun)
+    return {
+      check: { name, status: 'warn', detail: 'skipped under --dry-run' },
+      reachedApi: false,
+    };
   if (!ctx.hasKey)
-    return { check: { name, status: 'warn', detail: 'skipped; no API key to test with' } };
+    return {
+      check: { name, status: 'warn', detail: 'skipped; no API key to test with' },
+      reachedApi: false,
+    };
   if (!ctx.endpointOk)
-    return { check: { name, status: 'warn', detail: 'skipped; endpoint URL is invalid' } };
+    return {
+      check: { name, status: 'warn', detail: 'skipped; endpoint URL is invalid' },
+      reachedApi: false,
+    };
 
   try {
     const client = makeHttpClient(opts, {
@@ -316,6 +331,7 @@ async function checkConnectivity(
       v3Enabled: me.v3Enabled,
       organizations: me.organizations,
       org: me.org,
+      reachedApi: true,
     };
   } catch (error) {
     if (error instanceof InterruptError) throw error;
@@ -325,9 +341,29 @@ async function checkConnectivity(
         error.code === 'AUTH_INVALID' ||
         error.code === 'AUTH_FORBIDDEN'
       ) {
-        return { check: { name, status: 'fail', detail: `API key rejected (${error.code})` } };
+        return {
+          check: { name, status: 'fail', detail: `API key rejected (${error.code})` },
+          reachedApi: true,
+        };
       }
-      return { check: { name, status: 'fail', detail: `GET /me failed (${error.code})` } };
+      // A named transport failure never reached the API (TLS interception, DNS,
+      // refused port, proxy block page). Print its actual cause instead of a
+      // bare UNAVAILABLE code, and let the tunnel check know not to blame the
+      // endpoint for a request that never arrived.
+      if (isTransportFailure(error)) {
+        return {
+          check: { name, status: 'fail', detail: `GET /me failed: ${error.message}` },
+          reachedApi: false,
+        };
+      }
+      return {
+        check: { name, status: 'fail', detail: `GET /me failed (${error.code})` },
+        // A fetch rejection is a TransportError with no HTTP status. Local
+        // validation errors (e.g. a malformed key) are not transport failures:
+        // rerunning the tunnel check surfaces the same local error instead of
+        // hiding it behind a skip. An edge 502/504 carries its status.
+        reachedApi: !(error instanceof TransportError) || error.httpStatus !== undefined,
+      };
     }
     return {
       check: {
@@ -335,6 +371,7 @@ async function checkConnectivity(
         status: 'fail',
         detail: `GET /me failed (${error instanceof Error ? error.message : String(error)})`,
       },
+      reachedApi: false,
     };
   }
 }
@@ -357,12 +394,21 @@ async function checkConnectivity(
 async function checkLocalTunnel(
   opts: CommonOptions,
   deps: DoctorDeps,
-  ctx: { hasKey: boolean; endpointOk: boolean; config: Config },
+  ctx: { hasKey: boolean; endpointOk: boolean; config: Config; reachedApi: boolean },
 ): Promise<DoctorCheck> {
   const name = 'Local tunnel';
   if (opts.dryRun) return { name, status: 'warn', detail: 'skipped under --dry-run' };
   if (!ctx.hasKey) return { name, status: 'warn', detail: 'skipped; no API key to test with' };
   if (!ctx.endpointOk) return { name, status: 'warn', detail: 'skipped; endpoint URL is invalid' };
+  // If GET /me never reached the API, this probe cannot reach it either. The
+  // old fall-through blamed the endpoint for not supporting tunnels — a
+  // misleading diagnosis of a TLS/DNS/proxy failure. Say what happened instead.
+  if (!ctx.reachedApi)
+    return {
+      name,
+      status: 'warn',
+      detail: 'skipped; the connectivity check did not reach TestSprite',
+    };
 
   const controller = new AbortController();
   const shutdownSignal = deps.shutdownSignal ?? globalShutdown.signal;

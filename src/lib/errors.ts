@@ -418,16 +418,34 @@ export function localValidationError(
  * Network/transport failure not associated with a server envelope. Treated
  * as `UNAVAILABLE` for exit-code purposes per design §8.2.
  */
+export interface TransportErrorOptions {
+  /** Cause-specific remediation; falls back to the generic availability text. */
+  nextAction?: string;
+  /**
+   * Machine-readable cause, e.g. `{ reason: 'tls_untrusted', cause:
+   * 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' }`. Every transport failure names what
+   * went wrong so `--output json` consumers and `doctor` can tell a TLS trust
+   * problem from a DNS typo or a proxy block page.
+   */
+  details?: Record<string, unknown>;
+  /** HTTP status when a response did arrive (e.g. an edge 502/504). */
+  httpStatus?: number;
+}
+
 export class TransportError extends ApiError {
-  constructor(message: string, requestId = 'local') {
-    super({
-      code: 'UNAVAILABLE',
-      message,
-      nextAction:
-        'Service is temporarily unavailable. The CLI retries with exponential backoff; if this persists, report it.',
-      requestId,
-      details: {},
-    });
+  constructor(message: string, requestId = 'local', options: TransportErrorOptions = {}) {
+    super(
+      {
+        code: 'UNAVAILABLE',
+        message,
+        nextAction:
+          options.nextAction ??
+          'Service is temporarily unavailable. The CLI retries with exponential backoff; if this persists, report it.',
+        requestId,
+        details: options.details ?? {},
+      },
+      options.httpStatus,
+    );
     this.name = 'TransportError';
   }
 }

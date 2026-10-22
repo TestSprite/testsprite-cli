@@ -397,6 +397,75 @@ describe('runDoctor — failing checks exit non-zero', () => {
     expect(capture.stdout.join('\n')).toContain('GET /me failed (NOT_FOUND)');
   });
 
+  it('a TLS trust failure names NODE_EXTRA_CA_CERTS and does not blame tunnels', async () => {
+    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const fetchImpl = vi.fn(async () => {
+      const cause = Object.assign(new Error('self-signed certificate in certificate chain'), {
+        code: 'SELF_SIGNED_CERT_IN_CHAIN',
+      });
+      throw new TypeError('fetch failed', { cause });
+    }) as unknown as DoctorDeps['fetchImpl'];
+    const rejection = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      { ...healthyDeps(credentialsPath, { fetchImpl }), ...deps },
+    ).catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(CLIError);
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('GET /me failed:');
+    expect(out).toContain('NODE_EXTRA_CA_CERTS');
+    expect(out).toContain('skipped; the connectivity check did not reach TestSprite');
+    expect(out).not.toContain('not available on this endpoint');
+    // Connectivity failed: the tunnel probe must not fire a second doomed request.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('an unclassified fetch rejection does not blame the tunnel endpoint', async () => {
+    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const fetchImpl = vi.fn(async () => {
+      const cause = Object.assign(new Error('connect EUNKNOWN'), { code: 'EUNKNOWN' });
+      throw new TypeError('fetch failed', { cause });
+    }) as unknown as DoctorDeps['fetchImpl'];
+    const rejection = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      { ...healthyDeps(credentialsPath, { fetchImpl }), ...deps },
+    ).catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(CLIError);
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('GET /me failed (UNAVAILABLE)');
+    expect(out).toContain('skipped; the connectivity check did not reach TestSprite');
+    expect(out).not.toContain('not available on this endpoint');
+    // Four connectivity attempts and no fifth tunnel probe.
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+
+  it('an HTML 403 block page is not reported as a rejected API key', async () => {
+    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(
+          '<!doctype html><html><head><title>Website blocked by your organization</title></head></html>',
+          { status: 403, headers: { 'content-type': 'text/html; charset=utf-8' } },
+        ),
+    ) as unknown as DoctorDeps['fetchImpl'];
+    const rejection = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      { ...healthyDeps(credentialsPath, { fetchImpl }), ...deps },
+    ).catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(CLIError);
+    const out = capture.stdout.join('\n');
+    expect(out).not.toContain('API key rejected');
+    expect(out).toContain('Website blocked by your organization');
+    expect(out).toContain('skipped; the connectivity check did not reach TestSprite');
+    expect(out).not.toContain('not available on this endpoint');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
   it('an excluded in-range Node runtime fails the Node.js check', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
