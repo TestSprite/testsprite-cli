@@ -22,7 +22,9 @@ import {
   parseSkillMarker,
   pathFor,
   renderForTarget,
+  renderLegacyOwnFileWithMarker,
   renderOwnFileWithMarker,
+  yamlScalar,
   type AgentTarget,
 } from './agent-targets.js';
 
@@ -55,6 +57,44 @@ function parseFrontmatterDescription(content: string): string | undefined {
     }
   }
   return undefined;
+}
+
+/**
+ * Strict parser for the single-line `key: scalar` frontmatter our wrappers
+ * emit. Unlike parseFrontmatterDescription above, it rejects a plain scalar
+ * carrying YAML structural indicators (`: `, ` #`, trailing `:`), which is the
+ * v0.15.0 failure mode: YAML readers see the `: ` as a nested key separator
+ * and reject the whole block.
+ */
+function parseFrontmatterBlock(content: string): Record<string, string> {
+  const match = /^---\n([\s\S]*?)\n---\n/.exec(content);
+  if (!match) throw new Error('missing frontmatter block');
+  const fields: Record<string, string> = {};
+  for (const line of match[1]!.split('\n')) {
+    const kv = /^([A-Za-z][A-Za-z0-9_-]*): (.+)$/.exec(line);
+    if (!kv) throw new Error(`not a single-line key/value pair: ${line}`);
+    fields[kv[1]!] = parseFrontmatterScalar(kv[2]!);
+  }
+  return fields;
+}
+
+function parseFrontmatterScalar(raw: string): string {
+  if (raw.startsWith('"')) {
+    if (!raw.endsWith('"') || raw.length === 1) {
+      throw new Error(`unterminated double-quoted scalar: ${raw}`);
+    }
+    return JSON.parse(raw) as string;
+  }
+  if (raw.startsWith("'")) {
+    if (!raw.endsWith("'") || raw.length === 1) {
+      throw new Error(`unterminated single-quoted scalar: ${raw}`);
+    }
+    return raw.slice(1, -1).replace(/''/g, "'");
+  }
+  if (/:\s/.test(raw) || /\s#/.test(raw) || raw.endsWith(':')) {
+    throw new Error(`plain scalar carries a YAML indicator: ${raw}`);
+  }
+  return raw;
 }
 
 // Load skill-template.md from repo root (vitest cwd = repo root).
@@ -981,6 +1021,80 @@ describe('render marker placement (own-file targets)', () => {
     expect(() => renderOwnFileWithMarker('claude', 'testsprite-unknown', 'marker')).toThrow(
       'unknown skill',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Frontmatter must parse as YAML for EVERY skill on EVERY own-file target.
+// Regression: the v0.15.0 `testsprite-ci` description contains `on: `-style
+// text, and an unquoted interpolation made Kiro/Cursor/Windsurf/Copilot
+// frontmatter unparseable.
+// ---------------------------------------------------------------------------
+describe('own-file frontmatter is valid YAML for every skill', () => {
+  const FRONTMATTER_TARGETS: AgentTarget[] = [
+    'claude',
+    'antigravity',
+    'cursor',
+    'kiro',
+    'windsurf',
+    'copilot',
+  ];
+  const NAME_TARGETS: AgentTarget[] = ['claude', 'antigravity', 'kiro'];
+
+  for (const target of FRONTMATTER_TARGETS) {
+    for (const skill of Object.keys(SKILLS)) {
+      it(`${target} / ${skill}: parses and round-trips the description`, () => {
+        const fields = parseFrontmatterBlock(renderForTarget(target, skill).content);
+        expect(fields.description).toBe(SKILLS[skill]!.description);
+        if (NAME_TARGETS.includes(target)) {
+          expect(fields.name).toBe(SKILLS[skill]!.name);
+        }
+      });
+    }
+  }
+
+  it('quotes a description that is unsafe as a plain scalar', () => {
+    const fields = parseFrontmatterBlock(renderForTarget('claude', 'testsprite-ci').content);
+    expect(fields.description).toBe(SKILLS['testsprite-ci']!.description);
+  });
+
+  it('keeps plain-scalar-safe descriptions unquoted (byte-identical renders)', () => {
+    for (const skill of ['testsprite-verify', 'testsprite-onboard']) {
+      expect(renderForTarget('claude', skill).content).toContain(
+        `description: ${SKILLS[skill]!.description}`,
+      );
+    }
+  });
+
+  it('quotes values YAML would resolve to a non-string type', () => {
+    for (const value of [
+      'true',
+      'False',
+      'null',
+      '~',
+      '123',
+      '-1.5e3',
+      '0x1f',
+      '.inf',
+      '2026-10-21',
+    ]) {
+      expect(yamlScalar(value)).toBe(JSON.stringify(value));
+    }
+  });
+
+  it('leaves ordinary one-line text as a plain scalar', () => {
+    for (const value of ['TestSprite verification', '123abc', 'on call', 'v0.15.0']) {
+      expect(yamlScalar(value)).toBe(value);
+    }
+  });
+
+  it('rejects the v0.15.0 unquoted render (the parser catches the regression)', () => {
+    const legacy = renderLegacyOwnFileWithMarker(
+      'claude',
+      'testsprite-ci',
+      buildSkillMarker('testsprite-ci', ownFileBodyFor('claude', 'testsprite-ci')),
+    );
+    expect(() => parseFrontmatterBlock(legacy)).toThrow(/YAML indicator/);
   });
 });
 

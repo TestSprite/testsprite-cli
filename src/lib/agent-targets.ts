@@ -36,7 +36,7 @@ export interface TargetSpec {
    * No-op for cline (body verbatim) and codex (managed-section authors plain
    * Markdown with no frontmatter).
    */
-  wrap(name: string, description: string, body: string): string;
+  wrap(name: string, description: string, body: string, quote?: boolean): string;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,12 +137,54 @@ export const SKILL_DESCRIPTION = SKILLS['testsprite-verify']!.description;
 // Wrappers
 // ---------------------------------------------------------------------------
 
-function wrapSkill(name: string, description: string, body: string): string {
-  return `---\nname: ${name}\ndescription: ${description}\n---\n\n${body}\n`;
+/**
+ * True when `value` can be emitted as a YAML plain scalar without changing its
+ * meaning. Anything else (notably a `: ` sequence, as in
+ * `` `on: deployment_status` ``) must be quoted, or YAML readers parse it as
+ * nested mapping syntax and reject the whole frontmatter block.
+ */
+function isPlainScalarSafe(value: string): boolean {
+  if (value === '' || value !== value.trim()) return false;
+  // Leading indicators reserve a scalar's first character (also applies to
+  // characters YAML reserves only at the start, like backtick and `%`).
+  if (/^[-?:,[\]{}#&*!|>'"%@`]/.test(value)) return false;
+  // `: ` starts a mapping value, ` #` starts a comment, and a trailing `:`
+  // is read as an empty value.
+  if (/:\s/.test(value) || /\s#/.test(value) || value.endsWith(':')) return false;
+  // Control characters (newlines, tabs) cannot appear in a single-line scalar.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1f\x7f]/.test(value)) return false;
+  // A plain scalar resolving to a non-string type (boolean, null, number,
+  // timestamp) would violate this helper's string contract, so quote it.
+  if (/^(?:~|null|true|false|yes|no|on|off)$/i.test(value)) return false;
+  if (
+    /^[-+]?(?:0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+|\d[\d_]*(?:\.[\d_]*)?(?:[eE][-+]?\d+)?|\.(?:inf|nan))$/i.test(
+      value,
+    )
+  ) {
+    return false;
+  }
+  if (/^\d{4}-\d{1,2}-\d{1,2}(?:$|[Tt ])/.test(value)) return false;
+  return true;
 }
 
-function wrapMdc(_name: string, description: string, body: string): string {
-  return `---\ndescription: ${description}\nalwaysApply: false\n---\n\n${body}\n`;
+/**
+ * Emit a frontmatter scalar: unchanged when a plain scalar is safe, otherwise a
+ * double-quoted YAML string (JSON escapes are a subset of YAML's). Keeps the
+ * verify/onboard renders byte-identical while making any description safe.
+ */
+export function yamlScalar(value: string): string {
+  return isPlainScalarSafe(value) ? value : JSON.stringify(value);
+}
+
+function wrapSkill(name: string, description: string, body: string, quote = true): string {
+  const value = quote ? yamlScalar(description) : description;
+  return `---\nname: ${name}\ndescription: ${value}\n---\n\n${body}\n`;
+}
+
+function wrapMdc(_name: string, description: string, body: string, quote = true): string {
+  const value = quote ? yamlScalar(description) : description;
+  return `---\ndescription: ${value}\nalwaysApply: false\n---\n\n${body}\n`;
 }
 
 /**
@@ -153,8 +195,9 @@ function wrapMdc(_name: string, description: string, body: string): string {
  * relevant — exactly the on-demand activation these skills want. (The other
  * triggers are `always_on`, `manual`, and `glob`.)
  */
-function wrapWindsurf(_name: string, description: string, body: string): string {
-  return `---\ntrigger: model_decision\ndescription: ${description}\n---\n\n${body}\n`;
+function wrapWindsurf(_name: string, description: string, body: string, quote = true): string {
+  const value = quote ? yamlScalar(description) : description;
+  return `---\ntrigger: model_decision\ndescription: ${value}\n---\n\n${body}\n`;
 }
 
 /**
@@ -166,8 +209,9 @@ function wrapWindsurf(_name: string, description: string, body: string): string 
  * (there is no on-demand "model decides" mode for Copilot instruction files, so
  * always-apply is the correct idiom). `description` is surfaced in Copilot's UI.
  */
-function wrapCopilot(_name: string, description: string, body: string): string {
-  return `---\ndescription: ${description}\napplyTo: '**'\n---\n\n${body}\n`;
+function wrapCopilot(_name: string, description: string, body: string, quote = true): string {
+  const value = quote ? yamlScalar(description) : description;
+  return `---\ndescription: ${value}\napplyTo: '**'\n---\n\n${body}\n`;
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +562,50 @@ export function renderOwnFileWithMarker(
     spec.wrap(skillSpec.name, skillSpec.description, resolvedBody),
     markerLine,
   );
+}
+
+/**
+ * Render an own-file artifact the way v0.15.0 did: the description interpolated
+ * as an unquoted plain scalar. Kept only so install/status can recognise those
+ * files as pristine-but-outdated instead of user edits — never written.
+ */
+export function renderLegacyOwnFileWithMarker(
+  target: AgentTarget,
+  skill: string,
+  markerLine: string,
+  body?: string,
+): string {
+  const spec = TARGETS[target];
+  if (spec.mode !== 'own-file') {
+    throw new Error(`renderLegacyOwnFileWithMarker: ${target} is not an own-file target`);
+  }
+  const skillSpec = SKILLS[skill];
+  if (!skillSpec) throw new Error(`unknown skill: ${skill}`);
+  const resolvedBody = body !== undefined ? body : ownFileBodyFor(target, skill);
+  return injectMarkerLine(
+    spec.wrap(skillSpec.name, skillSpec.description, resolvedBody, false),
+    markerLine,
+  );
+}
+
+/**
+ * True when `content` is exactly what v0.15.0 wrote for this (target, skill):
+ * the marker's hash still matches the canonical body, but the bytes only match
+ * the legacy unquoted render. Such files are stale installs, not user edits, so
+ * a plain `agent install` may repair them without `--force`.
+ */
+export function isLegacyOwnFileRender(
+  target: AgentTarget,
+  skill: string,
+  content: string,
+  body?: string,
+): boolean {
+  if (TARGETS[target].mode !== 'own-file') return false;
+  const marker = parseSkillMarker(content);
+  if (marker === null) return false;
+  const resolvedBody = body !== undefined ? body : ownFileBodyFor(target, skill);
+  if (marker.hash12 !== bodyHash12(resolvedBody)) return false;
+  return content === renderLegacyOwnFileWithMarker(target, skill, marker.line, resolvedBody);
 }
 
 /**
