@@ -1,6 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ApiError } from './errors.js';
 import {
@@ -401,6 +401,20 @@ describe('writeJUnitReportFile', () => {
       exitCode: 5,
     });
   });
+
+  it.each(['/', '\\'])(
+    'rejects a relative directory path ending in %s and writes nothing',
+    async sep => {
+      const dir = mkdtempSync(join(tmpdir(), 'junit-report-file-sep-'));
+      const target = `${relative(process.cwd(), join(dir, 'reports'))}${sep}`;
+      await expect(writeJUnitReportFile(target, '<testsuites/>')).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+      });
+      expect(readdirSync(dir)).toEqual([]);
+      rmSync(dir, { recursive: true, force: true });
+    },
+  );
 
   it('rejects parent that is a file', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'junit-report-file-parent-'));

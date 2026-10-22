@@ -6237,6 +6237,8 @@ export async function runScaffold(
 
   if (opts.out !== undefined) {
     const resolved = isAbsolute(opts.out) ? opts.out : resolve(process.cwd(), opts.out);
+    // Before the overwrite check: `--out existing-dir/` is a directory, not a file that already exists.
+    assertOutIsFilePath(opts.out);
     // Never clobber silently: scaffolds are starting points the user edits, so
     // an accidental re-run must not erase their work. --force opts in.
     if (!opts.force && existsSync(resolved)) {
@@ -16461,6 +16463,16 @@ interface FileSink {
  * `resolved` directly means the real `--out` file is never truncated
  * up front, see `closeOutputFile` for the commit step.
  */
+/**
+ * Check the RAW path: `resolve()` drops a trailing separator, and on
+ * Windows the separator is usually `\`.
+ */
+function assertOutIsFilePath(rawPath: string): void {
+  if (/[\\/]$/.test(rawPath)) {
+    throw localValidationError('out', 'must point to a file, not a directory');
+  }
+}
+
 function openOutputFile(rawPath: string): FileSink {
   if (typeof rawPath !== 'string' || rawPath.length === 0) {
     throw localValidationError('out', 'must be a non-empty file path');
@@ -16469,9 +16481,7 @@ function openOutputFile(rawPath: string): FileSink {
   // Defensive: reject obviously-bad paths up front (a directory string
   // would fail later with EISDIR; that's a clearer 5/VALIDATION_ERROR
   // surface than letting it crash mid-write with TransportError).
-  if (resolved.endsWith('/')) {
-    throw localValidationError('out', 'must point to a file, not a directory');
-  }
+  assertOutIsFilePath(rawPath);
   // Validate the parent dir synchronously so a missing or non-directory
   // parent surfaces as exit 5 / VALIDATION_ERROR rather than exit 1 /
   // TRANSPORT_ERROR. Without this, an ENOENT/ENOTDIR fires asynchronously
