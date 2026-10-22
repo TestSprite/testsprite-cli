@@ -753,6 +753,22 @@ describe('ci run — pull request context and single-execution admission', () =>
     expect(existsSync(h.deps.env.GITHUB_STEP_SUMMARY)).toBe(false);
   });
 
+  it('deployment_status: a draft pull request is gated, not skipped (no ready_for_review re-run follows)', async () => {
+    const h = harness(undefined, 'passed', {
+      pulls: [{ number: 7, state: 'open', draft: true, head: { sha: SHA, ref: 'feat/y' } }],
+    });
+    await runCiRun(
+      { ...h.opts, environment: 'staging', targetUrl: PREVIEW, skipPreflight: true },
+      githubEnv(h, 'deployment_status', { deployment: { sha: SHA } }, { GITHUB_TOKEN: 'ghs_x' }),
+    );
+    expect(h.dispatches()).toHaveLength(1);
+    expect(h.dispatches()[0]!.body).toMatchObject({
+      previewName: 'github-pr-7',
+      githubTrigger: { prNumber: 7, commitSha: SHA },
+    });
+    expect(h.stderr.some(s => s.includes('Skipping draft'))).toBe(false);
+  });
+
   it('deployment_status: finds the PR by commit with GITHUB_TOKEN; none → notice, nothing to gate', async () => {
     const found = harness(undefined, 'passed', {
       pulls: [{ number: 7, state: 'open', draft: false, head: { sha: SHA, ref: 'feat/y' } }],

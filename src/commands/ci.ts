@@ -1331,7 +1331,12 @@ export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise
   let previewName: string | undefined;
   let githubTrigger: CiGithubTrigger | undefined;
   if (github.kind === 'pull_request') {
-    if (github.draft) {
+    // Only a pull_request event comes back for this PR on `ready_for_review`. A
+    // deployment_status event is not repeated when a draft is marked ready, so
+    // skipping it here would leave a green check on the head commit that no
+    // later event replaces. Its preview already exists: gate it.
+    const event = env.GITHUB_EVENT_NAME;
+    if (github.draft && (event === 'pull_request' || event === 'pull_request_target')) {
       recordTelemetryExtras({ ciRunOutcome: 'skipped_draft' });
       skipCiRun(
         `Skipping draft pull request #${github.trigger.prNumber}; the gate runs once it is ready for review.`,
