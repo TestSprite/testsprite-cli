@@ -136,7 +136,8 @@ export function parseCredentials(content: string): CredentialsFile {
   for (const rawLine of content.split('\n')) {
     const line = rawLine.trim();
     if (line === '' || line.startsWith('#') || line.startsWith(';')) continue;
-    const sectionMatch = /^\[([^\]]+)\]$/.exec(line);
+    // A header may carry a trailing comment (`[prod]  # production account`).
+    const sectionMatch = /^\[([^\]]+)\]\s*(?:[#;].*)?$/.exec(line);
     if (sectionMatch) {
       const sectionName = sectionMatch[1]!.trim();
       const existing = result[sectionName];
@@ -147,6 +148,13 @@ export function parseCredentials(content: string): CredentialsFile {
         result[sectionName] = newEntry;
         currentEntry = newEntry;
       }
+      continue;
+    }
+    // Any other `[`-line is a header we can't read. Its keys must not land in
+    // the section above it (that silently swapped one profile's key into
+    // another, and the next write lost the original key).
+    if (line.startsWith('[')) {
+      currentEntry = null;
       continue;
     }
     if (currentEntry === null) continue;

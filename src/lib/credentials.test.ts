@@ -90,6 +90,30 @@ unknown_key = ignored
 `;
     expect(parseCredentials(content)).toEqual({ default: { apiKey: 'sk-real' } });
   });
+
+  it('reads a section header that carries a trailing comment', () => {
+    const content = `[default]
+api_key = sk-default
+[prod]  # production account
+api_key = sk-prod
+[dev] ; dev account
+api_key = sk-dev
+`;
+    expect(parseCredentials(content)).toEqual({
+      default: { apiKey: 'sk-default' },
+      prod: { apiKey: 'sk-prod' },
+      dev: { apiKey: 'sk-dev' },
+    });
+  });
+
+  it('never moves keys under an unreadable header into the section above it', () => {
+    const content = `[default]
+api_key = sk-default
+[prod] stray text
+api_key = sk-prod
+`;
+    expect(parseCredentials(content)).toEqual({ default: { apiKey: 'sk-default' } });
+  });
 });
 
 describe('serializeCredentials', () => {
