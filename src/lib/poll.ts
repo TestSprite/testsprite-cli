@@ -108,6 +108,17 @@ export interface PollOptions {
 const LONG_POLL_WAIT_SECONDS = 25;
 /** Backoff schedule for the non-long-poll fallback path (ms). */
 const BACKOFF_SCHEDULE_MS = [2000, 4000, 8000, 15000];
+/**
+ * Minimum spacing between two long-poll reads (ms). A `?waitSeconds` read is
+ * only re-issued immediately because the server is expected to hold it until
+ * the run is terminal or the window elapses. A non-terminal answer that comes
+ * back sooner than this (a server or proxy that accepts but ignores
+ * `waitSeconds`, or one that only holds some statuses) would otherwise turn the
+ * loop into back-to-back GETs for the whole `--timeout` — tripping the rate
+ * limit and ending a healthy wait with RATE_LIMITED. Matches the first rung of
+ * the backoff schedule, so the fallback mode's pace is the floor here too.
+ */
+export const LONG_POLL_MIN_INTERVAL_MS = BACKOFF_SCHEDULE_MS[0]!;
 
 /**
  * Poll `GET /api/cli/v1/runs/{runId}` until the run reaches a terminal
@@ -258,6 +269,7 @@ async function pollIterations(
     const remainingSeconds = Math.ceil(remainingMs / 1000);
 
     let run: RunResponse;
+    const requestStartedMs = now;
     try {
       if (useBackoff) {
         run = await client.getRun(runId, { signal: sessionSignal });
@@ -382,11 +394,19 @@ async function pollIterations(
     }
 
     // Long-poll path: server already waited up to waitSeconds for us;
-    // loop immediately (no extra client-side sleep).
+    // loop immediately (no extra client-side sleep) — unless it answered
+    // faster than LONG_POLL_MIN_INTERVAL_MS, i.e. it did not hold the read.
+    // Pace the remainder so a non-holding server gets at most one read per
+    // interval instead of a tight request loop.
     if (!useBackoff) {
       // Check deadline before looping.
-      if (Date.now() >= deadlineMs) {
+      const afterMs = Date.now();
+      if (afterMs >= deadlineMs) {
         throw new TimeoutError(runId, timeoutSeconds);
+      }
+      const heldMs = afterMs - requestStartedMs;
+      if (heldMs < LONG_POLL_MIN_INTERVAL_MS) {
+        await sleep(Math.min(LONG_POLL_MIN_INTERVAL_MS - heldMs, deadlineMs - afterMs));
       }
       continue;
     }
