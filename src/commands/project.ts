@@ -24,6 +24,7 @@ import {
 } from '../lib/local-target.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { readSecretFileGuarded } from '../lib/secret-file.js';
+import { terminalWidth } from '../lib/ticker.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
@@ -1923,12 +1924,12 @@ function makeOutput(mode: OutputMode, deps: ProjectDeps): Output {
 const PROJECT_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliProject>> = [
   {
     header: 'ID',
-    width: rows => Math.max(2, ...rows.map(project => project.id.length)),
+    width: rows => Math.max(2, ...rows.map(project => terminalWidth(project.id))),
     render: project => project.id,
   },
   {
     header: 'NAME',
-    width: rows => Math.max(4, ...rows.map(project => project.name.length)),
+    width: rows => Math.max(4, ...rows.map(project => terminalWidth(project.name))),
     render: project => project.name,
   },
   { header: 'TYPE', width: 8, render: project => project.type },
@@ -1936,22 +1937,23 @@ const PROJECT_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliProject>> = [
   {
     header: 'ORG',
     width: rows =>
-      Math.max(3, ...rows.map(project => (project.orgName ?? project.orgId ?? '').length)),
+      Math.max(3, ...rows.map(project => terminalWidth(project.orgName ?? project.orgId ?? ''))),
     render: project => project.orgName ?? project.orgId ?? '',
   },
   {
     header: 'URL',
-    width: rows => Math.max(3, ...rows.map(project => renderProjectUrl(project).length)),
+    width: rows => Math.max(3, ...rows.map(project => terminalWidth(renderProjectUrl(project)))),
     render: renderProjectUrl,
   },
   {
     header: 'CREATED',
-    width: rows => Math.max(7, ...rows.map(project => project.createdAt.length)),
+    width: rows => Math.max(7, ...rows.map(project => terminalWidth(project.createdAt))),
     render: project => project.createdAt,
   },
   {
     header: 'DEFAULT ENV',
-    width: rows => Math.max(11, ...rows.map(project => (project.defaultEnvironment ?? '-').length)),
+    width: rows =>
+      Math.max(11, ...rows.map(project => terminalWidth(project.defaultEnvironment ?? '-'))),
     render: project => project.defaultEnvironment ?? '-',
   },
   {
@@ -1982,7 +1984,13 @@ function defaultProjectListColumns(
   );
 }
 
-function renderProjectListText(
+/**
+ * Render `project list`'s text table over a fetched page. Falls back to the
+ * default column set (ORG/URL included only when the data carries them).
+ * Exported for direct unit coverage of the CJK display-width regression
+ * (#369): later columns must not shift when a project name is full-width.
+ */
+export function renderProjectListText(
   page: Page<CliProject>,
   options: { columns?: string; noHeader?: boolean } = {},
 ): string {

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../lib/errors.js';
+import { terminalWidth } from '../lib/ticker.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import {
   type CliProject,
@@ -10,6 +11,7 @@ import {
   type CliDeleteProjectResponse,
   type CliUpdateProjectResponse,
   createProjectCommand,
+  renderProjectListText,
   runAutoAuth,
   runCreate,
   runCredential,
@@ -3046,4 +3048,35 @@ describe('first-suite signpost for a `--local` project', () => {
       expect(stderr).not.toContain('[hint]');
     },
   );
+});
+
+describe('renderProjectListText — CJK display-width regression (#369)', () => {
+  const cjkProject: CliProject = {
+    ...PROJECT_FIXTURE,
+    id: 'project_cjk',
+    name: '登录支付验证系统',
+  };
+  const page = { items: [PROJECT_FIXTURE, cjkProject], nextToken: null };
+
+  // String indexes can't assert alignment (a CJK row carries fewer UTF-16
+  // units for the same terminal cells); compare the DISPLAY width of the
+  // prefix before the column instead.
+  const offsetOf = (line: string, needle: string): number => {
+    const idx = line.indexOf(needle);
+    expect(idx).toBeGreaterThan(-1);
+    return terminalWidth(line.slice(0, idx));
+  };
+
+  it('keeps later columns aligned when a project name is full-width', () => {
+    const lines = renderProjectListText(page).split('\n');
+    expect(lines.length).toBe(3);
+    expect(offsetOf(lines[1]!, 'frontend')).toBe(offsetOf(lines[2]!, 'frontend'));
+    expect(offsetOf(lines[0]!, 'TYPE')).toBe(offsetOf(lines[1]!, 'frontend'));
+  });
+
+  it('keeps alignment with --columns reordering and CJK names', () => {
+    const lines = renderProjectListText(page, { columns: 'type,name', noHeader: true }).split('\n');
+    expect(lines.length).toBe(2);
+    expect(offsetOf(lines[0]!, PROJECT_FIXTURE.name)).toBe(offsetOf(lines[1]!, cjkProject.name));
+  });
 });
