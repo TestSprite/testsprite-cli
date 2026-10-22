@@ -14,7 +14,12 @@ import type { RunResponse } from './runs.types.js';
 import { Output } from './output.js';
 import { emitCiArtifacts, summarizeAcceptedPayload } from './gh-output.js';
 import { buildJUnitReport, writeJUnitReportFile } from './junit-report.js';
-import { pollRunUntilTerminal, TimeoutError, isTerminalStatus } from './poll.js';
+import {
+  pollRunUntilTerminal,
+  TimeoutError,
+  isTerminalStatus,
+  UnreachableAtDeadlineError,
+} from './poll.js';
 import { ApiError, InterruptError, RequestTimeoutError, localValidationError } from './errors.js';
 import {
   buildLocalTargetUrl,
@@ -442,6 +447,21 @@ export async function withEnvironmentTunnel<T>(
               onTick: run => context!.onPoll(run),
             });
           } catch (err) {
+            // The deadline passed while the API was unreachable: still exit 10,
+            // with the owned-tunnel hint instead of the re-attach one, since the
+            // tunnel closes with this process.
+            if (err instanceof UnreachableAtDeadlineError) {
+              throw new ApiError(
+                {
+                  code: 'UNAVAILABLE',
+                  message: err.message,
+                  nextAction: `The owned tunnel is closing; inspect cancellation with testsprite test cancel ${runId}.`,
+                  requestId: err.requestId,
+                  details: err.details,
+                },
+                err.httpStatus,
+              );
+            }
             if (!(err instanceof TimeoutError)) throw err;
             throw new ApiError({
               code: 'UNSUPPORTED',

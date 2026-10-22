@@ -738,6 +738,41 @@ describe('runTestRun — with --wait', () => {
     expect(err.name).toBe('CLIError');
   });
 
+  it('network outage outlasting --timeout → exit 10 (UNAVAILABLE) and {runId, status} still on stdout', async () => {
+    vi.useFakeTimers();
+    try {
+      const { credentialsPath } = makeCreds();
+      // The trigger answers; every poll read after it hits a dead network.
+      const fetchImpl = makeFetch(url => {
+        if (url.includes('/runs/run_abc')) throw new TypeError('fetch failed');
+        return { body: TRIGGER_RESP };
+      });
+      const stdout: string[] = [];
+      const pending = runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: false,
+          testId: 'test_xyz',
+          wait: true,
+          timeoutSeconds: 30,
+        },
+        { credentialsPath, fetchImpl, stdout: line => stdout.push(line), stderr: () => {} },
+      ).catch((caught: unknown) => caught);
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(await pending).toMatchObject({
+        code: 'UNAVAILABLE',
+        exitCode: 10,
+        details: { runId: 'run_abc', timeoutSeconds: 30 },
+      });
+      expect(JSON.parse(stdout.join(''))).toMatchObject({ runId: 'run_abc', status: 'running' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('wait timeout → UNSUPPORTED error (exit 7) with nextAction containing run-id', async () => {
     const { credentialsPath } = makeCreds();
     let elapsedMs = 0;
