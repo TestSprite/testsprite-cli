@@ -11,7 +11,7 @@ import { ApiError, InterruptError } from '../lib/errors.js';
 import type { FetchImpl, HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { formatScheduleFrequencyAdvisory, runsPerMonth } from '../lib/cron.js';
-import { renderTextTable, type TextTableColumn } from '../lib/text-table.js';
+import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
 import { historyRetentionNote, type HistoryRetentionMeta } from '../lib/history-retention.js';
 
@@ -183,6 +183,9 @@ export async function runList(
   deps: ScheduleDeps = {},
 ): Promise<ScheduleListResponse> {
   const out = makeOutput(opts.output, deps);
+  if (opts.output === 'text') {
+    resolveTextColumns(opts.columns, SCHEDULE_LIST_COLUMNS);
+  }
   const client = makeClient(opts, deps);
 
   const response = await client.get<ScheduleListResponse>('/schedules');
@@ -512,6 +515,9 @@ export async function runRunList(
   deps: ScheduleDeps = {},
 ): Promise<ScheduleRunListResponse> {
   const out = makeOutput(opts.output, deps);
+  if (opts.output === 'text') {
+    resolveTextColumns(opts.columns, RUN_LIST_COLUMNS);
+  }
   const client = makeClient(opts, deps);
 
   const response = await client.get<ScheduleRunListResponse>(
@@ -772,6 +778,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
         '\nExit codes:\n' +
         '  0  success\n' +
         '  3  auth error\n' +
+        '  5  validation error (e.g., bad --columns)\n' +
         '  7  schedules are not available on this account\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
         ' 13  not available on your plan',
@@ -965,6 +972,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
         '  0  success\n' +
         '  3  auth error\n' +
         '  4  not found\n' +
+        '  5  validation error (e.g., bad --columns)\n' +
         '  7  schedules are not available on this account\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
         ' 13  not available on your plan',

@@ -2,6 +2,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import { ApiError } from '../lib/errors.js';
 import { type CliSchedule, createScheduleCommand, runGet, runList } from './schedule.js';
 
@@ -272,6 +273,68 @@ describe('runList', () => {
 
     const [header, row] = out.join('\n').split('\n');
     expect(row!.indexOf('project')).toBe(header!.indexOf('TARGET'));
+  });
+
+  it('text output rejects unknown columns with VALIDATION_ERROR before auth/network access', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not make network calls on invalid columns');
+    });
+
+    await expect(
+      runList(
+        { ...BASE, output: 'text', columns: 'bogus' },
+        { stdout: () => undefined, fetchImpl: fetchImpl as unknown as typeof fetch },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'columns' },
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('text output rejects unknown columns with VALIDATION_ERROR even when server returns empty list', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { schedules: [] } }));
+    await expect(
+      runList(
+        { ...BASE, output: 'text', columns: 'bogus' },
+        { credentialsPath, fetchImpl, stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'columns' },
+    });
+  });
+
+  it('text output rejects unknown columns with VALIDATION_ERROR before dry-run banner emission', async () => {
+    resetDryRunBannerForTesting();
+    const stderr: string[] = [];
+
+    await expect(
+      runList(
+        { ...BASE, output: 'text', dryRun: true, columns: 'bogus' },
+        { stdout: () => undefined, stderr: line => stderr.push(line) },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'columns' },
+    });
+    expect(stderr).toEqual([]);
+  });
+
+  it('json output ignores text-only column flags', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { schedules: [SCHEDULE_FIXTURE] } }));
+
+    const out: string[] = [];
+    const result = await runList(
+      { ...BASE, output: 'json', columns: 'bogus', noHeader: true },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    expect(result.schedules).toEqual([SCHEDULE_FIXTURE]);
   });
 });
 
