@@ -224,10 +224,13 @@ describe('buildGithubWorkflow', () => {
     expect(yaml).toContain('exit 1');
   });
 
-  it('guards both events: no fork or draft PRs, only successful non-production deployments', () => {
+  it('guards both events: no fork, Dependabot or draft PRs, only successful non-production deployments', () => {
     const yaml = buildGithubWorkflow(WF_BASE);
     expect(yaml).toContain('types: [opened, synchronize, reopened, ready_for_review]');
     expect(yaml).toContain('github.event.pull_request.head.repo.full_name == github.repository');
+    // Dependabot branches live in the base repo, so the fork guard passes, but
+    // Dependabot events get no Actions secrets.
+    expect(yaml).toContain("github.actor != 'dependabot[bot]'");
     expect(yaml).toContain('!github.event.pull_request.draft');
     expect(yaml).toContain("github.event.deployment_status.state == 'success'");
     expect(yaml).toContain('!github.event.deployment.production_environment');
