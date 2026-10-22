@@ -26,7 +26,7 @@ import {
 } from './http.js';
 import { globalShutdown, type ShutdownHandle } from './interrupt.js';
 import type { OutputMode } from './output.js';
-import { createDryRunFetch } from './dry-run/fetch.js';
+import { createDryRunFetch, withDryRunBannerOnce } from './dry-run/fetch.js';
 import { redactDeep } from './redact.js';
 import { noteServerVersion } from './version-notice.js';
 import { VERSION } from '../version.js';
@@ -336,14 +336,21 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
   if (opts.dryRun) {
     const dryRunEndpoint = opts.endpointUrl ?? DRY_RUN_DEFAULT_ENDPOINT;
     // Validate even under --dry-run so a typo in --endpoint-url is caught
-    // offline (no creds, no network). Validate BEFORE the banner so a rejected
-    // endpoint doesn't first announce a "sample response".
+    // offline (no creds, no network). A rejected endpoint throws here, before
+    // any dry-run response is produced, so no banner is announced first.
     assertValidEndpointUrl(dryRunEndpoint);
-    emitDryRunBanner(stderr);
+    // The banner is emitted lazily the first time a dry-run request
+    // actually returns a canned sample (via the fetch wrapper below),
+    // not at client construction — so a command that fails local
+    // validation after building the client never announces a "sample
+    // response" it will not produce. The wrapper applies to the injected
+    // test fetch too, so it behaves the same way.
+    const baseFetch = deps.fetchImpl ?? createDryRunFetch();
+    const fetchImpl = withDryRunBannerOnce(baseFetch, () => emitDryRunBanner(stderr));
     return {
       baseUrl: facadeBaseUrl(dryRunEndpoint),
       apiKey: DRY_RUN_API_KEY,
-      fetchImpl: deps.fetchImpl ?? createDryRunFetch(),
+      fetchImpl,
       onDebug: opts.debug ? (event: DebugEvent) => stderr(formatDryRunDebug(event)) : undefined,
       onTransition: opts.verbose ? (msg: string) => stderr(`[verbose] ${msg}`) : undefined,
       env,
