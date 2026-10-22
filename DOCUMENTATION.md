@@ -1488,6 +1488,8 @@ testsprite ci run --project proj_xxxxxxxx \
 
 Archive any requested reports with a step that also runs after failure (`if: always()` in GitHub Actions).
 
+JUnit testcases use the trimmed human-readable test name, falling back to `testId`. The `classname` remains the project ID for project batches or `testlist:<listId>` for test lists. Only when names collide within one report, the CLI appends a short test ID to each colliding name, for example `Checkout [12345678]`. The prefix starts at eight characters (or the full ID when shorter) and expands when necessary to distinguish IDs or avoid an existing title; a numeric suffix resolves any remaining collision. Unique names and reports without collisions remain unchanged, byte for byte. A subset that no longer contains the collision uses the original readable name again. The custom `testId` and `runId` attributes, outcomes, durations, and summary counts are unchanged.
+
 ### Full frontend coverage: use a test list
 
 > ⚠️ On a V2 project, `test run --all --project <id>` uses the backend-only batch engine, so frontend tests are skipped and reported under `skippedFrontend`; a batch `--target-url` request is unsupported (exit 7). On a V3 project, `--all` includes frontend and backend tests and `--target-url` applies to frontend tests. For a gate spanning several projects, group the tests into a **test list** and run that:

@@ -49,6 +49,10 @@ describe('durationSecondsBetween', () => {
   });
 });
 
+/**
+ * Create a passed testcase fixture, retaining the caller's ID and any overrides
+ * for status, run metadata, timing, and diagnostics used by report assertions.
+ */
 function makeResult(overrides: Partial<JUnitTestResult> & { testId: string }): JUnitTestResult {
   return {
     status: 'passed',
@@ -202,6 +206,144 @@ describe('buildJUnitReport', () => {
     );
     // testsuite time is the sum of testcase durations (was always 0 before).
     expect(xml).toContain('skipped="0" time="12.5">');
+  });
+
+  it.each(['passed', 'failed', 'error', 'skipped'])(
+    'keeps same-name %s tests distinct using standard JUnit attributes',
+    status => {
+      const xml = buildJUnitReport({
+        suiteName: 'List',
+        classname: 'testlist:list_1',
+        results: ['test_a', 'test_b'].map(testId =>
+          makeResult({ testId, name: 'Checkout', status, runId: `run_${testId}` }),
+        ),
+      });
+      // CI consumers may ignore the custom testId/runId attributes entirely.
+      const identities = [...xml.matchAll(/<testcase classname="([^"]*)" name="([^"]*)"/g)].map(
+        match => [match[1], match[2]],
+      );
+      expect(identities).toHaveLength(2);
+      expect(new Set(identities.map(identity => JSON.stringify(identity))).size).toBe(2);
+      expect(identities).toEqual([
+        ['testlist:list_1', 'Checkout [test_a]'],
+        ['testlist:list_1', 'Checkout [test_b]'],
+      ]);
+    },
+  );
+
+  it('leaves the complete non-colliding report byte-identical to the original format', () => {
+    const xml = buildJUnitReport({
+      suiteName: 'Suite "A"',
+      classname: 'project<&>',
+      results: [
+        makeResult({
+          testId: 'a',
+          name: '  Login & logout  ',
+          runId: 'run_a',
+          durationSeconds: 1.25,
+        }),
+        makeResult({
+          testId: 'b',
+          name: 'Checkout',
+          status: 'failed',
+          runId: 'run_b',
+          durationSeconds: 2,
+        }),
+        makeResult({ testId: 'fallback', name: '  ' }),
+      ],
+    });
+    // Full XML baseline from the scope-only renderer, including whitespace and trailing LF.
+    expect(xml).toBe(
+      [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<testsuites>',
+        '  <testsuite name="Suite &quot;A&quot;" tests="3" failures="1" errors="0" skipped="0" time="3.25">',
+        '    <testcase classname="project&lt;&amp;&gt;" name="Login &amp; logout" testId="a" runId="run_a" time="1.25">',
+        '    </testcase>',
+        '    <testcase classname="project&lt;&amp;&gt;" name="Checkout" testId="b" runId="run_b" time="2">',
+        '      <failure message="failed" type="failed">status: failed\nrunId: run_b</failure>',
+        '    </testcase>',
+        '    <testcase classname="project&lt;&amp;&gt;" name="fallback" testId="fallback" time="0">',
+        '    </testcase>',
+        '  </testsuite>',
+        '</testsuites>',
+        '',
+      ].join('\n'),
+    );
+  });
+
+  it('uses short IDs for collisions and leaves unique names and classnames unchanged', () => {
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: '12345678-abcd', name: 'Checkout' }),
+        makeResult({ testId: '87654321-dcba', name: 'Checkout' }),
+        makeResult({ testId: 'unique-id', name: 'Login' }),
+      ],
+    });
+    expect(xml).toContain('classname="proj_1" name="Checkout [12345678]"');
+    expect(xml).toContain('classname="proj_1" name="Checkout [87654321]"');
+    expect(xml).toContain('classname="proj_1" name="Login"');
+    expect(xml).toContain('testId="12345678-abcd"');
+  });
+
+  it('disambiguates shared short prefixes without changing an existing suffix-like title', () => {
+    const rows = [
+      makeResult({ testId: '12345678-a', name: 'Checkout' }),
+      makeResult({ testId: '12345678-b', name: 'Checkout' }),
+      makeResult({ testId: 'unique', name: 'Checkout [12345678-a]' }),
+    ];
+    for (const results of [rows, [...rows].reverse()]) {
+      const xml = buildJUnitReport({ suiteName: 'List', classname: 'testlist:list_1', results });
+      const names = [...xml.matchAll(/<testcase classname="testlist:list_1" name="([^"]*)"/g)].map(
+        match => match[1],
+      );
+      expect(new Set(names).size).toBe(3);
+      expect(xml).toContain('name="Checkout [12345678-a-2]" testId="12345678-a"');
+      expect(xml).toContain('name="Checkout [12345678-b]" testId="12345678-b"');
+      expect(xml).toContain('name="Checkout [12345678-a]" testId="unique"');
+    }
+  });
+
+  it('detects collisions after trimming and test ID fallback, then escapes the final name', () => {
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'a<&>', name: '  Checkout & pay ' }),
+        makeResult({ testId: 'b', name: 'Checkout & pay' }),
+        makeResult({ testId: 'fallback', name: ' ' }),
+        makeResult({ testId: 'c', name: 'fallback' }),
+      ],
+    });
+    expect(xml).toContain('name="Checkout &amp; pay [a&lt;&amp;&gt;]" testId="a&lt;&amp;&gt;"');
+    expect(xml).toContain('name="Checkout &amp; pay [b]"');
+    expect(xml).toContain('name="fallback [fallback]"');
+    expect(xml).toContain('name="fallback [c]"');
+  });
+
+  it('keeps collision suffixes stable for reordered retries and removes them in a unique subset', () => {
+    const rows = ['test_a', 'test_b'].map(testId =>
+      makeResult({ testId, name: 'Checkout', runId: `first_${testId}` }),
+    );
+    for (const results of [
+      rows,
+      [...rows].reverse().map(row => ({ ...row, runId: `retry_${row.testId}`, status: 'failed' })),
+    ]) {
+      const xml = buildJUnitReport({ suiteName: 'List', classname: 'testlist:list_1', results });
+      for (const row of rows) {
+        expect(xml).toContain(
+          `classname="testlist:list_1" name="Checkout [${row.testId}]" testId="${row.testId}"`,
+        );
+      }
+    }
+    const subset = buildJUnitReport({
+      suiteName: 'List',
+      classname: 'testlist:list_1',
+      results: [rows[0]!],
+    });
+    expect(subset).toContain('classname="testlist:list_1" name="Checkout" testId="test_a"');
   });
 
   it('falls back to time="0" when the run carries no timing', () => {
