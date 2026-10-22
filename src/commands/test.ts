@@ -2196,7 +2196,14 @@ function readCappedFileGuarded(
       // A lower bound for a pipe or a growing file: reading stopped here.
       return { ok: false, sizeBytes: bytes.length };
     }
-    return { ok: true, raw: decodeWithBom(bytes) };
+    let raw: string;
+    try {
+      raw = decodeWithBom(bytes);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : 'unknown error';
+      throw localValidationError(field, `cannot decode ${path}: ${reason}`);
+    }
+    return { ok: true, raw };
   } finally {
     closeSync(fd);
   }

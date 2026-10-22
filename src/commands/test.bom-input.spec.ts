@@ -2,7 +2,8 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { runLint } from './test.js';
+import { runCreateFromPlan, runLint } from './test.js';
+import { ApiError } from '../lib/errors.js';
 
 /**
  * Integration tests for issue #463: the CLI's own docs suggest creating plan
@@ -50,4 +51,36 @@ describe('plan files saved with a BOM (PowerShell 5.1 `>`) lint cleanly', () => 
       expect(report.issues).toEqual([]);
     });
   }
+
+  it('an odd-byte UTF-16BE plan file fails create with the typed encoding error, not a crash', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bom-plan-'));
+    const body = Buffer.from(JSON.stringify(PLAN, null, 2), 'utf16le');
+    body.swap16();
+    const path = join(dir, 'plan-utf16be-odd.json');
+    writeFileSync(path, Buffer.concat([Buffer.from([0xfe, 0xff]), body, Buffer.from([0x00])]));
+    writeFileSync(
+      join(dir, 'credentials'),
+      '[default]\napi_url = http://localhost:13502\napi_key = sk-user-test\n',
+    );
+    const deps = {
+      credentialsPath: join(dir, 'credentials'),
+      fetchImpl: (() => {
+        throw new Error('unexpected network');
+      }) as typeof fetch,
+      stdout: () => {},
+      stderr: () => {},
+    };
+    // Plan parsing fires before any network; the typed localValidationError
+    // (not a raw ERR_INVALID_BUFFER_SIZE) is what reaches the caller. The
+    // human-readable text rides on nextAction (envelope message is generic).
+    const err: unknown = await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug: false, planFrom: path },
+      deps as never,
+    ).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ApiError);
+    expect(String((err as { nextAction?: string }).nextAction)).toContain('incomplete code unit');
+  });
 });

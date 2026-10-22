@@ -18,7 +18,13 @@ export function decodeWithBom(bytes: Buffer): string {
   }
   if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
     // Buffers have no 'utf16be' decoder: swap the byte pairs, then decode LE.
-    const be = Buffer.from(bytes.subarray(2));
+    // An odd trailing byte is an incomplete code unit — reject it here instead
+    // of letting swap16() throw an untyped ERR_INVALID_BUFFER_SIZE.
+    const body = bytes.subarray(2);
+    if (body.length % 2 !== 0) {
+      throw new Error('UTF-16BE input ends with an incomplete code unit');
+    }
+    const be = Buffer.from(body);
     be.swap16();
     return be.toString('utf16le');
   }
