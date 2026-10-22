@@ -1,9 +1,14 @@
-import { mkdtempSync } from 'node:fs';
+import * as fs from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultConfigPath, loadConfig } from './config.js';
 import { writeProfile } from './credentials.js';
+
+vi.mock('node:fs', async importOriginal => ({
+  ...(await importOriginal<typeof fs>()),
+}));
 
 let tmpRoot: string;
 let credentialsPath: string;
@@ -14,6 +19,139 @@ beforeEach(() => {
 });
 
 describe('loadConfig', () => {
+  it.each([
+    {
+      env: { TESTSPRITE_API_KEY: ' sk-env ', TESTSPRITE_API_URL: ' https://env.example.com ' },
+      endpointUrl: undefined,
+      expectedUrl: 'https://env.example.com',
+    },
+    {
+      env: { TESTSPRITE_API_KEY: 'sk-env' },
+      endpointUrl: 'https://flag.example.com',
+      expectedUrl: 'https://flag.example.com',
+    },
+    {
+      env: { TESTSPRITE_API_KEY: 'sk-env', TESTSPRITE_API_URL: 'https://env.example.com' },
+      endpointUrl: 'https://flag.example.com',
+      expectedUrl: 'https://flag.example.com',
+    },
+  ])(
+    'uses complete overrides without opening an unused credentials directory ($expectedUrl)',
+    ({ env, endpointUrl, expectedUrl }) => {
+      mkdirSync(credentialsPath);
+      expect(loadConfig({ env, endpointUrl, credentialsPath })).toEqual({
+        profile: 'default',
+        apiKey: 'sk-env',
+        apiUrl: expectedUrl,
+      });
+    },
+  );
+
+  it('uses complete overrides without reading an unreadable credentials file', () => {
+    writeFileSync(credentialsPath, '[default]\napi_key = sk-file\n');
+    const readFileSync = fs.readFileSync;
+    const permissionError = Object.assign(new Error('Permission denied'), { code: 'EACCES' });
+    const read = vi.spyOn(fs, 'readFileSync').mockImplementation((...args) => {
+      if (args[0] === credentialsPath) throw permissionError;
+      return readFileSync(...args);
+    });
+    try {
+      expect(
+        loadConfig({
+          env: { TESTSPRITE_API_KEY: 'sk-env', TESTSPRITE_API_URL: 'https://env.example.com' },
+          credentialsPath,
+        }),
+      ).toEqual({
+        profile: 'default',
+        apiKey: 'sk-env',
+        apiUrl: 'https://env.example.com',
+      });
+      expect(read).not.toHaveBeenCalled();
+      expect(() => loadConfig({ env: { TESTSPRITE_API_KEY: 'sk-env' }, credentialsPath })).toThrow(
+        permissionError,
+      );
+      expect(read).toHaveBeenCalledTimes(1);
+    } finally {
+      read.mockRestore();
+    }
+  });
+
+  it.each([
+    { env: { TESTSPRITE_API_KEY: 'sk-env' }, endpointUrl: undefined },
+    { env: { TESTSPRITE_API_URL: 'https://env.example.com' }, endpointUrl: undefined },
+    { env: {}, endpointUrl: 'https://flag.example.com' },
+    { env: { TESTSPRITE_API_KEY: 'sk-env', TESTSPRITE_API_URL: '  ' }, endpointUrl: undefined },
+    {
+      env: { TESTSPRITE_API_KEY: '  ', TESTSPRITE_API_URL: 'https://env.example.com' },
+      endpointUrl: undefined,
+    },
+  ])(
+    'retains filesystem errors when a missing field needs fallback ($env)',
+    ({ env, endpointUrl }) => {
+      mkdirSync(credentialsPath);
+      expect(() => loadConfig({ env, endpointUrl, credentialsPath })).toThrowError(
+        expect.objectContaining({ code: 'EISDIR' }),
+      );
+    },
+  );
+
+  it.each([
+    { profile: 'bad/name', envProfile: undefined },
+    { profile: undefined, envProfile: 'bad[name]' },
+    { profile: '', envProfile: undefined },
+  ])(
+    'validates the selected profile before complete overrides or file access ($profile, $envProfile)',
+    ({ profile, envProfile }) => {
+      mkdirSync(credentialsPath);
+      expect(() =>
+        loadConfig({
+          profile,
+          credentialsPath,
+          env: {
+            TESTSPRITE_PROFILE: envProfile,
+            TESTSPRITE_API_KEY: 'sk-env',
+            TESTSPRITE_API_URL: 'https://env.example.com',
+          },
+        }),
+      ).toThrowError(expect.objectContaining({ code: 'VALIDATION_ERROR' }));
+    },
+  );
+
+  it.each([
+    {
+      env: { TESTSPRITE_API_KEY: 'sk-env' },
+      endpointUrl: undefined,
+      expectedKey: 'sk-env',
+      expectedUrl: 'https://file.example.com',
+    },
+    {
+      env: { TESTSPRITE_API_URL: 'https://env.example.com' },
+      endpointUrl: undefined,
+      expectedKey: 'sk-file',
+      expectedUrl: 'https://env.example.com',
+    },
+    {
+      env: {},
+      endpointUrl: 'https://flag.example.com',
+      expectedKey: 'sk-file',
+      expectedUrl: 'https://flag.example.com',
+    },
+  ])(
+    'fills only missing override fields from the selected profile ($expectedUrl)',
+    ({ env, endpointUrl, expectedKey, expectedUrl }) => {
+      writeProfile(
+        'staging',
+        { apiKey: 'sk-file', apiUrl: 'https://file.example.com' },
+        { path: credentialsPath },
+      );
+      expect(loadConfig({ profile: 'staging', env, endpointUrl, credentialsPath })).toEqual({
+        profile: 'staging',
+        apiKey: expectedKey,
+        apiUrl: expectedUrl,
+      });
+    },
+  );
+
   it('returns built-in defaults when nothing is provided', () => {
     const config = loadConfig({ env: {}, credentialsPath });
     expect(config.apiUrl).toBe('https://api.testsprite.com');

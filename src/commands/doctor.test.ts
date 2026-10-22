@@ -6,15 +6,21 @@
  * assert on the rendered report + the exit-on-failure contract.
  */
 
+import * as fs from 'node:fs';
 import { chmodSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, CLIError } from '../lib/errors.js';
+import { loadConfig } from '../lib/config.js';
 import { writeProfile } from '../lib/credentials.js';
 import type { DoctorDeps, DoctorReport } from './doctor.js';
 import { createDoctorCommand, runDoctor } from './doctor.js';
+
+vi.mock('node:fs', async importOriginal => ({
+  ...(await importOriginal<typeof fs>()),
+}));
 
 interface CapturedOutput {
   stdout: string[];
@@ -302,7 +308,7 @@ describe('runDoctor — failing checks exit non-zero', () => {
     expect(out).toContain('delete the file and re-run `testsprite setup`');
   });
 
-  it('unreadable credentials file with TESTSPRITE_API_KEY set degrades to a warning', async () => {
+  it('unreadable credentials file with complete overrides degrades to a warning', async () => {
     const { capture, deps } = makeCapture();
     const eperm = Object.assign(new Error('read EPERM: permission denied'), { code: 'EPERM' });
     const report = await runDoctor(
@@ -310,7 +316,10 @@ describe('runDoctor — failing checks exit non-zero', () => {
       {
         ...healthyDeps(credentialsPath),
         ...deps,
-        env: { TESTSPRITE_API_KEY: 'sk-user-env' },
+        env: {
+          TESTSPRITE_API_KEY: 'sk-user-env',
+          TESTSPRITE_API_URL: 'https://env.example.com',
+        },
         loadConfigFn: () => {
           throw eperm;
         },
@@ -321,6 +330,79 @@ describe('runDoctor — failing checks exit non-zero', () => {
     expect(out).toContain('[WARN]');
     expect(out).toContain('cannot be read (EPERM)');
     expect(out).toContain('TESTSPRITE_API_KEY is set');
+  });
+
+  it.each([
+    {
+      env: { TESTSPRITE_API_KEY: ' sk-user-env ', TESTSPRITE_API_URL: ' https://env.example.com ' },
+      endpointUrl: undefined,
+      expectedUrl: 'https://env.example.com',
+    },
+    {
+      env: { TESTSPRITE_API_KEY: 'sk-user-env', TESTSPRITE_API_URL: ' ' },
+      endpointUrl: 'https://flag.example.com',
+      expectedUrl: 'https://flag.example.com',
+    },
+  ])(
+    'reports an unreadable store even when commands use complete overrides ($expectedUrl)',
+    async ({ env, endpointUrl, expectedUrl }) => {
+      writeProfile('default', { apiKey: 'sk-file' }, { path: credentialsPath });
+      const readFileSync = fs.readFileSync;
+      const permissionError = Object.assign(new Error('Permission denied'), { code: 'EACCES' });
+      const read = vi.spyOn(fs, 'readFileSync').mockImplementation((...args) => {
+        if (args[0] === credentialsPath) throw permissionError;
+        return readFileSync(...args);
+      });
+      try {
+        expect(loadConfig({ env, endpointUrl, credentialsPath })).toEqual({
+          profile: 'default',
+          apiKey: 'sk-user-env',
+          apiUrl: expectedUrl,
+        });
+        expect(read).not.toHaveBeenCalled();
+        const { capture, deps } = makeCapture();
+        const fetchImpl = makeFetch(OK_ME);
+        const report = await runDoctor(
+          { profile: 'default', output: 'text', debug: false, endpointUrl },
+          { ...healthyDeps(credentialsPath, { env, fetchImpl }), ...deps },
+        );
+        expect(report.failures).toBe(0);
+        expect(report.checks.find(c => c.name === 'Credentials')).toMatchObject({
+          status: 'warn',
+          detail: expect.stringContaining('cannot be read (EACCES)'),
+        });
+        expect(report.checks.find(c => c.name === 'Connectivity')?.status).toBe('ok');
+        expect(report.checks.find(c => c.name === 'Local tunnel')?.status).toBe('ok');
+        expect(fetchImpl).toHaveBeenCalledTimes(2);
+        expect(capture.stdout.join('\n')).toContain(
+          'TESTSPRITE_API_KEY is set, so commands still work',
+        );
+        expect(read).toHaveBeenCalledTimes(1);
+      } finally {
+        read.mockRestore();
+      }
+    },
+  );
+
+  it.each([
+    { TESTSPRITE_API_KEY: 'sk-user-env' },
+    { TESTSPRITE_API_KEY: 'sk-user-env', TESTSPRITE_API_URL: ' ' },
+    { TESTSPRITE_API_KEY: ' ', TESTSPRITE_API_URL: 'https://env.example.com' },
+  ])('does not promise working commands with incomplete overrides (%j)', async env => {
+    const { capture, deps } = makeCapture();
+    const rejection = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...healthyDeps(credentialsPath, { env }),
+        ...deps,
+        loadConfigFn: () => {
+          throw Object.assign(new Error('Permission denied'), { code: 'EPERM' });
+        },
+      },
+    ).catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(CLIError);
+    expect(capture.stdout.join('\n')).toContain('cannot be read (EPERM)');
+    expect(capture.stdout.join('\n')).not.toContain('so commands still work');
   });
 
   // POSIX-only premise: chmod 000 yields EACCES on Linux/macOS; Windows file
@@ -337,7 +419,10 @@ describe('runDoctor — failing checks exit non-zero', () => {
         {
           ...healthyDeps(credentialsPath),
           ...deps,
-          env: { TESTSPRITE_API_KEY: 'sk-user-env' }, // commands still work without the file
+          env: {
+            TESTSPRITE_API_KEY: 'sk-user-env',
+            TESTSPRITE_API_URL: 'https://env.example.com',
+          }, // commands still work without the file
         },
       );
       const out = capture.stdout.join('\n');
