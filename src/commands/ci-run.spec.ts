@@ -380,6 +380,15 @@ globalThis.fetch = async (input, init = {}) => {
     }
   });
 
+  it('keeps the malformed loopback error and writes zero outputs', () => {
+    const result = run(['--target-url', 'http://localhost:3000/app']);
+    expect(result.status, result.stderr).toBe(5);
+    expect(result.stderr).toContain('no path');
+    expect(result.outputs).toBe(
+      'previous=value\ntotal=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\n',
+    );
+  });
+
   it.each([false, true])(
     'a public override of a loopback environment keeps the CI gate, strict=%s',
     strict => {

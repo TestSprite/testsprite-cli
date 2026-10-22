@@ -10025,7 +10025,7 @@ async function finishZeroDispatchBatch(params: {
   );
 }
 
-function refuseCiLoopbackTarget(deps: TestDeps): never {
+function refuseCiLoopbackTarget(deps: TestDeps, validationError?: unknown): never {
   recordTelemetryExtras({ ciRunOutcome: 'refused_loopback' });
   emitCiStepOutputs(
     { total: 0, passed: 0, failed: 0, skipped: 0, timedOut: 0, runs: [] },
@@ -10034,6 +10034,7 @@ function refuseCiLoopbackTarget(deps: TestDeps): never {
       stderr: deps.stderr ?? (line => process.stderr.write(`${line}\n`)),
     },
   );
+  if (validationError !== undefined) throw validationError;
   throw localValidationError(
     'target-url',
     'ci run requires a publicly reachable target URL. For a local app, use ' +
@@ -10076,8 +10077,14 @@ export async function runTestRunAll(
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const out = makeOutput(opts.output, deps);
 
-  if (opts.ci && opts.targetUrl !== undefined && parseLoopbackTargetUrl(opts.targetUrl)) {
-    refuseCiLoopbackTarget(deps);
+  if (opts.ci && opts.targetUrl !== undefined) {
+    let loopback;
+    try {
+      loopback = parseLoopbackTargetUrl(opts.targetUrl);
+    } catch (err) {
+      refuseCiLoopbackTarget(deps, err);
+    }
+    if (loopback) refuseCiLoopbackTarget(deps);
   }
 
   if (opts.dryRun && opts.targetUrl === undefined && !opts.noWait) {
