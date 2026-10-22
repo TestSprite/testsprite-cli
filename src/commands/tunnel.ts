@@ -769,7 +769,7 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts: { ttl?: string }, command: Command) => {
-      const ttlSeconds = parseTtl(cmdOpts.ttl);
+      const ttlSeconds = parseTtl(cmdOpts.ttl, stderrOf(deps));
       await runTunnelStart(
         {
           ...resolveCommonOptions(command, deps.env),
@@ -871,7 +871,14 @@ function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): Common
   };
 }
 
-function parseTtl(raw: string | undefined): number | undefined {
+/** Documented effective range: the server clamps the requested lifetime to [60, 28800]. */
+const TTL_MIN_SECONDS = 60;
+const TTL_MAX_SECONDS = 28800;
+
+export function parseTtl(
+  raw: string | undefined,
+  stderr: (line: string) => void = () => {},
+): number | undefined {
   if (raw === undefined) return undefined;
   const n = Number(raw);
   if (!Number.isInteger(n) || n <= 0) {
@@ -884,6 +891,12 @@ function parseTtl(raw: string | undefined): number | undefined {
         details: { field: 'ttl', reason: 'must be a positive whole number of seconds' },
       },
     });
+  }
+  if (n < TTL_MIN_SECONDS || n > TTL_MAX_SECONDS) {
+    stderr(
+      `Warning: --ttl ${n} is outside the effective range ` +
+        `${TTL_MIN_SECONDS}–${TTL_MAX_SECONDS} seconds; the server will clamp it.`,
+    );
   }
   return n;
 }
