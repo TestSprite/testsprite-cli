@@ -6,6 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { assertFreshBuild } from '../../test/helpers/assertFreshBuild.js';
+import { FS_ENFORCES_MODE_BITS } from '../../test/helpers/fsModeEnforcement.js';
 import { ApiError } from './errors.js';
 import { readSecretFileGuarded } from './secret-file.js';
 
@@ -147,8 +148,10 @@ describe('readSecretFileGuarded', () => {
   describe('permission denied', () => {
     // POSIX-only premise: a 0o000 mode has no effect on Windows ACLs, and
     // this repo's other permission-mode tests (credentials.test.ts) skip the
-    // same way rather than emulate the ACL side.
-    it.skipIf(process.platform === 'win32')(
+    // same way rather than emulate the ACL side. Under CAP_DAC_OVERRIDE
+    // (containers, root) the premise fails the same way, so the filesystem
+    // is probed instead of assumed.
+    it.skipIf(process.platform === 'win32' || !FS_ENFORCES_MODE_BITS)(
       'reports permission denied rather than crashing',
       () => {
         const path = join(tmpRoot, 'locked.txt');
