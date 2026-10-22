@@ -19,7 +19,7 @@ import { createTunnelCommand } from './commands/tunnel.js';
 import { createTestCommand } from './commands/test.js';
 import { createTestListCommand } from './commands/testlist.js';
 import { createUsageCommand } from './commands/usage.js';
-import { resolveProfileName } from './lib/config.js';
+import { loadConfig, resolveProfileName } from './lib/config.js';
 import { classifyBillingRefusal } from './lib/billing-refusal.js';
 import { TARGETS, type AgentTarget } from './lib/agent-targets.js';
 import {
@@ -415,7 +415,13 @@ try {
     process.exitCode = code;
   };
 
-  const rawMode = program.opts<{ output?: string }>().output;
+  // Persistent default --output from ~/.testsprite/config sits below the flag
+  // (flag > env > config-file > built-in 'text'); the flag wins when present.
+  const config = loadConfig({
+    profile: resolveProfileName(program.opts<{ profile?: string }>().profile),
+    env: process.env,
+  });
+  const rawMode = program.opts<{ output?: string }>().output ?? config.output;
   const mode = isOutputMode(rawMode) ? rawMode : 'text';
   const output = new Output(mode);
   if (err instanceof ApiError) {
