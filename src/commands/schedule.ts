@@ -395,6 +395,10 @@ export async function runUpdate(
   }
   const environment = normalizeScheduleEnvironmentName(opts.env);
 
+  if (opts.name !== undefined && opts.name.trim().length === 0) {
+    throw localValidationError('--name must not be empty');
+  }
+
   const body: UpdateScheduleRequest = {
     ...(opts.name !== undefined ? { name: opts.name } : {}),
     ...(environment !== undefined ? { environment } : {}),

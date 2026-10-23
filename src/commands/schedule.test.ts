@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../lib/errors.js';
-import { type CliSchedule, createScheduleCommand, runGet, runList } from './schedule.js';
+import { type CliSchedule, createScheduleCommand, runGet, runList, runUpdate } from './schedule.js';
 
 const SCHEDULE_FIXTURE: CliSchedule = {
   scheduleId: 'sch_b3c91efa',
@@ -425,5 +425,29 @@ describe('runGet', () => {
         { credentialsPath, fetchImpl, stdout: () => {} },
       ),
     ).rejects.toBeInstanceOf(ApiError);
+  });
+});
+
+describe('runUpdate --name validation', () => {
+  it('rejects an empty --name instead of sending it to the server', async () => {
+    const fetchImpl = vi.fn();
+    await expect(
+      runUpdate(
+        { ...BASE, output: 'json', scheduleId: 'sch_1', name: '' },
+        { fetchImpl: fetchImpl as unknown as typeof globalThis.fetch, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('rejects a whitespace-only --name', async () => {
+    const fetchImpl = vi.fn();
+    const err = await runUpdate(
+      { ...BASE, output: 'json', scheduleId: 'sch_1', name: '   ' },
+      { fetchImpl: fetchImpl as unknown as typeof globalThis.fetch, stdout: () => {}, stderr: () => {} },
+    ).catch((caught: unknown) => caught);
+    expect(err).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect((err as { nextAction: string }).nextAction).toContain('--name must not be empty');
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
