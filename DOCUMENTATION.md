@@ -232,7 +232,7 @@ Credential flags:
 
 - `--api-key <key>` supplies a key directly and skips the secret prompt. Prefer `--from-env` in shared scripts so the key does not enter shell history.
 - `--from-env` reads `TESTSPRITE_API_KEY`. A non-empty `--api-key` takes precedence when both are supplied.
-- `--skip-if-configured` reuses the active profile's saved key when one exists. With no saved key it falls back to the ordinary prompt; combine it with `--yes` only on machines where the profile is already configured. An explicit `--api-key` or `--from-env` still replaces the saved key.
+- `--skip-if-configured` reuses the active profile's saved key when one exists. With no saved key, an interactive terminal falls back to the ordinary prompt; a non-interactive run exits 5 unless `--api-key` or `--from-env` supplies a usable key. Combine it with `--yes` only on machines where the profile is already configured. An explicit `--api-key` or `--from-env` still replaces the saved key.
 - `--profile <name>` selects the credential profile through the global flag. The default credentials file is `~/.testsprite/credentials`.
 
 Agent-install flags:
