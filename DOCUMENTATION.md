@@ -1145,6 +1145,8 @@ testsprite ci init github --set-secret --repo owner/name
 - **A — your platform deploys every PR** (for example the Vercel or Netlify git integration): change the trigger to `on: deployment_status`, delete the placeholder step, and keep the rest. A repository that deploys **several** projects gets one deployment per project for the same commit (Vercel names them `Preview – <project>`); pin the one to gate with `&& github.event.deployment.environment == 'Preview – <project>'` in the `if:`, or the gate tests whichever project's URL arrives. The run step reads the URL from `github.event.deployment_status.environment_url`, and `ci run` finds the pull request behind the deployment's commit with `GITHUB_TOKEN`; a deployment that belongs to no open pull request is skipped with a notice. The job only runs for successful, non-production deployments (it checks both `production_environment` and the environment name, because Vercel reports `production_environment: false` on its production deployments). This shape needs the repository to actually receive deployment events from your platform; confirm it with one real pull request.
 - **B — you deploy in the workflow**: keep `on: pull_request`, replace the placeholder's commands with your deploy, and end it with `echo "url=<preview address>" >> "$GITHUB_OUTPUT"`. Your platform token goes in its own repo secret.
 
+Concurrency groups include the workflow filename from `--path` so separate generated workflows do not cancel each other. The filename keeps its extension and URI-escapes special characters rather than discarding them. Regenerating the same file keeps its group; the PR number or deployment SHA still identifies runs within that workflow. Both examples below use `.github/workflows/testsprite.yml`.
+
 The two finished shapes, with the template's comments left out (the generated file carries them):
 
 ```yaml
@@ -1158,7 +1160,7 @@ permissions:
 jobs:
   gate:
     concurrency:
-      group: testsprite-${{ github.event.pull_request.number || github.event.deployment.sha }}
+      group: testsprite-testsprite.yml-${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
     if: >-
       github.event_name == 'deployment_status' &&
@@ -1207,7 +1209,7 @@ permissions:
 jobs:
   gate:
     concurrency:
-      group: testsprite-${{ github.event.pull_request.number || github.event.deployment.sha }}
+      group: testsprite-testsprite.yml-${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
     if: >-
       github.event_name == 'pull_request' &&

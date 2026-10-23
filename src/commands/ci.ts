@@ -278,6 +278,10 @@ export function buildGithubWorkflow(input: {
   assertSafeWorkflowValue('project', input.projectId);
   assertSafeWorkflowValue('env', input.environment);
   if (input.endpointUrl) assertSafeWorkflowValue('endpoint-url', input.endpointUrl);
+  // All generated workflows live directly under .github/workflows/. Keep the
+  // readable filename, including its extension; escape rather than discard
+  // punctuation so distinct filenames cannot collapse to the same slug.
+  const workflowSlug = encodeURIComponent(path.posix.basename(input.workflowPath));
 
   const envLines = [
     `      ${API_KEY_SECRET_NAME}: \${{ secrets.${API_KEY_SECRET_NAME} }}`,
@@ -320,6 +324,8 @@ permissions:
 
 jobs:
   testsprite-tests:
+    # Include this workflow's filename: concurrency groups are repository-wide,
+    # so another project's workflow must not cancel this gate.
     # B (pull_request): a new push to the pull request cancels the previous job.
     # A (deployment_status): one group per COMMIT — Vercel sets deployment.ref to
     # the commit sha, so a new push does not cancel the previous commit's job.
@@ -328,7 +334,7 @@ jobs:
     # Cancelling only stops this job's CLI: the TestSprite run it started keeps
     # executing and reports in the Portal; the new push starts its own run.
     concurrency:
-      group: testsprite-\${{ github.event.pull_request.number || github.event.deployment.sha }}
+      group: testsprite-${workflowSlug}-\${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
     # pull_request: skip fork PRs (they get no repository secrets) and draft PRs.
     # deployment_status: only successful, non-production deployments. Vercel leaves
