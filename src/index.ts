@@ -504,8 +504,9 @@ try {
           code: 'REQUEST_TIMEOUT',
           message: err.message,
           nextAction:
+            err.nextAction ??
             'Increase --request-timeout <seconds> or set TESTSPRITE_REQUEST_TIMEOUT_MS. ' +
-            'Check that the backend is reachable and not overloaded.',
+              'Check that the backend is reachable and not overloaded.',
           requestId: err.requestId,
           details: { timeoutMs: err.timeoutMs },
         },

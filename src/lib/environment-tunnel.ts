@@ -47,10 +47,30 @@ export function readEnvironmentPreflight<T>(
   client: Pick<HttpClient, 'get'>,
   path: string,
 ): Promise<T> {
-  return client.get<T>(path, {
-    retry: false,
-    signal: AbortSignal.timeout(ENVIRONMENT_PREFLIGHT_TIMEOUT_MS),
-  });
+  // Abort with a RequestTimeoutError as the reason, not AbortSignal.timeout's
+  // raw DOMException: HttpClient passes a RequestTimeoutError through
+  // untouched, so a stalled preflight read surfaces as REQUEST_TIMEOUT
+  // (exit 7) instead of reaching the top-level catch as an uncaught
+  // exception. The 5s deadline here is fixed — --request-timeout does not
+  // govern it — so the message and nextAction name the preflight read
+  // rather than pointing at the flag.
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(
+      new RequestTimeoutError(ENVIRONMENT_PREFLIGHT_TIMEOUT_MS, 'local', {
+        message:
+          `Environment preflight read timed out after ` +
+          `${ENVIRONMENT_PREFLIGHT_TIMEOUT_MS / 1000}s (client-side).`,
+        nextAction:
+          'The environment preflight read timed out. ' +
+          'Check that the backend is reachable and not overloaded, then retry.',
+      }),
+    );
+  }, ENVIRONMENT_PREFLIGHT_TIMEOUT_MS);
+  timer.unref?.();
+  return client
+    .get<T>(path, { retry: false, signal: controller.signal })
+    .finally(() => clearTimeout(timer));
 }
 
 export function assertNoTunnelOptions(args: {
