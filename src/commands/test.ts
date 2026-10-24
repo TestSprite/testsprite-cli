@@ -7683,6 +7683,17 @@ function normalizeEnvironmentName(raw: string | undefined): string | undefined {
   return name;
 }
 
+/** Reject an explicitly empty name filter; omission alone selects every test. */
+export function parseNameFilter(raw: string | undefined): string | undefined {
+  if (raw === '') {
+    throw localValidationError(
+      'filter',
+      'must not be empty; omit --filter to run every project test, or pass a non-empty substring',
+    );
+  }
+  return raw;
+}
+
 /**
  * Validate the `--timeout` flag value. Returns a clamped integer in
  * range [1, 3600], or the default when absent.
@@ -15098,7 +15109,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--filter <substr>',
-      'with --all: only run tests whose name contains this substring (case-insensitive)',
+      'with --all: only run tests whose name contains this non-empty substring (case-insensitive); omit to run every test',
     )
     .option(
       '--max-concurrency <n>',
@@ -15186,6 +15197,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         );
       }
       const isAll = cmdOpts.all === true;
+      const nameFilter = parseNameFilter(cmdOpts.filter);
       const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
       // Mutual-exclusion: exactly one of positional <test-id> vs --all must be set.
@@ -15204,7 +15216,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       // --filter is an --all-only narrowing flag (mirrors `test rerun --filter`).
       // Without --all it would be SILENTLY ignored while the explicit <test-id>
       // still runs — defeating the caller's narrowing intent. Reject early.
-      if (cmdOpts.filter !== undefined && cmdOpts.filter !== '' && !isAll) {
+      if (nameFilter !== undefined && !isAll) {
         throw localValidationError(
           'filter',
           '--filter only applies with --all (it narrows which project tests run). Remove --filter, or add --all with --project <id> or TESTSPRITE_PROJECT_ID.',
@@ -15334,7 +15346,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           {
             ...resolveCommonOptions(command, deps.env),
             projectId,
-            nameFilter: cmdOpts.filter,
+            nameFilter,
             wait: effectiveWait,
             noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
             concurrencyIsDefault: cmdOpts.maxConcurrency === undefined,
@@ -15399,7 +15411,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             wait: effectiveWait,
             all: isAll,
             projectId: cmdOpts.project,
-            nameFilter: cmdOpts.filter,
+            nameFilter,
             localPort,
             localHost,
             targetUrl: cmdOpts.targetUrl,
@@ -15557,7 +15569,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--filter <substr>',
-      'with --all: only rerun tests whose name contains this substring (case-insensitive)',
+      'with --all: only rerun tests whose name contains this non-empty substring (case-insensitive); omit to rerun every test',
     )
     .option('--wait', 'block until terminal status or --timeout elapses', false)
     .option('--no-wait', 'detach without opening an automatic environment tunnel')
@@ -15636,6 +15648,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testIdsArg: string[], cmdOpts: RerunFlagOpts, command: Command) => {
+      const nameFilter = parseNameFilter(cmdOpts.filter);
       // Commander's `--no-auto-heal` pattern makes `cmdOpts.autoHeal` default
       // `true` (unchanged by the user) and `false` when the user passes
       // `--no-auto-heal`. There is no explicit `--auto-heal` flag, so
@@ -15680,7 +15693,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           projectId: cmdOpts.project,
           skipTerminal: cmdOpts.skipTerminal === true,
           statusFilter: cmdOpts.status,
-          nameFilter: cmdOpts.filter,
+          nameFilter,
           wait: cmdOpts.wait === true,
           noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
           skipPreflight: cmdOpts.skipPreflight === true,
