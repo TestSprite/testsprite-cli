@@ -6,6 +6,7 @@ import {
   emitDryRunBanner,
   makeHttpClient,
   parseRequestTimeoutFlag,
+  resolveRequestTimeoutMs,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
@@ -283,7 +284,10 @@ export async function runConfigure(
     baseUrl: facadeBaseUrl(apiUrl),
     apiKey,
     fetchImpl: deps.fetchImpl,
-    requestTimeoutMs: opts.requestTimeoutMs,
+    // Same precedence as every other command's client (flag > env > default,
+    // same clamping): `setup --from-env` previously read the flag only, so a
+    // TESTSPRITE_REQUEST_TIMEOUT_MS deadline was silently ignored here.
+    requestTimeoutMs: resolveRequestTimeoutMs(opts, env),
     shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
     shutdown: deps.shutdown ?? globalShutdown,
   });
