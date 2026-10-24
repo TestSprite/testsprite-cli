@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { runCreateFromPlan, runLint } from './test.js';
+import { runCreateBatch, runCreateFromPlan, runLint } from './test.js';
 import { ApiError } from '../lib/errors.js';
 
 /**
@@ -44,9 +44,12 @@ describe('plan files saved with a BOM (PowerShell 5.1 `>`) lint cleanly', () => 
     it(`lints a ${enc} plan file with zero issues`, async () => {
       const dir = mkdtempSync(join(tmpdir(), 'bom-plan-'));
       const path = writeEncoded(dir, `plan-${enc}.json`, JSON.stringify(PLAN, null, 2), enc);
-      const report = await runLint(
-        { profile: 'default', output: 'json', debug: false, planFrom: path },
-      );
+      const report = await runLint({
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        planFrom: path,
+      });
       expect(report.checked).toBe(1);
       expect(report.issues).toEqual([]);
     });
@@ -82,5 +85,42 @@ describe('plan files saved with a BOM (PowerShell 5.1 `>`) lint cleanly', () => 
     );
     expect(err).toBeInstanceOf(ApiError);
     expect(String((err as { nextAction?: string }).nextAction)).toContain('incomplete code unit');
+  });
+});
+
+describe('plan-from-dir caps the batch on raw bytes, not decoded length', () => {
+  it('a UTF-16 directory whose raw bytes exceed 5 MB fails with PAYLOAD_TOO_LARGE before any network', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bom-dir-'));
+    // One valid (small) plan so the batch would otherwise assemble cleanly.
+    writeEncoded(dir, '01-plan.json', JSON.stringify(PLAN, null, 2), 'utf16le');
+    // One non-plan JSON file (skipped by the plan heuristic AFTER being read)
+    // whose RAW UTF-16LE bytes blow the 5 MB cap while its decoded length
+    // stays well under it — the exact gap a decoded-length check misses.
+    // 2.7 MB of ASCII decodes from ~5.4 MB of UTF-16LE.
+    const padding = `{"padding":"${'x'.repeat(2_700_000)}"}`;
+    writeEncoded(dir, '02-padding.json', padding, 'utf16le');
+    writeFileSync(
+      join(dir, 'credentials'),
+      '[default]\napi_url = http://localhost:13502\napi_key = sk-user-test\n',
+    );
+    const deps = {
+      credentialsPath: join(dir, 'credentials'),
+      fetchImpl: (() => {
+        throw new Error('unexpected network');
+      }) as typeof fetch,
+      stdout: () => {},
+      stderr: () => {},
+    };
+    const err: unknown = await runCreateBatch(
+      { profile: 'default', output: 'json', debug: false, plans: '', planFromDir: dir },
+      deps as never,
+    ).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ApiError);
+    expect(String((err as { nextAction?: string }).nextAction)).toContain(
+      'multiple smaller directories',
+    );
   });
 });

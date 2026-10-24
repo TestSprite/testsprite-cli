@@ -20,7 +20,6 @@ import {
   existsSync,
   fstatSync,
   openSync,
-  readFileSync,
   readSync,
   readdirSync,
   statSync,
@@ -2113,7 +2112,7 @@ function readCappedFileGuarded(
   field: string,
   path: string,
   maxBytes: number,
-): { ok: true; raw: string } | { ok: false; sizeBytes: number } {
+): { ok: true; raw: string; sizeBytes: number } | { ok: false; sizeBytes: number } {
   const absolute = resolveAbsolute(path);
 
   let fd: number;
@@ -2203,7 +2202,7 @@ function readCappedFileGuarded(
       const reason = err instanceof Error ? err.message : 'unknown error';
       throw localValidationError(field, `cannot decode ${path}: ${reason}`);
     }
-    return { ok: true, raw };
+    return { ok: true, raw, sizeBytes: bytes.length };
   } finally {
     closeSync(fd);
   }
@@ -4032,7 +4031,8 @@ interface CreateBatchOptions extends CommonOptions {
  *
  * Caps:
  *   - 50 specs per batch (CLI rejects locally before sending)
- *   - 5 MB total body (CLI checks after stringify)
+ *   - 5 MB total raw bytes (CLI enforces while reading files; the assembled
+ *     JSON size is re-checked after stringify)
  *   - 200 steps + 256 KB per individual plan (per-line validation)
  *
  * BE specs in the batch are flagged on stderr with their `specIndex`
@@ -5219,8 +5219,11 @@ function readPlansJsonlGuarded(path: string): CliPlanInput[] {
  * filename so the caller can fix one file at a time.
  *
  * Caps: 50 specs total (same as JSONL); aggregate size checked against
- * MAX_BATCH_BODY_BYTES (5 MB) using the JSON-serialised size of the assembled
- * spec array.
+ * MAX_BATCH_BODY_BYTES (5 MB) on the RAW bytes as each file is read — a
+ * UTF-16LE/BE body decodes to roughly half its byte count, so a cap checked
+ * only on the decoded (or JSON-serialised) text let a >5 MB directory slip
+ * through. The JSON-serialised size of the assembled array is still checked
+ * afterwards as a final guard.
  */
 function readPlansFromDirGuarded(dir: string, stderrFn: (line: string) => void): CliPlanInput[] {
   const absolute = resolveAbsolute(dir);
@@ -5255,16 +5258,44 @@ function readPlansFromDirGuarded(dir: string, stderrFn: (line: string) => void):
 
   const specs: CliPlanInput[] = [];
   let skippedCount = 0;
+  let rawBytes = 0;
   for (let i = 0; i < entries.length; i += 1) {
     const filename = entries[i]!;
     const filePath = join(absolute, filename);
 
     let raw: string;
     try {
-      raw = readTextFileBomAware(filePath);
+      // Cap the batch on raw bytes as each file comes off disk: a UTF-16
+      // file's decoded length is ~half its byte count, so checking the
+      // assembled text afterwards would under-count UTF-16 directories.
+      const result = readCappedFileGuarded(
+        'plan-from-dir',
+        filePath,
+        MAX_BATCH_BODY_BYTES - rawBytes,
+      );
+      if (!result.ok) {
+        throw ApiError.fromEnvelope({
+          error: {
+            code: 'PAYLOAD_TOO_LARGE',
+            message: `Plan-from-dir batch exceeds the 5 MB CLI cap (${rawBytes + result.sizeBytes} bytes).`,
+            nextAction: 'Split into multiple smaller directories or trim step descriptions.',
+            requestId: 'local',
+            details: {
+              field: 'plan-from-dir',
+              sizeBytes: rawBytes + result.sizeBytes,
+              maxBytes: MAX_BATCH_BODY_BYTES,
+            },
+          },
+        });
+      }
+      raw = result.raw;
+      rawBytes += result.sizeBytes;
     } catch (err) {
-      // Hard I/O error (permission denied etc.): re-throw so the user knows the
-      // directory is unreadable — this is not a "skip" case.
+      // Typed errors from the capped reader (the PAYLOAD_TOO_LARGE envelope
+      // above, its localValidationError file errors) pass through unchanged.
+      // Hard I/O error (permission denied etc.): re-throw so the user knows
+      // the directory is unreadable — this is not a "skip" case.
+      if (err instanceof ApiError || err instanceof CLIError) throw err;
       const reason = err instanceof Error ? err.message : 'unknown error';
       throw localValidationError('plan-from-dir', `cannot read ${filename}: ${reason}`);
     }
