@@ -1432,6 +1432,7 @@ async function assertCiEnvironmentExists(opts: CiRunOptions, deps: TestDeps): Pr
   );
 }
 
+/** Build CI run and workflow scaffolding commands with injectable runtime dependencies. */
 export function createCiCommand(deps: CiDeps = {}): Command {
   const ci = new Command('ci').description('Run tests in CI and scaffold CI integration');
 
