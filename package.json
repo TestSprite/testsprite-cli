@@ -17,7 +17,7 @@
     "generate:version": "node scripts/generate-version.mjs",
     "prebuild": "node scripts/generate-version.mjs",
     "build": "tsc -p tsconfig.build.json && node scripts/postbuild.mjs",
-    "clean": "rm -rf dist coverage",
+    "clean": "node scripts/clean.mjs",
     "lint": "eslint . && node .github/scripts/check-ticket-refs.mjs",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
