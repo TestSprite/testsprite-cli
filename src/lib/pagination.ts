@@ -38,6 +38,9 @@ export const MAX_AUTO_PAGES = 1000;
  */
 export function validatePaginationFlags(flags: PaginationFlags): PaginationFlags {
   const out: PaginationFlags = { ...flags };
+  if (out.startingToken !== undefined && out.startingToken.trim().length === 0) {
+    throw localValidationError('starting-token', 'must be a non-empty cursor');
+  }
   if (out.pageSize !== undefined) {
     if (!Number.isFinite(out.pageSize) || !Number.isInteger(out.pageSize) || out.pageSize < 1) {
       throw localValidationError(

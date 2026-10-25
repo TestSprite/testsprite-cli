@@ -28,6 +28,37 @@ describe('validatePaginationFlags', () => {
     expect(validatePaginationFlags({})).toEqual({});
   });
 
+  it('rejects an explicitly empty starting token', () => {
+    expect(() => validatePaginationFlags({ startingToken: '' })).toThrow(ApiError);
+    try {
+      validatePaginationFlags({ startingToken: '' });
+    } catch (error) {
+      expect(error).toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'starting-token' },
+      });
+    }
+  });
+
+  it('rejects a whitespace-only starting token', () => {
+    expect(() => validatePaginationFlags({ startingToken: ' \t\n' })).toThrow(ApiError);
+    try {
+      validatePaginationFlags({ startingToken: ' \t\n' });
+    } catch (error) {
+      expect(error).toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'starting-token' },
+      });
+    }
+  });
+
+  it('preserves a non-empty opaque starting token unchanged', () => {
+    const flags = { startingToken: ' opaque-token ' };
+    expect(validatePaginationFlags(flags)).toEqual(flags);
+  });
+
   it('rejects pageSize=0', () => {
     expect(() => validatePaginationFlags({ pageSize: 0 })).toThrow(ApiError);
   });
