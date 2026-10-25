@@ -40,8 +40,9 @@ Options:
   --target <t>    Agent target(s): claude, cursor, cline, antigravity, kiro,
                   windsurf, copilot, codex (comma-separated or repeated).
                   Merged with any positional target(s). (default: [])
-  --skill <name>  Skill(s) to install: testsprite-verify, testsprite-onboard
-                  (comma-separated or repeated; default: all) (default: [])
+  --skill <name>  Skill(s) to install: testsprite-verify, testsprite-onboard,
+                  testsprite-ci (comma-separated or repeated; default: all)
+                  (default: [])
   --dir <path>    Project root to write into (default: cwd)
   --force         For own-file targets: overwrite existing file (a .bak backup
                   is kept). For codex (managed-section): replaces the section
@@ -134,18 +135,16 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > ci 1`] = `
 "Usage: testsprite ci [options] [command]
 
-Scaffold CI integration for TestSprite
+Run tests in CI and scaffold CI integration
 
 Options:
   -h, --help                 display help for command
 
 Commands:
+  run [options]              Run project tests, wait for results, and apply the
+                             CI gate
   init [options] <platform>  Write a CI workflow that runs your TestSprite
                              tests (platform: github)
-  doctor [options]           Check that deployment events reach this repo — the
-                             precondition a deployment-gated workflow rests on
-  connect [options]          Link your deploy platform (Vercel) to this repo so
-                             deployment events are emitted
   help [command]             display help for command
 "
 `;
@@ -158,19 +157,90 @@ Write a CI workflow that runs your TestSprite tests (platform: github)
 Options:
   --project <id>       project id to run (auto-detected if you have exactly
                        one)
-  --filter <substr>    only run tests whose name contains this substring
-  --timeout <s>        max seconds to wait for a terminal verdict (1-3600)
-                       (default: "600")
-  --path <file>        output path for the workflow (default:
-                       ".github/workflows/testsprite.yml")
-  --force              overwrite an existing workflow (a .bak backup is kept)
-                       (default: false)
+  --env <name>         environment whose sign-in each PR run uses (default: the
+                       project's default environment, written out by name)
+  --timeout <s>        max seconds ci run waits for a terminal verdict (1-3600;
+                       omitted: ci run's default)
+  --path <file>        workflow file to write, under .github/workflows/ (.yml
+                       or .yaml) (default: ".github/workflows/testsprite.yml")
+  --force              overwrite an existing workflow with different content
+                       (keeps a .bak) (default: false)
   --set-secret         set the TESTSPRITE_API_KEY repo secret via gh (if
                        installed + authenticated); OVERWRITES an existing
                        secret of that name (default: false)
   --repo <owner/name>  target repo for --set-secret (gh infers from the cwd if
                        omitted)
   -h, --help           display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > ci run 1`] = `
+"Usage: testsprite ci run [options]
+
+Run project tests, wait for results, and apply the CI gate
+
+Options:
+  --project <id>                  project id (defaults to
+                                  TESTSPRITE_PROJECT_ID)
+  --all                           run all project tests (already the default)
+  --filter <substr>               only run tests whose name contains this
+                                  substring
+  --env <name>                    the environment whose sign-in the run uses
+                                  (unknown names fail). In a pull request, with
+                                  --target-url, the run happens in a temporary
+                                  clone of it at the preview address, named
+                                  github-pr-<N> like a GitHub App run
+  --target-url <url>              frontend tests: the address to test,
+                                  typically this pull request's preview
+                                  deployment
+  --skip-preflight                skip the pre-charge reachability probe for
+                                  --target-url (default: false)
+  --timeout <s>                   max seconds to wait for results (1-3600)
+                                  (default: "600")
+  --execution-report-timeout <s>  max seconds to wait for the execution report
+                                  that fills the job summary (1-3600) (default:
+                                  "60")
+  --no-execution-report           keep the job summary to the local results
+                                  table; read and write no execution report
+  --max-concurrency <n>           maximum concurrent polls (1-100) (default:
+                                  "50")
+  --idempotency-key <key>         idempotency key for the batch dispatch
+  --fail-on-skipped               fail if any requested test was not run
+                                  (default: warn)
+  --allow-empty                   allow zero dispatched tests (default: exit 5)
+  --gh-output                     force GitHub annotations and job summary
+                                  outside Actions
+  --summary-file <path>           write the unified CI summary JSON to this
+                                  file
+  --report <format>               also write a report (junit); disabled by
+                                  default
+  --report-file <path>            JUnit report destination (requires --report
+                                  junit)
+  --report-suite-name <name>      JUnit suite name (default:
+                                  testsprite:<projectId>)
+  -h, --help                      display help for command
+
+Always waits for results. Failed tests and timeouts fail the gate.
+Skipped tests warn unless --fail-on-skipped; missing test ids and unknown
+environments always fail. Every selected test is seeded into ONE execution
+and the server paces dispatch, as for a GitHub App run.
+In GitHub Actions the pull request is read from the event (a deployment_status
+event is looked up by commit with GITHUB_TOKEN); draft PRs and deployments
+with no pull request are skipped with a notice and zero step outputs. The run
+is stamped with the PR, so the Portal links back to it. ci run does not read
+the deployment's state or environment: filter deployment_status events with
+the job's \`if:\` (state == 'success', not production), or a failed or
+production deployment is gated too.
+Writes total, passed, failed, skipped, timedOut to GITHUB_OUTPUT when present.
+On a supporting backend the job summary is the execution report — the same content
+the GitHub App posts as its PR comment — and execution-report-file /
+execution-report-markdown-file name its JSON and Markdown for later steps.
+Reports and outputs are emitted before the exit code is decided.
+Backend tests use the URL in their own code, not --target-url. PR comments are not yet supported.
+
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
@@ -743,7 +813,8 @@ Options:
   --name <name>              human-readable test name (becomes \`title\` in
                              storage)
   --description <text>       optional human description (≤ 2000 chars)
-  --priority <prio>          optional priority — one of: p0, p1, p2, p3
+  --priority <prio>          optional priority: p0/high, p1/medium, p2/low (p3
+                             = low)
   --step-timeout <ms>        per-test step timeout in milliseconds (1-60000);
                              applied by the execution engine to every step of
                              this test
@@ -797,7 +868,7 @@ Options:
 Plan file format (--plan-from <file>) — minimal valid example:
 
 {
-  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.14.0/schemas/plan.schema.json",
+  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.15.0/schemas/plan.schema.json",
   "projectId": "prj_abc123",
   "type": "frontend",
   "name": "Login rejects an empty password",
@@ -1618,7 +1689,7 @@ Commands:
   project                      Manage TestSprite projects
   test                         Inspect TestSprite tests
   testlist                     Manage test lists (groups of tests)
-  ci                           Scaffold CI integration for TestSprite
+  ci                           Run tests in CI and scaffold CI integration
   schedule                     Manage TestSprite schedules
   tunnel                       Open a tunnel so TestSprite can reach an app on
                                this machine

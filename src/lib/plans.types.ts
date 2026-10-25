@@ -66,7 +66,7 @@ export interface CliPlanProposal {
   proposalId: string;
   title: string;
   description: string;
-  /** CLI priority vocabulary (`p1`..`p3`, mapped from V3 High/Medium/Low). */
+  /** Priority as the CLI shows it: `p0` (High), `p1` (Medium), `p2` (Low). */
   priority: string;
   category: string;
   feature: string;

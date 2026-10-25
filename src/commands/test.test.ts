@@ -13164,3 +13164,95 @@ describe('runTestRun / runTestRerun — dashboard line on the queued-run output'
     expect(bare.join('\n')).not.toContain('dashboard');
   });
 });
+
+// ---------------------------------------------------------------------------
+// `test list` on an EMPTY project is the moment a new user without a
+// coding agent discovers there is nothing to run. Text mode adds one [hint] on
+// stderr (stdout stays exactly "No tests." for pipes). A filtered-out page or a
+// page with a cursor is not an empty project, and JSON callers get nothing.
+// ---------------------------------------------------------------------------
+describe('`test list` on an empty project points at test plan generate', () => {
+  it('text mode, no filters, no cursor: stdout stays "No tests." and stderr gets one [hint] with the project id', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { items: [], nextToken: null } }));
+    const out: string[] = [];
+    const stderrLines: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_alice',
+        pageSize: 25,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => out.push(line),
+        stderr: l => stderrLines.push(l),
+      },
+    );
+    expect(out.join('\n')).toBe('No tests.');
+    const hint = stderrLines.find(l => l.startsWith('[hint]'));
+    expect(hint).toBeDefined();
+    expect(hint).toContain('testsprite test plan generate --project project_alice');
+    // Generation only stages proposals: accept must follow, and a backend
+    // project needs its API spec first. `test list` cannot tell the type
+    // without another request, so the prerequisite is named as a clause.
+    expect(hint).toContain('then testsprite test plan accept --project project_alice');
+    expect(hint).toContain('testsprite project docs upload <spec> --project project_alice');
+    expect(hint).toContain('testsprite test create --plan-template');
+  });
+
+  it('json mode: no hint', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { items: [], nextToken: null } }));
+    const stderrLines: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        pageSize: 25,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: l => stderrLines.push(l) },
+    );
+    expect(stderrLines.some(l => l.startsWith('[hint]'))).toBe(false);
+  });
+
+  it('a --type filter that returns nothing is not an empty project: no hint', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { items: [], nextToken: null } }));
+    const stderrLines: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_alice',
+        pageSize: 25,
+        type: 'backend',
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: l => stderrLines.push(l) },
+    );
+    expect(stderrLines.some(l => l.startsWith('[hint]'))).toBe(false);
+  });
+
+  it('an empty page with a cursor is not an empty project: no hint', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { items: [], nextToken: 'still-more' } }));
+    const stderrLines: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        projectId: 'project_alice',
+        pageSize: 25,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: l => stderrLines.push(l) },
+    );
+    expect(stderrLines.some(l => l.startsWith('[hint]'))).toBe(false);
+  });
+});

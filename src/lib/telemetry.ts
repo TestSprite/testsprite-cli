@@ -14,9 +14,10 @@
  *   - Opt-out: skipped when `TESTSPRITE_NO_TELEMETRY` or the cross-tool
  *     `DO_NOT_TRACK` is set. Also skipped under `--dry-run` (no network) and
  *     when no leaf command actually ran (bare `--help` / parse errors).
- *   - Never on abort (SIGINT/SIGTERM): Ctrl-C must exit immediately, so the
- *     abort path emits nothing (awaiting would delay shutdown; fire-and-forget
- *     would be cut off before delivery anyway).
+ *   - On abort (SIGINT/SIGTERM) the event is still sent — `outcome: 'abort'`,
+ *     through the same bounded flush `index.ts` runs before setting the exit
+ *     code — and the extras the command recorded before the signal ride along
+ *     (a cancelled CI gate keeps its `gated` outcome and execution id).
  *
  * Privacy: the event is a fixed allowlist of low-cardinality, PII-free fields.
  * It NEVER carries target URLs, api keys, arg values, error messages, or
@@ -216,7 +217,9 @@ export type TelemetryConflictReason =
 /**
  * Low-cardinality facts a command records about its own outcome before it
  * returns, merged into the one event `index.ts` fires. Counts are non-negative
- * integers; enums are closed. Nothing here can carry an id, a URL, or a message.
+ * integers; enums are closed. Nothing here can carry a URL, a message, or an
+ * id that names a person or a repository — `executionId` is the server's own
+ * opaque UUID for the run, so the event can be joined to the execution's report.
  */
 export interface TelemetryExtras {
   local?: boolean;
@@ -240,6 +243,49 @@ export interface TelemetryExtras {
   force?: boolean;
   workflowExisted?: boolean;
   projectResolved?: 'flag' | 'auto';
+  /** `ci run` facts: what the gate did, which execution it was, whether the report arrived. */
+  ciRunOutcome?: CiRunTelemetryOutcome;
+  executionId?: string;
+  reportReady?: boolean;
+}
+
+/**
+ * What a `ci run` invocation ended up doing. `gated` = tests were dispatched
+ * and the exit code is the verdict; `skipped_*` = nothing to gate (exit 0, no
+ * summary); `refused_*` = refused before or at dispatch; `empty` = nothing
+ * selected. The funnel step "`ci init` → first gated run" is computed from it.
+ */
+export type CiRunTelemetryOutcome =
+  | 'gated'
+  | 'skipped_draft'
+  | 'skipped_no_pr'
+  | 'refused_admission'
+  | 'refused_env'
+  | 'refused_preview_name'
+  | 'refused_loopback'
+  | 'refused_billing'
+  | 'refused_other'
+  | 'empty';
+
+/**
+ * The `ci run` outcome for an API refusal — at the environment pre-check or at
+ * the batch dispatch. Every refusal gets a value, so `refused_other` really is
+ * "any other refusal": a validation error is split by the server's
+ * `details.reason`; a 402/403 (credits, a feature gate) is `refused_billing`;
+ * a 401, 429 or anything else is `refused_other`.
+ */
+export function ciRefusalOutcome(err: {
+  code: string;
+  details?: Record<string, unknown>;
+}): CiRunTelemetryOutcome {
+  if (err.code === 'VALIDATION_ERROR') {
+    const reason = err.details?.reason;
+    if (reason === 'preview-name-taken') return 'refused_preview_name';
+    if (reason === 'private-or-local') return 'refused_loopback';
+    return 'refused_other';
+  }
+  if (err.code === 'INSUFFICIENT_CREDITS' || err.code === 'FEATURE_GATED') return 'refused_billing';
+  return 'refused_other';
 }
 
 /** What callers may hand the sanitizer: the typed shape, or an arbitrary bag it filters. */
@@ -257,22 +303,38 @@ const COUNT_KEYS = [
   'localConcurrencyLimit',
   'localPeakInFlight',
 ] as const;
-const BOOLEAN_KEYS = ['force', 'workflowExisted', 'local'] as const;
-const ENUM_KEYS: { [K in 'conflictReason' | 'platform' | 'projectResolved']: ReadonlySet<string> } =
-  {
-    conflictReason: new Set<TelemetryConflictReason>([
-      'in_flight',
-      'insufficient_credits',
-      'paused',
-      'billing_hold',
-      'mcp_view_only',
-      'local_address',
-      'tunnel-required',
-      'error',
-    ]),
-    platform: new Set(['github']),
-    projectResolved: new Set(['flag', 'auto']),
-  };
+const BOOLEAN_KEYS = ['force', 'workflowExisted', 'local', 'reportReady'] as const;
+/** Opaque server ids the beacon accepts — a UUID, nothing free-form. */
+const UUID_KEYS = ['executionId'] as const;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const ENUM_KEYS: {
+  [K in 'conflictReason' | 'platform' | 'projectResolved' | 'ciRunOutcome']: ReadonlySet<string>;
+} = {
+  conflictReason: new Set<TelemetryConflictReason>([
+    'in_flight',
+    'insufficient_credits',
+    'paused',
+    'billing_hold',
+    'mcp_view_only',
+    'local_address',
+    'tunnel-required',
+    'error',
+  ]),
+  platform: new Set(['github']),
+  projectResolved: new Set(['flag', 'auto']),
+  ciRunOutcome: new Set<CiRunTelemetryOutcome>([
+    'gated',
+    'skipped_draft',
+    'skipped_no_pr',
+    'refused_admission',
+    'refused_env',
+    'refused_preview_name',
+    'refused_loopback',
+    'refused_billing',
+    'refused_other',
+    'empty',
+  ]),
+};
 
 /**
  * Keep only the allowlisted keys with a value of the right shape. Pure: this is
@@ -289,6 +351,10 @@ export function sanitizeTelemetryExtras(partial: TelemetryExtrasInput): Telemetr
   for (const key of BOOLEAN_KEYS) {
     const v = rec[key];
     if (typeof v === 'boolean') out[key] = v;
+  }
+  for (const key of UUID_KEYS) {
+    const v = rec[key];
+    if (typeof v === 'string' && UUID_RE.test(v)) out[key] = v;
   }
   for (const key of Object.keys(ENUM_KEYS) as Array<keyof typeof ENUM_KEYS>) {
     const v = rec[key];

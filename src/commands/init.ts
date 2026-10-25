@@ -757,7 +757,13 @@ function renderInitText(data: unknown): string {
     lines.push(
       '  # 2. Generate tests: ask your coding agent (the testsprite-onboard skill is installed),',
     );
-    lines.push('  #    or create one yourself, then run them (use the projectId from step 1):');
+    lines.push(
+      '  #    or have TestSprite propose them directly (uses credits), review them, then accept:',
+    );
+    lines.push('  testsprite test plan generate --project <projectId>');
+    lines.push('  testsprite test plan accept --project <projectId>');
+    lines.push('');
+    lines.push('  # 3. Run them (use the projectId from step 1):');
     lines.push('  testsprite test run --all --project <projectId>');
     lines.push('');
     lines.push('  # Manage installed agent skills');
@@ -766,8 +772,20 @@ function renderInitText(data: unknown): string {
       '  testsprite agent install --target=<t>   # re-install or install additional targets',
     );
   } else {
-    lines.push('  # 2. Create a test, then run it (use the projectId from step 1):');
-    lines.push('  testsprite test create --project <projectId> ...');
+    // Without an agent, this is the only place a new user learns that
+    // TestSprite can propose the first suite. Printing this runs and charges
+    // nothing; generating does use credits, which the line says. The
+    // hand-authored path stays visible as the fallback.
+    lines.push(
+      '  # 2. Let TestSprite propose your first tests (uses credits), review them, then accept:',
+    );
+    lines.push('  #    Backend project? Upload your API spec first:');
+    lines.push('  #    testsprite project docs upload ./openapi.yaml --project <projectId>');
+    lines.push('  testsprite test plan generate --project <projectId>');
+    lines.push('  testsprite test plan accept --project <projectId>');
+    lines.push('  #    Prefer to write one yourself: testsprite test create --plan-template');
+    lines.push('');
+    lines.push('  # 3. Run them (use the projectId from step 1):');
     lines.push('  testsprite test run --all --project <projectId>');
     lines.push(
       '  # Tip: `testsprite agent install` sets up the onboarding skill for your coding agent',

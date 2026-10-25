@@ -1160,6 +1160,195 @@ describe('test run local batch', () => {
     expect(f.calls.some(c => c.method === 'POST')).toBe(false);
   });
 
+  describe('--all --local on an EMPTY project points at the hand-written plan', () => {
+    const listing = (items: Array<Record<string, unknown>>) => (call: Call) =>
+      call.method === 'GET' && call.url.includes('/tests?')
+        ? new Response(JSON.stringify({ items, nextToken: null }), {
+            headers: { 'content-type': 'application/json' },
+          })
+        : undefined;
+    const LOCAL_WORDING = 'plan generation cannot reach an app on your machine yet';
+
+    it('text mode: exit 5 names the hand-written plan and the local run, never plan generate', async () => {
+      const f = fixture([], { onCall: listing([]) });
+      const err = await f
+        .run('--all', '--project', 'P', '--local', '5173', '--skip-preflight', '--text-output')
+        .then(
+          () => undefined as never,
+          (e: unknown) => e as Error & { exitCode?: number },
+        );
+      expect(err).toMatchObject({ exitCode: 5 });
+      expect(err.message).toContain(LOCAL_WORDING);
+      // --plan-from ignores --project, so the id goes in the file, not on the command.
+      expect(err.message).toContain('set projectId to P in it');
+      expect(err.message).toContain('testsprite test create --plan-from first.plan.json,');
+      expect(err.message).not.toMatch(/--plan-from \S+ --project/);
+      expect(err.message).toContain('testsprite test run <test-id> --local 5173');
+      expect(err.message).not.toContain('--local-host');
+      expect(err.message).not.toContain('test plan generate');
+    });
+
+    it('a non-default --local-host is carried into the suggested run command', async () => {
+      const f = fixture([], { onCall: listing([]) });
+      const err = await f
+        .run(
+          '--all',
+          '--project',
+          'P',
+          '--local',
+          '5173',
+          '--local-host',
+          '::1',
+          '--skip-preflight',
+          '--text-output',
+        )
+        .then(
+          () => undefined as never,
+          (e: unknown) => e as Error,
+        );
+      expect(err.message).toContain('testsprite test run <test-id> --local 5173 --local-host ::1');
+    });
+
+    const emptyRunMessage = async (
+      f: ReturnType<typeof fixture>,
+      ...args: string[]
+    ): Promise<string> => {
+      const err = await f.run(...args).then(
+        () => undefined as never,
+        (e: unknown) => e as Error & { exitCode?: number },
+      );
+      expect(err).toMatchObject({ exitCode: 5 });
+      return err.message;
+    };
+
+    it('a non-default saved local environment is named, so the run does not fall back to the default one', async () => {
+      const f = fixture([], {
+        onCall: call =>
+          call.method === 'GET' && call.url.endsWith('/projects/P/env')
+            ? new Response(
+                JSON.stringify({
+                  environments: [
+                    {
+                      name: 'production',
+                      url: 'https://app.example.com',
+                      isDefault: true,
+                      isTemporary: false,
+                    },
+                    {
+                      name: 'Local',
+                      url: 'http://127.0.0.1:5173',
+                      isDefault: false,
+                      isTemporary: false,
+                    },
+                  ],
+                }),
+                { headers: { 'content-type': 'application/json' } },
+              )
+            : listing([])(call),
+      });
+      const message = await emptyRunMessage(
+        f,
+        '--all',
+        '--project',
+        'P',
+        '--env',
+        'Local',
+        '--skip-preflight',
+        '--text-output',
+      );
+      expect(message).toContain(LOCAL_WORDING);
+      expect(message).toContain("testsprite test run <test-id> --env 'Local'");
+      expect(message).not.toContain('--local 5173');
+    });
+
+    it('the default saved local environment is named too', async () => {
+      const f = fixture([], { onCall: listing([]) });
+      const message = await emptyRunMessage(
+        f,
+        '--all',
+        '--project',
+        'P',
+        '--skip-preflight',
+        '--text-output',
+      );
+      expect(message).toContain("testsprite test run <test-id> --env 'saved'");
+    });
+
+    it('an explicit loopback --target-url is replayed as typed', async () => {
+      const f = fixture([], { onCall: listing([]) });
+      const message = await emptyRunMessage(
+        f,
+        '--all',
+        '--project',
+        'P',
+        '--target-url',
+        'http://localhost:5173',
+        '--skip-preflight',
+        '--text-output',
+      );
+      expect(message).toContain('testsprite test run <test-id> --target-url http://localhost:5173');
+      expect(message).not.toContain('--local 5173');
+    });
+
+    it('text mode + --allow-empty: the same pointer reaches stderr as a [hint] line', async () => {
+      const f = fixture([], { onCall: listing([]) });
+      await f.run('--all', '--project', 'P', '--local', '9', '--allow-empty', '--text-output');
+      const hint = f.stderr.find(line => line.startsWith('[hint] '));
+      expect(hint).toContain(LOCAL_WORDING);
+    });
+
+    it('--output json: neither the error message nor stderr carries the pointer', async () => {
+      const f = fixture([], { onCall: listing([]) });
+      const err = await f
+        .run('--all', '--project', 'P', '--local', '5173', '--skip-preflight')
+        .then(
+          () => undefined as never,
+          (e: unknown) => e as Error & { exitCode?: number },
+        );
+      expect(err).toMatchObject({ exitCode: 5 });
+      expect(err.message).not.toContain(LOCAL_WORDING);
+      expect(f.stderr.join('\n')).not.toContain('[hint]');
+    });
+
+    it('a --filter that matched nothing is NOT an empty project: no pointer', async () => {
+      const f = fixture([], {
+        onCall: listing([{ id: 'f1', projectId: 'P', name: 'Login flow', type: 'frontend' }]),
+      });
+      const err = await f
+        .run(
+          '--all',
+          '--project',
+          'P',
+          '--local',
+          '5173',
+          '--filter',
+          'checkout',
+          '--skip-preflight',
+          '--text-output',
+        )
+        .then(
+          () => undefined as never,
+          (e: unknown) => e as Error & { exitCode?: number },
+        );
+      expect(err).toMatchObject({ exitCode: 5 });
+      expect(err.message).not.toContain(LOCAL_WORDING);
+    });
+
+    it('a project with only backend tests is NOT empty: no pointer', async () => {
+      const f = fixture([], {
+        onCall: listing([{ id: 'b1', projectId: 'P', name: 'API check', type: 'backend' }]),
+      });
+      const err = await f
+        .run('--all', '--project', 'P', '--local', '5173', '--skip-preflight', '--text-output')
+        .then(
+          () => undefined as never,
+          (e: unknown) => e as Error & { exitCode?: number },
+        );
+      expect(err).toMatchObject({ exitCode: 5 });
+      expect(err.message).not.toContain(LOCAL_WORDING);
+    });
+  });
+
   it('reports zero peak in flight when every trigger is refused', async () => {
     const f = fixture(['a', 'b'], {
       onCall: call =>

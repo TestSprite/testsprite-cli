@@ -5430,6 +5430,152 @@ describe('run --all --wait: auto-resume already-running conflicts (Gap B)', () =
     expect(summary.total).toBe(1);
   });
 
+  function inFlightRunRead(overrides: Partial<RunResponse>): RunResponse {
+    return {
+      runId: 'run_inflight',
+      testId: 'test_busy',
+      projectId: 'project_1',
+      userId: 'u1',
+      status: 'passed',
+      source: 'cli',
+      createdAt: '2026-06-09T10:00:00.000Z',
+      startedAt: '2026-06-09T10:00:05.000Z',
+      finishedAt: '2026-06-09T10:00:30.000Z',
+      codeVersion: 'v1',
+      targetUrl: 'https://example.com',
+      createdFrom: 'cli',
+      failedStepIndex: null,
+      failureKind: null,
+      error: null,
+      videoUrl: null,
+      stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
+      ...overrides,
+    };
+  }
+  const ENV_LISTING = {
+    environments: [
+      { id: 'env_default', name: 'default', url: 'https://example.com', isDefault: true },
+      { id: 'env_staging', name: 'staging', url: 'https://staging.example.com', isDefault: false },
+    ],
+  };
+  function batchWithOneInFlight(inFlight: RunResponse) {
+    const conflictResp: BatchRunFreshResponse = {
+      accepted: [],
+      deferred: [],
+      conflicts: [{ testId: 'test_busy', currentRunId: 'run_inflight' }],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const calls: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      calls.push(`${init.method ?? 'GET'} ${url.replace(/^https?:\/\/[^/]+/, '')}`);
+      if ((init.method ?? 'GET') === 'POST') {
+        // Echo the batch target like a current backend, so the echo guard
+        // (`target-url-not-honored`) is not what this test exercises.
+        const sent =
+          typeof init.body === 'string' ? (JSON.parse(init.body) as { targetUrl?: string }) : {};
+        return {
+          body: sent.targetUrl ? { ...conflictResp, targetUrl: sent.targetUrl } : conflictResp,
+        };
+      }
+      if (url.endsWith('/projects/project_1/env')) return { body: ENV_LISTING };
+      if (url.includes('/runs/run_inflight')) return { body: inFlight };
+      return errorBody('NOT_FOUND');
+    });
+    return { fetchImpl, calls };
+  }
+  const batchOpts = {
+    profile: 'default',
+    output: 'json' as const,
+    debug: false,
+    projectId: 'project_1',
+    wait: true,
+    timeoutSeconds: 60,
+    maxConcurrency: 5,
+  };
+
+  it('--env: an in-flight run on ANOTHER environment is not attached — it stays a hard conflict (exit 6)', async () => {
+    const { credentialsPath } = makeCreds();
+    const { fetchImpl, calls } = batchWithOneInFlight(
+      inFlightRunRead({ environment: { id: 'env_default', name: 'default' } }),
+    );
+    const stderr: string[] = [];
+    const err = await runTestRunAll(
+      { ...batchOpts, environment: 'staging' },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: l => stderr.push(l),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ exitCode: 6 });
+    // The in-flight run was read and the project's environments listed, but it
+    // was never polled as this batch's own result.
+    expect(calls.filter(c => c.includes('/runs/run_inflight')).length).toBe(1);
+    expect(calls.some(c => c.endsWith('/projects/project_1/env'))).toBe(true);
+    expect(stderr.some(l => l.includes('does not match the requested environment'))).toBe(true);
+    expect(stderr.some(l => l.includes('polling in-flight run'))).toBe(false);
+  });
+
+  it('--env: an in-flight run on THAT environment is attached and polled', async () => {
+    const { credentialsPath } = makeCreds();
+    const { fetchImpl } = batchWithOneInFlight(
+      inFlightRunRead({ environment: { id: 'env_staging', name: 'staging' } }),
+    );
+    const printed: Array<Record<string, unknown>> = [];
+    await runTestRunAll(
+      { ...batchOpts, environment: 'staging' },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    const summary = printed.find(p => p.summary)?.summary as { passed: number; conflicts: number };
+    expect(summary).toMatchObject({ passed: 1, conflicts: 0 });
+  });
+
+  it('no --env: an in-flight run that records an environment must be on the project default', async () => {
+    const { credentialsPath } = makeCreds();
+    const { fetchImpl } = batchWithOneInFlight(
+      inFlightRunRead({ environment: { id: 'env_pr_8', name: 'github-pr-8' } }),
+    );
+    const stderr: string[] = [];
+    const err = await runTestRunAll(batchOpts, {
+      credentialsPath,
+      fetchImpl,
+      stdout: () => {},
+      stderr: l => stderr.push(l),
+      sleep: instantSleep,
+    }).catch(e => e);
+    expect(err).toMatchObject({ exitCode: 6 });
+    expect(stderr.some(l => l.includes('not attaching'))).toBe(true);
+  });
+
+  it('--target-url: an in-flight run against another URL is not attached', async () => {
+    const { credentialsPath } = makeCreds();
+    const { fetchImpl } = batchWithOneInFlight(
+      inFlightRunRead({ targetUrl: 'https://pr-9.preview.example.com' }),
+    );
+    const stderr: string[] = [];
+    const err = await runTestRunAll(
+      { ...batchOpts, targetUrl: 'https://pr-8.preview.example.com', skipPreflight: true },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: l => stderr.push(l),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ exitCode: 6 });
+    expect(stderr.some(l => l.includes('it targets https://pr-9.preview.example.com'))).toBe(true);
+  });
+
   it('a hard conflict (no currentRunId) still exits 6 when nothing is pollable', async () => {
     const { credentialsPath } = makeCreds();
 
@@ -8402,6 +8548,188 @@ describe('test run --env', () => {
     const text = out.join('\n');
     expect(text).toContain('environment local-dev');
     expect(text).toContain('targetUrl   http://127.0.0.1:55015');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `test run --all` on an EMPTY project (nothing skipped, no filter)
+// is a dead end for a new user: the exit-5 message itself names the generate
+// path so it prints in order after "Error:", and --allow-empty gets the same
+// pointer on stderr. Skipped-tests and filter-miss reasons are NOT an empty
+// project and must not claim it is.
+// ---------------------------------------------------------------------------
+describe('zero-dispatch on an EMPTY project points at test plan generate', () => {
+  const EMPTY_BATCH: BatchRunFreshResponse = {
+    accepted: [],
+    conflicts: [],
+    deferred: [],
+    skippedFrontend: [],
+    skippedIntegration: [],
+  };
+  const quiet = (stderr: string[] = []) => ({
+    stdout: () => undefined,
+    stderr: (l: string) => {
+      stderr.push(l);
+    },
+    sleep: () => Promise.resolve(),
+  });
+  function baseOpts(over: Record<string, unknown> = {}) {
+    return {
+      profile: 'default',
+      output: 'text' as const,
+      debug: false,
+      projectId: 'project_be',
+      wait: false,
+      timeoutSeconds: 600,
+      maxConcurrency: 5,
+      ...over,
+    };
+  }
+
+  it('empty project: the exit-5 message names test plan generate with the project id', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    await expect(
+      runTestRunAll(baseOpts() as never, { credentialsPath, fetchImpl, ...quiet() }),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.stringContaining('testsprite test plan generate --project project_be'),
+    });
+  });
+
+  it('empty project + --allow-empty: the pointer still reaches stderr', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    const stderr: string[] = [];
+    await runTestRunAll(baseOpts({ allowEmpty: true }) as never, {
+      credentialsPath,
+      fetchImpl,
+      ...quiet(stderr),
+    });
+    expect(stderr.join('\n')).toContain('testsprite test plan generate --project project_be');
+  });
+
+  it('empty project: the pointer names accept after generate, so the suggested path can run', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    const err = await runTestRunAll(baseOpts() as never, {
+      credentialsPath,
+      fetchImpl,
+      ...quiet(),
+    }).catch((e: unknown) => e as Error);
+    const message = (err as Error).message;
+    const generateAt = message.indexOf('testsprite test plan generate --project project_be');
+    const acceptAt = message.indexOf('testsprite test plan accept --project project_be');
+    expect(generateAt).toBeGreaterThanOrEqual(0);
+    expect(acceptAt).toBeGreaterThan(generateAt);
+    expect(message).toContain('testsprite project docs upload <spec> --project project_be');
+  });
+
+  it('project id from TESTSPRITE_PROJECT_ID (no --project): the exit-5 message still names it', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    await expect(
+      runTestRunAll(baseOpts({ projectId: undefined }) as never, {
+        credentialsPath,
+        fetchImpl,
+        env: { TESTSPRITE_PROJECT_ID: 'project_env' },
+        ...quiet(),
+      }),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.stringContaining('testsprite test plan generate --project project_env'),
+    });
+  });
+
+  it('project id from TESTSPRITE_PROJECT_ID + --allow-empty: the pointer still reaches stderr', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    const stderr: string[] = [];
+    await runTestRunAll(baseOpts({ projectId: undefined, allowEmpty: true }) as never, {
+      credentialsPath,
+      fetchImpl,
+      env: { TESTSPRITE_PROJECT_ID: 'project_env' },
+      ...quiet(stderr),
+    });
+    expect(stderr.join('\n')).toContain('[hint] This project has no tests yet.');
+    expect(stderr.join('\n')).toContain('testsprite test plan generate --project project_env');
+  });
+
+  it('--output json: the exit-5 message carries no pointer (the JSON envelope is unchanged)', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    const stderr: string[] = [];
+    await expect(
+      runTestRunAll(baseOpts({ output: 'json' }) as never, {
+        credentialsPath,
+        fetchImpl,
+        ...quiet(stderr),
+      }),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.not.stringContaining('plan generate'),
+    });
+    expect(stderr.join('\n')).not.toContain('[hint]');
+  });
+
+  it('--output json + --allow-empty: no pointer on stderr either', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    const stderr: string[] = [];
+    await runTestRunAll(baseOpts({ output: 'json', allowEmpty: true }) as never, {
+      credentialsPath,
+      fetchImpl,
+      ...quiet(stderr),
+    });
+    expect(stderr.join('\n')).not.toContain('[hint]');
+    expect(stderr.join('\n')).not.toContain('plan generate');
+  });
+
+  it('all frontend tests skipped is NOT an empty project: no generate pointer', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { ...EMPTY_BATCH, skippedFrontend: ['fe_1', 'fe_2'] },
+    }));
+    await expect(
+      runTestRunAll(baseOpts() as never, { credentialsPath, fetchImpl, ...quiet() }),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.not.stringContaining('plan generate'),
+    });
+  });
+
+  it('a --filter that matched nothing is NOT an empty project: no generate pointer', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/run')) return { body: EMPTY_BATCH };
+      return {
+        body: {
+          items: [
+            {
+              id: 't1',
+              projectId: 'project_be',
+              name: 'Login flow',
+              type: 'backend',
+              status: 'passed',
+              createdFrom: 'cli',
+              createdAt: '2026-01-01T00:00:00.000Z',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+            },
+          ],
+          nextToken: null,
+        },
+      };
+    });
+    await expect(
+      runTestRunAll(baseOpts({ nameFilter: 'checkout' }) as never, {
+        credentialsPath,
+        fetchImpl,
+        ...quiet(),
+      }),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.not.stringContaining('plan generate'),
+    });
   });
 });
 

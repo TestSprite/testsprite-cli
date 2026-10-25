@@ -2,6 +2,8 @@ import {
   mkdtempSync,
   statSync,
   readFileSync,
+  readdirSync,
+  renameSync,
   writeFileSync,
   existsSync,
   mkdirSync,
@@ -18,6 +20,7 @@ import {
   defaultCredentialsPath,
   deleteProfile,
   ensureRestrictiveMode,
+  isCredentialsWritePermissionError,
   parseCredentials,
   readCredentialsFile,
   readProfile,
@@ -32,6 +35,7 @@ vi.mock('node:fs', async importOriginal => {
     ...actual,
     writeFileSync: vi.fn(actual.writeFileSync),
     unlinkSync: vi.fn(actual.unlinkSync),
+    renameSync: vi.fn(actual.renameSync),
   };
 });
 
@@ -296,6 +300,100 @@ describe('writeProfile', () => {
       Object.defineProperty(process, 'platform', originalPlatform);
       vi.mocked(unlinkSync).mockImplementation(actualUnlink);
     }
+  });
+
+  describe('replacing the credentials file', () => {
+    let originalPlatform: PropertyDescriptor;
+    let actualRename: typeof renameSync;
+
+    beforeEach(() => {
+      originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+      actualRename = vi.mocked(renameSync).getMockImplementation()!;
+      // An existing file is the case a scanner can hold open.
+      writeProfile('default', { apiKey: 'sk-old' }, { path: credentialsPath });
+    });
+
+    afterEach(() => {
+      Object.defineProperty(process, 'platform', originalPlatform);
+      vi.mocked(renameSync).mockImplementation(actualRename);
+    });
+
+    const renameCalls = () =>
+      vi.mocked(renameSync).mock.calls.filter(call => call[1] === credentialsPath);
+    const tempFilesLeft = () =>
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmpRoot` is this suite's own `mkdtempSync` temp dir, never user input
+      readdirSync(tmpRoot).filter(name => name.includes('.tmp.'));
+
+    it.each(['EPERM', 'EBUSY', 'EACCES'] as const)(
+      'retries a transient %s on Windows and saves the profile',
+      code => {
+        vi.mocked(renameSync).mockClear();
+        vi.mocked(renameSync).mockImplementationOnce(() => {
+          throw Object.assign(new Error('file in use'), { code });
+        });
+        Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath });
+
+        expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
+        expect(renameCalls()).toHaveLength(2);
+        expect(tempFilesLeft()).toEqual([]);
+      },
+    );
+
+    it('surfaces a persistent Windows EPERM as a write-permission error and keeps the old file', () => {
+      const denied = Object.assign(new Error('access denied'), { code: 'EPERM' });
+      vi.mocked(renameSync).mockImplementation((from, to) => {
+        if (to === credentialsPath) throw denied;
+        return actualRename(from, to);
+      });
+      Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+      const started = Date.now();
+
+      let thrown: unknown;
+      try {
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath });
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBe(denied);
+      // Still eligible for the session-only fallback `setup --from-env` offers.
+      expect(isCredentialsWritePermissionError(thrown)).toBe(true);
+      // Retried for the transient window only, then given up.
+      expect(renameCalls().length).toBeGreaterThan(1);
+      expect(Date.now() - started).toBeLessThan(4_000);
+      expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-old' });
+      expect(tempFilesLeft()).toEqual([]);
+    });
+
+    it('does not retry on non-Windows hosts', () => {
+      vi.mocked(renameSync).mockClear();
+      const denied = Object.assign(new Error('permission denied'), { code: 'EPERM' });
+      vi.mocked(renameSync).mockImplementationOnce(() => {
+        throw denied;
+      });
+      Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'linux' });
+
+      expect(() =>
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath }),
+      ).toThrow(denied);
+      expect(renameCalls()).toHaveLength(1);
+    });
+
+    it('does not retry an error that is not contention', () => {
+      vi.mocked(renameSync).mockClear();
+      const readOnly = Object.assign(new Error('read-only file system'), { code: 'EROFS' });
+      vi.mocked(renameSync).mockImplementationOnce(() => {
+        throw readOnly;
+      });
+      Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+
+      expect(() =>
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath }),
+      ).toThrow(readOnly);
+      expect(renameCalls()).toHaveLength(1);
+    });
   });
 
   it('creates the file with mode 0600 and writes the profile', () => {

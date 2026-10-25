@@ -130,7 +130,13 @@ program.addCommand(
   }),
 );
 program.addCommand(createTestListCommand());
-program.addCommand(createCiCommand({}));
+program.addCommand(
+  createCiCommand({
+    onWaitTimeout: context => {
+      waitTimeoutTelemetry = context;
+    },
+  }),
+);
 program.addCommand(createScheduleCommand({}));
 program.addCommand(createTunnelCommand({}));
 program.addCommand(createAgentCommand({}));

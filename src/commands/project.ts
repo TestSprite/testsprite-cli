@@ -12,6 +12,7 @@ import {
 } from '../lib/client-factory.js';
 import { resolveProfileName } from '../lib/config.js';
 import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
+import { firstSuiteNextSteps } from '../lib/first-suite-hint.js';
 import type { FetchImpl, HttpClient } from '../lib/http.js';
 import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
 import {
@@ -467,6 +468,16 @@ export async function runCreate(
         `no-target-resolvable until one is set. Fix: testsprite project update ` +
         `${resolvedId ?? '<project-id>'} --url <url>`,
     );
+  }
+
+  // A new project with no tests is where activation stalls. Point at
+  // the generate -> accept path (text mode only: a JSON caller already holds
+  // the id; --dry-run returned above, its id is the canned sample). Printed
+  // after the URL advisory so a fix-first warning is never buried below it.
+  // A --local project is skipped: its record above already ends with the
+  // hand-written-plan next steps.
+  if (opts.output !== 'json' && resolvedId !== undefined && !localTarget) {
+    stderr(firstSuiteNextSteps(resolvedId, opts.type));
   }
 
   return created;
@@ -2064,8 +2075,12 @@ function renderCreateProjectText(
     lines.push(
       `Local project: TestSprite will reach ${url} only through a tunnel from this machine.`,
       'Next: write a plan and run it locally:',
-      `  In plan.json, set projectId to ${projectId}.`,
-      `  testsprite test create --project ${projectId} --plan-from plan.json`,
+      // The only next step a --local project gets (it has no first-suite hint),
+      // so it names how to get a plan file. `--plan-from` takes the project from
+      // the file and ignores `--project`, hence "set projectId" and no flag.
+      '  testsprite test create --plan-template > plan.json',
+      `  In plan.json, set projectId to ${projectId} and edit the steps.`,
+      '  testsprite test create --plan-from plan.json',
       '  testsprite test run <test-id>',
       `Portal runs of this project stay blocked (free) until you set a public URL with: testsprite project update ${projectId} --url https://...`,
     );
