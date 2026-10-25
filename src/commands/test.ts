@@ -6651,6 +6651,9 @@ export async function runResultHistory(
       throw localValidationError('page-size', 'must be between 1 and 100');
     }
   }
+  if (opts.cursor !== undefined && opts.cursor.trim().length === 0) {
+    throw localValidationError('cursor', 'must be a non-empty cursor');
+  }
   if (opts.output === 'text') {
     resolveTextColumns(opts.columns, RUN_HISTORY_TABLE_COLUMNS);
   }

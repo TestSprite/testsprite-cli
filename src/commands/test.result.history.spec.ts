@@ -775,6 +775,36 @@ describe('runResultHistory — pagination', () => {
       details: expect.objectContaining({ field: 'page-size' }),
     });
   });
+
+  it.each(['', ' \t\n'])('rejects blank --cursor (%j) before creating a client', async cursor => {
+    const temp = mkdtempSync(join(tmpdir(), 'cli-m34-hist-no-creds-'));
+    const fetchImpl = vi.fn() as unknown as typeof globalThis.fetch;
+
+    await expect(
+      runResultHistory(
+        {
+          output: 'json',
+          testId: 'test_abc',
+          cursor,
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        {
+          credentialsPath: join(temp, 'missing-credentials'),
+          fetchImpl,
+          stdout: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'cursor' }),
+    });
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
