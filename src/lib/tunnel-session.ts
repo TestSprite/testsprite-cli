@@ -49,10 +49,9 @@ import type { TunnelMintResponse } from './tunnel.types.js';
  * How long to wait for the control plane's first successful connection.
  *
  * The vendored client resolves `start()` only on the first
- * `control-connected` event, and its control loop retries every non-auth
- * failure forever. Without a deadline, `--local` against an unreachable
- * control plane hangs with no output at all — the worst possible shape for a
- * command an agent might be driving unattended.
+ * `control-authenticated` event. The client also bounds authentication at
+ * 10 seconds; this outer deadline bounds the complete connection attempt so an
+ * unreachable control plane cannot leave an unattended command hanging.
  */
 export const DEFAULT_TUNNEL_CONNECT_TIMEOUT_MS = 20_000;
 

@@ -541,6 +541,15 @@ describe('runInit — happy path (interactive)', () => {
     expect(stdout).toContain('testsprite project create --type frontend');
     expect(stdout).toContain('testsprite test run --all --project <projectId>');
     expect(stdout).toContain('the testsprite-onboard skill is installed');
+    // The agent branch also names the direct generate path, and in the
+    // order that works: generating only stages proposals, so accept must come
+    // before `test run --all` or the run dispatches nothing and exits 5.
+    const generateAt = stdout.indexOf('testsprite test plan generate --project <projectId>');
+    const acceptAt = stdout.indexOf('testsprite test plan accept --project <projectId>');
+    const runAllAt = stdout.indexOf('testsprite test run --all --project <projectId>');
+    expect(generateAt).toBeGreaterThanOrEqual(0);
+    expect(acceptAt).toBeGreaterThan(generateAt);
+    expect(runAllAt).toBeGreaterThan(acceptAt);
     // No "current project" wording, no bare test list.
     expect(stdout).not.toContain('current project');
     expect(stdout).not.toContain('testsprite test list');
@@ -759,10 +768,14 @@ describe('runInit — --no-agent', () => {
 
     const stdout = captured.stdout.join('\n');
     expect(stdout).toContain('skipped (--no-agent)');
-    // --no-agent points at manual test creation; must not claim the skill is installed.
+    // --no-agent: points at generate -> accept with the hand-authored
+    // fallback; must not claim the skill is installed.
     expect(stdout).toContain('Next steps:');
     expect(stdout).toContain('testsprite project create --type frontend');
-    expect(stdout).toContain('testsprite test create --project <projectId>');
+    expect(stdout).toContain('testsprite test plan generate --project <projectId>');
+    expect(stdout).toContain('testsprite test plan accept --project <projectId>');
+    expect(stdout).toContain('testsprite test create --plan-template');
+    expect(stdout).not.toContain('testsprite test create --project <projectId> ...');
     expect(stdout).toContain('testsprite test run --all --project <projectId>');
     expect(stdout).not.toContain('skill is installed');
     // No "current project" wording, no bare test list.

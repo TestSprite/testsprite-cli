@@ -18,6 +18,7 @@ import {
   createProjectEnvCommand,
   runEnvCreate,
   runEnvDelete,
+  runEnvGet,
   runEnvList,
   runEnvSetDefault,
   runEnvUpdate,
@@ -57,7 +58,15 @@ function makeFetch(
     };
     calls.push(call);
     const { status = 200, body } = handler(call);
-    return new Response(JSON.stringify(body), {
+    const responseBody =
+      call.method === 'GET' &&
+      call.url.endsWith('/env') &&
+      body &&
+      typeof body === 'object' &&
+      'environment' in body
+        ? { environments: [(body as { environment: unknown }).environment] }
+        : body;
+    return new Response(JSON.stringify(responseBody), {
       status,
       headers: { 'content-type': 'application/json' },
     });
@@ -79,7 +88,7 @@ function makeCreds(apiKey = 'sk-user-test', apiUrl = 'http://localhost:13504') {
 const PROJECT_ID = '22c810b0-f34c-42c0-b372-af6f4e1c4fc7';
 const SECRET = 'hunter2-DO-NOT-PRINT';
 /** An app that only runs on this machine is a real environment target. */
-const LOCAL_URL = 'http://127.0.0.1:5173';
+const LOCAL_URL = 'http://localhost:5173';
 
 function env(overrides: Partial<CliProjectEnvironment> = {}): CliProjectEnvironment {
   return {
@@ -92,6 +101,7 @@ function env(overrides: Partial<CliProjectEnvironment> = {}): CliProjectEnvironm
     username: 'qa+demo@example.com',
     enableOtp: false,
     updatedAt: '2026-09-09T00:00:00.000Z',
+    variables: {},
     ...overrides,
   };
 }
@@ -118,12 +128,12 @@ function errorEnvelope(code: string, status: number) {
 // ---------------------------------------------------------------------------
 
 describe('project env — command surface', () => {
-  it('is attached under `project` and exposes the five verbs', () => {
+  it('is attached under `project` and exposes the environment verbs', () => {
     const project = createProjectCommand();
     const envCmd = project.commands.find(c => c.name() === 'env');
     expect(envCmd).toBeDefined();
     const names = envCmd!.commands.map(c => c.name()).sort();
-    expect(names).toEqual(['create', 'delete', 'list', 'set-default', 'update']);
+    expect(names).toEqual(['create', 'delete', 'get', 'list', 'set-default', 'update']);
   });
 
   it('create exposes --name, --url / --local, --username, --password, --password-file, --set-default', () => {
@@ -152,6 +162,69 @@ describe('project env — command surface', () => {
     expect(longs).not.toContain('--origin-mode');
   });
 
+  it('create combines sign-in flags with variables and safe output', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const variables = { REGION: 'west', ROLE: 'qa' };
+    const command = createProjectEnvCommand({
+      credentialsPath,
+      fetchImpl: makeFetch(calls, () => ({
+        body: {
+          environment: {
+            ...env({
+              name: 'staging',
+              authMode: 'manual',
+              hasCredentials: false,
+              username: null,
+              variables,
+            }),
+            password: SECRET,
+            config: { password: SECRET },
+          },
+          created: true,
+        },
+      })),
+      stdout: line => stdout.push(line),
+      stderr: line => stderr.push(line),
+    });
+    await command.parseAsync(
+      [
+        'create',
+        PROJECT_ID,
+        '--name',
+        'staging',
+        '--url',
+        'https://staging.example.com',
+        '--sign-in',
+        'sso',
+        '--session-ttl',
+        'never',
+        '--var',
+        'REGION=west',
+        '--var',
+        'ROLE=qa',
+      ],
+      { from: 'user' },
+    );
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.method).toBe('GET');
+    expect(calls[1]!.body).toEqual({
+      name: 'staging',
+      url: 'https://staging.example.com',
+      signIn: 'manual',
+      sessionReuseTtlSeconds: -1,
+      variables,
+    });
+    expect(stdout).toHaveLength(1);
+    expect(stdout[0]).toContain('login:       managed in Portal');
+    expect(stdout[0]).toContain('REGION=west');
+    expect(stdout[0]).toContain('ROLE=qa');
+    expect(stdout[0]).not.toContain(SECRET);
+    expect(stderr.join('\n')).toContain('SSO selected: runs will NOT be signed in');
+  });
+
   it('update exposes --url, --rename (and no --clear-url); delete exposes --confirm', () => {
     const envCmd = createProjectEnvCommand();
     const update = envCmd.commands.find(c => c.name() === 'update')!;
@@ -168,6 +241,406 @@ describe('project env — command surface', () => {
     expect(update.options.map(o => o.long)).not.toContain('--clear-url');
     const del = envCmd.commands.find(c => c.name() === 'delete')!;
     expect(del.options.map(o => o.long)).toContain('--confirm');
+  });
+});
+
+describe('environment read and safe writes', () => {
+  it('get treats OTP login as managed in Portal', async () => {
+    const { credentialsPath } = makeCreds();
+    const output: string[] = [];
+    const command = createProjectEnvCommand({
+      credentialsPath,
+      fetchImpl: makeFetch([], () => ({ body: { environment: env({ enableOtp: true }) } })),
+      stdout: line => output.push(line),
+      stderr: () => {},
+    });
+    await command.parseAsync(['get', PROJECT_ID, 'demo'], { from: 'user' });
+    expect(output.join('\n')).toContain('login:       managed in Portal');
+  });
+
+  it('clear credentials dry run reports no login', async () => {
+    const output: string[] = [];
+    await runEnvUpdate(
+      {
+        ...COMMON,
+        output: 'text',
+        dryRun: true,
+        projectId: PROJECT_ID,
+        name: 'demo',
+        clearCredentials: true,
+      },
+      { stdout: line => output.push(line), stderr: () => {} },
+    );
+    expect(output.join('\n')).toContain('login:       none');
+  });
+
+  it('get uses the name path', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const command = createProjectEnvCommand({
+      credentialsPath,
+      fetchImpl: makeFetch(calls, () => ({ body: { environment: env() } })),
+      stdout: () => {},
+      stderr: () => {},
+    });
+    await command.parseAsync(['get', PROJECT_ID, 'pr 12/preview'], { from: 'user' });
+    expect(calls[0]?.url).toContain(`/projects/${PROJECT_ID}/env/pr%2012%2Fpreview`);
+  });
+
+  it('get text retains id and omits password', async () => {
+    const { credentialsPath } = makeCreds();
+    const output: string[] = [];
+    const command = createProjectEnvCommand({
+      credentialsPath,
+      fetchImpl: makeFetch([], () => ({ body: { environment: { ...env(), password: SECRET } } })),
+      stdout: line => output.push(line),
+      stderr: () => {},
+    });
+    await command.parseAsync(['get', PROJECT_ID, 'demo'], { from: 'user' });
+    expect(output.join('\n')).toContain('name:');
+    expect(output.join('\n')).toContain(env().id);
+    expect(output.join('\n')).not.toContain(SECRET);
+  });
+
+  it('get never echoes a password the server unexpectedly returns — text or JSON, top-level, in variables, or under config', async () => {
+    // Defense in depth: the facade's documented wire shape never carries a
+    // password (see `CliProjectEnvironment`'s type comment) — this pins what
+    // happens if a server regression sends one anyway, in every shape a leak
+    // could take: a stray top-level field, a `variables.password` entry, or
+    // the Portal's raw `config` object riding along unexpectedly.
+    for (const output of ['text', 'json'] as const) {
+      const { credentialsPath } = makeCreds();
+      const out: string[] = [];
+      const res = await runEnvGet(
+        { ...COMMON, output, projectId: PROJECT_ID, name: 'demo' },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch([], () => ({
+            body: {
+              environment: {
+                ...env(),
+                password: SECRET,
+                variables: { password: SECRET, region: 'us-east-1' },
+                config: { username: 'qa', password: SECRET },
+              },
+            },
+          })),
+          stdout: line => out.push(line),
+          stderr: () => {},
+        },
+      );
+      const printed = out.join('\n');
+      expect(printed).not.toContain(SECRET);
+      expect(printed).not.toContain('"config"');
+      // A legitimate, non-secret custom variable alongside the poisoned
+      // `password` key still prints — only the reserved key is dropped.
+      expect(printed).toContain('region');
+      // Only the PRINTED copy is sanitized; the value handed back to a
+      // programmatic caller is the untouched server response.
+      expect((res.environment as unknown as { password?: string }).password).toBe(SECRET);
+    }
+  });
+
+  it('clear credentials sends clearCredentials', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    await runEnvUpdate(
+      { ...COMMON, projectId: PROJECT_ID, name: 'demo', clearCredentials: true } as Parameters<
+        typeof runEnvUpdate
+      >[0],
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, () => ({
+          body: { environment: env({ hasCredentials: false, username: null }) },
+        })),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+    expect(calls[1]?.body).toEqual({ clearCredentials: true });
+  });
+
+  it('clear credentials with a password is rejected locally', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    await expect(
+      runEnvUpdate(
+        {
+          ...COMMON,
+          projectId: PROJECT_ID,
+          name: 'demo',
+          clearCredentials: true,
+          password: SECRET,
+        } as Parameters<typeof runEnvUpdate>[0],
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(calls, () => ({ body: { environment: env() } })),
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(calls).toEqual([]);
+  });
+
+  it('write confirmations retain the legacy id line', async () => {
+    const { credentialsPath } = makeCreds();
+    const output: string[] = [];
+    const deps = {
+      credentialsPath,
+      fetchImpl: makeFetch([], () => ({ body: { environment: env(), created: true } })),
+      stdout: (line: string) => output.push(line),
+      stderr: () => {},
+    };
+    await runEnvCreate(
+      { ...COMMON, output: 'text', projectId: PROJECT_ID, name: 'demo', url: env().url },
+      deps,
+    );
+    await runEnvUpdate(
+      { ...COMMON, output: 'text', projectId: PROJECT_ID, name: 'demo', username: 'qa' },
+      deps,
+    );
+    await runEnvSetDefault(
+      { ...COMMON, output: 'text', projectId: PROJECT_ID, name: 'demo' },
+      deps,
+    );
+    await runEnvDelete(
+      { ...COMMON, output: 'text', projectId: PROJECT_ID, name: 'demo', confirm: true },
+      { ...deps, fetchImpl: makeFetch([], () => ({ body: { deleted: true, name: 'demo' } })) },
+    );
+    expect(output.join('\n')).toContain(env().id);
+  });
+});
+
+describe('environment variables', () => {
+  it('mixed update refuses an old server response that applied only the URL', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const output: string[] = [];
+    const error = await runEnvUpdate(
+      {
+        ...COMMON,
+        projectId: PROJECT_ID,
+        name: 'demo',
+        url: 'https://new.example.com',
+        clearCredentials: true,
+        vars: ['REGION=west'],
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, () => ({
+          body: { environment: env({ url: 'https://new.example.com' }) },
+        })),
+        stdout: line => output.push(line),
+        stderr: () => {},
+      },
+    ).catch(e => e as ApiError);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.method).toBe('GET');
+    expect(calls[1]?.body).toEqual({
+      url: 'https://new.example.com',
+      clearCredentials: true,
+      variables: { REGION: 'west' },
+    });
+    expect(error).toMatchObject({
+      code: 'UNSUPPORTED',
+      nextAction: expect.stringContaining('--clear-credentials'),
+    });
+    expect((error as ApiError).nextAction).toContain('--var');
+    expect((error as ApiError).nextAction).toContain('URL may already have been applied');
+    expect(output).toEqual([]);
+  });
+
+  it('create --var refuses a response without variables', async () => {
+    const { credentialsPath } = makeCreds();
+    const output: string[] = [];
+    const error = await runEnvCreate(
+      { ...COMMON, projectId: PROJECT_ID, name: 'demo', url: env().url, vars: ['REGION=west'] },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch([], call => ({
+          body: {
+            environment: env(call.method === 'GET' ? {} : { variables: undefined }),
+            created: true,
+          },
+        })),
+        stdout: line => output.push(line),
+        stderr: () => {},
+      },
+    ).catch(e => e as ApiError);
+    expect(error).toMatchObject({
+      code: 'UNSUPPORTED',
+      nextAction: expect.stringContaining('server did not apply --var'),
+    });
+    const nextAction = (error as ApiError).nextAction;
+    expect(nextAction).toContain(`was created without them`);
+    expect(nextAction).toContain(`testsprite project env update ${PROJECT_ID} demo --var`);
+    expect(nextAction).not.toContain('retry');
+    expect(output).toEqual([]);
+  });
+
+  it.each([
+    ['missing key', { REGION: 'west' }],
+    ['wrong value', { REGION: 'east', TENANT: 'trial' }],
+  ])('update --var rejects a response with %s', async (_case, variables) => {
+    const { credentialsPath } = makeCreds();
+    const error = await runEnvUpdate(
+      {
+        ...COMMON,
+        projectId: PROJECT_ID,
+        name: 'demo',
+        vars: ['REGION=west', 'TENANT=trial'],
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch([], () => ({ body: { environment: env({ variables }) } })),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    ).catch(e => e as ApiError);
+    expect(error).toMatchObject({
+      code: 'UNSUPPORTED',
+      nextAction: expect.stringContaining('server did not apply --var'),
+    });
+  });
+
+  it('update --var sends a variable merge', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    await runEnvUpdate(
+      { ...COMMON, projectId: PROJECT_ID, name: 'demo', vars: ['REGION=east'] },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, () => ({
+          body: { environment: env({ variables: { REGION: 'east' } }) },
+        })),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+    expect(calls[1]?.body).toEqual({ variables: { REGION: 'east' } });
+  });
+
+  it('repeated --var is sent as variables', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const command = createProjectEnvCommand({
+      credentialsPath,
+      fetchImpl: makeFetch(calls, () => ({
+        body: {
+          environment: env({ variables: { REGION: 'west', TENANT: 'trial' } }),
+          created: true,
+        },
+      })),
+      stdout: () => {},
+      stderr: () => {},
+    });
+    await command.parseAsync(
+      [
+        'create',
+        PROJECT_ID,
+        '--name',
+        'demo',
+        '--url',
+        env().url,
+        '--var',
+        'REGION=west',
+        '--var',
+        'TENANT=trial',
+      ],
+      { from: 'user' },
+    );
+    expect(calls[1]?.body).toMatchObject({ variables: { REGION: 'west', TENANT: 'trial' } });
+  });
+
+  it('--var keeps equals signs in the value', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const command = createProjectEnvCommand({
+      credentialsPath,
+      fetchImpl: makeFetch(calls, () => ({
+        body: { environment: env({ variables: { TOKEN_HINT: 'a=b=c' } }), created: true },
+      })),
+      stdout: () => {},
+      stderr: () => {},
+    });
+    await command.parseAsync(
+      ['create', PROJECT_ID, '--name', 'demo', '--url', env().url, '--var', 'TOKEN_HINT=a=b=c'],
+      { from: 'user' },
+    );
+    expect(calls[1]?.body).toMatchObject({ variables: { TOKEN_HINT: 'a=b=c' } });
+  });
+
+  it('duplicate --var is rejected locally', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    await expect(
+      runEnvCreate(
+        {
+          ...COMMON,
+          projectId: PROJECT_ID,
+          name: 'demo',
+          url: env().url,
+          vars: ['A=1', 'A=2'],
+        } as Parameters<typeof runEnvCreate>[0],
+        { credentialsPath, fetchImpl: makeFetch(calls, () => ({ body: {} })), stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(calls).toEqual([]);
+  });
+
+  it('reserved --var key is rejected locally', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    await expect(
+      runEnvUpdate(
+        { ...COMMON, projectId: PROJECT_ID, name: 'demo', vars: ['password=hidden'] } as Parameters<
+          typeof runEnvUpdate
+        >[0],
+        { credentialsPath, fetchImpl: makeFetch(calls, () => ({ body: {} })), stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(calls).toEqual([]);
+  });
+
+  it('oversize --var is rejected without echoing the value', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const value = 'private-data-'.repeat(400);
+    const error = await runEnvCreate(
+      {
+        ...COMMON,
+        projectId: PROJECT_ID,
+        name: 'demo',
+        url: env().url,
+        vars: [`LONG=${value}`],
+      } as Parameters<typeof runEnvCreate>[0],
+      { credentialsPath, fetchImpl: makeFetch(calls, () => ({ body: {} })), stdout: () => {} },
+    ).catch(e => e as ApiError);
+    expect(error).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(JSON.stringify(error)).not.toContain(value);
+    expect(calls).toEqual([]);
+  });
+
+  it('get lists variables', async () => {
+    const { credentialsPath } = makeCreds();
+    const output: string[] = [];
+    const command = createProjectEnvCommand({
+      credentialsPath,
+      fetchImpl: makeFetch([], () => ({
+        body: {
+          environment: env({
+            variables: { REGION: 'west', TOKEN_HINT: 'a=b', password: 'must-not-print' },
+          }),
+        },
+      })),
+      stdout: line => output.push(line),
+      stderr: () => {},
+    });
+    await command.parseAsync(['get', PROJECT_ID, 'demo'], { from: 'user' });
+    expect(output.join('\n')).toContain('REGION=west');
+    expect(output.join('\n')).toContain('TOKEN_HINT=a=b');
+    expect(output.join('\n')).not.toContain('must-not-print');
   });
 });
 
@@ -296,6 +769,293 @@ describe('runEnvCreate', () => {
     errorSpy.mockRestore();
   });
 
+  it('retries a persistent create conflict once', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const error = await runEnvCreate(
+      { ...COMMON, projectId: PROJECT_ID, name: 'demo', url: env().url },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, () => errorEnvelope('CONFLICT', 409)),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    ).catch(e => e as ApiError);
+    expect(calls).toHaveLength(2);
+    expect(error).toMatchObject({ code: 'CONFLICT', exitCode: 6, nextAction: 'x' });
+  });
+
+  it.each([
+    [{ signIn: 'otp' }, { signIn: 'otp', otpChannels: ['email'] }],
+    [
+      { signIn: 'otp', otpChannel: ['sms,email', 'sms'] },
+      { signIn: 'otp', otpChannels: ['sms', 'email'] },
+    ],
+    [
+      { signIn: 'sso', sessionTtl: 'never' },
+      { signIn: 'manual', sessionReuseTtlSeconds: -1 },
+    ],
+    [
+      { signIn: 'credentials', username: 'qa', password: SECRET },
+      { signIn: 'account', username: 'qa', password: SECRET },
+    ],
+  ])('adds explicit sign-in fields %j', async (flags, expected) => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    await runEnvCreate(
+      {
+        ...COMMON,
+        projectId: PROJECT_ID,
+        name: 'staging',
+        url: 'https://staging.example.com',
+        ...flags,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, () => ({ body: { environment: env(), created: true } })),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+    expect(calls[0]!.body).toEqual({
+      name: 'staging',
+      url: 'https://staging.example.com',
+      ...expected,
+    });
+  });
+
+  it.each([
+    [{ signIn: 'account' }, '--username'],
+    [{ signIn: 'account', username: 'qa' }, '--password'],
+    [{ signIn: 'public', username: 'qa' }, '--username'],
+    [{ signIn: 'otp', passwordFile: '/missing' }, '--password-file'],
+    [{ signIn: 'manual', password: SECRET }, '--password'],
+    [{ signIn: 'public', otpChannel: ['sms'] }, '--otp-channel'],
+    [{ otpChannel: ['email'] }, '--otp-channel'],
+    [{ signIn: 'otp', otpChannel: ['push'] }, '--otp-channel'],
+    [
+      { signIn: 'otp', local: '5173' },
+      '--sign-in otp and --sign-in manual are not available for --local environments',
+    ],
+    [
+      { signIn: 'manual', local: '5173' },
+      '--sign-in otp and --sign-in manual are not available for --local environments',
+    ],
+  ])(
+    'rejects invalid sign-in create flags %j before request and file read',
+    async (flags, hint) => {
+      const { credentialsPath } = makeCreds();
+      const calls: Call[] = [];
+      const error = (await runEnvCreate(
+        {
+          ...COMMON,
+          projectId: PROJECT_ID,
+          name: 'staging',
+          url: 'local' in flags ? undefined : 'https://staging.example.com',
+          ...flags,
+        },
+        { credentialsPath, fetchImpl: makeFetch(calls, () => ({ body: {} })), stdout: () => {} },
+      ).catch(e => e)) as ApiError;
+      expect(error.code).toBe('VALIDATION_ERROR');
+      expect(error.exitCode).toBe(5);
+      expect(`${error.message} ${error.nextAction}`).toContain(hint);
+      if ('passwordFile' in flags && flags.passwordFile === '/missing')
+        expect(error.details.reason).toBe('invalid_sign_in_flags');
+      if ('local' in flags && 'signIn' in flags)
+        expect(error.details.reason).toBe('local-environment-sign-in-unsupported');
+      expect(calls).toEqual([]);
+    },
+  );
+
+  it.each([
+    [
+      { password: SECRET, passwordFile: '/missing' },
+      '--password and --password-file are mutually exclusive.',
+    ],
+    [{ username: '   ', password: SECRET }, '--username must not be empty or whitespace-only.'],
+    [{ username: 'qa', password: '   ' }, '--password must not be empty or whitespace-only.'],
+  ])('uses the sign-in refusal contract for credential flags %j', async (flags, nextAction) => {
+    for (const dryRun of [false, true]) {
+      const { credentialsPath } = makeCreds();
+      const calls: Call[] = [];
+      const stdout: string[] = [];
+      const error = await runEnvCreate(
+        {
+          ...COMMON,
+          dryRun,
+          projectId: PROJECT_ID,
+          name: 'staging',
+          url: 'https://staging.example.com',
+          ...flags,
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(calls, () => ({ body: {} })),
+          stdout: line => stdout.push(line),
+        },
+      ).catch(e => e as ApiError);
+      expect(error).toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        nextAction,
+        details: { reason: 'invalid_sign_in_flags' },
+      });
+      expect(calls).toEqual([]);
+      expect(stdout).toEqual([]);
+    }
+  });
+
+  it.each(['constructor', '__proto__', 'toString'])(
+    'rejects inherited --sign-in %s before request',
+    async signIn => {
+      const { credentialsPath } = makeCreds();
+      const calls: Call[] = [];
+      const error = (await runEnvCreate(
+        {
+          ...COMMON,
+          projectId: PROJECT_ID,
+          name: 'staging',
+          url: 'https://staging.example.com',
+          signIn,
+        },
+        { credentialsPath, fetchImpl: makeFetch(calls, () => ({ body: {} })), stdout: () => {} },
+      ).catch(e => e)) as ApiError;
+      expect(error.exitCode).toBe(5);
+      expect(error.details.reason).toBe('invalid_sign_in_flags');
+      expect(calls).toEqual([]);
+    },
+  );
+
+  it.each([
+    [
+      'manual',
+      'SSO selected: runs will NOT be signed in until someone logs in once in the Portal (project → Settings → Environments → staging → Log in). Check with: testsprite project sign-in get ' +
+        PROJECT_ID +
+        ' --env staging',
+    ],
+    [
+      'otp',
+      'OTP selected: see the provisioned inbox/phone with: testsprite project sign-in get ' +
+        PROJECT_ID +
+        ' --env staging',
+    ],
+  ])('shows a text hint after creating %s', async (signIn, hint) => {
+    const { credentialsPath } = makeCreds();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const deps = {
+      credentialsPath,
+      fetchImpl: makeFetch([], () => ({
+        body: { environment: env({ name: 'staging', authMode: signIn }), created: true },
+      })),
+      stdout: (line: string) => stdout.push(line),
+      stderr: (line: string) => stderr.push(line),
+    };
+    const opts = {
+      ...COMMON,
+      output: 'text' as const,
+      projectId: PROJECT_ID,
+      name: 'staging',
+      url: 'https://staging.example.com',
+      signIn,
+    };
+    await runEnvCreate(opts, deps);
+    expect(stderr.join('\n')).toContain(hint);
+    expect(stdout.join('\n')).not.toContain(hint);
+    stderr.length = 0;
+    await runEnvCreate({ ...opts, output: 'json' }, deps);
+    expect(stderr.join('\n')).not.toContain(hint);
+  });
+
+  it.each([[{ password: 'pw' }], [{ username: 'qa@example.com' }]])(
+    'refuses half a test account without --sign-in (%j) before any request',
+    async creds => {
+      const { credentialsPath } = makeCreds();
+      const calls: Call[] = [];
+      const error = (await runEnvCreate(
+        {
+          ...COMMON,
+          projectId: PROJECT_ID,
+          name: 'staging',
+          url: 'https://staging.example.com',
+          ...creds,
+        },
+        { credentialsPath, fetchImpl: makeFetch(calls, () => ({ body: {} })), stdout: () => {} },
+      ).catch(e => e)) as ApiError;
+      expect(error.exitCode).toBe(5);
+      expect(error.nextAction).toContain('go together');
+      expect(calls).toEqual([]);
+    },
+  );
+
+  it.each([
+    ['public', false, null, false],
+    ['otp', false, null, true],
+    ['manual', false, null, false],
+  ] as const)(
+    'previews --sign-in %s in the environment row',
+    async (signIn, hasCredentials, username, enableOtp) => {
+      const { credentialsPath } = makeCreds();
+      const calls: Call[] = [];
+      const stdout: string[] = [];
+      const result = await runEnvCreate(
+        {
+          ...COMMON,
+          output: 'text',
+          dryRun: true,
+          projectId: PROJECT_ID,
+          name: 'staging',
+          url: 'https://staging.example.com',
+          signIn,
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(calls, () => ({ body: {} })),
+          stdout: line => stdout.push(line),
+          stderr: () => {},
+        },
+      );
+      expect(result.environment).toMatchObject({
+        authMode: signIn,
+        hasCredentials,
+        username,
+        enableOtp,
+      });
+      expect(stdout.join('\n')).toContain(
+        `login:       ${signIn === 'public' ? 'none' : 'managed in Portal'}`,
+      );
+      expect(calls).toEqual([]);
+    },
+  );
+
+  it('previews account credentials without reading the password file', async () => {
+    const { credentialsPath } = makeCreds();
+    const result = await runEnvCreate(
+      {
+        ...COMMON,
+        dryRun: true,
+        projectId: PROJECT_ID,
+        name: 'staging',
+        url: 'https://staging.example.com',
+        signIn: 'account',
+        username: 'qa@example.com',
+        passwordFile: '/missing',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch([], () => ({ body: {} })),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+    expect(result.environment).toMatchObject({
+      authMode: 'account',
+      hasCredentials: true,
+      username: 'qa@example.com',
+      enableOtp: false,
+    });
+  });
+
   it('POSTs { name, url, username, password, setDefault } with a cli-proj-env-create idempotency key', async () => {
     const { credentialsPath } = makeCreds();
     const calls: Call[] = [];
@@ -400,19 +1160,29 @@ describe('runEnvCreate', () => {
     expect(calls[0]!.body).toMatchObject({ url, originMode: 'local' });
   });
 
-  it.each(['http://localhost:5173', 'http://127.0.0.1:5173', 'http://[::1]:5173'])(
-    'a loopback --url (%s) is refused before any request and redirected to --local',
+  it.each(['http://localhost:5173', 'http://127.0.0.1:5173/', 'http://[::1]:5173'])(
+    'a loopback --url (%s) sends the existing wire shape unchanged',
     async url => {
       const { credentialsPath } = makeCreds();
       const calls: Call[] = [];
-      const error = await runEnvCreate(
-        { ...COMMON, projectId: PROJECT_ID, name: 'local-dev', url },
-        { credentialsPath, fetchImpl: makeFetch(calls, () => ({ body: {} })), stdout: () => {} },
-      ).catch(e => e as ApiError);
-      expect(error).toBeInstanceOf(ApiError);
-      expect((error as ApiError).code).toBe('VALIDATION_ERROR');
-      expect((error as ApiError).nextAction).toContain('Use --local <port> instead of --url');
-      expect(calls).toEqual([]);
+      const deps = {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, () => ({ body: { environment: env({ url }), created: true } })),
+        stdout: () => {},
+        stderr: () => {},
+      };
+      await runEnvCreate(
+        { ...COMMON, projectId: PROJECT_ID, name: 'local-dev', url, skipPreflight: true },
+        deps,
+      );
+      await runEnvUpdate(
+        { ...COMMON, projectId: PROJECT_ID, name: 'local-dev', url, skipPreflight: true },
+        deps,
+      );
+      expect(calls.map(call => call.body)).toEqual([
+        { name: 'local-dev', url, originMode: 'local' },
+        { url, originMode: 'local' },
+      ]);
     },
   );
 
@@ -465,7 +1235,7 @@ describe('runEnvCreate', () => {
       },
     ).catch(e => e as ApiError);
     expect((error as ApiError).message).toBe(
-      'Nothing is listening on http://127.0.0.1:5173. Start your app first, or pass --skip-preflight.',
+      'Nothing is listening on http://localhost:5173. Start your app first, or pass --skip-preflight.',
     );
     expect(calls).toEqual([]);
 
@@ -514,6 +1284,7 @@ describe('runEnvCreate', () => {
         name: 'local-dev',
         local: '5173',
         skipPreflight: true,
+        username: 'dev',
         passwordFile: pwFile,
       },
       {
@@ -541,6 +1312,7 @@ describe('runEnvCreate', () => {
           name: 'local-dev',
           local: '5173',
           skipPreflight: true,
+          username: 'dev',
           password: SECRET,
         },
         {
@@ -555,6 +1327,74 @@ describe('runEnvCreate', () => {
       expect(out.join('\n')).not.toContain(SECRET);
       expect(err.join('\n')).not.toContain(SECRET);
     }
+  });
+
+  it('never prints the password even if the server echoes it back in the response', async () => {
+    // Same defense-in-depth as the `get` test above, exercised on the create
+    // response shape (`{ environment, created }`).
+    for (const output of ['text', 'json'] as const) {
+      const { credentialsPath } = makeCreds();
+      const out: string[] = [];
+      await runEnvCreate(
+        {
+          ...COMMON,
+          output,
+          projectId: PROJECT_ID,
+          name: 'local-dev',
+          local: '5173',
+          skipPreflight: true,
+          username: 'dev',
+          password: SECRET,
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch([], () => ({
+            body: {
+              environment: { ...env({ name: 'local-dev', url: LOCAL_URL }), password: SECRET },
+              created: true,
+            },
+          })),
+          stdout: l => out.push(l),
+          stderr: () => {},
+        },
+      );
+      const printed = out.join('\n');
+      expect(printed).not.toContain(SECRET);
+      // Not a vacuous pass: something was actually printed.
+      expect(printed).toContain('local-dev');
+    }
+  });
+
+  it('--debug never traces the request password', async () => {
+    const { credentialsPath } = makeCreds();
+    const out: string[] = [];
+    const err: string[] = [];
+    await runEnvCreate(
+      {
+        ...COMMON,
+        output: 'json',
+        debug: true,
+        projectId: PROJECT_ID,
+        name: 'local-dev',
+        local: '5173',
+        skipPreflight: true,
+        username: 'dev',
+        password: SECRET,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch([], () => ({
+          body: { environment: env({ name: 'local-dev', url: LOCAL_URL }), created: true },
+        })),
+        stdout: l => out.push(l),
+        stderr: l => err.push(l),
+      },
+    );
+    expect(out.join('\n')).not.toContain(SECRET);
+    expect(err.join('\n')).not.toContain(SECRET);
+    // Not a vacuous pass: `--debug` actually traced this request, so the
+    // absence of SECRET above reflects a checked trace, not an empty one.
+    expect(err.some(line => line.startsWith('[debug '))).toBe(true);
   });
 
   it('refuses when --url is missing, with no request sent', async () => {
@@ -655,6 +1495,7 @@ describe('runEnvCreate', () => {
         projectId: PROJECT_ID,
         name: 'local-dev',
         local: '5173',
+        username: 'dev',
         password: SECRET,
       },
       {
@@ -672,6 +1513,65 @@ describe('runEnvCreate', () => {
     expect(res.environment.url).toBe(LOCAL_URL);
     expect(out.join('\n')).not.toContain(SECRET);
   });
+
+  it('dry-run validates credential flags before printing the plan', async () => {
+    const { credentialsPath, dir } = makeCreds();
+    const pwFile = join(dir, 'pw.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes into this test's own mkdtempSync temp dir, never user input.
+    writeFileSync(pwFile, SECRET);
+    const calls: Call[] = [];
+    const out: string[] = [];
+    await expect(
+      runEnvCreate(
+        {
+          ...COMMON,
+          dryRun: true,
+          projectId: PROJECT_ID,
+          name: 'local-dev',
+          local: '5173',
+          password: SECRET,
+          passwordFile: pwFile,
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(calls, () => ({ body: {} })),
+          stdout: l => out.push(l),
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    // No plan was printed and the password file was never read.
+    expect(out).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
+  it('dry-run never prints the password', async () => {
+    for (const output of ['text', 'json'] as const) {
+      const { credentialsPath } = makeCreds();
+      const out: string[] = [];
+      const err: string[] = [];
+      await runEnvCreate(
+        {
+          ...COMMON,
+          output,
+          dryRun: true,
+          projectId: PROJECT_ID,
+          name: 'local-dev',
+          local: '5173',
+          username: 'dev',
+          password: SECRET,
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch([], () => ({ body: {} })),
+          stdout: l => out.push(l),
+          stderr: l => err.push(l),
+        },
+      );
+      expect(out.join('\n')).not.toContain(SECRET);
+      expect(err.join('\n')).not.toContain(SECRET);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -679,6 +1579,139 @@ describe('runEnvCreate', () => {
 // ---------------------------------------------------------------------------
 
 describe('runEnvUpdate', () => {
+  it('never prints the password — text or JSON, real path and dry-run, even if the server echoes it back', async () => {
+    for (const output of ['text', 'json'] as const) {
+      for (const dryRun of [false, true] as const) {
+        const { credentialsPath } = makeCreds();
+        const out: string[] = [];
+        await runEnvUpdate(
+          { ...COMMON, output, dryRun, projectId: PROJECT_ID, name: 'demo', password: SECRET },
+          {
+            credentialsPath,
+            fetchImpl: makeFetch([], () => ({
+              body: { environment: { ...env(), password: SECRET } },
+            })),
+            stdout: l => out.push(l),
+            stderr: () => {},
+          },
+        );
+        const printed = out.join('\n');
+        expect(printed).not.toContain(SECRET);
+        // Not a vacuous pass: something was actually printed.
+        expect(printed).toContain('demo');
+      }
+    }
+  });
+
+  it('--debug never traces the request password', async () => {
+    const { credentialsPath } = makeCreds();
+    const out: string[] = [];
+    const err: string[] = [];
+    await runEnvUpdate(
+      {
+        ...COMMON,
+        output: 'json',
+        debug: true,
+        projectId: PROJECT_ID,
+        name: 'demo',
+        password: SECRET,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch([], () => ({ body: { environment: env() } })),
+        stdout: l => out.push(l),
+        stderr: l => err.push(l),
+      },
+    );
+    expect(out.join('\n')).not.toContain(SECRET);
+    expect(err.join('\n')).not.toContain(SECRET);
+    // Not a vacuous pass: `--debug` actually traced this request, so the
+    // absence of SECRET above reflects a checked trace, not an empty one.
+    expect(err.some(line => line.startsWith('[debug '))).toBe(true);
+  });
+
+  it('clear credentials requires both no stored credentials and no username in the response', async () => {
+    const { credentialsPath } = makeCreds();
+    const error = await runEnvUpdate(
+      { ...COMMON, projectId: PROJECT_ID, name: 'demo', clearCredentials: true },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch([], () => ({
+          body: { environment: env({ hasCredentials: false, username: 'stale@example.com' }) },
+        })),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    ).catch(e => e as ApiError);
+    expect(error).toMatchObject({
+      code: 'UNSUPPORTED',
+      nextAction: expect.stringContaining('server did not apply --clear-credentials'),
+    });
+  });
+
+  it('preserves a Portal-only conflict after the compatible retry', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const nextAction = 'Open https://portal.example.com/settings/environments';
+    const error = await runEnvUpdate(
+      { ...COMMON, projectId: PROJECT_ID, name: 'demo', clearCredentials: true },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, call =>
+          call.method === 'GET'
+            ? { body: { environments: [env()] } }
+            : {
+                status: 409,
+                body: {
+                  error: {
+                    code: 'CONFLICT',
+                    message: 'Portal-only login mode',
+                    nextAction,
+                    requestId: 'req_conflict',
+                    details: { reason: 'portal-only-login-mode' },
+                  },
+                },
+              },
+        ),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    ).catch(e => e as ApiError);
+    expect(calls).toHaveLength(3);
+    expect(error).toMatchObject({
+      code: 'CONFLICT',
+      exitCode: 6,
+      nextAction,
+      details: { reason: 'portal-only-login-mode' },
+    });
+  });
+
+  it.each([
+    ['manual', 'text', true],
+    ['manual', 'json', false],
+    ['account', 'text', false],
+  ] as const)(
+    'a --url change on a %s environment in %s mode warns about the captured session: %s',
+    async (authMode, output, warns) => {
+      const { credentialsPath } = makeCreds();
+      const stderr: string[] = [];
+      await runEnvUpdate(
+        { ...COMMON, output, projectId: PROJECT_ID, name: 'sso', url: 'https://new.example.com' },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch([], () => ({
+            body: { environment: env({ name: 'sso', authMode, url: 'https://new.example.com' }) },
+          })),
+          stdout: () => {},
+          stderr: (line: string) => stderr.push(line),
+        },
+      );
+      expect(
+        stderr.some(line => line.includes('SSO session captured on its previous address')),
+      ).toBe(warns);
+    },
+  );
+
   it('PATCHes /projects/{id}/env/{name} with only the supplied fields', async () => {
     const { credentialsPath } = makeCreds();
     const calls: Call[] = [];
@@ -697,7 +1730,7 @@ describe('runEnvUpdate', () => {
     expect(calls[0]!.headers['idempotency-key']).toMatch(/^cli-proj-env-update-/);
   });
 
-  it('--local <port> repoints an environment at this machine; a loopback --url is redirected to it; an empty --url is refused', async () => {
+  it('--local and loopback --url repoint an environment; an empty --url is refused', async () => {
     const { credentialsPath } = makeCreds();
     const calls: Call[] = [];
     const connect = vi.fn(async () => {});
@@ -714,14 +1747,17 @@ describe('runEnvUpdate', () => {
     expect(connect).toHaveBeenCalledWith('127.0.0.1', 5173, 2000);
     expect(calls[0]!.body).toEqual({ url: LOCAL_URL, originMode: 'local' });
 
-    // A loopback address is never stored through `--url` — `--local` is the
-    // one spelling, and the refusal says so.
-    const redirected = await runEnvUpdate(
-      { ...COMMON, projectId: PROJECT_ID, name: 'demo', url: LOCAL_URL },
-      { credentialsPath, fetchImpl: makeFetch([], () => ({ body: {} })), stdout: () => {} },
-    ).catch(e => e as ApiError);
-    expect((redirected as ApiError).code).toBe('VALIDATION_ERROR');
-    expect((redirected as ApiError).nextAction).toContain('Use --local <port> instead of --url');
+    const rawUrl = 'http://127.0.0.1:5173/';
+    await runEnvUpdate(
+      { ...COMMON, projectId: PROJECT_ID, name: 'local-dev', url: rawUrl, skipPreflight: true },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, () => ({ body: { environment: env({ url: rawUrl }) } })),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+    expect(calls[1]?.body).toEqual({ url: rawUrl, originMode: 'local' });
 
     // There is no way to clear a URL: an environment always has an address.
     await expect(
@@ -757,6 +1793,35 @@ describe('runEnvUpdate', () => {
       },
     );
     expect(calls[0]!.url).toContain('/env/pr%2012%2Fpreview');
+  });
+
+  it('dry-run also validates credential flags before printing the plan', async () => {
+    const { credentialsPath, dir } = makeCreds();
+    const pwFile = join(dir, 'pw.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes into this test's own mkdtempSync temp dir, never user input.
+    writeFileSync(pwFile, SECRET);
+    const calls: Call[] = [];
+    const out: string[] = [];
+    await expect(
+      runEnvUpdate(
+        {
+          ...COMMON,
+          dryRun: true,
+          projectId: PROJECT_ID,
+          name: 'demo',
+          password: SECRET,
+          passwordFile: pwFile,
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(calls, () => ({ body: {} })),
+          stdout: l => out.push(l),
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    expect(out).toEqual([]);
+    expect(calls).toEqual([]);
   });
 });
 
@@ -813,6 +1878,22 @@ describe('runEnvDelete', () => {
 });
 
 describe('runEnvSetDefault', () => {
+  it('retries a persistent set-default conflict once', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const error = await runEnvSetDefault(
+      { ...COMMON, projectId: PROJECT_ID, name: 'demo' },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, () => errorEnvelope('CONFLICT', 409)),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    ).catch(e => e as ApiError);
+    expect(calls).toHaveLength(2);
+    expect(error).toMatchObject({ code: 'CONFLICT', exitCode: 6, nextAction: 'x' });
+  });
+
   it('POSTs /projects/{id}/env/{name}/default and renders the environment', async () => {
     const { credentialsPath } = makeCreds();
     const calls: Call[] = [];
@@ -832,5 +1913,364 @@ describe('runEnvSetDefault', () => {
     expect(calls[0]!.url).toContain(`/projects/${PROJECT_ID}/env/staging/default`);
     expect(calls[0]!.headers['idempotency-key']).toMatch(/^cli-proj-env-set-default-/);
     expect(out.join('\n')).toContain('default:     yes');
+  });
+});
+
+describe('environment compatibility contracts', () => {
+  it('appends login and variables after the legacy environment detail lines', async () => {
+    const output: string[] = [];
+    const { credentialsPath } = makeCreds();
+    await runEnvGet(
+      { ...COMMON, output: 'text', projectId: PROJECT_ID, name: 'demo' },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch([], () => ({ body: { environment: env({ variables: {} }) } })),
+        stdout: line => output.push(line),
+        stderr: () => {},
+      },
+    );
+    expect(output[0]?.split('\n').slice(0, 7)).toEqual([
+      'name:        demo',
+      `id:          ${env().id}`,
+      'default:     yes',
+      `url:         ${env().url}`,
+      'auth:        account (credentials set)',
+      `account:     ${env().username}`,
+      `updatedAt:   ${env().updatedAt}`,
+    ]);
+    expect(output[0]?.split('\n')[7]).toBe('login:       username+password (qa+demo@example.com)');
+  });
+
+  it('reports an unavailable environment detail route as an unsupported old server', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runEnvGet(
+        { ...COMMON, projectId: PROJECT_ID, name: 'demo' },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch([], () => errorEnvelope('NOT_FOUND', 404)),
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'UNSUPPORTED',
+      exitCode: 7,
+      message: expect.stringContaining('server is too old'),
+    });
+  });
+
+  it.each([
+    ['create', 404],
+    ['update', 404],
+    ['clear', 200],
+  ] as const)(
+    '%s refuses unsupported environment writes before any side effect (probe %s)',
+    async (operation, status) => {
+      const { credentialsPath } = makeCreds();
+      const calls: Call[] = [];
+      const deps = {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, call => {
+          if (call.method === 'GET')
+            return status === 200
+              ? { body: { environments: [env({ variables: undefined })] } }
+              : errorEnvelope('NOT_FOUND', status);
+          return { body: { environment: env(), created: true } };
+        }),
+        stdout: () => {},
+        stderr: () => {},
+      };
+      const attempt =
+        operation === 'create'
+          ? runEnvCreate(
+              {
+                ...COMMON,
+                projectId: PROJECT_ID,
+                name: 'demo',
+                url: env().url,
+                vars: ['REGION=west'],
+              },
+              deps,
+            )
+          : runEnvUpdate(
+              {
+                ...COMMON,
+                projectId: PROJECT_ID,
+                name: 'demo',
+                ...(operation === 'clear' ? { clearCredentials: true } : { vars: ['REGION=west'] }),
+              },
+              deps,
+            );
+      await expect(attempt).rejects.toMatchObject({
+        code: 'UNSUPPORTED',
+      });
+      expect(calls.map(call => call.method)).toEqual(['GET']);
+    },
+  );
+
+  it.each(['create', 'update', 'set-default'] as const)(
+    '%s retries one transient conflict with the same idempotency key',
+    async operation => {
+      const { credentialsPath } = makeCreds();
+      const calls: Call[] = [];
+      const deps = {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, () =>
+          calls.length === 1
+            ? errorEnvelope('CONFLICT', 409)
+            : { body: { environment: env(), created: true } },
+        ),
+        stdout: () => {},
+        stderr: () => {},
+      };
+      const opts = { ...COMMON, projectId: PROJECT_ID, name: 'demo' };
+      let thrown: unknown;
+      try {
+        if (operation === 'create') await runEnvCreate({ ...opts, url: env().url }, deps);
+        else if (operation === 'update') await runEnvUpdate({ ...opts, username: 'qa' }, deps);
+        else await runEnvSetDefault(opts, deps);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeUndefined();
+      expect(calls).toHaveLength(2);
+      expect(calls[0]?.headers['idempotency-key']).toBe(calls[1]?.headers['idempotency-key']);
+    },
+  );
+});
+
+describe('environment capability probe fallbacks', () => {
+  it.each([
+    { operation: 'create', resource: 'project', detail: false },
+    { operation: 'update', resource: 'project', detail: false },
+    { operation: 'clear', resource: 'project', detail: false },
+    { operation: 'update', resource: 'environment', detail: true },
+    { operation: 'clear', resource: 'environment', detail: true },
+  ] as const)(
+    '$operation preserves a missing $resource response from the capability probe',
+    async ({ operation, resource, detail }) => {
+      const { credentialsPath } = makeCreds();
+      const calls: Call[] = [];
+      const output: string[] = [];
+      const envelope = {
+        code: 'NOT_FOUND',
+        message: `The requested ${resource} does not exist.`,
+        nextAction: `Choose an existing ${resource}.`,
+        requestId: 'request-missing-resource',
+        details: { resource, reason: 'missing_resource' },
+      };
+      const deps = {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, call =>
+          detail && call.url.endsWith('/env')
+            ? { body: { environments: [] } }
+            : { status: 404, body: { error: envelope } },
+        ),
+        stdout: (line: string) => output.push(line),
+        stderr: () => {},
+      };
+      const opts = { ...COMMON, projectId: PROJECT_ID, name: 'demo' };
+      const attempt =
+        operation === 'create'
+          ? runEnvCreate({ ...opts, url: env().url, vars: ['REGION=west'] }, deps)
+          : runEnvUpdate(
+              {
+                ...opts,
+                ...(operation === 'clear' ? { clearCredentials: true } : { vars: ['REGION=west'] }),
+              },
+              deps,
+            );
+      await expect(attempt).rejects.toMatchObject({ ...envelope, httpStatus: 404, exitCode: 4 });
+      expect(calls.map(call => call.method)).toEqual(detail ? ['GET', 'GET'] : ['GET']);
+      expect(output).toEqual([]);
+    },
+  );
+
+  it('supports the first environment with variables when the detail route proves support', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    await runEnvCreate(
+      { ...COMMON, projectId: PROJECT_ID, name: 'first', url: env().url, vars: ['REGION=west'] },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, call => {
+          if (call.method === 'GET' && call.url.endsWith('/env'))
+            return { body: { environments: [] } };
+          if (call.method === 'GET')
+            return {
+              status: 400,
+              body: {
+                error: {
+                  code: 'VALIDATION_ERROR',
+                  message: 'Unknown environment',
+                  nextAction: 'Choose a name',
+                  requestId: 'r',
+                  details: { field: 'environment', reason: 'unknown_environment' },
+                },
+              },
+            };
+          return {
+            body: {
+              environment: env({ name: 'first', variables: { REGION: 'west' } }),
+              created: true,
+            },
+          };
+        }),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+    expect(calls.map(call => call.method)).toEqual(['GET', 'GET', 'POST']);
+    expect(calls[2]?.body).toMatchObject({ variables: { REGION: 'west' } });
+  });
+
+  it('preserves write-only keys and verifies the requested variable echo', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    await runEnvUpdate(
+      { ...COMMON, projectId: PROJECT_ID, name: 'demo', vars: ['REGION=west'] },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, call =>
+          call.method === 'GET'
+            ? errorEnvelope('FORBIDDEN', 403)
+            : { body: { environment: env({ variables: { REGION: 'west' } }) } },
+        ),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    );
+    expect(calls.map(call => call.method)).toEqual(['GET', 'PATCH']);
+  });
+
+  it('reports the renamed environment and applied fields when an old server strips variables', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const error = await runEnvUpdate(
+      {
+        ...COMMON,
+        projectId: PROJECT_ID,
+        name: 'staging',
+        rename: 'preview',
+        url: 'https://preview.example.com',
+        username: 'preview-user',
+        vars: ['REGION=west'],
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, call =>
+          call.method === 'GET'
+            ? errorEnvelope('FORBIDDEN', 403)
+            : {
+                body: {
+                  environment: env({
+                    name: 'preview',
+                    url: 'https://preview.example.com',
+                    username: 'preview-user',
+                    variables: undefined,
+                  }),
+                },
+              },
+        ),
+        stdout: () => {},
+        stderr: () => {},
+      },
+    ).catch((error: unknown) => error);
+    expect(error).toMatchObject({ code: 'UNSUPPORTED', exitCode: 7, details: {} });
+    expect((error as ApiError).message).toContain("environment 'preview' was updated");
+    expect((error as ApiError).message).toContain('--rename / --url / --username applied');
+    expect((error as ApiError).nextAction).toContain(
+      `testsprite project env update ${PROJECT_ID} preview --var KEY=VALUE`,
+    );
+    expect((error as ApiError).nextAction).not.toContain('staging --var');
+    expect((error as ApiError).nextAction).not.toContain('REGION=west');
+    expect(calls.map(call => call.method)).toEqual(['GET', 'PATCH']);
+    expect(calls[1]?.body).toMatchObject({ rename: 'preview', variables: { REGION: 'west' } });
+  });
+
+  it('reports a supplied password without claiming its hidden value when variables were ignored', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    const output: string[] = [];
+    const password = 'receipt-password-value-never-print';
+    const error = await runEnvUpdate(
+      { ...COMMON, projectId: PROJECT_ID, name: 'staging', password, vars: ['REGION=west'] },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(calls, call =>
+          call.method === 'GET'
+            ? errorEnvelope('FORBIDDEN', 403)
+            : {
+                body: {
+                  environment: env({ name: 'staging', hasCredentials: true, variables: undefined }),
+                },
+              },
+        ),
+        stdout: line => output.push(line),
+        stderr: line => output.push(line),
+      },
+    ).catch((error: unknown) => error);
+    expect(error).toMatchObject({ code: 'UNSUPPORTED', exitCode: 7, details: {} });
+    expect((error as ApiError).message).toContain(
+      '--password was supplied; its stored value is not returned',
+    );
+    expect((error as ApiError).nextAction).toContain(
+      `testsprite project env update ${PROJECT_ID} staging --var KEY=VALUE`,
+    );
+    expect(JSON.stringify(error)).not.toContain(password);
+    expect(output.join('\n')).not.toContain(password);
+    expect(calls.map(call => call.method)).toEqual(['GET', 'PATCH']);
+    expect(calls[1]?.body).toMatchObject({ password, variables: { REGION: 'west' } });
+  });
+
+  it('keeps post-write confirmation after an unavailable probe and says exactly what was created', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    await expect(
+      runEnvCreate(
+        {
+          ...COMMON,
+          projectId: PROJECT_ID,
+          name: 'preview',
+          url: env().url,
+          vars: ['REGION=west'],
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(calls, call =>
+            call.method === 'GET'
+              ? errorEnvelope('FORBIDDEN', 403)
+              : {
+                  body: {
+                    environment: env({ name: 'preview', variables: undefined }),
+                    created: true,
+                  },
+                },
+          ),
+          stdout: () => {},
+          stderr: () => {},
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'UNSUPPORTED',
+      message: "The server did not apply --var; environment 'preview' was created without them.",
+    });
+    expect(calls.map(call => call.method)).toEqual(['GET', 'POST']);
+  });
+});
+
+describe('environment rename validation compatibility', () => {
+  it('keeps the rename field in invalid rename errors', async () => {
+    await expect(
+      runEnvUpdate(
+        { ...COMMON, projectId: PROJECT_ID, name: 'demo', rename: '   ' },
+        { stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'rename' },
+    });
   });
 });

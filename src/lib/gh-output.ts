@@ -1,4 +1,7 @@
 import { appendFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { ExecutionReport } from './runs.types.js';
 import { describeConflict, type RunConflict } from './conflict-reason.js';
 
 /**
@@ -47,6 +50,12 @@ export interface CiSummary {
   skipped: number;
   timedOut: number;
   runs: CiRunRow[];
+  /**
+   * The server's execution report (the GitHub App comment content) when the
+   * backend could provide one for this batch. Absent otherwise — never null —
+   * so a summary from an older backend is byte-identical to before.
+   */
+  executionReport?: ExecutionReport;
 }
 
 /**
@@ -105,13 +114,17 @@ function bucketRows(
  * cannot read as "1/1 passed" with no annotation — but it counts as `skipped`,
  * never `failed`: whether non-dispatch fails the job is the exit-code
  * gates' call, and a `failed` count the gates disagree with is exactly the
- * artifacts-contradict-the-exit bug. (`skippedFrontend` / `skippedIntegration`
- * are NOT folded in — they exit 0 and are the Action layer's allow-partial
- * concern.)
+ * artifacts-contradict-the-exit bug.
+ *
+ * `skippedFrontend` / `skippedIntegration` are folded in only under
+ * `foldSkippedBuckets` (the `ci run` contract: ONE skipped number covering
+ * everything requested but not run). Default off — for `test run --all` they
+ * exit 0 and are the Action layer's allow-partial concern, and changing that
+ * default would silently change its artifacts.
  */
 export function summarizeAcceptedPayload(
   capturedJson: string,
-  opts: { notFoundNote?: string } = {},
+  opts: { notFoundNote?: string; foldSkippedBuckets?: boolean } = {},
 ): CiSummary {
   let parsed: unknown;
   try {
@@ -127,6 +140,9 @@ export function summarizeAcceptedPayload(
     deferred?: unknown;
     conflicts?: unknown;
     notFound?: unknown;
+    skipped?: unknown;
+    skippedFrontend?: unknown;
+    skippedIntegration?: unknown;
   } = parsed !== null && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
   const acceptedRows: CiRunRow[] = Array.isArray(payload.accepted)
     ? payload.accepted
@@ -149,15 +165,34 @@ export function summarizeAcceptedPayload(
           };
         })
     : [];
+  const notFoundConflicts = new Set(
+    Array.isArray(payload.conflicts)
+      ? payload.conflicts
+          .filter(c => (c as Partial<RunConflict> | null)?.reason === 'not_found')
+          .map(c => String((c as RunConflict).testId))
+      : [],
+  );
   const rows: CiRunRow[] = [
     ...acceptedRows,
+    ...bucketRows(payload.skipped, 'skipped', item =>
+      typeof (item as { reason?: unknown })?.reason === 'string'
+        ? (item as { reason: string }).reason
+        : 'not dispatched',
+    ),
     ...bucketRows(payload.deferred, 'deferred', 'rate-deferred (not dispatched)'),
+    // One note per conflict, from its reason (HEAD); under `foldSkippedBuckets`
+    // a `not_found` conflict keeps its own status so the `ci run` gate can
+    // exit 4 for it instead of reading it as a transient conflict.
     ...bucketRows(payload.conflicts, 'conflict', item => {
       const conflict = item as Partial<RunConflict> | null;
       return conflict && typeof conflict.testId === 'string' && conflict.reason
         ? `${describeConflict(conflict as RunConflict)} (not dispatched)`
         : 'already in flight (not dispatched)';
-    }),
+    }).map(row =>
+      opts.foldSkippedBuckets === true && notFoundConflicts.has(row.testId)
+        ? { ...row, status: 'not_found' }
+        : row,
+    ),
     // Default note is `test rerun`'s cause (a not-found id has no replayable
     // run). `testlist run` passes its own — a not-found `--case` id is one that
     // is not a member of the list — so the annotation/artifact don't state the
@@ -167,6 +202,22 @@ export function summarizeAcceptedPayload(
       'not_found',
       opts.notFoundNote ?? 'no replayable run (not dispatched)',
     ),
+    ...(opts.foldSkippedBuckets === true
+      ? [
+          // `bucketRows` handles both bucket shapes: `skippedFrontend` is bare
+          // testId strings, `skippedIntegration` is `{ testId }` objects.
+          ...bucketRows(
+            payload.skippedFrontend,
+            'skipped',
+            'frontend test — not run by the batch engine',
+          ),
+          ...bucketRows(
+            payload.skippedIntegration,
+            'skipped',
+            'assembled integration test — run it from the portal',
+          ),
+        ]
+      : []),
   ];
   const passed = rows.filter(row => row.status === 'passed').length;
   const timedOut = rows.filter(row => row.status === 'timeout').length;
@@ -333,13 +384,21 @@ export function emitGithubOutputs(
      */
     annotations?: (line: string) => void;
   },
-  opts: { force?: boolean; label?: string } = {},
+  opts: {
+    force?: boolean;
+    label?: string;
+    /**
+     * Pre-rendered job-summary Markdown (the execution report) that replaces
+     * the local results table when the backend provided one.
+     */
+    markdown?: string;
+  } = {},
 ): void {
   const label = opts.label ?? 'run';
   const summaryPath = env.GITHUB_STEP_SUMMARY;
   if (typeof summaryPath === 'string' && summaryPath.length > 0) {
     try {
-      sinks.appendFile(summaryPath, renderJobSummaryMarkdown(summary));
+      sinks.appendFile(summaryPath, opts.markdown ?? renderJobSummaryMarkdown(summary));
     } catch {
       sinks.stderr(`[${label}] could not append to GITHUB_STEP_SUMMARY; continuing`);
     }
@@ -384,6 +443,7 @@ export function emitCiArtifacts(
   opts: { ghOutput?: boolean; summaryFile?: string; output?: string },
   io: { env: NodeJS.ProcessEnv; stdout: (line: string) => void; stderr: (line: string) => void },
   label: string,
+  extra: { markdown?: string } = {},
 ): void {
   const ghEnabled = opts.ghOutput === true || io.env.GITHUB_ACTIONS === 'true';
   if (!ghEnabled && opts.summaryFile === undefined) return;
@@ -408,7 +468,142 @@ export function emitCiArtifacts(
         // to stderr instead (the Actions runner parses both streams).
         annotations: opts.output === 'json' ? io.stderr : io.stdout,
       },
-      { force: opts.ghOutput === true, label },
+      { force: opts.ghOutput === true, label, markdown: extra.markdown },
     );
+  }
+}
+
+/**
+ * Hand the execution report to later steps: its JSON and Markdown are written
+ * under `$RUNNER_TEMP` (else the OS temp dir) and their paths appended to
+ * `$GITHUB_OUTPUT` as `execution-report-file` / `execution-report-markdown-file`.
+ * Paths, not bodies — a step output is capped at 1 MiB and multi-line values
+ * need heredoc escaping. No-op without `GITHUB_OUTPUT` (nothing can consume
+ * them). Best-effort: a write failure is reported and never masks the gate.
+ */
+export function emitExecutionReportOutputs(
+  ready: { report: ExecutionReport; markdown: string },
+  io: { env: NodeJS.ProcessEnv; stderr: (line: string) => void },
+): { jsonPath: string; markdownPath: string } | undefined {
+  const outputPath = io.env.GITHUB_OUTPUT;
+  if (!outputPath) return undefined;
+  const dir = io.env.RUNNER_TEMP || tmpdir();
+  const safeId = ready.report.executionId.replace(/[^A-Za-z0-9_-]/g, '_');
+  const jsonPath = join(dir, `testsprite-execution-report-${safeId}.json`);
+  const markdownPath = join(dir, `testsprite-execution-report-${safeId}.md`);
+  // A `key=value` output line ends at a newline, so a path carrying one would
+  // smuggle a second output; such a path is skipped rather than escaped.
+  if (/[\r\n]/.test(jsonPath) || /[\r\n]/.test(markdownPath)) {
+    io.stderr(
+      '[ci run] execution report outputs skipped: the temp directory path contains a newline',
+    );
+    return undefined;
+  }
+  try {
+    // Owner-only: the report carries the run's narrative, error text, fix
+    // prompts and screenshot links, and the runner's temp dir is shared.
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- Runner temp directory (`$RUNNER_TEMP` or the OS temp dir) plus a sanitised execution id; never caller input.
+    writeFileSync(jsonPath, `${JSON.stringify(ready.report, null, 2)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- Same runner temp directory and sanitised id as above.
+    writeFileSync(markdownPath, ready.markdown, { encoding: 'utf8', mode: 0o600 });
+  } catch (err) {
+    io.stderr(
+      `[ci run] execution report files not written (${err instanceof Error ? err.message : String(err)}); continuing`,
+    );
+    return undefined;
+  }
+  try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- GITHUB_OUTPUT is the runner-provided output path; only the two temp-file paths above are appended.
+    appendFileSync(
+      outputPath,
+      `execution-report-file=${jsonPath}\nexecution-report-markdown-file=${markdownPath}\n`,
+      'utf8',
+    );
+  } catch {
+    io.stderr('[ci run] execution report outputs not appended to GITHUB_OUTPUT; continuing');
+  }
+  return { jsonPath, markdownPath };
+}
+
+/**
+ * The job-summary Markdown for a batch that has a server execution report.
+ *
+ * The exit code comes from the CLI's own poll of every run plus whatever did
+ * not dispatch; the report describes only the execution. Usually they agree
+ * and the summary is the report, byte for byte the App's comment. When they
+ * do not — a run the CLI could not read or that timed out, a test refused
+ * before dispatch, a retry error — the report alone would read "all passed"
+ * under a red check, so the local verdict is stated first and the rows the
+ * report cannot contain are appended. A red run whose failures the report
+ * also shows agrees — the counts match — and keeps the App's comment as is.
+ */
+export function reconcileExecutionReportMarkdown(
+  summary: CiSummary,
+  ready: { report: ExecutionReport; markdown: string },
+): string {
+  const localNonPassed = summary.runs.filter(row => row.status !== 'passed');
+  const { stats } = ready.report;
+  const agrees =
+    summary.skipped === 0 &&
+    summary.timedOut === 0 &&
+    summary.passed === stats.passed &&
+    summary.failed === stats.failed + stats.blocked &&
+    summary.total === stats.total;
+  if (agrees) return ready.markdown;
+  const reported = new Set(ready.report.tests.map(t => t.id));
+  const missing = localNonPassed.filter(row => !row.runId || !reported.has(row.runId));
+  const banner = [
+    '> [!WARNING]',
+    `> **CI gate: ${summary.passed} of ${summary.total} passed, ${summary.failed} failed, ${summary.skipped} skipped, ${summary.timedOut} timed out.**`,
+    "> The check's result comes from the CLI's own poll of each run. The report below is the server's view of execution " +
+      `\`${ready.report.executionId}\`` +
+      (missing.length > 0 ? ' and does not cover the rows listed at the end.' : '.'),
+    '',
+  ];
+  const appendix =
+    missing.length > 0
+      ? [
+          '',
+          '### Not reflected in the execution report',
+          '',
+          '| Test | Status | Detail | Run |',
+          '| --- | --- | --- | --- |',
+          ...missing.map(row => {
+            const label = row.title?.trim() || row.testId;
+            const test = row.dashboardUrl
+              ? `[${escapeMarkdownLinkText(label)}](${escapeMarkdownUrl(row.dashboardUrl)})`
+              : escapeTableCell(label);
+            const runId = row.runId ?? '';
+            const run =
+              row.executionUrl && runId
+                ? `[${escapeMarkdownLinkText(runId)}](${escapeMarkdownUrl(row.executionUrl)})`
+                : escapeTableCell(runId);
+            return `| ${test} | ${escapeTableCell(row.status)} | ${escapeTableCell(row.error ?? '')} | ${run} |`;
+          }),
+          '',
+        ]
+      : [];
+  return [...banner, ready.markdown.replace(/\s+$/, ''), ...appendix, ''].join('\n');
+}
+
+/** Numeric step outputs share the exact counters used by every other CI sink. */
+export function emitCiStepOutputs(
+  summary: CiSummary,
+  io: { env: NodeJS.ProcessEnv; stderr: (line: string) => void },
+): void {
+  const outputPath = io.env.GITHUB_OUTPUT;
+  if (!outputPath) return;
+  const content = (['total', 'passed', 'failed', 'skipped', 'timedOut'] as const)
+    .map(key => `${key}=${summary[key]}\n`)
+    .join('');
+  try {
+    // Runner-provided output file; only numeric counter values are appended.
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- GITHUB_OUTPUT is an explicit runner/operator-provided output path, not API/test content; only computed numeric counters are appended.
+    appendFileSync(outputPath, content, 'utf8');
+  } catch {
+    io.stderr('[ci run] could not append to GITHUB_OUTPUT; continuing');
   }
 }

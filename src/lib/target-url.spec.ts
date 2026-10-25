@@ -511,13 +511,13 @@ describe('assertNotLocal — error details', () => {
     }
   });
 
-  it('includes a --local hint for localhost block', () => {
+  it('names a saved loopback environment for localhost block', () => {
     try {
       assertNotLocal('http://localhost:3000');
     } catch (err) {
       const apiErr = err as ApiError;
       const details = apiErr.details as Record<string, unknown>;
-      expect(details.hint).toContain('--local');
+      expect(details.hint).toContain('--url http://localhost:<port>');
     }
   });
 
@@ -542,13 +542,13 @@ describe('assertNotLocal — error details', () => {
 
   // A loopback IP literal (not just the `localhost` name) gets the same
   // --local hint — `--local`'s tunnel reaches exactly this address class.
-  it('includes a --local hint for a loopback IP literal (127.0.0.1)', () => {
+  it('names a saved loopback environment for a loopback IP literal (127.0.0.1)', () => {
     try {
       assertNotLocal('http://127.0.0.1');
     } catch (err) {
       const apiErr = err as ApiError;
       const details = apiErr.details as Record<string, unknown>;
-      expect(details.hint).toContain('--local');
+      expect(details.hint).toContain('--url http://localhost:<port>');
     }
   });
 
@@ -616,7 +616,7 @@ describe('assertNotLocal — error details', () => {
 
   // The mapped address is decoded, so its loopback classification is known
   // and gets the same usable --local hint as the plain IPv4 form.
-  it('includes the loopback --local hint for decoded ::ffff:127.0.0.1', () => {
+  it('names a canonical environment URL for decoded ::ffff:127.0.0.1', () => {
     try {
       assertNotLocal('http://[::ffff:127.0.0.1]');
       throw new Error('expected assertNotLocal to throw');
@@ -624,8 +624,8 @@ describe('assertNotLocal — error details', () => {
       const apiErr = err as ApiError;
       const details = apiErr.details as Record<string, unknown>;
       expect(details.reason).toContain('127.0.0.1');
-      expect(details.hint).toContain('test run <test-id> --local');
-      expect(apiErr.nextAction).toContain('--local');
+      expect(details.hint).toContain('test run <test-id> --env <name>');
+      expect(apiErr.nextAction).toContain('--env <name>');
     }
   });
 });
@@ -721,11 +721,11 @@ describe('assertNotLocal — local project creation guidance', () => {
       if (!(error instanceof ApiError)) throw new Error('expected local target refusal');
       expect(error.exitCode).toBe(5);
       expect(error.nextAction).toContain(
-        'Use --local <port> instead of --url for an app on this machine',
+        'Use --url http://localhost:<port> for an app on this machine',
       );
       expect(error.nextAction).not.toContain('must be an internet-reachable address');
       expect(error.nextAction).toContain('See `testsprite project create --help`');
-      expect(error.details?.hint).toContain('Use --local <port> instead of --url');
+      expect(error.details?.hint).toContain('Use --url http://localhost:<port>');
     },
   );
 });

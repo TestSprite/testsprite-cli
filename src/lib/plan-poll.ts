@@ -485,11 +485,10 @@ async function ladderLoop(
           error: {
             code: 'INTERNAL',
             message:
-              `Plan generation appears stuck: ${state.triggerPosts} trigger request(s) ` +
-              `(${state.acceptedPosts} accepted) but the server still reports no staged ` +
-              `proposals and nothing running.`,
+              `Plan generation is not making progress after ${state.triggerPosts} ` +
+              `${state.triggerPosts === 1 ? 'try' : 'tries'}: nothing new is staged and no stage is running.`,
             nextAction:
-              'Retry later or check the project in the Portal. If this persists, report the requestId to support@testsprite.com.',
+              'Wait a few minutes, then run the same command again. If this keeps happening, check the project in the Portal or contact support@testsprite.com.',
             requestId: 'local',
             details: {
               projectId,

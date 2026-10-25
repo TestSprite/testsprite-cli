@@ -15,6 +15,7 @@ import {
   TUNNEL_LIST_RESPONSE_SCHEMA,
   TUNNEL_MINT_RESPONSE_SCHEMA,
   TUNNEL_STATUS_RESPONSE_SCHEMA,
+  EXECUTION_REPORT_RESPONSE_SCHEMA,
 } from './response-schemas.js';
 import type { CliTestListRunResponse } from './testlist.types.js';
 import type {
@@ -30,6 +31,7 @@ import type {
   ListRunsQuery,
   ListRunsResponse,
   CancelRunResponse,
+  ExecutionReportResponse,
 } from './runs.types.js';
 import type {
   CliAcceptPlansResponse,
@@ -527,7 +529,7 @@ export class HttpClient {
    */
   async triggerTestListRun(
     listId: string,
-    body: { testIds?: string[] },
+    body: { testIds?: string[]; tunnelClientId?: string; targetUrl?: string },
     options: { idempotencyKey: string; signal?: AbortSignal },
   ): Promise<CliTestListRunResponse> {
     return this.postWithMeta<CliTestListRunResponse>(
@@ -655,6 +657,21 @@ export class HttpClient {
       retry: options.retry,
       schema: TUNNEL_STATUS_RESPONSE_SCHEMA,
     });
+  }
+
+  /**
+   * The execution report — the GitHub App's PR-comment content — for one
+   * execution. `ready: false` asks the caller to poll again; the server keeps
+   * building the report meanwhile.
+   */
+  async getExecutionReport(
+    executionId: string,
+    options: { signal?: AbortSignal; retry?: boolean } = {},
+  ): Promise<ExecutionReportResponse> {
+    return this.get<ExecutionReportResponse>(
+      `/tests/executions/${encodeURIComponent(executionId)}/report`,
+      { signal: options.signal, retry: options.retry, schema: EXECUTION_REPORT_RESPONSE_SCHEMA },
+    );
   }
 
   /**

@@ -25,7 +25,7 @@ export interface JUnitTestResult {
   name?: string;
   /**
    * Wall-clock duration of the run in seconds, for `testcase time`. Derived from
-   * the poll result's `startedAt`/`finishedAt`; omitted when timing is absent
+   * the poll result's `startedAt` (or `createdAt`) and `finishedAt`; omitted when timing is absent
    * (rendered as `0`, the pre-fix behaviour).
    */
   durationSeconds?: number;
@@ -33,12 +33,15 @@ export interface JUnitTestResult {
 
 /**
  * Duration in seconds between two ISO timestamps, or `undefined` when either is
- * missing / unparseable / negative (clock skew). Kept ≥ 0.
+ * missing / unparseable / negative (clock skew). Prefer startedAt, falling back
+ * to createdAt on servers that do not record a start. Kept ≥ 0.
  */
 export function durationSecondsBetween(
   startedAt: string | null | undefined,
   finishedAt: string | null | undefined,
+  createdAt?: string | null,
 ): number | undefined {
+  startedAt = startedAt ?? createdAt;
   if (!startedAt || !finishedAt) return undefined;
   const start = Date.parse(startedAt);
   const end = Date.parse(finishedAt);
@@ -247,13 +250,20 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
 
 /**
  * The summary's non-dispatched rows (deferred / conflict / not-found) as
- * skipped JUnit results. Accepted rows carry run statuses and never match
- * `isNonDispatchedStatus`, so the filter alone separates the two without
- * relying on row order.
+ * skipped JUnit results. Accepted rows carry run statuses and today never
+ * match `isNonDispatchedStatus`, but the two vocabularies are only disjoint
+ * by convention: `skipped` is a word both could use. So a member already in
+ * `dispatched` (the polled results the caller is writing) is left out here
+ * rather than trusted to stay apart, which keeps `tests` from counting one
+ * member twice if the server ever reports such a status for an admitted run.
  */
-export function skippedJUnitResultsFromSummary(summary: CiSummary): JUnitTestResult[] {
+export function skippedJUnitResultsFromSummary(
+  summary: CiSummary,
+  dispatched: ReadonlyArray<Pick<JUnitTestResult, 'testId'>> = [],
+): JUnitTestResult[] {
+  const alreadyIncluded = new Set(dispatched.map(row => row.testId));
   return summary.runs
-    .filter(row => isNonDispatchedStatus(row.status))
+    .filter(row => isNonDispatchedStatus(row.status) && !alreadyIncluded.has(row.testId))
     .map(row => ({ testId: row.testId, status: 'skipped', skipReason: row.error ?? row.status }));
 }
 

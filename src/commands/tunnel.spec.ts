@@ -63,6 +63,38 @@ const LIST_BODY = {
   ],
 };
 
+describe('tunnel help', () => {
+  function helpFor(name?: string): string {
+    const root = createTunnelCommand();
+    const command = name ? root.commands.find(command => command.name() === name)! : root;
+    let text = '';
+    command.configureOutput({
+      writeOut: chunk => {
+        text += chunk;
+      },
+    });
+    command.outputHelp();
+    return text;
+  }
+
+  it('describes automatic environment tunnels and adopting an existing tunnel', () => {
+    const text = helpFor();
+    expect(text).toContain('automatically');
+    expect(text).toContain('test run <id> --env <name> --tunnel-client <id>');
+  });
+
+  it('start help suggests a built server for a heavy development server', () => {
+    const text = helpFor('start');
+    expect(text).toContain('a minute per page');
+    expect(text).toContain('npm run build');
+    expect(text).toContain('preview/start');
+  });
+
+  it.each(['list', 'status', 'stop'])('%s help explains automatic tunnel bindings', name => {
+    expect(helpFor(name)).toContain('automatically');
+  });
+});
+
 function makeFetch(
   handler: (
     method: string,

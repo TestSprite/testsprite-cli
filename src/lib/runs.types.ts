@@ -64,10 +64,13 @@ export interface RunEnvironmentRef {
 
 /**
  * Body sent to `POST /api/cli/v1/tests/{testId}/runs/rerun`.
- * No `targetUrl` — rerun replays against the project's configured URL.
+ * Tunnel replay includes the saved environment URL verbatim; ordinary replay
+ * uses the configured URL.
  * `source` must be "cli" (not "cli-rerun" — that is not a valid RUN_SOURCES value).
  */
 export interface RerunRequest {
+  tunnelClientId?: string;
+  targetUrl?: string;
   source: 'cli';
   /** Opt into AI heal-on-drift. Paid + FE only. Server tier-gates and echoes effective value. */
   autoHeal?: boolean;
@@ -114,6 +117,7 @@ export interface RerunAdvisory {
  * `runId` is always non-null (minted synchronously before async invoke).
  */
 export interface RerunResponse {
+  tunnelClientId?: string;
   /** The named test's runId (minted synchronously before async Lambda invoke). */
   runId: string;
   status: 'queued';
@@ -145,6 +149,8 @@ export interface RerunResponse {
  * Mixed FE/BE testIds allowed; BE closure deduped server-side per project.
  */
 export interface BatchRerunRequest {
+  tunnelClientId?: string;
+  targetUrl?: string;
   source: 'cli';
   testIds: string[];
   autoHeal?: boolean;
@@ -208,6 +214,7 @@ export interface BatchRerunClosure {
  *   chunked dispatch requests (see `dedupeRerunAdvisories` in `commands/test.ts`).
  */
 export interface BatchRerunResponse {
+  tunnelClientId?: string;
   accepted: BatchRerunAccepted[];
   deferred: BatchRerunDeferred[];
   conflicts: BatchRerunConflict[];
@@ -221,6 +228,7 @@ export interface BatchRerunResponse {
  * All fields are stamped at trigger time and cannot change for this runId.
  */
 export interface TriggerRunResponse {
+  tunnelClientId?: string;
   runId: string;
   status: 'queued';
   enqueuedAt: string;
@@ -337,6 +345,12 @@ export interface RunResponse {
   error: string | null;
   videoUrl: string | null;
   stepSummary: RunStepSummary;
+  /**
+   * How the stored code was routed. `path: 'refused'` means the run was
+   * blocked before dispatch because the stored code could not be replayed;
+   * `reason` names why. Absent on older backends.
+   */
+  replay?: { path: string; reason?: string | null; caveat?: string | null };
   /** Optional hint from the server; honored by the polling loop. */
   retryAfterSeconds?: number;
   /**
@@ -535,6 +549,19 @@ export interface ListRunsQuery {
  * BE-only engine — FE tests in the set are skipped server-side (advisory only).
  * `testIds` absent / empty → run ALL BE tests in the project.
  */
+/**
+ * Where a `ci run` came from on GitHub, read off the Actions event. Stamped on
+ * the execution so the Portal can link the run back to its pull request.
+ */
+export interface CiGithubTrigger {
+  repoOwner: string;
+  repoName: string;
+  branchName?: string;
+  /** 40-hex commit the preview was built from. */
+  commitSha?: string;
+  prNumber: number;
+}
+
 export interface BatchRunFreshRequest {
   projectId: string;
   testIds?: string[];
@@ -545,10 +572,26 @@ export interface BatchRunFreshRequest {
   environment?: string;
   /** Per-run URL override for the batch; echoed when the backend honors it. */
   targetUrl?: string;
+  /**
+   * `'all'`: the server seeds every selected case into one execution and
+   * paces dispatch itself (as for a GitHub App run) instead of cutting the
+   * selection to the per-key budget and returning the rest as `deferred`.
+   * Default `'budget'` is today's behaviour. Echoed when honored.
+   */
+  admission?: 'budget' | 'all';
+  /** `github-pr-<N>`: run in a temporary clone of `environment` at `targetUrl`. Echoed when honored. */
+  previewName?: string;
+  githubTrigger?: CiGithubTrigger;
 }
 
 /** One accepted run in the batch fresh-run response. */
 export interface BatchRunFreshAccepted {
+  /**
+   * The `test_execution.id` this run was dispatched under (V3-served runs
+   * only; absent on a V2 backend). One execution usually covers the whole
+   * batch — `ci run` de-duplicates it to read the execution report.
+   */
+  executionId?: string;
   testId: string;
   /**
    * runId minted synchronously by `claimRunSlotOrThrow`. The backend partitions
@@ -591,6 +634,13 @@ export interface BatchRunFreshResponse {
   skippedFrontend: string[];
   skippedIntegration: Array<{ testId: string }>;
   /**
+   * Backend projects only: the integration phase that follows the wave.
+   * `existing` integration tests run after it (0.2 credits each);
+   * `mayGenerate` means a first run may also generate new ones. Absent on
+   * older backends and for frontend projects.
+   */
+  integration?: { existing: number; runsAfterWave: boolean; mayGenerate: boolean };
+  /**
    * Project-level portal link the batch closes with ("watch it here"). Same
    * absent-vs-present contract as the per-run `dashboardUrl`: ABSENT ⇒ an older
    * backend (or the V2 engine, whose live page is the CLI's own
@@ -606,4 +656,61 @@ export interface BatchRunFreshResponse {
    * report a verdict for an unconfirmed target.
    */
   targetUrl?: string;
+  /** Echoes, same contract as `targetUrl`: absent means this backend never read the field. */
+  admission?: 'budget' | 'all';
+  previewName?: string;
+}
+
+// ─── Execution report (GET /tests/executions/{executionId}/report) ───────────
+
+/** One row of an execution report — one `test_result` of that execution. */
+export interface ExecutionReportTest {
+  /** The `test_result.id` (the CLI's run id). */
+  id: string;
+  title: string;
+  /** Display id of the case (e.g. `AUTH-002`); null when unresolved. */
+  slug: string | null;
+  status: 'PASSED' | 'FAILED' | 'BLOCKED' | (string & {});
+  /** Presigned PNG of a step snapshot; null when unavailable. */
+  screenshotUrl: string | null;
+  /** Raw failure text; set for FAILED rows. */
+  error: string | null;
+  /** Suggested fix prompt; set for FAILED rows. */
+  fix: string | null;
+  /** This result's own Portal page (`…/execution/{eid}/test/{rid}`). */
+  resultUrl?: string;
+}
+
+/**
+ * The execution report the GitHub App posts as its PR comment — the server's
+ * content model, returned verbatim so a later CI step can shape it itself.
+ */
+export interface ExecutionReport {
+  projectId: string;
+  executionId: string;
+  projectName: string;
+  orgId: string | null;
+  stats: { passed: number; failed: number; blocked: number; total: number };
+  allPassed: boolean;
+  /** Narrative run summary from the analyze pass; null when unavailable. */
+  narrative: string | null;
+  whatCouldBeBetter: string | null;
+  recommendedNextStep: string | null;
+  /** Ordered failed → blocked → passed. */
+  tests: ExecutionReportTest[];
+  /** The execution's Portal page. */
+  resultUrl: string;
+}
+
+/**
+ * `ready: false` means the execution is still running or its report is still
+ * being built (the build waits for the analyze pass); poll again after
+ * `retryAfterSeconds`. `report` and `markdown` are present only when ready.
+ */
+export interface ExecutionReportResponse {
+  ready: boolean;
+  retryAfterSeconds?: number;
+  report?: ExecutionReport;
+  /** The report rendered as GitHub-flavoured Markdown — the PR comment body. */
+  markdown?: string;
 }

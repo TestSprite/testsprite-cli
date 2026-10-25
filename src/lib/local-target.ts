@@ -39,8 +39,8 @@ export const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '::1'] as const;
 
 export type LoopbackHost = (typeof LOOPBACK_HOSTS)[number];
 
-/** Default `--local-host`. An IP literal, so no resolver is involved at all. */
-export const DEFAULT_LOCAL_HOST: LoopbackHost = '127.0.0.1';
+/** Default host for a new `--local <port>` shorthand target. */
+export const DEFAULT_LOCAL_HOST: LoopbackHost = 'localhost';
 
 /**
  * Per-candidate dial budget. Deliberately short: this is a loopback connect on
@@ -87,11 +87,21 @@ export function parseLocalPort(raw: string): number {
  * caller's own machine and nothing else, so a non-loopback value here is a
  * misunderstanding to correct immediately, not a request to forward.
  */
-export function normalizeLocalHost(raw: string | undefined): LoopbackHost {
-  if (raw === undefined) return DEFAULT_LOCAL_HOST;
+/**
+ * The loopback spelling a host string names, or `undefined` when it names
+ * anything else. Accepts bracketed IPv6 (`[::1]`, as `URL.hostname` renders
+ * it) and any letter case. This is the membership question; callers that
+ * need a refusal on a miss use {@link normalizeLocalHost}.
+ */
+export function loopbackHost(raw: string): LoopbackHost | undefined {
   const unbracketed = raw.startsWith('[') && raw.endsWith(']') ? raw.slice(1, -1) : raw;
   const candidate = unbracketed.trim().toLowerCase();
-  const match = LOOPBACK_HOSTS.find(host => host === candidate);
+  return LOOPBACK_HOSTS.find(host => host === candidate);
+}
+
+export function normalizeLocalHost(raw: string | undefined): LoopbackHost {
+  if (raw === undefined) return DEFAULT_LOCAL_HOST;
+  const match = loopbackHost(raw);
   if (match === undefined) {
     throw localValidationError(
       'local-host',
@@ -130,13 +140,39 @@ export interface StoredLocalTarget {
   port: number;
 }
 
+/** Parse a loopback origin that the stored-target API and tunnel can reach. */
+export function parseLoopbackTargetUrl(
+  raw: string,
+  field = 'target-url',
+): StoredLocalTarget | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return undefined;
+  }
+  const host = loopbackHost(parsed.hostname);
+  if (host === undefined) return undefined;
+  // Read the explicit port from the input: URL.port drops the default :80.
+  const match = /^http:\/\/(localhost|127\.0\.0\.1|\[::1\]):([0-9]+)\/?$/.exec(raw);
+  const port = match === null ? 0 : Number(match[2]);
+  if (match === null || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw localValidationError(
+      field,
+      'loopback URLs must use http://localhost:<port>, http://127.0.0.1:<port>, or http://[::1]:<port>, with a port between 1 and 65535 and no path ' +
+        '(an optional trailing / is allowed), query, fragment, or credentials',
+    );
+  }
+  return { host, port };
+}
+
 /**
  * Parse the `--local` / `--local-host` / `--url` trio a stored-target write
  * takes. `--local` and `--url` are two spellings of one field, so both is a
  * contradiction; `--local-host` only means something next to `--local`; the
  * port is validated strictly because it becomes part of a URL runs are billed
- * against. Returns the local target, or `undefined` when `--url` (or nothing)
- * was given.
+ * against. Returns the local target for either shorthand or loopback URL input,
+ * or `undefined` for a public URL (or no target).
  */
 export function parseStoredLocalTarget(opts: {
   local?: string;
@@ -149,7 +185,9 @@ export function parseStoredLocalTarget(opts: {
   if (opts.localHost !== undefined && opts.local === undefined) {
     throw flagPairError('--local-host requires --local');
   }
-  if (opts.local === undefined) return undefined;
+  if (opts.local === undefined) {
+    return opts.url === undefined ? undefined : parseLoopbackTargetUrl(opts.url, 'url');
+  }
   if (!/^\d+$/.test(opts.local)) {
     throw flagPairError('--local must be a port number between 1 and 65535');
   }
@@ -302,7 +340,7 @@ const SKIP_HINT = 'Skip this check with --skip-preflight.';
 export async function assertLocalPortListening(
   host: LoopbackHost | string,
   port: number,
-  opts: { skipPreflight?: boolean },
+  opts: { skipPreflight?: boolean; environmentName?: string },
   _stderrFn: (line: string) => void,
   deps: LocalPortProbeDeps = {},
 ): Promise<void> {
@@ -313,10 +351,15 @@ export async function assertLocalPortListening(
     throw ApiError.fromEnvelope({
       error: {
         code: 'VALIDATION_ERROR',
-        message: `Nothing is listening on ${host}:${port}, so a tunnel run would fail after being billed.`,
+        message:
+          opts.environmentName !== undefined
+            ? `Nothing is listening on ${host}:${port} (environment "${opts.environmentName}"). Start your app or run with --skip-preflight.`
+            : `Nothing is listening on ${host}:${port}, so a tunnel run would fail after being billed.`,
         nextAction:
-          `Start your app on port ${port} first, or point --local at the port it is actually ` +
-          `serving. ${SKIP_HINT}`,
+          opts.environmentName !== undefined
+            ? `Start your app on ${host}:${port} (environment "${opts.environmentName}") or run with --skip-preflight.`
+            : `Start your app on port ${port} first, or point --local at the port it is actually ` +
+              `serving. ${SKIP_HINT}`,
         requestId: 'local',
         details: {
           field: 'local',

@@ -1755,6 +1755,10 @@ it('marks a dispatched batch run for recovery guidance on fan-out interruption',
     if (url.includes('/tests/test_one/runs')) {
       return new Response(JSON.stringify(makeTriggerResponse('test_one', 'run_one')));
     }
+    if (url.endsWith('/tests/test_one'))
+      return new Response(JSON.stringify({ type: 'frontend', projectId: 'project_1' }));
+    if (url.endsWith('/projects/project_alice/env'))
+      return new Response(JSON.stringify({ environments: [] }));
     throw interruption;
   }) as typeof fetch;
   const error = await runCreateBatch(

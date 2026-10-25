@@ -5974,6 +5974,10 @@ describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatc
           { status: 202 },
         );
       }
+      if (/\/tests\/[^/]+$/.test(String(input)))
+        return new Response(JSON.stringify({ type: 'backend', projectId: 'project_1' }));
+      if (String(input).endsWith('/projects/project_1/env'))
+        return new Response(JSON.stringify({ environments: [] }));
       throw interruption;
     }) as FetchImpl;
     const error = await runTestRerun(
@@ -6038,6 +6042,10 @@ describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatc
           headers: { 'content-type': 'application/json' },
         });
       }
+      if (/\/tests\/[^/]+$/.test(url))
+        return new Response(JSON.stringify({ type: 'backend', projectId: 'project_1' }));
+      if (url.endsWith('/projects/project_1/env'))
+        return new Response(JSON.stringify({ environments: [] }));
       return new Promise<Response>((_resolve, reject) => {
         const signal = init.signal;
         const rejectWithReason = (): void => {
@@ -6422,4 +6430,63 @@ describe('runTestRerun — --env', () => {
     expect(rerun?.body).toEqual({ source: 'cli', autoHeal: false });
     expect(seen.some(s => s.url.endsWith('/me'))).toBe(false);
   });
+});
+
+it('uses polled run timing for batch rerun JUnit without changing JSON', async () => {
+  const reportFile = join(mkdtempSync(join(tmpdir(), 'rerun-junit-timing-')), 'report.xml');
+  const stdout: string[] = [];
+  await runTestRerun(
+    {
+      testIds: ['test_a', 'test_b'],
+      all: false,
+      wait: true,
+      timeoutSeconds: 600,
+      autoHeal: false,
+      autoHealExplicit: false,
+      skipDependencies: false,
+      maxConcurrency: 5,
+      output: 'json',
+      profile: 'default',
+      debug: false,
+      projectId: 'project_abc',
+      report: 'junit',
+      reportFile,
+    },
+    {
+      ...makeCreds(),
+      fetchImpl: makeFetch((url, init) => {
+        if (init.method === 'POST')
+          return {
+            body: {
+              accepted: [
+                { testId: 'test_a', runId: 'run_a', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+                { testId: 'test_b', runId: 'run_b', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+              ],
+              conflicts: [],
+              deferred: [],
+              notFound: [],
+              closure: { byProject: [] },
+            },
+          };
+        if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
+        const runId = url.includes('run_a') ? 'run_a' : 'run_b';
+        return {
+          body: {
+            ...makeTerminalRun(runId, 'passed'),
+            startedAt: runId === 'run_a' ? null : '2026-06-03T10:00:05.000Z',
+          },
+        };
+      }),
+      stdout: line => stdout.push(line),
+      stderr: () => {},
+      sleep: instantSleep,
+    },
+  );
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads the JUnit report this test wrote to its own temp dir, never user input
+  const xml = readFileSync(reportFile, 'utf8');
+  expect(xml).toContain('skipped="0" time="55">');
+  expect(xml).toContain('testId="test_a" runId="run_a" time="30">');
+  expect(xml).toContain('testId="test_b" runId="run_b" time="25">');
+  expect(stdout[0]).not.toContain('durationSeconds');
+  expect(stdout[0]).not.toContain('createdAt');
 });

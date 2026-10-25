@@ -1058,7 +1058,8 @@ describe('runWhoami', () => {
     );
     expect(capture.stdout.join('\n')).toContain('routing: v3');
     expect(capture.stderr.join('\n')).toContain('[advisory]');
-    expect(capture.stderr.join('\n')).toContain('--target-url');
+    expect(capture.stderr.join('\n')).toContain('rerun');
+    expect(capture.stderr.join('\n')).not.toContain('--target-url');
   });
 
   it('renders routing: v2 and NO advisory when v3Enabled is false', async () => {

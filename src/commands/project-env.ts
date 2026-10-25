@@ -6,20 +6,10 @@
  * picks one by NAME, which is unique per project server-side; the default
  * environment is what every run without `--env` has always used.
  *
- * An app that only runs on your own machine is named with `--local <port>`
- * instead of `--url` — the same spelling as `project create`. The CLI builds
- * the loopback URL and sends the `originMode: 'local'` marker that lets the
- * server store it:
- *
- *   project env create <pid> --name local-dev --local 5173 \
- *     --username … --password-file …
- *   test run <test-id> --env local-dev --local 5173
- *
- * `--local` on the run is what makes that address reachable from the cloud
- * runner; a run against a loopback environment without it is refused before
- * dispatch. A loopback `--url` is redirected to `--local`; everything the
- * runner can never reach (RFC1918, link-local, the metadata address,
- * non-http(s)) stays rejected.
+ * A loopback URL names an app on this machine. `--local <port>` is shorthand
+ * for `--url http://localhost:<port>`; both send the existing local marker.
+ * Frontend runs resolve this URL and open a tunnel automatically. Other
+ * private addresses and non-http(s) URLs remain rejected.
  *
  * Thin facade over `/api/cli/v1/projects/{id}/env`; the server owns every
  * rule (name uniqueness, default recompute, credential storage). Passwords go
@@ -27,7 +17,7 @@
  * renderer here.
  */
 import { randomUUID } from 'node:crypto';
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import {
   emitDryRunBanner,
   makeHttpClient,
@@ -35,7 +25,7 @@ import {
   type CommonOptions,
 } from '../lib/client-factory.js';
 import { resolveProfileName } from '../lib/config.js';
-import { ApiError } from '../lib/errors.js';
+import { ApiError, InterruptError } from '../lib/errors.js';
 import type { HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { readSecretFileGuarded } from '../lib/secret-file.js';
@@ -48,9 +38,15 @@ import { assertNotLocal } from '../lib/target-url.js';
 import { renderTextTable, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
 import type { ProjectDeps } from './project.js';
+import {
+  parseSessionTtl,
+  parseSignInMode,
+  signInValidationError,
+  validateSignInFlags,
+} from './project-sign-in.js';
 
 // ---------------------------------------------------------------------------
-// Wire types — `GET|POST /projects/{id}/env`, `PATCH|DELETE /projects/{id}/env/{name}`,
+// Wire types — `GET|POST /projects/{id}/env`, `GET|PATCH|DELETE /projects/{id}/env/{name}`,
 // `POST /projects/{id}/env/{name}/default`
 // ---------------------------------------------------------------------------
 
@@ -60,7 +56,7 @@ export interface CliProjectEnvironment {
   name: string;
   /**
    * The address runs against this environment open. May be a loopback URL for
-   * an app that only runs on your own machine — pair it with `--local`.
+   * an app that only runs on your own machine — frontend runs open a tunnel.
    */
   url: string;
   isDefault: boolean;
@@ -77,6 +73,7 @@ export interface CliProjectEnvironment {
   username: string | null;
   enableOtp: boolean;
   updatedAt: string;
+  variables?: Record<string, string>;
 }
 
 export interface CliProjectEnvListResponse {
@@ -134,14 +131,14 @@ function stderrOf(deps: ProjectDeps): (line: string) => void {
   return deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 }
 
-function localValidationError(message: string): ApiError {
+function localValidationError(message: string, field?: string): ApiError {
   return ApiError.fromEnvelope({
     error: {
       code: 'VALIDATION_ERROR',
       message: 'Invalid request.',
       nextAction: message,
       requestId: 'local',
-      details: { reason: 'missing_required_flag' },
+      details: { reason: 'missing_required_flag', ...(field ? { field } : {}) },
     },
   });
 }
@@ -155,23 +152,194 @@ function envPath(projectId: string, name?: string): string {
 function requireEnvName(raw: string | undefined, flag: string): string {
   const name = raw?.trim() ?? '';
   if (name.length === 0) {
-    throw localValidationError(`${flag} is required and must not be empty or whitespace-only`);
+    throw localValidationError(
+      `${flag} is required and must not be empty or whitespace-only`,
+      flag === '--rename' ? 'rename' : undefined,
+    );
   }
-  if (name.length > 100) throw localValidationError(`${flag} must be at most 100 characters`);
+  if (name.length > 100)
+    throw localValidationError(
+      `${flag} must be at most 100 characters`,
+      flag === '--rename' ? 'rename' : undefined,
+    );
   return name;
 }
 
-/** Resolve `--password` / `--password-file` (mutually exclusive; never both). */
-function resolvePassword(opts: { password?: string; passwordFile?: string }): string | undefined {
+const RESERVED_VARIABLE_KEYS = new Set([
+  'url',
+  'username',
+  'password',
+  'authType',
+  'credential',
+  'memory_hints',
+  'rerun_context',
+  '__proto__',
+  'constructor',
+  'prototype',
+]);
+
+function parseVariables(raw: string[] | undefined): Record<string, string> | undefined {
+  if (raw === undefined || raw.length === 0) return undefined;
+  if (raw.length > 50) throw localValidationError('--var supports at most 50 keys.');
+  const variables: Record<string, string> = Object.create(null) as Record<string, string>;
+  let totalBytes = 0;
+  for (const item of raw) {
+    const separator = item.indexOf('=');
+    if (separator <= 0) throw localValidationError('--var requires KEY=VALUE with a nonempty key.');
+    const key = item.slice(0, separator);
+    const value = item.slice(separator + 1);
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(key) || RESERVED_VARIABLE_KEYS.has(key)) {
+      throw localValidationError('--var key is invalid or reserved.');
+    }
+    if (Object.hasOwn(variables, key)) throw localValidationError('--var key was repeated.');
+    if (Buffer.byteLength(value, 'utf8') > 4096) {
+      throw localValidationError('--var value exceeds 4096 UTF-8 bytes.');
+    }
+    totalBytes += Buffer.byteLength(key, 'utf8') + Buffer.byteLength(value, 'utf8');
+    if (totalBytes > 32768) throw localValidationError('--var values exceed 32 KiB.');
+    variables[key] = value;
+  }
+  return variables;
+}
+
+function collectVar(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
+function unsupportedServer(feature: string): ApiError {
+  return ApiError.fromEnvelope({
+    error: {
+      code: 'UNSUPPORTED',
+      message: `The server is too old to support ${feature}.${feature === 'project env get' ? '' : ' No requested write was sent.'}`,
+      nextAction: `Upgrade the server before using ${feature}.`,
+      requestId: 'local',
+      details: {},
+    },
+  });
+}
+
+async function assertEnvironmentWriteSupport(
+  client: HttpClient,
+  projectId: string,
+  name: string,
+  feature: string,
+): Promise<void> {
+  try {
+    const listed = await client.get<CliProjectEnvListResponse>(envPath(projectId));
+    if (listed.environments?.length) {
+      if (
+        listed.environments.every(
+          environment =>
+            environment.variables !== undefined &&
+            environment.variables !== null &&
+            typeof environment.variables === 'object',
+        )
+      )
+        return;
+      throw unsupportedServer(feature);
+    }
+    const detail = await client.get<CliProjectEnvUpdateResponse>(envPath(projectId, name));
+    if (
+      !detail.environment ||
+      detail.environment.variables === undefined ||
+      detail.environment.variables === null ||
+      typeof detail.environment.variables !== 'object'
+    )
+      throw unsupportedServer(feature);
+  } catch (err) {
+    if (err instanceof InterruptError) throw err;
+    if (err instanceof ApiError) {
+      if (err.code === 'UNSUPPORTED') throw err;
+      if (err.httpStatus === 404 && !err.details.resource) throw unsupportedServer(feature);
+      if (err.code === 'VALIDATION_ERROR' && err.details.field === 'environment') return;
+      if (err.httpStatus !== 403) throw err;
+    }
+    // A key may have write:projects without read:projects. If the probe is
+    // unavailable, preserve that write path and require the response echo below.
+  }
+}
+
+function confirmRequestedEffects(
+  environment: CliProjectEnvironment | undefined,
+  requested: { clearCredentials?: boolean; variables?: Record<string, string> },
+  urlMayHaveChanged: boolean,
+  created?: { projectId: string; name: string },
+  updated?: {
+    projectId: string;
+    name: string;
+    appliedFields: string[];
+    passwordSupplied?: boolean;
+  },
+): void {
+  const unapplied: string[] = [];
+  if (
+    requested.clearCredentials &&
+    (environment?.hasCredentials !== false || environment.username)
+  ) {
+    unapplied.push('--clear-credentials');
+  }
+  if (requested.variables !== undefined) {
+    const returned = environment?.variables;
+    if (
+      returned === undefined ||
+      returned === null ||
+      typeof returned !== 'object' ||
+      Object.entries(requested.variables).some(
+        ([key, value]) => !Object.hasOwn(returned, key) || returned[key] !== value,
+      )
+    ) {
+      unapplied.push('--var');
+    }
+  }
+  if (unapplied.length === 0) return;
+  // A create already wrote the environment, so "retry" would hit a name
+  // conflict; say what exists and how to finish once the server supports it.
+  const receipt = created
+    ? `The server did not apply ${unapplied.join(' / ')}; environment '${created.name}' was created without them.`
+    : updated
+      ? `The server did not apply ${unapplied.join(' / ')}; environment '${updated.name}' ${updated.appliedFields.length ? `was updated (${updated.appliedFields.join(' / ')} applied)` : 'accepted the update'}.`
+      : `The server did not apply ${unapplied.join(' / ')}; upgrade the server or retry.`;
+  const message =
+    receipt +
+    (updated?.passwordSupplied
+      ? ' --password was supplied; its stored value is not returned.'
+      : '');
+  const retryFlags = unapplied.map(flag => (flag === '--var' ? '--var KEY=VALUE' : flag)).join(' ');
+  const nextAction = created
+    ? `${message} After the server is upgraded, run: testsprite project env update ${created.projectId} ${created.name} ${retryFlags}`
+    : updated
+      ? `${message} After the server is upgraded, run: testsprite project env update ${updated.projectId} ${updated.name} ${retryFlags}${urlMayHaveChanged ? ' URL may already have been applied.' : ''}`
+      : `${message}${urlMayHaveChanged ? ' URL may already have been applied.' : ''}`;
+  throw ApiError.fromEnvelope({
+    error: {
+      code: 'UNSUPPORTED',
+      message,
+      nextAction,
+      requestId: 'local',
+      details: {},
+    },
+  });
+}
+
+/**
+ * Pure validation for `--password` / `--password-file`: mutual exclusion and
+ * non-empty inline value. No filesystem I/O — safe to call before a
+ * `--dry-run` early return, which must never touch the filesystem even when
+ * `--password-file` is present (see `resolvePassword`).
+ */
+function assertPasswordFlagsValid(opts: { password?: string; passwordFile?: string }): void {
   if (opts.password !== undefined && opts.passwordFile !== undefined) {
     throw localValidationError('--password and --password-file are mutually exclusive.');
   }
-  if (opts.password !== undefined) {
-    if (opts.password.trim().length === 0) {
-      throw localValidationError('--password must not be empty or whitespace-only');
-    }
-    return opts.password;
+  if (opts.password !== undefined && opts.password.trim().length === 0) {
+    throw localValidationError('--password must not be empty or whitespace-only');
   }
+}
+
+/** Resolve `--password` / `--password-file` (mutually exclusive; never both). Real path only. */
+function resolvePassword(opts: { password?: string; passwordFile?: string }): string | undefined {
+  assertPasswordFlagsValid(opts);
+  if (opts.password !== undefined) return opts.password;
   if (opts.passwordFile !== undefined) {
     return readSecretFileGuarded('password-file', opts.passwordFile);
   }
@@ -226,7 +394,13 @@ function renderEnvListText(r: CliProjectEnvListResponse): string {
 }
 
 function renderEnvText(env: CliProjectEnvironment): string {
-  return [
+  const login =
+    env.enableOtp || !['public', 'none', 'account'].includes(env.authMode)
+      ? 'managed in Portal'
+      : env.authMode === 'public' || env.authMode === 'none' || !env.hasCredentials
+        ? 'none'
+        : `username+password${env.username ? ` (${env.username})` : ''}`;
+  const lines = [
     `name:        ${env.name}`,
     `id:          ${env.id}`,
     `default:     ${env.isDefault ? 'yes' : 'no'}`,
@@ -234,7 +408,14 @@ function renderEnvText(env: CliProjectEnvironment): string {
     `auth:        ${describeAuth(env)}`,
     `account:     ${env.username ?? '(none stored)'}`,
     `updatedAt:   ${env.updatedAt}`,
-  ].join('\n');
+    `login:       ${login}`,
+  ];
+  const variables = Object.entries(env.variables ?? {}).filter(([key]) => key !== 'password');
+  lines.push(`variables:   ${variables.length}`);
+  for (const [key, value] of variables.sort(([a], [b]) => a.localeCompare(b))) {
+    lines.push(`  ${key}=${value}`);
+  }
+  return lines.join('\n');
 }
 
 function sampleEnv(overrides: Partial<CliProjectEnvironment>): CliProjectEnvironment {
@@ -248,7 +429,61 @@ function sampleEnv(overrides: Partial<CliProjectEnvironment>): CliProjectEnviron
     username: null,
     enableOtp: false,
     updatedAt: '2026-09-09T00:00:00.000Z',
+    variables: {},
     ...overrides,
+  };
+}
+
+/**
+ * Defence-in-depth DENY-list applied to an environment ONLY at the point it
+ * reaches `Output.print`. `Output.print`'s JSON branch stringifies its input
+ * verbatim BY DESIGN for most commands (`test code get --output json`, plans,
+ * fixtures) so that success data round-trips byte-identical — see the
+ * comment on `Output.print` and `redact.ts` — and this codebase treats an
+ * unrecognized field on a success payload as something to PASS THROUGH, not
+ * drop (`project get`'s `defaultEnvironment`/`environmentCount`, `test
+ * list`'s `statusByEnvironment`, and `CliProjectEnvironment.authMode` itself
+ * is an open string specifically so a mode added server-side shows up
+ * without a CLI release). An allow-list here would silently swallow any new
+ * field the server starts returning until the CLI ships again — so this
+ * shallow-copies the environment and removes only the two shapes a
+ * regression could use to leak a credential: a stray top-level `password`
+ * and the Portal's raw `config` object (see the type comment above — the
+ * wire shape is documented to never carry either). `variables` gets the same
+ * treatment as the reserved-key set the CLI already enforces on `--var`
+ * (`RESERVED_VARIABLE_KEYS`, mirrored server-side): everything else in
+ * `variables` — and everything else on the environment — passes through
+ * untouched, including a `variables` key the source never had at all ("JSON
+ * does not invent fields for older backends" falls out of the copy for
+ * free). Only the PRINTED copy is affected — the value `runEnv*` returns to
+ * its caller is the untouched server response.
+ */
+function forDisplay(env: CliProjectEnvironment | undefined): CliProjectEnvironment | undefined {
+  if (env === undefined || env === null || typeof env !== 'object') return env;
+  const clone: Record<string, unknown> = { ...(env as unknown as Record<string, unknown>) };
+  delete clone.password;
+  delete clone.config;
+  if (
+    clone.variables !== undefined &&
+    clone.variables !== null &&
+    typeof clone.variables === 'object'
+  ) {
+    const variables: Record<string, unknown> = { ...(clone.variables as Record<string, unknown>) };
+    for (const key of RESERVED_VARIABLE_KEYS) delete variables[key];
+    clone.variables = variables;
+  }
+  return clone as unknown as CliProjectEnvironment;
+}
+
+/** Apply {@link forDisplay} to a single-environment response, for `out.print` only. */
+function envForPrint<T extends { environment: CliProjectEnvironment }>(res: T): T {
+  return { ...res, environment: forDisplay(res.environment) as CliProjectEnvironment };
+}
+
+/** Apply {@link forDisplay} to a list response, for `out.print` only. */
+function envListForPrint(res: CliProjectEnvListResponse): CliProjectEnvListResponse {
+  return {
+    environments: res.environments.map(e => forDisplay(e) as CliProjectEnvironment),
   };
 }
 
@@ -273,12 +508,43 @@ export async function runEnvList(
         sampleEnv({ name: 'local-dev', url: 'http://127.0.0.1:5173', hasCredentials: true }),
       ],
     };
-    out.print(sample, data => renderEnvListText(data as CliProjectEnvListResponse));
+    out.print(envListForPrint(sample), data =>
+      renderEnvListText(data as CliProjectEnvListResponse),
+    );
     return sample;
   }
   const client = makeClient(opts, deps);
   const res = await client.get<CliProjectEnvListResponse>(envPath(opts.projectId));
-  out.print(res, data => renderEnvListText(data as CliProjectEnvListResponse));
+  out.print(envListForPrint(res), data => renderEnvListText(data as CliProjectEnvListResponse));
+  return res;
+}
+
+export async function runEnvGet(
+  opts: EnvListOptions & { name: string },
+  deps: ProjectDeps = {},
+): Promise<CliProjectEnvUpdateResponse> {
+  const out = makeOutput(opts.output, deps);
+  const name = requireEnvName(opts.name, '<name>');
+  if (opts.dryRun) {
+    emitDryRunBanner(stderrOf(deps));
+    const sample = { environment: sampleEnv({ name }) };
+    out.print(envForPrint(sample), data =>
+      renderEnvText((data as CliProjectEnvUpdateResponse).environment),
+    );
+    return sample;
+  }
+  const client = makeClient(opts, deps);
+  let res: CliProjectEnvUpdateResponse;
+  try {
+    res = await client.get<CliProjectEnvUpdateResponse>(envPath(opts.projectId, name));
+  } catch (err) {
+    if (err instanceof ApiError && err.httpStatus === 404 && !err.details.resource)
+      throw unsupportedServer('project env get');
+    throw err;
+  }
+  out.print(envForPrint(res), data =>
+    renderEnvText((data as CliProjectEnvUpdateResponse).environment),
+  );
   return res;
 }
 
@@ -297,8 +563,12 @@ interface EnvCreateOptions extends CommonOptions {
   username?: string;
   password?: string;
   passwordFile?: string;
+  vars?: string[];
   setDefault?: boolean;
   idempotencyKey?: string;
+  signIn?: string;
+  otpChannel?: string[];
+  sessionTtl?: string;
 }
 
 export async function runEnvCreate(
@@ -314,35 +584,72 @@ export async function runEnvCreate(
   if (localTarget === undefined && (opts.url === undefined || opts.url.trim().length === 0)) {
     throw localValidationError(
       '--url is required: it names the address runs against this environment open. ' +
-        'For an app that only runs on this machine, pass --local <port> instead, then run it ' +
-        'with `test run <id> --env <name> --local <port>`.',
+        'For an app on this machine, pass --url http://localhost:<port> or --local <port>, then run it ' +
+        'with `test run <id> --env <name>`; the CLI opens a tunnel automatically.',
     );
   }
-  if (opts.url !== undefined) {
+  if (opts.url !== undefined && !localTarget) {
     assertNotLocal(opts.url, {
       field: 'url',
       helpCommand: 'testsprite project env create',
       hintContext: 'local-project-create',
     });
   }
-  const url = localTarget ? buildLocalTargetUrl(localTarget.host, localTarget.port) : opts.url!;
-  if (opts.username !== undefined && opts.username.trim().length === 0) {
-    throw localValidationError('--username must not be empty or whitespace-only');
+  const url =
+    opts.url ??
+    (localTarget ? buildLocalTargetUrl(localTarget.host, localTarget.port) : undefined)!;
+  const signIn = opts.signIn === undefined ? undefined : parseSignInMode(opts.signIn, '--sign-in');
+  validateSignInFlags(signIn, opts, true);
+  if (localTarget && (signIn === 'otp' || signIn === 'manual')) {
+    throw signInValidationError(
+      '--sign-in otp and --sign-in manual are not available for --local environments (runs through the tunnel sign in inline); use --sign-in public or account.',
+      'local-environment-sign-in-unsupported',
+    );
+  }
+  const otpChannels = opts.otpChannel?.flatMap(value =>
+    value.split(',').map(channel => channel.trim()),
+  );
+  if (
+    otpChannels &&
+    (otpChannels.length === 0 ||
+      otpChannels.some(channel => channel !== 'email' && channel !== 'sms'))
+  ) {
+    throw signInValidationError('--otp-channel accepts email and sms only.');
+  }
+  const uniqueOtpChannels = otpChannels === undefined ? undefined : [...new Set(otpChannels)];
+  const variables = parseVariables(opts.vars);
+  const passwordGiven = opts.password !== undefined || opts.passwordFile !== undefined;
+  if (signIn === undefined && (opts.username !== undefined) !== passwordGiven) {
+    // Half an account would be stored on a public environment.
+    throw localValidationError(
+      '--username and --password (or --password-file) go together; pass both for a test account, or neither.',
+    );
   }
 
   if (opts.dryRun) {
     emitDryRunBanner(stderr);
     mintIdempotencyKey('create', opts, stderr);
+    const hasCredentials =
+      opts.username !== undefined &&
+      (opts.password !== undefined || opts.passwordFile !== undefined) &&
+      (signIn === undefined || signIn === 'account');
+    const previewMode = signIn ?? (hasCredentials ? 'account' : 'public');
     const sample: CliProjectEnvCreateResponse = {
       environment: sampleEnv({
         name,
         url,
         isDefault: opts.setDefault === true,
-        hasCredentials: opts.password !== undefined || opts.passwordFile !== undefined,
+        authMode: previewMode,
+        hasCredentials,
+        username: hasCredentials ? (opts.username ?? null) : null,
+        enableOtp: previewMode === 'otp',
+        variables: variables ?? {},
       }),
       created: true,
     };
-    out.print(sample, data => renderEnvText((data as CliProjectEnvCreateResponse).environment));
+    out.print(envForPrint(sample), data =>
+      renderEnvText((data as CliProjectEnvCreateResponse).environment),
+    );
     return sample;
   }
 
@@ -352,21 +659,44 @@ export async function runEnvCreate(
 
   // Secrets are read only on the real path — never for a dry run.
   const password = resolvePassword(opts);
-  const body: Record<string, string | boolean> = { name, url };
+  const body: Record<string, string | boolean | number | string[] | Record<string, string>> = {
+    name,
+    url,
+  };
   // The marker rides with the URL: it is what authorizes storing a loopback
   // address, and it lives on the environment the server creates.
   if (localTarget) body.originMode = 'local';
   if (opts.username !== undefined) body.username = opts.username;
   if (password !== undefined) body.password = password;
   if (opts.setDefault) body.setDefault = true;
+  if (variables !== undefined) body.variables = variables;
+  if (signIn !== undefined) body.signIn = signIn;
+  if (signIn === 'otp') body.otpChannels = uniqueOtpChannels ?? ['email'];
+  if (opts.sessionTtl !== undefined) body.sessionReuseTtlSeconds = parseSessionTtl(opts.sessionTtl);
 
   const idempotencyKey = mintIdempotencyKey('create', opts, stderr);
   const client = makeClient(opts, deps);
+  if (variables !== undefined)
+    await assertEnvironmentWriteSupport(client, opts.projectId, name, '--var');
   const res = await client.post<CliProjectEnvCreateResponse>(envPath(opts.projectId), {
     body,
     headers: { 'idempotency-key': idempotencyKey },
   });
-  out.print(res, data => renderEnvText((data as CliProjectEnvCreateResponse).environment));
+  confirmRequestedEffects(res.environment, { variables }, false, {
+    projectId: opts.projectId,
+    name: res.environment?.name ?? name,
+  });
+  out.print(envForPrint(res), data =>
+    renderEnvText((data as CliProjectEnvCreateResponse).environment),
+  );
+  if (opts.output === 'text' && signIn === 'manual')
+    stderr(
+      `SSO selected: runs will NOT be signed in until someone logs in once in the Portal (project → Settings → Environments → ${res.environment.name} → Log in). Check with: testsprite project sign-in get ${opts.projectId} --env ${res.environment.name}`,
+    );
+  if (opts.output === 'text' && signIn === 'otp')
+    stderr(
+      `OTP selected: see the provisioned inbox/phone with: testsprite project sign-in get ${opts.projectId} --env ${res.environment.name}`,
+    );
   return res;
 }
 
@@ -385,6 +715,8 @@ interface EnvUpdateOptions extends CommonOptions {
   username?: string;
   password?: string;
   passwordFile?: string;
+  clearCredentials?: boolean;
+  vars?: string[];
   rename?: string;
   idempotencyKey?: string;
 }
@@ -406,23 +738,36 @@ export async function runEnvUpdate(
           'if it is no longer used (testsprite project env delete <project-id> <name> --confirm).',
       );
     }
-    assertNotLocal(opts.url, {
-      field: 'url',
-      helpCommand: 'testsprite project env update',
-      hintContext: 'local-project-create',
-    });
+    if (!localTarget)
+      assertNotLocal(opts.url, {
+        field: 'url',
+        helpCommand: 'testsprite project env update',
+        hintContext: 'local-project-create',
+      });
   }
-  const url = localTarget ? buildLocalTargetUrl(localTarget.host, localTarget.port) : opts.url;
+  const url =
+    opts.url ?? (localTarget ? buildLocalTargetUrl(localTarget.host, localTarget.port) : undefined);
   if (opts.username !== undefined && opts.username.trim().length === 0) {
     throw localValidationError('--username must not be empty or whitespace-only');
   }
   const rename = opts.rename !== undefined ? requireEnvName(opts.rename, '--rename') : undefined;
+  const variables = parseVariables(opts.vars);
   const passwordSupplied = opts.password !== undefined || opts.passwordFile !== undefined;
+  if (
+    opts.clearCredentials &&
+    (opts.username !== undefined || opts.password !== undefined || opts.passwordFile !== undefined)
+  ) {
+    throw localValidationError(
+      '--clear-credentials excludes --username, --password and --password-file.',
+    );
+  }
   const mutable = {
     url: url !== undefined,
     username: opts.username !== undefined,
     password: passwordSupplied,
     rename: rename !== undefined,
+    clearCredentials: opts.clearCredentials === true,
+    variables: variables !== undefined,
   };
   const present = Object.entries(mutable)
     .filter(([, on]) => on)
@@ -430,9 +775,12 @@ export async function runEnvUpdate(
   if (present.length === 0) {
     throw localValidationError(
       'At least one mutable flag is required: --url, --username, ' +
-        '--password / --password-file, or --rename.',
+        '--password / --password-file, --clear-credentials, --rename, or --var.',
     );
   }
+  // See the matching comment in `runEnvCreate`: validate credential flag
+  // usage before the dry-run plan is built, not just on the real path.
+  assertPasswordFlagsValid(opts);
 
   if (opts.dryRun) {
     emitDryRunBanner(stderr);
@@ -442,9 +790,12 @@ export async function runEnvUpdate(
         name: rename ?? name,
         url: url ?? 'https://staging.example.com',
         hasCredentials: passwordSupplied,
+        variables: variables ?? {},
       }),
     };
-    out.print(sample, data => renderEnvText((data as CliProjectEnvUpdateResponse).environment));
+    out.print(envForPrint(sample), data =>
+      renderEnvText((data as CliProjectEnvUpdateResponse).environment),
+    );
     return sample;
   }
 
@@ -453,20 +804,61 @@ export async function runEnvUpdate(
   }
 
   const password = resolvePassword(opts);
-  const body: Record<string, string> = {};
+  const body: Record<string, string | boolean | Record<string, string>> = {};
   if (url !== undefined) body.url = url;
   if (localTarget) body.originMode = 'local';
   if (opts.username !== undefined) body.username = opts.username;
   if (password !== undefined) body.password = password;
   if (rename !== undefined) body.rename = rename;
+  if (opts.clearCredentials) body.clearCredentials = true;
+  if (variables !== undefined) body.variables = variables;
 
   const idempotencyKey = mintIdempotencyKey('update', opts, stderr);
   const client = makeClient(opts, deps);
+  if (variables !== undefined || opts.clearCredentials) {
+    await assertEnvironmentWriteSupport(
+      client,
+      opts.projectId,
+      name,
+      [opts.clearCredentials ? '--clear-credentials' : '', variables !== undefined ? '--var' : '']
+        .filter(Boolean)
+        .join(' / '),
+    );
+  }
   const res = await client.patch<CliProjectEnvUpdateResponse>(envPath(opts.projectId, name), {
     body,
     headers: { 'idempotency-key': idempotencyKey },
   });
-  out.print(res, data => renderEnvText((data as CliProjectEnvUpdateResponse).environment));
+  confirmRequestedEffects(
+    res.environment,
+    { clearCredentials: opts.clearCredentials, variables },
+    url !== undefined,
+    undefined,
+    {
+      projectId: opts.projectId,
+      name: res.environment?.name ?? name,
+      passwordSupplied: password !== undefined,
+      appliedFields: [
+        rename !== undefined && res.environment?.name === rename ? '--rename' : '',
+        url !== undefined && res.environment?.url === url ? '--url' : '',
+        opts.username !== undefined && res.environment?.username === opts.username
+          ? '--username'
+          : '',
+        opts.clearCredentials &&
+        res.environment?.hasCredentials === false &&
+        !res.environment.username
+          ? '--clear-credentials'
+          : '',
+      ].filter(Boolean),
+    },
+  );
+  out.print(envForPrint(res), data =>
+    renderEnvText((data as CliProjectEnvUpdateResponse).environment),
+  );
+  if (opts.output === 'text' && url !== undefined && res.environment.authMode === 'manual')
+    stderr(
+      `This environment signs in with an SSO session captured on its previous address; if the site changed, log in again in the Portal (project → Settings → Environments → ${res.environment.name} → Log in).`,
+    );
   return res;
 }
 
@@ -538,7 +930,9 @@ export async function runEnvSetDefault(
     const sample: CliProjectEnvUpdateResponse = {
       environment: sampleEnv({ name, isDefault: true }),
     };
-    out.print(sample, data => renderEnvText((data as CliProjectEnvUpdateResponse).environment));
+    out.print(envForPrint(sample), data =>
+      renderEnvText((data as CliProjectEnvUpdateResponse).environment),
+    );
     return sample;
   }
 
@@ -548,7 +942,9 @@ export async function runEnvSetDefault(
     `${envPath(opts.projectId, name)}/default`,
     { body: {}, headers: { 'idempotency-key': idempotencyKey } },
   );
-  out.print(res, data => renderEnvText((data as CliProjectEnvUpdateResponse).environment));
+  out.print(envForPrint(res), data =>
+    renderEnvText((data as CliProjectEnvUpdateResponse).environment),
+  );
   return res;
 }
 
@@ -565,8 +961,12 @@ interface EnvCreateFlagOpts {
   username?: string;
   password?: string;
   passwordFile?: string;
+  var?: string[];
   setDefault?: boolean;
   idempotencyKey?: string;
+  signIn?: string;
+  otpChannel?: string[];
+  sessionTtl?: string;
 }
 
 interface EnvUpdateFlagOpts {
@@ -577,6 +977,8 @@ interface EnvUpdateFlagOpts {
   username?: string;
   password?: string;
   passwordFile?: string;
+  clearCredentials?: boolean;
+  var?: string[];
   rename?: string;
   idempotencyKey?: string;
 }
@@ -599,6 +1001,25 @@ const EXIT_CODE_NOTE =
   '  4  project (or environment) not found\n' +
   '  5  validation error\n' +
   '  6  conflict (name already exists / deleting the default)';
+const UPDATE_EXIT_CODE_NOTE =
+  '\nExit codes:\n' +
+  '  0  success\n' +
+  '  3  auth error\n' +
+  '  4  project (or environment) not found\n' +
+  '  5  validation error\n' +
+  '  6  conflict (name already exists) / precondition (credentials or --local on an SSO or OTP environment; see `project sign-in set`)';
+const CREATE_EXIT_CODE_NOTE =
+  '\nExit codes:\n' +
+  '  0  success\n' +
+  '  3  auth error\n' +
+  '  4  project not found\n' +
+  '  5  validation error\n' +
+  '  6  conflict (name already exists) / precondition (OTP or SSO on a local environment)' +
+  '\n  7  unsupported (V2 environments or OTP/SSO in BYOC)' +
+  '\n  10 service unavailable' +
+  '\n  11 rate limited' +
+  '\n  13 SSO feature gated' +
+  '\n  14 client too old';
 
 export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
   const env = new Command('env')
@@ -608,7 +1029,7 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
     .addHelpText(
       'after',
       '\nFor an app that only runs on this machine, create or update the environment with\n' +
-        '`--local <port>` instead of `--url`; reach it per run with `test run <id> --env <name> --local <port>`.',
+        '`--url http://localhost:<port>` or `--local <port>`; `test run <id> --env <name>` opens a tunnel automatically.',
     );
 
   env
@@ -620,27 +1041,54 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
     });
 
   env
+    .command('get <project-id> <name>')
+    .description('Get one environment by name, including its login settings.' + EXIT_CODE_NOTE)
+    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .action(async (projectId: string, name: string, _cmdOpts: unknown, command: Command) => {
+      await runEnvGet({ ...resolveCommonOptions(command, deps.env), projectId, name }, deps);
+    });
+
+  env
     .command('create <project-id>')
     .description(
-      'Create an environment (--name and one of --url / --local are required).' + EXIT_CODE_NOTE,
+      'Create an environment (--name and one of --url / --local are required).' +
+        CREATE_EXIT_CODE_NOTE,
     )
     .option('--name <name>', 'environment name, unique within the project (required)')
     .option(
       '--url <url>',
-      'address runs open (public http/https; for an app on this machine use --local)',
+      'address runs open (public http/https, or a loopback http origin with an explicit port)',
     )
     .option(
       '--local <port>',
-      'an app on this machine: stores http://<host>:<port> (1-65535; excludes --url; frontend only)',
+      'shorthand for --url http://localhost:<port> (1-65535; excludes --url; frontend only)',
     )
-    .option(
-      '--local-host <host>',
-      'loopback host: localhost, 127.0.0.1 (default), or ::1; requires --local',
+    .addOption(
+      new Option(
+        '--local-host <host>',
+        'deprecated loopback host override; requires --local',
+      ).hideHelp(),
     )
     .option('--skip-preflight', 'skip the local TCP listener check before creating')
     .option('--username <user>', 'test-account username the browser logs in with')
     .option('--password <pw>', 'test-account password (prefer --password-file)')
     .option('--password-file <path>', 'read the password from a file instead of the command line')
+    .option(
+      '--var <KEY=VALUE>',
+      'set a custom variable (repeatable); shown in plain text by `env get` — not for secrets, use --username/--password',
+      collectVar,
+      [],
+    )
+    .option('--sign-in <mode>', 'public, account, otp, or manual (aliases: none, credentials, sso)')
+    .option(
+      '--otp-channel <email,sms>',
+      'OTP channels: email and/or sms; repeat or comma-separate',
+      (value: string, previous: string[] = []) => [...previous, value],
+    )
+    .option(
+      '--session-ttl <seconds|never>',
+      'SSO session reuse lifetime: 1–2592000 seconds or never (manual only)',
+    )
     .option('--set-default', "make this the project's default environment", false)
     .option('--idempotency-key <token>', IDEMPOTENCY_HELP)
     .addHelpText('after', GLOBAL_OPTS_HINT)
@@ -657,6 +1105,10 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
           username: cmdOpts.username,
           password: cmdOpts.password,
           passwordFile: cmdOpts.passwordFile,
+          vars: cmdOpts.var,
+          signIn: cmdOpts.signIn,
+          otpChannel: cmdOpts.otpChannel,
+          sessionTtl: cmdOpts.sessionTtl,
           setDefault: cmdOpts.setDefault === true,
           idempotencyKey: cmdOpts.idempotencyKey,
         },
@@ -666,23 +1118,32 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
 
   env
     .command('update <project-id> <name>')
-    .description("Change an environment's URL, credentials or name." + EXIT_CODE_NOTE)
+    .description("Change an environment's URL, credentials or name." + UPDATE_EXIT_CODE_NOTE)
     .option(
       '--url <url>',
-      'new address runs open (public http/https; for an app on this machine use --local)',
+      'new address runs open (public http/https, or a loopback http origin with an explicit port)',
     )
     .option(
       '--local <port>',
-      'repoint at an app on this machine: stores http://<host>:<port> (1-65535; excludes --url)',
+      'shorthand for --url http://localhost:<port> (1-65535; excludes --url)',
     )
-    .option(
-      '--local-host <host>',
-      'loopback host: localhost, 127.0.0.1 (default), or ::1; requires --local',
+    .addOption(
+      new Option(
+        '--local-host <host>',
+        'deprecated loopback host override; requires --local',
+      ).hideHelp(),
     )
     .option('--skip-preflight', 'skip the local TCP listener check before the update')
     .option('--username <user>', 'new test-account username')
     .option('--password <pw>', 'new test-account password (prefer --password-file)')
     .option('--password-file <path>', 'read the new password from a file')
+    .option('--clear-credentials', 'remove stored username and password; disable account login')
+    .option(
+      '--var <KEY=VALUE>',
+      'merge a custom variable (repeatable); shown in plain text by `env get` — not for secrets, use --username/--password',
+      collectVar,
+      [],
+    )
     .option(
       '--rename <new-name>',
       'rename the environment (runs keep referring to it by the new name)',
@@ -703,6 +1164,8 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
             username: cmdOpts.username,
             password: cmdOpts.password,
             passwordFile: cmdOpts.passwordFile,
+            clearCredentials: cmdOpts.clearCredentials,
+            vars: cmdOpts.var,
             rename: cmdOpts.rename,
             idempotencyKey: cmdOpts.idempotencyKey,
           },

@@ -9,6 +9,8 @@ import {
   assertValidEndpointUrl,
   emitDryRunBanner,
   createHttpClientFactory,
+  formatDebug,
+  formatDryRunDebug,
   makeHttpClient,
   parseRequestTimeoutFlag,
   resetDryRunBannerForTesting,
@@ -18,6 +20,7 @@ import {
   REQUEST_TIMEOUT_DEFAULT_MS,
   REQUEST_TIMEOUT_MAX_MS,
   REQUEST_TIMEOUT_MIN_MS,
+  type DebugEvent,
 } from './http.js';
 import { ApiError } from './errors.js';
 import { ShutdownController, globalShutdown } from './interrupt.js';
@@ -152,6 +155,35 @@ describe('makeHttpClient — dry-run path', () => {
     for (const line of debug) {
       expect(line).toMatch(/^\[debug \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\]/);
     }
+  });
+
+  it('debug log redacts authorization and nested secrets', () => {
+    // `DebugEvent` carries no headers/body today (see `formatDebug`'s doc
+    // comment) — this proves the forward-compatibility contract: if a future
+    // debug event ever carried request/response context, a secret in it
+    // could not leak through this formatter either.
+    const event = {
+      kind: 'response',
+      method: 'GET',
+      url: 'https://api.example.com/me',
+      attempt: 1,
+      status: 200,
+      requestId: 'req_1',
+      headers: { authorization: 'Bearer sk-user-should-not-leak', 'x-request-id': 'req_1' },
+      nested: { apiKey: 'sk-should-not-leak-either' },
+    } as unknown as DebugEvent;
+
+    const line = formatDebug(event);
+    expect(line).not.toContain('sk-user-should-not-leak');
+    expect(line).not.toContain('sk-should-not-leak-either');
+    expect(line).toContain('[REDACTED]');
+    // Ordinary fields survive.
+    expect(line).toContain('"x-request-id":"req_1"');
+
+    const dryRunLine = formatDryRunDebug(event);
+    expect(dryRunLine).not.toContain('sk-user-should-not-leak');
+    expect(dryRunLine).not.toContain('sk-should-not-leak-either');
+    expect(dryRunLine).toContain('[REDACTED]');
   });
 
   it('--verbose wires onTransition to stderr', async () => {

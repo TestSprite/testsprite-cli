@@ -53,6 +53,8 @@ import type {
   RunSource,
   RunStatus,
   TriggerRunResponse,
+  ExecutionReport,
+  ExecutionReportResponse,
 } from './runs.types.js';
 import type { CliTestListRunResponse } from './testlist.types.js';
 import type {
@@ -145,6 +147,15 @@ export const RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, RunResponse> = v.loos
   error: v.nullish(v.string(), null),
   videoUrl: v.nullish(v.string(), null),
   stepSummary: RUN_STEP_SUMMARY_SCHEMA,
+  // Optional with no default: absent on older backends. `reason` / `caveat` are
+  // `null` on the wire when the run carries no routing reason or caveat.
+  replay: v.optional(
+    v.looseObject({
+      path: v.string(),
+      reason: v.nullish(v.string()),
+      caveat: v.nullish(v.string()),
+    }),
+  ),
   retryAfterSeconds: v.optional(v.number()),
   // Portal link. Three-state wire contract (pinned): **absent** — an older
   // backend that predates this field, and cannot have produced a V3-native/
@@ -345,6 +356,8 @@ export const BATCH_RUN_FRESH_RESPONSE_SCHEMA: v.GenericSchema<unknown, BatchRunF
         runId: v.string(),
         enqueuedAt: v.string(),
         dashboardUrl: v.optional(v.string()),
+        // V3-served runs name their execution; an older backend omits it.
+        executionId: v.optional(v.string()),
       }),
     ),
     conflicts: v.array(
@@ -358,6 +371,14 @@ export const BATCH_RUN_FRESH_RESPONSE_SCHEMA: v.GenericSchema<unknown, BatchRunF
     deferred: v.array(v.looseObject({ testId: v.string() })),
     skippedFrontend: v.array(v.string()),
     skippedIntegration: v.array(v.looseObject({ testId: v.string() })),
+    // Optional with no default: absent on older backends and frontend projects.
+    integration: v.optional(
+      v.looseObject({
+        existing: v.number(),
+        runsAfterWave: v.boolean(),
+        mayGenerate: v.boolean(),
+      }),
+    ),
     // Project-level closing link. Absent-key-preserving like `RUN_RESPONSE_SCHEMA`'s
     // `dashboardUrl` (see the note there): omitted stays ABSENT so the client
     // keeps computing its legacy template for an older backend / the V2 engine;
@@ -365,6 +386,10 @@ export const BATCH_RUN_FRESH_RESPONSE_SCHEMA: v.GenericSchema<unknown, BatchRunF
     dashboardUrl: v.nullish(v.string(), undefined),
     // An exact echo confirms that the backend read the target URL override.
     targetUrl: v.optional(v.string()),
+    // Same contract for the CI fields: a client that sent one and gets no
+    // echo was served by a backend that cut the batch / ran a plain override.
+    admission: v.optional(v.picklist(['budget', 'all'])),
+    previewName: v.optional(v.string()),
   });
 
 /**
@@ -587,4 +612,44 @@ export const TUNNEL_LIST_RESPONSE_SCHEMA: v.GenericSchema<unknown, TunnelListRes
         createdAt: v.optional(v.nullable(v.string())),
       }),
     ),
+  });
+
+/** Mirrors `ExecutionReport` — the server's report model, kept loose so new fields pass through. */
+export const EXECUTION_REPORT_SCHEMA: v.GenericSchema<unknown, ExecutionReport> = v.looseObject({
+  projectId: v.string(),
+  executionId: v.string(),
+  projectName: v.string(),
+  orgId: v.nullish(v.string(), null),
+  stats: v.looseObject({
+    passed: v.number(),
+    failed: v.number(),
+    blocked: v.number(),
+    total: v.number(),
+  }),
+  allPassed: v.boolean(),
+  narrative: v.nullish(v.string(), null),
+  whatCouldBeBetter: v.nullish(v.string(), null),
+  recommendedNextStep: v.nullish(v.string(), null),
+  tests: v.array(
+    v.looseObject({
+      id: v.string(),
+      title: v.string(),
+      slug: v.nullish(v.string(), null),
+      status: openWireLiteral<'PASSED' | 'FAILED' | 'BLOCKED'>(),
+      screenshotUrl: v.nullish(v.string(), null),
+      error: v.nullish(v.string(), null),
+      fix: v.nullish(v.string(), null),
+      resultUrl: v.optional(v.string()),
+    }),
+  ),
+  resultUrl: v.string(),
+});
+
+/** Mirrors `ExecutionReportResponse`: `report`/`markdown` only travel with `ready: true`. */
+export const EXECUTION_REPORT_RESPONSE_SCHEMA: v.GenericSchema<unknown, ExecutionReportResponse> =
+  v.looseObject({
+    ready: v.boolean(),
+    retryAfterSeconds: v.optional(v.number()),
+    report: v.optional(EXECUTION_REPORT_SCHEMA),
+    markdown: v.optional(v.string()),
   });

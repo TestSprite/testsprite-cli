@@ -27,6 +27,28 @@ describe('sampleJUnitReportXml', () => {
 });
 
 describe('findSample', () => {
+  it('provides password-free project sign-in get and set samples', () => {
+    const get = findSample('GET', '/projects/p_x/sign-in?environment=default');
+    const set = findSample('PUT', '/projects/p_x/sign-in', {
+      mode: 'account',
+      password: 'secret-example',
+    });
+    expect(get?.operationId).toBe('getProjectSignIn');
+    expect(set?.operationId).toBe('setProjectSignIn');
+    expect(set?.body()).toMatchObject({
+      signIn: { mode: 'account', account: { passwordSet: true } },
+      changed: true,
+    });
+    expect(JSON.stringify(set?.body())).not.toContain('secret-example');
+  });
+  it('previews setting an existing OTP environment as unchanged', () => {
+    const set = findSample('PUT', '/projects/p_x/sign-in', { mode: 'otp' });
+    expect(set?.body()).toMatchObject({
+      environment: { authMode: 'otp', enableOtp: true },
+      signIn: { mode: 'otp' },
+      changed: false,
+    });
+  });
   it('keeps tunnel collection and single-client samples distinct', () => {
     const list = findSample('GET', '/tunnel');
     const status = findSample('GET', '/tunnel/11111111-2222-4333-8444-555555555555');
@@ -162,6 +184,18 @@ describe('findSample', () => {
     expect(result?.operationId).toBe('getTestResult');
     const failure = findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests/t_x/failure');
     expect(failure?.operationId).toBe('getTestFailure');
+  });
+
+  it('resolves /tests/executions/{id}/report without the /tests/{testId} family catching it', () => {
+    const report = findSample(
+      'GET',
+      'https://api.testsprite.com/api/cli/v1/tests/executions/exec_1/report',
+    );
+    expect(report?.operationId).toBe('getExecutionReport');
+    // Four segments never match the two-segment `getTest` pattern either way.
+    expect(
+      findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests/executions')?.operationId,
+    ).toBe('getTest');
   });
 
   it('resolves /tests/{id}/failure/summary distinct from /failure (M2.1 piece 3)', () => {
@@ -479,6 +513,18 @@ describe('findSample', () => {
             deletedAt: expect.any(String),
           });
           break;
+        case 'getProjectSignIn':
+        case 'setProjectSignIn':
+          expect(body).toMatchObject({
+            projectId: expect.any(String),
+            environment: expect.objectContaining({
+              name: expect.any(String),
+              authMode: expect.any(String),
+            }),
+            signIn: expect.objectContaining({ mode: expect.any(String) }),
+          });
+          expect(body.nextAction === null || typeof body.nextAction === 'string').toBe(true);
+          break;
         case 'generatePlans':
           // POST /projects/{id}/plans/generate →
           // CliGeneratePlansResponse (202 trigger ack).
@@ -550,6 +596,17 @@ describe('findSample', () => {
             clientId: expect.any(String),
             status: expect.any(String),
             expiresAt: expect.any(String),
+          });
+          break;
+        case 'getExecutionReport':
+          expect(body).toMatchObject({
+            ready: true,
+            markdown: expect.any(String),
+            report: expect.objectContaining({
+              executionId: expect.any(String),
+              stats: expect.objectContaining({ total: expect.any(Number) }),
+              tests: expect.any(Array),
+            }),
           });
           break;
         default:
@@ -701,8 +758,8 @@ describe('findSample', () => {
     expect(e?.operationId).toBe('getTest');
     const body = e?.body() as Record<string, unknown>;
     expect('priority' in body).toBe(true);
-    // First test in the sample has priority 'p1'.
-    expect(body.priority).toBe('p1');
+    // First test in the sample has priority 'Medium' (reads return High/Medium/Low).
+    expect(body.priority).toBe('Medium');
   });
 
   it('listTests sample items carry priority field (G1a)', () => {

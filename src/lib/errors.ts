@@ -1,4 +1,5 @@
 import { resolvePortalBase } from './facade.js';
+import { redactDeep } from './redact.js';
 import { classifyBillingRefusal, gateRefusalOf } from './billing-refusal.js';
 
 /**
@@ -261,7 +262,17 @@ export class ApiError extends CLIError {
     this.requestId = envelope.requestId;
     this.nextAction = envelope.nextAction;
     this.serverNextAction = serverNextAction ?? envelope.nextAction;
-    this.details = envelope.details;
+    // Redact at the single point every ApiError is constructed — server
+    // envelopes (fromEnvelope), locally-fabricated ones (authRequired,
+    // localValidationError), and any future direct `new ApiError(...)` — so
+    // `.details` and `.getDetail(...)` are already clean everywhere they are
+    // read: `Output.error`'s JSON envelope, `index.ts`'s hand-built ApiError
+    // envelope, and the AUTH_FORBIDDEN/CLIENT_TOO_OLD/AMBIGUOUS_ORG text-mode
+    // blocks in `index.ts` that print specific detail keys directly (those
+    // never go through `Output.error` at all, so redacting only at the
+    // render call sites would miss them). Server envelopes are already
+    // redacted server-side; this is defence in depth, not the only layer.
+    this.details = redactDeep(envelope.details);
     this.httpStatus = httpStatus;
     this.apiUrl = apiUrl;
     this.retryAfterMs = retryAfterMs;

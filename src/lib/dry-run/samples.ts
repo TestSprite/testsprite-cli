@@ -44,6 +44,7 @@ import type {
   BatchRunFreshResponse,
   ListRunsResponse,
   CancelRunResponse,
+  ExecutionReportResponse,
 } from '../runs.types.js';
 import type {
   CliAcceptPlansResponse,
@@ -51,6 +52,10 @@ import type {
   CliGetPlansResponse,
 } from '../plans.types.js';
 import type { TunnelListResponse, TunnelStatusResponse } from '../tunnel.types.js';
+import type {
+  CliProjectSignInResponse,
+  CliProjectSignInSetResponse,
+} from '../../commands/project-sign-in.js';
 
 const SAMPLE_USER_ID = '11111111-1111-4111-8111-111111111111';
 const SAMPLE_KEY_ID = 'key_dryrun_2026';
@@ -198,7 +203,7 @@ const tests: CliTest[] = [
     createdFrom: 'portal',
     status: 'failed',
     // G1a — priority label shown on one row so dry-run learners see the field.
-    priority: 'p1',
+    priority: 'Medium',
     createdAt: '2026-04-20T11:00:00.000Z',
     updatedAt: '2026-05-05T12:34:56.000Z',
     details: {
@@ -405,6 +410,47 @@ const failureSummary: CliFailureSummary = {
   recommendedFixTarget: failureContext.failure.recommendedFixTarget,
 };
 
+const SAMPLE_EXECUTION_ID = 'exec_dryrun0001';
+
+/** A ready execution report: one failed and one passed row, the App's Markdown shape in miniature. */
+const executionReportSample: ExecutionReportResponse = {
+  ready: true,
+  report: {
+    projectId: SAMPLE_PROJECT_ID,
+    executionId: SAMPLE_EXECUTION_ID,
+    projectName: 'Sample project',
+    orgId: null,
+    stats: { passed: 1, failed: 1, blocked: 0, total: 2 },
+    allPassed: false,
+    narrative: 'Dry-run sample: one regression in checkout, login passed.',
+    whatCouldBeBetter: 'Add coverage for password reset.',
+    recommendedNextStep: 'Fix the checkout selector and rerun.',
+    tests: [
+      {
+        id: SAMPLE_RUN_ID,
+        title: 'Checkout applies a coupon',
+        slug: 'CHK-002',
+        status: 'FAILED',
+        screenshotUrl: null,
+        error: 'AssertionError: expected the order total to drop',
+        fix: 'Apply the coupon before computing the total.',
+      },
+      {
+        id: `${SAMPLE_RUN_ID}-2`,
+        title: 'Login with a valid account',
+        slug: 'AUTH-001',
+        status: 'PASSED',
+        screenshotUrl: null,
+        error: null,
+        fix: null,
+      },
+    ],
+    resultUrl: `https://www.testsprite.com/dashboard-v3/projects/${SAMPLE_PROJECT_ID}/execution/${SAMPLE_EXECUTION_ID}`,
+  },
+  markdown:
+    '> [!WARNING]\n> ### Ran into trouble — 1 failed\n>\n> Dry-run sample: one regression in checkout, login passed.\n',
+};
+
 const passedRunSample: RunResponse = {
   runId: SAMPLE_RUN_ID,
   testId: SAMPLE_TEST_ID_PASSED,
@@ -580,6 +626,61 @@ function buildPathPattern(pathTemplate: string): RegExp {
 const ENTRIES: DryRunSampleEntry[] = [
   entry('whoami', 'GET', '/me', me),
   entry('listProjects', 'GET', '/projects', pageOf(projects)),
+  entry('getProjectSignIn', 'GET', '/projects/{projectId}/sign-in', {
+    projectId: SAMPLE_PROJECT_ID,
+    environment: {
+      id: 'env_dryrun',
+      name: 'default',
+      url: 'https://app.example.com',
+      isDefault: true,
+      authMode: 'public',
+      hasCredentials: false,
+      username: null,
+      enableOtp: false,
+      updatedAt: '2026-09-25T00:00:00.000Z',
+    },
+    signIn: { mode: 'public', account: null, otp: null, manual: null },
+    nextAction: null,
+  } satisfies CliProjectSignInResponse),
+  entry('setProjectSignIn', 'PUT', '/projects/{projectId}/sign-in', (request?: unknown) => {
+    const body = request as { mode?: string } | undefined;
+    const mode = body?.mode ?? 'manual';
+    return {
+      projectId: SAMPLE_PROJECT_ID,
+      environment: {
+        id: 'env_dryrun',
+        name: 'default',
+        url: 'https://app.example.com',
+        isDefault: true,
+        authMode: mode,
+        hasCredentials: mode === 'account',
+        username: mode === 'account' ? 'qa@example.com' : null,
+        enableOtp: mode === 'otp',
+        updatedAt: '2026-09-25T00:00:00.000Z',
+      },
+      signIn: {
+        mode,
+        account: mode === 'account' ? { username: 'qa@example.com', passwordSet: true } : null,
+        otp:
+          mode === 'otp'
+            ? { channels: ['email'], email: 'dryrun@inbox.example', phone: null }
+            : null,
+        manual:
+          mode === 'manual'
+            ? {
+                sessionReuseTtlSeconds: 3600,
+                hasValidSession: false,
+                needsReauth: true,
+                reason: 'never',
+                capturedAt: null,
+                expiresAt: null,
+              }
+            : null,
+      },
+      changed: mode !== 'otp',
+      nextAction: mode === 'manual' ? 'Log in once in the Portal.' : null,
+    } satisfies CliProjectSignInSetResponse;
+  }),
   // Plan-generation surface. All three MUST be registered
   // BEFORE `getProject`: findSample is first-match-wins and the projects/*
   // family shares the `/projects/…` prefix, so the more specific plans
@@ -709,6 +810,14 @@ const ENTRIES: DryRunSampleEntry[] = [
   entry('getTestCode', 'GET', '/tests/{testId}/code', testCode),
   entry('listTestSteps', 'GET', '/tests/{testId}/steps', pageOf(testSteps)),
   entry('getTestResult', 'GET', '/tests/{testId}/result', latestResult),
+  // Execution report — static `executions/` prefix, four segments, so no
+  // `/tests/{testId}/…` pattern can shadow it; kept beside the other reads.
+  entry(
+    'getExecutionReport',
+    'GET',
+    '/tests/executions/{executionId}/report',
+    executionReportSample,
+  ),
   // `/failure/summary` MUST come before `/failure` so the regex matcher
   // doesn't shadow it with the bundle endpoint.
   entry('getTestFailureSummary', 'GET', '/tests/{testId}/failure/summary', failureSummary),

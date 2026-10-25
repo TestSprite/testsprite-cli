@@ -14,9 +14,10 @@
  *   - Opt-out: skipped when `TESTSPRITE_NO_TELEMETRY` or the cross-tool
  *     `DO_NOT_TRACK` is set. Also skipped under `--dry-run` (no network) and
  *     when no leaf command actually ran (bare `--help` / parse errors).
- *   - Never on abort (SIGINT/SIGTERM): Ctrl-C must exit immediately, so the
- *     abort path emits nothing (awaiting would delay shutdown; fire-and-forget
- *     would be cut off before delivery anyway).
+ *   - On abort (SIGINT/SIGTERM) the event is still sent — `outcome: 'abort'`,
+ *     through the same bounded flush `index.ts` runs before setting the exit
+ *     code — and the extras the command recorded before the signal ride along
+ *     (a cancelled CI gate keeps its `gated` outcome and execution id).
  *
  * Privacy: the event is a fixed allowlist of low-cardinality, PII-free fields.
  * It NEVER carries target URLs, api keys, arg values, error messages, or
@@ -99,12 +100,8 @@ export interface TelemetryOutcomeInput extends Partial<WaitTimeoutTelemetry> {
   output?: string;
   dryRun?: boolean;
   /**
-   * True when the invocation requested a local tunnel target (`test run
-   * --local <port>`) — the flag's mere presence, never its port number or
-   * host. Reported regardless of outcome, including a zero-network refusal
-   * (dead port, `--local` combined with an incompatible flag): those are
-   * exactly the attempts nothing server-side ever sees, which is why this
-   * field is not redundant with a backend-side mint/attach analytics event.
+   * True when --local was present, including refusals and borrowed tunnels,
+   * or when this invocation automatically opened a saved-environment tunnel.
    */
   local?: boolean;
 }
@@ -220,9 +217,12 @@ export type TelemetryConflictReason =
 /**
  * Low-cardinality facts a command records about its own outcome before it
  * returns, merged into the one event `index.ts` fires. Counts are non-negative
- * integers; enums are closed. Nothing here can carry an id, a URL, or a message.
+ * integers; enums are closed. Nothing here can carry a URL, a message, or an
+ * id that names a person or a repository — `executionId` is the server's own
+ * opaque UUID for the run, so the event can be joined to the execution's report.
  */
 export interface TelemetryExtras {
+  local?: boolean;
   /** Batch dispatch accounting (`test run --all`, `testlist run`). */
   accepted?: number;
   conflicts?: number;
@@ -243,6 +243,49 @@ export interface TelemetryExtras {
   force?: boolean;
   workflowExisted?: boolean;
   projectResolved?: 'flag' | 'auto';
+  /** `ci run` facts: what the gate did, which execution it was, whether the report arrived. */
+  ciRunOutcome?: CiRunTelemetryOutcome;
+  executionId?: string;
+  reportReady?: boolean;
+}
+
+/**
+ * What a `ci run` invocation ended up doing. `gated` = tests were dispatched
+ * and the exit code is the verdict; `skipped_*` = nothing to gate (exit 0, no
+ * summary); `refused_*` = refused before or at dispatch; `empty` = nothing
+ * selected. The funnel step "`ci init` → first gated run" is computed from it.
+ */
+export type CiRunTelemetryOutcome =
+  | 'gated'
+  | 'skipped_draft'
+  | 'skipped_no_pr'
+  | 'refused_admission'
+  | 'refused_env'
+  | 'refused_preview_name'
+  | 'refused_loopback'
+  | 'refused_billing'
+  | 'refused_other'
+  | 'empty';
+
+/**
+ * The `ci run` outcome for an API refusal — at the environment pre-check or at
+ * the batch dispatch. Every refusal gets a value, so `refused_other` really is
+ * "any other refusal": a validation error is split by the server's
+ * `details.reason`; a 402/403 (credits, a feature gate) is `refused_billing`;
+ * a 401, 429 or anything else is `refused_other`.
+ */
+export function ciRefusalOutcome(err: {
+  code: string;
+  details?: Record<string, unknown>;
+}): CiRunTelemetryOutcome {
+  if (err.code === 'VALIDATION_ERROR') {
+    const reason = err.details?.reason;
+    if (reason === 'preview-name-taken') return 'refused_preview_name';
+    if (reason === 'private-or-local') return 'refused_loopback';
+    return 'refused_other';
+  }
+  if (err.code === 'INSUFFICIENT_CREDITS' || err.code === 'FEATURE_GATED') return 'refused_billing';
+  return 'refused_other';
 }
 
 /** What callers may hand the sanitizer: the typed shape, or an arbitrary bag it filters. */
@@ -260,22 +303,38 @@ const COUNT_KEYS = [
   'localConcurrencyLimit',
   'localPeakInFlight',
 ] as const;
-const BOOLEAN_KEYS = ['force', 'workflowExisted'] as const;
-const ENUM_KEYS: { [K in 'conflictReason' | 'platform' | 'projectResolved']: ReadonlySet<string> } =
-  {
-    conflictReason: new Set<TelemetryConflictReason>([
-      'in_flight',
-      'insufficient_credits',
-      'paused',
-      'billing_hold',
-      'mcp_view_only',
-      'local_address',
-      'tunnel-required',
-      'error',
-    ]),
-    platform: new Set(['github']),
-    projectResolved: new Set(['flag', 'auto']),
-  };
+const BOOLEAN_KEYS = ['force', 'workflowExisted', 'local', 'reportReady'] as const;
+/** Opaque server ids the beacon accepts — a UUID, nothing free-form. */
+const UUID_KEYS = ['executionId'] as const;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const ENUM_KEYS: {
+  [K in 'conflictReason' | 'platform' | 'projectResolved' | 'ciRunOutcome']: ReadonlySet<string>;
+} = {
+  conflictReason: new Set<TelemetryConflictReason>([
+    'in_flight',
+    'insufficient_credits',
+    'paused',
+    'billing_hold',
+    'mcp_view_only',
+    'local_address',
+    'tunnel-required',
+    'error',
+  ]),
+  platform: new Set(['github']),
+  projectResolved: new Set(['flag', 'auto']),
+  ciRunOutcome: new Set<CiRunTelemetryOutcome>([
+    'gated',
+    'skipped_draft',
+    'skipped_no_pr',
+    'refused_admission',
+    'refused_env',
+    'refused_preview_name',
+    'refused_loopback',
+    'refused_billing',
+    'refused_other',
+    'empty',
+  ]),
+};
 
 /**
  * Keep only the allowlisted keys with a value of the right shape. Pure: this is
@@ -292,6 +351,10 @@ export function sanitizeTelemetryExtras(partial: TelemetryExtrasInput): Telemetr
   for (const key of BOOLEAN_KEYS) {
     const v = rec[key];
     if (typeof v === 'boolean') out[key] = v;
+  }
+  for (const key of UUID_KEYS) {
+    const v = rec[key];
+    if (typeof v === 'string' && UUID_RE.test(v)) out[key] = v;
   }
   for (const key of Object.keys(ENUM_KEYS) as Array<keyof typeof ENUM_KEYS>) {
     const v = rec[key];
@@ -314,6 +377,11 @@ let pendingExtras: TelemetryExtras = {};
  */
 export function recordTelemetryExtras(partial: TelemetryExtrasInput): void {
   pendingExtras = { ...pendingExtras, ...sanitizeTelemetryExtras(partial) };
+}
+
+/** Extend explicit --local telemetry to commands that automatically open a tunnel. */
+export function recordTelemetryTunnelOpened(opened: boolean): void {
+  if (opened) recordTelemetryExtras({ local: true });
 }
 
 /** Return everything recorded so far and clear the sink (one event per process). */
@@ -383,7 +451,7 @@ export interface TelemetryEvent extends Partial<WaitTimeoutTelemetry>, Telemetry
   nodeVersion?: string;
   output?: string;
   ci?: boolean;
-  /** Present (always `true`) only for a `test run --local` invocation; absent otherwise. */
+  /** Present (always `true`) for --local attempts or automatically opened tunnels. */
   local?: boolean;
   /** The validated `TESTSPRITE_CLIENT` tag (e.g. `github-action/v1`); absent when unset/invalid. */
   client?: string;
@@ -519,6 +587,8 @@ export function buildTelemetryEvent(
   extras: TelemetryExtrasInput = {},
 ): TelemetryEvent {
   const client = resolveClientTag(env);
+  const { local: runtimeLocal, ...sanitizedExtras } = sanitizeTelemetryExtras(extras);
+  const local = input.local === true || runtimeLocal === true;
   return {
     command: input.command,
     outcome: input.outcome,
@@ -534,11 +604,11 @@ export function buildTelemetryEvent(
     ci: isTruthyEnv(env.CI) || !isTTY,
     ...(client !== undefined ? { client } : {}),
     ...buildCiContext(env),
-    ...(input.local ? { local: true } : {}),
+    ...(local ? { local: true } : {}),
     ...(input.outcome === 'error' && input.reason === 'wait_timeout'
       ? {
           reason: 'wait_timeout',
-          ...(input.local &&
+          ...(local &&
           (input.cancelOutcome === 'cancelled' ||
             input.cancelOutcome === 'already_terminal' ||
             input.cancelOutcome === 'failed' ||
@@ -547,7 +617,7 @@ export function buildTelemetryEvent(
             : {}),
         }
       : {}),
-    ...sanitizeTelemetryExtras(extras),
+    ...sanitizedExtras,
   };
 }
 

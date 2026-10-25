@@ -10,9 +10,11 @@ import {
   escapeXml,
   parseJUnitReportFormat,
   resolveBatchReportProjectId,
+  skippedJUnitResultsFromSummary,
   writeJUnitReportFile,
   type JUnitTestResult,
 } from './junit-report.js';
+import type { CiSummary } from './gh-output.js';
 
 describe('durationSecondsBetween', () => {
   it('computes seconds between two ISO timestamps', () => {
@@ -20,6 +22,22 @@ describe('durationSecondsBetween', () => {
       12.5,
     );
   });
+  it('uses createdAt when startedAt is null', () => {
+    expect(
+      durationSecondsBetween(null, '2026-08-17T10:00:12.500Z', '2026-08-17T10:00:00.000Z'),
+    ).toBe(12.5);
+  });
+
+  it('prefers startedAt over createdAt', () => {
+    expect(
+      durationSecondsBetween(
+        '2026-08-17T10:00:05.000Z',
+        '2026-08-17T10:00:12.500Z',
+        '2026-08-17T10:00:00.000Z',
+      ),
+    ).toBe(7.5);
+  });
+
   it('returns undefined when a timestamp is missing / unparseable / negative', () => {
     expect(durationSecondsBetween(null, '2026-08-17T10:00:00.000Z')).toBeUndefined();
     expect(durationSecondsBetween('2026-08-17T10:00:00.000Z', undefined)).toBeUndefined();
@@ -394,5 +412,35 @@ describe('writeJUnitReportFile', () => {
       exitCode: 5,
     });
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('skippedJUnitResultsFromSummary', () => {
+  const summary: CiSummary = {
+    total: 3,
+    passed: 1,
+    failed: 0,
+    skipped: 2,
+    timedOut: 0,
+    runs: [
+      { testId: 'ran', status: 'passed' },
+      { testId: 'deferred', status: 'deferred', error: 'deferred: run in flight' },
+      // A dispatched run the server later reports under a non-dispatched
+      // word. It is already in the polled results, so it must not appear twice.
+      { testId: 'ran', status: 'skipped' },
+    ],
+  };
+
+  it('turns non-dispatched rows into skipped results with their reason', () => {
+    expect(skippedJUnitResultsFromSummary(summary)).toEqual([
+      { testId: 'deferred', status: 'skipped', skipReason: 'deferred: run in flight' },
+      { testId: 'ran', status: 'skipped', skipReason: 'skipped' },
+    ]);
+  });
+
+  it('leaves out members that are already in the polled results', () => {
+    expect(skippedJUnitResultsFromSummary(summary, [{ testId: 'ran' }])).toEqual([
+      { testId: 'deferred', status: 'skipped', skipReason: 'deferred: run in flight' },
+    ]);
   });
 });

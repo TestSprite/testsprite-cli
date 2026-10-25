@@ -226,6 +226,30 @@ describe('ApiError.fromEnvelope', () => {
     });
     expect(err.code).toBe('NOT_FOUND');
   });
+
+  it('redacts nested secrets from server-supplied details at construction', () => {
+    const err = ApiError.fromEnvelope({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Invalid request.',
+        nextAction: 'Fix it.',
+        requestId: 'req_1',
+        details: {
+          // `field` names WHICH flag failed — must survive even though its
+          // value happens to be the literal word "password".
+          field: 'password',
+          nested: { password: 'hunter2', apiKey: 'sk-should-not-leak' },
+          list: [{ token: 'tok_abc' }, { authorization: 'Bearer xyz' }],
+        },
+      },
+    });
+    expect(err.details).toEqual({
+      field: 'password',
+      nested: { password: '[REDACTED]', apiKey: '[REDACTED]' },
+      list: [{ token: '[REDACTED]' }, { authorization: '[REDACTED]' }],
+    });
+    expect(err.getDetail('nested')).toEqual({ password: '[REDACTED]', apiKey: '[REDACTED]' });
+  });
 });
 
 describe('ApiError.authRequired', () => {

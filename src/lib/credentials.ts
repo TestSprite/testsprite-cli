@@ -101,7 +101,6 @@ interface CredentialsLock {
 
 interface RestrictiveModeOptions {
   platform?: NodeJS.Platform;
-  env?: NodeJS.ProcessEnv;
   spawnSync?: (
     command: string,
     args: readonly string[],
@@ -128,6 +127,8 @@ const CREDENTIALS_LOCK_WAIT_MS = 5_000;
 // problem and is surfaced as such.
 const CREDENTIALS_LOCK_TRANSIENT_WAIT_MS = 1_000;
 const CREDENTIALS_LOCK_STALE_MS = 30_000;
+// How long a transient Windows error on replacing the credentials file is retried.
+const CREDENTIALS_RENAME_TRANSIENT_WAIT_MS = 2_000;
 
 export function parseCredentials(content: string): CredentialsFile {
   const result: CredentialsFile = {};
@@ -246,36 +247,59 @@ export function ensureRestrictiveMode(path: string, options: RestrictiveModeOpti
 }
 
 /**
- * Restrict a Windows credentials file to the current user using icacls.
+ * Restrict a Windows credentials file to the file owner using icacls.
  * The command is invoked with an args array so credential paths are never shell-interpreted.
+ *
+ * Uses /reset to clear any broken inheritance state, followed by
+ * /inheritance:r /grant:r *S-1-3-4:F which decouples the file from parent ACLs
+ * and grants Full Control to the OWNER RIGHTS SID (S-1-3-4). This avoids
+ * dependency on resolving %USERNAME% (which fails on Microsoft Account or
+ * domain-joined machines).
  */
 function ensureWindowsRestrictiveAcl(path: string, options: RestrictiveModeOptions): void {
-  const username = (options.env ?? process.env).USERNAME?.trim();
-  if (!username) {
-    warnWindowsAcl(
-      'could not determine the Windows username; credentials file permissions were not tightened',
-      options,
-    );
-    return;
-  }
-
   const run = options.spawnSync ?? spawnSync;
-  const result = run('icacls', [path, '/inheritance:r', '/grant:r', `${username}:F`], {
-    shell: false,
-    stdio: 'ignore',
-    windowsHide: true,
-  });
+  const icaclsOptions = {
+    shell: false as const,
+    stdio: 'ignore' as const,
+    windowsHide: true as const,
+  };
 
-  if (result.error) {
+  const resetResult = run('icacls', [path, '/reset'], icaclsOptions);
+  if (resetResult.error) {
     warnWindowsAcl(
-      `icacls failed while tightening credentials file permissions: ${result.error.message}`,
+      `icacls failed while resetting credentials file permissions: ${resetResult.error.message}`,
       options,
     );
     return;
   }
-  if (result.status !== 0) {
+  if (resetResult.status !== 0) {
     warnWindowsAcl(
-      `icacls exited with status ${result.status ?? 'unknown'}; credentials file permissions may be too broad`,
+      `icacls /reset exited with status ${resetResult.status ?? 'unknown'}; credentials file permissions may be too broad`,
+      options,
+    );
+    return;
+  }
+
+  // The trailing :F is load-bearing, not incidental: after /inheritance:r the
+  // file carries exactly this one ACE, and Full Control is what leaves
+  // WRITE_DAC with the owner — which is what makes a later `icacls /reset`
+  // possible at all. Tightening this to :R would leave the file unrepairable
+  // without taking ownership.
+  const grantResult = run(
+    'icacls',
+    [path, '/inheritance:r', '/grant:r', '*S-1-3-4:F'],
+    icaclsOptions,
+  );
+  if (grantResult.error) {
+    warnWindowsAcl(
+      `icacls failed while tightening credentials file permissions: ${grantResult.error.message}`,
+      options,
+    );
+    return;
+  }
+  if (grantResult.status !== 0) {
+    warnWindowsAcl(
+      `icacls exited with status ${grantResult.status ?? 'unknown'}; credentials file permissions may be too broad`,
       options,
     );
   }
@@ -318,8 +342,7 @@ function writeCredentialsAtomic(path: string, file: CredentialsFile): void {
   try {
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmp` is `${path}.tmp.${pid}`, derived from the same internal credentials-file path; same baselined risk profile as the other fs calls in this file.
     writeFileSync(tmp, serializeCredentials(file), { mode: 0o600, encoding: 'utf8' });
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- both operands derive from the internal credentials-file path (see above).
-    renameSync(tmp, path);
+    renameCredentialsFile(tmp, path);
   } catch (error) {
     try {
       // eslint-disable-next-line security/detect-non-literal-fs-filename -- best-effort cleanup of the temp file this function just created; same internal path.
@@ -336,6 +359,25 @@ function writeCredentialsAtomic(path: string, file: CredentialsFile): void {
     rethrowCredentialsWriteError(error);
   }
   ensureRestrictiveMode(path);
+}
+
+/**
+ * Replace the credentials file with the temp file. On Windows a transient
+ * EPERM/EBUSY/EACCES (another program briefly holding the file) is retried for a
+ * short window; anything else, or an error that persists, is thrown.
+ */
+function renameCredentialsFile(tmp: string, path: string): void {
+  const deadline = Date.now() + CREDENTIALS_RENAME_TRANSIENT_WAIT_MS;
+  while (true) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- both operands derive from the internal credentials-file path (see writeCredentialsAtomic).
+      renameSync(tmp, path);
+      return;
+    } catch (error) {
+      if (!isWindowsLockContention(error) || Date.now() >= deadline) throw error;
+      sleepSync(CREDENTIALS_LOCK_RETRY_MS);
+    }
+  }
 }
 
 function acquireCredentialsLock(path: string): CredentialsLock {

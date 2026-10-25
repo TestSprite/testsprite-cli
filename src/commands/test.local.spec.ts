@@ -312,6 +312,11 @@ describe('test run --local — before anything is minted or charged', () => {
     // The whole point: no run row, no credit spend, no tunnel credential.
     expect(calls).toEqual([
       { method: 'GET', url: 'http://localhost:13502/api/cli/v1/tests/test_xyz', body: undefined },
+      {
+        method: 'GET',
+        url: 'http://localhost:13502/api/cli/v1/projects/project_1/env',
+        body: undefined,
+      },
     ]);
   });
 
@@ -1099,10 +1104,14 @@ describe('test run --local — teardown', () => {
 
 describe('test run --local — detaching from a tunnel run tells the truth', () => {
   const optOutConsequence =
-    'Passing --no-cancel-on-interrupt keeps the run executing without its tunnel; it cannot ' +
-    'reach your app and is still billed.';
+    'Passing --no-cancel-on-interrupt keeps the run going in the cloud, and it is still billed. ' +
+    'The tunnel is closed, so steps that still need your machine will fail; the run can still ' +
+    'pass if it no longer needs to load anything from your machine.';
 
-  async function interruptRun(overrides: Partial<Parameters<typeof runTestRun>[0]> = {}) {
+  async function interruptRun(
+    overrides: Partial<Parameters<typeof runTestRun>[0]> = {},
+    signal: 'SIGINT' | 'SIGTERM' = 'SIGINT',
+  ) {
     const port = 5173;
     const calls: Call[] = [];
     const lines: string[] = [];
@@ -1129,7 +1138,7 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
             calls,
             targetUrl: target,
             run: () => {
-              shutdown.interrupt('SIGINT');
+              shutdown.interrupt(signal);
               return { ...passedRun(target), status: 'running' };
             },
           }),
@@ -1168,7 +1177,7 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
         'closes with ' +
         'this process, so it was cancelled (exit 130). The run may already have been billed; a ' +
         "cancelled run's verdict is discarded. Start a new run with: testsprite test run " +
-        `test_xyz --local 5173. ${optOutConsequence}`,
+        `test_xyz --local 5173 --local-host 127.0.0.1. ${optOutConsequence}`,
     );
     expect(text).not.toMatch(/guaranteed failure|no further credits are spent/i);
     const tunnelDetach = (
@@ -1181,7 +1190,7 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
     expect(tunnelDetach?.nextAction).toBe(
       'Run run_abc was cancelled after SIGINT (exit 130) and its tunnel was closed. The run ' +
         "may already have been billed; a cancelled run's verdict is discarded. Start a new " +
-        `run with: testsprite test run test_xyz --local 5173. ${optOutConsequence}`,
+        `run with: testsprite test run test_xyz --local 5173 --local-host 127.0.0.1. ${optOutConsequence}`,
     );
   });
 
@@ -1242,12 +1251,23 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
     });
   });
 
-  it('honours --no-cancel-on-interrupt', async () => {
-    const { calls, lines } = await interruptRun({ cancelOnInterrupt: false });
-    expect(calls.some(c => c.method === 'POST' && c.url.includes('/cancel'))).toBe(false);
-    // Still honest: it must not silently look like a normal detach.
-    expect(lines.join('\n')).toMatch(/tunnel/i);
-  });
+  it.each([
+    ['SIGINT', 130],
+    ['SIGTERM', 143],
+  ] as const)(
+    'honours --no-cancel-on-interrupt after %s with exit %s',
+    async (signal, exitCode) => {
+      const { calls, lines, thrown } = await interruptRun({ cancelOnInterrupt: false }, signal);
+      expect(thrown).toMatchObject({ signal, exitCode });
+      expect(calls.some(c => c.method === 'DELETE' && c.url.includes('/tunnel/'))).toBe(true);
+      expect(lines.join('\n')).toContain(optOutConsequence);
+      expect(lines.join('\n')).toContain('testsprite test result test_xyz');
+      expect(lines.join('\n')).toContain('testsprite test wait run_abc');
+      expect(calls.some(c => c.method === 'POST' && c.url.includes('/cancel'))).toBe(false);
+      // Still honest: it must not silently look like a normal detach.
+      expect(lines.join('\n')).toMatch(/tunnel/i);
+    },
+  );
 
   it('treats an adopted tunnel interrupt as an ordinary detach', async () => {
     const port = 5173;
@@ -1322,6 +1342,15 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
           fetchImpl: makeRecordingFetch({
             calls,
             targetUrl: 'https://example.com',
+            respond: call =>
+              call.url.endsWith('/projects/project_1/env')
+                ? new Response(
+                    JSON.stringify({
+                      environments: [{ name: 'demo', url: 'https://example.com', isDefault: true }],
+                    }),
+                    { status: 200, headers: { 'content-type': 'application/json' } },
+                  )
+                : undefined,
             run: () => {
               shutdown.interrupt('SIGINT');
               return { ...passedRun('https://example.com'), status: 'running' };
@@ -2269,6 +2298,15 @@ describe('test run timeout defaults', () => {
       fetchImpl: makeRecordingFetch({
         calls: [],
         targetUrl,
+        respond: call =>
+          !local && call.url.endsWith('/projects/project_1/env')
+            ? new Response(
+                JSON.stringify({
+                  environments: [{ name: 'demo', url: targetUrl, isDefault: true }],
+                }),
+                { status: 200, headers: { 'content-type': 'application/json' } },
+              )
+            : undefined,
         run: () => ({ ...passedRun(targetUrl), status: 'running', retryAfterSeconds: 25 }),
       }),
       stdout: line => stdout.push(line),
@@ -2314,17 +2352,16 @@ describe('test run timeout defaults', () => {
 
   it.each(
     [
-      { localHost: undefined, targetUrl: 'http://127.0.0.1:5173', hostFlag: '' },
-      { localHost: '::1' as const, targetUrl: 'http://[::1]:5173', hostFlag: ' --local-host ::1' },
+      { localHost: undefined, targetUrl: 'http://127.0.0.1:5173' },
+      { localHost: '::1' as const, targetUrl: 'http://[::1]:5173' },
       {
         localHost: 'localhost' as const,
         targetUrl: 'http://localhost:5173',
-        hostFlag: ' --local-host localhost',
       },
     ].flatMap(host => (['text', 'json'] as const).map(output => ({ ...host, output }))),
   )(
-    'preserves $localHost in owned timeout recovery commands ($output)',
-    async ({ localHost, targetUrl, hostFlag, output }) => {
+    'preserves an explicit $localHost target in owned timeout recovery ($output)',
+    async ({ localHost, targetUrl, output }) => {
       vi.useFakeTimers();
       const stdout: string[] = [];
       const stderr: string[] = [];
@@ -2356,7 +2393,7 @@ describe('test run timeout defaults', () => {
       ).catch((err: unknown) => err);
       await vi.advanceTimersByTimeAsync(1000);
       const err = await pending;
-      const retry = `testsprite test run test_xyz --local 5173${hostFlag} --timeout 1800`;
+      const retry = `testsprite test run test_xyz --local 5173${localHost === 'localhost' ? '' : ` --local-host ${localHost ?? '127.0.0.1'}`} --timeout 1800`;
       expect(err).toMatchObject({ exitCode: 7, nextAction: expect.stringContaining(retry) });
       expect(stderr.join('\n')).toContain(retry);
       if (output === 'text') expect(stdout.join('\n')).toContain(targetUrl);
@@ -2371,7 +2408,7 @@ describe('test run timeout defaults', () => {
   it('explains the local default in run help', () => {
     const run = createTestCommand().commands.find(command => command.name() === 'run')!;
     expect(run.helpInformation().replace(/\s+/g, ' ')).toContain(
-      'default 600, or 1200 with --local',
+      'default 600, or 1200 through a tunnel',
     );
   });
 });
@@ -2685,28 +2722,35 @@ describe('test run --local --env', () => {
     expect(calls.filter(call => call.url.endsWith('/tunnel'))).toEqual([]);
   });
 
-  it('public --env plus --local rejects before mint', async () => {
+  it('sends public --env plus --local and cleans up after an old server refuses it', async () => {
     const portProbe = vi.spyOn(net, 'connect');
     const calls: Call[] = [];
+    const tunnel = fakeTunnel();
+    const serverMessage = 'This environment has a public URL and cannot use a tunnel.';
     const fetchImpl = makeRecordingFetch({
       calls,
-      targetUrl: 'http://127.0.0.1:5173',
-      respond: call =>
-        call.url.endsWith('/projects/project_1/env')
-          ? new Response(
-              JSON.stringify({
-                environments: [
-                  {
-                    id: 'env_public',
-                    name: 'demo',
-                    url: 'https://demo.example.com',
-                    isDefault: false,
-                  },
-                ],
-              }),
-              { status: 200, headers: { 'content-type': 'application/json' } },
-            )
-          : undefined,
+      targetUrl: 'http://localhost:5173',
+      respond: call => {
+        if (call.url.endsWith('/projects/project_1/env'))
+          return new Response(
+            JSON.stringify({
+              environments: [
+                {
+                  id: 'env_public',
+                  name: 'demo',
+                  url: 'https://demo.example.com',
+                  isDefault: false,
+                },
+              ],
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        if (call.method === 'POST' && call.url.endsWith('/runs'))
+          return apiErrorResponse(400, 'VALIDATION_ERROR', serverMessage, {
+            reason: 'tunnel-public-environment',
+          });
+        return undefined;
+      },
     });
     const err = await runTestRun(
       {
@@ -2718,21 +2762,37 @@ describe('test run --local --env', () => {
         wait: true,
         timeoutSeconds: 30,
         environment: 'demo',
+        skipPreflight: true,
       },
       {
         ...makeCreds(),
         fetchImpl,
         stdout: () => {},
         stderr: () => {},
-        createTunnelClient: fakeTunnel().factory,
+        createTunnelClient: tunnel.factory,
       },
     ).catch(e => e);
-    expect(err).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-    expect(err.nextAction).toContain('testsprite test run test_xyz --env demo');
-    expect(err.nextAction).toContain('testsprite test run test_xyz --local 5173');
+    expect(err).toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      message: serverMessage,
+      nextAction: 'retry',
+      details: { reason: 'tunnel-public-environment' },
+    });
     expect(
-      calls.filter(call => call.url.endsWith('/tunnel') || call.url.includes('/runs')),
-    ).toEqual([]);
+      calls.filter(call => call.method === 'POST' && call.url.endsWith('/tunnel')),
+    ).toHaveLength(1);
+    const triggers = calls.filter(call => call.method === 'POST' && call.url.endsWith('/runs'));
+    expect(triggers).toHaveLength(1);
+    expect(triggers[0]?.body).toMatchObject({
+      environment: 'demo',
+      targetUrl: 'http://localhost:5173',
+      tunnelClientId: MINT_BODY.clientId,
+    });
+    expect(
+      calls.filter(call => call.method === 'DELETE' && call.url.includes('/tunnel/')),
+    ).toHaveLength(1);
+    expect(tunnel.calls).toEqual({ start: 1, stop: 1 });
     expect(portProbe).not.toHaveBeenCalled();
     portProbe.mockRestore();
   });

@@ -82,6 +82,16 @@ describe('createScheduleCommand', () => {
     expect(flagNames).toContain('--no-header');
   });
 
+  it('create and update expose --env with project schedule guidance', () => {
+    const schedule = createScheduleCommand();
+    for (const name of ['create', 'update']) {
+      const command = schedule.commands.find(c => c.name() === name)!;
+      const env = command.options.find(o => o.long === '--env');
+      expect(env?.description).toContain('Pin this project schedule to an environment');
+      expect(env?.description).toContain("project's default environment");
+    }
+  });
+
   it('list exposes no pagination flags — the endpoint returns every schedule', () => {
     const schedule = createScheduleCommand();
     const list = schedule.commands.find(c => c.name() === 'list')!;
@@ -93,6 +103,73 @@ describe('createScheduleCommand', () => {
 });
 
 describe('runList', () => {
+  it('list shows pinned and inherited environments', async () => {
+    const { credentialsPath } = makeCreds();
+    const rows = [
+      { ...SCHEDULE_FIXTURE, environment: 'staging', environmentMode: 'pinned' },
+      {
+        ...SCHEDULE_FIXTURE,
+        scheduleId: 'sch_inherit',
+        environment: null,
+        environmentMode: 'inherit',
+      },
+      {
+        ...SCHEDULE_FIXTURE,
+        scheduleId: 'sch_list',
+        targetType: 'testList',
+        environment: null,
+        environmentMode: null,
+      },
+      { ...SCHEDULE_FIXTURE, scheduleId: 'sch_legacy' },
+    ];
+    const fetchImpl = makeFetch(() => ({ body: { schedules: rows } }));
+    const output: string[] = [];
+    await runList(
+      { ...BASE, output: 'text' },
+      { credentialsPath, fetchImpl, stdout: line => output.push(line) },
+    );
+    const text = output.join('\n');
+    expect(text.split('\n')[0]!.split(/\s{2,}/)).toEqual([
+      'ID',
+      'NAME',
+      'STATUS',
+      'TARGET',
+      'CRON',
+      'TZ',
+      'LAST RUN',
+      'ENVIRONMENT',
+    ]);
+    expect(text).toContain('ENVIRONMENT');
+    expect(text.split('\n').find(row => row.includes('sch_b3c91efa'))).toContain(
+      'staging (pinned)',
+    );
+    expect(text.split('\n').find(row => row.includes('sch_inherit'))).toContain(
+      'project default (inherits)',
+    );
+    expect(text.split('\n').find(row => row.includes('sch_list'))).toMatch(/\s-$/);
+    expect(text.split('\n').find(row => row.includes('sch_legacy'))).toMatch(/\s-$/);
+  });
+
+  it('json passes environment fields through', async () => {
+    const { credentialsPath } = makeCreds();
+    const schedules = [
+      { ...SCHEDULE_FIXTURE, environment: 'staging', environmentMode: 'pinned' },
+      { ...SCHEDULE_FIXTURE, scheduleId: 'sch_legacy' },
+    ];
+    const fetchImpl = makeFetch(() => ({ body: { schedules } }));
+    const output: string[] = [];
+    await runList(
+      { ...BASE, output: 'json' },
+      { credentialsPath, fetchImpl, stdout: line => output.push(line) },
+    );
+    const json = JSON.parse(output.join('\n'));
+    expect(json.schedules[0]).toMatchObject({
+      environment: 'staging',
+      environmentMode: 'pinned',
+    });
+    expect(json.schedules[1]).not.toHaveProperty('environment');
+    expect(json.schedules[1]).not.toHaveProperty('environmentMode');
+  });
   it('requests /schedules and returns the schedules array', async () => {
     const { credentialsPath } = makeCreds();
     const urls: string[] = [];
@@ -199,6 +276,39 @@ describe('runList', () => {
 });
 
 describe('runGet', () => {
+  it('shows the environment mode on a project schedule', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { ...SCHEDULE_FIXTURE, environment: 'staging', environmentMode: 'pinned' },
+    }));
+    const output: string[] = [];
+    await runGet(
+      { ...BASE, output: 'text', scheduleId: SCHEDULE_FIXTURE.scheduleId },
+      { credentialsPath, fetchImpl, stdout: line => output.push(line) },
+    );
+    expect(output.join('\n')).toContain('environment: staging (pinned)');
+    expect(
+      output
+        .join('\n')
+        .split('\n')
+        .map(line => line.split(':')[0]),
+    ).toEqual([
+      'id',
+      'name',
+      'status',
+      'targetType',
+      'targetId',
+      'cron',
+      'timezone',
+      'startAt',
+      'endAt',
+      'sendTo',
+      'lastRunId',
+      'createdAt',
+      'updatedAt',
+      'environment',
+    ]);
+  });
   it('requests the schedule by id and renders its fields', async () => {
     const { credentialsPath } = makeCreds();
     const urls: string[] = [];
@@ -218,6 +328,7 @@ describe('runGet', () => {
     expect(text).toContain('id:         sch_b3c91efa');
     expect(text).toContain('status:     ENABLED');
     expect(text).toContain('cron:       0 3 * * *');
+    expect(text).not.toContain('environment:');
   });
 
   it('url-encodes the schedule id', async () => {

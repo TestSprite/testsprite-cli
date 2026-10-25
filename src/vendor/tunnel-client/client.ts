@@ -1,5 +1,3 @@
-// VENDOR DELTA: terminal 1008 auth closes distinguish revocation and
-// post-Ack takeover from initial authentication failure. See ./VENDOR.md #16.
 import { EventEmitter, once } from "node:events";
 import dns from "node:dns";
 import { readFileSync } from "node:fs";
@@ -8,33 +6,32 @@ import { performance } from "node:perf_hooks";
 import { Duplex } from "node:stream";
 import tls from "node:tls";
 import { domainToASCII } from "node:url";
-// VENDOR DELTA: `ws` -> undici-backed facade. See ./ws-compat.ts.
 import WebSocket from "./ws-compat.js";
-// VENDOR DELTA: `lodash` -> three local predicates. See ./lodash-lite.ts.
 import { isNumber, isPlainObject, isString } from "./lodash-lite.js";
 
 import { encodeFrame, readTypedFrame } from "./protocol.js";
-// VENDOR DELTA: no CLIENT_VERSION (no package.json import) and no endpoint
-// defaults — `controlUrl`/`tunnelAddr` are required and come from the mint
-// response. See ./config.ts.
 import {
   DEFAULT_ALLOW_PRIVATE_NETWORK_TARGET,
   DEFAULT_AUTH_TIMEOUT_MS,
+  DEFAULT_CLIENT_UNKNOWN_RETRY_DEADLINE_MS,
   DEFAULT_CONNECT_TIMEOUT_MS,
-  DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
   DEFAULT_DATA_PLANE_RETRY_DEADLINE_MS,
   DEFAULT_DATA_PLANE_SETTLE_MS,
   DEFAULT_HEARTBEAT_MS,
   DEFAULT_LOG_LEVEL,
   DEFAULT_RECONNECT_MS,
   DEFAULT_TARGET_CONNECT_TIMEOUT_MS,
+  DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
 } from "./config.js";
 import {
-    ClientToServerControlMessage, ErrCode, LogLevel,
-    ServerToClientControlMessage,
-    StreamOpenRequestFrame,
-    TunnelClientOptions,
-    TunnelHelloFrame,
+  ClientToServerControlMessage,
+  ErrCode,
+  LogLevel,
+  ServerToClientControlMessage,
+  StreamOpenRequestFrame,
+  TunnelClientOptions,
+  TunnelHelloFrame,
+  TunnelTransport,
 } from "./types.js";
 
 import {
@@ -43,11 +40,6 @@ import {
   YamuxSession,
 } from "@llmcode/yamux-ts";
 
-// VENDOR DELTA: `Record<string, number>` -> `Record<LogLevel, number>`, and
-// the two `keyof typeof LEVEL_ORDER` parameters below become `LogLevel`. This
-// CLI compiles with `noUncheckedIndexedAccess`, under which indexing a string
-// index signature yields `number | undefined`; a mapped type over the four
-// known levels does not. Type-only — no behaviour change. Worth upstreaming.
 const LEVEL_ORDER: Record<LogLevel, number> = {
   debug: 10,
   info: 20,
@@ -57,56 +49,52 @@ const LEVEL_ORDER: Record<LogLevel, number> = {
 
 const STREAM_CLOSE_TIMEOUT_MS = 1_500;
 const CONTROL_AUTHENTICATION_FAILED = Symbol("control-authentication-failed");
+const CONTROL_CLIENT_UNKNOWN = Symbol("control-client-unknown");
+const CONTROL_CLIENT_UNKNOWN_EXPIRED = Symbol("control-client-unknown-expired");
 
 interface TunnelAddress {
   host: string;
   port: number;
 }
 
-type ResolvedTunnelClientOptions = Required<
-  Omit<
-    TunnelClientOptions,
-    | "clientId"
-    | "secret"
-    | "tunnelTlsAddr"
-    | "tunnelTlsServername"
-    | "tunnelTlsCa"
-  >
-> &
-  Pick<TunnelClientOptions, "clientId" | "secret"> & {
-    tunnelTlsAddr?: string;
-    tunnelTlsServername?: string;
-    tunnelTlsCa: Array<string | Buffer>;
-  };
+interface NormalizedTunnelClientOptions {
+  clientId: string;
+  secret: string;
+  controlUrl: string;
+  tunnelTlsServername?: string;
+  tunnelTlsCa: Array<string | Buffer>;
+  tlsHandshakeTimeoutMs: number;
+  connectTimeoutMs: number;
+  dataPlaneRetryDeadlineMs: number;
+  clientUnknownRetryDeadlineMs: number;
+  onClientUnknown?: TunnelClientOptions["onClientUnknown"];
+  dataPlaneSettleMs: number;
+  authTimeoutMs: number;
+  heartbeatMs: number;
+  reconnectMs: number;
+  logLevel: "debug" | "info" | "warn" | "error";
+  allowPrivateNetworkTarget: boolean;
+  onError: NonNullable<TunnelClientOptions["onError"]>;
+  logSink: NonNullable<TunnelClientOptions["logSink"]>;
+}
 
 export class TunnelClient extends EventEmitter {
-  private readonly options: ResolvedTunnelClientOptions;
-  readonly #transportMode: "tls" | "plaintext";
+  readonly #transportMode: TunnelTransport;
+  private readonly options: NormalizedTunnelClientOptions;
   private readonly tunnelAddress: TunnelAddress;
 
   private running = false;
   private controlConnected = false;
   private controlWs?: WebSocket;
   private controlLoopTask?: Promise<void>;
-  // VENDOR DELTA: monotonically scopes authentication readiness to one
-  // control socket. A reconnect gets a new generation, so an Ack emitted by
-  // an older socket cannot satisfy a later start() wait. See VENDOR.md #14.
   private controlConnectionGeneration = 0;
   private allowTunnelReconnect = true;
   private dataPlaneTerminalErrorReported = false;
+  private clientUnknownEpisodeStartedAt?: number;
+  private clientUnknownDeadline?: NodeJS.Timeout;
   private readonly tunnelRuntimes = new Map<string, TunnelRuntime>();
-  // VENDOR DELTA: reconnect backoffs are tied to this lifecycle controller so stop() cancels
-  // both control and tunnel sleeps instead of awaiting a still-ref'd timer. See VENDOR.md #9.
-  private reconnectDelayController = new AbortController();
-  // VENDOR DELTA: every socket this client dials on behalf of an inbound proxy
-  // stream (connectOnce). Tearing down a tunnel data session (runtime.socket)
-  // does NOT reach these independent per-stream sockets, and a browser
-  // keep-alive target that holds the connection open and sends nothing parks
-  // proxyStreams()'s copyOneWay(target, …) forever, so its finally-cleanup never
-  // runs. On teardown such ESTABLISHED sockets stay ref'd and keep the event loop
-  // alive for the remote's idle timeout (minutes) — the visible symptom is a
-  // --local run whose Ctrl-C / --timeout appears to hang. stop()/CloseTunnel
-  // destroy these directly. See VENDOR.md #13.
+  private lifecycleController = new AbortController();
+  private targetDialController = new AbortController();
   private readonly activeTargetSockets = new Set<Socket>();
 
   constructor(options: TunnelClientOptions) {
@@ -116,84 +104,81 @@ export class TunnelClient extends EventEmitter {
       throw new Error("clientId and secret are required");
     }
 
-    const configuredPlaintextAddress = parseTunnelAddr(options.tunnelAddr);
-    const deadlineMs =
-      options.dataPlaneRetryDeadlineMs ?? DEFAULT_DATA_PLANE_RETRY_DEADLINE_MS;
-    if (!Number.isInteger(deadlineMs) || deadlineMs < 0) {
-      throw new RangeError("dataPlaneRetryDeadlineMs must be a non-negative integer");
-    }
-    const settleMs = options.dataPlaneSettleMs ?? DEFAULT_DATA_PLANE_SETTLE_MS;
-    if (!Number.isInteger(settleMs) || settleMs < 0) {
-      throw new RangeError("dataPlaneSettleMs must be a non-negative integer");
-    }
-    const connectTimeoutMs = options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
-    if (!Number.isInteger(connectTimeoutMs) || connectTimeoutMs < 0) {
-      throw new RangeError("connectTimeoutMs must be a non-negative integer");
-    }
-    const tlsHandshakeTimeoutMs = options.tlsHandshakeTimeoutMs ?? DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS;
-    if (!Number.isInteger(tlsHandshakeTimeoutMs) || tlsHandshakeTimeoutMs < 0) {
+    if (!Number.isInteger(options.tlsHandshakeTimeoutMs ?? DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS)
+      || (options.tlsHandshakeTimeoutMs ?? DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS) < 0) {
       throw new RangeError("tlsHandshakeTimeoutMs must be a non-negative integer");
     }
+    if (!Number.isInteger(options.dataPlaneRetryDeadlineMs ?? DEFAULT_DATA_PLANE_RETRY_DEADLINE_MS)
+      || (options.dataPlaneRetryDeadlineMs ?? DEFAULT_DATA_PLANE_RETRY_DEADLINE_MS) < 0) {
+      throw new RangeError("dataPlaneRetryDeadlineMs must be a non-negative integer");
+    }
+    if (!Number.isInteger(options.clientUnknownRetryDeadlineMs ?? DEFAULT_CLIENT_UNKNOWN_RETRY_DEADLINE_MS)
+      || (options.clientUnknownRetryDeadlineMs ?? DEFAULT_CLIENT_UNKNOWN_RETRY_DEADLINE_MS) < 0) {
+      throw new RangeError("clientUnknownRetryDeadlineMs must be a non-negative integer");
+    }
+    if (!Number.isInteger(options.dataPlaneSettleMs ?? DEFAULT_DATA_PLANE_SETTLE_MS)
+      || (options.dataPlaneSettleMs ?? DEFAULT_DATA_PLANE_SETTLE_MS) < 0) {
+      throw new RangeError("dataPlaneSettleMs must be a non-negative integer");
+    }
+    if (!Number.isInteger(options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS)
+      || (options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS) < 0) {
+      throw new RangeError("connectTimeoutMs must be a non-negative integer");
+    }
+
+    const configuredPlaintextAddress = parseTunnelAddr(options.tunnelAddr);
+    const configuredTlsAddress = options.tunnelTlsAddr === undefined
+      ? undefined
+      : parseTunnelAddr(options.tunnelTlsAddr);
+
+    if (configuredTlsAddress !== undefined) {
+      this.#transportMode = "tls";
+      this.tunnelAddress = configuredTlsAddress;
+    } else {
+      this.#transportMode = "plaintext";
+      this.tunnelAddress = configuredPlaintextAddress;
+    }
+
     let tunnelTlsServername: string | undefined;
-    if (options.tunnelTlsAddr !== undefined) {
-      const tunnelTlsAddress = parseTunnelAddr(options.tunnelTlsAddr);
-      this.tunnelAddress = tunnelTlsAddress;
-      if (net.isIP(tunnelTlsAddress.host) !== 0 && !options.tunnelTlsServername) {
+    if (this.transport === "tls") {
+      const configuredServername = options.tunnelTlsServername;
+      if (net.isIP(this.tunnelAddress.host) !== 0 && !configuredServername) {
         throw new Error(
           "tunnelTlsServername is required when tunnelTlsAddr uses an IP-literal host",
         );
       }
-      tunnelTlsServername = options.tunnelTlsServername ?? tunnelTlsAddress.host;
+      tunnelTlsServername = configuredServername ?? this.tunnelAddress.host;
       if (tunnelTlsServername.trim().length === 0) {
         throw new Error("tunnelTlsServername must not be empty");
       }
-    } else {
-      this.tunnelAddress = configuredPlaintextAddress;
     }
-
-    this.#transportMode = options.tunnelTlsAddr === undefined ? "plaintext" : "tls";
-    const extraTlsCa =
-      options.tunnelTlsCa === undefined
-        ? []
-        : Array.isArray(options.tunnelTlsCa)
-          ? options.tunnelTlsCa
-          : [options.tunnelTlsCa];
 
     this.options = {
       clientId: options.clientId,
       secret: options.secret,
       controlUrl: options.controlUrl,
-      tunnelAddr: options.tunnelAddr,
-      ...(options.tunnelTlsAddr !== undefined
-        ? {
-            tunnelTlsAddr: options.tunnelTlsAddr,
-            tunnelTlsServername,
-          }
-        : {}),
-      tunnelTlsCa: extraTlsCa,
-      connectTimeoutMs,
-      tlsHandshakeTimeoutMs,
-      dataPlaneRetryDeadlineMs: deadlineMs,
-      dataPlaneSettleMs: settleMs,
+      tunnelTlsServername,
+      tunnelTlsCa: normalizeTlsCa(options.tunnelTlsCa),
+      tlsHandshakeTimeoutMs: options.tlsHandshakeTimeoutMs ?? DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS,
+      connectTimeoutMs: options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
+      dataPlaneRetryDeadlineMs:
+        options.dataPlaneRetryDeadlineMs ?? DEFAULT_DATA_PLANE_RETRY_DEADLINE_MS,
+      clientUnknownRetryDeadlineMs:
+        options.clientUnknownRetryDeadlineMs ?? DEFAULT_CLIENT_UNKNOWN_RETRY_DEADLINE_MS,
+      onClientUnknown: options.onClientUnknown,
+      dataPlaneSettleMs: options.dataPlaneSettleMs ?? DEFAULT_DATA_PLANE_SETTLE_MS,
       authTimeoutMs: options.authTimeoutMs ?? DEFAULT_AUTH_TIMEOUT_MS,
       heartbeatMs: options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS,
       reconnectMs: options.reconnectMs ?? DEFAULT_RECONNECT_MS,
       logLevel: options.logLevel ?? DEFAULT_LOG_LEVEL,
       allowPrivateNetworkTarget: options.allowPrivateNetworkTarget ?? DEFAULT_ALLOW_PRIVATE_NETWORK_TARGET,
       onError: options.onError ?? (() => null),
-      // VENDOR DELTA: upstream logs through `console.log`/`console.warn`,
-      // which would write to STDOUT and corrupt `--output json` — a hard
-      // contract in this CLI. The default sink is stderr-only, and the CLI
-      // injects its own so tunnel chatter obeys `--verbose`/`--debug`.
-      logSink:
-        options.logSink ??
-        ((_level: LogLevel, line: string) => {
-          process.stderr.write(`${line}\n`);
-        }),
+      logSink: options.logSink ?? ((_level: LogLevel, line: string) => {
+        process.stderr.write(`${line}\n`);
+      }),
     };
   }
 
-  public get transport(): "tls" | "plaintext" {
+  public get transport(): TunnelTransport {
     return this.#transportMode;
   }
 
@@ -201,22 +186,25 @@ export class TunnelClient extends EventEmitter {
     if (this.running) {
       return;
     }
-    if (this.reconnectDelayController.signal.aborted) {
-      this.reconnectDelayController = new AbortController();
+    if (this.lifecycleController.signal.aborted) {
+      this.lifecycleController = new AbortController();
     }
+    if (this.targetDialController.signal.aborted) {
+      this.targetDialController = new AbortController();
+    }
+    this.clearClientUnknownEpisode();
     this.running = true;
     this.dataPlaneTerminalErrorReported = false;
 
     const expectedConnectionGeneration = this.controlConnectionGeneration + 1;
-    this.controlLoopTask = this.runControlLoop();
-
-    await new Promise<void>((resolve, reject) => {
+    const readiness = new Promise<void>((resolve, reject) => {
       let settled = false;
-
       const cleanup = () => {
         clearTimeout(timeout);
         this.off("control-authenticated", onAuthenticated);
         this.off(CONTROL_AUTHENTICATION_FAILED, onAuthenticationFailed);
+        this.off(CONTROL_CLIENT_UNKNOWN, onClientUnknown);
+        this.off(CONTROL_CLIENT_UNKNOWN_EXPIRED, onClientUnknownExpired);
       };
 
       const settle = (callback: () => void) => {
@@ -229,40 +217,52 @@ export class TunnelClient extends EventEmitter {
       };
 
       const onAuthenticated = (connectionGeneration: number) => {
-        if (connectionGeneration === expectedConnectionGeneration) {
+        if (connectionGeneration >= expectedConnectionGeneration) {
           settle(resolve);
         }
       };
-
       const onAuthenticationFailed = (connectionGeneration: number, error: Error) => {
-        if (connectionGeneration === expectedConnectionGeneration) {
+        if (connectionGeneration >= expectedConnectionGeneration) {
           settle(() => reject(error));
         }
       };
-
-      const onLoopEnd = () => {
-        settle(() => reject(new Error("Control loop ended before connecting")));
-      };
+      const onClientUnknown = () => clearTimeout(timeout);
+      const onClientUnknownExpired = (error: ClientUnknownError) => settle(() => reject(error));
+      const timeout = setTimeout(() => {
+        settle(() => reject(new Error(
+          `The tunnel server accepted the connection but never acknowledged authentication within ${this.options.authTimeoutMs}ms`,
+        )));
+      }, this.options.authTimeoutMs);
 
       this.on("control-authenticated", onAuthenticated);
       this.on(CONTROL_AUTHENTICATION_FAILED, onAuthenticationFailed);
-      this.controlLoopTask?.then(onLoopEnd);
-      const timeout = setTimeout(() => {
-        settle(() =>
-          reject(
-            new Error(
-              `The tunnel server accepted the connection but never acknowledged authentication within ${this.options.authTimeoutMs}ms`,
-            ),
-          ),
-        );
-      }, this.options.authTimeoutMs);
+      this.on(CONTROL_CLIENT_UNKNOWN, onClientUnknown);
+      this.on(CONTROL_CLIENT_UNKNOWN_EXPIRED, onClientUnknownExpired);
+      this.controlLoopTask = this.runControlLoop();
+      const onLoopEnd = () => {
+        settle(() => reject(new Error("Control loop ended before connecting")));
+      };
+      this.controlLoopTask.then(onLoopEnd, onLoopEnd);
     });
+    await readiness;
 
     this.log("info", "Tunnel client started");
   }
 
   public async stop(): Promise<void> {
-    this.beginStop();
+    this.running = false;
+    this.clearClientUnknownEpisode();
+    this.lifecycleController.abort();
+
+    if (
+      this.controlWs &&
+      (this.controlWs.readyState === WebSocket.OPEN ||
+        this.controlWs.readyState === WebSocket.CONNECTING)
+    ) {
+      this.controlWs.close();
+    }
+
+    this.stopAllTunnelRuntimes();
 
     const tunnelTasks = Array.from(this.tunnelRuntimes.values(), (runtime) => runtime.task);
     await Promise.allSettled([this.controlLoopTask, ...tunnelTasks]);
@@ -278,26 +278,66 @@ export class TunnelClient extends EventEmitter {
       try {
         await this.connectControl();
       } catch (err) {
+        if (!this.running) return;
         if (isControlAuthFailureError(err)) {
-          const message = err.revoked
+          const message = err.reason.trim().toUpperCase() === "CLIENT_REVOKED"
             ? "tunnel credential revoked"
-            : err.acknowledged
+            : err.authenticated
               ? "tunnel connection superseded or credential revoked"
               : `Control authentication failed, stop reconnecting: ${toErrorMessage(err)}`;
           this.reportError(ErrCode.AuthFailed, message, "error");
+          this.clearClientUnknownEpisode();
           this.running = false;
-          this.reconnectDelayController.abort();
+          this.lifecycleController.abort();
           this.controlConnected = false;
           this.stopAllTunnelRuntimes();
           return;
         }
-        this.reportError(ErrCode.ControlDisconnected, `Control disconnected: ${toErrorMessage(err)}`);
+        if (err instanceof ControlClientUnknownCloseError) {
+          this.openClientUnknownEpisode();
+          if (this.options.onClientUnknown) {
+            try {
+              await abortable(Promise.resolve().then(() => this.options.onClientUnknown!()), this.lifecycleController.signal);
+            } catch (hookError) {
+              if (this.running) this.log("warn", `Client recovery hook failed: ${redactSecret(toErrorMessage(hookError), this.options.secret)}`);
+            }
+          }
+        } else {
+          this.reportError(ErrCode.ControlDisconnected, `Control disconnected: ${toErrorMessage(err)}`);
+        }
       }
 
       if (this.running) {
-        await delay(this.options.reconnectMs, this.reconnectDelayController.signal);
+        await delay(this.options.reconnectMs, this.lifecycleController.signal);
       }
     }
+  }
+
+  private openClientUnknownEpisode(): void {
+    this.clientUnknownEpisodeStartedAt ??= performance.now();
+    if (this.options.clientUnknownRetryDeadlineMs === 0 || this.clientUnknownDeadline) return;
+    const remainingMs = Math.max(0,
+      this.options.clientUnknownRetryDeadlineMs - (performance.now() - this.clientUnknownEpisodeStartedAt));
+    this.clientUnknownDeadline = setTimeout(() => {
+      this.clientUnknownDeadline = undefined;
+      if (!this.running || this.clientUnknownEpisodeStartedAt === undefined) return;
+      const error = new ClientUnknownError(this.options.clientUnknownRetryDeadlineMs);
+      this.emit(CONTROL_CLIENT_UNKNOWN_EXPIRED, error);
+      try {
+        this.options.onError(error);
+      } catch {
+        this.log("warn", "onError callback threw; continuing client lifecycle");
+      }
+      this.log("error", error.message);
+      void this.stop();
+    }, remainingMs);
+    this.clientUnknownDeadline.unref();
+  }
+
+  private clearClientUnknownEpisode(): void {
+    if (this.clientUnknownDeadline) clearTimeout(this.clientUnknownDeadline);
+    this.clientUnknownDeadline = undefined;
+    this.clientUnknownEpisodeStartedAt = undefined;
   }
 
   private async runTunnelLoop(
@@ -318,7 +358,7 @@ export class TunnelClient extends EventEmitter {
           }
           const errorMessage = toErrorMessage(err);
           const safeErrorMessage = redactSecret(errorMessage, this.options.secret);
-          this.recordDataPlaneFailure(tunnelConnectionId, runtime, safeErrorMessage);
+          this.openDataPlaneFailureEpisode(runtime, safeErrorMessage);
           this.reportError(
             ErrCode.TunnelDisconnected,
             `Tunnel ${tunnelConnectionId} disconnected: ${safeErrorMessage}`,
@@ -331,12 +371,12 @@ export class TunnelClient extends EventEmitter {
         }
 
         if (this.running) {
-          await delay(this.options.reconnectMs, this.reconnectDelayController.signal);
+          await delay(this.options.reconnectMs, this.lifecycleController.signal);
         }
       }
     } finally {
-      this.clearDataPlaneAttemptTimers(runtime);
       this.clearDataPlaneFailureEpisode(runtime);
+      this.clearAttemptTimers(runtime);
       runtime.socket = undefined;
       runtime.session = undefined;
       this.tunnelRuntimes.delete(tunnelConnectionId);
@@ -355,14 +395,13 @@ export class TunnelClient extends EventEmitter {
       let heartbeatTimer: NodeJS.Timeout | undefined;
       let opened = false;
       let authenticationSettled = false;
-      let authenticationAcknowledged = false;
+      let authenticated = false;
 
       const failAuthentication = (error: Error) => {
-        if (authenticationSettled) {
-          return;
+        if (!authenticationSettled) {
+          authenticationSettled = true;
+          this.emit(CONTROL_AUTHENTICATION_FAILED, connectionGeneration, error);
         }
-        authenticationSettled = true;
-        this.emit(CONTROL_AUTHENTICATION_FAILED, connectionGeneration, error);
       };
 
       const cleanup = () => {
@@ -414,9 +453,10 @@ export class TunnelClient extends EventEmitter {
         }
 
         if (message.type === "Ack") {
-          authenticationAcknowledged = true;
+          authenticated = true;
           if (!authenticationSettled) {
             authenticationSettled = true;
+            this.clearClientUnknownEpisode();
             this.emit("control-authenticated", connectionGeneration);
           }
           return;
@@ -425,6 +465,9 @@ export class TunnelClient extends EventEmitter {
         if (message.type === "RequestTunnel") {
           this.log("debug", `RequestTunnel received: ${message.payload.tunnel_connection_id}`);
           this.allowTunnelReconnect = true;
+          if (this.targetDialController.signal.aborted) {
+            this.targetDialController = new AbortController();
+          }
           this.ensureTunnelRuntime(message.payload.tunnel_connection_id);
           return;
         }
@@ -438,11 +481,11 @@ export class TunnelClient extends EventEmitter {
 
       ws.on("error", (err) => {
         cleanup();
-        failAuthentication(
-          new Error(
+        if (this.clientUnknownEpisodeStartedAt === undefined) {
+          failAuthentication(new Error(
             `Control websocket errored before authentication was acknowledged: ${toErrorMessage(err)}`,
-          ),
-        );
+          ));
+        }
         if (!opened) {
           this.controlConnected = false;
           this.stopAllTunnelRuntimes();
@@ -459,14 +502,19 @@ export class TunnelClient extends EventEmitter {
         this.emit("control-disconnected");
 
         const reason = reasonBuffer.toString("utf8");
-        failAuthentication(
-          new Error(
+        if (code === 1008 && reason.trim().toUpperCase() === "CLIENT_UNKNOWN") {
+          this.emit(CONTROL_CLIENT_UNKNOWN);
+          reject(new ControlClientUnknownCloseError());
+          return;
+        }
+        if (this.clientUnknownEpisodeStartedAt === undefined || isAuthFailureClose(code, reason)) {
+          failAuthentication(new Error(
             `Control websocket closed before authentication was acknowledged (code=${code}, reason=${reason || "<empty>"})`,
-          ),
-        );
+          ));
+        }
         this.log("warn", `Control websocket closed (code=${code}, reason=${reason || "<empty>"})`);
         if (isAuthFailureClose(code, reason)) {
-          reject(new ControlAuthFailureError(code, reason, authenticationAcknowledged));
+          reject(new ControlAuthFailureError(code, reason, authenticated));
           return;
         }
 
@@ -545,7 +593,6 @@ export class TunnelClient extends EventEmitter {
 
     const runtime: TunnelRuntime = {
       stopRetryOnDisconnect: false,
-      sessionEstablished: false,
       task: Promise.resolve(),
     };
 
@@ -559,104 +606,104 @@ export class TunnelClient extends EventEmitter {
     runtime: TunnelRuntime,
   ): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.clearDataPlaneAttemptTimers(runtime);
-      runtime.sessionEstablished = false;
-      const transport = this.#transportMode;
-      const socket =
-        transport === "tls"
-          ? tls.connect({
-              host: this.tunnelAddress.host,
-              port: this.tunnelAddress.port,
-              servername: this.options.tunnelTlsServername!,
-              minVersion: "TLSv1.2",
-              ca: tlsCaOption(this.options.tunnelTlsCa),
-            })
-          : net.connect({
-              host: this.tunnelAddress.host,
-              port: this.tunnelAddress.port,
-            });
+      const socket = this.connectDataPlane();
 
       runtime.socket = socket;
 
-      let transportConnected = false;
       let helloWritten = false;
+      let established = false;
       let settled = false;
+      let session: YamuxSession | undefined;
+
+      const clearDialTimeout = () => {
+        if (runtime.dialTimeout) {
+          clearTimeout(runtime.dialTimeout);
+          runtime.dialTimeout = undefined;
+        }
+      };
+
+      const clearSettleTimeout = () => {
+        if (runtime.settleTimeout) {
+          clearTimeout(runtime.settleTimeout);
+          runtime.settleTimeout = undefined;
+        }
+      };
+
+      const cleanup = () => {
+        clearDialTimeout();
+        clearSettleTimeout();
+        if (runtime.socket === socket) runtime.socket = undefined;
+        if (runtime.session === session) runtime.session = undefined;
+      };
 
       const settle = (next: () => void) => {
         if (settled) {
           return;
         }
         settled = true;
+        cleanup();
         next();
       };
 
-      const interrupted = () =>
-        !this.running || !this.allowTunnelReconnect || runtime.stopRetryOnDisconnect;
-
-      const rejectAttempt = (error: Error) => {
-        this.clearDataPlaneAttemptTimers(runtime);
-        if (interrupted()) {
-          settle(resolve);
+      const markEstablished = () => {
+        if (
+          established
+          || settled
+          || !this.running
+          || !this.allowTunnelReconnect
+          || runtime.stopRetryOnDisconnect
+        ) {
           return;
         }
-        settle(() => {
-          if (!socket.destroyed) {
-            socket.destroy();
-          }
-          reject(error);
-        });
+        established = true;
+        clearSettleTimeout();
+        this.clearDataPlaneFailureEpisode(runtime);
       };
 
       socket.once("error", (err) => {
-        if (!runtime.sessionEstablished) {
-          rejectAttempt(err);
+        if (!established) {
+          settle(() => reject(err));
+          return;
         }
+        this.log(
+          "warn",
+          `Tunnel ${this.transport} error on established session ${tunnelConnectionId}: ${redactSecret(toErrorMessage(err), this.options.secret)}`,
+        );
       });
 
       const finalizeClose = () => {
-        this.clearDataPlaneAttemptTimers(runtime);
-        if (runtime.socket === socket) {
-          runtime.socket = undefined;
-          runtime.session = undefined;
-        }
         settle(() => {
           this.emit("tunnel-disconnected", tunnelConnectionId);
           this.log("warn", `Tunnel tcp closed: ${tunnelConnectionId}`);
-          if (interrupted()) {
+          if (!this.running || !this.allowTunnelReconnect || runtime.stopRetryOnDisconnect) {
             resolve();
             return;
           }
-          if (!runtime.sessionEstablished) {
-            const underlyingError = socket.errored;
-            reject(
-              underlyingError instanceof Error
-                ? underlyingError
-                : new Error(
-                    transportConnected && helloWritten
-                      ? `Tunnel ${transport} connection closed before the session was established`
-                      : `Tunnel ${transport} connection closed before TunnelHello was sent`,
-                  ),
-            );
+          if (!helloWritten) {
+            reject(new Error(
+              `Tunnel ${this.transport} connection closed before TunnelHello was sent`,
+            ));
             return;
           }
-          resolve();
+          if (established) {
+            resolve();
+            return;
+          }
+          reject(new Error(
+            `Tunnel ${this.transport} connection closed before the session was established`,
+          ));
         });
       };
 
-      socket.once(transport === "tls" ? "secureConnect" : "connect", () => {
-        if (runtime.connectTimer !== undefined) {
-          clearTimeout(runtime.connectTimer);
-          runtime.connectTimer = undefined;
-        }
-        transportConnected = true;
-        if (interrupted()) {
+      const onReady = () => {
+        clearDialTimeout();
+        if (!this.running || !this.allowTunnelReconnect || runtime.stopRetryOnDisconnect) {
           socket.destroy();
           settle(resolve);
           return;
         }
 
-        this.log("info", `Tunnel ${transport} connected: ${tunnelConnectionId}`);
-
+        this.log("info", `Tunnel ${this.transport} connected: ${tunnelConnectionId}`);
         const hello: TunnelHelloFrame = {
           client_id: this.options.clientId,
           secret: this.options.secret,
@@ -664,180 +711,167 @@ export class TunnelClient extends EventEmitter {
         };
 
         try {
-          socket.write(encodeFrame(hello), error => {
+          socket.write(encodeFrame(hello), (error) => {
             if (error) {
-              rejectAttempt(error);
+              settle(() => reject(error));
+              socket.destroy();
               return;
             }
-            if (settled || interrupted()) {
+            if (settled || socket.destroyed) {
               return;
             }
+
             helloWritten = true;
-            if (!runtime.sessionEstablished) {
-              runtime.settleTimer = setTimeout(() => {
-                runtime.settleTimer = undefined;
-                this.markDataPlaneEstablished(runtime);
-              }, this.options.dataPlaneSettleMs);
-              runtime.settleTimer.unref();
-            }
+            runtime.settleTimeout = setTimeout(markEstablished, this.options.dataPlaneSettleMs);
+            runtime.settleTimeout.unref();
+
+            session = createYamuxClientSession(socket);
+            runtime.session = session;
+
+            session.on("stream", (stream: Duplex) => {
+              markEstablished();
+              void this.handleIncomingStream(stream);
+            });
+
+            session.on("error", (err: Error) => {
+              if (isBenignCloseError(err)) {
+                this.log("debug", `Yamux benign close (${tunnelConnectionId}): ${toErrorMessage(err)}`);
+                return;
+              }
+
+              this.log("warn", `Yamux error (${tunnelConnectionId}): ${toErrorMessage(err)}`);
+
+              if (!socket.destroyed) {
+                socket.destroy(err);
+              }
+            });
+
+            session.on("close", () => {
+              this.log("debug", `Yamux session closed: ${tunnelConnectionId}`);
+            });
+
             this.emit("tunnel-connected", tunnelConnectionId);
           });
-
-          const session = createYamuxClientSession(socket);
-          runtime.session = session;
-
-          session.on("stream", (stream: Duplex) => {
-            this.markDataPlaneEstablished(runtime);
-            void this.handleIncomingStream(stream);
-          });
-
-          session.on("error", (err: Error) => {
-            if (isBenignCloseError(err)) {
-              this.log("debug", `Yamux benign close (${tunnelConnectionId}): ${toErrorMessage(err)}`);
-              return;
-            }
-
-            this.log("warn", `Yamux error (${tunnelConnectionId}): ${toErrorMessage(err)}`);
-
-            if (!socket.destroyed) {
-              socket.destroy(err);
-            }
-          });
-
-          session.on("close", () => {
-            this.log("debug", `Yamux session closed: ${tunnelConnectionId}`);
-          });
-        } catch (err) {
-          rejectAttempt(err instanceof Error ? err : new Error(String(err)));
+        } catch (error) {
+          settle(() => reject(error));
+          socket.destroy();
         }
-      });
+      };
+
+      socket.once(this.transport === "tls" ? "secureConnect" : "connect", onReady);
+      if (this.transport === "tls") {
+        runtime.dialTimeout = setTimeout(() => {
+          socket.destroy(new Error(
+            `TLS handshake timed out after ${this.options.tlsHandshakeTimeoutMs}ms`,
+          ));
+        }, this.options.tlsHandshakeTimeoutMs);
+      } else {
+        runtime.dialTimeout = setTimeout(() => {
+          socket.destroy(new Error(
+            `Plaintext connect timed out after ${this.options.connectTimeoutMs}ms`,
+          ));
+        }, this.options.connectTimeoutMs);
+      }
+      runtime.dialTimeout.unref();
 
       socket.once("close", finalizeClose);
       socket.once("end", finalizeClose);
-
-      const attemptTimeoutMs =
-        transport === "tls" ? this.options.tlsHandshakeTimeoutMs : this.options.connectTimeoutMs;
-      runtime.connectTimer = setTimeout(() => {
-        runtime.connectTimer = undefined;
-        if (transportConnected || settled) {
-          return;
-        }
-        const label = transport === "tls" ? "TLS handshake" : "Plaintext connect";
-        rejectAttempt(new Error(`${label} timed out after ${attemptTimeoutMs}ms`));
-      }, attemptTimeoutMs);
-      runtime.connectTimer.unref();
     });
   }
 
-  private recordDataPlaneFailure(
-    tunnelConnectionId: string,
-    runtime: TunnelRuntime,
-    errorMessage: string,
-  ): void {
-    runtime.lastFailureMessage = errorMessage;
-    if (
-      runtime.failureEpisodeStartedAt !== undefined
-      || this.options.dataPlaneRetryDeadlineMs === 0
-    ) {
-      return;
+  private connectDataPlane(): Socket {
+    if (this.transport === "tls") {
+      const ca = tlsCaOption(this.options.tunnelTlsCa);
+      return tls.connect({
+        host: this.tunnelAddress.host,
+        port: this.tunnelAddress.port,
+        servername: this.options.tunnelTlsServername,
+        minVersion: "TLSv1.2",
+        ...(ca === undefined ? {} : { ca }),
+      });
     }
 
-    runtime.failureEpisodeStartedAt = performance.now();
-    this.armDataPlaneFailureDeadline(tunnelConnectionId, runtime);
+    return net.connect({
+      host: this.tunnelAddress.host,
+      port: this.tunnelAddress.port,
+    });
   }
 
-  private armDataPlaneFailureDeadline(
-    tunnelConnectionId: string,
+  private openDataPlaneFailureEpisode(
     runtime: TunnelRuntime,
+    safeErrorMessage: string,
   ): void {
+    runtime.lastFailureMessage = safeErrorMessage;
     const deadlineMs = this.options.dataPlaneRetryDeadlineMs;
-    const startedAt = runtime.failureEpisodeStartedAt;
-    if (deadlineMs === 0 || startedAt === undefined) {
-      return;
-    }
+    if (deadlineMs === 0 || runtime.failureDeadline) return;
 
-    const elapsedMs = performance.now() - startedAt;
-    const remainingMs = Math.max(0, Math.ceil(deadlineMs - elapsedMs));
-    runtime.failureDeadlineTimer = setTimeout(() => {
-      runtime.failureDeadlineTimer = undefined;
-      this.expireDataPlaneFailureEpisode(tunnelConnectionId, runtime);
+    runtime.failureEpisodeStartedAt ??= performance.now();
+    const remainingMs = Math.max(
+      0,
+      Math.ceil(deadlineMs - (performance.now() - runtime.failureEpisodeStartedAt)),
+    );
+    runtime.failureDeadline = setTimeout(() => {
+      this.expireDataPlaneFailureEpisode(runtime);
     }, remainingMs);
-    runtime.failureDeadlineTimer.unref();
+    runtime.failureDeadline.unref();
   }
 
-  private expireDataPlaneFailureEpisode(
-    tunnelConnectionId: string,
-    runtime: TunnelRuntime,
-  ): void {
+  private expireDataPlaneFailureEpisode(runtime: TunnelRuntime): void {
+    runtime.failureDeadline = undefined;
     if (
-      !this.running
+      runtime.failureEpisodeStartedAt === undefined
+      || !this.running
       || !this.allowTunnelReconnect
       || runtime.stopRetryOnDisconnect
-      || runtime.failureEpisodeStartedAt === undefined
     ) {
-      this.clearDataPlaneFailureEpisode(runtime);
       return;
     }
 
     runtime.stopRetryOnDisconnect = true;
-    this.clearDataPlaneAttemptTimers(runtime);
-    if (runtime.socket && !runtime.socket.destroyed) {
-      runtime.socket.destroy();
-    }
-
+    if (runtime.socket && !runtime.socket.destroyed) runtime.socket.destroy();
+    if (this.dataPlaneTerminalErrorReported) return;
+    this.dataPlaneTerminalErrorReported = true;
+    const address = formatTunnelAddress(this.tunnelAddress);
     try {
-      if (!this.dataPlaneTerminalErrorReported) {
-        this.dataPlaneTerminalErrorReported = true;
-        this.reportError(
-          ErrCode.DataPlaneUnreachable,
-          `Data plane ${this.#transportMode} at ${formatTunnelAddress(this.tunnelAddress)} `
-            + `is unreachable after ${this.options.dataPlaneRetryDeadlineMs}ms: `
-            + (runtime.lastFailureMessage ?? "unknown data-plane failure"),
-          "error",
-        );
-      }
+      this.reportError(
+        ErrCode.DataPlaneUnreachable,
+        `Data plane ${this.transport} at ${address} is unreachable after `
+          + `${this.options.dataPlaneRetryDeadlineMs}ms: ${runtime.lastFailureMessage ?? "unknown data-plane failure"}`,
+        "error",
+      );
     } finally {
-      this.beginStop();
-    }
-  }
-
-  private markDataPlaneEstablished(runtime: TunnelRuntime): void {
-    if (!this.running || !this.allowTunnelReconnect || runtime.stopRetryOnDisconnect) {
-      return;
-    }
-    runtime.sessionEstablished = true;
-    if (runtime.settleTimer !== undefined) {
-      clearTimeout(runtime.settleTimer);
-      runtime.settleTimer = undefined;
-    }
-    this.clearDataPlaneFailureEpisode(runtime);
-  }
-
-  private clearDataPlaneAttemptTimers(runtime: TunnelRuntime): void {
-    if (runtime.connectTimer !== undefined) {
-      clearTimeout(runtime.connectTimer);
-      runtime.connectTimer = undefined;
-    }
-    if (runtime.settleTimer !== undefined) {
-      clearTimeout(runtime.settleTimer);
-      runtime.settleTimer = undefined;
+      void this.stop();
     }
   }
 
   private clearDataPlaneFailureEpisode(runtime: TunnelRuntime): void {
-    if (runtime.failureDeadlineTimer !== undefined) {
-      clearTimeout(runtime.failureDeadlineTimer);
-      runtime.failureDeadlineTimer = undefined;
+    if (runtime.failureDeadline) {
+      clearTimeout(runtime.failureDeadline);
+      runtime.failureDeadline = undefined;
     }
     runtime.failureEpisodeStartedAt = undefined;
     runtime.lastFailureMessage = undefined;
   }
 
+  private clearAttemptTimers(runtime: TunnelRuntime): void {
+    if (runtime.dialTimeout) {
+      clearTimeout(runtime.dialTimeout);
+      runtime.dialTimeout = undefined;
+    }
+    if (runtime.settleTimeout) {
+      clearTimeout(runtime.settleTimeout);
+      runtime.settleTimeout = undefined;
+    }
+  }
+
   private stopAllTunnelRuntimes(): void {
+    // Invalidate pending DNS/connection work before draining sockets. A later
+    // RequestTunnel gets a fresh signal without reviving work from this session.
+    this.targetDialController.abort();
     for (const runtime of this.tunnelRuntimes.values()) {
       runtime.stopRetryOnDisconnect = true;
-      this.clearDataPlaneAttemptTimers(runtime);
       this.clearDataPlaneFailureEpisode(runtime);
+      this.clearAttemptTimers(runtime);
       if (runtime.session) {
         runtime.session.close();
       }
@@ -845,40 +879,19 @@ export class TunnelClient extends EventEmitter {
         runtime.socket.destroy();
       }
     }
-    // VENDOR DELTA: destroy every outstanding proxy target socket. See the
-    // `activeTargetSockets` field comment. Iterate a copy: destroy() emits
-    // 'close' synchronously for an already-connected socket, and that handler
-    // deletes from the live set.
-    for (const socket of [...this.activeTargetSockets]) {
-      if (!socket.destroyed) {
-        socket.destroy();
-      }
+    for (const socket of this.activeTargetSockets) {
+      socket.destroy();
     }
     this.activeTargetSockets.clear();
   }
 
-  private beginStop(): void {
-    this.running = false;
-    this.reconnectDelayController.abort();
-
-    // VENDOR DELTA: also close a socket still in CONNECTING. Upstream only
-    // closes an OPEN one, so a control plane that accepts TCP and never
-    // completes the WebSocket handshake leaves the socket untouched — and the
-    // `await this.controlLoopTask` in stop() then waits on the very handshake
-    // nothing is going to finish. stop() never returns, so the caller's
-    // teardown never reaches the credential delete that follows it.
-    if (
-      this.controlWs
-      && (this.controlWs.readyState === WebSocket.OPEN
-        || this.controlWs.readyState === WebSocket.CONNECTING)
-    ) {
-      this.controlWs.close();
-    }
-
-    this.stopAllTunnelRuntimes();
-  }
-
   private async handleIncomingStream(stream: Duplex): Promise<void> {
+    const completed = new AbortController();
+    const signal = anySignal([
+      this.lifecycleController.signal,
+      this.targetDialController.signal,
+      completed.signal,
+    ]);
     try {
       const frame = await readTypedFrame(stream, isStreamOpenRequestFrame);
       const targetHost = frame.target_host;
@@ -891,13 +904,15 @@ export class TunnelClient extends EventEmitter {
         `Open request ${logContext}: ${targetHost}:${targetPort}`,
       );
 
-      const target = await this.connectTarget(targetHost, targetPort);
+      const target = await this.connectTarget(targetHost, targetPort, signal);
       this.log("debug", `Target connected: ${logContext}`);
 
       await this.proxyStreams(stream, target, logContext);
       this.log("debug", `Stream proxy finished: ${logContext}`);
     } catch (err) {
-      if (err instanceof YamuxStreamResetError) {
+      if (signal.aborted || !this.running) {
+        // Lifecycle teardown is expected; keep stream cleanup below.
+      } else if (err instanceof YamuxStreamResetError) {
         this.log("debug", `Stream reset while handling inbound stream: ${toErrorMessage(err)}`);
       } else if (err instanceof BlockedTargetError) {
         this.reportError(ErrCode.BlockedTargetRejected, `Rejecting stream open request targeting a blocked (private/internal) address: ${toErrorMessage(err)}`);
@@ -909,6 +924,8 @@ export class TunnelClient extends EventEmitter {
       if (!stream.destroyed && !isBenignCloseError(err)) {
         stream.destroy();
       }
+    } finally {
+      completed.abort();
     }
   }
 
@@ -988,46 +1005,59 @@ export class TunnelClient extends EventEmitter {
     }
   }
 
-  private async connectTarget(host: string, port: number): Promise<Socket> {
-    // `host`/`port` here are the `target_host`/`target_port` relayed verbatim from the inbound
-    // proxy request on the internet-facing proxy port — untrusted input as far as this client
-    // is concerned. Resolve once, validate the exact resolved candidate set, then dial that same
-    // set (never the original hostname): a name that later rebinds to a different address can't
-    // slip through, because there is no second, independent lookup between the check and the
-    // dial. Mirrors `connect_target`/`ensure_candidates_are_loopback` in the Rust client.
-    const candidates = await resolveDialCandidates(host, port);
-    ensureTargetAllowed(host, port, candidates, this.options.allowPrivateNetworkTarget);
+  private async connectTarget(
+    host: string,
+    port: number,
+    signal?: AbortSignal,
+  ): Promise<Socket> {
+    const completed = new AbortController();
+    try {
+      signal ??= anySignal([
+        this.lifecycleController.signal,
+        this.targetDialController.signal,
+        completed.signal,
+      ]);
+      // `host`/`port` here are the `target_host`/`target_port` relayed verbatim from the inbound
+      // proxy request on the internet-facing proxy port — untrusted input as far as this client
+      // is concerned. Resolve once, validate the exact resolved candidate set, then dial that same
+      // set (never the original hostname): a name that later rebinds to a different address can't
+      // slip through, because there is no second, independent lookup between the check and the
+      // dial. Mirrors `connect_target`/`ensure_candidates_are_loopback` in the Rust client.
+      signal.throwIfAborted();
+      const candidates = await abortable(resolveDialCandidates(host, port), signal);
+      signal.throwIfAborted();
+      ensureTargetAllowed(host, port, candidates, this.options.allowPrivateNetworkTarget);
 
-    let lastError: unknown;
+      let lastError: unknown;
 
-    for (const candidate of candidates) {
-      try {
-        return await this.connectOnce(candidate.host, candidate.port);
-      } catch (err) {
-        lastError = err;
+      for (const candidate of candidates) {
+        signal.throwIfAborted();
+        try {
+          return await this.connectOnce(candidate.host, candidate.port, signal);
+        } catch (err) {
+          signal.throwIfAborted();
+          lastError = err;
+        }
       }
-    }
 
-    throw new TargetConnectError(
-      host,
-      port,
-      lastError ?? new Error(`no dial candidates for ${host}:${port}`),
-    );
+      throw new TargetConnectError(
+        host,
+        port,
+        lastError ?? new Error(`no dial candidates for ${host}:${port}`),
+      );
+    } finally {
+      completed.abort();
+    }
   }
 
-  private connectOnce(host: string, port: number): Promise<Socket> {
+  private connectOnce(host: string, port: number, signal: AbortSignal): Promise<Socket> {
     return new Promise((resolve, reject) => {
+      signal.throwIfAborted();
       const socket = net.connect({ host, port });
-
-      // VENDOR DELTA: track from creation so a teardown mid-dial destroys it too;
-      // the 'close' handler removes it whether the dial succeeds, fails, or is
-      // force-destroyed by stopAllTunnelRuntimes(). See the field comment.
       this.activeTargetSockets.add(socket);
-      socket.once("close", () => {
-        this.activeTargetSockets.delete(socket);
-      });
+      socket.once("close", () => this.activeTargetSockets.delete(socket));
 
-      const onError = (err: Error) => {
+      const onError = (err: unknown) => {
         cleanup();
         if (!socket.destroyed) {
           socket.destroy();
@@ -1040,6 +1070,8 @@ export class TunnelClient extends EventEmitter {
         resolve(socket);
       };
 
+      const onAbort = () => onError(signal.reason);
+
       const timeout = setTimeout(() => {
         onError(new Error(`connect timeout ${DEFAULT_TARGET_CONNECT_TIMEOUT_MS}ms`));
       }, DEFAULT_TARGET_CONNECT_TIMEOUT_MS);
@@ -1048,10 +1080,12 @@ export class TunnelClient extends EventEmitter {
         clearTimeout(timeout);
         socket.off("error", onError);
         socket.off("connect", onConnect);
+        signal.removeEventListener("abort", onAbort);
       };
 
       socket.once("error", onError);
       socket.once("connect", onConnect);
+      signal.addEventListener("abort", onAbort, { once: true });
     });
   }
 
@@ -1063,9 +1097,62 @@ export class TunnelClient extends EventEmitter {
   }
 
   private reportError(code: ErrCode, message: string, level: LogLevel = "warn"): void {
-    this.options.onError({ code, message });
+    try {
+      this.options.onError({ code, message });
+    } catch {
+      this.log("warn", "onError callback threw; continuing client lifecycle");
+    }
     this.log(level, message);
   }
+}
+
+function anySignal(signals: AbortSignal[]): AbortSignal {
+  const controller = new AbortController();
+  const aborted = signals.find((signal) => signal.aborted);
+  if (aborted) {
+    controller.abort(aborted.reason);
+    return controller.signal;
+  }
+
+  const listeners = new Map<AbortSignal, () => void>();
+  const cleanup = () => {
+    for (const [signal, listener] of listeners) {
+      signal.removeEventListener("abort", listener);
+    }
+    listeners.clear();
+  };
+  for (const signal of new Set(signals)) {
+    const onAbort = () => {
+      cleanup();
+      controller.abort(signal.reason);
+    };
+    listeners.set(signal, onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+  }
+  return controller.signal;
+}
+
+function abortable<T>(task: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+    }
+    task.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -1247,9 +1334,7 @@ export function blockedTargetReason(address: string): string | undefined {
     return "not an IP literal";
   }
 
-  // VENDOR DELTA: classify IPv6 loopback and embedded-IPv4 spaces with binary `net.BlockList`
-  // matching instead of spelling-specific mapped-address regexes. This makes equivalent IPv6
-  // spellings share one verdict and refuses compatible, mapped, translated, and NAT64 forms.
+  // Match IPv6 ranges in binary so expanded and compressed spellings share one verdict.
   const targetFamily: "ipv4" | "ipv6" = family === 4 ? "ipv4" : "ipv6";
 
   const loopback = new net.BlockList();
@@ -1265,30 +1350,10 @@ export function blockedTargetReason(address: string): string | undefined {
 
   if (targetFamily === "ipv6") {
     const embeddedIpv4 = new net.BlockList();
-    // VENDOR DELTA: `::/32` and `64:ff9b::/32` rather than the narrower canonical-form
-    // prefixes (`::/96`, and `64:ff9b::/96` + `64:ff9b:1::/48`) alone. Each /32 is the
-    // binary superset of every RFC-named spelling in its family, so a reserved-but-
-    // non-canonical prefix that sits between two narrow rules (e.g.
-    // `64:ff9b:ffff::a9fe:a9fe`, which is in neither the RFC 6052 `/96` nor the RFC 8215
-    // `/48`) can no longer slip through. Mirrors `src/lib/target-url.ts`'s
-    // `NAT64_SUBNETS` / `IPV4_COMPATIBLE_SUBNETS` exactly (see that file's doc comment for
-    // the full reasoning); both `0000::/8` and `0064::/16` are IETF-reserved, so widening
-    // costs no reachable public target. The narrower `::ffff:0:0/96` / `::ffff:0:0:0/80` /
-    // `0:0:0:ffff:0:0:0:0/96` entries below are now FULLY SUBSUMED by the wider `::/32` and
-    // change no verdict — every hit here returns the one generic string, so unlike
-    // `target-url.ts` they name no family. They are kept only as an inline record of which
-    // RFC-named spellings this range covers, and deleting them is behaviour-neutral (proved
-    // by mutation: removing all three leaves the target-guard spec at 31/31). `::1` and mapped
-    // loopback
-    // (`::ffff:127.0.0.0/104`) are unaffected — the loopback `BlockList` above is checked
-    // first and returns before this one is ever consulted. See VENDOR.md #11.
+    // The /32 supersets cover compatible, mapped, translated and non-canonical NAT64 forms.
+    // Native and mapped loopback are exempted above before these reserved ranges are checked.
     embeddedIpv4.addSubnet("::", 32, "ipv6");
-    embeddedIpv4.addSubnet("::ffff:0:0", 96, "ipv6");
-    embeddedIpv4.addSubnet("::ffff:0:0:0", 80, "ipv6");
-    embeddedIpv4.addSubnet("0:0:0:ffff:0:0:0:0", 96, "ipv6");
     embeddedIpv4.addSubnet("64:ff9b::", 32, "ipv6");
-    // VENDOR DELTA: 6to4 and Teredo derive IPv4 destinations by construction, so they belong
-    // with the other embedded-IPv4 spaces. See VENDOR.md #10.
     embeddedIpv4.addSubnet("2002::", 16, "ipv6");
     embeddedIpv4.addSubnet("2001::", 32, "ipv6");
     if (embeddedIpv4.check(address, "ipv6")) {
@@ -1322,8 +1387,6 @@ const BLOCKED_IPV4: ReadonlyArray<readonly [string, ReadonlyArray<readonly [stri
 
 const BLOCKED_IPV6: ReadonlyArray<readonly [string, ReadonlyArray<readonly [string, number]>]> = [
   ["IPv6 unique-local address", [["fc00::", 7]]],
-  // VENDOR DELTA: deprecated site-local space is private-scope even though it predates ULA.
-  // See VENDOR.md #10.
   ["IPv6 site-local address", [["fec0::", 10]]],
   ["IPv6 link-local address", [["fe80::", 10]]],
   ["multicast address", [["ff00::", 8]]],
@@ -1362,24 +1425,69 @@ export function ensureTargetAllowed(
   }
 }
 
-/**
- * Build the `ca` option for a TLS dial. Extra roots are appended to Node's
- * DEFAULT trust store — the bundled Mozilla roots plus whatever
- * NODE_EXTRA_CA_CERTS / --use-system-ca added — because `tls.rootCertificates`
- * alone silently drops NODE_EXTRA_CA_CERTS, which is exactly how corporate
- * TLS-inspecting proxies are trusted. With no extra root configured the option
- * stays undefined so Node applies its defaults untouched.
- */
-function tlsCaOption(extraRoots: ReadonlyArray<string | Buffer>): Array<string | Buffer> | undefined {
-  if (extraRoots.length === 0) return undefined;
-  const withDefaults = tls as unknown as {
-    getCACertificates?: (type: "default") => readonly string[];
-  };
-  const defaults =
-    typeof withDefaults.getCACertificates === "function"
-      ? withDefaults.getCACertificates("default")
-      : [...tls.rootCertificates, ...readNodeExtraCaCertificates()];
-  return [...defaults, ...extraRoots];
+function parseTunnelAddr(addr: string): TunnelAddress {
+  if (addr !== addr.trim() || addr.includes("://") || /[\s\0/\\?#@]/.test(addr)) {
+    throw new Error(`Invalid tunnel address: ${addr}`);
+  }
+
+  let hostPart = "";
+  let portPart = "";
+
+  if (addr.startsWith("[")) {
+    const closing = addr.indexOf("]");
+    if (
+      closing < 0
+      || closing + 2 > addr.length
+      || addr[closing + 1] !== ":"
+      || net.isIP(addr.slice(1, closing)) !== 6
+    ) {
+      throw new Error(`Invalid tunnel address: ${addr}`);
+    }
+    hostPart = addr.slice(1, closing);
+    portPart = addr.slice(closing + 2);
+  } else {
+    const sep = addr.lastIndexOf(":");
+    if (sep <= 0 || sep === addr.length - 1 || addr.indexOf(":") !== sep) {
+      throw new Error(`Invalid tunnel address: ${addr}`);
+    }
+    hostPart = addr.slice(0, sep);
+    portPart = addr.slice(sep + 1);
+  }
+
+  if (!/^\d+$/.test(portPart)) {
+    throw new Error(`Invalid tunnel address: ${addr}`);
+  }
+  const port = Number(portPart);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new Error(`Invalid tunnel address: ${addr}`);
+  }
+
+  const host = net.isIP(hostPart) === 0 ? canonicalDnsHostname(hostPart) : hostPart;
+  if (host === undefined) {
+    throw new Error(`Invalid tunnel address: ${addr}`);
+  }
+
+  return { host, port };
+}
+
+function canonicalDnsHostname(host: string): string | undefined {
+  const ascii = domainToASCII(host).toLowerCase();
+  if (ascii.length === 0 || ascii.length > 253) {
+    return undefined;
+  }
+  const withoutTrailingDot = ascii.endsWith(".") ? ascii.slice(0, -1) : ascii;
+  const valid = withoutTrailingDot.split(".").every(
+    (label) =>
+      label.length > 0
+      && label.length <= 63
+      && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/iu.test(label),
+  );
+  return valid ? ascii : undefined;
+}
+
+function normalizeTlsCa(extraCa: TunnelClientOptions["tunnelTlsCa"]): Array<string | Buffer> {
+  if (extraCa === undefined) return [];
+  return Array.isArray(extraCa) ? [...extraCa] : [extraCa];
 }
 
 /**
@@ -1409,75 +1517,23 @@ function readNodeExtraCaCertificates(): string[] {
   return certificates;
 }
 
-function parseTunnelAddr(addr: string): { host: string; port: number } {
-  if (addr.length === 0 || /\s|[/?#@]/u.test(addr)) {
-    throw new Error(`Invalid tunnel address: ${addr}`);
-  }
-
-  let hostPart = "";
-  let portPart = "";
-
-  if (addr.startsWith("[")) {
-    const closing = addr.indexOf("]");
-    if (
-      closing <= 1
-      || closing !== addr.lastIndexOf("]")
-      || closing + 2 > addr.length
-      || addr[closing + 1] !== ":"
-    ) {
-      throw new Error(`Invalid tunnel address: ${addr}`);
-    }
-    hostPart = addr.slice(1, closing);
-    portPart = addr.slice(closing + 2);
-    if (net.isIP(hostPart) !== 6) {
-      throw new Error(`Invalid tunnel address: ${addr}`);
-    }
-  } else {
-    const sep = addr.indexOf(":");
-    if (sep <= 0 || sep === addr.length - 1) {
-      throw new Error(`Invalid tunnel address: ${addr}`);
-    }
-    if (sep !== addr.lastIndexOf(":")) {
-      throw new Error(`Invalid tunnel address: ${addr}`);
-    }
-    hostPart = addr.slice(0, sep);
-    portPart = addr.slice(sep + 1);
-    if (net.isIP(hostPart) === 0) {
-      const canonicalHost = canonicalDnsHostname(hostPart);
-      if (canonicalHost === undefined) {
-        throw new Error(`Invalid tunnel address: ${addr}`);
-      }
-      hostPart = canonicalHost;
-    }
-  }
-
-  if (!/^\d+$/u.test(portPart)) {
-    throw new Error(`Invalid tunnel address: ${addr}`);
-  }
-  const port = Number(portPart);
-  if (port <= 0 || port > 65535) {
-    throw new Error(`Invalid tunnel address: ${addr}`);
-  }
-
-  return {
-    host: hostPart,
-    port,
+/**
+ * Build the `ca` option for a TLS dial. Extra roots are appended to Node's
+ * default trust store. Node 22.15+ exposes that store directly. Older supported
+ * releases expose only bundled roots, so append the NODE_EXTRA_CA_CERTS file
+ * cached per path before adding the caller's roots (CLI compatibility). With no explicit
+ * root configured the option stays undefined so Node applies its defaults.
+ */
+function tlsCaOption(extraRoots: ReadonlyArray<string | Buffer>): Array<string | Buffer> | undefined {
+  if (extraRoots.length === 0) return undefined;
+  const withDefaults = tls as unknown as {
+    getCACertificates?: (type: "default") => readonly string[];
   };
-}
-
-function canonicalDnsHostname(host: string): string | undefined {
-  const ascii = domainToASCII(host).toLowerCase();
-  if (ascii.length === 0 || ascii.length > 253) {
-    return undefined;
-  }
-  const withoutTrailingDot = ascii.endsWith(".") ? ascii.slice(0, -1) : ascii;
-  const valid = withoutTrailingDot.split(".").every(
-    (label) =>
-      label.length > 0
-      && label.length <= 63
-      && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/iu.test(label),
-  );
-  return valid ? ascii : undefined;
+  const defaults =
+    typeof withDefaults.getCACertificates === "function"
+      ? withDefaults.getCACertificates("default")
+      : [...tls.rootCertificates, ...readNodeExtraCaCertificates()];
+  return [...defaults, ...extraRoots];
 }
 
 function isStreamOpenRequestFrame(value: unknown): value is StreamOpenRequestFrame {
@@ -1497,26 +1553,31 @@ function isStreamOpenRequestFrame(value: unknown): value is StreamOpenRequestFra
 
 interface TunnelRuntime {
   stopRetryOnDisconnect: boolean;
-  sessionEstablished: boolean;
   failureEpisodeStartedAt?: number;
-  failureDeadlineTimer?: NodeJS.Timeout;
+  failureDeadline?: NodeJS.Timeout;
   lastFailureMessage?: string;
-  connectTimer?: NodeJS.Timeout;
-  settleTimer?: NodeJS.Timeout;
+  dialTimeout?: NodeJS.Timeout;
+  settleTimeout?: NodeJS.Timeout;
   socket?: Socket;
   session?: YamuxSession;
   task: Promise<void>;
 }
 
 class ControlAuthFailureError extends Error {
-  readonly revoked: boolean;
-  readonly acknowledged: boolean;
-
-  constructor(code: number, reason: string, acknowledged: boolean) {
+  constructor(code: number, readonly reason: string, readonly authenticated: boolean) {
     super(`control auth failure (code=${code}, reason=${reason || "unknown"})`);
     this.name = "ControlAuthFailureError";
-    this.revoked = reason.trim().toUpperCase() === "CLIENT_REVOKED";
-    this.acknowledged = acknowledged;
+  }
+}
+
+class ControlClientUnknownCloseError extends Error {}
+
+export class ClientUnknownError extends Error {
+  readonly code = ErrCode.ClientUnknown;
+
+  constructor(deadlineMs: number) {
+    super(`Tunnel client registration was not found after ${deadlineMs}ms`);
+    this.name = "ClientUnknownError";
   }
 }
 
@@ -1550,6 +1611,5 @@ function isControlAuthFailureError(err: unknown): err is ControlAuthFailureError
 }
 
 function isAuthFailureClose(code: number, reason: string): boolean {
-  const normalizedReason = reason.trim().toUpperCase();
-  return code === 1008 && (normalizedReason === "AUTH_FAILED" || normalizedReason === "CLIENT_REVOKED");
+  return code === 1008 && ["AUTH_FAILED", "CLIENT_REVOKED"].includes(reason.trim().toUpperCase());
 }

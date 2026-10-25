@@ -24,6 +24,7 @@ import type {
   CliPlanProposal,
 } from '../lib/plans.types.js';
 import { PLAN_GENERATION_STAGES } from '../lib/plans.types.js';
+import { MAX_TRIGGER_POSTS_TOTAL } from '../lib/plan-poll.js';
 import {
   runPlanGenerate,
   runPlanAccept,
@@ -573,9 +574,9 @@ describe('runPlanGenerate — first-run hint and credentials warning', () => {
       makeDeps(backend.fetchImpl, capture) as never,
     );
     const stderr = capture.stderr.join('\n');
-    expect(stderr).toContain("[hint] this project hasn't been explored yet");
-    expect(stderr).toContain('exploration + strategy + proposals');
-    expect(stderr).toContain('Ctrl-C detaches safely');
+    expect(stderr).toContain(
+      '[hint] 3 stages: exploration, strategy, proposals. Takes minutes. Ctrl-C is safe; re-run to continue.',
+    );
     // No price is announced up front — the surface matches `test run`, which
     // quotes no cost either. Spend is reported AFTER the fact on the result
     // line (`credits used: N, balance: M`), covered by the render tests above.
@@ -617,9 +618,11 @@ describe('runPlanGenerate — first-run hint and credentials warning', () => {
       makeDeps(backend.fetchImpl, capture) as never,
     );
     const stderr = capture.stderr.join('\n');
-    expect(stderr).toContain('strategy + proposals');
+    expect(stderr).toContain(
+      '[hint] 2 stages: strategy, proposals. Ctrl-C is safe; re-run to continue.',
+    );
     expect(stderr).not.toMatch(/up to \d+ credits/);
-    expect(stderr).not.toContain("hasn't been explored");
+    expect(stderr).not.toContain('exploration');
     expect(stderr).not.toContain('[warn]');
   });
 
@@ -729,11 +732,14 @@ describe('runPlanGenerate — typed exit-7 timeout conversion', () => {
       expect((err as ApiError).nextAction).toContain(
         `testsprite test plan generate --project ${PROJECT_ID}`,
       );
+      // §13.3: the envelope carries the stages left, not only the partial.
+      expect((err as ApiError).getDetail('stagesRemaining')).toEqual(['strategy', 'proposals']);
       // Partial on stdout so a redirected file is never 0-byte.
       const partial = JSON.parse(capture.stdout.join('\n')) as Record<string, unknown>;
       expect(partial.status).toBe('running');
       expect(partial.generationStatus).toBe('exploring');
       expect(partial.projectId).toBe(PROJECT_ID);
+      expect(partial.stagesRemaining).toEqual(['strategy', 'proposals']);
     } finally {
       Date.now = realDateNow;
     }
@@ -773,6 +779,87 @@ describe('runPlanGenerate — cap-exhaustion stuck fuse partial envelope (F7)', 
     const partial = JSON.parse(capture.stdout.join('\n')) as Record<string, unknown>;
     expect(partial.status).toBe('running');
     expect(partial.projectId).toBe(PROJECT_ID);
+    // Exploration was accepted (so it counts as started, not left) but was
+    // never seen running or finished: not "done", and no Continue: line — an
+    // immediate re-run would repeat the same attempts.
+    expect(partial.stagesRemaining).toEqual(['strategy', 'proposals']);
+    const stderr = capture.stderr.join('\n');
+    expect(stderr).not.toContain('done');
+    // Every try was accepted here, so tries == accepted == the stage count.
+    expect(stderr).toContain(
+      `Stage 1/3 exploration is not making progress after ${PLAN_GENERATION_STAGES.length} tries. ` +
+        'Wait a few minutes, then run the same command again; it picks up from here.',
+    );
+    expect(stderr).not.toContain('would not start');
+    expect(stderr).not.toContain('Continue:');
+  });
+
+  it('attach-only fuse: every try answered "already in progress" — counts the tries, names no stage', async () => {
+    // No trigger was ever accepted, so the plan is unknown (stagesRemaining
+    // null, no position) and the line must not read "after 0 attempts".
+    const backend = makePlanBackend({
+      triggers: [errorBody(409, 'CONFLICT', { reason: 'stage_in_flight' })],
+      reads: [
+        {
+          body: {
+            generation: { status: 'idle', errorCode: null, errorMessage: null },
+            proposals: [],
+            credits: { charged: [], balance: null },
+          },
+        },
+      ],
+    });
+    const capture: Capture = { stdout: [], stderr: [] };
+    const err = await runPlanGenerate(
+      baseOpts({ output: 'text', timeoutSeconds: 600 }),
+      makeDeps(backend.fetchImpl, capture) as never,
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).getDetail('acceptedPosts')).toBe(0);
+    expect((err as ApiError).getDetail('triggerPosts')).toBe(MAX_TRIGGER_POSTS_TOTAL);
+    const stderr = capture.stderr.join('\n');
+    expect(stderr).toContain(
+      `Generation is not making progress after ${MAX_TRIGGER_POSTS_TOTAL} tries. ` +
+        'Wait a few minutes, then run the same command again; it picks up from here.',
+    );
+    expect(stderr).not.toContain('after 0 ');
+    expect(stderr).not.toContain('Continue:');
+    const stdout = capture.stdout.join('\n');
+    expect(stdout).toContain('status      stalled (appears stuck)');
+    expect(stdout).not.toContain('remaining');
+  });
+
+  it('mixed fuse: one accepted try then "already in progress" answers — counts every try', async () => {
+    const backend = makePlanBackend({
+      triggers: [
+        { body: accepted('exploration', ['strategy', 'proposals']) },
+        errorBody(409, 'CONFLICT', { reason: 'stage_in_flight' }),
+      ],
+      reads: [
+        {
+          body: {
+            generation: { status: 'idle', errorCode: null, errorMessage: null },
+            proposals: [],
+            credits: { charged: [], balance: null },
+          },
+        },
+      ],
+    });
+    const capture: Capture = { stdout: [], stderr: [] };
+    const err = await runPlanGenerate(
+      baseOpts({ output: 'text', timeoutSeconds: 600 }),
+      makeDeps(backend.fetchImpl, capture) as never,
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).getDetail('acceptedPosts')).toBe(1);
+    expect((err as ApiError).getDetail('triggerPosts')).toBe(MAX_TRIGGER_POSTS_TOTAL);
+    const stderr = capture.stderr.join('\n');
+    expect(stderr).toContain(
+      `Stage 1/3 exploration is not making progress after ${MAX_TRIGGER_POSTS_TOTAL} tries.`,
+    );
+    const stdout = capture.stdout.join('\n');
+    expect(stdout).toContain('status      stalled (appears stuck) during stage 1/3 exploration');
+    expect(stdout).toContain('remaining   strategy, proposals');
   });
 });
 
@@ -818,12 +905,13 @@ describe('runPlanGenerate — RequestTimeoutError partial envelope', () => {
       status: 'running',
       generationStatus: 'exploring',
       proposalsStaged: 0,
+      stagesRemaining: ['strategy', 'proposals'],
     });
     const stderr = capture.stderr.join('\n');
-    expect(stderr).toContain('request timed out');
     expect(stderr).toContain(
-      `Re-attach with: testsprite test plan generate --project ${PROJECT_ID}`,
+      'Request timed out. Paused during stage 1/3 exploration. 2 stages left.',
     );
+    expect(stderr).toContain(`Continue: testsprite test plan generate --project ${PROJECT_ID}`);
   });
 });
 
@@ -885,18 +973,20 @@ describe('runPlanGenerate — RATE_LIMITED mid-poll partial envelope', () => {
       status: 'running',
       generationStatus: 'proposing',
       proposalsStaged: 0,
+      stagesRemaining: [],
     });
     const stderr = capture.stderr.join('\n');
-    expect(stderr).toContain('Rate limited by the server');
     expect(stderr).toContain(
-      `Re-attach with: testsprite test plan generate --project ${PROJECT_ID}`,
+      'Rate limited by the server (HTTP 429). Paused during stage 1/1 proposals. Nothing left to start.',
     );
+    expect(stderr).toContain(`Continue: testsprite test plan generate --project ${PROJECT_ID}`);
   });
 });
 
 describe('runPlanGenerate — SIGINT graceful detach', () => {
   it('prints the partial + honest detach hint and rethrows InterruptError (exit 130)', async () => {
     const shutdown = new ShutdownController();
+    let reads = 0;
     const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
       const url = typeof input === 'string' ? input : (input as { url: string }).url;
       const method = (init.method ?? 'GET').toUpperCase();
@@ -905,6 +995,19 @@ describe('runPlanGenerate — SIGINT graceful detach', () => {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
+      }
+      // The pre-trigger baseline read answers, so the trigger happens and the
+      // plan is known; the Ctrl-C lands in the first in-ladder poll.
+      reads += 1;
+      if (reads === 1) {
+        return new Response(
+          JSON.stringify({
+            generation: { status: 'idle', errorCode: null, errorMessage: null },
+            proposals: [],
+            credits: { charged: [], balance: null },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
       }
       // The plans long-poll hangs until the composed signal aborts.
       return new Promise<Response>((_resolve, reject) => {
@@ -924,8 +1027,371 @@ describe('runPlanGenerate — SIGINT graceful detach', () => {
     const partial = JSON.parse(capture.stdout.join('\n')) as Record<string, unknown>;
     expect(partial.status).toBe('running');
     const stderr = capture.stderr.join('\n');
-    expect(stderr).toContain('keeps running (and billing)');
+    expect(partial).toHaveProperty('stagesRemaining');
+    expect(stderr).toContain('Interrupted (SIGINT). Paused');
+    expect(stderr).not.toContain('keeps running');
+    expect(stderr).toContain('Continue: ');
     expect(stderr).toContain(`testsprite test plan generate --project ${PROJECT_ID}`);
+    // The top-level JSON envelope (src/index.ts) is built from this metadata,
+    // so it tells the same paused-stage story as the line above instead of
+    // the generic "keeps executing… test wait <runId>" run story.
+    const detach = (err as InterruptError & { planDetach?: Record<string, unknown> }).planDetach;
+    expect(detach).toEqual({
+      projectId: PROJECT_ID,
+      stagesRemaining: ['strategy', 'proposals'],
+      nextAction:
+        'Plan generation paused during stage 1/3 exploration. 2 stages left. ' +
+        `Continue: testsprite test plan generate --project ${PROJECT_ID}`,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Generate — stage position lines (one per finished stage, text mode only)
+// ---------------------------------------------------------------------------
+
+describe('runPlanGenerate — stage position lines', () => {
+  function plansAt(status: 'exploring' | 'strategizing' | 'proposing' | 'idle'): { body: unknown } {
+    return {
+      body: {
+        generation: { status, errorCode: null, errorMessage: null },
+        proposals: [],
+        credits: { charged: [], balance: null },
+      },
+    };
+  }
+
+  it('prints `stage i/N <name> done` as each stage finishes, numbered from the first trigger', async () => {
+    const backend = makePlanBackend({
+      triggers: [
+        { body: accepted('exploration', ['strategy', 'proposals']) },
+        { body: accepted('strategy', ['proposals']) },
+        { body: accepted('proposals', []) },
+      ],
+      // baseline read, then: exploring → idle → strategizing → idle → proposing → staged
+      reads: [
+        plansAt('idle'),
+        plansAt('exploring'),
+        plansAt('idle'),
+        plansAt('strategizing'),
+        plansAt('idle'),
+        plansAt('proposing'),
+        { body: stagedPlans() },
+      ],
+    });
+    const capture: Capture = { stdout: [], stderr: [] };
+    await runPlanGenerate(
+      baseOpts({ output: 'text' }),
+      makeDeps(backend.fetchImpl, capture) as never,
+    );
+    const stderr = capture.stderr.join('\n');
+    expect(stderr).toMatch(/stage 1\/3 exploration done \S+/);
+    expect(stderr).toMatch(/stage 2\/3 strategy done \S+/);
+    expect(stderr).toMatch(/stage 3\/3 proposals done \S+/);
+    expect(backend.calls.filter(c => c.method === 'POST')).toHaveLength(3);
+  });
+
+  it('JSON mode prints no stage lines', async () => {
+    const backend = makePlanBackend({
+      triggers: [{ body: accepted('proposals', []) }],
+      reads: [plansAt('idle'), plansAt('proposing'), { body: stagedPlans() }],
+    });
+    const capture: Capture = { stdout: [], stderr: [] };
+    await runPlanGenerate(
+      baseOpts({ output: 'json' }),
+      makeDeps(backend.fetchImpl, capture) as never,
+    );
+    expect(capture.stderr.join('\n')).not.toContain('stage 1/1');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Generate — stage tracker only reports "done" on evidence
+// ---------------------------------------------------------------------------
+
+describe('runPlanGenerate — stage tracker evidence gates', () => {
+  function plansAt(status: 'exploring' | 'strategizing' | 'proposing' | 'idle'): { body: unknown } {
+    return {
+      body: {
+        generation: { status, errorCode: null, errorMessage: null },
+        proposals: [],
+        credits: { charged: [], balance: null },
+      },
+    };
+  }
+
+  it('a failed stage is never announced as done', async () => {
+    const backend = makePlanBackend({
+      triggers: [{ body: accepted('strategy', ['proposals']) }],
+      reads: [
+        plansAt('idle'),
+        {
+          body: {
+            generation: {
+              status: 'failed',
+              errorCode: 'strategy_generation_stale',
+              errorMessage: 'strategy generation crashed',
+            },
+            proposals: [],
+            credits: { charged: [], balance: null },
+          },
+        },
+      ],
+    });
+    const capture: Capture = { stdout: [], stderr: [] };
+    const err = await runPlanGenerate(
+      baseOpts({ output: 'text' }),
+      makeDeps(backend.fetchImpl, capture) as never,
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).exitCode).toBe(1);
+    expect(capture.stderr.join('\n')).not.toContain('done');
+  });
+
+  it('idle before the stage was seen running does not count as finished; the real completion prints once', async () => {
+    const backend = makePlanBackend({
+      triggers: [
+        { body: accepted('exploration', ['strategy', 'proposals']) },
+        { body: accepted('strategy', ['proposals']) },
+        { body: accepted('proposals', []) },
+      ],
+      // baseline, then the not-yet-started idle read, then the stage runs.
+      reads: [
+        plansAt('idle'),
+        plansAt('idle'),
+        plansAt('exploring'),
+        plansAt('exploring'),
+        plansAt('idle'),
+        plansAt('strategizing'),
+        plansAt('idle'),
+        plansAt('proposing'),
+        { body: stagedPlans() },
+      ],
+    });
+    const capture: Capture = { stdout: [], stderr: [] };
+    // Interleave a marker into the captured stderr before every GET so the
+    // ORDER of the stage line relative to the reads is observable: reads 1-2
+    // are idle (baseline + not-started), reads 3-4 report exploring, read 5 is
+    // the idle that means "finished". The done line must come after read 5,
+    // never after read 2 (which is where the previous tracker printed it).
+    let gets = 0;
+    const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+      if ((init.method ?? 'GET').toUpperCase() === 'GET') capture.stderr.push(`__GET ${++gets}__`);
+      return backend.fetchImpl(input, init);
+    }) as FetchImpl;
+    await runPlanGenerate(baseOpts({ output: 'text' }), makeDeps(fetchImpl, capture) as never);
+    const lines = capture.stderr;
+    const stderr = lines.join('\n');
+    expect(stderr.match(/stage 1\/3 exploration done/g)).toHaveLength(1);
+    expect(stderr.match(/stage 2\/3 strategy done/g)).toHaveLength(1);
+    expect(stderr.match(/stage 3\/3 proposals done/g)).toHaveLength(1);
+    const doneAt = lines.findIndex(l => l.includes('stage 1/3 exploration done'));
+    expect(doneAt).toBeGreaterThan(lines.indexOf('__GET 5__'));
+    expect(lines.indexOf('__GET 6__') === -1 || doneAt < lines.indexOf('__GET 6__')).toBe(true);
+  });
+
+  it('proposals: an idle read with nothing staged yet does not count as done; the staged read does, once', async () => {
+    const backend = makePlanBackend({
+      triggers: [{ body: accepted('proposals', []) }],
+      // baseline, proposing, the idle-but-empty blip the ladder polls through,
+      // proposing again, then the real staged batch.
+      reads: [
+        plansAt('idle'),
+        plansAt('proposing'),
+        plansAt('idle'),
+        plansAt('proposing'),
+        { body: stagedPlans() },
+      ],
+    });
+    const capture: Capture = { stdout: [], stderr: [] };
+    let gets = 0;
+    const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+      if ((init.method ?? 'GET').toUpperCase() === 'GET') capture.stderr.push(`__GET ${++gets}__`);
+      return backend.fetchImpl(input, init);
+    }) as FetchImpl;
+    await runPlanGenerate(baseOpts({ output: 'text' }), makeDeps(fetchImpl, capture) as never);
+    const lines = capture.stderr;
+    expect(lines.join('\n').match(/stage 1\/1 proposals done/g)).toHaveLength(1);
+    // Printed only after the fifth read (the staged one), never at the blip (read 3).
+    const doneAt = lines.findIndex(l => l.includes('stage 1/1 proposals done'));
+    expect(doneAt).toBeGreaterThan(lines.indexOf('__GET 5__'));
+  });
+
+  it('a stage seen running that then FAILS is never announced as done (the failed guard, not the active gate)', async () => {
+    // Round-3 mutant: with `if (status === 'failed') return` removed, the
+    // failed read looks like "active → not active" and prints `done`.
+    const backend = makePlanBackend({
+      triggers: [{ body: accepted('strategy', ['proposals']) }],
+      reads: [
+        plansAt('idle'),
+        plansAt('strategizing'),
+        {
+          body: {
+            generation: {
+              status: 'failed',
+              errorCode: 'strategy_generation_stale',
+              errorMessage: 'strategy generation crashed',
+            },
+            proposals: [],
+            credits: { charged: [], balance: null },
+          },
+        },
+      ],
+    });
+    const capture: Capture = { stdout: [], stderr: [] };
+    const err = await runPlanGenerate(
+      baseOpts({ output: 'text' }),
+      makeDeps(backend.fetchImpl, capture) as never,
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).exitCode).toBe(1);
+    expect(capture.stderr.join('\n')).not.toContain('done');
+  });
+
+  it('a stage that finished between two polls is marked done when the NEXT stage is seen running — before that stage finishes', async () => {
+    // Round-3 mutant: the later-active `markDone(this.current)` branch. The
+    // accepted-trigger loop would eventually catch exploration up, but only
+    // AFTER strategy's own done line — so the order is the discriminator.
+    const backend = makePlanBackend({
+      triggers: [
+        { body: accepted('exploration', ['strategy', 'proposals']) },
+        { body: accepted('proposals', []) },
+      ],
+      reads: [
+        plansAt('idle'),
+        plansAt('strategizing'),
+        plansAt('idle'),
+        plansAt('proposing'),
+        { body: stagedPlans() },
+      ],
+    });
+    const capture: Capture = { stdout: [], stderr: [] };
+    await runPlanGenerate(
+      baseOpts({ output: 'text' }),
+      makeDeps(backend.fetchImpl, capture) as never,
+    );
+    const lines = capture.stderr;
+    const stderr = lines.join('\n');
+    // Never seen running itself, so no elapsed suffix.
+    expect(stderr.match(/^stage 1\/3 exploration done$/gm)).toHaveLength(1);
+    expect(stderr.match(/stage 2\/3 strategy done \S+/g)).toHaveLength(1);
+    expect(stderr.match(/stage 3\/3 proposals done/g)).toHaveLength(1);
+    const explorationAt = lines.findIndex(l => l.includes('stage 1/3 exploration done'));
+    const strategyAt = lines.findIndex(l => l.includes('stage 2/3 strategy done'));
+    expect(explorationAt).toBeLessThan(strategyAt);
+  });
+
+  it('a stage never seen running is marked done by the next ACCEPTED trigger (the predecessor loop)', async () => {
+    // Round-3 mutant: the `for (const s of this.planned)` loop in onTrigger.
+    // Exploration is accepted, two idle reads follow (finished before our
+    // first poll), the ladder re-POSTs and strategy is accepted: that
+    // acceptance is the only evidence exploration finished.
+    const backend = makePlanBackend({
+      triggers: [
+        { body: accepted('exploration', ['strategy', 'proposals']) },
+        { body: accepted('strategy', ['proposals']) },
+        { body: accepted('proposals', []) },
+      ],
+      reads: [
+        plansAt('idle'),
+        plansAt('idle'),
+        plansAt('idle'),
+        plansAt('strategizing'),
+        plansAt('idle'),
+        plansAt('proposing'),
+        { body: stagedPlans() },
+      ],
+    });
+    const capture: Capture = { stdout: [], stderr: [] };
+    let gets = 0;
+    const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+      if ((init.method ?? 'GET').toUpperCase() === 'GET') capture.stderr.push(`__GET ${++gets}__`);
+      return backend.fetchImpl(input, init);
+    }) as FetchImpl;
+    await runPlanGenerate(baseOpts({ output: 'text' }), makeDeps(fetchImpl, capture) as never);
+    const lines = capture.stderr;
+    expect(lines.join('\n').match(/^stage 1\/3 exploration done$/gm)).toHaveLength(1);
+    // Printed at the second accepted trigger: after read 3, before read 4.
+    const doneAt = lines.findIndex(l => l.includes('stage 1/3 exploration done'));
+    expect(doneAt).toBeGreaterThan(lines.indexOf('__GET 3__'));
+    expect(doneAt).toBeLessThan(lines.indexOf('__GET 4__'));
+  });
+
+  it('stuck fuse after an earlier stage really ran: that stage is done, the stuck one is named', async () => {
+    // Exploration is seen running and then idle; strategy is accepted again
+    // and again but never seen running, until the accepted-POST fuse trips.
+    const backend = makePlanBackend({
+      triggers: [
+        { body: accepted('exploration', ['strategy', 'proposals']) },
+        { body: accepted('strategy', ['proposals']) },
+      ],
+      reads: [plansAt('idle'), plansAt('exploring'), plansAt('idle')],
+    });
+    const capture: Capture = { stdout: [], stderr: [] };
+    const err = await runPlanGenerate(
+      baseOpts({ output: 'text', timeoutSeconds: 600 }),
+      makeDeps(backend.fetchImpl, capture) as never,
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).getDetail('acceptedPosts')).toBe(PLAN_GENERATION_STAGES.length);
+    const stderr = capture.stderr.join('\n');
+    expect(stderr.match(/stage 1\/3 exploration done/g)).toHaveLength(1);
+    expect(stderr).not.toContain('strategy done');
+    expect(stderr).toContain(
+      `Stage 2/3 strategy is not making progress after ${PLAN_GENERATION_STAGES.length} tries.`,
+    );
+    expect(stderr).not.toContain('Continue:');
+    const stdout = capture.stdout.join('\n');
+    expect(stdout).toContain('status      stalled (appears stuck) during stage 2/3 strategy');
+    expect(stdout).toContain('remaining   proposals');
+  });
+
+  it('interrupted before the stage was seen running: still "during" that stage, only later stages left', async () => {
+    const shutdown = new ShutdownController();
+    let gets = 0;
+    const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+      const url = typeof input === 'string' ? input : (input as { url: string }).url;
+      const method = (init.method ?? 'GET').toUpperCase();
+      if (method === 'POST' && url.includes('/plans/generate')) {
+        return new Response(JSON.stringify(accepted('exploration', ['strategy', 'proposals'])), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      gets += 1;
+      if (gets === 1) {
+        // The pre-trigger baseline read answers normally (idle, nothing staged).
+        return new Response(JSON.stringify(plansAt('idle').body), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      // The first in-ladder read hangs until Ctrl-C.
+      return new Promise<Response>((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => reject(init.signal!.reason as Error), {
+          once: true,
+        });
+        queueMicrotask(() => shutdown.interrupt('SIGINT'));
+      });
+    }) as FetchImpl;
+    const capture: Capture = { stdout: [], stderr: [] };
+    const err = await runPlanGenerate(
+      baseOpts({ output: 'text' }),
+      makeDeps(fetchImpl, capture, { shutdown }) as never,
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(InterruptError);
+    const stdout = capture.stdout.join('\n');
+    const stderr = capture.stderr.join('\n');
+    expect(stderr).not.toContain('done');
+    // Accepted means started (and charged) even before a poll reports it
+    // running, so it is neither "not started" nor left.
+    expect(stderr).toContain(
+      'Interrupted (SIGINT). Paused during stage 1/3 exploration. 2 stages left.',
+    );
+    expect(stdout).toContain(
+      'status      paused (interrupted (SIGINT)) during stage 1/3 exploration',
+    );
+    expect(stdout).toContain('remaining   strategy, proposals');
   });
 });
 
@@ -1033,7 +1499,7 @@ describe('runPlanGenerate — 412/402/404/429 reason matrix', () => {
     const { err, capture } = await triggerError(429, 'RATE_LIMITED', {});
     expect(err.code).toBe('RATE_LIMITED');
     expect(err.exitCode).toBe(11);
-    expect(capture.stderr.join('\n')).toContain('Re-attach with');
+    expect(capture.stderr.join('\n')).toContain('Continue: testsprite test plan generate');
   });
 });
 
@@ -1324,7 +1790,9 @@ describe('test plan generate — --timeout default wiring', () => {
       expect((err as ApiError).code).toBe('UNSUPPORTED');
       expect((err as ApiError).exitCode).toBe(7);
       expect((err as ApiError).getDetail('timeoutSeconds')).toBe(1800);
-      expect((err as ApiError).message).toContain('Timed out after 1800s');
+      expect((err as ApiError).message).toContain(
+        `Timed out after 1800s waiting for plan generation on project ${PROJECT_ID}`,
+      );
     } finally {
       Date.now = realDateNow;
     }

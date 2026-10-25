@@ -15,10 +15,10 @@ describe('blockedTargetReason', () => {
     '::0:ffff:a9fe:a9fe',
     '64:ff9b::a9fe:a9fe',
     // Non-canonical NAT64 prefix — in neither RFC 6052's `64:ff9b::/96` nor RFC 8215's
-    // `64:ff9b:1::/48`, but inside the `64:ff9b::/32` superset (VENDOR.md #11).
+    // `64:ff9b:1::/48`, but inside upstream's `64:ff9b::/32` superset.
     '64:ff9b:ffff::a9fe:a9fe',
     // Outside the old `::/96` IPv4-compatible check, but inside the `::/32` superset
-    // (VENDOR.md #11).
+    // adopted from upstream.
     '::1:2:3:4:5:6',
     '2002:a9fe:a9fe::',
     '2001:0000:4136:e378:8000:63bf:3fff:fdd2',

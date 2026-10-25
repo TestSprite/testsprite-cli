@@ -70,6 +70,7 @@ export interface CliTestListRunAccepted {
  * is a 404). `reason` is set only when nothing dispatched (empty list).
  */
 export interface CliTestListRunResponse {
+  tunnelClientId?: string;
   accepted: CliTestListRunAccepted[];
   conflicts: RunConflict[];
   deferred: Array<{ testId: string }>;

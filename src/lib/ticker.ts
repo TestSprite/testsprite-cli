@@ -27,6 +27,15 @@ export interface Ticker {
    */
   finalize(line?: string): void;
   /**
+   * Print a standalone line while the ticker is live: on a TTY the
+   * in-place progress line is cleared first so the note lands on its own
+   * row (a plain `stderr.write` would be appended to the tail of the
+   * progress line, whose writer never emits a newline). On a non-TTY the
+   * line is written as is. Use this for every stderr line a command prints
+   * between `update()` calls (hints, advisories, stage transitions).
+   */
+  note(line: string): void;
+  /**
    * True only when `update()` redraws the SAME terminal line (TTY, ANSI
    * allowed). False on a non-TTY (updates are no-ops) and under NO_COLOR
    * (every update prints a new line). The one signal a between-polls
@@ -178,6 +187,7 @@ export function createTicker(
       redrawsInPlace: false,
       update: () => undefined,
       finalize: () => undefined,
+      note: (line: string) => stderrWrite(line),
     };
   }
 
@@ -197,6 +207,11 @@ export function createTicker(
           lastLength = stamped.length;
         }
         void stderrWrite;
+      },
+      note(line: string): void {
+        // Every update is already its own line here; nothing to clear.
+        stderrWrite(line);
+        lastLength = 0;
       },
     };
   }
@@ -218,8 +233,19 @@ export function createTicker(
       if (lastLength > 0) {
         // Move to a fresh line so the result block doesn't run into the ticker.
         rawWrite('\n');
+        // The live line is gone: a second finalize() (e.g. the failed-stage
+        // branch, then the catch-all) must not emit a stray blank line.
+        lastLength = 0;
       }
       void stderrWrite; // reference to suppress unused warning
+    },
+    note(line: string): void {
+      // Clear the live progress line (same ESC[2K + \r as update), then
+      // print the note with its own newline through the SAME raw writer so
+      // ordering is preserved. The next update() redraws below it.
+      if (lastLength > 0) rawWrite('\x1b[2K\r');
+      rawWrite(`${line}\n`);
+      lastLength = 0;
     },
   };
 }

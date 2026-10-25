@@ -98,7 +98,7 @@ class MemorySocket extends Duplex {
 
   override _destroy(_error: Error | null, callback: (error?: Error | null) => void): void {
     if (this.peer?.destroyed === false) this.peer.push(null);
-    callback();
+    callback(_error);
   }
 }
 
@@ -644,6 +644,144 @@ describe('TunnelClient TLS data plane', () => {
     }
   });
 
+  // Ported from upstream client.deadline.test.ts: a healthy session ending is
+  // distinct from a failed retry, and user callbacks cannot stop deadline cleanup.
+  it.each(['close', 'error'])(
+    'starts the failure deadline only at a failed retry after an established %s',
+    async disconnect => {
+      vi.useFakeTimers();
+      const connections = new Set<MemoryConnection>();
+      let stable!: MemoryConnection;
+      let attempts = 0;
+      const errors: Array<{ code: ErrCode; message: string }> = [];
+      const warnings: string[] = [];
+      vi.spyOn(net, 'connect').mockImplementation((() => {
+        if (++attempts > 1) {
+          const socket = createPendingSocket();
+          queueMicrotask(() => socket.destroy(new Error('retry refused')));
+          return socket;
+        }
+        stable = createMemoryConnection();
+        connections.add(stable);
+        queueMicrotask(() => stable.client.emit('connect'));
+        return stable.client;
+      }) as typeof net.connect);
+      const { client, controlSocket } = await startClient({
+        tunnelAddr: 'selfhost.example:7400',
+        reconnectMs: 300,
+        dataPlaneSettleMs: 20,
+        dataPlaneRetryDeadlineMs: 100,
+        onError: error => errors.push(error),
+        logSink: (level, line) => {
+          if (level === 'warn') warnings.push(line);
+        },
+      });
+      try {
+        requestTunnel(controlSocket);
+        await vi.advanceTimersByTimeAsync(20);
+        stable.client.destroy(
+          disconnect === 'error' ? new Error(`established connection reset ${SECRET}`) : undefined,
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        expect(errors).toEqual([]);
+        if (disconnect === 'error') {
+          expect(
+            warnings.some(line => line.includes('established connection reset [REDACTED]')),
+          ).toBe(true);
+          expect(
+            warnings.find(line => line.includes('error on established session')),
+          ).not.toContain(SECRET);
+        }
+        await vi.advanceTimersByTimeAsync(299);
+        expect(attempts).toBe(1);
+        expect(control.sockets[0]!.readyState).toBe(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(attempts).toBe(2);
+        expect(errors.map(error => error.code)).toEqual([ErrCode.TunnelDisconnected]);
+        await vi.advanceTimersByTimeAsync(99);
+        expect(errors.filter(error => error.code === ErrCode.DataPlaneUnreachable)).toHaveLength(0);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(errors.filter(error => error.code === ErrCode.DataPlaneUnreachable)).toHaveLength(1);
+        expect(control.sockets[0]!.readyState).toBe(3);
+      } finally {
+        await client.stop();
+        destroyConnections(connections);
+      }
+    },
+  );
+
+  it('still reaches the terminal deadline and tears down when onError throws', async () => {
+    vi.useFakeTimers();
+    const sockets: Socket[] = [];
+    const errors: Array<{ code: ErrCode; message: string }> = [];
+    vi.spyOn(net, 'connect').mockImplementation((() => {
+      const socket = createPendingSocket();
+      sockets.push(socket);
+      queueMicrotask(() => socket.destroy(new Error('dial refused')));
+      return socket;
+    }) as typeof net.connect);
+    const { client, controlSocket } = await startClient({
+      dataPlaneRetryDeadlineMs: 25,
+      reconnectMs: 5,
+      onError: error => {
+        errors.push(error);
+        throw new Error('callback failure');
+      },
+    });
+    try {
+      requestTunnel(controlSocket);
+      await vi.advanceTimersByTimeAsync(30);
+      expect(errors.filter(error => error.code === ErrCode.DataPlaneUnreachable)).toHaveLength(1);
+      expect(sockets.every(socket => socket.destroyed)).toBe(true);
+      expect(control.sockets[0]!.readyState).toBe(3);
+      const attemptsAtDeadline = sockets.length;
+      await vi.advanceTimersByTimeAsync(100);
+      expect(sockets).toHaveLength(attemptsAtDeadline);
+    } finally {
+      await client.stop();
+      for (const socket of sockets) socket.destroy();
+    }
+  });
+
+  it('retains and redacts a pre-establishment yamux error at the terminal deadline', async () => {
+    vi.useFakeTimers();
+    const connection = createMemoryConnection();
+    const errors: Array<{ code: ErrCode; message: string }> = [];
+    vi.spyOn(net, 'connect').mockImplementation((() => {
+      queueMicrotask(() => connection.client.emit('connect'));
+      return connection.client;
+    }) as typeof net.connect);
+    const { client, controlSocket } = await startClient({
+      dataPlaneRetryDeadlineMs: 100,
+      dataPlaneSettleMs: 1_000,
+      reconnectMs: 300,
+      onError: error => errors.push(error),
+    });
+    try {
+      requestTunnel(controlSocket);
+      await vi.advanceTimersByTimeAsync(0);
+      const runtime = (
+        client as unknown as { tunnelRuntimes: Map<string, { session?: EventEmitter }> }
+      ).tunnelRuntimes.get(TUNNEL_CONNECTION_ID);
+      expect(runtime?.session).toBeDefined();
+      runtime!.session!.emit('error', new Error(`yamux negotiation failed; credential=${SECRET}`));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(errors.filter(error => error.code === ErrCode.DataPlaneUnreachable)).toEqual([
+        {
+          code: ErrCode.DataPlaneUnreachable,
+          message:
+            'Data plane plaintext at 127.0.0.1:1 is unreachable after 100ms: ' +
+            'yamux negotiation failed; credential=[REDACTED]',
+        },
+      ]);
+      expect(errors.every(error => !error.message.includes(SECRET))).toBe(true);
+      expect(connection.client.destroyed).toBe(true);
+    } finally {
+      await client.stop();
+      connection.destroy();
+    }
+  });
+
   it('keeps retrying timed-out plaintext connects when the deadline is disabled', async () => {
     vi.useFakeTimers();
     const sockets: Socket[] = [];
@@ -942,6 +1080,24 @@ describe('TunnelClient TLS data plane', () => {
 });
 
 describe('TunnelClient tunnel address validation', () => {
+  it.each(['tunnelAddr', 'tunnelTlsAddr'] as const)(
+    'rejects a backslash in %s instead of truncating its host',
+    field => {
+      expect(
+        () =>
+          new TunnelClient({
+            clientId: CLIENT_ID,
+            secret: SECRET,
+            controlUrl: 'ws://control.test/ws',
+            tunnelAddr: 'data.example:7400',
+            [field]: 'a\\b:1',
+            tunnelTlsServername: 'data.example',
+            logSink: () => {},
+          }),
+      ).toThrow('Invalid tunnel address: a\\b:1');
+    },
+  );
+
   const rejectedAddresses = [
     'tls://data.example:443',
     'data.example/path:443',
@@ -958,6 +1114,11 @@ describe('TunnelClient tunnel address validation', () => {
     '[]:443',
     '[not-an-ipv6-literal]:443',
     '[127.0.0.1]:443',
+    'under_score.example:443',
+    '-leading.example:443',
+    'trailing-.example:443',
+    'empty..example:443',
+    'a'.repeat(64) + '.example:443',
   ];
 
   it.each(['tunnelAddr', 'tunnelTlsAddr'] as const)(
@@ -982,33 +1143,37 @@ describe('TunnelClient tunnel address validation', () => {
     },
   );
 
-  it.each(['data.example:443', '127.0.0.1:7400', '[::1]:7400', 'b\u00fccher.example:443'])(
-    'accepts a strict authority address: %s',
-    address => {
-      expect(
-        () =>
-          new TunnelClient({
-            clientId: CLIENT_ID,
-            secret: SECRET,
-            controlUrl: 'ws://control.test/ws',
-            tunnelAddr: address,
-            logSink: () => {},
-          }),
-      ).not.toThrow();
-      expect(
-        () =>
-          new TunnelClient({
-            clientId: CLIENT_ID,
-            secret: SECRET,
-            controlUrl: 'ws://control.test/ws',
-            tunnelAddr: 'data.example:7400',
-            tunnelTlsAddr: address,
-            tunnelTlsServername: 'data.example',
-            logSink: () => {},
-          }),
-      ).not.toThrow();
-    },
-  );
+  it.each([
+    'data.example:443',
+    '127.0.0.1:7400',
+    '[::1]:7400',
+    'b\u00fccher.example:443',
+    'DATA.Example.:443',
+    '[2001:DB8::1]:7400',
+  ])('accepts a strict authority address: %s', address => {
+    expect(
+      () =>
+        new TunnelClient({
+          clientId: CLIENT_ID,
+          secret: SECRET,
+          controlUrl: 'ws://control.test/ws',
+          tunnelAddr: address,
+          logSink: () => {},
+        }),
+    ).not.toThrow();
+    expect(
+      () =>
+        new TunnelClient({
+          clientId: CLIENT_ID,
+          secret: SECRET,
+          controlUrl: 'ws://control.test/ws',
+          tunnelAddr: 'data.example:7400',
+          tunnelTlsAddr: address,
+          tunnelTlsServername: 'data.example',
+          logSink: () => {},
+        }),
+    ).not.toThrow();
+  });
 });
 
 describe('TunnelClient data-plane retry deadline validation', () => {

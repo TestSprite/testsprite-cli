@@ -17,7 +17,6 @@ describe('routingLabel', () => {
 describe('V3 routing advisory', () => {
   it('names the open behavior gaps', () => {
     const text = V3_ROUTING_ADVISORY.join('\n');
-    expect(text).toContain('--target-url');
     expect(text).toContain('rerun');
   });
 
@@ -26,6 +25,7 @@ describe('V3 routing advisory', () => {
     const text = V3_ROUTING_ADVISORY.join('\n');
     expect(text).not.toContain('test cancel');
     expect(text).not.toContain('zombie');
+    expect(text).not.toContain('--target-url');
   });
 
   it('emitV3RoutingAdvisory writes every line to the sink', () => {
