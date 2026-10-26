@@ -1307,7 +1307,7 @@ export type CiRunOptions = Omit<
  */
 export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise<void> {
   const env = deps.env ?? process.env;
-  const stdout = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
+  const stdout = deps.stdout;
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   if (opts.targetUrl !== undefined && opts.targetUrl.trim() === '') {
     throw localValidationError('target-url', 'must be a non-empty URL');
@@ -1387,7 +1387,7 @@ export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise
 function skipCiRun(
   notice: string,
   output: OutputMode,
-  io: { env: NodeJS.ProcessEnv; stdout: (line: string) => void; stderr: (line: string) => void },
+  io: { env: NodeJS.ProcessEnv; stdout?: (line: string) => void; stderr: (line: string) => void },
 ): void {
   io.stderr(`::notice title=TestSprite::${notice}`);
   const nothing: CiSummary = { total: 0, passed: 0, failed: 0, skipped: 0, timedOut: 0, runs: [] };
