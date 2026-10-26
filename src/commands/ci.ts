@@ -10,7 +10,7 @@ import {
 import { ApiError, CLIError, localValidationError } from '../lib/errors.js';
 import { loadConfig, resolveProfileName } from '../lib/config.js';
 import { type FetchImpl, type HttpClient } from '../lib/http.js';
-import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
+import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import type { Page } from '../lib/pagination.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import {
@@ -1307,6 +1307,7 @@ export type CiRunOptions = Omit<
  */
 export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise<void> {
   const env = deps.env ?? process.env;
+  const stdout = deps.stdout ?? ((line: string) => process.stdout.write(`${line}\n`));
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   if (opts.targetUrl !== undefined && opts.targetUrl.trim() === '') {
     throw localValidationError('target-url', 'must be a non-empty URL');
@@ -1335,7 +1336,8 @@ export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise
       recordTelemetryExtras({ ciRunOutcome: 'skipped_draft' });
       skipCiRun(
         `Skipping draft pull request #${github.trigger.prNumber}; the gate runs once it is ready for review.`,
-        { env, stderr },
+        opts.output,
+        { env, stdout, stderr },
       );
       return;
     }
@@ -1347,7 +1349,11 @@ export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise
   } else if (github.kind === 'no_pull_request' && github.event === 'deployment_status') {
     // A deployment that belongs to no pull request has nothing to gate.
     recordTelemetryExtras({ ciRunOutcome: 'skipped_no_pr' });
-    skipCiRun(`Skipping: ${github.reason}; nothing to gate.`, { env, stderr });
+    skipCiRun(`Skipping: ${github.reason}; nothing to gate.`, opts.output, {
+      env,
+      stdout,
+      stderr,
+    });
     return;
   }
 
@@ -1373,15 +1379,21 @@ export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise
  * A `ci run` that has nothing to gate (a draft PR, a deployment with no pull
  * request) exits 0 with a `::notice::` — and still writes its step outputs, as
  * zeros, so a later step reading `steps.<id>.outputs.passed` sees a number
- * rather than an empty string. Nothing was dispatched, so nothing else (job
+ * rather than an empty string. Under `--output json` stdout carries the
+ * result too, `{skipped: true, reason, summary}`, so a script parsing it never
+ * reads an empty string either. Nothing was dispatched, so nothing else (job
  * summary, summary file, report) is written: those describe runs.
  */
 function skipCiRun(
   notice: string,
-  io: { env: NodeJS.ProcessEnv; stderr: (line: string) => void },
+  output: OutputMode,
+  io: { env: NodeJS.ProcessEnv; stdout: (line: string) => void; stderr: (line: string) => void },
 ): void {
   io.stderr(`::notice title=TestSprite::${notice}`);
   const nothing: CiSummary = { total: 0, passed: 0, failed: 0, skipped: 0, timedOut: 0, runs: [] };
+  if (output === 'json') {
+    new Output(output, io).print({ skipped: true, reason: notice, summary: nothing });
+  }
   emitCiStepOutputs(nothing, io);
 }
 

@@ -788,6 +788,54 @@ describe('ci run — pull request context and single-execution admission', () =>
     expect(none.outputs()).toBe('total=0\npassed=0\nfailed=0\nskipped=0\ntimedOut=0\n');
   });
 
+  const skips = [
+    [
+      'a draft pull request',
+      'pull_request',
+      { pull_request: { number: 7, draft: true, head: { sha: SHA } } },
+      'Skipping draft pull request #7; the gate runs once it is ready for review.',
+    ],
+    [
+      'a deployment with no pull request',
+      'deployment_status',
+      { deployment: { sha: SHA } },
+      'nothing to gate',
+    ],
+  ] as const;
+
+  it.each(skips)(
+    'under --output json, %s still prints a result on stdout',
+    async (_label, event, payload, notice) => {
+      const h = harness(undefined, 'passed', { pulls: [] });
+      await runCiRun(
+        { ...h.opts, environment: 'staging', targetUrl: PREVIEW },
+        githubEnv(h, event, payload, { GITHUB_TOKEN: 'ghs_x' }),
+      );
+      expect(h.dispatches()).toEqual([]);
+      const result = JSON.parse(h.stdout.join('\n')) as { reason: string };
+      // The zeroed CiSummary the step outputs carry, under the key a run's
+      // envelope uses, so `jq .summary.passed` reads on every path.
+      expect(result).toEqual({
+        skipped: true,
+        reason: expect.stringContaining(notice) as unknown,
+        summary: { total: 0, passed: 0, failed: 0, skipped: 0, timedOut: 0, runs: [] },
+      });
+      expect(h.stderr).toContain(`::notice title=TestSprite::${result.reason}`);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- Harness-owned summary path under this test's mkdtemp directory; no external path input.
+      expect(existsSync(h.opts.summaryFile!)).toBe(false);
+    },
+  );
+
+  it.each(skips)('in text mode, %s prints nothing on stdout', async (_label, event, payload) => {
+    const h = harness(undefined, 'passed', { pulls: [] });
+    await runCiRun(
+      { ...h.opts, output: 'text', environment: 'staging', targetUrl: PREVIEW },
+      githubEnv(h, event, payload, { GITHUB_TOKEN: 'ghs_x' }),
+    );
+    expect(h.stdout).toEqual([]);
+    expect(h.stderr.some(s => s.startsWith('::notice'))).toBe(true);
+  });
+
   it('a backend that does not echo the admission mode is refused with exit 7, after publishing', async () => {
     const h = harness(undefined, 'passed', { echo: false });
     await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({
