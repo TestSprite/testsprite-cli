@@ -16228,6 +16228,23 @@ function parseNumericFlag(raw: string | undefined, flagName: string): number | u
   return n;
 }
 
+/**
+ * `--expected-step-count` must distinguish "flag omitted" from an explicitly
+ * blank/whitespace shell expansion (`""` / `"  "`). `Number("")` is 0, which
+ * would otherwise silently become `If-Match-Step-Count: 0`.
+ */
+export function parseExpectedStepCountFlag(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  if (raw.trim() === '') {
+    throw localValidationError(
+      'expected-step-count',
+      'must be a non-empty non-negative integer (blank/whitespace is not allowed; omit the flag to skip the precondition)',
+    );
+  }
+  return parseNumericFlag(raw, 'expected-step-count');
+}
+
+
 function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
@@ -18360,7 +18377,7 @@ function createTestPlanCommand(deps: TestDeps): Command {
           ...resolveCommonOptions(command, deps.env),
           testId,
           stepsFile: cmdOpts.steps,
-          expectedStepCount: parseNumericFlag(cmdOpts.expectedStepCount, 'expected-step-count'),
+          expectedStepCount: parseExpectedStepCountFlag(cmdOpts.expectedStepCount),
           force: cmdOpts.force === true ? true : undefined,
           idempotencyKey: cmdOpts.idempotencyKey,
           dryRunSimulateError:
