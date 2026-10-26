@@ -38,6 +38,7 @@ describe('loadConfig', () => {
   ])(
     'uses complete overrides without opening an unused credentials directory ($expectedUrl)',
     ({ env, endpointUrl, expectedUrl }) => {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- Fixed fixture basename under this test's fresh mkdtemp directory; no external path input.
       mkdirSync(credentialsPath);
       expect(loadConfig({ env, endpointUrl, credentialsPath })).toEqual({
         profile: 'default',
@@ -48,11 +49,13 @@ describe('loadConfig', () => {
   );
 
   it('uses complete overrides without reading an unreadable credentials file', () => {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- Seeds only the credentials fixture under this test's fresh mkdtemp directory.
     writeFileSync(credentialsPath, '[default]\napi_key = sk-file\n');
     const readFileSync = fs.readFileSync;
     const permissionError = Object.assign(new Error('Permission denied'), { code: 'EACCES' });
     const read = vi.spyOn(fs, 'readFileSync').mockImplementation((...args) => {
       if (args[0] === credentialsPath) throw permissionError;
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- Forwards the test's internal fs calls after rejecting its controlled credentials fixture path.
       return readFileSync(...args);
     });
     try {
@@ -88,6 +91,7 @@ describe('loadConfig', () => {
   ])(
     'retains filesystem errors when a missing field needs fallback ($env)',
     ({ env, endpointUrl }) => {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- Fixed fixture basename under this test's fresh mkdtemp directory; no external path input.
       mkdirSync(credentialsPath);
       expect(() => loadConfig({ env, endpointUrl, credentialsPath })).toThrowError(
         expect.objectContaining({ code: 'EISDIR' }),
@@ -102,6 +106,7 @@ describe('loadConfig', () => {
   ])(
     'validates the selected profile before complete overrides or file access ($profile, $envProfile)',
     ({ profile, envProfile }) => {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- Fixed fixture basename under this test's fresh mkdtemp directory; no external path input.
       mkdirSync(credentialsPath);
       expect(() =>
         loadConfig({

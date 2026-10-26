@@ -351,6 +351,7 @@ describe('runDoctor — failing checks exit non-zero', () => {
       const permissionError = Object.assign(new Error('Permission denied'), { code: 'EACCES' });
       const read = vi.spyOn(fs, 'readFileSync').mockImplementation((...args) => {
         if (args[0] === credentialsPath) throw permissionError;
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- Forwards the test's internal fs calls after rejecting its controlled credentials fixture path.
         return readFileSync(...args);
       });
       try {
