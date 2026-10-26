@@ -23,6 +23,7 @@ The full reference for the TestSprite CLI: install verification, manual setup, e
   - [CI gate (`ci run`)](#ci-gate-ci-run)
   - [CI integration (`ci init`)](#ci-integration-ci-init)
   - [Account & diagnostics](#account--diagnostics)
+  - [Shell completion (`completion`)](#shell-completion-completion)
 - [Configuration](#configuration)
 - [Output & scripting](#output--scripting)
 - [Continuous integration](#continuous-integration)
@@ -1309,6 +1310,84 @@ testsprite doctor && testsprite test run test_xxxxxxxx --wait
 ```
 
 Every check reuses the same helpers the real commands use, so the report reflects exactly what a subsequent command would resolve. For an org-scoped key, the report also lists `Organizations` (account-wide membership list) and `Org binding` (this key's bound organization) checks.
+
+### Shell completion (`completion`)
+
+`testsprite completion [shell]` prints a completion script for Bash, Zsh, or
+Fish to stdout. It does not install the script or edit your shell configuration.
+Generating the script needs no API key and does not call the TestSprite API or
+consume credits.
+
+```bash
+testsprite completion bash
+testsprite completion zsh
+testsprite completion fish
+```
+
+Without an argument, the command detects the shell from `$SHELL`. That variable
+can name your login shell rather than the shell you are currently using, so pass
+the shell explicitly in startup files. Missing or unsupported shell names fail
+with `VALIDATION_ERROR` (exit 5). PowerShell and CMD are not supported; Windows
+users can use the Bash instructions inside Git Bash instead. The output is shell
+code, not JSON, even when `--output json` is set.
+
+#### Bash
+
+Enable completion in the current interactive Bash session:
+
+```bash
+eval "$(testsprite completion bash)"
+```
+
+For future sessions, add that line once to `~/.bashrc` after the configuration
+that puts `testsprite` on your `PATH`, then open a new Bash session. The same
+instructions work in Git Bash on Windows; do not run the Bash code in PowerShell.
+Check registration with `complete -p testsprite`. To disable it for the current
+session, run `complete -r testsprite`; remove the startup line to stop enabling it
+in new sessions.
+
+#### Zsh
+
+Initialize Zsh's completion system, then load the generated script:
+
+```zsh
+autoload -Uz compinit
+compinit
+source <(testsprite completion zsh)
+```
+
+For future sessions, add the `source` line once to `~/.zshrc`, after completion
+initialization and the configuration that puts `testsprite` on your `PATH`. If
+your shell framework already calls `compinit`, use that initialization rather
+than adding a second call. Remove the `source` line and start a new session to
+disable the completion.
+
+#### Fish
+
+Enable completion in the current interactive Fish session:
+
+```fish
+testsprite completion fish | source
+```
+
+For future sessions, save the script in Fish's per-user completions directory:
+
+```fish
+mkdir -p "$__fish_config_dir/completions"
+testsprite completion fish > "$__fish_config_dir/completions/testsprite.fish"
+```
+
+Fish loads that file when it needs completion for `testsprite`. Regenerate it
+after upgrading the CLI so it reflects the installed command set. To disable it,
+remove the generated `testsprite.fish` file and start a new Fish session.
+
+**Scope and troubleshooting.** These are static suggestions, not live project or
+test lookups. The current scripts describe top-level commands and their immediate
+subcommands; they do not model the full nested command tree, command-specific
+flags, or option values. Use `testsprite <command> --help` for the authoritative
+syntax. If completion is missing, first check `testsprite --version` in that same
+shell, confirm you loaded the script for that shell, and start a new session after
+editing its startup file. An API key cannot fix shell registration or `PATH`.
 
 ## Configuration
 
