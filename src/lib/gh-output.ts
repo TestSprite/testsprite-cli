@@ -252,7 +252,10 @@ export function summarizeSingleRun(run: {
     ...(typeof run.dashboardUrl === 'string' ? { dashboardUrl: run.dashboardUrl } : {}),
     ...(typeof run.executionUrl === 'string' ? { executionUrl: run.executionUrl } : {}),
     ...(typeof run.error === 'string' && run.error.length > 0 ? { error: run.error } : {}),
-    ...(typeof run.failedStepIndex === 'number' ? { failedStepIndex: run.failedStepIndex } : {}),
+    ...((run.status === 'failed' || run.status === 'blocked') &&
+    typeof run.failedStepIndex === 'number'
+      ? { failedStepIndex: run.failedStepIndex }
+      : {}),
   };
   const passed = row.status === 'passed' ? 1 : 0;
   const timedOut = row.status === 'timeout' ? 1 : 0;

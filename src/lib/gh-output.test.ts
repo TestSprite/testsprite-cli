@@ -226,6 +226,12 @@ describe('single-run annotation: failed step (#672)', () => {
     expect(summarizeSingleRun(run).runs[0]).not.toHaveProperty('failedStepIndex');
     expect(annotationsFor(run)).toEqual(['::error title=TestSprite test_b::status=failed boom']);
   });
+
+  it('drops the step unless the run failed or was blocked', () => {
+    const run = { testId: 'test_b', status: 'cancelled', failedStepIndex: 3 };
+    expect(summarizeSingleRun(run).runs[0]).not.toHaveProperty('failedStepIndex');
+    expect(annotationsFor(run).join('\n')).not.toContain('(step');
+  });
 });
 
 describe('renderJobSummaryMarkdown', () => {
