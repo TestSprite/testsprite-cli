@@ -188,6 +188,46 @@ describe('summarizeSingleRun', () => {
   });
 });
 
+describe('single-run annotation: failed step (#672)', () => {
+  function annotationsFor(run: Parameters<typeof summarizeSingleRun>[0]): string[] {
+    const lines: string[] = [];
+    emitGithubOutputs(
+      summarizeSingleRun(run),
+      {},
+      { stdout: line => lines.push(line), stderr: () => {}, appendFile: () => {} },
+      { force: true },
+    );
+    return lines;
+  }
+
+  it('carries failedStepIndex onto the row and names the step after the error', () => {
+    const run = {
+      testId: 'test_b',
+      runId: 'run_b',
+      status: 'failed',
+      error: 'Expected heading to be visible',
+      executionUrl: 'https://portal.example.com/exec/b',
+      failedStepIndex: 4,
+    };
+    expect(summarizeSingleRun(run).runs[0]!.failedStepIndex).toBe(4);
+    expect(annotationsFor(run)).toEqual([
+      '::error title=TestSprite test_b::status=failed Expected heading to be visible (step 4) https://portal.example.com/exec/b',
+    ]);
+  });
+
+  it('names the step when the run carries no error text', () => {
+    expect(annotationsFor({ testId: 'test_b', status: 'failed', failedStepIndex: 1 })).toEqual([
+      '::error title=TestSprite test_b::status=failed (step 1)',
+    ]);
+  });
+
+  it('leaves the row and the annotation unchanged when there is no failed step', () => {
+    const run = { testId: 'test_b', status: 'failed', error: 'boom', failedStepIndex: null };
+    expect(summarizeSingleRun(run).runs[0]).not.toHaveProperty('failedStepIndex');
+    expect(annotationsFor(run)).toEqual(['::error title=TestSprite test_b::status=failed boom']);
+  });
+});
+
 describe('renderJobSummaryMarkdown', () => {
   it('renders the counts headline and one table row per run', () => {
     const md = renderJobSummaryMarkdown(summarizeAcceptedPayload(PAYLOAD));

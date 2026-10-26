@@ -7563,6 +7563,8 @@ export function renderRunResponseText(
   if (run.startedAt) lines.push(`startedAt   ${run.startedAt}`);
   if (run.finishedAt) lines.push(`finishedAt  ${run.finishedAt}`);
   if (run.failureKind) lines.push(`failureKind ${run.failureKind}`);
+  if ((run.status === 'failed' || run.status === 'blocked') && run.failedStepIndex !== null)
+    lines.push(`failedStepIndex ${run.failedStepIndex}`);
   // D5-UX: show the human error string when status is failed/blocked and
   // the backend provided it. Truncate long multi-line errors to the first
   // line (≤200 chars) so the text output stays readable. JSON mode is
