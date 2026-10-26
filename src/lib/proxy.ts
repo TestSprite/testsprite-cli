@@ -36,15 +36,23 @@ export function maybeInstallProxyAgent(deps: ProxyDeps = {}): boolean {
   );
   if (!hasProxy) return false;
   const install = deps.install ?? setGlobalDispatcher;
-  // EnvHttpProxyAgent reads HTTPS_PROXY/HTTP_PROXY/NO_PROXY itself, per
-  // request, so NO_PROXY exemptions apply without extra plumbing here.
+  // The proxy URLs are read here, in undici's own order (lower-case first;
+  // HTTPS falls back to the HTTP proxy), so a `host:port` value can get the
+  // `http://` curl assumes; undici alone rejects it. `''` stops undici from
+  // re-reading process.env. EnvHttpProxyAgent still reads NO_PROXY itself,
+  // per request, so exemptions apply without extra plumbing here.
   //
-  // A malformed or unsupported proxy value (e.g. `socks5://...`) makes the
+  // A malformed or unsupported proxy value (e.g. `ftp://...`) makes the
   // agent throw. Because this runs at startup, an unguarded throw would abort
   // every command before the CLI's own error handling — so fall back to the
   // default (proxy-less) dispatcher and warn instead of crashing.
   try {
-    install(new EnvHttpProxyAgent());
+    install(
+      new EnvHttpProxyAgent({
+        httpProxy: withScheme(env.http_proxy ?? env.HTTP_PROXY),
+        httpsProxy: withScheme(env.https_proxy ?? env.HTTPS_PROXY),
+      }),
+    );
     return true;
   } catch (error) {
     const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
@@ -55,6 +63,11 @@ export function maybeInstallProxyAgent(deps: ProxyDeps = {}): boolean {
     );
     return false;
   }
+}
+
+function withScheme(value: string | undefined): string {
+  if (!value) return '';
+  return /^[a-z][a-z\d+.-]*:\/\//i.test(value) ? value : `http://${value}`;
 }
 
 /**
