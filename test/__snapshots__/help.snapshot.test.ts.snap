@@ -658,7 +658,9 @@ Commands:
   Exit codes:
     0  all targeted tests deleted (or --dry-run)
     1  one or more deletions failed (server error)
+    3  auth error (a rejected key on any id — outranks 1 and 14)
     5  validation error (missing --confirm, missing --project with --all, etc.)
+    14 client too old (on any id — outranks 1)
   
   Note: a 404 "not found" response is counted as skipped in the summary, not an error.
   run [options] [test-id...]            Trigger one or several test runs. Saved loopback environments open a tunnel automatically and wait for a verdict.
@@ -747,8 +749,10 @@ Commands:
   
   Exit codes:
     0  cancelled (fresh or already-cancelled — naturally idempotent)
+    3  auth error (multi-id: a rejected key on any id — outranks 4, 6 and 14)
     4  run id not found (single id), or ANY id not found (multi-id — outranks conflict)
     6  run already terminal (passed/failed/blocked) — single id: 409; multi-id: any conflict
+    14 client too old (multi-id: on any id — outranks 4 and 6)
   
   Multi-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound}.
   help [command]                        display help for command
@@ -768,8 +772,10 @@ finishes on its own and its result is discarded once cancelled.
 
 Exit codes:
   0  cancelled (fresh or already-cancelled — naturally idempotent)
+  3  auth error (multi-id: a rejected key on any id — outranks 4, 6 and 14)
   4  run id not found (single id), or ANY id not found (multi-id — outranks conflict)
   6  run already terminal (passed/failed/blocked) — single id: 409; multi-id: any conflict
+  14 client too old (multi-id: on any id — outranks 4 and 6)
 
 Multi-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound}.
 
