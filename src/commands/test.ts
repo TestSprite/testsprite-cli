@@ -16244,7 +16244,6 @@ export function parseExpectedStepCountFlag(raw: string | undefined): number | un
   return parseNumericFlag(raw, 'expected-step-count');
 }
 
-
 function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;

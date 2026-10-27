@@ -13,7 +13,9 @@ function disableExits(cmd: Command): void {
 function makeCreds(): { credentialsPath: string } {
   const dir = mkdtempSync(join(tmpdir(), 'cli-expected-step-count-'));
   const credentialsPath = join(dir, 'credentials');
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- creates this suite's own mkdtempSync temp dir, never user input
   mkdirSync(dir, { recursive: true });
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes the fixture credentials body into this suite's own mkdtempSync temp dir, never user input
   writeFileSync(
     credentialsPath,
     '[default]\napi_url = http://localhost:13503\napi_key = sk-user-test\n',
@@ -25,6 +27,7 @@ function makeCreds(): { credentialsPath: string } {
 function stepsFile(): string {
   const dir = mkdtempSync(join(tmpdir(), 'cli-expected-step-count-steps-'));
   const path = join(dir, 'steps.json');
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes steps fixture into this test's own mkdtempSync temp dir, never user input
   writeFileSync(
     path,
     JSON.stringify({
@@ -64,43 +67,40 @@ describe('parseExpectedStepCountFlag', () => {
 });
 
 describe('createTestCommand plan put --expected-step-count', () => {
-  it.each(['', '  '])(
-    'rejects blank raw value "%s" before fetch (exit 5)',
-    async raw => {
-      const { credentialsPath } = makeCreds();
-      const steps = stepsFile();
-      const fetchImpl = vi.fn<typeof globalThis.fetch>();
-      const cmd = createTestCommand({
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-      });
-      cmd.option('--output <mode>', 'output mode');
-      disableExits(cmd);
+  it.each(['', '  '])('rejects blank raw value "%s" before fetch (exit 5)', async raw => {
+    const { credentialsPath } = makeCreds();
+    const steps = stepsFile();
+    const fetchImpl = vi.fn<typeof globalThis.fetch>();
+    const cmd = createTestCommand({
+      credentialsPath,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: () => undefined,
+    });
+    cmd.option('--output <mode>', 'output mode');
+    disableExits(cmd);
 
-      await expect(
-        cmd.parseAsync(
-          [
-            'plan',
-            'put',
-            'test_1',
-            '--steps',
-            steps,
-            '--expected-step-count',
-            raw,
-            '--output',
-            'json',
-          ],
-          { from: 'user' },
-        ),
-      ).rejects.toMatchObject({
-        code: 'VALIDATION_ERROR',
-        exitCode: 5,
-        details: expect.objectContaining({ field: 'expected-step-count' }),
-      });
+    await expect(
+      cmd.parseAsync(
+        [
+          'plan',
+          'put',
+          'test_1',
+          '--steps',
+          steps,
+          '--expected-step-count',
+          raw,
+          '--output',
+          'json',
+        ],
+        { from: 'user' },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'expected-step-count' }),
+    });
 
-      expect(fetchImpl).not.toHaveBeenCalled();
-    },
-  );
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
