@@ -209,7 +209,7 @@ On an owned tunnel, Ctrl-C or a timeout cancels unfinished runs by default, and 
 
 > The earlier command names — `init`, `auth configure`, `auth whoami`, `auth logout` — still work as hidden, deprecated aliases (each prints a one-line notice pointing at the new name), so existing scripts keep running. `auth configure` now runs the full `setup` (it also installs the skill).
 
-📚 **Full reference — every command, flag, and example:** [DOCUMENTATION.md](./DOCUMENTATION.md), including [configuration & profiles](./DOCUMENTATION.md#configuration), [scripting](./DOCUMENTATION.md#output--scripting), and [exit codes](./DOCUMENTATION.md#exit-codes).
+📚 **Full reference — every command, flag, and example:** [DOCUMENTATION.md](./DOCUMENTATION.md), including [configuration & profiles](./DOCUMENTATION.md#configuration), [shell completion](./DOCUMENTATION.md#shell-completion-completion), [scripting](./DOCUMENTATION.md#output--scripting), and [exit codes](./DOCUMENTATION.md#exit-codes).
 
 ## Why a CLI for coding agents?
 
