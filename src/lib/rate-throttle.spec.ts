@@ -5,6 +5,20 @@
 import { describe, expect, it } from 'vitest';
 import { RateThrottle } from './rate-throttle.js';
 
+it('returns an unused acquisition without removing older dispatched slots', () => {
+  let now = 0;
+  const throttle = new RateThrottle(2, 60_000, () => now);
+  expect(throttle.acquire()).toBe(0);
+  now = 1000;
+  expect(throttle.acquire()).toBe(0);
+  throttle.releaseLast();
+  expect(throttle.acquire()).toBe(0);
+  expect(throttle.acquire()).toBe(59050);
+  now = 60_000;
+  expect(throttle.acquire()).toBe(0);
+  expect(throttle.acquire()).toBe(1050);
+});
+
 describe('RateThrottle', () => {
   it('returns 0 (no delay) when window is empty', () => {
     const throttle = new RateThrottle(5, 60_000);
