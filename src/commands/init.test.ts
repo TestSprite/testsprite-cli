@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import { readProfile, writeProfile } from '../lib/credentials.js';
 import type { MeResponse } from './auth.js';
@@ -65,6 +65,18 @@ function makeOkFetch(): InitDeps['fetchImpl'] {
         headers: { 'content-type': 'application/json' },
       }),
   ) as unknown as InitDeps['fetchImpl'];
+}
+
+/** Mock fetch that never answers; it rejects only when the request is aborted. */
+function makeHangingFetch(): InitDeps['fetchImpl'] {
+  return vi.fn(
+    (_input: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+          once: true,
+        });
+      }),
+  );
 }
 
 /** Mock fetch that returns 401 for any request (simulates bad key). */
@@ -503,6 +515,53 @@ describe('runInit — session-only environment credentials', () => {
     ).rejects.toBe(error);
     expect(captured.stderr).toEqual([]);
     expect(captured.stdout).toEqual([]);
+  });
+});
+
+describe('runInit: the key check against /me does not answer', () => {
+  const options = () =>
+    makeBaseOpts({ fromEnv: true, noAgent: true, output: 'json', requestTimeoutMs: 20 });
+
+  it('setup --from-env exits 7 with REQUEST_TIMEOUT, keeps the request id and saves nothing', async () => {
+    const { captured, deps } = makeCapture();
+    const err = await runInit(options(), {
+      ...deps,
+      env: { TESTSPRITE_API_KEY: 'sk-user-valid-key' },
+      credentialsPath,
+      fetchImpl: makeHangingFetch(),
+      isTTY: false,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RequestTimeoutError);
+    expect(err).toMatchObject({
+      code: 'REQUEST_TIMEOUT',
+      exitCode: 7,
+      requestId: expect.stringMatching(/^cli_/),
+    });
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    const stderr = captured.stderr.join('\n');
+    expect(stderr).toContain('timed out, profile NOT updated');
+    expect(stderr).not.toContain('API key rejected');
+    expect(captured.stdout).toEqual([]);
+  });
+
+  it('a 401 from /me still exits 3 with the typed envelope', async () => {
+    const { captured, deps } = makeCapture();
+    await expect(
+      runInit(options(), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: 'sk-user-revoked-key' },
+        credentialsPath,
+        fetchImpl: makeAuthFailFetch(),
+        isTTY: false,
+      }),
+    ).rejects.toMatchObject({
+      code: 'AUTH_INVALID',
+      exitCode: 3,
+      nextAction: 'Provide a valid key.',
+      requestId: 'r-1',
+    });
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(captured.stderr.join('\n')).toContain('API key rejected');
   });
 });
 
