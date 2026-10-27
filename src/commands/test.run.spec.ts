@@ -4536,6 +4536,65 @@ describe('runTestRunAll — batch fresh run', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 
+  // #376: a single <test-id> never reaches the zero-dispatch gate that
+  // --allow-empty softens, so the flag used to be ignored (run triggered, exit 0).
+  it.each([
+    ['plain', ['test_xyz']],
+    ['--wait', ['test_xyz', '--wait']],
+    ['--local', ['test_xyz', '--local', '3000', '--skip-preflight']],
+    ['a repeated id (one test)', ['test_xyz', 'test_xyz']],
+  ])(
+    '<test-id> --allow-empty (without --all, %s) → exit 5 before any request',
+    async (_label, args) => {
+      const { createTestCommand } = await import('./test.js');
+      const { credentialsPath } = makeCreds();
+      const fetchImpl = vi.fn(() => {
+        throw new Error('network called');
+      }) as unknown as typeof globalThis.fetch;
+      const test = createTestCommand({
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+      });
+      disableExits(test);
+      await expect(
+        test.parseAsync(['run', ...args, '--allow-empty'], { from: 'user' }),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: expect.objectContaining({ field: 'allow-empty' }),
+        nextAction:
+          'Flag `--allow-empty` is invalid: --allow-empty only applies with --all or several test ids (it permits a batch that dispatches zero tests). Remove --allow-empty, or add --all with --project <id> or TESTSPRITE_PROJECT_ID.',
+      });
+      expect(fetchImpl).not.toHaveBeenCalled();
+    },
+  );
+
+  it('control: --all --allow-empty is still accepted (an empty batch exits 0)', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const { credentialsPath } = makeCreds();
+    const emptyBatch: BatchRunFreshResponse = {
+      accepted: [],
+      conflicts: [],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const stderr: string[] = [];
+    const test = createTestCommand({
+      credentialsPath,
+      fetchImpl: makeFetch(() => ({ body: emptyBatch })),
+      stdout: () => undefined,
+      stderr: line => stderr.push(line),
+    });
+    disableExits(test);
+    await test.parseAsync(['run', '--all', '--project', 'project_be', '--allow-empty'], {
+      from: 'user',
+    });
+    expect(stderr.join('\n')).toContain('--allow-empty set — exiting 0');
+  });
+
   it('--wait polls each accepted runId and returns on all-pass (exit 0)', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch((url, init) => {
