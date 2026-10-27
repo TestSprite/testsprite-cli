@@ -2676,10 +2676,10 @@ export async function runDeleteBatch(
     );
   }
 
-  // Validate --status filter.
-  if (opts.statusFilter !== undefined) {
-    validateStatusFilter(opts.statusFilter);
-  }
+  // Validate --status filter. An empty selection is refused here, before any
+  // request: treating it as "no filter" would delete every test in the project.
+  const statusSelection =
+    opts.statusFilter !== undefined ? parseStatusSelection(opts.statusFilter) : undefined;
 
   const client = makeClient(opts, deps);
 
@@ -2709,15 +2709,9 @@ export async function runDeleteBatch(
     let allTests = allPage.items;
 
     // --status filter.
-    if (opts.statusFilter !== undefined && opts.statusFilter !== '') {
-      const allowed = new Set(
-        opts.statusFilter
-          .split(',')
-          .map(s => s.trim())
-          .filter(s => s.length > 0),
-      );
+    if (statusSelection !== undefined) {
       const before = allTests.length;
-      allTests = allTests.filter(t => allowed.has(t.status));
+      allTests = allTests.filter(t => statusSelection.has(t.status));
       const skipped = before - allTests.length;
       if (skipped > 0) {
         stderrFn(
@@ -12311,6 +12305,9 @@ function validateRerunOptions(opts: RunTestRerunOptions): boolean {
         'Remove --status, or add --all --project <id>.',
     );
   }
+  // Validate the --all selection up front so `--dry-run` refuses the same
+  // empty / invalid --status the real sweep refuses (see parseStatusSelection).
+  if (opts.statusFilter !== undefined) parseStatusSelection(opts.statusFilter);
   if (opts.skipTerminal && !opts.all) {
     throw localValidationError(
       'skip-terminal',
@@ -13213,10 +13210,10 @@ async function runTestRerunCore(
   let knownTests = opts.knownTests;
 
   if (opts.all) {
-    // Validate --status filter before any network call.
-    if (opts.statusFilter !== undefined) {
-      validateStatusFilter(opts.statusFilter);
-    }
+    // Validate --status filter before any network call. An empty selection is
+    // refused: treating it as "no filter" would rerun every test in the project.
+    const statusSelection =
+      opts.statusFilter !== undefined ? parseStatusSelection(opts.statusFilter) : undefined;
 
     // Resolve all tests in the project — follow nextToken until exhausted so
     // projects with >1 service page (>25 tests) are fully covered.
@@ -13244,15 +13241,9 @@ async function runTestRerunCore(
 
     // --status <list>: only dispatch tests whose status matches one of the
     // listed values. Tokens are already validated above.
-    if (opts.statusFilter !== undefined && opts.statusFilter !== '') {
-      const allowed = new Set(
-        opts.statusFilter
-          .split(',')
-          .map(s => s.trim())
-          .filter(s => s.length > 0),
-      );
+    if (statusSelection !== undefined) {
       const before = allTests.length;
-      allTests = allTests.filter(t => allowed.has(t.status));
+      allTests = allTests.filter(t => statusSelection.has(t.status));
       const skipped = before - allTests.length;
       if (skipped > 0) {
         stderrFn(
@@ -16199,6 +16190,32 @@ function validateStatusFilter(raw: string | undefined): void {
       );
     }
   }
+}
+
+/**
+ * Parse the `--status <list>` selection of a project-wide `--all` sweep
+ * (`test delete-batch --all`, `test rerun --all`) into the set of statuses to
+ * keep. Unlike `test list --status`, where an empty value harmlessly means
+ * "no filter", these sweeps permanently delete tests or spend run credits, and
+ * "no filter" means EVERY test in the project. A `--status` that was given but
+ * names no status (`--status ""`, `--status=`, `--status "$UNSET_VAR"`,
+ * `--status ,`) is therefore refused with VALIDATION_ERROR (exit 5) before any
+ * request, instead of silently widening the sweep to the whole project.
+ */
+function parseStatusSelection(raw: string): Set<string> {
+  validateStatusFilter(raw);
+  const tokens = raw
+    .split(',')
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+  if (tokens.length === 0) {
+    throw localValidationError(
+      'status',
+      `must name at least one status (comma-separated; accepted: ${PUBLIC_STATUSES.join(', ')}) — an empty --status would select every test in the project. Omit --status to target every test on purpose`,
+      [...PUBLIC_STATUSES],
+    );
+  }
+  return new Set(tokens);
 }
 
 function parseEnumFlag<T extends string>(

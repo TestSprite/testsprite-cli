@@ -440,6 +440,8 @@ testsprite test delete-batch --all --project proj_xxxxxxxx --confirm
 testsprite test delete test_xxxxxxxx --dry-run --output json
 ```
 
+With `--all`, a `--status` that names no status (`--status ""`, an unset shell variable, `--status ,`) exits 5 before any request instead of selecting every test. Omit `--status` to target every test on purpose. The same applies to `test rerun --all --status`.
+
 #### `testsprite test code put <test-id>`
 
 Replace the generated test code with a new file. **The replacement must be Python** — the execution engine runs the stored code with Python `exec()` (frontend: Playwright `playwright.async_api`; backend: `requests` + assertions), so a TypeScript/JavaScript file would fail at run time with a `SyntaxError`. The CLI uses an etag (`codeVersion`) for optimistic-concurrency control: it auto-fetches the current version, or pass `--expected-version` to pin one, or `--force` to skip the guard.

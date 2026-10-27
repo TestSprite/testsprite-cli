@@ -874,6 +874,87 @@ describe('runDeleteBatch (dogfood L1796)', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   });
 
+  // An empty --status (e.g. `--status "$STATUSES"` with the variable unset, or
+  // `--status=`) used to be read as "no filter" and permanently delete EVERY
+  // test in the project, while `--status ,` deleted none.
+  it.each([
+    ['empty string', ''],
+    ['whitespace only', '   '],
+    ['separators only', ' , ,'],
+  ])('exit 5 and NOTHING deleted when --all --status is %s', async (_label, statusFilter) => {
+    const creds = makeCreds();
+    const requests: string[] = [];
+    const deletedIds: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      requests.push(`${init.method ?? 'GET'} ${url}`);
+      if (init.method === 'DELETE') {
+        const testId = decodeURIComponent(url.split('/tests/')[1]!.split('?')[0]!);
+        deletedIds.push(testId);
+        return { body: deleteResp(testId) };
+      }
+      return {
+        body: {
+          items: [
+            { id: 'test_passed', status: 'passed' },
+            { id: 'test_failed', status: 'failed' },
+          ],
+          nextToken: null,
+        },
+      };
+    });
+
+    await expect(
+      runDeleteBatch(
+        {
+          testIds: [],
+          all: true,
+          projectId: 'project_abc',
+          statusFilter,
+          confirm: true,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, fetchImpl, stderr: () => {}, stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({ field: 'status' }),
+      nextAction: expect.stringContaining('every test'),
+    });
+    expect(deletedIds).toEqual([]);
+    expect(requests).toEqual([]);
+  });
+
+  it('--dry-run --all refuses an empty --status the same way the real sweep does', async () => {
+    const creds = makeCreds();
+    const requests: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      requests.push(`${init.method ?? 'GET'} ${url}`);
+      return { body: { items: [{ id: 'test_passed', status: 'passed' }], nextToken: null } };
+    });
+    await expect(
+      runDeleteBatch(
+        {
+          testIds: [],
+          all: true,
+          projectId: 'project_abc',
+          statusFilter: '',
+          confirm: false,
+          output: 'json',
+          profile: 'default',
+          dryRun: true,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, fetchImpl, stderr: () => {}, stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    expect(requests).toEqual([]);
+  });
+
   // ---- correctness-fix tests (code-review 2026-06-04) ----------------------
 
   it('exit 5 when explicit IDs and --all are both supplied (data-loss guard)', async () => {
