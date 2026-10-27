@@ -691,13 +691,17 @@ describe('runCreateBatch --run --wait: --timeout per-run', () => {
   });
 
   it.each([
-    { terminal: 'passed', retry: false, expectedExit: 0 },
-    { terminal: 'failed', retry: false, expectedExit: 1 },
-    { terminal: 'passed', retry: true, expectedExit: 0 },
-    { terminal: 'failed', retry: true, expectedExit: 1 },
+    { terminal: 'passed', retry: false, finishOffsetMs: 1500, expectedExit: 0 },
+    { terminal: 'failed', retry: false, finishOffsetMs: 1500, expectedExit: 1 },
+    { terminal: 'passed', retry: true, finishOffsetMs: 2500, expectedExit: 0 },
+    { terminal: 'failed', retry: true, finishOffsetMs: 2500, expectedExit: 1 },
+    { terminal: 'passed', retry: false, finishOffsetMs: 2000, expectedExit: 7 },
+    { terminal: 'failed', retry: false, finishOffsetMs: 2000, expectedExit: 7 },
+    { terminal: 'passed', retry: false, finishOffsetMs: 2200, expectedExit: 7 },
+    { terminal: 'failed', retry: false, finishOffsetMs: 2200, expectedExit: 7 },
   ])(
-    'observes $terminal within the original fractional budget (retry: $retry)',
-    async ({ terminal, retry, expectedExit }) => {
+    'classifies $terminal at $finishOffsetMs ms against the original budget (retry: $retry)',
+    async ({ terminal, retry, finishOffsetMs, expectedExit }) => {
       const { credentialsPath } = makeCreds();
       const plans = writePlansJsonl([FE_SPEC]);
       const testId = 'test_fractional';
@@ -705,7 +709,7 @@ describe('runCreateBatch --run --wait: --timeout per-run', () => {
       const startMs = Date.now();
       let now = startMs;
       const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
-      const finishMs = startMs + (retry ? 2500 : 1500);
+      const finishMs = startMs + finishOffsetMs;
       const timeoutSeconds = retry ? 3 : 2;
       let triggers = 0;
       const pollTimes: number[] = [];
@@ -741,6 +745,9 @@ describe('runCreateBatch --run --wait: --timeout per-run', () => {
           pollTimes.push(now - startMs);
           const run =
             terminal === 'passed' ? makePassedRun(testId, runId) : makeFailedRun(testId, runId);
+          run.createdAt = new Date(startMs).toISOString();
+          run.startedAt = new Date(startMs + 250).toISOString();
+          run.finishedAt = new Date(finishMs).toISOString();
           return {
             body: now >= finishMs ? run : { ...run, status: 'running', finishedAt: null },
           };
@@ -776,11 +783,15 @@ describe('runCreateBatch --run --wait: --timeout per-run', () => {
 
         expect(result.exitCode).toBe(expectedExit);
         expect(JSON.parse(stdout.join('')).results).toMatchObject([
-          { testId, runId, status: terminal },
+          { testId, runId, status: expectedExit === 7 ? 'timeout' : terminal },
         ]);
         expect(triggers).toBe(retry ? 2 : 1);
         expect(pollTimes).toEqual([finishMs - startMs]);
-        expect(now - startMs).toBeLessThan(timeoutSeconds * 1000);
+        if (expectedExit === 7) {
+          expect(now - startMs).toBeGreaterThanOrEqual(timeoutSeconds * 1000);
+        } else {
+          expect(now - startMs).toBeLessThan(timeoutSeconds * 1000);
+        }
       } finally {
         clock.mockRestore();
       }
@@ -788,52 +799,39 @@ describe('runCreateBatch --run --wait: --timeout per-run', () => {
   );
 
   it('one slow run hits timeout while other completes; overall exit is 1 (not 7, mixed)', async () => {
-    // test_d1: passes quickly (poll returns terminal on first call — returns
-    // *before* mockNow crosses the deadline)
-    // test_d2: always returns non-terminal; each poll advances mockNow by
-    // 600 ms, so the 1 s deadline is crossed on the second iteration.
     const { credentialsPath } = makeCreds();
     const testIds = ['test_d1', 'test_d2'];
     const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC]);
-
-    // Fetch-driven mock clock: trigger and batch-create calls don't advance
-    // time; only poll fetches do. This is robust against indeterminate
-    // Date.now() call counts in the HTTP layer.
-    const realDateNow = Date.now;
-    let mockNow = realDateNow();
-    Date.now = () => mockNow;
-
+    const stdout: string[] = [];
+    vi.useFakeTimers();
     try {
-      const fetchImpl = makeFetch(url => {
-        if (url.includes('/tests/batch')) {
-          return { body: makeBatchCreateResponse(testIds) };
+      const respond = makeFetch(url => {
+        if (url.includes('/tests/batch')) return { body: makeBatchCreateResponse(testIds) };
+        const trigger = /\/tests\/(test_d[12])\/runs$/.exec(url);
+        if (trigger?.[1]) {
+          return { body: makeTriggerResponse(trigger[1], `run_${trigger[1]}`) };
         }
-        const triggerMatch = /\/tests\/(test_[a-z0-9]+)\/runs$/.exec(url);
-        if (triggerMatch?.[1]) {
-          const testId = triggerMatch[1];
-          const runId = `run_${testId}`;
-          return { body: makeTriggerResponse(testId, runId) };
-        }
-        const pollMatch = /\/runs\/(run_test_d[12])/.exec(url);
-        if (pollMatch?.[1]) {
-          const runId = pollMatch[1];
+        const poll = /\/runs\/(run_test_d[12])/.exec(url);
+        if (poll?.[1]) {
+          const runId = poll[1];
           const testId = runId.replace('run_', '');
-          // Each poll fetch advances the mock clock by 600 ms. With 1 s
-          // timeout, test_d2 needs ~2 iterations to hit the deadline.
-          mockNow += 600;
-          if (testId === 'test_d1') return { body: makePassedRun(testId, runId) };
-          return { body: { ...makePassedRun(testId, runId), status: 'running' as const } };
+          const run = makePassedRun(testId, runId);
+          return {
+            body: testId === 'test_d1' ? run : { ...run, status: 'running', finishedAt: null },
+          };
         }
-        return {
-          status: 404,
-          body: {
-            error: { code: 'NOT_FOUND', message: 'not found', nextAction: '', requestId: 'r1' },
-          },
-        };
+        throw new Error(`Unexpected fixture request: ${url}`);
       });
-
-      const stdout: string[] = [];
-      const err = await runCreateBatch(
+      const fetchImpl: typeof fetch = async (input, init) => {
+        const url = String(input);
+        // Let the fast response settle before either 600 ms slow poll returns.
+        // Parallel requests share elapsed time; they must not each advance it.
+        if (url.includes('/runs/run_test_d2')) {
+          await new Promise(resolve => setTimeout(resolve, 600));
+        }
+        return respond(input, init);
+      };
+      const execution = runCreateBatch(
         {
           profile: 'default',
           output: 'json',
@@ -842,7 +840,8 @@ describe('runCreateBatch --run --wait: --timeout per-run', () => {
           plans: plansFile,
           run: true,
           wait: true,
-          timeoutSeconds: 1, // per-run timeout of 1 second
+          maxConcurrency: 2,
+          timeoutSeconds: 1,
         },
         {
           credentialsPath,
@@ -851,23 +850,19 @@ describe('runCreateBatch --run --wait: --timeout per-run', () => {
           stderr: () => {},
           sleep: instantSleep,
         },
-      ).catch(e => e);
-
-      // Should exit 1 (mixed: one pass, one timeout — not all timeout → exit 1)
-      expect(err).toBeInstanceOf(CLIError);
-      expect((err as CLIError).exitCode).toBe(1);
-
-      // Results: test_d1 passes, test_d2 has timeout error
+      ).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(1200);
+      const error = await execution;
+      expect(error).toBeInstanceOf(CLIError);
+      expect((error as CLIError).exitCode).toBe(1);
       const printed = JSON.parse(stdout.join('')) as {
         results: Array<{ testId: string; status: string }>;
       };
       expect(printed.results).toHaveLength(2);
-      const d1 = printed.results.find(r => r.testId === 'test_d1');
-      const d2 = printed.results.find(r => r.testId === 'test_d2');
-      expect(d1?.status).toBe('passed');
-      expect(d2?.status).toBe('timeout');
+      expect(printed.results.find(row => row.testId === 'test_d1')?.status).toBe('passed');
+      expect(printed.results.find(row => row.testId === 'test_d2')?.status).toBe('timeout');
     } finally {
-      Date.now = realDateNow;
+      vi.useRealTimers();
     }
   });
 
@@ -876,7 +871,7 @@ describe('runCreateBatch --run --wait: --timeout per-run', () => {
     const testIds = ['test_e1', 'test_e2'];
     const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC]);
 
-    // Fetch-driven mock clock — same approach as the mixed-outcome test.
+    // Fetch-driven mock clock for a batch that never reaches a terminal state.
     // Both runs always return non-terminal, so every poll fetch advances
     // mockNow until the 1 s deadline is crossed.
     const realDateNow = Date.now;
@@ -2121,6 +2116,107 @@ describe('MAJOR 1: HTTP-layer does not retry RATE_LIMITED for triggerRunWithMeta
 });
 
 describe('runCreateBatch: deadline at throttle-window expiry', () => {
+  it.each([60, 61])(
+    'does not let expired retries consume slots needed by a later member (timeout: %s)',
+    async timeoutSeconds => {
+      const { credentialsPath } = makeCreds();
+      const ids = Array.from({ length: 50 }, (_, i) => `test_stagger_${i}`);
+      const lastId = ids[49]!;
+      const plans = writePlansJsonl(ids.map(() => FE_SPEC));
+      const start = Date.now();
+      const attempts = new Map<string, number[]>();
+      const keys = new Map<string, string[]>();
+      const stdout: string[] = [];
+      vi.useFakeTimers();
+      vi.setSystemTime(start);
+      const fetchImpl = makeFetch((url, init) => {
+        if (url.includes('/tests/batch')) return { body: makeBatchCreateResponse(ids) };
+        const trigger = /\/tests\/(test_stagger_\d+)\/runs$/.exec(url);
+        if (trigger?.[1] && init.method === 'POST') {
+          const id = trigger[1];
+          const times = attempts.get(id) ?? [];
+          times.push(Date.now() - start);
+          attempts.set(id, times);
+          keys.set(id, [
+            ...(keys.get(id) ?? []),
+            new Headers(init.headers).get('idempotency-key')!,
+          ]);
+          if (times.length === 1) {
+            return {
+              status: 429,
+              body: {
+                error: {
+                  code: 'RATE_LIMITED',
+                  message: 'Run trigger rate limit exceeded: 60 triggers per minute per key.',
+                  nextAction: 'Wait and retry.',
+                  requestId: 'req_stagger',
+                  details: { retryAfterSeconds: 1 },
+                },
+              },
+            };
+          }
+          return { body: makeTriggerResponse(id, `run_${id}`) };
+        }
+        const poll = /\/runs\/run_(test_stagger_\d+)/.exec(url);
+        if (poll?.[1]) return { body: makePassedRun(poll[1], `run_${poll[1]}`) };
+        throw new Error(`Unexpected fixture request: ${url}`);
+      });
+      try {
+        const execution = runCreateBatch(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: true,
+            plans,
+            run: true,
+            wait: true,
+            maxConcurrency: 50,
+            timeoutSeconds,
+          },
+          {
+            credentialsPath,
+            fetchImpl,
+            stdout: line => stdout.push(line),
+            stderr: line => {
+              // Model staggered fan-out starts: 49 members at t=0, the last at t=1s.
+              // Advancing here precedes its deadline and throttle-slot acquisition.
+              if (line.startsWith(`[batch-run] ${lastId} idempotency-key:`)) {
+                vi.setSystemTime(start + 1000);
+              }
+            },
+          },
+        ).then(
+          () => 0,
+          (error: CLIError) => error.exitCode,
+        );
+        await vi.advanceTimersByTimeAsync(62_000);
+        expect(await execution).toBe(timeoutSeconds === 60 ? 1 : 0);
+        const rows = JSON.parse(stdout.join('')).results as Array<{
+          testId: string;
+          runId: string;
+          status: string;
+        }>;
+        expect(rows).toHaveLength(50);
+        expect(rows.find(row => row.testId === lastId)).toMatchObject({
+          runId: `run_${lastId}`,
+          status: 'passed',
+        });
+        expect(attempts.get(lastId)).toHaveLength(2);
+        expect(attempts.get(lastId)![1]).toBeLessThan(1000 + timeoutSeconds * 1000);
+        for (const id of ids.slice(0, 49)) {
+          expect(attempts.get(id)).toHaveLength(timeoutSeconds === 60 ? 1 : 2);
+          expect(rows.find(row => row.testId === id)).toMatchObject({
+            status: timeoutSeconds === 60 ? 'timeout' : 'passed',
+            runId: timeoutSeconds === 60 ? '' : `run_${id}`,
+          });
+        }
+        for (const values of keys.values()) expect(new Set(values).size).toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it.each([
     { count: 50, timeout: 60, wait: true, posts: 1, polls: 0, sleeps: [1000, 59000] },
     { count: 50, timeout: 2, wait: true, posts: 1, polls: 0, sleeps: [1000, 1000] },

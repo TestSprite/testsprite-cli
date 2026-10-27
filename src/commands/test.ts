@@ -4553,6 +4553,9 @@ async function runBatchRun(
       // A slot can become available exactly when the clamped sleep exhausts
       // the --wait budget. Recheck after acquisition before starting a run.
       if (opts.wait && remainingMs() <= 0) {
+        // No await has occurred since acquire() returned 0, so this is still
+        // our slot. Keep it available for siblings whose deadlines are later.
+        rateThrottle.releaseLast();
         return {
           testId,
           runId: '',
@@ -4831,6 +4834,12 @@ async function runBatchRun(
           ? (msg: string) => stderrFn(`[batch-run][verbose] ${testId}: ${msg}`)
           : undefined,
       });
+      // Long-poll rounding and the transport cushion can return a terminal
+      // row after this spec's budget. Enforce its deadline here without
+      // changing other commands' shared-poller or terminal-recovery behavior.
+      if (remainingMs() <= 0) {
+        throw new TimeoutError(triggerResponse.runId, timeoutSeconds);
+      }
     } catch (err) {
       // An unobserved tunnel run still occupies a slot until cleanup settles.
       if (deps.environmentTunnel?.targets?.has(testId)) {
