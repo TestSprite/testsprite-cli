@@ -10,7 +10,7 @@ import {
 } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Command } from 'commander';
 import type { RunResponse } from '../lib/runs.types.js';
@@ -3407,6 +3407,55 @@ describe('runScaffold', () => {
     });
     // --force overwrites.
     await expect(runScaffold({ ...opts, force: true }, deps)).resolves.toBeDefined();
+  });
+
+  // A trailing separator means "a directory", whether the path is relative
+  // (path.resolve drops the separator) or a native Windows path ending in `\`.
+  // Neither may be written as a FILE named after the intended directory.
+  it.each([
+    [
+      'relative path ending in /',
+      (dir: string) => `${relative(process.cwd(), join(dir, 'plans'))}/`,
+    ],
+    ['absolute path ending in \\', (dir: string) => `${join(dir, 'plans')}\\`],
+  ])('--out given a %s rejects and writes nothing', async (_label, outFor) => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-scaffold-sep-'));
+    await expect(
+      runScaffold(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          scaffoldType: 'frontend',
+          out: outFor(dir),
+          force: false,
+        },
+        { stdout: () => undefined, stderr: () => undefined, env: {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(readdirSync(dir)).toEqual([]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('--out naming an existing directory with a trailing separator says it is a directory, not that it exists', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cli-scaffold-sepdir-'));
+    await expect(
+      runScaffold(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          scaffoldType: 'frontend',
+          out: `${dir}/`,
+          force: false,
+        },
+        { stdout: () => undefined, stderr: () => undefined, env: {} },
+      ),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      nextAction: expect.stringContaining('must point to a file, not a directory'),
+    });
+    rmSync(dir, { recursive: true, force: true });
   });
 
   it('--out pointing at an existing path (here a directory) rejects without --force', async () => {

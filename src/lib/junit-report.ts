@@ -272,7 +272,8 @@ async function assertReportFileParent(rawPath: string): Promise<string> {
     throw localValidationError('report-file', 'must be a non-empty file path');
   }
   const resolved = isAbsolute(rawPath) ? rawPath : resolve(process.cwd(), rawPath);
-  if (resolved.endsWith('/') || resolved.endsWith('\\')) {
+  // Check the RAW path: `resolve()` drops a trailing separator.
+  if (/[\\/]$/.test(rawPath)) {
     throw localValidationError('report-file', 'must point to a file, not a directory');
   }
 
