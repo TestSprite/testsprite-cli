@@ -646,6 +646,35 @@ export function resolveTelemetryAuth(
 }
 
 /**
+ * {@link resolveTelemetryAuth} for the pre-action hook, which runs before every
+ * command: never throws. An unreadable credentials file (EPERM/EACCES — the
+ * Windows ACL lock-out `doctor` diagnoses — or any other read/parse failure)
+ * returns `undefined` so the caller can skip the beacon and let the command run
+ * and report the problem its own way, as the module contract requires
+ * (telemetry never changes a command's behavior, output, or exit code).
+ * `onError` receives the swallowed error, for `--debug`.
+ */
+export function tryResolveTelemetryAuth(
+  opts: { profile?: string; endpointUrl?: string },
+  deps: {
+    env?: NodeJS.ProcessEnv;
+    credentialsPath?: string;
+    onError?: (error: unknown) => void;
+  } = {},
+): ResolvedTelemetryAuth | undefined {
+  try {
+    return resolveTelemetryAuth(opts, deps);
+  } catch (error) {
+    try {
+      deps.onError?.(error);
+    } catch {
+      // A broken diagnostic sink must not turn a skipped beacon into a failure.
+    }
+    return undefined;
+  }
+}
+
+/**
  * Fire one command-outcome event to the beacon. Awaited by `index.ts` before
  * `process.exit` (the flush) — bounded and fully best-effort, so it can neither
  * hang nor throw. Skips silently when opted out, under dry-run, with no leaf

@@ -50,7 +50,7 @@ import {
   isTelemetryOptedOut,
   recordOutcome,
   recordTelemetryExtras,
-  resolveTelemetryAuth,
+  tryResolveTelemetryAuth,
   type ResolvedTelemetryAuth,
   type WaitTimeoutTelemetry,
 } from './lib/telemetry.js';
@@ -304,13 +304,25 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
   // Telemetry gate, same reasons as the update notice below: skip `completion`
   // (its stdout is eval'd by shells) and `--plan-template` (pure-local). Resolve
   // auth now, before the command's action runs, so `auth remove` still reports
-  // on the key it used; skip the read for opt-out / dry-run.
+  // on the key it used; skip the read for opt-out / dry-run. The read is
+  // best-effort: an unreadable credentials file must not end the process here,
+  // before the command could run — `doctor` exists to diagnose exactly that, and
+  // offline commands never need the key. On failure the command runs as if
+  // telemetry were off (no event, and no fallback read at exit either).
   telemetryEmit = commandPath !== 'completion' && !isPlanTemplate;
   if (telemetryEmit && !isTelemetryOptedOut(process.env) && globals.dryRun !== true) {
-    telemetryAuth = resolveTelemetryAuth({
-      profile: globals.profile,
-      endpointUrl: globals.endpointUrl,
-    });
+    telemetryAuth = tryResolveTelemetryAuth(
+      { profile: globals.profile, endpointUrl: globals.endpointUrl },
+      {
+        onError: globals.debug
+          ? error =>
+              process.stderr.write(
+                `[debug] telemetry skipped: ${error instanceof Error ? error.message : String(error)}\n`,
+              )
+          : undefined,
+      },
+    );
+    if (telemetryAuth === undefined) telemetryEmit = false;
   }
   if (!isPlanTemplate) {
     maybeEmitSkillNudge({
