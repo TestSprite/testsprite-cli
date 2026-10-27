@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ApiError } from './errors.js';
-import type { HttpClient } from './http.js';
+import { ApiError, RequestTimeoutError } from './errors.js';
+import { HttpClient } from './http.js';
 import { assertLocalPortListening, parseLoopbackTargetUrl } from './local-target.js';
-import { readEnvironmentPreflight, resolveEnvironmentRunTarget } from './environment-tunnel.js';
+import {
+  ENVIRONMENT_PREFLIGHT_TIMEOUT_MS,
+  readEnvironmentPreflight,
+  resolveEnvironmentRunTarget,
+} from './environment-tunnel.js';
 
 function resolver(environments: unknown) {
   const get = vi.fn(async () => ({ environments }));
@@ -27,6 +31,63 @@ describe('environment preflight and diagnostics', () => {
     });
     await readEnvironmentPreflight({ get } as unknown as Pick<HttpClient, 'get'>, '/tests/a');
     expect(get).toHaveBeenCalledTimes(1);
+  });
+  it('classifies a stalled preflight read as REQUEST_TIMEOUT (exit 7), not a raw abort', async () => {
+    vi.useFakeTimers();
+    try {
+      const get = vi.fn((_path: string, options: { signal: AbortSignal }) => {
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener('abort', () => reject(options.signal.reason));
+        });
+      });
+      const promise = readEnvironmentPreflight(
+        { get } as unknown as Pick<HttpClient, 'get'>,
+        '/tests/a',
+      );
+      const assertion = expect(promise).rejects.toBeInstanceOf(RequestTimeoutError);
+      await vi.advanceTimersByTimeAsync(ENVIRONMENT_PREFLIGHT_TIMEOUT_MS);
+      await assertion;
+      const err = (await promise.catch(e => e)) as RequestTimeoutError;
+      expect(err.code).toBe('REQUEST_TIMEOUT');
+      expect(err.exitCode).toBe(7);
+      expect(err.timeoutMs).toBe(ENVIRONMENT_PREFLIGHT_TIMEOUT_MS);
+      // The 5s preflight deadline is fixed; the guidance must name the
+      // preflight read and never point at --request-timeout, which does
+      // not govern it.
+      expect(err.message).toContain('Environment preflight read timed out');
+      expect(err.message).not.toContain('--request-timeout');
+      expect(err.nextAction).toContain('environment preflight read');
+      expect(err.nextAction).not.toContain('--request-timeout');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it('passes the preflight REQUEST_TIMEOUT through a real HttpClient untouched', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchImpl = vi.fn((_input: unknown, init?: { signal?: AbortSignal }) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+        });
+      });
+      const client = new HttpClient({
+        baseUrl: 'https://api.example.com/api/cli/v1',
+        apiKey: '<redacted>',
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        sleep: () => Promise.resolve(),
+        random: () => 0,
+        requestTimeoutMs: 120_000,
+      });
+      const promise = readEnvironmentPreflight(client, '/tests/a');
+      const assertion = expect(promise).rejects.toBeInstanceOf(RequestTimeoutError);
+      await vi.advanceTimersByTimeAsync(ENVIRONMENT_PREFLIGHT_TIMEOUT_MS);
+      await assertion;
+      const err = (await promise.catch(e => e)) as RequestTimeoutError;
+      expect(err.code).toBe('REQUEST_TIMEOUT');
+      expect(err.exitCode).toBe(7);
+    } finally {
+      vi.useRealTimers();
+    }
   });
   it('falls back after a failed test read without reading environments', async () => {
     const get = vi.fn(async (_path: string, _options: unknown) => {
