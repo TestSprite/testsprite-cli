@@ -186,6 +186,82 @@ const WF_BASE = {
 };
 
 describe('buildGithubWorkflow', () => {
+  const concurrency = (workflow: string) => {
+    const match = workflow.match(/ {4}concurrency:\n {6}group: (.+)\n {6}cancel-in-progress: (.+)/);
+    if (!match?.[1] || !match[2]) throw new Error('Missing workflow concurrency configuration');
+    return { group: match[1], cancelInProgress: match[2] };
+  };
+
+  it('isolates different workflow paths even for the same project and environment', () => {
+    const web = concurrency(
+      buildGithubWorkflow({ ...WF_BASE, workflowPath: '.github/workflows/testsprite-web.yml' }),
+    );
+    const api = concurrency(
+      buildGithubWorkflow({ ...WF_BASE, workflowPath: '.github/workflows/testsprite-api.yml' }),
+    );
+    expect(web.group).not.toBe(api.group);
+  });
+
+  it('keeps the same workflow group when regenerated with different project settings', () => {
+    const first = concurrency(buildGithubWorkflow(WF_BASE));
+    const regenerated = concurrency(buildGithubWorkflow({ ...WF_BASE }));
+    const reconfigured = concurrency(
+      buildGithubWorkflow({ ...WF_BASE, projectId: 'proj-2', environment: 'qa' }),
+    );
+    expect(first.group).toContain('testsprite.yml');
+    expect(regenerated).toEqual(first);
+    expect(reconfigured).toEqual(first);
+  });
+
+  it.each([
+    ['.github/workflows/testsprite.yml', '.github/workflows/testsprite.yaml'],
+    ['.github/workflows/testsprite.api.yml', '.github/workflows/testsprite-api.yml'],
+    ['.github/workflows/testsprite api.yml', '.github/workflows/testsprite%20api.yml'],
+    ['.github/workflows/TestSprite.yml', '.github/workflows/testsprite.yml'],
+    ['.github/workflows/A.yml', '.github/workflows/%41.yml'],
+    ['.github/workflows/test:sprite.yml', '.github/workflows/test%3Asprite.yml'],
+  ])('keeps distinct filenames independent: %s versus %s', (first, second) => {
+    // GitHub compares concurrency group names case-insensitively.
+    const groupOf = (workflowPath: string) =>
+      concurrency(buildGithubWorkflow({ ...WF_BASE, workflowPath })).group.toLowerCase();
+    expect(groupOf(first)).not.toBe(groupOf(second));
+  });
+
+  it('escapes uppercase letters without altering existing escapes', () => {
+    const group = concurrency(
+      buildGithubWorkflow({ ...WF_BASE, workflowPath: '.github/workflows/Test Sprite:CI.yml' }),
+    ).group;
+    expect(group).toContain('testsprite-%54est%20%53prite%3A%43%49.yml-');
+  });
+
+  it.each(['pull_request', 'deployment_status'] as const)(
+    'retains cancellation within one workflow for %s',
+    event => {
+      const generated = buildGithubWorkflow(WF_BASE);
+      // The documented deployment shape changes only the trigger and URL step.
+      const workflow =
+        event === 'deployment_status'
+          ? generated.replace(
+              '  pull_request:\n    types: [opened, synchronize, reopened, ready_for_review]',
+              '  deployment_status:',
+            )
+          : generated;
+      expect(workflow).toContain(`\n  ${event}:`);
+      const { group, cancelInProgress } = concurrency(workflow);
+      expect(group).toContain('testsprite.yml-');
+      expect(group).toContain(
+        '${{ github.event.pull_request.number || github.event.deployment.sha }}',
+      );
+      expect(cancelInProgress).toBe('true');
+      const eventKey = '${{ github.event.pull_request.number || github.event.deployment.sha }}';
+      const key = event === 'pull_request' ? '42' : 'a'.repeat(40);
+      expect(group.replace(eventKey, key)).toBe(
+        concurrency(buildGithubWorkflow({ ...WF_BASE })).group.replace(eventKey, key),
+      );
+      expect(group.replace(eventKey, key)).not.toBe(group.replace(eventKey, 'another-event'));
+    },
+  );
+
   it('matches the reviewed template (default flags)', () => {
     expect(buildGithubWorkflow(WF_BASE)).toMatchSnapshot();
   });
@@ -234,7 +310,7 @@ describe('buildGithubWorkflow', () => {
     // Vercel writes production_environment: false on production deployments.
     expect(yaml).toContain("github.event.deployment.environment != 'production'");
     expect(yaml).toContain(
-      'group: testsprite-${{ github.event.pull_request.number || github.event.deployment.sha }}',
+      'group: testsprite-testsprite.yml-${{ github.event.pull_request.number || github.event.deployment.sha }}',
     );
   });
 
