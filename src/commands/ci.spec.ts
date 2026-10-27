@@ -465,15 +465,32 @@ describe('runCiInit', () => {
     });
   });
 
-  it('a byte-identical workflow is left alone and gets no .bak, with or without --force', async () => {
+  it.each([false, true])('CRLF-equivalent workflow stays untouched (force=%s)', async force => {
     const io = collect();
     const fresh = makeFakeFs();
     await runCiInit(opts({ project: 'p' }), deps({ fs: fresh, ...collect() }));
-    const fs = makeFakeFs({ [WF]: fresh.files.get(WF)! });
-    await runCiInit(opts({ project: 'p', force: true }), deps({ fs, ...io }));
+    const existing = fresh.files.get(WF)!.replace(/\n/g, '\r\n');
+    const fs = makeFakeFs({ [WF]: existing });
+    await runCiInit(opts({ project: 'p', force }), deps({ fs, ...io }));
+    expect(fs.files.get(WF)).toBe(existing);
     expect(fs.files.has(`${WF}.bak`)).toBe(false);
     expect(io.json()).toMatchObject({ wrote: false, status: 'unchanged' });
     expect(io.json()).not.toHaveProperty('backupPath');
+  });
+
+  it('CRLF workflow with a real edit still needs force and keeps its original backup', async () => {
+    const fresh = makeFakeFs();
+    await runCiInit(opts({ project: 'p' }), deps({ fs: fresh, ...collect() }));
+    const canonical = fresh.files.get(WF)!;
+    const existing = canonical.replace(/\n/g, '\r\n') + '# local edit\r\n';
+    const fs = makeFakeFs({ [WF]: existing });
+    await expect(runCiInit(opts({ project: 'p' }), deps({ fs }))).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+    });
+    expect(fs.files.get(WF)).toBe(existing);
+    await runCiInit(opts({ project: 'p', force: true }), deps({ fs }));
+    expect(fs.files.get(WF)).toBe(canonical);
+    expect(fs.files.get(`${WF}.bak`)).toBe(existing);
   });
 
   it('honors a custom --path under .github/workflows/ (.yaml too)', async () => {
