@@ -255,6 +255,12 @@ export async function runTestlistUpdate(
   if (opts.clearProjectEnv && hasProjectEnv) {
     throw localValidationError('clear-project-env', 'cannot be combined with --project-env');
   }
+  // `create` rejects an empty --name up front; an explicitly passed empty (or
+  // whitespace-only) --name on update is never intentional, so fail fast here
+  // instead of PUTting a blank name to the server.
+  if (opts.name !== undefined && opts.name.trim().length === 0) {
+    throw localValidationError('name', 'must not be empty');
+  }
   if (opts.name === undefined && !hasProjectEnv && !opts.clearProjectEnv) {
     throw localValidationError('name', 'pass --name, --project-env, or --clear-project-env');
   }

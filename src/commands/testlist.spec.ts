@@ -290,6 +290,36 @@ describe('testlist commands', () => {
     expect(body).toEqual({ name: 'renamed' });
   });
 
+  it('update --name "" → VALIDATION_ERROR, no network call (create rejects empty names)', async () => {
+    const { env } = makeCreds();
+    let called = false;
+    const fetchImpl = makeFetch(() => {
+      called = true;
+      return { body: DETAIL };
+    });
+    const err = (await runTestlistUpdate(
+      { ...base, listId: 'list-1', name: '' },
+      { env, fetchImpl, stdout: () => {} },
+    ).catch(e => e)) as ApiError;
+    expect(err.code).toBe('VALIDATION_ERROR');
+    expect(called).toBe(false);
+  });
+
+  it('update --name "   " (whitespace-only) → VALIDATION_ERROR, no network call', async () => {
+    const { env } = makeCreds();
+    let called = false;
+    const fetchImpl = makeFetch(() => {
+      called = true;
+      return { body: DETAIL };
+    });
+    const err = (await runTestlistUpdate(
+      { ...base, listId: 'list-1', name: '   ' },
+      { env, fetchImpl, stdout: () => {} },
+    ).catch(e => e)) as ApiError;
+    expect(err.code).toBe('VALIDATION_ERROR');
+    expect(called).toBe(false);
+  });
+
   it('update parses --project-env pairs and sends them', async () => {
     const { env } = makeCreds();
     let body: unknown;
