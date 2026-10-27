@@ -1332,6 +1332,12 @@ These apply to every command:
 
 ### Secrets in output
 
+Authenticated API requests follow redirects only within the configured origin
+(scheme, hostname and port). A cross-origin redirect is rejected before sending
+credentials to its destination. The CLI reports both origins as a transport
+error without retrying that request. Same-origin redirects retain normal HTTP
+method/body behavior and are limited to 20 hops.
+
 Any field named like `password`, `token`, `secret`, `apiKey` / `api_key`, `authorization`, `cookie`, or `credential(s)` — at any depth, inside arrays too — is replaced with `[REDACTED]` in an error envelope's `details` and in `--debug` request tracing, in both `--output json` and text. `--dry-run` previews never contain a secret in the first place: they show presence flags (such as `hasCredentials`) and field names, not credential values. This is a second, independent layer: the backend already redacts its own error envelopes, but the CLI redacts again on the way out. Ordinary fields that merely contain one of those words as a substring — a boolean presence flag like `hasCredentials`, a file path like `credentialsPath`, or a pagination cursor like `nextToken` — are left alone; only the credential-shaped field itself is blanked.
 
 **Success output is never redacted.** A command's result — generated test code, plans, backend-test fixtures — is the caller's own data and must round-trip byte-identical (`test code get --output json` piped through an edit into `test code put`, `test plan get` into `test plan put`): it prints exactly as the server stored it, even when it legitimately contains a literal `Authorization: Bearer …` header or a `password` key. Redaction only ever touches error envelopes and request traces, never a success payload.
