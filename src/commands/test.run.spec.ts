@@ -3665,6 +3665,64 @@ describe('runTestRunAll — batch fresh run', () => {
     };
   }
 
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'preserves batch receipts and disarms the conflict metadata scope on %s',
+    async signal => {
+      const { credentialsPath } = makeCreds();
+      const shutdown = new ShutdownController();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      let armedAtRead = false;
+      const response: BatchRunFreshResponse = {
+        ...BATCH_FRESH_RESP,
+        conflicts: [{ testId: 'test_busy', currentRunId: 'run_busy', reason: 'in_flight' }],
+        skippedFrontend: ['test_frontend'],
+        skippedIntegration: [{ testId: 'test_integration' }],
+      };
+      const error: unknown = await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          shutdown,
+          fetchImpl: makeFetch((url, init) => {
+            if (init.method === 'POST') return { body: response };
+            if (url.includes('/runs/run_busy')) {
+              armedAtRead = shutdown.isArmed;
+              shutdown.interrupt(signal);
+              throw shutdown.signal.reason;
+            }
+            return { body: { environments: [] } };
+          }),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+        },
+      ).catch((caught: unknown) => caught);
+      expect(error).toBe(shutdown.signal.reason);
+      expect(armedAtRead).toBe(true);
+      expect(shutdown.isArmed).toBe(false);
+      expect(JSON.parse(stdout.join('\n'))).toEqual({
+        accepted: response.accepted.map(e => ({
+          testId: e.testId,
+          runId: e.runId,
+          status: 'running',
+        })),
+        conflicts: response.conflicts,
+        deferred: [],
+        skippedFrontend: response.skippedFrontend,
+        skippedIntegration: response.skippedIntegration,
+      });
+      expect(stderr.join('\n')).toContain('testsprite test wait run_fresh_01 run_fresh_02');
+    },
+  );
+
   it('run --all --wait: a NOT_FOUND member poll → exit 4 with error.code (was folded to exit 1 before this PR)', async () => {
     const { credentialsPath } = makeCreds();
     let caughtError: unknown;
