@@ -4436,6 +4436,18 @@ async function runBatchRun(
   const billingRunErrors: ApiError[] = [];
   const sleepFn = deps.sleep ?? defaultSleep;
   const shutdown = shutdownOf(deps);
+  const envListings = new Map<string, Promise<CliProjectEnvListResponse>>();
+  const listEnvironments = (projectId: string): Promise<CliProjectEnvListResponse> => {
+    let listing = envListings.get(projectId);
+    if (!listing) {
+      listing = client.get<CliProjectEnvListResponse>(
+        `/projects/${encodeURIComponent(projectId)}/env`,
+        { signal: shutdown.signal },
+      );
+      envListings.set(projectId, listing);
+    }
+    return listing;
+  };
   // Response-driven --target-url advisory, fired at most ONCE for the whole
   // batch (Finding 2's contract) the first time any member's trigger
   // response reports a target different from what was requested — see the
@@ -4699,6 +4711,50 @@ async function runBatchRun(
             (v): v is string => typeof v === 'string' && v.length > 0,
           );
           if (conflictReason === 'run_in_flight' && currentRunId !== undefined) {
+            const incompatibleRun = (reason: string): ApiError =>
+              new ApiError({
+                code: 'CONFLICT',
+                message: `Conflict: run ${currentRunId} is already in flight; ${reason}. This invocation cannot attach to it.`,
+                nextAction: `testsprite test wait ${currentRunId}`,
+                requestId: '',
+                details: { reason: 'run_in_flight', currentRunId },
+              });
+            let inFlight: RunResponse | undefined;
+            try {
+              try {
+                inFlight = await client.getRun(currentRunId, { signal: shutdown.signal });
+              } catch (readErr) {
+                if (readErr instanceof InterruptError) throw readErr;
+              }
+              if (inFlight) {
+                await verifyInFlightRunEnvironment(
+                  inFlight,
+                  normalizeEnvironmentName(opts.environment),
+                  listEnvironments,
+                  incompatibleRun,
+                );
+                if (opts.targetUrl !== undefined && inFlight.targetUrl !== opts.targetUrl) {
+                  throw incompatibleRun('its target URL does not match the requested target URL');
+                }
+              } else if (opts.environment !== undefined || opts.targetUrl !== undefined) {
+                throw incompatibleRun('its environment could not be verified');
+              }
+            } catch (attachErr) {
+              if (attachErr instanceof InterruptError) throw attachErr;
+              if (!(attachErr instanceof ApiError) || attachErr.code !== 'CONFLICT')
+                throw attachErr;
+              return {
+                testId,
+                runId: '',
+                status: 'error',
+                codeVersion: '',
+                error: {
+                  code: attachErr.code,
+                  message: `${attachErr.message} ${attachErr.nextAction}`,
+                  exitCode: attachErr.exitCode,
+                },
+              };
+            }
             stderrFn(
               `[batch-run] ${testId} — run already in flight (runId: ${currentRunId}). Auto-resuming wait.`,
             );
@@ -4707,7 +4763,7 @@ async function runBatchRun(
               status: 'queued',
               enqueuedAt: new Date().toISOString(),
               codeVersion: '',
-              targetUrl: opts.targetUrl ?? '',
+              targetUrl: inFlight?.targetUrl ?? '',
             };
             break; // exit the outer retry loop with a conflict-resumed response
           } else {
