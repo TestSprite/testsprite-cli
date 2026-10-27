@@ -1,5 +1,5 @@
-import { createWriteStream } from 'node:fs';
-import { rename, stat, unlink } from 'node:fs/promises';
+import { createWriteStream, statSync } from 'node:fs';
+import { rename, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { localValidationError, TransportError } from './errors.js';
@@ -267,34 +267,61 @@ export function skippedJUnitResultsFromSummary(
     .map(row => ({ testId: row.testId, status: 'skipped', skipReason: row.error ?? row.status }));
 }
 
-async function assertReportFileParent(rawPath: string): Promise<string> {
+/**
+ * Check that an output artifact path (`--report-file`, `--summary-file`) can be
+ * written: non-empty, not a directory, and inside an existing directory.
+ * Returns the resolved absolute path.
+ *
+ * Called in each command's pre-flight, before anything is dispatched or billed,
+ * so a mistyped directory fails fast with exit 5 instead of surfacing only after
+ * a full batch has run. The write itself re-checks (the directory can vanish in
+ * between).
+ */
+function errorCode(err: unknown): string {
+  return (err as NodeJS.ErrnoException | undefined)?.code ?? 'unknown error';
+}
+
+function isAbsentPathError(err: unknown): boolean {
+  const code = errorCode(err);
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+export function assertArtifactPath(field: 'report-file' | 'summary-file', rawPath: string): string {
   if (typeof rawPath !== 'string' || rawPath.length === 0) {
-    throw localValidationError('report-file', 'must be a non-empty file path');
+    throw localValidationError(field, 'must be a non-empty file path');
   }
   const resolved = isAbsolute(rawPath) ? rawPath : resolve(process.cwd(), rawPath);
   if (resolved.endsWith('/') || resolved.endsWith('\\')) {
-    throw localValidationError('report-file', 'must point to a file, not a directory');
+    throw localValidationError(field, 'must point to a file, not a directory');
   }
 
   const parent = dirname(resolved);
   let parentStat;
   try {
-    parentStat = await stat(parent);
-  } catch {
-    throw localValidationError('report-file', `parent directory does not exist: ${parent}`);
+    parentStat = statSync(parent);
+  } catch (err) {
+    if (isAbsentPathError(err))
+      throw localValidationError(field, `parent directory does not exist: ${parent}`);
+    throw localValidationError(
+      field,
+      `cannot access parent directory ${parent}: ${errorCode(err)}`,
+    );
   }
   if (!parentStat.isDirectory()) {
-    throw localValidationError('report-file', `parent path is not a directory: ${parent}`);
+    throw localValidationError(field, `parent path is not a directory: ${parent}`);
   }
 
   let targetStat;
   try {
-    targetStat = await stat(resolved);
-  } catch {
-    return resolved;
+    targetStat = statSync(resolved);
+  } catch (err) {
+    // Only a missing target is fine (it will be created); anything else (EACCES, ELOOP...) would fail the
+    // write after the run was dispatched, which is exactly what this pre-flight exists to prevent.
+    if (isAbsentPathError(err)) return resolved;
+    throw localValidationError(field, `cannot access ${resolved}: ${errorCode(err)}`);
   }
   if (targetStat.isDirectory()) {
-    throw localValidationError('report-file', `must point to a file, not a directory: ${resolved}`);
+    throw localValidationError(field, `must point to a file, not a directory: ${resolved}`);
   }
   return resolved;
 }
@@ -303,7 +330,7 @@ async function assertReportFileParent(rawPath: string): Promise<string> {
  * Atomically write JUnit XML to `--report-file` (temp sibling + rename).
  */
 export async function writeJUnitReportFile(rawPath: string, xml: string): Promise<void> {
-  const resolved = await assertReportFileParent(rawPath);
+  const resolved = assertArtifactPath('report-file', rawPath);
   const parent = dirname(resolved);
   const tmpPath = join(parent, `.${basename(resolved)}.tmp-${randomUUID()}`);
 

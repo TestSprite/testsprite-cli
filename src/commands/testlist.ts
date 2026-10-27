@@ -54,6 +54,7 @@ import {
   parseJUnitReportFormat,
   skippedJUnitResultsFromSummary,
   writeJUnitReportFile,
+  assertArtifactPath,
   type JUnitReportFormat,
   type JUnitTestResult,
 } from '../lib/junit-report.js';
@@ -524,6 +525,10 @@ function validateTestlistRunOptions(opts: RunTestlistRunOptions): void {
       '--summary-file requires --wait (it reduces the terminal run result). Add --wait.',
     );
   }
+  if (opts.report === 'junit' && opts.reportFile !== undefined) {
+    assertArtifactPath('report-file', opts.reportFile);
+  }
+  if (opts.summaryFile !== undefined) assertArtifactPath('summary-file', opts.summaryFile);
 }
 
 export async function runTestlistRun(
