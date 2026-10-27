@@ -10,6 +10,7 @@ import { ErrCode } from '../vendor/tunnel-client/index.js';
 import type { TunnelClientOptions } from '../vendor/tunnel-client/index.js';
 import {
   createTunnelCommand,
+  parseTtl,
   runTunnelList,
   runTunnelStart,
   runTunnelStatus,
@@ -1497,5 +1498,52 @@ describe('tunnel — dry run', () => {
     );
     expect(fetchImpl).not.toHaveBeenCalled();
     expect(tunnel.calls.start).toBe(0);
+  });
+});
+
+describe('tunnel start --ttl range', () => {
+  it('warns when --ttl is below the effective minimum instead of silently relying on server clamping', () => {
+    const warnings: string[] = [];
+    const ttl = parseTtl('5', line => warnings.push(line));
+    expect(ttl).toBe(5);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('--ttl 5');
+    expect(warnings[0]).toContain('60–28800');
+    expect(warnings[0]).toContain('clamp');
+  });
+
+  it('warns when --ttl is above the effective maximum', () => {
+    const warnings: string[] = [];
+    const ttl = parseTtl('999999', line => warnings.push(line));
+    expect(ttl).toBe(999999);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('--ttl 999999');
+  });
+
+  it('stays silent for --ttl inside the effective range', () => {
+    const warnings: string[] = [];
+    expect(parseTtl('60', line => warnings.push(line))).toBe(60);
+    expect(parseTtl('3600', line => warnings.push(line))).toBe(3600);
+    expect(parseTtl('28800', line => warnings.push(line))).toBe(28800);
+    expect(warnings).toHaveLength(0);
+  });
+
+  it('stays silent when --ttl is omitted', () => {
+    const warnings: string[] = [];
+    expect(parseTtl(undefined, line => warnings.push(line))).toBeUndefined();
+    expect(warnings).toHaveLength(0);
+  });
+
+  it('still rejects non-positive-integer --ttl with a validation error', () => {
+    for (const raw of ['abc', '0', '-5', '1.5']) {
+      let caught: unknown;
+      try {
+        parseTtl(raw, () => {});
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+      expect((caught as { nextAction: string }).nextAction).toContain('positive whole number');
+    }
   });
 });
