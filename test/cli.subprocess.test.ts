@@ -609,6 +609,27 @@ describe('invalid --output is rejected uniformly (exit 5)', () => {
   }, 30_000);
 });
 
+describe('--output csv | ndjson (issue #164)', () => {
+  it('project list --output csv writes CRLF records to stdout and nothing else', async () => {
+    const result = await runCli(['--dry-run', '--output', 'csv', 'project', 'list'], {});
+    expect(result.exitCode).toBe(0);
+    const records = result.stdout.split('\r\n');
+    expect(records[0]).toMatch(/^id,name,type,createdFrom,createdAt,updatedAt,/);
+    expect(records.at(-1)).toBe('');
+    expect(records.length).toBeGreaterThan(2);
+  }, 30_000);
+
+  it('a non-list command rejects --output ndjson with exit 5 and an empty stdout', async () => {
+    const result = await runCli(['--output', 'ndjson', 'auth', 'status'], {
+      TESTSPRITE_API_KEY: 'sk-user-subproc',
+      TESTSPRITE_API_URL: baseUrl,
+    });
+    expect(result.exitCode).toBe(5);
+    expect(result.stderr).toContain('ndjson is only supported by list commands');
+    expect(result.stdout).toBe('');
+  }, 30_000);
+});
+
 describe('a malformed --profile is rejected (exit 5), not silently corrupting credentials', () => {
   // A profile name becomes an INI section header (`[name]`). `prod]` would
   // serialise to `[prod]]`, which the parser cannot read back — `setup` would

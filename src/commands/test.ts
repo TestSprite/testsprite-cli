@@ -87,7 +87,15 @@ import {
 import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
 import { VERSION } from '../version.js';
-import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
+import {
+  GLOBAL_OPTS_HINT,
+  Output,
+  resolveListOutput,
+  resolveOutputMode,
+  type CsvColumns,
+  type ListFormat,
+  type OutputMode,
+} from '../lib/output.js';
 import {
   fetchSinglePage,
   paginate,
@@ -966,6 +974,8 @@ function attachTunnelInterruptDetach(err: InterruptError, detach: TunnelDetach):
 type CommonOptions = FactoryCommonOptions;
 
 interface ListOptions extends CommonOptions {
+  /** `--output csv|ndjson`; `output` is then `json`. */
+  format?: ListFormat;
   projectId?: string;
   environment?: string;
   type?: 'frontend' | 'backend';
@@ -1139,6 +1149,16 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
         },
       });
     }
+  }
+  if (opts.format !== undefined) {
+    await out.printRows(opts.format, page.items, TEST_CSV_COLUMNS);
+    // stdout carries rows only; the cursor goes where `--output text` hints go.
+    if (page.nextToken) {
+      (deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`)))(
+        `nextToken: ${page.nextToken}`,
+      );
+    }
+    return page;
   }
   out.print(page, data =>
     renderTestListText(data as Page<CliTest>, {
@@ -6602,6 +6622,8 @@ export function parseDuration(raw: string, now: Date = new Date()): string {
 }
 
 interface ResultHistoryOptions extends CommonOptions {
+  /** `--output csv|ndjson`; `output` is then `json`. */
+  format?: ListFormat;
   testId: string;
   /** Filter by trigger source. */
   source?: RunSource;
@@ -6675,17 +6697,34 @@ export async function runResultHistory(
   const runs =
     opts.rerun === undefined ? resp.runs : resp.runs.filter(r => r.isRerun === opts.rerun);
 
-  if (opts.output !== 'text') {
+  if (opts.format === undefined && opts.output !== 'text') {
     out.print({ ...resp, runs }, data => JSON.stringify(data));
     return { ...resp, runs };
   }
 
-  // Text mode rendering
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const retentionNote = historyRetentionNote(resp.meta, client.resolvedBaseUrl);
   const printRetentionNote = () => {
     if (retentionNote) stderr(retentionNote);
   };
+
+  // csv / ndjson: stdout carries rows only, and the hints text mode prints
+  // (next cursor, empty-history note, retention) go to stderr.
+  if (opts.format !== undefined) {
+    await out.printRows(opts.format, runs, RUN_HISTORY_CSV_COLUMNS);
+    if (resp.nextCursor !== null) {
+      stderr(`Next page: --cursor ${resp.nextCursor}`);
+    } else if (runs.length === 0) {
+      stderr(
+        resp.meta.note ??
+          'No CLI-tracked history for this test. History is recorded from 2026-05-14 onward.',
+      );
+    }
+    printRetentionNote();
+    return { ...resp, runs };
+  }
+
+  // Text mode rendering
 
   // Empty / pre-cutover: print the backend meta.note instead of a blank table.
   // EXCEPTION: if nextCursor is non-null this page is empty only because the
@@ -6757,6 +6796,23 @@ export async function runResultHistory(
 function describeRunEnv(run: { environment?: RunEnvironmentRef | null }): string {
   return run.environment?.name ?? '—';
 }
+
+/** `test result --history --output csv` columns; see {@link CsvColumns}. */
+const RUN_HISTORY_CSV_COLUMNS: CsvColumns<RunHistoryItem> = {
+  runId: true,
+  status: true,
+  source: true,
+  isRerun: true,
+  createdFrom: true,
+  createdAt: true,
+  startedAt: true,
+  finishedAt: true,
+  codeVersion: true,
+  failureKind: true,
+  targetUrl: true,
+  targetUrlSource: true,
+  environment: run => run.environment?.name,
+};
 
 const RUN_HISTORY_TABLE_COLUMNS: ReadonlyArray<TextTableColumn<RunHistoryItem>> = [
   { header: 'RUN ID', width: 36, render: run => run.runId },
@@ -14463,7 +14519,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       // both are supplied (prevents accidental override).
       await runList(
         {
-          ...resolveCommonOptions(command, deps.env),
+          ...resolveCommonOptions(command, deps.env, { listFormats: true }),
           projectId: cmdOpts.project,
           environment: cmdOpts.env,
           type: parseEnumFlag(cmdOpts.type, 'type', TEST_TYPES),
@@ -14862,7 +14918,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         // M3.4 piece-5: --history mode — list prior runs.
         await runResultHistory(
           {
-            ...resolveCommonOptions(command, deps.env),
+            ...resolveCommonOptions(command, deps.env, { listFormats: true }),
             testId,
             source: parseEnumFlag(cmdOpts.source, 'source', RUN_SOURCES) as RunSource | undefined,
             since: cmdOpts.since,
@@ -16228,7 +16284,11 @@ function parseNumericFlag(raw: string | undefined, flagName: string): number | u
   return n;
 }
 
-function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
+function resolveCommonOptions(
+  command: Command,
+  env?: NodeJS.ProcessEnv,
+  { listFormats = false }: { listFormats?: boolean } = {},
+): CommonOptions & { format?: ListFormat } {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
@@ -16237,7 +16297,9 @@ function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): Common
   // rather than silently treating the request as text mode.
   return {
     profile: resolveProfileName(globals.profile, env),
-    output: resolveOutputMode(globals.output),
+    ...(listFormats
+      ? resolveListOutput(globals.output)
+      : { output: resolveOutputMode(globals.output) }),
     dryRun: globals.dryRun ?? false,
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
@@ -16685,6 +16747,34 @@ async function readPresignedBody(
 function renderTestTypeCell(test: CliTest): string {
   return test.isIntegration === true ? `${test.type}/int` : test.type;
 }
+
+/**
+ * `test list --output csv` columns; see {@link CsvColumns}. The per-environment
+ * status array, plan steps and status details are nested, so they stay in
+ * `--output json` / `ndjson` only.
+ */
+const TEST_CSV_COLUMNS: CsvColumns<CliTest> = {
+  id: true,
+  projectId: true,
+  projectName: true,
+  name: true,
+  type: true,
+  isIntegration: true,
+  createdFrom: true,
+  status: true,
+  statusByEnvironment: false,
+  headlineEnvironment: test => test.headlineEnvironment?.name,
+  createdAt: true,
+  updatedAt: true,
+  planStepCount: true,
+  planSteps: false,
+  details: false,
+  priority: true,
+  stepTimeoutMs: true,
+  produces: true,
+  consumes: true,
+  category: true,
+};
 
 const TEST_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliTest>> = [
   {
