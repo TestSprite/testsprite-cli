@@ -6184,14 +6184,13 @@ export async function runScaffold(
 ): Promise<CliPlanInput | CliBackendScaffold> {
   const out = makeOutput(opts.output, deps);
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-  const env = deps.env ?? process.env;
   // Pre-fill the project id from TESTSPRITE_PROJECT_ID when the caller's
-  // environment carries one; otherwise a clearly-marked placeholder the user
-  // swaps after running `testsprite project list`.
-  const projectId =
-    typeof env.TESTSPRITE_PROJECT_ID === 'string' && env.TESTSPRITE_PROJECT_ID.length > 0
-      ? env.TESTSPRITE_PROJECT_ID
-      : '<run: testsprite project list>';
+  // environment carries a usable one; otherwise a clearly-marked placeholder
+  // the user swaps after running `testsprite project list`. Routed through the
+  // same resolution every other command's `--project` uses, so a blank or
+  // whitespace-padded env value is treated as unset (and a padded one is
+  // trimmed) instead of leaking straight into the scaffolded plan.
+  const projectId = resolveProjectId(undefined, deps) ?? '<run: testsprite project list>';
 
   let payload: CliPlanInput | CliBackendScaffold;
   let body: string;
