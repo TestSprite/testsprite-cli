@@ -845,10 +845,10 @@ describe('runCreateBatch --run --wait: --timeout per-run', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Idempotency: each per-run key is unique (regression guard)
+// Idempotency: per-run keys are distinct and stable across retries
 // ---------------------------------------------------------------------------
 
-describe('runCreateBatch --run: idempotency key uniqueness', () => {
+describe('runCreateBatch --run: run idempotency keys', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
   let errorSpy: ReturnType<typeof vi.spyOn>;
 
@@ -862,14 +862,17 @@ describe('runCreateBatch --run: idempotency key uniqueness', () => {
     errorSpy.mockRestore();
   });
 
-  it('each run trigger gets a distinct idempotency key, none matches the create key', async () => {
+  /**
+   * Run `create-batch --run --wait` for three FE specs against a fake server
+   * and record the idempotency key on the create POST and on each trigger.
+   */
+  async function runCapturingKeys(idempotencyKey?: string) {
     const { credentialsPath } = makeCreds();
     const testIds = ['test_f1', 'test_f2', 'test_f3'];
     const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC, FE_SPEC]);
-    const createIdemKey = 'cli-create-batch-test-key';
-
-    const seenRunIdempotencyKeys: string[] = [];
-    let createIdempotencyKeySeen = '';
+    const runKeys: Record<string, string> = {};
+    const stderr: string[] = [];
+    let createKey = '';
 
     const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
       const url =
@@ -881,7 +884,7 @@ describe('runCreateBatch --run: idempotency key uniqueness', () => {
       const headers = new Headers(init.headers as Record<string, string>);
 
       if (url.includes('/tests/batch')) {
-        createIdempotencyKeySeen = headers.get('idempotency-key') ?? '';
+        createKey = headers.get('idempotency-key') ?? '';
         return new Response(JSON.stringify(makeBatchCreateResponse(testIds)), {
           status: 200,
           headers: { 'content-type': 'application/json' },
@@ -891,10 +894,8 @@ describe('runCreateBatch --run: idempotency key uniqueness', () => {
       const triggerMatch = /\/tests\/(test_[a-z0-9]+)\/runs$/.exec(url);
       if (triggerMatch?.[1]) {
         const testId = triggerMatch[1];
-        const key = headers.get('idempotency-key') ?? '';
-        seenRunIdempotencyKeys.push(key);
-        const runId = `run_${testId}`;
-        return new Response(JSON.stringify(makeTriggerResponse(testId, runId)), {
+        runKeys[testId] = headers.get('idempotency-key') ?? '';
+        return new Response(JSON.stringify(makeTriggerResponse(testId, `run_${testId}`)), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
@@ -903,8 +904,7 @@ describe('runCreateBatch --run: idempotency key uniqueness', () => {
       const pollMatch = /\/runs\/(run_test_[a-z0-9]+)/.exec(url);
       if (pollMatch?.[1]) {
         const runId = pollMatch[1];
-        const testId = runId.replace('run_', '');
-        return new Response(JSON.stringify(makePassedRun(testId, runId)), {
+        return new Response(JSON.stringify(makePassedRun(runId.replace('run_', ''), runId)), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
@@ -927,31 +927,59 @@ describe('runCreateBatch --run: idempotency key uniqueness', () => {
         plans: plansFile,
         run: true,
         wait: true,
-        idempotencyKey: createIdemKey,
+        ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
         timeoutSeconds: 60,
       },
       {
         credentialsPath,
         fetchImpl,
         stdout: () => {},
-        stderr: () => {},
+        stderr: line => stderr.push(line),
         sleep: instantSleep,
       },
     );
+    return { createKey, runKeys, stderr };
+  }
 
-    // 3 run triggers → 3 run idempotency keys
-    expect(seenRunIdempotencyKeys).toHaveLength(3);
-    // All run keys must be unique
-    const uniqueKeys = new Set(seenRunIdempotencyKeys);
-    expect(uniqueKeys.size).toBe(3);
-    // None of the run keys matches the create key (regression guard)
-    expect(seenRunIdempotencyKeys).not.toContain(createIdemKey);
-    // The create key was used on the batch POST
-    expect(createIdempotencyKeySeen).toBe(createIdemKey);
-    // All run keys should start with 'cli-batch-run-'
-    for (const key of seenRunIdempotencyKeys) {
-      expect(key).toMatch(/^cli-batch-run-[0-9a-f-]{36}$/);
+  it('derives a distinct run key per test from the create key, never the create key itself', async () => {
+    const { createKey, runKeys } = await runCapturingKeys('cli-create-batch-test-key');
+
+    expect(createKey).toBe('cli-create-batch-test-key');
+    expect(runKeys).toEqual({
+      test_f1: 'cli-create-batch-test-key:run:test_f1',
+      test_f2: 'cli-create-batch-test-key:run:test_f2',
+      test_f3: 'cli-create-batch-test-key:run:test_f3',
+    });
+  });
+
+  it('re-sends the same run keys when retried with the same --idempotency-key', async () => {
+    const first = await runCapturingKeys('ci-build-42');
+    const retry = await runCapturingKeys('ci-build-42');
+
+    // Identical keys let the server return the runs the first attempt started
+    // instead of starting (and billing) them a second time.
+    expect(retry.runKeys).toEqual(first.runKeys);
+  });
+
+  it('re-sends the same run keys when retried with the printed auto-minted key', async () => {
+    const first = await runCapturingKeys();
+    const printed = first.stderr
+      .find(line => line.startsWith('idempotency-key: '))
+      ?.slice('idempotency-key: '.length);
+    expect(printed).toBe(first.createKey);
+
+    const retry = await runCapturingKeys(printed);
+    expect(retry.runKeys).toEqual(first.runKeys);
+  });
+
+  it('keeps a derived run key within 256 characters when the create key is at the limit', async () => {
+    const { runKeys } = await runCapturingKeys('k'.repeat(256));
+
+    for (const [testId, key] of Object.entries(runKeys)) {
+      expect(key.length).toBeLessThanOrEqual(256);
+      expect(key.endsWith(`:run:${testId}`)).toBe(true);
     }
+    expect(new Set(Object.values(runKeys)).size).toBe(3);
   });
 });
 

@@ -951,7 +951,8 @@ Options:
                              flag when you know better. Zero network calls when
                              set. (default: false)
   --idempotency-key <token>  opaque idempotency token for the batch create
-                             (1-256 ASCII chars). Defaults to a UUIDv4 minted
+                             (1-256 ASCII chars); with --run, each trigger key
+                             is derived from it. Defaults to a UUIDv4 minted
                              per invocation; pin one yourself for safe retries.
   -h, --help                 display help for command
 

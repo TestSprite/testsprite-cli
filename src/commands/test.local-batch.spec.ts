@@ -1437,16 +1437,17 @@ describe('test run local batch', () => {
     expect(f.stderr.filter(line => line.startsWith('idempotency-key:'))).toEqual([]);
   });
 
-  it('prints the first automatic trigger key once', async () => {
+  it('prints the automatic key once and derives every trigger key from it', async () => {
     const f = fixture(['a', 'b']);
     await f.run('a', 'b', '--local', '5173', '--skip-preflight');
     const keys = f.calls
       .filter(c => c.method === 'POST' && /\/tests\/[^/]+\/runs/.test(c.url))
       .map(c => c.idempotencyKey);
-    expect(keys[0]).not.toBe(keys[1]);
-    expect(f.stderr.filter(line => line.startsWith('idempotency-key:'))).toEqual([
-      `idempotency-key: ${keys[0]}`,
-    ]);
+    const printed = f.stderr.filter(line => line.startsWith('idempotency-key:'));
+    expect(printed).toHaveLength(1);
+    const base = printed[0]!.slice('idempotency-key: '.length);
+    // Passing the printed key back with --idempotency-key reproduces these keys.
+    expect(keys).toEqual([`${base}:${f.clientId}:a`, `${base}:${f.clientId}:b`]);
   });
 
   it('prints the text table without inventing a project dashboard link', async () => {
