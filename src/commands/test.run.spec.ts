@@ -8840,3 +8840,64 @@ describe('run output regressions', () => {
     },
   );
 });
+
+describe('runTestRun --wait — failure recovery hint for a run that is terminal on the first poll', () => {
+  async function runTerminal(
+    output: 'text' | 'json',
+    runStatus: RunResponse['status'],
+    type?: string,
+  ) {
+    const { credentialsPath } = makeCreds();
+    const router = beRunRouter({ type, runStatus, result: () => makeBeResult() });
+    const stderr: string[] = [];
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output,
+        debug: false,
+        dryRun: false,
+        testId: 'test_be',
+        wait: true,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(router.handler),
+        stdout: () => {},
+        stderr: l => stderr.push(l),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    return {
+      err,
+      hint: stderr.find(l => l.startsWith('Run finished')) ?? '',
+      counts: router.counts,
+    };
+  }
+
+  it.each(['failed', 'blocked'] as const)(
+    'JSON: a %s backend run points at test failure get <test-id>',
+    async runStatus => {
+      const { err, hint, counts } = await runTerminal('json', runStatus);
+      expect(err.exitCode).toBe(1);
+      expect(hint).toContain("'testsprite test failure get test_be'");
+      expect(hint).not.toContain('artifact get');
+      expect(counts.result).toBe(0);
+    },
+  );
+
+  it('JSON: a failed frontend run keeps the run-scoped artifact hint', async () => {
+    const { hint } = await runTerminal('json', 'failed', 'frontend');
+    expect(hint).toContain("'testsprite test artifact get run_abc'");
+  });
+
+  it('JSON: the hint costs one extra type lookup, and only for a failed run', async () => {
+    // `test run` already reads the test once before triggering; the hint adds
+    // at most one GET on top of that, and none when the run passed.
+    const passed = await runTerminal('json', 'passed');
+    const failed = await runTerminal('json', 'failed');
+    expect(passed.err.status).toBe('passed');
+    expect(passed.hint).toBe('');
+    expect(failed.counts.type - passed.counts.type).toBe(1);
+  });
+});

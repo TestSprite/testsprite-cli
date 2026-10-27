@@ -255,3 +255,108 @@ describe('BE closure fan-out: a member poll error is classified (survives fan-ou
     expect(stdoutLines.length).toBeGreaterThan(0);
   });
 });
+
+describe('BE rerun --wait: failure recovery hint names test failure get <test-id>', () => {
+  const baseOpts = {
+    all: false as const,
+    wait: true as const,
+    timeoutSeconds: 10,
+    autoHeal: false,
+    autoHealExplicit: false,
+    skipDependencies: false,
+    maxConcurrency: 10,
+    profile: 'default',
+    dryRun: false,
+    debug: false,
+    verbose: false,
+  };
+
+  async function rerun(args: {
+    output: 'text' | 'json';
+    rerunResp: RerunResponse;
+    namedStatus: 'passed' | 'failed' | 'blocked';
+    testType?: 'backend' | 'frontend';
+  }) {
+    const creds = makeCreds();
+    const namedRun = makeTerminalRun('run_rerun_be_named', args.namedStatus);
+    const producerRun = makeTerminalRun('run_rerun_be_producer', 'passed');
+    producerRun.testId = 'test_be_producer_01';
+    const stderr: string[] = [];
+    const typeLookups: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_be_consumer_01/runs/rerun')) return { body: args.rerunResp };
+      if (url.includes('/runs/run_rerun_be_named')) return { body: namedRun };
+      if (url.includes('/runs/run_rerun_be_producer')) return { body: producerRun };
+      if (/\/tests\/test_be_(consumer|producer)_01(\?|$)/.test(url)) {
+        typeLookups.push(url);
+        return { body: { ...BE_TEST, type: args.testType ?? 'backend' } };
+      }
+      return errorBody('NOT_FOUND');
+    });
+    const err = await runTestRerun(
+      { ...baseOpts, output: args.output, testIds: ['test_be_consumer_01'] },
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl,
+        stderr: line => stderr.push(line),
+        stdout: () => {},
+      },
+    ).catch(e => e);
+    return { err, hint: stderr.find(l => l.startsWith('Run finished')) ?? '', typeLookups };
+  }
+
+  it.each(['text', 'json'] as const)(
+    'multi-member closure (%s): a failed named test points at test failure get, with no extra type lookup',
+    async output => {
+      const { err, hint, typeLookups } = await rerun({
+        output,
+        rerunResp: makeBeRerunResp(),
+        namedStatus: 'failed',
+      });
+      expect(err.exitCode).toBe(1);
+      expect(hint).toContain("'testsprite test failure get test_be_consumer_01'");
+      expect(hint).not.toContain('artifact get');
+      // Only the pre-trigger read of the named test; the hint adds nothing.
+      expect(typeLookups).toHaveLength(1);
+    },
+  );
+
+  it('single-member closure (json): known backend from the closure, so no extra type lookup', async () => {
+    const resp = makeBeRerunResp();
+    resp.closure!.members = resp.closure!.members.slice(0, 1);
+    resp.closure!.addedProducers = [];
+    const { err, hint, typeLookups } = await rerun({
+      output: 'json',
+      rerunResp: resp,
+      namedStatus: 'blocked',
+    });
+    expect(err.exitCode).toBe(1);
+    expect(hint).toContain("'testsprite test failure get test_be_consumer_01'");
+    expect(typeLookups).toHaveLength(1);
+  });
+
+  it('no closure (json): a failed backend rerun reuses the type read before triggering', async () => {
+    const resp = makeBeRerunResp();
+    delete resp.closure;
+    const { hint, typeLookups } = await rerun({
+      output: 'json',
+      rerunResp: resp,
+      namedStatus: 'failed',
+    });
+    expect(hint).toContain("'testsprite test failure get test_be_consumer_01'");
+    expect(typeLookups).toHaveLength(1);
+  });
+
+  it('no closure (json): a failed frontend rerun keeps the run-scoped artifact hint', async () => {
+    const resp = makeBeRerunResp();
+    delete resp.closure;
+    const { hint } = await rerun({
+      output: 'json',
+      rerunResp: resp,
+      namedStatus: 'failed',
+      testType: 'frontend',
+    });
+    expect(hint).toContain("'testsprite test artifact get run_rerun_be_named'");
+  });
+});
