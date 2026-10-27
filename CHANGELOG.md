@@ -4,6 +4,11 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ci run` on `deployment_status` gates only an open pull request whose head is the deployed commit** (#550). A redeploy of a merged or closed pull request's head commit, or an open pull request that merely contains the commit, is now skipped with a `::notice::` and exit 0 (`no_pull_request`) instead of cloning an environment and gating it.
+- **The `deployment_status` pull-request lookup honors `--request-timeout` and survives a non-JSON reply** (#551). A GitHub API that never answers is exit 10 within the request budget instead of hanging the job, and a 200 with an HTML body (proxy, captive portal) is exit 10 with a clear message instead of an uncaught exception. 401/403 keep exit 5.
+
 ## [0.15.0] - 2026-10-17
 
 ### Added
