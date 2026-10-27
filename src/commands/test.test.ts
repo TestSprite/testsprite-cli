@@ -1634,6 +1634,23 @@ describe('runGet', () => {
     const parsed = JSON.parse(out.join('')) as CliTest;
     expect(parsed.priority).toBe('p0');
   });
+
+  it('rejects empty and whitespace-only test id with VALIDATION_ERROR before network access', async () => {
+    const fetchImpl = vi.fn();
+    for (const invalidId of ['', '   ']) {
+      await expect(
+        runGet(
+          { profile: 'default', output: 'json', debug: false, testId: invalidId },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'test-id', reason: 'is required' },
+      });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
 
 // ---------- P4: code / steps / result ----------
@@ -2724,6 +2741,23 @@ describe('runCodeGet', () => {
     expect(got.code).toBe('');
     expect(stderr.join('\n')).toContain('no code generated yet');
   });
+
+  it('rejects empty and whitespace-only test id with VALIDATION_ERROR before network access', async () => {
+    const fetchImpl = vi.fn();
+    for (const invalidId of ['', '   ']) {
+      await expect(
+        runCodeGet(
+          { profile: 'default', output: 'json', debug: false, testId: invalidId },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'test-id', reason: 'is required' },
+      });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
 
 describe('runCodePut', () => {
@@ -3576,6 +3610,23 @@ describe('runOpen', () => {
     ).resolves.toBeDefined();
     expect(errs.join('\n')).toContain('could not launch a browser');
   });
+
+  it('rejects empty and whitespace-only test id with VALIDATION_ERROR before network access', async () => {
+    const fetchImpl = vi.fn();
+    for (const invalidId of ['', '   ']) {
+      await expect(
+        runOpen(
+          { profile: 'default', output: 'json', debug: false, testId: invalidId, noBrowser: true },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'test-id', reason: 'is required' },
+      });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
 
 describe('runSteps', () => {
@@ -4124,6 +4175,23 @@ describe('runSteps', () => {
     const steps = test.commands.find(c => c.name() === 'steps')!;
     const flagNames = steps.options.map(o => o.long);
     expect(flagNames).toContain('--run-id');
+  });
+
+  it('rejects empty and whitespace-only test id with VALIDATION_ERROR before network access', async () => {
+    const fetchImpl = vi.fn();
+    for (const invalidId of ['', '   ']) {
+      await expect(
+        runSteps(
+          { profile: 'default', output: 'json', debug: false, testId: invalidId },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'test-id', reason: 'is required' },
+      });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
 
@@ -5492,6 +5560,23 @@ describe('runResult — D1 targetUrlSource', () => {
     // No advisory in JSON mode
     expect(stderrLines.some(l => l.includes('[advisory]'))).toBe(false);
   });
+
+  it('rejects empty and whitespace-only test id with VALIDATION_ERROR before network access', async () => {
+    const fetchImpl = vi.fn();
+    for (const invalidId of ['', '   ']) {
+      await expect(
+        runResult(
+          { profile: 'default', output: 'json', debug: false, testId: invalidId },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'test-id', reason: 'is required' },
+      });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
 
 // ---------- §5.2 / M2.1 piece 3 — runFailureSummary ----------
@@ -5582,6 +5667,23 @@ describe('runFailureSummary', () => {
       exitCode: 4,
       details: { reason: 'no_failing_run' },
     });
+  });
+
+  it('rejects empty and whitespace-only test id with VALIDATION_ERROR before network access', async () => {
+    const fetchImpl = vi.fn();
+    for (const invalidId of ['', '   ']) {
+      await expect(
+        runFailureSummary(
+          { profile: 'default', output: 'json', debug: false, testId: invalidId },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'test-id', reason: 'is required' },
+      });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
 
@@ -6276,6 +6378,29 @@ describe('runFailureGet', () => {
       exitCode: 5,
       details: expect.objectContaining({ reason: 'code_version_mismatch' }),
     });
+  });
+
+  it('rejects empty and whitespace-only test id with VALIDATION_ERROR before network access', async () => {
+    const fetchImpl = vi.fn();
+    for (const invalidId of ['', '   ']) {
+      await expect(
+        runFailureGet(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            testId: invalidId,
+            failedOnly: false,
+          },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'test-id', reason: 'is required' },
+      });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
 
