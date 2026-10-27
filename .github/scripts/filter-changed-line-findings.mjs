@@ -38,22 +38,40 @@ function addedLines(relPath) {
   try {
     out = execFileSync(
       'git',
-      ['diff', '--unified=0', '--diff-filter=ACMR', base, head, '--', relPath],
+      [
+        'diff',
+        '--unified=0',
+        '--diff-filter=ACMR',
+        // Force a textual diff: without it a `.gitattributes` `-diff` attribute
+        // (or a textconv driver) yields a binary marker with no hunks, which
+        // this filter would read as "no added lines" and pass silently.
+        '--text',
+        '--no-ext-diff',
+        '--no-textconv',
+        base,
+        head,
+        '--',
+        relPath,
+      ],
       { encoding: 'utf8' },
     );
   } catch {
     return null;
   }
   const lines = new Set();
+  let sawHunk = false;
   for (const line of out.split('\n')) {
     const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
     if (!m) continue;
+    sawHunk = true;
     const start = Number(m[1]);
     const count = m[2] === undefined ? 1 : Number(m[2]);
     // count === 0 is a pure deletion at that position — no added line.
     for (let i = 0; i < count; i++) lines.add(start + i);
   }
-  return lines;
+  // A changed file that still yields no hunks has an unknown edit scope: keep
+  // every finding rather than none, so an attribute can never silence the gate.
+  return sawHunk ? lines : null;
 }
 
 const offenders = [];
