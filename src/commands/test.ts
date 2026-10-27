@@ -1295,6 +1295,37 @@ interface CreateOptions extends CommonOptions {
 }
 
 /**
+ * `test create` / `test create-batch`: `--wait`, `--timeout` and (batch only)
+ * `--max-concurrency` act on the runs `--run` triggers. Without `--run`
+ * nothing is triggered, so they are refused like `--env` instead of exiting 0
+ * with no run at all (#376). Each flag is passed as "given on the command line".
+ */
+function assertRunChainFlagsNeedRun(
+  run: boolean | undefined,
+  given: { wait?: boolean; timeout?: boolean; maxConcurrency?: boolean },
+): void {
+  if (run === true) return;
+  if (given.wait === true) {
+    throw localValidationError(
+      'wait',
+      '--wait requires --run (it polls the run that --run triggers). Add --run, or remove --wait',
+    );
+  }
+  if (given.timeout === true) {
+    throw localValidationError(
+      'timeout',
+      '--timeout requires --run (it bounds the wait for the run that --run triggers). Add --run, or remove --timeout',
+    );
+  }
+  if (given.maxConcurrency === true) {
+    throw localValidationError(
+      'max-concurrency',
+      '--max-concurrency requires --run (it caps the triggers --run keeps in flight). Add --run, or remove --max-concurrency',
+    );
+  }
+}
+
+/**
  * Chained `test create --run` / `test create --plan-from --run` derive the
  * trigger idempotency key as `<createKey>:run`. Validate that derived key
  * BEFORE the create POST so a near-limit user-supplied base key fails fast
@@ -1475,6 +1506,10 @@ export async function runCreate(
   if (opts.environment !== undefined && opts.run !== true) {
     throw localValidationError('env', '--env requires --run');
   }
+  assertRunChainFlagsNeedRun(opts.run, {
+    wait: opts.wait,
+    timeout: opts.timeout !== undefined && opts.timeoutIsDefault !== true,
+  });
   normalizeEnvironmentName(opts.environment);
   // P1-2: validate idempotency key before any I/O — non-ASCII chars cause a
   // ByteString TypeError at the HTTP transport layer (exit 10 UNAVAILABLE).
@@ -3468,6 +3503,10 @@ export async function runCreateFromPlan(
   if (opts.environment !== undefined && opts.run !== true) {
     throw localValidationError('env', '--env requires --run');
   }
+  assertRunChainFlagsNeedRun(opts.run, {
+    wait: opts.wait,
+    timeout: opts.timeout !== undefined && opts.timeoutIsDefault !== true,
+  });
   normalizeEnvironmentName(opts.environment);
   assertIdempotencyKey(opts.idempotencyKey);
   // codex #128 P2: validate the derived `<key>:run` chain key before the
@@ -3991,6 +4030,11 @@ export async function runCreateBatch(
   if (opts.environment !== undefined && opts.run !== true) {
     throw localValidationError('env', '--env requires --run');
   }
+  assertRunChainFlagsNeedRun(opts.run, {
+    wait: opts.wait,
+    timeout: opts.timeoutSeconds !== undefined,
+    maxConcurrency: opts.maxConcurrency !== undefined,
+  });
   normalizeEnvironmentName(opts.environment);
   assertIdempotencyKey(opts.idempotencyKey);
   // Exactly one of --plans or --plan-from-dir is required.
@@ -14567,6 +14611,10 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         runPlanTemplate(resolveCommonOptions(command, deps.env), deps);
         return;
       }
+      assertRunChainFlagsNeedRun(cmdOpts.run, {
+        wait: cmdOpts.wait === true,
+        timeout: cmdOpts.timeout !== undefined,
+      });
       // --plan-from and --code-file are mutually exclusive. Dispatch
       // here so each `run*` function stays single-purpose. If neither
       // is set, the existing runCreate path enforces --code-file.
@@ -14698,7 +14746,12 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           maxConcurrency: parseNumericFlag(cmdOpts.maxConcurrency, 'max-concurrency'),
           wait: cmdOpts.wait === true,
           noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
-          timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
+          // undefined = flag not given (runCreateBatch defaults it, and refuses
+          // an explicit --timeout without --run).
+          timeoutSeconds:
+            cmdOpts.timeout === undefined
+              ? undefined
+              : parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
           targetUrl: cmdOpts.targetUrl,
           environment: cmdOpts.env,
           skipPreflight: cmdOpts.skipPreflight === true,
