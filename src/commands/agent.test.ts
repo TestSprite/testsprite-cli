@@ -11,8 +11,10 @@ import {
   SKILLS,
   buildSkillMarker,
   loadSkillBodyFor,
+  ownFileBodyFor,
   pathFor,
   renderForTarget,
+  renderLegacyOwnFileWithMarker,
   renderOwnFileWithMarker,
   TARGETS,
   type AgentTarget,
@@ -2968,6 +2970,44 @@ describe('runStatus — agent status (issue #123)', () => {
   // compact target that used to be a dead end — install saw the file as
   // current and skipped it, status still said stale — so pin that the remedy
   // now clears the state it is printed for.
+  // v0.15.0 wrote the skills with an unquoted frontmatter description. Those
+  // bytes are a pristine install of an older render, not a user edit, so status
+  // must call them stale and a plain install (no --force) must repair them.
+  it.each(['claude', 'windsurf'] as AgentTarget[])(
+    'v0.15.0-style unquoted render reads stale and refreshes without --force (%s)',
+    async target => {
+      const { fs: agentFs, seedFile } = makeMemFs();
+      const skill = 'testsprite-ci';
+      const body = ownFileBodyFor(target, skill);
+      seedFile(
+        path.resolve(CWD, pathFor(target, skill)),
+        renderLegacyOwnFileWithMarker(target, skill, buildSkillMarker(skill, body), body),
+      );
+
+      const before = await statusRows(agentFs);
+      expect(before.rows.find(r => r.target === target && r.skill === skill)?.state).toBe('stale');
+      expect((before.thrown as CLIError).exitCode).toBe(1);
+
+      const { deps } = makeCapture();
+      await runInstall(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          dryRun: false,
+          target: [target],
+          skills: [skill],
+          force: false,
+        },
+        { cwd: CWD, fs: agentFs, ...deps },
+      );
+
+      const after = await statusRows(agentFs);
+      expect(after.rows.find(r => r.target === target && r.skill === skill)?.state).toBe('ok');
+      expect(after.thrown).toBeUndefined();
+    },
+  );
+
   it('stale on a compact target: install --force clears it', async () => {
     const { fs: agentFs, seedFile } = makeMemFs();
     const oldBody = '# TestSprite Verification Loop\n\nold body from a previous CLI release\n';
