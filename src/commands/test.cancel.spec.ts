@@ -344,6 +344,141 @@ describe('runTestCancel — multi-id summary + exit precedence (CXL-11)', () => 
     // Stable machine shape (codex finding 2): errors is ALWAYS present,
     // an empty array on full success — never an absent key.
     expect(result.errors).toEqual([]);
+    expect(result.refunds).toEqual([]);
+  });
+
+  it.each(['json', 'text'] as const)(
+    'preserves mixed refund outcomes in %s mode without failing successful cancellations',
+    async output => {
+      const { credentialsPath } = makeCreds();
+      const refunds = {
+        run_paid: { status: 'refunded', amount: 0 },
+        run_free: { status: 'not_charged' },
+        run_failed: { status: 'failed' },
+        run_already_failed: { status: 'failed' },
+      } satisfies Record<string, NonNullable<CancelRunResponse['refund']>>;
+      const runIds = [...Object.keys(refunds), 'run_legacy'];
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const result = await runTestCancel(
+        { profile: 'default', output, debug: false, dryRun: false, runIds },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(url => {
+            const runId = runIdFromCancelUrl(url)!;
+            return {
+              body: makeCancelResponse(runId, {
+                ...(runId in refunds ? { refund: refunds[runId as keyof typeof refunds] } : {}),
+                alreadyCancelled: runId === 'run_already_failed',
+              }),
+            };
+          }),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+        },
+      );
+      const expectedRefunds = Object.entries(refunds).map(([runId, refund]) => ({
+        runId,
+        ...refund,
+      }));
+      expect(result).toEqual({
+        cancelled: ['run_paid', 'run_free', 'run_failed', 'run_legacy'],
+        alreadyCancelled: ['run_already_failed'],
+        conflicts: [],
+        notFound: [],
+        errors: [],
+        refunds: expectedRefunds,
+      });
+      if (output === 'json') {
+        expect(JSON.parse(stdout.join('\n'))).toEqual(result);
+      } else {
+        const text = stdout.join('\n');
+        expect(text).toContain('run_paid  refund      credits returned: 0');
+        expect(text).toContain('run_free  refund      run was never charged; nothing to return');
+        for (const runId of ['run_failed', 'run_already_failed']) {
+          expect(text).toContain(`${runId}  refund      failed — cancellation succeeded`);
+        }
+        expect(text).not.toContain('run_legacy  refund');
+      }
+      expect(stderr.filter(line => line.startsWith('[warning]'))).toEqual([
+        '[warning] Refund failed for runs: run_failed run_already_failed; cancellation succeeded, but credits were not returned; contact TestSprite support.',
+      ]);
+    },
+  );
+
+  it.each([
+    { output: 'json' as const, runIds: ['run_actual'] },
+    { output: 'json' as const, runIds: ['run_actual', 'run_legacy'] },
+    { output: 'text' as const, runIds: ['run_actual', 'run_legacy'] },
+  ])(
+    'keeps requested refund IDs authoritative for $runIds in $output mode',
+    async ({ output, runIds }) => {
+      const { credentialsPath } = makeCreds();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      // The response validator preserves unknown refund fields for forward compatibility.
+      const refund = { status: 'failed' as const, runId: 'run_unrelated' };
+      const result = await runTestCancel(
+        { profile: 'default', output, debug: false, dryRun: false, runIds },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(url => {
+            const runId = runIdFromCancelUrl(url)!;
+            return { body: makeCancelResponse(runId, runId === 'run_actual' ? { refund } : {}) };
+          }),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+        },
+      );
+      expect(stderr.join('\n')).toContain('Refund failed for runs: run_actual;');
+      expect(stderr.join('\n')).not.toContain('run_unrelated');
+      if (runIds.length > 1) {
+        expect((result as CliCancelSummary).refunds).toEqual([
+          { runId: 'run_actual', status: 'failed' },
+        ]);
+        expect(stdout.join('\n')).not.toContain('run_unrelated');
+      }
+    },
+  );
+
+  it.each([
+    { code: 'NOT_FOUND', exitCode: 4 },
+    { code: 'CONFLICT', exitCode: 6 },
+    { code: 'AUTH_FORBIDDEN', exitCode: 1 },
+  ])('warns about a failed refund before throwing exit $exitCode', async ({ code, exitCode }) => {
+    const { credentialsPath } = makeCreds();
+    const events: string[] = [];
+    const stdout: string[] = [];
+    await expect(
+      runTestCancel(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: false,
+          runIds: ['run_failed', 'run_error'],
+        },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(url =>
+            runIdFromCancelUrl(url) === 'run_error'
+              ? errorBody(code, { status: 'passed' })
+              : { body: makeCancelResponse('run_failed', { refund: { status: 'failed' } }) },
+          ),
+          stdout: line => stdout.push(line),
+          stderr: line => events.push(line),
+        },
+      ).catch((err: unknown) => {
+        events.push('throw');
+        throw err;
+      }),
+    ).rejects.toMatchObject({ exitCode });
+    expect(JSON.parse(stdout.join('\n')).refunds).toEqual([
+      { runId: 'run_failed', status: 'failed' },
+    ]);
+    const warningIndex = events.findIndex(line => line.startsWith('[warning]'));
+    expect(warningIndex).toBeGreaterThanOrEqual(0);
+    expect(warningIndex).toBeLessThan(events.indexOf('throw'));
   });
 
   it('mixed: cancelled + conflict + notFound → notFound wins (exit 4), all buckets populated', async () => {
