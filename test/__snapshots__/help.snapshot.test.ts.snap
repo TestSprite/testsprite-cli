@@ -672,7 +672,13 @@ Commands:
     5  validation error (e.g., bad URL, or positional + --all both set)
     6  conflict (already running — see nextAction for the active runId)
     7  timeout — resume with: testsprite test wait <run-id>, or stop it with: testsprite test cancel <run-id>
-   10  transport/network failure (UNAVAILABLE) — retry the command
+   10  transport/network failure (UNAVAILABLE). If it printed a runId with status
+       running, that run is still executing: check it with testsprite test wait
+       <run-id> (running this command again triggers and bills a new run).
+       With --local or a local environment, the tunnel closed with this command
+       and test wait cannot reopen it: follow the printed next step. If its
+       cancellation was skipped, the run can still finish, but steps that need
+       your machine can fail. Otherwise retry the command
    11  rate limited — honor Retry-After, or the in-flight run cap was hit
        (details.reason "inflight_cap"; see: testsprite test run --help)
   
@@ -1304,7 +1310,13 @@ Exit codes:
   5  validation error (e.g., bad URL, or positional + --all both set)
   6  conflict (already running — see nextAction for the active runId)
   7  timeout — resume with: testsprite test wait <run-id>, or stop it with: testsprite test cancel <run-id>
- 10  transport/network failure (UNAVAILABLE) — retry the command
+ 10  transport/network failure (UNAVAILABLE). If it printed a runId with status
+     running, that run is still executing: check it with testsprite test wait
+     <run-id> (running this command again triggers and bills a new run).
+     With --local or a local environment, the tunnel closed with this command
+     and test wait cannot reopen it: follow the printed next step. If its
+     cancellation was skipped, the run can still finish, but steps that need
+     your machine can fail. Otherwise retry the command
  11  rate limited — honor Retry-After, or the in-flight run cap was hit
      (details.reason "inflight_cap"; see: testsprite test run --help)
 

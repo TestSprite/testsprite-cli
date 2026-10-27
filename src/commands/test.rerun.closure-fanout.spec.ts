@@ -183,8 +183,9 @@ describe('BE closure fan-out: a member poll error is classified (survives fan-ou
       if (url.includes('/runs/run_rerun_be_named')) return { body: namedRun };
       // Producer member poll fails for the whole window — the fan-out still
       // completes and prints the partial, but the producer's verdict was never
-      // observed, so --wait must exit 7 (not silently succeed as exit 0).
-      return errorBody('UNAVAILABLE', { reason: 'upstream' });
+      // observed, so --wait must exit 7 (not silently succeed as exit 0). A
+      // 500, because a 503 is an outage the poll waits out until --timeout.
+      return errorBody('INTERNAL', { reason: 'upstream' });
     });
 
     const err = await runTestRerun(
@@ -213,9 +214,9 @@ describe('BE closure fan-out: a member poll error is classified (survives fan-ou
     // carrying its diagnostic code.
     expect(Array.isArray(json.closureFailures)).toBe(true);
     const producerFailure = json.closureFailures!.find(f => f.testId === 'test_be_producer_01');
-    expect(producerFailure?.status).toBe('UNAVAILABLE');
+    expect(producerFailure?.status).toBe('INTERNAL');
     expect(producerFailure?.unobserved).toBe(true);
-    expect(stderrLines.some(l => l.includes('closure member') && l.includes('UNAVAILABLE'))).toBe(
+    expect(stderrLines.some(l => l.includes('closure member') && l.includes('INTERNAL'))).toBe(
       true,
     );
   });

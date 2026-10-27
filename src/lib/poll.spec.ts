@@ -6,10 +6,10 @@
  * (or a spy) so there are no real delays.
  */
 
-import { describe, expect, it, vi } from 'vitest';
-import { ApiError, InterruptError } from './errors.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApiError, InterruptError, TransportError } from './errors.js';
 import { ShutdownController } from './interrupt.js';
-import { pollRunUntilTerminal, TimeoutError } from './poll.js';
+import { pollRunUntilTerminal, TimeoutError, UnreachableAtDeadlineError } from './poll.js';
 import type { RunClient } from './poll.js';
 import { defaultSleep, sleepUnlessInterrupted } from './poll-support.js';
 import type { RunResponse } from './runs.types.js';
@@ -542,29 +542,36 @@ describe('pollRunUntilTerminal — AbortSignal + timeout enforcement', () => {
     expect(receivedSignals[0]).toBeInstanceOf(AbortSignal);
   });
 
-  it('reuses the same session AbortSignal across poll iterations (no per-iteration churn)', async () => {
+  it('composes no AbortSignal.any per poll iteration (no per-iteration churn)', async () => {
     // Regression guard for the AbortController/AbortSignal.any churn fix: a
-    // fresh controller + composed signal per iteration was pure waste (the
-    // abort target — deadlineMs + cushion — never changes between
-    // iterations), and on a `--wait` fan-out over many concurrent runIds it
-    // produced enough short-lived `AbortSignal.any` composites to make V8's
-    // FinalizationRegistry cleanup pass pathologically slow. The signal is
-    // now hoisted once per poll session and reused for every iteration.
+    // fresh `AbortSignal.any` composite per iteration registered a dependent
+    // on the long-lived shutdown signal each time, and on a `--wait` fan-out
+    // over many concurrent runIds that made V8's FinalizationRegistry cleanup
+    // pass pathologically slow. The session signal is composed once; the
+    // per-read stall guard composes with plain listeners
+    // (`composeAbortSignals`), which leave nothing for the registry.
+    const anySpy = vi.spyOn(AbortSignal, 'any');
+    const shutdown = new ShutdownController();
     const receivedSignals: Array<AbortSignal | undefined> = [];
     const client: RunClient = {
       getRun: async (_runId, opts) => {
         receivedSignals.push(opts?.signal);
-        // Return non-terminal then terminal to force two iterations
-        return receivedSignals.length < 2 ? makeRun('running') : makeRun('passed');
+        return receivedSignals.length < 6 ? makeRun('running') : makeRun('passed');
       },
     };
-    await pollRunUntilTerminal(client, RUN_ID, {
-      timeoutSeconds: 60,
-      sleep: instantSleep,
-    });
-    expect(receivedSignals).toHaveLength(2);
-    expect(receivedSignals[0]).toBeInstanceOf(AbortSignal);
-    expect(receivedSignals[0]).toBe(receivedSignals[1]);
+    try {
+      await pollRunUntilTerminal(client, RUN_ID, {
+        timeoutSeconds: 60,
+        sleep: instantSleep,
+        shutdown,
+      });
+      expect(receivedSignals).toHaveLength(6);
+      expect(receivedSignals.every(signal => signal instanceof AbortSignal)).toBe(true);
+      // One composite for the whole session (deadline + shutdown), however many reads.
+      expect(anySpy).toHaveBeenCalledOnce();
+    } finally {
+      anySpy.mockRestore();
+    }
   });
 
   it('surfaces TimeoutError when fetch resolves as AbortError (hung fetch past deadline)', async () => {
@@ -943,5 +950,407 @@ describe('pollRunUntilTerminal — shutdown (SIGINT/SIGTERM graceful detach)', (
     }).catch(e => e);
     expect(err).toBeInstanceOf(TimeoutError);
     expect(disposedCount).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Outage once the endpoint has answered (#437): waited out until the deadline
+// ---------------------------------------------------------------------------
+
+describe('pollRunUntilTerminal: outage once the endpoint has answered', () => {
+  beforeEach(() => {
+    // Fake clock and the real default (setTimeout) sleep, so every read time
+    // below is the time the loop actually waited.
+    vi.useFakeTimers();
+    // No jitter: the schedule is exactly 2s, 4s, 8s, then 15s.
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  type Step = RunResponse | (() => ApiError);
+
+  /** Answers reads from `script` in order (the last step repeats) and records each read's time. */
+  function makeScriptedClient(script: Step[]): RunClient & { readTimesMs: number[] } {
+    const startMs = Date.now();
+    const readTimesMs: number[] = [];
+    return {
+      readTimesMs,
+      getRun: async () => {
+        readTimesMs.push(Date.now() - startMs);
+        const step = script[Math.min(readTimesMs.length - 1, script.length - 1)]!;
+        if (typeof step === 'function') throw step();
+        return step;
+      },
+    };
+  }
+
+  /** Settles the poll into a value, so a rejection during the timer advance is not unhandled. */
+  function settle(poll: Promise<RunResponse>): Promise<{ run: RunResponse } | { error: unknown }> {
+    return poll.then(
+      run => ({ run }),
+      (error: unknown) => ({ error }),
+    );
+  }
+
+  const networkDown = (): ApiError => new TransportError('fetch failed', 'req_down');
+  const serviceUnavailable = (retryAfterMs?: number) => (): ApiError =>
+    ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'UNAVAILABLE',
+          message: 'Service unavailable',
+          nextAction: 'retry',
+          requestId: 'req_503',
+          details: {},
+        },
+      },
+      503,
+      retryAfterMs,
+    );
+
+  it('waits out an outage longer than the transport retries and returns the verdict', async () => {
+    const client = makeScriptedClient([
+      makeRun('running'),
+      networkDown,
+      networkDown,
+      networkDown,
+      makeRun('passed'),
+    ]);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600 }));
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(await outcome).toMatchObject({ run: { status: 'passed' } });
+    expect(client.readTimesMs).toEqual([0, 0, 2000, 6000, 14000]);
+  });
+
+  it('re-reads after 2s, 4s, 8s, then every 15s, and exits 10 with the runId when the outage outlasts --timeout', async () => {
+    const client = makeScriptedClient([makeRun('running'), networkDown]);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 60 }));
+    await vi.advanceTimersByTimeAsync(70_000);
+
+    const result = await outcome;
+    expect(client.readTimesMs).toEqual([0, 0, 2000, 6000, 14000, 29000, 44000, 59000]);
+    expect(result).toHaveProperty('error');
+    const err = (result as { error: unknown }).error;
+    expect(err).toBeInstanceOf(UnreachableAtDeadlineError);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).not.toBeInstanceOf(TimeoutError);
+    expect(err).toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+      runId: RUN_ID,
+      requestId: 'req_down',
+      details: { runId: RUN_ID, timeoutSeconds: 60 },
+    });
+    expect((err as ApiError).message).toContain('fetch failed');
+    expect((err as ApiError).nextAction).toContain(`testsprite test wait ${RUN_ID}`);
+  });
+
+  it("honours a 503's Retry-After instead of the schedule", async () => {
+    const client = makeScriptedClient([
+      makeRun('running'),
+      serviceUnavailable(7000),
+      makeRun('passed'),
+    ]);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600 }));
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(await outcome).toMatchObject({ run: { status: 'passed' } });
+    expect(client.readTimesMs).toEqual([0, 0, 7000]);
+  });
+
+  it("honours the envelope's retryAfterSec when a 503 sends no Retry-After header", async () => {
+    const client = makeScriptedClient([
+      makeRun('running'),
+      () => makeApiError('UNAVAILABLE', { retryAfterSec: 5 }, 503),
+      makeRun('passed'),
+    ]);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600 }));
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(await outcome).toMatchObject({ run: { status: 'passed' } });
+    expect(client.readTimesMs).toEqual([0, 0, 5000]);
+  });
+
+  it('waits out an outage on the first read after a trigger (the trigger reached the endpoint)', async () => {
+    const client = makeScriptedClient([networkDown, networkDown, makeRun('passed')]);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600 }));
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(await outcome).toMatchObject({ run: { status: 'passed' } });
+    expect(client.readTimesMs).toEqual([0, 2000, 6000]);
+  });
+
+  it('fails fast on first contact (test wait): an unreachable endpoint is reported, not waited out', async () => {
+    const client = makeScriptedClient([networkDown]);
+    const outcome = settle(
+      pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600, isFirstContact: true }),
+    );
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    const result = await outcome;
+    expect(client.readTimesMs).toEqual([0, 1000]);
+    const err = (result as { error: unknown }).error;
+    expect(err).toBeInstanceOf(TransportError);
+    expect(err).not.toBeInstanceOf(UnreachableAtDeadlineError);
+  });
+
+  it('after a first contact answers, a later outage is waited out', async () => {
+    const client = makeScriptedClient([
+      makeRun('running'),
+      networkDown,
+      networkDown,
+      makeRun('passed'),
+    ]);
+    const outcome = settle(
+      pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600, isFirstContact: true }),
+    );
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(await outcome).toMatchObject({ run: { status: 'passed' } });
+  });
+
+  it('a read that answers ends the outage: the deadline is then a plain TimeoutError (exit 7)', async () => {
+    const client = makeScriptedClient([
+      makeRun('running'),
+      networkDown,
+      makeRun('running', { retryAfterSeconds: 5 }),
+    ]);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 30 }));
+    await vi.advanceTimersByTimeAsync(40_000);
+
+    const err = (await outcome) as { error: unknown };
+    expect(err.error).toBeInstanceOf(TimeoutError);
+  });
+
+  it('keeps 429 handling during an outage: RATE_LIMITED still ends the wait at once', async () => {
+    const client = makeScriptedClient([
+      makeRun('running'),
+      networkDown,
+      () => makeApiError('RATE_LIMITED', {}, 429),
+    ]);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600 }));
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    const result = (await outcome) as { error: unknown };
+    expect(result.error).toMatchObject({ code: 'RATE_LIMITED' });
+    expect(client.readTimesMs).toEqual([0, 0, 2000]);
+  });
+
+  it('keeps the INTERNAL single retry during an outage: a second 500 still ends the wait', async () => {
+    const client = makeScriptedClient([
+      makeRun('running'),
+      networkDown,
+      () => makeApiError('INTERNAL', {}, 500),
+    ]);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600 }));
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    const result = (await outcome) as { error: unknown };
+    expect(result.error).toMatchObject({ code: 'INTERNAL' });
+    expect(client.readTimesMs).toEqual([0, 0, 2000, 3000]);
+  });
+
+  it('Ctrl-C during the outage backoff wins at once', async () => {
+    const shutdown = new ShutdownController();
+    const client = makeScriptedClient([makeRun('running'), networkDown]);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600, shutdown }));
+    await vi.advanceTimersByTimeAsync(1000);
+    shutdown.interrupt('SIGINT');
+    await vi.advanceTimersByTimeAsync(0);
+
+    const result = (await outcome) as { error: unknown };
+    expect(result.error).toBeInstanceOf(InterruptError);
+    expect(client.readTimesMs).toEqual([0, 0]);
+  });
+
+  it('reports the outage and the reconnection through onTransition', async () => {
+    const messages: string[] = [];
+    const client = makeScriptedClient([makeRun('running'), networkDown, makeRun('passed')]);
+    const outcome = settle(
+      pollRunUntilTerminal(client, RUN_ID, {
+        timeoutSeconds: 600,
+        onTransition: message => messages.push(message),
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(10_000);
+    await outcome;
+
+    expect(messages).toEqual([
+      `Cannot reach the TestSprite API (fetch failed); run ${RUN_ID} keeps executing server-side. Retrying in 2s until the --timeout deadline`,
+      `Reconnected after 2s; still waiting for run ${RUN_ID}`,
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stalled reads (#437): a silently dead connection is aborted and reconnected
+// ---------------------------------------------------------------------------
+
+describe('pollRunUntilTerminal: a read that never answers', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * A read on a dead connection: no answer and no error, until its signal
+   * aborts, which rejects it with the signal's reason as a real fetch does.
+   */
+  const hang = (signal: AbortSignal | undefined): Promise<RunResponse> =>
+    new Promise((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+
+  type Step =
+    | RunResponse
+    | 'hang'
+    | (() => ApiError)
+    | ((options: Parameters<RunClient['getRun']>[1]) => Promise<RunResponse>);
+
+  /** Answers reads from `script` in order (the last step repeats) and records each read's time. */
+  function makeScriptedClient(
+    script: Step[],
+  ): RunClient & { readTimesMs: number[]; signals: Array<AbortSignal | undefined> } {
+    const startMs = Date.now();
+    const readTimesMs: number[] = [];
+    const signals: Array<AbortSignal | undefined> = [];
+    return {
+      readTimesMs,
+      signals,
+      getRun: async (_runId, options) => {
+        readTimesMs.push(Date.now() - startMs);
+        signals.push(options?.signal);
+        const step = script[Math.min(readTimesMs.length - 1, script.length - 1)]!;
+        if (step === 'hang') return hang(options?.signal);
+        if (typeof step === 'function') {
+          const outcome = step(options);
+          if (outcome instanceof ApiError) throw outcome;
+          return outcome;
+        }
+        return step;
+      },
+    };
+  }
+
+  function settle(poll: Promise<RunResponse>): Promise<{ run: RunResponse } | { error: unknown }> {
+    return poll.then(
+      run => ({ run }),
+      (error: unknown) => ({ error }),
+    );
+  }
+
+  it('aborts a read silent for its 25s window plus 20s and reconnects on a fresh read', async () => {
+    const client = makeScriptedClient([makeRun('running'), 'hang', makeRun('passed')]);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600 }));
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(await outcome).toMatchObject({ run: { status: 'passed' } });
+    // Aborted at 45s, re-read after the outage schedule's first 2s.
+    expect(client.readTimesMs).toEqual([0, 0, 47_000]);
+    expect(client.signals[1]?.aborted).toBe(true);
+  });
+
+  it('gives a read without a long-poll window (backoff mode) a 20s budget', async () => {
+    const client = makeScriptedClient([
+      makeRun('running'),
+      () => makeApiError('VALIDATION_ERROR', {}, 400),
+      'hang',
+      makeRun('passed'),
+    ]);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600 }));
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(await outcome).toMatchObject({ run: { status: 'passed' } });
+    expect(client.readTimesMs).toEqual([0, 0, 0, 22_000]);
+  });
+
+  it('exits 10 when reads keep stalling until --timeout', async () => {
+    const client = makeScriptedClient([makeRun('running'), 'hang']);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 120 }));
+    await vi.advanceTimersByTimeAsync(130_000);
+
+    const result = (await outcome) as { error: unknown };
+    expect(result.error).toBeInstanceOf(UnreachableAtDeadlineError);
+    expect(result.error).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10, runId: RUN_ID });
+    expect((result.error as ApiError).message).toContain('no answer for 45s');
+  });
+
+  it('a retry wait inside the read restarts the budget, so a 429 Retry-After is not a stall', async () => {
+    const client = makeScriptedClient([
+      makeRun('running'),
+      options =>
+        new Promise<RunResponse>((resolve, reject) => {
+          // http.ts reports a 60s Retry-After wait, then answers after it.
+          options?.onRetryWait?.(60_000);
+          const timer = setTimeout(() => resolve(makeRun('passed')), 61_000);
+          options?.signal?.addEventListener(
+            'abort',
+            () => {
+              clearTimeout(timer);
+              reject(options.signal!.reason);
+            },
+            { once: true },
+          );
+        }),
+    ]);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600 }));
+    await vi.advanceTimersByTimeAsync(70_000);
+
+    expect(await outcome).toMatchObject({ run: { status: 'passed' } });
+    expect(client.readTimesMs).toEqual([0, 0]);
+    expect(client.signals[1]?.aborted).toBe(false);
+  });
+
+  it('is not armed before the endpoint has answered (test wait): the deadline reports it', async () => {
+    const client = makeScriptedClient(['hang']);
+    const outcome = settle(
+      pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 120, isFirstContact: true }),
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(client.readTimesMs).toEqual([0]);
+    expect(client.signals[0]?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(70_000);
+    const result = (await outcome) as { error: unknown };
+    expect(result.error).toBeInstanceOf(TimeoutError);
+  });
+
+  it('Ctrl-C during a stalled read surfaces the InterruptError, not a stall', async () => {
+    const shutdown = new ShutdownController();
+    const client = makeScriptedClient([makeRun('running'), 'hang']);
+    const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600, shutdown }));
+    await vi.advanceTimersByTimeAsync(10_000);
+    shutdown.interrupt('SIGINT');
+    await vi.advanceTimersByTimeAsync(0);
+
+    const result = (await outcome) as { error: unknown };
+    expect(result.error).toBeInstanceOf(InterruptError);
+    expect(client.readTimesMs).toEqual([0, 0]);
+  });
+
+  it('reports the stall and the reconnection through onTransition', async () => {
+    const messages: string[] = [];
+    const client = makeScriptedClient([makeRun('running'), 'hang', makeRun('passed')]);
+    const outcome = settle(
+      pollRunUntilTerminal(client, RUN_ID, {
+        timeoutSeconds: 600,
+        onTransition: message => messages.push(message),
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    await outcome;
+
+    expect(messages).toEqual([
+      `Cannot reach the TestSprite API (no answer for 45s); run ${RUN_ID} keeps executing server-side. Retrying in 2s until the --timeout deadline`,
+      `Reconnected after 47s; still waiting for run ${RUN_ID}`,
+    ]);
   });
 });

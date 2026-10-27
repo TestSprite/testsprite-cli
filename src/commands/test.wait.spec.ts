@@ -1226,6 +1226,187 @@ describe('runTestWait: TimeoutError writes partial JSON to stdout', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Network outage mid-wait (#437), on the real HttpClient with fake timers
+// ---------------------------------------------------------------------------
+
+describe('runTestWait: network outage mid-wait', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const jsonRunResponse = (status: RunResponse['status']): Response =>
+    new Response(JSON.stringify(makeRun(status)), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+
+  it('waits out an outage longer than two transport-retry bursts and prints the verdict (exit 0)', async () => {
+    vi.useFakeTimers();
+    const { credentialsPath } = makeCreds();
+    // Fetch 1 answers (the endpoint is proven); fetches 2-9 are a dead network,
+    // two full http.ts bursts of 4 attempts, which ended the wait with exit 10
+    // before; fetch 10 is the verdict.
+    let fetchCalls = 0;
+    const fetchImpl: typeof globalThis.fetch = async () => {
+      fetchCalls += 1;
+      if (fetchCalls > 1 && fetchCalls <= 9) throw new TypeError('fetch failed');
+      return jsonRunResponse(fetchCalls === 1 ? 'running' : 'passed');
+    };
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+
+    const pending = runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        verbose: true,
+        runId: 'run_abc',
+        timeoutSeconds: 600,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await pending;
+
+    expect(result.status).toBe('passed');
+    expect(fetchCalls).toBe(10);
+    expect(JSON.parse(stdoutLines.join('\n'))).toMatchObject({
+      runId: 'run_abc',
+      status: 'passed',
+    });
+    const stderr = stderrLines.join('\n');
+    expect(stderr).toContain(
+      '[verbose] Cannot reach the TestSprite API (fetch failed); run run_abc keeps executing server-side.',
+    );
+    expect(stderr).toMatch(/\[verbose\] Reconnected after \d+s; still waiting for run run_abc/);
+  });
+
+  it('exits 10 with {runId, status} on stdout when the outage outlasts --timeout', async () => {
+    vi.useFakeTimers();
+    const { credentialsPath } = makeCreds();
+    let fetchCalls = 0;
+    const fetchImpl: typeof globalThis.fetch = async () => {
+      fetchCalls += 1;
+      if (fetchCalls > 1) throw new TypeError('fetch failed');
+      return jsonRunResponse('running');
+    };
+    const stdoutLines: string[] = [];
+
+    const pending = runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 30,
+      },
+      { credentialsPath, fetchImpl, stdout: line => stdoutLines.push(line), stderr: () => {} },
+    ).catch((caught: unknown) => caught);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    const caught = await pending;
+    expect(caught).toBeInstanceOf(ApiError);
+    expect(caught).toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+      details: { runId: 'run_abc', timeoutSeconds: 30 },
+    });
+    expect((caught as ApiError).nextAction).toContain('testsprite test wait run_abc');
+    expect(JSON.parse(stdoutLines.join('\n'))).toEqual({ runId: 'run_abc', status: 'running' });
+  });
+
+  it('fails fast with exit 10 when the first read cannot reach the API (first contact)', async () => {
+    vi.useFakeTimers();
+    const { credentialsPath } = makeCreds();
+    let fetchCalls = 0;
+    const fetchImpl: typeof globalThis.fetch = async () => {
+      fetchCalls += 1;
+      throw new TypeError('fetch failed');
+    };
+    const stdoutLines: string[] = [];
+
+    const pending = runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: line => stdoutLines.push(line), stderr: () => {} },
+    ).catch((caught: unknown) => caught);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(await pending).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
+    // Two http.ts transport-retry bursts of 4 attempts, then the error: no
+    // waiting out, and no partial, since the run was never read.
+    expect(fetchCalls).toBe(8);
+    expect(stdoutLines).toEqual([]);
+  });
+
+  it('aborts a long-poll read that never answers after 45s and reconnects, instead of waiting ~300s', async () => {
+    vi.useFakeTimers();
+    const { credentialsPath } = makeCreds();
+    // Poll read 1 answers; poll read 2 is a dead socket (no answer, no error)
+    // until its signal aborts; poll read 3, on a fresh connection, is the
+    // verdict. Other requests (the backend-result lookup) answer normally.
+    let pollReads = 0;
+    let secondReadAbortedAtMs: number | undefined;
+    const startMs = Date.now();
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (!url.includes('/runs/run_abc')) return jsonRunResponse('running');
+      pollReads += 1;
+      if (pollReads === 2) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => {
+              secondReadAbortedAtMs = Date.now() - startMs;
+              reject(init.signal!.reason);
+            },
+            { once: true },
+          );
+        });
+      }
+      return jsonRunResponse(pollReads === 1 ? 'running' : 'passed');
+    };
+    const stderrLines: string[] = [];
+
+    const pending = runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        verbose: true,
+        runId: 'run_abc',
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await pending;
+
+    expect(result.status).toBe('passed');
+    expect(pollReads).toBe(3);
+    expect(secondReadAbortedAtMs).toBe(45_000);
+    expect(stderrLines.join('\n')).toContain(
+      '[verbose] Cannot reach the TestSprite API (no answer for 45s); run run_abc keeps executing server-side.',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // FIX 4 — D5-UX: text mode shows the `error` string for failed/blocked runs
 // ---------------------------------------------------------------------------
 describe('[fix-4-ux] runTestWait — text mode shows error string for failed/blocked runs', () => {
