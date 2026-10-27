@@ -13056,7 +13056,12 @@ describe('test run --all --wait — pollFreshAccepted failure diagnostics (#448)
     failureKind: null,
     error: null,
     videoUrl: null,
-    stepSummary: { total: 1, completed: 1, passedCount: status === 'passed' ? 1 : 0, failedCount: 0 },
+    stepSummary: {
+      total: 1,
+      completed: 1,
+      passedCount: status === 'passed' ? 1 : 0,
+      failedCount: 0,
+    },
     ...overrides,
   });
 
