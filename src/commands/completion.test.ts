@@ -10,11 +10,11 @@ const SPEC: CompletionSpec = {
 };
 
 describe('isShell / detectShell', () => {
-  it('recognizes the three supported shells', () => {
+  it('recognizes the four supported shells', () => {
     expect(isShell('bash')).toBe(true);
     expect(isShell('zsh')).toBe(true);
     expect(isShell('fish')).toBe(true);
-    expect(isShell('powershell')).toBe(false);
+    expect(isShell('powershell')).toBe(true);
   });
 
   it('detects the shell from a $SHELL path', () => {
@@ -60,6 +60,13 @@ describe('renderCompletion', () => {
     expect(script).toContain('__fish_seen_subcommand_from auth');
     expect(script).toContain('-l output');
   });
+
+  it('powershell script registers an argument completer and lists commands', () => {
+    const script = renderCompletion('powershell', SPEC);
+    expect(script).toContain('Register-ArgumentCompleter');
+    expect(script).toContain('setup');
+    expect(script).toContain('--output');
+  });
 });
 
 describe('createCompletionCommand', () => {
@@ -81,7 +88,7 @@ describe('createCompletionCommand', () => {
 
   it('rejects an unsupported shell with VALIDATION_ERROR (exit 5)', async () => {
     const cmd = createCompletionCommand(() => SPEC, { env: {}, stdout: () => undefined });
-    await expect(cmd.parseAsync(['powershell'], { from: 'user' })).rejects.toMatchObject({
+    await expect(cmd.parseAsync(['tcsh'], { from: 'user' })).rejects.toMatchObject({
       code: 'VALIDATION_ERROR',
     });
   });
