@@ -24,6 +24,7 @@ The full reference for the TestSprite CLI: install verification, manual setup, e
   - [CI integration (`ci init`)](#ci-integration-ci-init)
   - [Account & diagnostics](#account--diagnostics)
 - [Configuration](#configuration)
+  - [Profiles & credentials](#profiles--credentials)
 - [Output & scripting](#output--scripting)
 - [Continuous integration](#continuous-integration)
 - [Exit codes](#exit-codes)
@@ -1288,6 +1289,33 @@ gh api repos/OWNER/REPO/deployments/$ID/statuses -f state=success -f environment
 
 ### Account & diagnostics
 
+#### `testsprite auth status`
+
+Check which user and API key the selected profile resolves to before running tests. This calls `GET /me` and requires a valid key with `read:me`; it does not trigger a test run.
+
+```bash
+testsprite auth status
+testsprite auth status --profile work --output json
+testsprite auth status --dry-run --output json
+```
+
+Text output identifies the user, key id, resolved endpoint, environment and scopes. Name, email and organization details appear when the server supplies them. JSON returns the server's identity object, not the text report's added endpoint line. Neither format prints the API key itself. An invalid key exits 3; the dry-run example uses sample identity data and cannot verify a real account.
+
+If a named profile still shows the wrong account, check the environment overrides in [Profiles & credentials](#profiles--credentials). Selecting a profile does not override `TESTSPRITE_API_KEY`.
+
+#### `testsprite auth remove`
+
+Remove only the selected profile's saved credentials from this machine:
+
+```bash
+testsprite auth remove --profile work --dry-run --output json
+testsprite auth remove --profile work --output json
+```
+
+This is local-only: it makes no API request, leaves other profiles intact, and **does not revoke the API key** or clear environment variables. JSON reports `{ "profile": "work", "status": "logged_out" }` after removal, or `"no_credentials"` when nothing was saved for that profile. A dry run reports the planned removal without changing the file.
+
+To stop using an environment-supplied key, unset it in the current shell as well. Revoke a compromised or retired key in the TestSprite Portal; deleting its local profile is not revocation. `auth whoami` and `auth logout` remain deprecated aliases for `auth status` and `auth remove` respectively.
+
 #### `testsprite usage` (alias: `testsprite credits`)
 
 Account pre-flight before a large batch: resolves the active key to its identity (`userId`, `keyId`, `env`) and surfaces the credit balance / plan fields when the backend supplies them. Useful right before a `test run --all` fan-out. For an org-scoped key, also prints the `orgs:` / `org binding:` lines described under [Authenticate](#1-authenticate).
@@ -1314,7 +1342,46 @@ Every check reuses the same helpers the real commands use, so the report reflect
 
 ### Profiles & credentials
 
-Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, the `TESTSPRITE_API_KEY` / `TESTSPRITE_API_URL` env vars override the file, so CI can run without ever touching `~/.testsprite/credentials`.
+Credentials live at `~/.testsprite/credentials` (INI-style; POSIX mode `0600`, owner-restricted ACL on Windows), one section per profile. Profiles select local credentials; they do not create accounts, switch an API key's organization, or grant scopes.
+
+The three values resolve independently, from highest to lowest priority:
+
+| Value        | Resolution order                                                                                      |
+| ------------ | ----------------------------------------------------------------------------------------------------- |
+| Profile name | `--profile` > `TESTSPRITE_PROFILE` > `default`                                                        |
+| API key      | `TESTSPRITE_API_KEY` > selected profile's `api_key`                                                   |
+| API endpoint | `--endpoint-url` > `TESTSPRITE_API_URL` > selected profile's `api_url` > `https://api.testsprite.com` |
+
+Empty or whitespace-only environment values are treated as unset. Profile names accept letters, digits, dot, underscore and hyphen, not spaces or brackets. There is no fallback to the default profile's key when a different selected profile has no key.
+
+Create a named profile through the masked prompt, then confirm its identity:
+
+```bash
+testsprite setup --profile work --no-agent
+testsprite auth status --profile work
+```
+
+The first command verifies the candidate key before saving it; `--no-agent` skips skill installation. It makes authenticated requests, unlike `--dry-run`. For non-interactive setup, provide the key through a secret environment variable and use `setup --profile work --from-env --no-agent --yes`; successful setup normally persists that key. See [Manual setup](#manual-setup) for the session-only fallback when saving is not permitted.
+
+Use `--profile work` on each command, or set the profile for the current shell with `export TESTSPRITE_PROFILE=work` (Bash/Zsh) or `$env:TESTSPRITE_PROFILE = 'work'` (PowerShell). This selection is not saved as a global default by the CLI.
+
+**A profile flag does not neutralize key or endpoint environment overrides.** To use only the saved `work` profile, clear inherited overrides in the current shell first:
+
+```bash
+# Bash/Zsh: affects this shell and commands launched from it
+unset TESTSPRITE_API_KEY TESTSPRITE_API_URL TESTSPRITE_PROFILE
+testsprite auth status --profile work
+```
+
+```powershell
+# PowerShell: does not change persistent user or machine environment settings
+Remove-Item Env:TESTSPRITE_API_KEY, Env:TESTSPRITE_API_URL, Env:TESTSPRITE_PROFILE -ErrorAction SilentlyContinue
+testsprite auth status --profile work
+```
+
+For an ephemeral CI runner, exporting `TESTSPRITE_API_KEY` is sufficient to authenticate commands; `setup` is not needed merely to use that key. Ordinary reads do not persist it. Configuration resolution still reads the selected local profile when a credentials file exists, so environment overrides do not bypass local-file read errors or profile-name validation. Never commit the credentials file or print it in diagnostic logs.
+
+Use [`auth remove`](#testsprite-auth-remove) to delete a saved profile. If commands still authenticate afterward, check for `TESTSPRITE_API_KEY` in the shell before assuming removal failed.
 
 ### Global flags
 
