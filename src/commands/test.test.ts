@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Command } from 'commander';
 import type { RunResponse } from '../lib/runs.types.js';
 import { ApiError, InterruptError } from '../lib/errors.js';
+import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import { GLOBAL_OPTS_HINT } from '../lib/output.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import { defaultSleep } from '../lib/poll-support.js';
@@ -406,6 +407,55 @@ describe('runList', () => {
       from: 'user',
     });
     expect(new URL(seen[0]!).searchParams.get('environment')).toBe('staging');
+  });
+
+  it('--dry-run does not emit the banner when local validation fails (issue #360)', async () => {
+    // Repro: `testsprite test list --dry-run` (no --project) used to print
+    // "[dry-run] sample response — not from the server" before the
+    // VALIDATION_ERROR, because the banner fired at client construction
+    // while `requireProjectId` ran after. The banner is now lazy (first
+    // dry-run response), so only the error prints.
+    resetDryRunBannerForTesting();
+    const stderr: string[] = [];
+    await expect(
+      runList(
+        { profile: 'default', output: 'json', debug: false, dryRun: true },
+        {
+          env: {} as NodeJS.ProcessEnv,
+          stderr: line => stderr.push(line),
+          stdout: () => undefined,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'project' }),
+    });
+    expect(stderr.join('\n')).not.toContain(DRY_RUN_BANNER);
+  });
+
+  it('--dry-run emits the banner when the command produces a dry-run response', async () => {
+    // Happy path guard: with validation passing, the lazy banner still
+    // prints exactly once before the canned sample.
+    resetDryRunBannerForTesting();
+    const stderr: string[] = [];
+    const out: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'project_alice',
+      },
+      {
+        env: {} as NodeJS.ProcessEnv,
+        stderr: line => stderr.push(line),
+        stdout: line => out.push(line),
+      },
+    );
+    expect(stderr.filter(l => l === DRY_RUN_BANNER)).toHaveLength(1);
+    expect(JSON.parse(out.join('\n'))).toHaveProperty('items');
   });
 
   it('json keeps status and adds statusByEnvironment and headlineEnvironment', async () => {
