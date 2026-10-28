@@ -1796,6 +1796,29 @@ describe('backendResultIsForThisRun — auto-resume stale-verdict floor (finding
       ),
     ).toBe(true);
   });
+
+  it.each([
+    { finishedAt: 'not-a-date', notBefore: inFlightCreatedAt, expected: false },
+    { finishedAt: 'not-a-date', notBefore: undefined, expected: false },
+    { finishedAt: inFlightCreatedAt, notBefore: 'not-a-date', expected: false },
+    { finishedAt: inFlightCreatedAt, notBefore: '', expected: false },
+    { finishedAt: inFlightCreatedAt, notBefore: undefined, expected: true },
+    { finishedAt: inFlightCreatedAt, notBefore: inFlightCreatedAt, expected: true },
+  ])('validates legacy timestamp correlation: %j', ({ finishedAt, notBefore, expected }) => {
+    expect(
+      backendResultIsForThisRun({ ...staleResult, finishedAt }, 'run_inflight', notBefore),
+    ).toBe(expected);
+  });
+
+  it('keeps exact run ID correlation independent of malformed legacy timestamps', () => {
+    expect(
+      backendResultIsForThisRun(
+        { ...staleResult, runIdIfAvailable: 'run_inflight', finishedAt: 'not-a-date' },
+        'run_inflight',
+        'not-a-date',
+      ),
+    ).toBe(true);
+  });
 });
 
 describe('backend wait fallback — testTitle overlay used for CI report titles', () => {
