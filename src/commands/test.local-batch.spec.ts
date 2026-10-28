@@ -351,6 +351,7 @@ describe('test run local batch', () => {
             projectId: 'R',
           }),
         ]);
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads summary.json from this test's own mkdtempSync-created directory; neither path component comes from user input.
         const summary = JSON.parse(readFileSync(summaryFile, 'utf8'));
         expect(summary).toMatchObject({
           total: 2,
@@ -358,6 +359,7 @@ describe('test run local batch', () => {
           failed: status === 'failed' ? 1 : 0,
           timedOut: 0,
         });
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads report.xml from this test's own mkdtempSync-created directory; neither path component comes from user input.
         const xml = readFileSync(reportFile, 'utf8');
         expect(xml).toContain('name="Backend checkout" testId="be" runId="run_be" time="1"');
         expect(xml).not.toContain('type="timeout"');
