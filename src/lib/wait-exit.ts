@@ -127,6 +127,42 @@ function priorityOf(exitCode: number): number {
   return WAIT_EXIT_PRIORITY.indexOf(exitCode as (typeof WAIT_EXIT_PRIORITY)[number]);
 }
 
+/** Resolve a non-retriable deferred-retry refusal alongside the polled outcomes. */
+export function resolveDeferredRetryFailure(
+  results: readonly WaitMemberResult[],
+  retryError: unknown,
+  opts: { timeoutSeconds: number; deferredTestIds: readonly string[] },
+): CLIError | ApiError | null {
+  // The non-retriable prefix of the shared table ends at FEATURE_GATED (13).
+  if (
+    !(retryError instanceof ApiError) ||
+    !isOperationalCode(retryError.exitCode) ||
+    priorityOf(retryError.exitCode) > priorityOf(13)
+  ) {
+    return null;
+  }
+  const failure = resolveWaitFailure(
+    [...results, { status: 'error', error: waitMemberError(retryError) }],
+    opts,
+  );
+  if (failure?.exitCode !== retryError.exitCode) return failure;
+  // Keep the dispatch envelope, including auth remediation, rather than the
+  // synthesized per-member message. These IDs still have no dispatched run.
+  return new ApiError(
+    {
+      code: retryError.code,
+      message: retryError.message,
+      nextAction: retryError.nextAction,
+      requestId: retryError.requestId,
+      details: { ...retryError.details, deferredTestIds: opts.deferredTestIds },
+    },
+    retryError.httpStatus,
+    retryError.retryAfterMs,
+    retryError.apiUrl,
+    retryError.serverNextAction,
+  );
+}
+
 /**
  * Resolve the process-level failure for a completed `--wait` fan-out, or `null`
  * when every member passed. Shared by `test run --all` / `test rerun` and

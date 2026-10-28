@@ -112,7 +112,11 @@ import type {
   CliGenerationStage,
   CliGenerationStatus,
 } from '../lib/plans.types.js';
-import { resolveWaitFailure, waitMemberError } from '../lib/wait-exit.js';
+import {
+  resolveDeferredRetryFailure,
+  resolveWaitFailure,
+  waitMemberError,
+} from '../lib/wait-exit.js';
 import { resolveCiRunFailure } from '../lib/ci-run.js';
 import type {
   RunResponse,
@@ -10691,7 +10695,7 @@ export async function runTestRunAll(
         (err.code === 'UNSUPPORTED' || err.code === 'PRECONDITION_FAILED')
       )
         throw err;
-      if (opts.ci) retryError = err;
+      retryError = err;
       // If the retry itself errors, surface it and stop retrying.
       stderrFn(
         `[deferred-retry] attempt ${attempt} failed with error: ${err instanceof Error ? err.message : String(err)}`,
@@ -10917,6 +10921,11 @@ export async function runTestRunAll(
         'run',
       );
     }
+    const retryFailure = resolveDeferredRetryFailure([], retryError, {
+      timeoutSeconds: opts.timeoutSeconds,
+      deferredTestIds: deferred.map(d => d.testId),
+    });
+    if (retryFailure) throw retryFailure;
     if (deferred.length > 0) {
       throw new CLIError(
         `Batch run incomplete: ${deferred.length} test${deferred.length !== 1 ? 's' : ''} rate-deferred (per-key run budget) — retry these individually after ~60s: ${deferred.map(d => d.testId).join(' ')}`,
@@ -11301,6 +11310,12 @@ export async function runTestRunAll(
     },
     'run',
   );
+
+  const retryFailure = resolveDeferredRetryFailure(freshRunResults, retryError, {
+    timeoutSeconds: opts.timeoutSeconds,
+    deferredTestIds: deferred.map(d => d.testId),
+  });
+  if (retryFailure) throw retryFailure;
 
   // Rate-deferred tests were never dispatched → the batch is incomplete (exit 7),
   // mirroring `test rerun --all`. Checked before the failed-run throw so the
@@ -13462,6 +13477,7 @@ async function runTestRerunCore(
   let accepted = batchResp.accepted.slice();
   let deferred = batchResp.deferred.slice();
   let conflicts = batchResp.conflicts.slice();
+  let retryError: unknown;
   // [P2] `notFound` is mutable: a deferred test may become un-replayable during
   // the retry window; the retry response's notFound[] is merged into this set so
   // the test is never reported as "resolved" when it actually vanished.
@@ -13669,6 +13685,7 @@ async function runTestRerunCore(
           throw err;
         }
         if (err instanceof InterruptError) throw err;
+        retryError = err;
         stderrFn(
           `[deferred-retry] attempt ${attempt} failed with error: ${err instanceof Error ? err.message : String(err)}`,
         );
@@ -13828,6 +13845,11 @@ async function runTestRerunCore(
       },
       'rerun',
     );
+    const retryFailure = resolveDeferredRetryFailure([], retryError, {
+      timeoutSeconds: opts.timeoutSeconds,
+      deferredTestIds: deferred.map(d => d.testId),
+    });
+    if (retryFailure) throw retryFailure;
     if (deferred.length > 0) {
       throw new CLIError(
         `Batch rerun: no tests were accepted (${deferred.length} deferred). ` +
@@ -14106,6 +14128,12 @@ async function runTestRerunCore(
     },
     'rerun',
   );
+
+  const retryFailure = resolveDeferredRetryFailure(rerunResults, retryError, {
+    timeoutSeconds: opts.timeoutSeconds,
+    deferredTestIds: deferred.map(d => d.testId),
+  });
+  if (retryFailure) throw retryFailure;
 
   // §5 (unify rerun with run --all / testlist run): auth is batch-wide — a bad
   // credential, not a bad test — and non-retriable, so it must win even over a

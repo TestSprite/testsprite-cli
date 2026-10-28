@@ -6114,6 +6114,90 @@ describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatc
 // Gap B — CI-native output on batch rerun --wait (::error:: + summary file)
 // ---------------------------------------------------------------------------
 
+describe('batch rerun — deferred retry refusals', () => {
+  it.each(['none', 'passed', 'failed'] as const)(
+    'retry 402 with accepted outcome %s surfaces credits after the summary',
+    async outcome => {
+      const creds = makeCreds();
+      const deferred = [{ testId: 'test_later', reason: 'rate_limited' }];
+      const envelope = {
+        code: 'INSUFFICIENT_CREDITS',
+        message: 'Insufficient credits: 1.5 credit(s) required.',
+        nextAction: 'Top up at https://www.testsprite.com/dashboard-v3/o/org_1/settings/billing.',
+        requestId: 'req_rerun_retry',
+        details: { required: 1.5 },
+      };
+      let posts = 0;
+      let polls = 0;
+      const fetchImpl = makeFetch(url => {
+        if (url.includes('/tests/batch/rerun')) {
+          return ++posts === 1
+            ? {
+                status: 202,
+                body: {
+                  accepted:
+                    outcome === 'none'
+                      ? []
+                      : [
+                          {
+                            testId: 'test_1',
+                            runId: 'run_b1',
+                            enqueuedAt: '2026-06-03T10:00:00.000Z',
+                          },
+                        ],
+                  deferred,
+                  conflicts: [],
+                  closure: { byProject: [] },
+                },
+              }
+            : { status: 402, body: { error: envelope } };
+        }
+        if (url.includes('/runs/run_b1')) {
+          polls++;
+          const run = makeTerminalRun('run_b1', outcome === 'failed' ? 'failed' : 'passed');
+          run.testId = 'test_1';
+          return { body: run };
+        }
+        return errorBody('NOT_FOUND');
+      });
+      const stdout: string[] = [];
+      const error = await runTestRerun(
+        {
+          testIds: ['test_1', 'test_later'],
+          all: false,
+          wait: true,
+          timeoutSeconds: 180,
+          autoHeal: false,
+          autoHealExplicit: false,
+          skipDependencies: false,
+          maxConcurrency: 10,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        {
+          ...creds,
+          fetchImpl,
+          sleep: instantSleep,
+          stdout: line => stdout.push(line),
+          stderr: () => {},
+        },
+      ).catch(e => e);
+      expect(error).toBeInstanceOf(ApiError);
+      expect(error).toMatchObject({
+        ...envelope,
+        exitCode: 12,
+        details: { required: 1.5, deferredTestIds: ['test_later'] },
+      });
+      expect(posts).toBe(2);
+      expect(polls).toBe(outcome === 'none' ? 0 : 1);
+      expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ deferred });
+    },
+  );
+});
+
 describe('gh-output integration on batch rerun --wait (Gap B)', () => {
   function mixedBatchHarness() {
     const creds = makeCreds();

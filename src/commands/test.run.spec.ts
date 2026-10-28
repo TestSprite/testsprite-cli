@@ -8016,6 +8016,255 @@ describe('runTestRunAll — insufficient credits → exit 12 (single-run parity)
   });
 });
 
+describe('runTestRunAll — deferred retry refusals', () => {
+  const deferred = ['later_1', 'later_2', 'later_3'].map(testId => ({ testId }));
+  const initial: BatchRunFreshResponse = {
+    accepted: [],
+    conflicts: ['credits_1', 'credits_2'].map(testId => ({
+      testId,
+      reason: 'insufficient_credits',
+    })),
+    deferred,
+    skippedFrontend: [],
+    skippedIntegration: [],
+  };
+  const billingAction =
+    'Top up at https://www.testsprite.com/dashboard-v3/o/org_1/settings/billing.';
+  const creditsError = {
+    code: 'INSUFFICIENT_CREDITS',
+    message: 'Insufficient credits: 1.5 credit(s) required.',
+    nextAction: billingAction,
+    requestId: 'req_retry',
+    details: { required: 1.5, orgId: 'org_1' },
+  };
+  const opts = {
+    projectId: 'project_1',
+    wait: true,
+    timeoutSeconds: 180,
+    maxConcurrency: 10,
+    profile: 'default',
+    debug: false,
+  };
+
+  it.each(['text', 'json'] as const)(
+    '%s: retry 402 preserves the credits envelope and writes artifacts before throwing',
+    async output => {
+      const { credentialsPath } = makeCreds();
+      const dir = mkdtempSync(join(tmpdir(), 'cli-deferred-credits-'));
+      const summaryFile = join(dir, 'summary.json');
+      const reportFile = join(dir, 'junit.xml');
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      let posts = 0;
+      const fetchImpl = makeFetch((url, init) => {
+        if (url.includes('/tests/batch/run') && init.method === 'POST') {
+          posts++;
+          if (posts === 1) return { status: 202, body: initial };
+          expect(JSON.parse(String(init.body)).testIds).toEqual(deferred.map(d => d.testId));
+          return { status: 402, body: { error: creditsError } };
+        }
+        return { body: { items: [], nextToken: null } };
+      });
+      const error = await runTestRunAll(
+        { ...opts, output, ghOutput: true, summaryFile, report: 'junit', reportFile },
+        {
+          credentialsPath,
+          fetchImpl,
+          sleep: instantSleep,
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+          env: {},
+        },
+      ).catch(e => e);
+
+      expect(error).toBeInstanceOf(ApiError);
+      expect(error).toMatchObject({
+        ...creditsError,
+        exitCode: 12,
+        details: { ...creditsError.details, deferredTestIds: deferred.map(d => d.testId) },
+      });
+      expect(error.message).not.toMatch(/retry.*after ~60s/i);
+      expect(posts).toBe(2);
+      expect(stdout.join('\n')).toContain('later_3');
+      expect([...stdout, ...stderr].some(line => line.startsWith('::warning'))).toBe(true);
+      expect(JSON.parse(readFileSync(summaryFile, 'utf8'))).toMatchObject({
+        total: 5,
+        skipped: 5,
+      });
+      expect(readFileSync(reportFile, 'utf8')).toContain('later_3');
+      expect(readFileSync(reportFile, 'utf8')).toContain('<skipped');
+    },
+  );
+
+  it.each([
+    [401, 'AUTH_INVALID', 3],
+    [403, 'AUTH_FORBIDDEN', 3],
+    [426, 'CLIENT_TOO_OLD', 14],
+    [403, 'FEATURE_GATED', 13],
+  ] as const)('retry HTTP %i %s surfaces exit %i', async (status, code, exitCode) => {
+    const { credentialsPath } = makeCreds();
+    const envelope = {
+      code,
+      message: `${code}: retry refused.`,
+      nextAction: 'Fix the credential, client or plan before retrying.',
+      requestId: 'req_refusal',
+      details: code === 'FEATURE_GATED' ? { reason: 'billing_hold' } : {},
+    };
+    let posts = 0;
+    const fetchImpl = makeFetch((url, init) => {
+      if (!url.includes('/tests/batch/run') || init.method !== 'POST') {
+        return { body: { items: [], nextToken: null } };
+      }
+      return ++posts === 1 ? { status: 202, body: initial } : { status, body: { error: envelope } };
+    });
+    const error = await runTestRunAll(
+      { ...opts, output: 'json' },
+      { credentialsPath, fetchImpl, sleep: instantSleep, stdout: () => {}, stderr: () => {} },
+    ).catch(e => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ ...envelope, exitCode });
+    expect(error.message).not.toMatch(/retry.*after ~60s/i);
+    expect(posts).toBe(2);
+  });
+
+  it.each([429, 503, 'network', 'timeout', 'deferred'] as const)(
+    'transient/unresolved retry %s keeps incomplete exit 7',
+    async response => {
+      vi.useFakeTimers();
+      try {
+        const { credentialsPath } = makeCreds();
+        let posts = 0;
+        const fetchImpl = makeFetch((url, init) => {
+          if (!url.includes('/tests/batch/run') || init.method !== 'POST') {
+            return { body: { items: [], nextToken: null } };
+          }
+          if (++posts === 1 || response === 'deferred') return { status: 202, body: initial };
+          if (response === 'network') throw new TypeError('fetch failed');
+          if (response === 'timeout') throw new RequestTimeoutError(1000);
+          return {
+            status: response,
+            body: {
+              error: {
+                code: response === 429 ? 'RATE_LIMITED' : 'UNAVAILABLE',
+                message: 'Try later.',
+                nextAction: '',
+                requestId: 'req_transient',
+                details: {},
+              },
+            },
+          };
+        });
+        const pending = runTestRunAll(
+          { ...opts, output: 'json' },
+          { credentialsPath, fetchImpl, sleep: instantSleep, stdout: () => {}, stderr: () => {} },
+        ).catch(e => e);
+        await vi.runAllTimersAsync();
+        const error = await pending;
+        expect(error).toMatchObject({ exitCode: 7 });
+        expect(error.message).toContain('after ~60s');
+        expect(error.message).toContain('later_3');
+        expect(posts).toBeGreaterThan(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(['passed', 'failed', 'auth'] as const)(
+    'polled run %s + retry 402 follows shared precedence',
+    async outcome => {
+      const { credentialsPath } = makeCreds();
+      let posts = 0;
+      let polls = 0;
+      const fetchImpl = makeFetch((url, init) => {
+        if (url.includes('/tests/batch/run') && init.method === 'POST') {
+          return ++posts === 1
+            ? {
+                status: 202,
+                body: {
+                  ...initial,
+                  accepted: [
+                    {
+                      testId: 'test_xyz',
+                      runId: 'run_abc',
+                      enqueuedAt: '2026-05-15T10:00:00.000Z',
+                    },
+                  ],
+                },
+              }
+            : { status: 402, body: { error: creditsError } };
+        }
+        if (url.includes('/runs/run_abc')) {
+          polls++;
+          if (outcome === 'auth') return errorBody('AUTH_INVALID');
+          return { body: outcome === 'passed' ? makePassedRun() : makeFailedRun() };
+        }
+        return { body: { items: [], nextToken: null } };
+      });
+      const stdout: string[] = [];
+      const error = await runTestRunAll(
+        { ...opts, output: 'json' },
+        {
+          credentialsPath,
+          fetchImpl,
+          sleep: instantSleep,
+          stdout: line => stdout.push(line),
+          stderr: () => {},
+        },
+      ).catch(e => e);
+      expect(error).toMatchObject({ exitCode: outcome === 'auth' ? 3 : 12 });
+      if (outcome !== 'auth') expect(error).toMatchObject(creditsError);
+      expect(posts).toBe(2);
+      expect(polls).toBeGreaterThan(0);
+      expect(JSON.parse(stdout.at(-1)!)).toMatchObject({
+        summary: { total: 1, deferred: 3, passed: outcome === 'passed' ? 1 : 0 },
+      });
+    },
+  );
+
+  it.each([false, true])('--ci with pollable=%s preserves its retry error', async pollable => {
+    const { credentialsPath } = makeCreds();
+    let posts = 0;
+    const fetchImpl = makeFetch((url, init) => {
+      if (url.includes('/tests/batch/run') && init.method === 'POST') {
+        return ++posts === 1
+          ? {
+              status: 202,
+              body: {
+                ...initial,
+                accepted: pollable
+                  ? [
+                      {
+                        testId: 'test_xyz',
+                        runId: 'run_abc',
+                        enqueuedAt: '2026-05-15T10:00:00.000Z',
+                      },
+                    ]
+                  : [],
+              },
+            }
+          : { status: 402, body: { error: creditsError } };
+      }
+      if (url.includes('/runs/run_abc')) return { body: makePassedRun() };
+      return { body: { items: [], nextToken: null } };
+    });
+    const stdout: string[] = [];
+    const error = await runTestRunAll(
+      { ...opts, output: 'json', ci: {} },
+      {
+        credentialsPath,
+        fetchImpl,
+        sleep: instantSleep,
+        stdout: line => stdout.push(line),
+        stderr: () => {},
+        env: {},
+      },
+    ).catch(e => e);
+    expect(error).toMatchObject({ ...creditsError, exitCode: 12 });
+    expect(JSON.parse(stdout.at(-1)!)).toHaveProperty('summary');
+  });
+});
+
 describe('telemetry extras recorded by the run commands', () => {
   beforeEach(() => {
     takeTelemetryExtras();

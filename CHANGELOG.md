@@ -4,6 +4,10 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **Deferred retries preserve non-retriable errors.** `test run --all --wait` and batch `test rerun --wait` surface auth, client-too-old, insufficient-credits and feature-gated retry refusals with their original exit code and remediation instead of the rate-deferred exit 7.
+
 ## [0.15.0] - 2026-10-17
 
 ### Added

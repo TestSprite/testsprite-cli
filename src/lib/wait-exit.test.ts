@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { resolveWaitFailure, waitMemberError, type WaitMemberResult } from './wait-exit.js';
+import {
+  resolveDeferredRetryFailure,
+  resolveWaitFailure,
+  waitMemberError,
+  type WaitMemberResult,
+} from './wait-exit.js';
 import { ApiError, CLIError } from './errors.js';
 import { classifyBillingRefusal } from './billing-refusal.js';
 
@@ -8,6 +13,76 @@ const err = (code: string, exitCode: number): WaitMemberResult['error'] => ({
   code,
   message: `${code} happened`,
   exitCode,
+});
+
+describe('resolveDeferredRetryFailure', () => {
+  const opts = { ...OPTS, deferredTestIds: ['later'] };
+  const credits = ApiError.fromEnvelope({
+    error: {
+      code: 'INSUFFICIENT_CREDITS',
+      message: 'No credits.',
+      nextAction: 'Top up at https://portal.example/dashboard-v3/o/org_1/settings/billing.',
+      requestId: 'req_retry',
+      details: { required: 1.5 },
+    },
+  });
+  const paused = ApiError.fromEnvelope({
+    error: {
+      code: 'FEATURE_GATED',
+      message: 'Workspace paused.',
+      nextAction: 'Resume the workspace.',
+      requestId: 'req_paused',
+      details: { reason: 'billing_hold' },
+    },
+  });
+
+  it('a higher-priority polled operational error wins over the retry refusal', () => {
+    const failure = resolveDeferredRetryFailure(
+      [{ status: 'error', error: err('CLIENT_TOO_OLD', 14) }],
+      credits,
+      opts,
+    );
+    expect(failure).toMatchObject({ code: 'CLIENT_TOO_OLD', exitCode: 14 });
+  });
+
+  it('a polled pause wins over retry credits through the shared billing exception', () => {
+    const failure = resolveDeferredRetryFailure(
+      [{ status: 'error', runId: 'paused_run', error: waitMemberError(paused) }],
+      credits,
+      opts,
+    );
+    expect(failure).toMatchObject({
+      code: 'FEATURE_GATED',
+      exitCode: 13,
+      nextAction: paused.nextAction,
+      details: { reason: 'billing_hold', runId: 'paused_run' },
+    });
+  });
+
+  it('a retry pause wins over polled credits with the original envelope and undispatched IDs', () => {
+    const failure = resolveDeferredRetryFailure(
+      [{ status: 'error', error: waitMemberError(credits) }],
+      paused,
+      opts,
+    );
+    expect(failure).toMatchObject({
+      code: 'FEATURE_GATED',
+      exitCode: 13,
+      message: paused.message,
+      nextAction: paused.nextAction,
+      requestId: paused.requestId,
+      details: { reason: 'billing_hold', deferredTestIds: ['later'] },
+    });
+    expect(paused.details).toEqual({ reason: 'billing_hold' });
+  });
+
+  it.each(['RATE_LIMITED', 'UNAVAILABLE', 'NOT_FOUND', 'VALIDATION_ERROR', 'CONFLICT', 'INTERNAL'])(
+    '%s retry leaves the existing deferred gate in charge',
+    code => {
+      const retryError = ApiError.fromEnvelope({ error: { code, message: 'Retry failed.' } });
+      expect(resolveDeferredRetryFailure([{ status: 'failed' }], retryError, opts)).toBeNull();
+    },
+  );
 });
 
 describe('resolveWaitFailure — --wait fan-out exit-code precedence', () => {
