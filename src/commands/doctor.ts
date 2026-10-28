@@ -46,6 +46,7 @@ import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
 import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 import { VERSION } from '../version.js';
 import { SUPPORTED_NODE_RANGE, shouldRejectNodeVersion } from '../version-guard.js';
+import { isInsideGitRepo, checkTestspriteIgnored } from '../lib/git-utils.js';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -135,6 +136,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   const checks: DoctorCheck[] = [
     { name: 'CLI version', status: 'ok', detail: VERSION },
     checkNodeVersion(nodeVersion),
+    checkGitRepo(cwd, deps),
     { name: 'Profile', status: 'ok', detail: config.profile },
     endpointCheck,
     checkCredentials(hasKey, config.profile, opts.dryRun ?? false, credentialsReadError),
@@ -179,6 +181,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   );
 
   checks.push(checkSkill(cwd, deps));
+  checks.push(await checkGitignoreSafety(cwd, deps));
 
   const failures = checks.filter(check => check.status === 'fail').length;
   const warnings = checks.filter(check => check.status === 'warn').length;
@@ -280,6 +283,37 @@ function checkSkill(cwd: string, deps: DoctorDeps): DoctorCheck {
     detail: installed
       ? 'installed in this project'
       : 'not installed here; run `testsprite setup` so your agent verifies its changes',
+  };
+}
+
+function checkGitRepo(cwd: string, deps: DoctorDeps): DoctorCheck {
+  const isGit = isInsideGitRepo(cwd, {
+    existsSync: deps.existsSync,
+  });
+  return {
+    name: 'Git repository',
+    status: isGit ? 'ok' : 'warn',
+    detail: isGit
+      ? 'initialized repository'
+      : 'not a Git repository; agent skills require Git tracking',
+  };
+}
+
+async function checkGitignoreSafety(cwd: string, deps: DoctorDeps): Promise<DoctorCheck> {
+  const isIgnored = await checkTestspriteIgnored(cwd, {
+    existsSync: deps.existsSync,
+    readFile: deps.readFileSync
+      ? async p => deps.readFileSync!(p)
+      : deps.existsSync
+        ? async () => ''
+        : undefined,
+  });
+  return {
+    name: 'Gitignore safety',
+    status: isIgnored ? 'ok' : 'warn',
+    detail: isIgnored
+      ? '.testsprite/ is ignored'
+      : '.testsprite/ is not ignored; run setup or add to .gitignore to avoid committing artifacts',
   };
 }
 
