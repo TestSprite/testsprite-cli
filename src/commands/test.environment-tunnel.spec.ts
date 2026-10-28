@@ -30,6 +30,10 @@ vi.mock('../lib/local-target.js', async importOriginal => ({
 const clientId = '11111111-2222-3333-4444-555555555555';
 const savedUrl = 'http://127.0.0.1:5173/';
 const common = { profile: 'default', output: 'json' as const, debug: false };
+/**
+ * Build an offline environment/tunnel fixture with configurable API responses.
+ * Capture requests and output, and inject shutdown events for interruption tests.
+ */
 function fixture(
   options: {
     url?: string;
@@ -1357,6 +1361,39 @@ describe('environment tunnel resolution', () => {
     });
   });
 
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'keeps one owned test-list partial envelope on %s during polling',
+    async signal => {
+      const shutdown = new ShutdownController();
+      const f = fixture({
+        shutdown,
+        poll: () => {
+          shutdown.interrupt(signal);
+          throw shutdown.signal.reason;
+        },
+      });
+      const error = await runTestlistRun(
+        { ...common, listId: 'L', wait: true, timeoutSeconds: 10, maxConcurrency: 5 },
+        f.deps,
+      ).catch((err: unknown) => err);
+
+      expect(error).toBe(shutdown.signal.reason);
+      expect(error).toMatchObject({ exitCode: signal === 'SIGINT' ? 130 : 143 });
+      expect(f.stdout).toHaveLength(1);
+      expect(JSON.parse(f.stdout[0]!)).toMatchObject({
+        accepted: [{ testId: 'a', runId: 'run_a', status: 'running' }],
+        conflicts: [],
+        deferred: [],
+        notRunTestIds: [],
+      });
+      // Owned tunnels retain their existing cleanup behavior; only the remote
+      // non-tunnel path detaches without cancelling runs.
+      expect(f.calls.filter(call => call.path.endsWith('/cancel')).map(call => call.path)).toEqual([
+        '/runs/run_a/cancel',
+      ]);
+    },
+  );
+
   it('uses distinct bounded idempotency keys for loopback test-list groups', async () => {
     const f = fixture({
       tests: [
@@ -1664,6 +1701,7 @@ describe('environment tunnel compatibility regressions', () => {
 });
 
 describe('creation tunnel preflight receipts', () => {
+  /** Write fixture plans with the requested test types for batch tunnel scenarios. */
   function plansFile(types: Array<'frontend' | 'backend'> = ['frontend', 'frontend']) {
     const plans = join(mkdtempSync(join(tmpdir(), 'creation-preflight-')), 'plans.jsonl');
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture-owned temporary directory.
