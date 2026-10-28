@@ -7599,6 +7599,7 @@ export function renderRunResponseText(
   // Closing pointer: where to inspect this run in the Portal (video, steps,
   // screenshots). Present only when withRunDashboardUrl could resolve it.
   if (run.dashboardUrl) lines.push(`dashboard   ${run.dashboardUrl}`);
+  if (run.executionUrl) lines.push(`execution   ${run.executionUrl}`);
   return lines.join('\n');
 }
 
@@ -7651,6 +7652,7 @@ function renderTriggerRunText(r: TriggerRunResponse): string {
   // bare `test run <id>` shows where to look without a second command. Only
   // when the server sent one — absent means it had no correct link to give.
   if (r.dashboardUrl) lines.push(`dashboard   ${r.dashboardUrl}`);
+  if (r.executionUrl) lines.push(`execution   ${r.executionUrl}`);
   return lines.join('\n');
 }
 
@@ -8305,8 +8307,8 @@ export async function runTestRun(
     }
 
     stderrFn(`Run ${triggerResponse.runId}`);
-    const receiptUrl = triggerResponse.dashboardUrl ?? triggerResponse.executionUrl;
-    if (receiptUrl) stderrFn(`Dashboard: ${receiptUrl}`);
+    if (triggerResponse.dashboardUrl) stderrFn(`Dashboard: ${triggerResponse.dashboardUrl}`);
+    if (triggerResponse.executionUrl) stderrFn(`Execution: ${triggerResponse.executionUrl}`);
 
     // Response-driven, not assumption-driven: the backend is the ground
     // truth for whether --target-url was actually applied — V3

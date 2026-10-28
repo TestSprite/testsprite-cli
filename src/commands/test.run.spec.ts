@@ -7481,40 +7481,84 @@ describe('early run receipt', () => {
   );
 
   it.each([
-    { links: {}, expected: undefined },
     {
+      name: 'no URLs',
+      links: {},
+      dashboard: undefined,
+      execution: undefined,
+    },
+    {
+      name: 'dashboard only',
+      links: { dashboardUrl: 'https://www.testsprite.com/tests/test_abc' },
+      dashboard: 'https://www.testsprite.com/tests/test_abc',
+      execution: undefined,
+    },
+    {
+      name: 'execution only',
       links: { executionUrl: 'https://www.testsprite.com/executions/run_abc' },
-      expected: 'https://www.testsprite.com/executions/run_abc',
+      dashboard: undefined,
+      execution: 'https://www.testsprite.com/executions/run_abc',
     },
-  ])(
-    'prints a no-wait receipt using only available server links ($expected)',
-    async ({ links, expected }) => {
-      const stderr: string[] = [];
-      const stdout: string[] = [];
-      const response = { ...TRIGGER_RESP, ...links };
-      await runTestRun(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          testId: 'test_xyz',
-          wait: false,
-          timeoutSeconds: 600,
-        },
-        {
-          ...makeCreds(),
-          stdout: line => stdout.push(line),
-          stderr: line => stderr.push(line),
-          fetchImpl: makeFetch(() => ({ body: response })),
-        },
-      );
-      expect(stderr).toContain('Run run_abc');
-      expect(stderr.filter(line => line.startsWith('Dashboard:'))).toEqual(
-        expected ? [`Dashboard: ${expected}`] : [],
-      );
-      expect(stdout).toEqual([JSON.stringify(response, null, 2)]);
+    {
+      name: 'both URLs',
+      links: {
+        dashboardUrl: 'https://www.testsprite.com/tests/test_abc',
+        executionUrl: 'https://www.testsprite.com/executions/run_abc',
+      },
+      dashboard: 'https://www.testsprite.com/tests/test_abc',
+      execution: 'https://www.testsprite.com/executions/run_abc',
     },
-  );
+    {
+      name: 'absent execution URL',
+      links: {
+        dashboardUrl: 'https://www.testsprite.com/tests/test_abc',
+      },
+      dashboard: 'https://www.testsprite.com/tests/test_abc',
+      execution: undefined,
+    },
+    {
+      name: 'empty execution URL',
+      links: {
+        dashboardUrl: 'https://www.testsprite.com/tests/test_abc',
+        executionUrl: '',
+      },
+      dashboard: 'https://www.testsprite.com/tests/test_abc',
+      execution: undefined,
+    },
+  ])('prints correct no-wait receipt links ($name)', async ({ links, dashboard, execution }) => {
+    const stderr: string[] = [];
+    const stdout: string[] = [];
+    const response = { ...TRIGGER_RESP, ...links };
+
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 600,
+      },
+      {
+        ...makeCreds(),
+        stdout: line => stdout.push(line),
+        stderr: line => stderr.push(line),
+        fetchImpl: makeFetch(() => ({ body: response })),
+      },
+    );
+
+    expect(stderr).toContain('Run run_abc');
+
+    expect(stderr.filter(line => line.startsWith('Dashboard:'))).toEqual(
+      dashboard ? [`Dashboard: ${dashboard}`] : [],
+    );
+
+    expect(stderr.filter(line => line.startsWith('Execution:'))).toEqual(
+      execution ? [`Execution: ${execution}`] : [],
+    );
+
+    expect(stdout).toEqual([JSON.stringify(response, null, 2)]);
+  });
 });
 
 // ---------------------------------------------------------------------------
