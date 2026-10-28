@@ -50,7 +50,10 @@ export function durationSecondsBetween(
   return seconds >= 0 ? seconds : undefined;
 }
 
-/** Format a duration for the JUnit `time` attribute (3 dp; absent → `0`). */
+/**
+ * Format a duration for testcase and suite time attributes, rounded to three
+ * decimal places; missing or NaN durations render as zero.
+ */
 function formatTime(seconds: number | undefined): string {
   if (seconds === undefined || Number.isNaN(seconds)) return '0';
   return (Math.round(seconds * 1000) / 1000).toString();
@@ -58,6 +61,7 @@ function formatTime(seconds: number | undefined): string {
 
 export interface JUnitReportBuildOptions {
   suiteName: string;
+  /** Shared project or test-list scope, preserved as the testcase classname. */
   classname: string;
   results: readonly JUnitTestResult[];
 }
@@ -148,6 +152,10 @@ export function escapeXml(text: string): string {
 
 type JUnitOutcome = 'passed' | 'failure' | 'error' | 'skipped';
 
+/**
+ * Map run statuses to JUnit outcomes: undispatched rows are skipped, execution
+ * or authentication errors are errors, and other non-passing rows are failures.
+ */
 function classifyJUnitOutcome(status: string, error?: JUnitTestResult['error']): JUnitOutcome {
   if (status === 'passed') return 'passed';
   if (isNonDispatchedStatus(status)) return 'skipped';
@@ -155,18 +163,67 @@ function classifyJUnitOutcome(status: string, error?: JUnitTestResult['error']):
   return 'failure';
 }
 
+/**
+ * Select the report diagnostic, preferring an explicit error message, then its
+ * code, and finally the run status when neither diagnostic field is available.
+ */
 function failureMessage(result: JUnitTestResult): string {
   if (result.error?.message) return result.error.message;
   if (result.error?.code) return result.error.code;
   return result.status;
 }
 
-function renderTestcase(result: JUnitTestResult, classname: string): string {
+/**
+ * Preserve readable names unless they collide within this report. Colliding rows
+ * receive an eight-character test-ID prefix, extended when prefixes overlap.
+ * Reserve original titles before allocating suffixes so an unrelated title is
+ * never renamed. A numeric fallback handles full-ID/title collisions, and sorting
+ * by test ID makes allocation independent of result order and ephemeral run IDs.
+ */
+function resolveTestcaseNames(results: readonly JUnitTestResult[]): string[] {
+  const names = results.map(result => result.name?.trim() || result.testId);
+  const groups = new Map<string, number[]>();
+  names.forEach((name, index) => {
+    const group = groups.get(name) ?? [];
+    group.push(index);
+    groups.set(name, group);
+  });
+  const used = new Set(names);
+  for (const name of [...groups.keys()].sort()) {
+    const indices = groups.get(name)!;
+    if (indices.length < 2) continue;
+    const ids = indices.map(index => results[index]!.testId);
+    indices.sort((a, b) => {
+      const left = results[a]!.testId;
+      const right = results[b]!.testId;
+      return left < right ? -1 : left > right ? 1 : a - b;
+    });
+    for (const index of indices) {
+      const id = results[index]!.testId;
+      const characters = Array.from(id);
+      let length = Math.min(8, characters.length);
+      let prefix = characters.slice(0, length).join('');
+      while (
+        length < characters.length &&
+        (ids.some(other => other !== id && other.startsWith(prefix)) ||
+          used.has(`${name} [${prefix}]`))
+      ) {
+        prefix = characters.slice(0, ++length).join('');
+      }
+      let candidate = `${name} [${prefix}]`;
+      let ordinal = 2;
+      while (used.has(candidate)) candidate = `${name} [${prefix}-${ordinal++}]`;
+      names[index] = candidate;
+      used.add(candidate);
+    }
+  }
+  return names;
+}
+
+/** Render one testcase with its collision-resolved name and original report scope. */
+function renderTestcase(result: JUnitTestResult, classname: string, resolvedName: string): string {
   const outcome = classifyJUnitOutcome(result.status, result.error);
-  // A readable CI test tab keys on `name`: prefer the human test name, fall back
-  // to the id. The UUID is preserved as a `testId` attribute (ignored by
-  // renderers, read by machine consumers) so the switch loses no information.
-  const name = escapeXml(result.name?.trim() || result.testId);
+  const name = escapeXml(resolvedName);
   const cls = escapeXml(classname);
   const time = formatTime(result.durationSeconds);
   const idAttr = ` testId="${escapeXml(result.testId)}"`;
@@ -235,7 +292,10 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
   }
 
   const suiteName = escapeXml(opts.suiteName);
-  const testcases = results.map(r => renderTestcase(r, opts.classname)).join('\n');
+  const names = resolveTestcaseNames(results);
+  const testcases = results
+    .map((r, index) => renderTestcase(r, opts.classname, names[index]!))
+    .join('\n');
 
   return [
     XML_DECL,
