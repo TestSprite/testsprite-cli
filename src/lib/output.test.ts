@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Output, isOutputMode, resolveOutputMode } from './output.js';
+import {
+  Output,
+  isOutputMode,
+  parseFieldsFlag,
+  projectFields,
+  resetJsonFieldsForTesting,
+  resolveOutputMode,
+  setJsonFields,
+} from './output.js';
 import { ApiError } from './errors.js';
 
 describe('isOutputMode', () => {
@@ -282,5 +290,191 @@ describe('Output.writeChunk — backpressure', () => {
     resolveDrain!();
     await writePromise;
     expect(writeResolved).toBe(true);
+  });
+});
+
+describe('parseFieldsFlag', () => {
+  it('splits on commas, trims, and drops empty entries and duplicates', () => {
+    expect(parseFieldsFlag(' id, name ,,id,latestResult.status ')).toEqual([
+      'id',
+      'name',
+      'latestResult.status',
+    ]);
+  });
+
+  it('rejects an empty list with VALIDATION_ERROR', () => {
+    expect(() => parseFieldsFlag(' , ')).toThrow(ApiError);
+    expect(() => parseFieldsFlag('')).toThrow(
+      expect.objectContaining({ code: 'VALIDATION_ERROR', exitCode: 5 }),
+    );
+  });
+
+  it('rejects a path with an empty segment', () => {
+    for (const bad of ['a..b', '.a', 'a.']) {
+      let caught: unknown;
+      try {
+        parseFieldsFlag(bad);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(ApiError);
+      expect((caught as ApiError).nextAction).toContain('not a valid field path');
+    }
+  });
+});
+
+describe('projectFields', () => {
+  const split = (...paths: string[]) => paths.map(path => path.split('.'));
+
+  it('keeps top-level and nested keys of an object', () => {
+    const data = { id: 't1', name: 'Login', latest: { status: 'failed', runId: 'r1' }, extra: 1 };
+    expect(projectFields(data, split('id', 'latest.status'))).toEqual({
+      value: { id: 't1', latest: { status: 'failed' } },
+      unmatched: [],
+    });
+  });
+
+  it('maps a list met along the path and keeps the requested envelope keys', () => {
+    const data = {
+      items: [
+        { id: 'a', name: 'A', status: 'passed' },
+        { id: 'b', name: 'B', status: 'failed' },
+      ],
+      nextToken: 'n1',
+      total: 2,
+    };
+    expect(projectFields(data, split('items.id', 'items.status', 'nextToken')).value).toEqual({
+      items: [
+        { id: 'a', status: 'passed' },
+        { id: 'b', status: 'failed' },
+      ],
+      nextToken: 'n1',
+    });
+  });
+
+  it('projects every element of a top-level array', () => {
+    expect(projectFields([{ id: 1, x: 2 }, { id: 3 }], split('id')).value).toEqual([
+      { id: 1 },
+      { id: 3 },
+    ]);
+  });
+
+  it('keeps a whole subtree when a parent and a child path are both requested', () => {
+    const data = { latest: { status: 'failed', runId: 'r1' } };
+    const result = projectFields(data, split('latest', 'latest.status', 'latest.nope'));
+    expect(result.value).toEqual(data);
+    expect(result.unmatched).toEqual([
+      { path: 'latest.nope', at: 'latest', available: ['status', 'runId'] },
+    ]);
+  });
+
+  it('reports paths that matched nothing, but not ones that only met an empty list', () => {
+    const result = projectFields({ items: [], name: 'x' }, split('items.id', 'nmae'));
+    expect(result.value).toEqual({ items: [] });
+    expect(result.unmatched).toEqual([{ path: 'nmae', at: '', available: ['items', 'name'] }]);
+  });
+
+  it('names the keys found where an unmatched path stopped, across list items', () => {
+    const data = {
+      items: [
+        { id: 'a', name: 'A' },
+        { id: 'b', status: 'failed' },
+      ],
+      nextToken: null,
+    };
+    expect(projectFields(data, split('items.nme')).unmatched).toEqual([
+      { path: 'items.nme', at: 'items', available: ['id', 'name', 'status'] },
+    ]);
+  });
+
+  it('keeps the position of list items that have nothing to keep', () => {
+    const data = { rows: [{ id: 1, x: 1 }, 'legacy-row', { id: 2, x: 2 }] };
+    expect(projectFields(data, split('rows.id'))).toEqual({
+      value: { rows: [{ id: 1 }, null, { id: 2 }] },
+      unmatched: [],
+    });
+  });
+
+  it('omits a list in which no item has anything to keep', () => {
+    const result = projectFields({ tags: ['smoke', 'login'], id: 't1' }, split('tags.name', 'id'));
+    expect(result.value).toEqual({ id: 't1' });
+    expect(result.unmatched).toEqual([{ path: 'tags.name', at: '', available: [] }]);
+  });
+
+  it('keeps a null on the path as null instead of reporting the path', () => {
+    const data = { latestResult: null, items: [{ id: 1 }, null], id: 't1' };
+    expect(projectFields(data, split('latestResult.status', 'items.id', 'id'))).toEqual({
+      value: { latestResult: null, items: [{ id: 1 }, null], id: 't1' },
+      unmatched: [],
+    });
+  });
+
+  it('prints an empty list for a top-level list in which no item has anything to keep', () => {
+    expect(projectFields(['smoke', 'login'], split('id'))).toEqual({
+      value: [],
+      unmatched: [{ path: 'id', at: '', available: [] }],
+    });
+  });
+
+  it('keeps a `__proto__` key as an ordinary field', () => {
+    const data = JSON.parse('{"__proto__": {"polluted": true}, "id": "t1"}') as unknown;
+    const { value } = projectFields(data, split('__proto__', 'id'));
+    expect(JSON.stringify(value)).toBe('{"__proto__":{"polluted":true},"id":"t1"}');
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+  });
+
+  it('leaves a non-object payload unchanged', () => {
+    expect(projectFields('plain', split('id')).value).toBe('plain');
+  });
+});
+
+describe('Output.print — --fields projection', () => {
+  afterEach(() => {
+    resetJsonFieldsForTesting();
+  });
+
+  function capture(mode: 'json' | 'text') {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const out = new Output(mode, { stdout: l => stdout.push(l), stderr: l => stderr.push(l) });
+    return { out, stdout, stderr };
+  }
+
+  it('trims json output to the requested fields', () => {
+    setJsonFields(['items.id', 'nextToken']);
+    const { out, stdout } = capture('json');
+    out.print({ items: [{ id: 'a', name: 'A' }], nextToken: null, extra: true });
+    expect(JSON.parse(stdout[0]!)).toEqual({ items: [{ id: 'a' }], nextToken: null });
+  });
+
+  it('warns once on stderr for a field that matched nothing, keeping stdout pure JSON', () => {
+    setJsonFields(['nmae']);
+    const { out, stdout, stderr } = capture('json');
+    out.print({ name: 'x' });
+    out.print({ name: 'y' });
+    expect(stdout.map(line => JSON.parse(line) as unknown)).toEqual([{}, {}]);
+    expect(stderr).toEqual([
+      '[warn] --fields "nmae" matched nothing in this output (available: name)',
+    ]);
+  });
+
+  it('says where a nested field stopped matching', () => {
+    setJsonFields(['items.nme']);
+    const { out, stderr } = capture('json');
+    out.print({ items: [{ id: 'a', name: 'A' }] });
+    expect(stderr).toEqual([
+      '[warn] --fields "items.nme" matched nothing in this output (available under items: id, name)',
+    ]);
+  });
+
+  it('does not touch text output or the json output once cleared', () => {
+    setJsonFields(['id']);
+    const text = capture('text');
+    text.out.print({ id: 1, name: 'n' }, () => 'rendered');
+    expect(text.stdout).toEqual(['rendered']);
+    resetJsonFieldsForTesting();
+    const json = capture('json');
+    json.out.print({ id: 1, name: 'n' });
+    expect(JSON.parse(json.stdout[0]!)).toEqual({ id: 1, name: 'n' });
   });
 });

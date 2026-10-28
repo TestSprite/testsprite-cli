@@ -9,8 +9,167 @@ export type OutputMode = 'json' | 'text';
  * `--profile`, `--endpoint-url`, `--request-timeout`, `--debug`.
  */
 export const GLOBAL_OPTS_HINT =
-  '\nGlobal options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):' +
+  '\nGlobal options (--dry-run, --output, --fields, --profile, --endpoint-url, --request-timeout, --verbose, --debug):' +
   '\n  testsprite --help';
+
+/**
+ * `--fields` projection for `--output json`, set once per process from the
+ * global flag (see `index.ts`) and applied by every {@link Output.print} — the
+ * single path all success JSON takes — so no command has to thread it.
+ * Each entry is one dot-separated path, split into segments.
+ */
+let jsonFieldPaths: readonly (readonly string[])[] | undefined;
+const warnedUnmatchedFields = new Set<string>();
+
+/**
+ * Parse a raw `--fields` value (`id,name,latestResult.status`) into paths.
+ * Whitespace around commas is ignored and duplicates are dropped; an empty
+ * list or an empty path segment (`a..b`, `.a`) is a VALIDATION_ERROR.
+ */
+export function parseFieldsFlag(raw: string): string[] {
+  const paths = [
+    ...new Set(
+      raw
+        .split(',')
+        .map(path => path.trim())
+        .filter(Boolean),
+    ),
+  ];
+  if (paths.length === 0) {
+    throw localValidationError('fields', 'must list at least one field (e.g. --fields id,name)');
+  }
+  const malformed = paths.find(path => path.split('.').some(segment => segment === ''));
+  if (malformed !== undefined) {
+    throw localValidationError(
+      'fields',
+      `"${malformed}" is not a valid field path — use dot-separated keys like latestResult.status`,
+    );
+  }
+  return paths;
+}
+
+/** Set (or clear, with `undefined`) the process-wide `--fields` projection. */
+export function setJsonFields(paths: readonly string[] | undefined): void {
+  jsonFieldPaths = paths?.map(path => path.split('.'));
+  warnedUnmatchedFields.clear();
+}
+
+export function resetJsonFieldsForTesting(): void {
+  setJsonFields(undefined);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** A requested `--fields` path that matched nothing, with the keys found where it stopped. */
+export interface UnmatchedField {
+  path: string;
+  /** Dot path of the object where the lookup stopped (`''` for the top level). */
+  at: string;
+  /** Keys present at `at`, to suggest the intended spelling; empty if no object was reached. */
+  available: string[];
+}
+
+/**
+ * Keep only the requested paths of `data`. An array met at any level (the
+ * top-level value, or `items` in `items.id`) is mapped element by element, so
+ * `--fields items.id,nextToken` trims every list item and keeps the cursor.
+ * Returns the projected value plus the requested paths that matched nothing.
+ */
+export function projectFields(
+  data: unknown,
+  paths: readonly (readonly string[])[],
+): { value: unknown; unmatched: UnmatchedField[] } {
+  type Wanted = { index: number; rest: readonly string[] };
+  // A path counts as matched once its last key is found anywhere — or when it
+  // runs into an empty list or a null, neither of which can show it is wrong.
+  const matched = new Set<number>();
+  // For a path not (yet) matched: the deepest object it reached, and its keys.
+  const stoppedAt = new Map<number, { depth: number; keys: Set<string> }>();
+  const pick = (value: unknown, wanted: readonly Wanted[]): unknown => {
+    if (value === null) {
+      for (const { index } of wanted) matched.add(index);
+      return null;
+    }
+    if (Array.isArray(value)) {
+      if (value.length === 0) for (const { index } of wanted) matched.add(index);
+      // An item with nothing to keep (e.g. a string in a list of objects)
+      // becomes null so the others keep their positions. A list where no item
+      // has anything to keep is omitted rather than printed as `[null, null]`.
+      const items = value.map(item => pick(item, wanted));
+      if (value.length > 0 && items.every(item => item === undefined)) return undefined;
+      return items.map(item => (item === undefined ? null : item));
+    }
+    if (!isPlainObject(value)) return undefined;
+    const whole = new Set<string>();
+    const nested = new Map<string, Wanted[]>();
+    for (const { index, rest } of wanted) {
+      const [key, ...tail] = rest;
+      if (key === undefined) continue;
+      if (!Object.hasOwn(value, key)) {
+        const depth = (paths[index]?.length ?? 0) - rest.length;
+        const stop = stoppedAt.get(index);
+        if (stop === undefined || depth > stop.depth) {
+          stoppedAt.set(index, { depth, keys: new Set(Object.keys(value)) });
+        } else if (depth === stop.depth) {
+          for (const name of Object.keys(value)) stop.keys.add(name);
+        }
+        continue;
+      }
+      if (tail.length === 0) {
+        matched.add(index);
+        whole.add(key);
+      } else {
+        nested.set(key, [...(nested.get(key) ?? []), { index, rest: tail }]);
+      }
+    }
+    // Entries + Object.fromEntries rather than `result[key] = …`, so a key such
+    // as `__proto__` stays an ordinary property instead of setting a prototype.
+    const kept: [string, unknown][] = [];
+    for (const [key, item] of Object.entries(value)) {
+      if (whole.has(key)) {
+        kept.push([key, item]);
+        // The whole value is kept, but walk any child paths too so they are
+        // reported only when they really are missing.
+        if (nested.has(key)) pick(item, nested.get(key)!);
+      } else if (nested.has(key)) {
+        const inner = pick(item, nested.get(key)!);
+        if (inner !== undefined) kept.push([key, inner]);
+      }
+    }
+    return Object.fromEntries(kept);
+  };
+  const value = pick(
+    data,
+    paths.map((rest, index) => ({ index, rest })),
+  );
+  const unmatched = paths.flatMap((path, index): UnmatchedField[] => {
+    if (matched.has(index)) return [];
+    const stop = stoppedAt.get(index);
+    return [
+      {
+        path: path.join('.'),
+        at: stop === undefined ? '' : path.slice(0, stop.depth).join('.'),
+        available: stop === undefined ? [] : [...stop.keys],
+      },
+    ];
+  });
+  // A list at the top level stays a list even when no item had anything to keep.
+  const projected = value === undefined && Array.isArray(data) ? [] : value;
+  return { value: projected === undefined ? data : projected, unmatched };
+}
+
+const MAX_HINTED_KEYS = 20;
+
+/** ` (available: id, name)` / ` (available under items: id, name)`, or `''` with nothing to suggest. */
+function availableHint(field: UnmatchedField): string {
+  if (field.available.length === 0) return '';
+  const shown = field.available.slice(0, MAX_HINTED_KEYS).join(', ');
+  const more = field.available.length > MAX_HINTED_KEYS ? ', ...' : '';
+  const where = field.at === '' ? '' : ` under ${field.at}`;
+  return ` (available${where}: ${shown}${more})`;
+}
 
 export function isOutputMode(value: unknown): value is OutputMode {
   return value === 'json' || value === 'text';
@@ -115,6 +274,20 @@ export class Output {
     // boundaries — `Output.error` below, the ApiError envelope in
     // `index.ts`, and `--debug` tracing in `client-factory.ts` — never to a
     // success payload.
+    if (this.mode === 'json' && jsonFieldPaths !== undefined) {
+      // `--fields` is an explicit request to trim the payload, so it is the
+      // one exception to the byte-identical round-trip above.
+      const { value, unmatched } = projectFields(data, jsonFieldPaths);
+      for (const field of unmatched) {
+        if (warnedUnmatchedFields.has(field.path)) continue;
+        warnedUnmatchedFields.add(field.path);
+        this.stderrWrite(
+          `[warn] --fields "${field.path}" matched nothing in this output${availableHint(field)}`,
+        );
+      }
+      this.stdoutWrite(JSON.stringify(value, null, 2));
+      return;
+    }
     if (this.mode === 'json' || !textRenderer) {
       this.stdoutWrite(JSON.stringify(data, null, 2));
       return;

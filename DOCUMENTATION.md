@@ -1325,10 +1325,20 @@ These apply to every command:
 | `--profile <name>`            | Pick a named profile (default: `default`)                                                          |
 | `--endpoint-url <url>`        | Override the API host                                                                              |
 | `--output json\|text`         | JSON is the stable automation contract; text is human-friendly                                     |
+| `--fields <list>`             | With `--output json`, keep only these comma-separated fields (see below)                           |
 | `--request-timeout <seconds>` | Per-request wall-clock timeout (default 120, range 1–600)                                          |
 | `--verbose`                   | Human-readable HTTP retry / backoff / polling messages to stderr                                   |
 | `--debug`                     | Method / URL / request-id / latency / retry decisions to stderr (the API key is never included)    |
 | `--dry-run`                   | Preview without writes or charges; configured `test run` may read metadata for its tunnel decision |
+
+**Trimming JSON with `--fields`.** `--fields` keeps only the listed keys of a command's JSON result, so a script or coding agent reads just what it needs. Dot paths reach nested keys, and a path that passes through a list applies to every item in it; keys you don't list — including list cursors — are dropped, and a `null` along a path is kept as `null`:
+
+```bash
+testsprite --output json test list --project <id> --fields items.id,items.name,items.status,nextToken
+testsprite --output json test result <test-id> --fields status,verdict,failureKind,summary
+```
+
+A field that matches nothing is reported once on stderr, with the keys available where the lookup stopped (`[warn] --fields "nmae" matched nothing in this output (available: name, status, …)`), while stdout stays valid JSON. `--fields` only applies to `--output json`; in text mode it is rejected with exit **5** (use `--columns` to pick text table columns). Error envelopes are never trimmed.
 
 ### Secrets in output
 
