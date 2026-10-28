@@ -421,7 +421,6 @@ testsprite test create --plan-from ./checkout.plan.json --dry-run --output json
 > files created this way work as-is; for other tools that expect UTF-8, write
 > `Out-File -Encoding utf8` or use `pwsh` instead.
 
-
 `--plan-from` owns the complete test definition and does not support this setting; a supplied `--step-timeout` is warned about and ignored. Set it later with `test update --step-timeout <ms>`.
 
 #### `testsprite test create-batch`

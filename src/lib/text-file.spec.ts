@@ -8,8 +8,10 @@ const PAYLOAD = '{"projectId":"project_alice","type":"frontend","name":"checkout
 
 function encoded(payload: string, enc: 'utf8' | 'utf8-bom' | 'utf16le' | 'utf16be'): Buffer {
   if (enc === 'utf8') return Buffer.from(payload, 'utf8');
-  if (enc === 'utf8-bom') return Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(payload, 'utf8')]);
-  if (enc === 'utf16le') return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(payload, 'utf16le')]);
+  if (enc === 'utf8-bom')
+    return Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(payload, 'utf8')]);
+  if (enc === 'utf16le')
+    return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(payload, 'utf16le')]);
   const body = Buffer.from(payload, 'utf16le');
   body.swap16();
   return Buffer.concat([Buffer.from([0xfe, 0xff]), body]);
