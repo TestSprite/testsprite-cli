@@ -13,6 +13,7 @@ The full reference for the TestSprite CLI: install verification, manual setup, e
 - [Agent onboarding (`agent install`)](#agent-onboarding-agent-install)
 - [Plan file format](#plan-file-format)
 - [Command reference](#command-reference)
+  - [Setup (`setup`)](#setup-setup)
   - [Read commands](#read-commands)
   - [Write commands](#write-commands)
   - [Generate commands](#generate-commands)
@@ -208,6 +209,41 @@ Get this exact skeleton without hand-copying it from this file: `testsprite test
 ## Command reference
 
 Every command supports the [global flags](#global-flags), and every example below pairs a real call with a `--dry-run` companion that works on a fresh install with no auth.
+
+### Setup (`setup`)
+
+`testsprite setup` is the recommended first command. It verifies and stores an API key, then installs the TestSprite skills for the coding agents detected in the current project. Use `--no-agent` when you only want to configure credentials.
+
+```bash
+# Interactive: prompt for the key and confirm detected agent targets
+testsprite setup
+
+# Non-interactive: read the key from TESTSPRITE_API_KEY and accept defaults
+TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --yes
+
+# Idempotent CI/agent rerun: reuse this profile's saved key when it exists
+testsprite setup --skip-if-configured --yes
+
+# Preview credential and skill actions without network calls or writes
+testsprite setup --dry-run --output json
+```
+
+Credential flags:
+
+- `--api-key <key>` supplies a key directly and skips the secret prompt. Prefer `--from-env` in shared scripts so the key does not enter shell history.
+- `--from-env` reads `TESTSPRITE_API_KEY`. A non-empty `--api-key` takes precedence when both are supplied.
+- `--skip-if-configured` reuses the active profile's saved key when one exists. With no saved key, an interactive terminal falls back to the ordinary prompt; a non-interactive run exits 5 unless `--api-key` or `--from-env` supplies a usable key. Combine it with `--yes` only on machines where the profile is already configured. An explicit `--api-key` or `--from-env` still replaces the saved key.
+- `--profile <name>` selects the credential profile through the global flag. The default credentials file is `~/.testsprite/credentials`.
+
+Agent-install flags:
+
+- `--agent <target>` chooses one target explicitly. Supported values are `claude`, `antigravity`, `cursor`, `cline`, `kiro`, `windsurf`, `copilot`, and `codex`.
+- `--no-agent` skips skill installation.
+- `--dir <path>` changes the project root used for agent detection and installation.
+- `--force` overwrites a differing own-file skill after saving a `.bak` copy. Managed-section targets continue to preserve content outside their TestSprite section.
+- `--yes` accepts detected targets and prevents interactive prompts. It still requires a usable non-interactive key source: `--api-key`, `--from-env`, or `--skip-if-configured` with an existing saved key.
+
+On success, text output identifies the profile, endpoint, environment, credential persistence state when relevant, and every agent target and skill installed. JSON output returns the same result as one object. With `--from-env`, an unwritable credentials file can produce `credentials.persisted: false`; keep `TESTSPRITE_API_KEY` set for later commands in that case.
 
 ### Read commands
 
