@@ -127,6 +127,36 @@ function priorityOf(exitCode: number): number {
   return WAIT_EXIT_PRIORITY.indexOf(exitCode as (typeof WAIT_EXIT_PRIORITY)[number]);
 }
 
+function selectWaitFailureMember(
+  results: readonly WaitMemberResult[],
+): (WaitMemberResult & { error: NonNullable<WaitMemberResult['error']> }) | undefined {
+  const errored = results.filter(
+    (r): r is WaitMemberResult & { error: NonNullable<WaitMemberResult['error']> } =>
+      r.status === 'error' && r.error !== undefined,
+  );
+  const authErr = errored.find(r => isAuthCode(r.error.code));
+  if (authErr) return authErr;
+
+  const operationalCandidates = errored.filter(r => isOperationalCode(r.error.exitCode ?? 1));
+  // Narrow exception to the table above (mirrors the identical rule in
+  // conflict-reason.ts's `isPausedRefusal`): when EVERY operational
+  // member is a billing refusal and at least one is a paused workspace, paused
+  // wins over a plain credits shortfall — topping up credits cannot resume a
+  // paused workspace. This does not reorder WAIT_EXIT_PRIORITY for any other
+  // code combination.
+  const isPausedMember = (r: (typeof operationalCandidates)[number]): boolean =>
+    r.error.code === 'FEATURE_GATED' && isPausedReason(memberMeta(r.error).details?.reason);
+  const isBillingRefusalMember = (r: (typeof operationalCandidates)[number]): boolean =>
+    r.error.code === 'INSUFFICIENT_CREDITS' || isPausedMember(r);
+  return operationalCandidates.length > 0 &&
+    operationalCandidates.every(isBillingRefusalMember) &&
+    operationalCandidates.some(isPausedMember)
+    ? operationalCandidates.find(isPausedMember)
+    : operationalCandidates.sort(
+        (a, b) => priorityOf(a.error.exitCode!) - priorityOf(b.error.exitCode!),
+      )[0];
+}
+
 /** Resolve a non-retriable deferred-retry refusal alongside the polled outcomes. */
 export function resolveDeferredRetryFailure(
   results: readonly WaitMemberResult[],
@@ -141,11 +171,11 @@ export function resolveDeferredRetryFailure(
   ) {
     return null;
   }
-  const failure = resolveWaitFailure(
-    [...results, { status: 'error', error: waitMemberError(retryError) }],
-    opts,
-  );
-  if (failure?.exitCode !== retryError.exitCode) return failure;
+  const retryMember = { status: 'error', error: waitMemberError(retryError) };
+  if (selectWaitFailureMember([...results, retryMember]) !== retryMember) {
+    // The dispatch refusal is not a run and must not inflate failure counts.
+    return resolveWaitFailure(results, opts);
+  }
   // Keep the dispatch envelope, including auth remediation, rather than the
   // synthesized per-member message. These IDs still have no dispatched run.
   return new ApiError(
@@ -192,10 +222,10 @@ export function resolveWaitFailure(
   // 1) Auth wins over everything — the credential is bad, not the test.
   //    Classified via the single `isAuthCode` source (derived from `exitCodeFor`)
   //    rather than a local `=== 3` so a future AUTH_* code can't be missed here.
-  const authErr = errored.find(r => isAuthCode(r.error.code));
-  if (authErr) {
+  const operational = selectWaitFailureMember(results);
+  if (operational && isAuthCode(operational.error.code)) {
     return new CLIError(
-      `${notPassed} run${notPassed !== 1 ? 's' : ''} failed — auth error (${authErr.error.code}): ${authErr.error.message}`,
+      `${notPassed} run${notPassed !== 1 ? 's' : ''} failed — auth error (${operational.error.code}): ${operational.error.message}`,
       3,
     );
   }
@@ -206,25 +236,6 @@ export function resolveWaitFailure(
   //    non-1 exit like 0/99). Routed through the ENVELOPE so `--output json`
   //    carries `error.code` — the machine-readable field this fix exists for;
   //    `ApiError.fromEnvelope` derives the exit via `exitCodeFor(code)`.
-  const operationalCandidates = errored.filter(r => isOperationalCode(r.error.exitCode ?? 1));
-  // Narrow exception to the table above (mirrors the identical rule in
-  // conflict-reason.ts's `isPausedRefusal`): when EVERY operational
-  // member is a billing refusal and at least one is a paused workspace, paused
-  // wins over a plain credits shortfall — topping up credits cannot resume a
-  // paused workspace. This does not reorder WAIT_EXIT_PRIORITY for any other
-  // code combination.
-  const isPausedMember = (r: (typeof operationalCandidates)[number]): boolean =>
-    r.error.code === 'FEATURE_GATED' && isPausedReason(memberMeta(r.error).details?.reason);
-  const isBillingRefusalMember = (r: (typeof operationalCandidates)[number]): boolean =>
-    r.error.code === 'INSUFFICIENT_CREDITS' || isPausedMember(r);
-  const operational =
-    operationalCandidates.length > 0 &&
-    operationalCandidates.every(isBillingRefusalMember) &&
-    operationalCandidates.some(isPausedMember)
-      ? operationalCandidates.find(isPausedMember)
-      : operationalCandidates.sort(
-          (a, b) => priorityOf(a.error.exitCode!) - priorityOf(b.error.exitCode!),
-        )[0];
   if (operational) {
     const meta = memberMeta(operational.error);
     if (meta.details && isErrorCode(operational.error.code)) {

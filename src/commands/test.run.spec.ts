@@ -8213,16 +8213,82 @@ describe('runTestRunAll — deferred retry refusals', () => {
         },
       ).catch(e => e);
       expect(error).toMatchObject({ exitCode: outcome === 'auth' ? 3 : 12 });
-      if (outcome !== 'auth') expect(error).toMatchObject(creditsError);
+      if (outcome === 'auth') {
+        expect(error.message).toBe('1 run failed — auth error (AUTH_INVALID): Error: AUTH_INVALID');
+      } else {
+        expect(error).toMatchObject(creditsError);
+      }
       expect(posts).toBe(2);
       expect(polls).toBeGreaterThan(0);
       expect(JSON.parse(stdout.at(-1)!)).toMatchObject({
-        summary: { total: 1, deferred: 3, passed: outcome === 'passed' ? 1 : 0 },
+        summary: {
+          total: 1,
+          deferred: 3,
+          passed: outcome === 'passed' ? 1 : 0,
+          failed: outcome === 'passed' ? 0 : 1,
+        },
       });
     },
   );
 
-  it.each([false, true])('--ci with pollable=%s preserves its retry error', async pollable => {
+  it('a polled pause keeps its envelope over a retry rollout with the same exit code', async () => {
+    const { credentialsPath } = makeCreds();
+    const pause = {
+      code: 'FEATURE_GATED',
+      message: 'Polled workspace paused.',
+      nextAction: 'Resume the polled workspace.',
+      requestId: 'req_polled_pause',
+      details: { reason: 'paused' },
+    };
+    const rollout = {
+      code: 'FEATURE_GATED',
+      message: 'Retry rollout is disabled.',
+      nextAction: 'Wait for retry rollout.',
+      requestId: 'req_retry_rollout',
+      details: { reason: 'rollout' },
+    };
+    let posts = 0;
+    let polls = 0;
+    const fetchImpl = makeFetch((url, init) => {
+      if (url.includes('/tests/batch/run') && init.method === 'POST') {
+        return ++posts === 1
+          ? {
+              status: 202,
+              body: {
+                ...initial,
+                accepted: [
+                  {
+                    testId: 'test_xyz',
+                    runId: 'run_abc',
+                    enqueuedAt: '2026-05-15T10:00:00.000Z',
+                  },
+                ],
+              },
+            }
+          : { status: 403, body: { error: rollout } };
+      }
+      if (url.includes('/runs/run_abc')) {
+        polls++;
+        return { status: 403, body: { error: pause } };
+      }
+      return { body: { items: [], nextToken: null } };
+    });
+    const error = await runTestRunAll(
+      { ...opts, output: 'json' },
+      { credentialsPath, fetchImpl, sleep: instantSleep, stdout: () => {}, stderr: () => {} },
+    ).catch(e => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({
+      ...pause,
+      exitCode: 13,
+      details: { ...pause.details, runId: 'run_abc', testId: 'test_xyz' },
+    });
+    expect(error.details).not.toHaveProperty('deferredTestIds');
+    expect(posts).toBe(2);
+    expect(polls).toBe(1);
+  });
+
+  it.each([false, true])('CI policy (ci run), pollable=%s keeps retry error', async pollable => {
     const { credentialsPath } = makeCreds();
     let posts = 0;
     const fetchImpl = makeFetch((url, init) => {

@@ -59,6 +59,46 @@ describe('resolveDeferredRetryFailure', () => {
     });
   });
 
+  it('a polled pause keeps its envelope when the retry rollout has the same exit code', () => {
+    const polledPause = ApiError.fromEnvelope({
+      error: {
+        code: 'FEATURE_GATED',
+        message: 'Polled workspace paused.',
+        nextAction: 'Resume the polled workspace.',
+        requestId: 'req_polled_pause',
+        details: { reason: 'paused' },
+      },
+    });
+    const rollout = ApiError.fromEnvelope({
+      error: {
+        code: 'FEATURE_GATED',
+        message: 'Retry rollout is disabled.',
+        nextAction: 'Wait for retry rollout.',
+        requestId: 'req_retry_rollout',
+        details: { reason: 'rollout' },
+      },
+    });
+    const results = [
+      {
+        status: 'error',
+        testId: 'paused_test',
+        runId: 'paused_run',
+        error: waitMemberError(polledPause),
+      },
+    ];
+    const failure = resolveDeferredRetryFailure(results, rollout, opts);
+    expect(failure).toMatchObject({
+      code: 'FEATURE_GATED',
+      exitCode: 13,
+      message: polledPause.message,
+      nextAction: polledPause.nextAction,
+      requestId: polledPause.requestId,
+      details: { reason: 'paused', runId: 'paused_run', testId: 'paused_test' },
+    });
+    expect(failure).toEqual(resolveWaitFailure(results, opts));
+    expect((failure as ApiError).details).not.toHaveProperty('deferredTestIds');
+  });
+
   it('a retry pause wins over polled credits with the original envelope and undispatched IDs', () => {
     const failure = resolveDeferredRetryFailure(
       [{ status: 'error', error: waitMemberError(credits) }],
