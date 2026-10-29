@@ -56,6 +56,8 @@ export function defaultCredentialsPath(): string {
 export interface ProfileEntry {
   apiKey?: string;
   apiUrl?: string;
+  output?: string;
+  projectId?: string;
 }
 
 export type CredentialsFile = Record<string, ProfileEntry>;
@@ -112,11 +114,16 @@ interface RestrictiveModeOptions {
 const FILE_KEY_TO_FIELD: Record<string, keyof ProfileEntry> = {
   api_key: 'apiKey',
   api_url: 'apiUrl',
+  endpoint_url: 'apiUrl',
+  output: 'output',
+  project: 'projectId',
 };
 
 const FIELD_TO_FILE_KEY: Record<keyof ProfileEntry, string> = {
   apiKey: 'api_key',
   apiUrl: 'api_url',
+  output: 'output',
+  projectId: 'project',
 };
 
 const CREDENTIALS_LOCK_RETRY_MS = 25;

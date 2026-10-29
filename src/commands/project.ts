@@ -10,7 +10,7 @@ import {
   resolveRequestTimeoutMs,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
-import { resolveProfileName } from '../lib/config.js';
+import { loadConfig, resolveProfileName } from '../lib/config.js';
 import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { firstSuiteNextSteps } from '../lib/first-suite-hint.js';
 import type { FetchImpl, HttpClient } from '../lib/http.js';
@@ -2131,6 +2131,10 @@ function requireDocsProjectId(projectId: string | undefined, deps: ProjectDeps):
   if (explicit && explicit.length > 0) return explicit;
   const envValue = (deps.env ?? process.env).TESTSPRITE_PROJECT_ID?.trim();
   if (envValue && envValue.length > 0) return envValue;
+  // Lowest-precedence persistent default from ~/.testsprite/config, composing
+  // with TESTSPRITE_PROJECT_ID (flag > env > config).
+  const configProjectId = loadConfig({ env: deps.env ?? process.env }).projectId;
+  if (configProjectId && configProjectId.length > 0) return configProjectId;
   throw localValidationError(
     '--project <id> is required; pass --project <id> or set TESTSPRITE_PROJECT_ID',
   );

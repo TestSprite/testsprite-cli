@@ -1316,6 +1316,33 @@ Every check reuses the same helpers the real commands use, so the report reflect
 
 Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, the `TESTSPRITE_API_KEY` / `TESTSPRITE_API_URL` env vars override the file, so CI can run without ever touching `~/.testsprite/credentials`.
 
+### Config file (`~/.testsprite/config`)
+
+Non-credential defaults live at `~/.testsprite/config` (INI-style, one section per profile, same `[default]`/`[profile name]` grammar as the credentials file). It is the lowest-precedence layer above the built-in defaults, so the resolution order for every setting it can hold is:
+
+```
+--<flag> flag  >  TESTSPRITE_* env var  >  ~/.testsprite/config  >  built-in default
+```
+
+It can hold, per profile:
+
+| Key in config              | Purpose                                                                  |
+| -------------------------- | ------------------------------------------------------------------------ |
+| `api_url` / `endpoint_url` | Default API host (overridden by `--endpoint-url` / `TESTSPRITE_API_URL`) |
+| `output`                   | Default `--output json\|text` (overridden by `--output`)                 |
+| `project`                  | Default project id (overridden by `--project` / `TESTSPRITE_PROJECT_ID`) |
+
+API credentials (`api_key`) are intentionally **not** in the config file — they stay in `~/.testsprite/credentials`, mirroring the aws-cli split (secrets in one file, settings in another). `~/.testsprite/config` is created and managed by you; the CLI only reads it and never writes it.
+
+Example `~/.testsprite/config`:
+
+```ini
+[default]
+output = json
+endpoint_url = https://api.testsprite.com
+project = prj_abc123
+```
+
 ### Global flags
 
 These apply to every command:

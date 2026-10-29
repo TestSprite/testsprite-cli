@@ -6,6 +6,8 @@ export interface Config {
   apiUrl: string;
   apiKey?: string;
   profile: string;
+  output?: string;
+  projectId?: string;
 }
 
 export interface LoadConfigOptions {
@@ -13,6 +15,7 @@ export interface LoadConfigOptions {
   endpointUrl?: string;
   env?: NodeJS.ProcessEnv;
   credentialsPath?: string;
+  configPath?: string;
 }
 
 export const DEFAULT_API_URL = 'https://api.testsprite.com';
@@ -50,21 +53,33 @@ export function resolveProfileName(
 }
 
 /**
- * Resolves the active profile name and its (apiUrl, apiKey) pair.
+ * Resolves the active profile name and its (apiUrl, apiKey) pair, plus the
+ * persistent settings carried by the config file (`~/.testsprite/config`).
  *
  * Resolution order, highest precedence first:
  *   profile name:  options.profile  > env.TESTSPRITE_PROFILE > "default"
  *   apiKey:        env.TESTSPRITE_API_KEY > credentials file profile entry
- *   apiUrl:        options.endpointUrl > env.TESTSPRITE_API_URL > credentials file > built-in default
+ *   apiUrl:        options.endpointUrl > env.TESTSPRITE_API_URL >
+ *                  credentials file > config file > built-in default
+ *   output:        --output flag (applied by the caller) > config file
+ *   projectId:     --project flag > env.TESTSPRITE_PROJECT_ID > config file
  *
- * Env wins over the credentials file so CI / scripted callers can run without touching
- * the user's ~/.testsprite/credentials.
+ * The config file is the lowest-precedence layer above the built-in defaults,
+ * so `flag > env > config-file > built-in default` holds for every setting it
+ * can hold (`output`, `endpoint_url`/`api_url`, `project`). API credentials
+ * (`api_key`) stay in `~/.testsprite/credentials` only — this mirrors the
+ * aws-cli split (credentials in one file, settings in another).
+ *
+ * Env wins over the credentials file so CI / scripted callers can run without
+ * touching the user's ~/.testsprite/credentials.
  */
 export function loadConfig(options: LoadConfigOptions = {}): Config {
   const env = options.env ?? process.env;
   const profile = resolveProfileName(options.profile, env);
   const credentialsPath = options.credentialsPath ?? defaultCredentialsPath();
-  const fileEntry = readProfile(profile, { path: credentialsPath });
+  const configPath = options.configPath ?? env.TESTSPRITE_CONFIG_FILE ?? defaultConfigPath();
+  const credentialsEntry = readProfile(profile, { path: credentialsPath });
+  const configEntry = readProfile(profile, { path: configPath });
 
   // Empty / whitespace-only env vars are treated as unset so they do not
   // short-circuit the `??` chain (e.g. `export TESTSPRITE_API_URL=` or
@@ -77,8 +92,15 @@ export function loadConfig(options: LoadConfigOptions = {}): Config {
   const envApiKey = normalizeEnvVar(env.TESTSPRITE_API_KEY);
 
   return {
-    apiUrl: options.endpointUrl ?? envApiUrl ?? fileEntry?.apiUrl ?? DEFAULT_API_URL,
-    apiKey: envApiKey ?? fileEntry?.apiKey,
+    apiUrl:
+      options.endpointUrl ??
+      envApiUrl ??
+      credentialsEntry?.apiUrl ??
+      configEntry?.apiUrl ??
+      DEFAULT_API_URL,
+    apiKey: envApiKey ?? credentialsEntry?.apiKey,
     profile,
+    output: configEntry?.output,
+    projectId: configEntry?.projectId,
   };
 }

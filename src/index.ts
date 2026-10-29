@@ -19,7 +19,7 @@ import { createTunnelCommand } from './commands/tunnel.js';
 import { createTestCommand } from './commands/test.js';
 import { createTestListCommand } from './commands/testlist.js';
 import { createUsageCommand } from './commands/usage.js';
-import { resolveProfileName } from './lib/config.js';
+import { loadConfig, resolveProfileName } from './lib/config.js';
 import { classifyBillingRefusal } from './lib/billing-refusal.js';
 import { TARGETS, type AgentTarget } from './lib/agent-targets.js';
 import {
@@ -415,7 +415,26 @@ try {
     process.exitCode = code;
   };
 
-  const rawMode = program.opts<{ output?: string }>().output;
+  // Persistent default --output from ~/.testsprite/config sits below the flag
+  // (flag > env > config-file > built-in 'text'); the flag wins when present.
+  // This is the error-rendering path, so the lookup is lazy (only when the flag
+  // is absent) and must never throw: a malformed `--profile` like `prod]` has
+  // already produced the VALIDATION_ERROR we are here to render, and reading
+  // the config again with that same name would escape this catch block as an
+  // uncaught exception (exit 1) instead of the documented exit 5 envelope.
+  const flagMode = program.opts<{ output?: string }>().output;
+  let configOutput: string | undefined;
+  if (flagMode === undefined) {
+    try {
+      configOutput = loadConfig({
+        profile: resolveProfileName(program.opts<{ profile?: string }>().profile),
+        env: process.env,
+      }).output;
+    } catch {
+      configOutput = undefined;
+    }
+  }
+  const rawMode = flagMode ?? configOutput;
   const mode = isOutputMode(rawMode) ? rawMode : 'text';
   const output = new Output(mode);
   if (err instanceof ApiError) {

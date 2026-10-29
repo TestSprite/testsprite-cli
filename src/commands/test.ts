@@ -16168,7 +16168,10 @@ function resolveProjectId(projectId: string | undefined, deps: TestDeps): string
   if (explicit && explicit.length > 0) return explicit;
   const envValue = (deps.env ?? process.env).TESTSPRITE_PROJECT_ID;
   const trimmed = envValue?.trim();
-  return trimmed && trimmed.length > 0 ? trimmed : undefined;
+  if (trimmed && trimmed.length > 0) return trimmed;
+  // Lowest-precedence persistent default from ~/.testsprite/config for the
+  // resolved profile, composing with TESTSPRITE_PROJECT_ID (flag > env > config).
+  return loadConfig({ env: deps.env ?? process.env }).projectId;
 }
 function requireProjectId(
   projectId: string | undefined,
