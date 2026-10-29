@@ -438,6 +438,24 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     );
   }
 
+  // Validate reused credentials before announcing an install. Reuse this lookup
+  // in Step 2 so other failures keep their existing fallback and output order.
+  let savedIdentityLookup: Promise<MeResponse> | undefined;
+  const savedIdentityStderr: string[] = [];
+  if (resolution && skipWillApply && !opts.dryRun) {
+    savedIdentityLookup = runWhoami(opts, {
+      ...toAuthDeps(deps),
+      stderr: line => savedIdentityStderr.push(line),
+    });
+    try {
+      await savedIdentityLookup;
+    } catch (err) {
+      if (err instanceof InterruptError) throw err;
+      if (err instanceof CLIError && err.exitCode === 3) throw err;
+      // Other failures are handled by the normal whoami catch below.
+    }
+  }
+
   // Announced only once the guards above have passed — otherwise a `--yes` with
   // no key source printed "detected …" and then exited 5, describing an install
   // that was never going to happen.
@@ -555,7 +573,8 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   }
   let me: MeResponse;
   try {
-    me = await runWhoami(opts, whoamiDeps);
+    for (const line of savedIdentityStderr) stderrFn(line);
+    me = await (savedIdentityLookup ?? runWhoami(opts, whoamiDeps));
   } catch (err) {
     if (err instanceof InterruptError) throw err;
     // A reused saved profile (--skip-if-configured) was never validated by
