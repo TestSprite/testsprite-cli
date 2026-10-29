@@ -875,7 +875,7 @@ A second `tunnel start` or process using the same credential takes over, and the
 Re-execute one or more tests as a **replay** — distinct from `test run`, which starts a fresh run. A frontend rerun uses the saved script (verbatim unless AI heal-on-drift engages); a backend rerun re-runs the named test together with its producer/teardown dependency closure. Frontend reruns request auto-heal by default; the server controls the default for fresh test runs. A rerun needs a saved run, and a backend rerun expands the dependency closure. A rerun is billed the same as a fresh run — 0.5 credits per FE rerun, 0.2 credits per BE rerun (legacy V2 accounts: FE rerun remains free). Without `--wait`, prints the queued run(s) and exits 0; with `--wait`, polls to terminal with the same exit-code matrix as `test run --wait`.
 
 ```bash
-# Frontend test — verbatim replay
+# Frontend test — ask for a verbatim replay
 testsprite test rerun test_xxxxxxxx --no-auto-heal --wait --output json
 
 # Backend test — reruns the dependency closure (producers + teardowns)
