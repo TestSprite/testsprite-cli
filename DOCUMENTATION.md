@@ -1535,6 +1535,25 @@ The full list is the [exit-code table](#exit-codes). On every path the same info
 | `14`                  | Client too old — the backend requires a newer CLI (HTTP 426 `CLIENT_TOO_OLD`); upgrade to proceed |
 | `129` / `130` / `143` | Interrupted by a signal (SIGHUP / SIGINT / SIGTERM) — `128 + signal number`                       |
 
+### Corporate TLS inspection and proxy block pages
+
+If every command exits `10` with a message naming `NODE_EXTRA_CA_CERTS`, the
+machine does not trust the certificate chain presented by the network. Node's
+default trust store is its bundled Mozilla roots plus any PEM bundle named by
+`NODE_EXTRA_CA_CERTS`; it does not read the operating-system store. Point that
+variable at the corporate root CA (for example
+`NODE_EXTRA_CA_CERTS=/path/to/corporate-root-ca.pem`). Never set
+`NODE_TLS_REJECT_UNAUTHORIZED=0` — it disables certificate checks for requests
+that carry the API key.
+
+If a proxy, firewall, or captive portal answers with an HTML `4xx` page, the CLI
+reports `UNAVAILABLE` with `details.reason: "not_testsprite"`, plus the status,
+content type, and page title, instead of mapping the status to an API verdict
+such as `AUTH_FORBIDDEN`. Ask IT to allow the API host, and set `HTTPS_PROXY` /
+`HTTP_PROXY` when the network requires an explicit proxy. A JSON API error
+envelope still maps by status; `408`, `429`, and `5xx` keep their existing retry
+behavior.
+
 ### Exit 7 on `test plan generate` — timeout or unsupported?
 
 Exit `7` is a shared bucket, and on this command it has three producers. The
