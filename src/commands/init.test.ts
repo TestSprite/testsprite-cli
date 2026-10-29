@@ -67,21 +67,21 @@ function makeOkFetch(): InitDeps['fetchImpl'] {
   ) as unknown as InitDeps['fetchImpl'];
 }
 
-/** Mock fetch that returns 401 for any request (simulates bad key). */
-function makeAuthFailFetch(): InitDeps['fetchImpl'] {
+/** Mock fetch that returns an auth failure for any request (simulates bad key). */
+function makeAuthFailFetch(status: 401 | 403 = 401): InitDeps['fetchImpl'] {
   return vi.fn(
     async () =>
       new Response(
         JSON.stringify({
           error: {
-            code: 'AUTH_INVALID',
+            code: status === 401 ? 'AUTH_INVALID' : 'AUTH_FORBIDDEN',
             message: 'Invalid API key',
             nextAction: 'Provide a valid key.',
             requestId: 'r-1',
           },
         }),
         {
-          status: 401,
+          status,
           headers: { 'content-type': 'application/json' },
         },
       ),
@@ -620,6 +620,10 @@ describe('runInit — happy path (interactive)', () => {
 
     const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
     expect(parsed.status).toBe('initialized');
+    expect(parsed.scopes).toEqual([]);
+    expect(parsed.env).toBe('production');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-json-test');
     expect(captured.stderr.some(line => line.includes('setup identity lookup failed'))).toBe(true);
   });
 
@@ -2055,13 +2059,14 @@ describe('runInit -- skipIfConfigured', () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs } = makeMemFs();
     // Write a saved key before running setup.
-    writeProfile('default', { apiKey: 'sk-saved' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-saved-key' }, { path: credentialsPath });
     // Provide a mock fetch that accepts /me so runWhoami (identity banner) succeeds.
     const fetchMock = makeOkFetch();
     const prompt = { secret: vi.fn(async () => 'sk-should-never-be-asked') };
 
     await runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
       ...deps,
+      env: {},
       credentialsPath,
       fetchImpl: fetchMock,
       fs: agentFs,
@@ -2071,12 +2076,58 @@ describe('runInit -- skipIfConfigured', () => {
 
     // The prompt must never have fired.
     expect(prompt.secret).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringMatching(/\/me$/),
+      expect.objectContaining({ method: 'GET' }),
+    );
     // The saved key must be untouched.
-    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-saved');
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-saved-key');
     // The summary must still be emitted.
-    const parsed = JSON.parse(captured.stdout.join('')) as { status: string };
-    expect(parsed.status).toBe('initialized');
+    expect(JSON.parse(captured.stdout.join(''))).toMatchObject({
+      status: 'initialized',
+      scopes: ME.scopes,
+      env: ME.env,
+      credentials: { persisted: true, source: 'profile' },
+    });
   });
+
+  it.each([
+    { status: 401, code: 'AUTH_INVALID' },
+    { status: 403, code: 'AUTH_FORBIDDEN' },
+  ] as const)(
+    'surfaces HTTP $status from the saved-key identity lookup',
+    async ({ status, code }) => {
+      const { captured, deps } = makeCapture();
+      const key = 'sk-user-revoked-key';
+      writeProfile('default', { apiKey: key }, { path: credentialsPath });
+      const fetchMock = makeAuthFailFetch(status);
+      const prompt = { secret: vi.fn(async () => 'sk-user-unused') };
+
+      await expect(
+        runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
+          ...deps,
+          env: {},
+          credentialsPath,
+          fetchImpl: fetchMock,
+          prompt,
+          isTTY: false,
+        }),
+      ).rejects.toMatchObject({
+        code,
+        exitCode: 3,
+        message: 'Invalid API key',
+        nextAction: 'Provide a valid key.',
+        httpStatus: status,
+        requestId: 'r-1',
+      });
+
+      expect(captured.stdout).toEqual([]);
+      expect(prompt.secret).not.toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe(key);
+    },
+  );
 
   it('proceeds to prompt when skipIfConfigured is true but no credentials exist', async () => {
     const { captured, deps } = makeCapture();

@@ -538,7 +538,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   );
 
   // -------------------------------------------------------------------------
-  // Step 2: Whoami banner — for identity display only; not used for validation
+  // Step 2: Whoami banner — also validates a reused saved profile
   // -------------------------------------------------------------------------
   // runWhoami resolves its key via loadConfig (`env.TESTSPRITE_API_KEY ?? profile`).
   // When the user passed an explicit --api-key, that key was just written to the
@@ -558,7 +558,12 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     me = await runWhoami(opts, whoamiDeps);
   } catch (err) {
     if (err instanceof InterruptError) throw err;
-    // Whoami is display-only. If it fails after a successful configure,
+    // A reused saved profile (--skip-if-configured) was never validated by
+    // configure, so this lookup is its only check: an auth failure is fatal.
+    if (configured.source === 'profile' && err instanceof CLIError && err.exitCode === 3) {
+      throw err;
+    }
+    // Otherwise whoami is display-only. If it fails after a successful configure,
     // continue with a minimal placeholder so the summary still prints.
     if (opts.debug) {
       const reason = err instanceof Error ? err.message : String(err);
