@@ -395,7 +395,7 @@ testsprite test create --project proj_xxxxxxxx --type frontend --name "Checkout"
   --code-file ./checkout.py --step-timeout 45000
 
 # Frontend test from an agent-supplied plan-steps document; trigger + wait inline
-testsprite test create --plan-from ./checkout.plan.json --type frontend \
+testsprite test create --plan-from ./checkout.plan.json \
   --run --wait --timeout 600 --output json
 
 # Print the plan-file skeleton, edit it, then create from it
@@ -487,7 +487,7 @@ testsprite test run <test-id>
 
 `project create --local` stores `http://localhost:<port>`. Alternatively, pass `--url http://localhost:<port>`, `--url http://127.0.0.1:<port>` or `--url http://[::1]:<port>` (an optional trailing `/` is preserved). Loopback stored URLs must use HTTP, an explicit port and no path; HTTPS, missing ports, other `127.x` hosts, unspecified addresses, LAN/RFC1918, link-local and metadata addresses remain refused. `--local-host` still overrides the shorthand host, but is deprecated and hidden from project/environment help; prefer an explicit URL. Existing rows retain their host spelling. `project get` and `project list` expose `originMode: 'local'` in JSON, while text output shows `(Local)`. Loopback creation is frontend-only; `--local` and `--url` remain mutually exclusive. The port is probed before creation unless `--skip-preflight` is given. V2-only accounts receive exit 7 (`local-origin-requires-v3`).
 
-Creation performs **no exploration or plan generation**. `test plan generate --project <project-id>` on a local project is refused **before charge**, with exit 6 and guidance to use `test create --plan-from … --project <id>` followed by `test run <test-id>`. Author a plan using the [plan file format](#plan-file-format), capture the created test id, and run it through the tunnel.
+Creation performs **no exploration or plan generation**. `test plan generate --project <project-id>` on a local project is refused **before charge**, with exit 6 and guidance to set `projectId` in the plan and use `test create --plan-from …` followed by `test run <test-id>`. Author a plan using the [plan file format](#plan-file-format), capture the created test id, and run it through the tunnel.
 
 Portal runs of a local project are **BLOCKED for free** until you set a public URL:
 
@@ -1397,7 +1397,7 @@ It **never** sends: your API key, target URLs, free-form flag or argument values
 run ids (other than the `ci run` execution id above — the server's own UUID, which names nothing about you or your code), repository names, or error **messages**. The event is a fixed
 allowlist; timeout seconds and the local concurrency limit are bounded numeric controls. It is bounded to ~1s and fully best-effort — it never delays beyond that,
 never changes a command's behavior or exit code, and is skipped entirely when no
-API key is configured, under `--dry-run`, or when the command is interrupted (Ctrl-C / SIGTERM).
+API key is configured, under `--dry-run`, or when the command is interrupted (Ctrl-C / SIGTERM / SIGHUP).
 
 Opt out with `TESTSPRITE_NO_TELEMETRY=1` or the cross-tool
 `DO_NOT_TRACK=1` (any truthy value; `0`/`false`/empty do not opt out).
