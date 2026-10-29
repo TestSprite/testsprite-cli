@@ -67,21 +67,21 @@ function makeOkFetch(): InitDeps['fetchImpl'] {
   ) as unknown as InitDeps['fetchImpl'];
 }
 
-/** Mock fetch that returns 401 for any request (simulates bad key). */
-function makeAuthFailFetch(): InitDeps['fetchImpl'] {
+/** Mock fetch that returns an auth failure for any request (simulates bad key). */
+function makeAuthFailFetch(status: 401 | 403 = 401): InitDeps['fetchImpl'] {
   return vi.fn(
     async () =>
       new Response(
         JSON.stringify({
           error: {
-            code: 'AUTH_INVALID',
+            code: status === 401 ? 'AUTH_INVALID' : 'AUTH_FORBIDDEN',
             message: 'Invalid API key',
             nextAction: 'Provide a valid key.',
             requestId: 'r-1',
           },
         }),
         {
-          status: 401,
+          status,
           headers: { 'content-type': 'application/json' },
         },
       ),
@@ -620,6 +620,10 @@ describe('runInit — happy path (interactive)', () => {
 
     const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
     expect(parsed.status).toBe('initialized');
+    expect(parsed.scopes).toEqual([]);
+    expect(parsed.env).toBe('production');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-json-test');
     expect(captured.stderr.some(line => line.includes('setup identity lookup failed'))).toBe(true);
   });
 
@@ -2055,13 +2059,14 @@ describe('runInit -- skipIfConfigured', () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs } = makeMemFs();
     // Write a saved key before running setup.
-    writeProfile('default', { apiKey: 'sk-saved' }, { path: credentialsPath });
+    writeProfile('default', { apiKey: 'sk-user-saved-key' }, { path: credentialsPath });
     // Provide a mock fetch that accepts /me so runWhoami (identity banner) succeeds.
     const fetchMock = makeOkFetch();
     const prompt = { secret: vi.fn(async () => 'sk-should-never-be-asked') };
 
     await runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
       ...deps,
+      env: {},
       credentialsPath,
       fetchImpl: fetchMock,
       fs: agentFs,
@@ -2071,11 +2076,212 @@ describe('runInit -- skipIfConfigured', () => {
 
     // The prompt must never have fired.
     expect(prompt.secret).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringMatching(/\/me$/),
+      expect.objectContaining({ method: 'GET' }),
+    );
     // The saved key must be untouched.
-    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-saved');
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-saved-key');
     // The summary must still be emitted.
-    const parsed = JSON.parse(captured.stdout.join('')) as { status: string };
-    expect(parsed.status).toBe('initialized');
+    expect(JSON.parse(captured.stdout.join(''))).toMatchObject({
+      status: 'initialized',
+      scopes: ME.scopes,
+      env: ME.env,
+      credentials: { persisted: true, source: 'profile' },
+    });
+  });
+
+  it.each([
+    { status: 401, code: 'AUTH_INVALID', output: 'json', isTTY: false, detected: true },
+    { status: 403, code: 'AUTH_FORBIDDEN', output: 'json', isTTY: false, detected: true },
+    { status: 401, code: 'AUTH_INVALID', output: 'text', isTTY: false, detected: true },
+    { status: 403, code: 'AUTH_FORBIDDEN', output: 'text', isTTY: false, detected: true },
+    { status: 401, code: 'AUTH_INVALID', output: 'text', isTTY: true, detected: true },
+    { status: 403, code: 'AUTH_FORBIDDEN', output: 'text', isTTY: true, detected: true },
+    { status: 401, code: 'AUTH_INVALID', output: 'json', isTTY: false, detected: false },
+    { status: 403, code: 'AUTH_FORBIDDEN', output: 'json', isTTY: false, detected: false },
+  ] as const)(
+    'surfaces HTTP $status without an agent notice ($output, TTY=$isTTY, detected=$detected)',
+    async ({ status, code, output, isTTY, detected }) => {
+      const { captured, deps } = makeCapture();
+      const { fs: agentFs, writeCalls, mkdirCalls } = makeMemFs();
+      const key = 'sk-user-revoked-key';
+      writeProfile('default', { apiKey: key }, { path: credentialsPath });
+      const fetchMock = makeAuthFailFetch(status);
+      const prompt = { secret: vi.fn(async () => 'sk-user-unused') };
+      const agentPrompt = vi.fn(async () => 'cursor');
+
+      await expect(
+        runInit(makeDetectOpts({ apiKey: undefined, skipIfConfigured: true, output }), {
+          ...deps,
+          env: {},
+          credentialsPath,
+          fetchImpl: fetchMock,
+          prompt,
+          agentPrompt,
+          isTTY,
+          cwd: CWD,
+          fs: agentFs,
+          detect: detectRepo(detected ? ['.cursor/rules/team-style.mdc'] : []),
+        }),
+      ).rejects.toMatchObject({
+        code,
+        exitCode: 3,
+        message: 'Invalid API key',
+        nextAction: 'Provide a valid key.',
+        httpStatus: status,
+        requestId: 'r-1',
+      });
+
+      expect(captured.stdout).toEqual([]);
+      expect(captured.stderr.join('\n')).not.toContain('[info]');
+      // runInit throws; index.ts writes the error envelope next. Its prefix must be empty.
+      expect(captured.stderr.join('')).toBe('');
+      expect(prompt.secret).not.toHaveBeenCalled();
+      expect(agentPrompt).not.toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(writeCalls).toEqual([]);
+      expect(mkdirCalls).toEqual([]);
+      expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe(key);
+    },
+  );
+
+  it('propagates an interrupted saved-key lookup before any agent notice or confirmation', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls, mkdirCalls } = makeMemFs();
+    const key = 'sk-user-saved-key';
+    writeProfile('default', { apiKey: key }, { path: credentialsPath });
+    const interruption = new InterruptError('SIGINT');
+    const fetchImpl = vi.fn(async () => {
+      throw interruption;
+    }) as unknown as InitDeps['fetchImpl'];
+    const agentPrompt = vi.fn(async () => 'cursor');
+
+    await expect(
+      runInit(makeDetectOpts({ apiKey: undefined, skipIfConfigured: true }), {
+        ...deps,
+        env: {},
+        credentialsPath,
+        fetchImpl,
+        agentPrompt,
+        isTTY: true,
+        cwd: CWD,
+        fs: agentFs,
+        detect: detectRepo(['.cursor/rules/team-style.mdc']),
+      }),
+    ).rejects.toBe(interruption);
+
+    expect(captured.stderr.join('\n')).not.toContain('[info]');
+    expect(agentPrompt).not.toHaveBeenCalled();
+    expect(captured.stdout).toEqual([]);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledWith(
+      expect.stringMatching(/\/me$/),
+      expect.objectContaining({ method: 'GET' }),
+    );
+    expect(writeCalls).toEqual([]);
+    expect(mkdirCalls).toEqual([]);
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe(key);
+  });
+
+  it.each([
+    {
+      files: ['.cursor/rules/team-style.mdc'],
+      notice: '[info] detected cursor (.cursor); installing skills for cursor',
+    },
+    {
+      files: [],
+      notice:
+        '[info] no coding agent detected in this project; installing for claude. ' +
+        `Pass --agent <target> to choose (${Object.keys(TARGETS).join(', ')}).`,
+    },
+  ])('keeps the valid saved-key agent notice unchanged: $notice', async ({ files, notice }) => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls } = makeMemFs();
+    writeProfile('default', { apiKey: 'sk-user-saved-key' }, { path: credentialsPath });
+    const fetchMock = makeOkFetch();
+
+    await runInit(makeDetectOpts({ apiKey: undefined, skipIfConfigured: true, output: 'json' }), {
+      ...deps,
+      env: {},
+      credentialsPath,
+      fetchImpl: fetchMock,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(files),
+    });
+
+    expect(captured.stderr).toEqual([notice]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(writeCalls.length).toBeGreaterThan(0);
+    expect(JSON.parse(captured.stdout.join(''))).toMatchObject({
+      status: 'initialized',
+      email: ME.email,
+      credentials: { persisted: true, source: 'profile' },
+    });
+  });
+
+  it('keeps saved-key confirmation notices before the prompt and HTTP debug output', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    writeProfile('default', { apiKey: 'sk-user-saved-key' }, { path: credentialsPath });
+    const fetchMock = makeOkFetch();
+    const agentPrompt = vi.fn(async () => {
+      expect(captured.stderr).toEqual(['[info] detected cursor (.cursor)']);
+      return 'cursor';
+    });
+
+    await runInit(makeDetectOpts({ apiKey: undefined, skipIfConfigured: true, debug: true }), {
+      ...deps,
+      env: {},
+      credentialsPath,
+      fetchImpl: fetchMock,
+      agentPrompt,
+      isTTY: true,
+      cwd: CWD,
+      fs: agentFs,
+      detect: detectRepo(['.cursor/rules/team-style.mdc']),
+    });
+
+    expect(agentPrompt).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(captured.stderr.slice(0, 2)).toEqual([
+      '[info] detected cursor (.cursor)',
+      '[info] installing skills for cursor',
+    ]);
+    expect(captured.stderr[2]).toMatch(/^\[debug /);
+    expect(captured.stdout.join('')).toContain('TestSprite initialized.');
+  });
+
+  it('keeps the saved-key dry-run notice before the preview without looking up identity', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs, writeCalls, mkdirCalls } = makeMemFs();
+    writeProfile('default', { apiKey: 'sk-user-revoked-key' }, { path: credentialsPath });
+    const fetchMock = makeAuthFailFetch();
+
+    await runInit(
+      makeDetectOpts({ apiKey: undefined, skipIfConfigured: true, dryRun: true, output: 'json' }),
+      {
+        ...deps,
+        env: {},
+        credentialsPath,
+        fetchImpl: fetchMock,
+        isTTY: false,
+        cwd: CWD,
+        fs: agentFs,
+        detect: detectRepo(['.cursor/rules/team-style.mdc']),
+      },
+    );
+
+    expect(captured.stderr[0]).toBe(
+      '[info] detected cursor (.cursor); installing skills for cursor',
+    );
+    expect(captured.stderr[1]).toMatch(/^\[dry-run\]/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(writeCalls).toEqual([]);
+    expect(mkdirCalls).toEqual([]);
   });
 
   it('proceeds to prompt when skipIfConfigured is true but no credentials exist', async () => {

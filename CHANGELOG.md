@@ -4,6 +4,10 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **`setup --skip-if-configured` rejects invalid saved credentials.** When the identity lookup rejects the saved API key with an authentication error (401/403), setup now exits 3 with the original error and recovery hint instead of reporting success. Valid saved keys still succeed without prompting.
+
 ## [0.15.0] - 2026-10-17
 
 ### Added

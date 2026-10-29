@@ -438,6 +438,24 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     );
   }
 
+  // Validate reused credentials before announcing an install. Reuse this lookup
+  // in Step 2 so other failures keep their existing fallback and output order.
+  let savedIdentityLookup: Promise<MeResponse> | undefined;
+  const savedIdentityStderr: string[] = [];
+  if (resolution && skipWillApply && !opts.dryRun) {
+    savedIdentityLookup = runWhoami(opts, {
+      ...toAuthDeps(deps),
+      stderr: line => savedIdentityStderr.push(line),
+    });
+    try {
+      await savedIdentityLookup;
+    } catch (err) {
+      if (err instanceof InterruptError) throw err;
+      if (err instanceof CLIError && err.exitCode === 3) throw err;
+      // Other failures are handled by the normal whoami catch below.
+    }
+  }
+
   // Announced only once the guards above have passed — otherwise a `--yes` with
   // no key source printed "detected …" and then exited 5, describing an install
   // that was never going to happen.
@@ -538,7 +556,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   );
 
   // -------------------------------------------------------------------------
-  // Step 2: Whoami banner — for identity display only; not used for validation
+  // Step 2: Whoami banner — also validates a reused saved profile
   // -------------------------------------------------------------------------
   // runWhoami resolves its key via loadConfig (`env.TESTSPRITE_API_KEY ?? profile`).
   // When the user passed an explicit --api-key, that key was just written to the
@@ -555,10 +573,16 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   }
   let me: MeResponse;
   try {
-    me = await runWhoami(opts, whoamiDeps);
+    for (const line of savedIdentityStderr) stderrFn(line);
+    me = await (savedIdentityLookup ?? runWhoami(opts, whoamiDeps));
   } catch (err) {
     if (err instanceof InterruptError) throw err;
-    // Whoami is display-only. If it fails after a successful configure,
+    // A reused saved profile (--skip-if-configured) was never validated by
+    // configure, so this lookup is its only check: an auth failure is fatal.
+    if (configured.source === 'profile' && err instanceof CLIError && err.exitCode === 3) {
+      throw err;
+    }
+    // Otherwise whoami is display-only. If it fails after a successful configure,
     // continue with a minimal placeholder so the summary still prints.
     if (opts.debug) {
       const reason = err instanceof Error ? err.message : String(err);
