@@ -733,6 +733,12 @@ Commands:
     4  test not found (no replayable run — trigger \`testsprite test run <id>\` first)
     5  validation error
   code                                  Inspect and edit generated test code
+  export [options] <test-id>            Export one backend test definition as
+                                        deterministic JSON (metadata and Python
+                                        source)
+  import [options] <file>               Create a backend test from an exported
+                                        definition, or update an explicit
+                                        --test-id
   plan                                  Generate + accept AI test plans (V3),
                                         and manage FE plan-steps
   failure                               Export the latest-failure agent bundle
@@ -960,6 +966,23 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 "
 `;
 
+exports[`--help snapshots > test export 1`] = `
+"Usage: testsprite test export [options] <test-id>
+
+Export one backend test definition as deterministic JSON (metadata and Python
+source)
+
+Options:
+  --out <path>  write a .testsprite.json file atomically; defaults to stdout
+  -h, --help    display help for command
+
+Backend tests only. This exports definitions for version control; run results are excluded.
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
 exports[`--help snapshots > test failure get 1`] = `
 "Usage: testsprite test failure get [options] <test-id>
 
@@ -1020,6 +1043,30 @@ Get a test by id
 
 Options:
   -h, --help  display help for command
+
+Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
+  testsprite --help
+"
+`;
+
+exports[`--help snapshots > test import 1`] = `
+"Usage: testsprite test import [options] <file>
+
+Create a backend test from an exported definition, or update an explicit
+--test-id
+
+Options:
+  --project <id>                override the project when creating a test
+  --test-id <id>                update this existing backend test instead of
+                                creating
+  --expected-version <version>  explicit codeVersion for an update; defaults to
+                                the saved version
+  --idempotency-key <token>     replayable base token; at most 247 ASCII
+                                characters including stage suffix budget
+  -h, --help                    display help for command
+
+Backend tests only. Updates write guarded code before metadata; the two writes are not atomic.
+Use the same idempotency key to retry a partial import. A different target requires --expected-version.
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help

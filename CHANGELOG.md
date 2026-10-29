@@ -4,6 +4,10 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- `test export <test-id> [--out <file>]` and `test import <file>` put individual backend test definitions under version control. Exports combine the existing test metadata and code API shapes with deterministic JSON and saved code-version provenance. Imports create by default; `--test-id` updates code with optimistic concurrency before metadata. Frontend definitions are explicitly unsupported in this first version.
+
 ## [0.15.0] - 2026-10-17
 
 ### Added

@@ -211,6 +211,8 @@ On an owned tunnel, Ctrl-C or a timeout cancels unfinished runs by default, and 
 
 📚 **Full reference — every command, flag, and example:** [DOCUMENTATION.md](./DOCUMENTATION.md), including [configuration & profiles](./DOCUMENTATION.md#configuration), [scripting](./DOCUMENTATION.md#output--scripting), and [exit codes](./DOCUMENTATION.md#exit-codes).
 
+Backend definitions can be stored in version control with `testsprite test export <test-id> --out test.testsprite.json` and restored with `testsprite test import test.testsprite.json`. Import creates a copy by default; add `--test-id <id>` to update using the saved code version. See the [definition export/import reference](DOCUMENTATION.md#testsprite-test-export-test-id--testsprite-test-import-file) for supported fields, concurrency, and retry behavior.
+
 ## Why a CLI for coding agents?
 
 - 🧪 **Tests like a real user.** Runs against a live browser or API in the cloud — real clicks, real navigation, real assertions. Not a mock.
