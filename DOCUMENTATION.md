@@ -113,8 +113,9 @@ This is the loop a coding agent runs on its own once you've onboarded it with `t
 testsprite setup
 
 # 1 — describe the behavior you want to guarantee, run it, wait
-testsprite test create --project proj_8f0f6 --type frontend \
-  --plan-from ./checkout-flow.plan.json --run --wait --output json
+# Set projectId in checkout-flow.plan.json to your project ID.
+testsprite test create --plan-from ./checkout-flow.plan.json \
+  --run --wait --output json
 #   → exits 1: the run failed
 
 # 2 — pull ONE self-consistent failure bundle to ./.testsprite/failure/
@@ -293,7 +294,7 @@ Common flags: `--page-size`, `--starting-token`, `--max-items` — same shape as
 
 #### `testsprite test result <test-id>`
 
-Get the latest result for a test — status, started / finished timestamps, video and failure-analysis URLs, summary counts (`passed / failed / skipped`), and correlation fields (`snapshotId`, `runId`, `codeVersion`). With `--include-analysis`, the response also carries an inline `analysis` block (root-cause hypothesis, recommended fix target, failure kind). Backend tests additionally surface the run's captured stdout (`apiOutput`) and Python traceback (`trace`): full content under `--output json` (and in `result.json` / `failure.json` inside failure bundles); text mode prints a bounded 20-line tail of each with a byte count.
+Get the latest result for a test — `status`, `verdict`, `executionStatus`, started / finished timestamps, video and failure-analysis URLs, a `summary` string, and correlation fields (`snapshotId`, `runIdIfAvailable`, `codeVersion`). With `--include-analysis`, the response also carries an inline `analysis` block (root-cause hypothesis, recommended fix target, failure kind). Backend tests additionally surface the run's captured stdout (`apiOutput`) and Python traceback (`trace`): full content under `--output json` (and in `result.json` / `failure.json` inside failure bundles); text mode prints a bounded 20-line tail of each with a byte count.
 
 With `--history`, each row also carries the environment the run used: an **ENV** column shows the environment name, or `—` for rows that predate environments. A run-time `--target-url` can reuse an existing same-origin environment or use a temporary one; `--env` can supply settings while the browser visits the override URL. The `targetUrl:` detail line reports the run's target. `--env <name>` filters the history to runs on that environment (server-side; only with `--history`). The latest-result view prints an `environment:` line for the same reason. JSON consumers get `environment: { id, name } | null` on every run/result payload and `targetUrl`; `targetUrlSource` is `null` on a V3 row.
 
@@ -479,7 +480,8 @@ testsprite project update proj_xxxxxxxx --test-id-attributes data-element,data-t
 
 ```bash
 testsprite project create --type frontend --name <name> --local <port> [--skip-preflight]
-testsprite test create --plan-from ./checkout.plan.json --project <project-id>
+# Set projectId in checkout.plan.json to the project ID returned above.
+testsprite test create --plan-from ./checkout.plan.json
 testsprite test run <test-id>
 ```
 
@@ -874,7 +876,7 @@ Re-execute one or more tests as a **replay** — distinct from `test run`, which
 
 ```bash
 # Frontend test — verbatim replay
-testsprite test rerun test_xxxxxxxx --wait --output json
+testsprite test rerun test_xxxxxxxx --no-auto-heal --wait --output json
 
 # Backend test — reruns the dependency closure (producers + teardowns)
 testsprite test rerun test_be_xxxx --wait --output json
@@ -1156,7 +1158,7 @@ permissions:
   contents: read
   pull-requests: read
 jobs:
-  gate:
+  testsprite-tests:
     concurrency:
       group: testsprite-${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
@@ -1205,7 +1207,7 @@ permissions:
   contents: read
   pull-requests: read
 jobs:
-  gate:
+  testsprite-tests:
     concurrency:
       group: testsprite-${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
@@ -1350,7 +1352,7 @@ Any field named like `password`, `token`, `secret`, `apiKey` / `api_key`, `autho
 | `TESTSPRITE_NO_UPDATE_NOTIFIER`            | Any non-empty value disables the once-per-24h "new version available" notice                                                                                                  |
 | `NO_COLOR`                                 | Suppress ANSI escape sequences in ticker output ([no-color.org](https://no-color.org/))                                                                                       |
 | `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`  | Standard proxy support - API traffic is routed through the configured proxy                                                                                                   |
-| `TESTSPRITE_NO_SKILL_WARNING`              | Any non-empty value silences the "verify skill not installed" reminder (CI / manual use)                                                                                      |
+| `TESTSPRITE_NO_SKILL_WARNING`              | Any value except blank, `0`, `false`, or `no` (after trimming and ignoring case) silences the "verify skill not installed" reminder (CI / manual use)                         |
 | `TESTSPRITE_NO_TELEMETRY` / `DO_NOT_TRACK` | Any truthy value (not `0`/`false`/empty) disables usage telemetry (see Telemetry below)                                                                                       |
 | `TESTSPRITE_PORTAL_URL`                    | Override the Portal origin used for `dashboardUrl` links (non-prod environments)                                                                                              |
 | `TESTSPRITE_CLIENT`                        | Identifies a wrapper driving the CLI (`<name>/<version>`, e.g. `github-action/v1`); appended to the User-Agent and reported as telemetry `client`. Invalid values are ignored |
@@ -1361,7 +1363,7 @@ Authenticated runs send one best-effort "command outcome" event per invocation
 to TestSprite (`POST /api/cli/v1/telemetry`) so we can measure which commands
 run and diagnose failures. Each event carries only:
 
-- the command name (e.g. `test run`), the outcome (`success`/`error`/`abort`),
+- the command name (e.g. `test run`), the outcome (`success`/`error`),
   the exit code, a machine error **code** (e.g. `VALIDATION_ERROR`), and the
   duration;
 - context: CLI version, OS, Node version, output mode, CI-vs-interactive (`ci`),
@@ -1395,7 +1397,7 @@ It **never** sends: your API key, target URLs, free-form flag or argument values
 run ids (other than the `ci run` execution id above — the server's own UUID, which names nothing about you or your code), repository names, or error **messages**. The event is a fixed
 allowlist; timeout seconds and the local concurrency limit are bounded numeric controls. It is bounded to ~1s and fully best-effort — it never delays beyond that,
 never changes a command's behavior or exit code, and is skipped entirely when no
-API key is configured or under `--dry-run`.
+API key is configured, under `--dry-run`, or when the command is interrupted (Ctrl-C / SIGTERM).
 
 Opt out with `TESTSPRITE_NO_TELEMETRY=1` or the cross-tool
 `DO_NOT_TRACK=1` (any truthy value; `0`/`false`/empty do not opt out).
@@ -1483,7 +1485,7 @@ testsprite ci run --project proj_xxxxxxxx \
 ```
 
 - **Waiting is automatic.** The command follows accepted runs to a terminal verdict (or `--timeout`, default 600 s). Skipped tests warn by default; add `--fail-on-skipped` for a strict gate.
-- **`--report junit --report-file <path>`** optionally writes a JUnit XML sidecar for dispatched runs. Skipped tests are currently omitted from JUnit; the unified summary includes them.
+- **`--report junit --report-file <path>`** optionally writes a JUnit XML sidecar. Skipped tests appear as `<skipped>` testcases with their reasons; the unified summary includes them.
 - **`--summary-file <path>`** writes a compact machine summary (`{ total, passed, failed, skipped, timedOut, runs[] }`) you can read from any step — `failed` counts only dispatched runs that failed; tests that never dispatched (deferred / conflicted / not found / skipped) count under `skipped`. **`--gh-output`** additionally emits a job-summary table and annotations (`::error::` for failures/timeouts, `::warning::` for never-dispatched tests); it auto-enables under `GITHUB_ACTIONS=true`, so you rarely pass it by hand.
 
 Archive any requested reports with a step that also runs after failure (`if: always()` in GitHub Actions).
