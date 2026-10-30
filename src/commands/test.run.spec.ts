@@ -16,7 +16,7 @@ import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-facto
 import type { FetchImpl } from '../lib/http.js';
 import type { RunResponse, TriggerRunResponse, BatchRunFreshResponse } from '../lib/runs.types.js';
 import { takeTelemetryExtras } from '../lib/telemetry.js';
-import { runTestRun, runTestRunAll } from './test.js';
+import { renderRunResponseText, runTestRun, runTestRunAll } from './test.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -7200,6 +7200,32 @@ describe('runTestRun — --target-url reachability preflight wiring', () => {
     );
     expect(result).toMatchObject({ runId: 'run_abc' });
     expect(probedUrls).toHaveLength(0);
+  });
+});
+
+describe('run card: failed step (#672)', () => {
+  it('prints failedStepIndex right after failureKind for a failed run', () => {
+    const lines = renderRunResponseText({ ...makeFailedRun(), failedStepIndex: 4 }).split('\n');
+    const kind = lines.indexOf('failureKind assertion');
+    expect(kind).toBeGreaterThanOrEqual(0);
+    expect(lines[kind + 1]).toBe('failedStepIndex 4');
+  });
+
+  it('prints it for a blocked run too', () => {
+    const text = renderRunResponseText({ ...makeFailedRun(), status: 'blocked' });
+    expect(text.split('\n')).toContain('failedStepIndex 2');
+  });
+
+  it('omits the line when the server reported no failed step', () => {
+    expect(renderRunResponseText({ ...makeFailedRun(), failedStepIndex: null })).not.toContain(
+      'failedStepIndex',
+    );
+  });
+
+  it('omits the line for a passed run', () => {
+    expect(renderRunResponseText({ ...makePassedRun(), failedStepIndex: 2 })).not.toContain(
+      'failedStepIndex',
+    );
   });
 });
 
