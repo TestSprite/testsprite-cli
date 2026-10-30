@@ -404,6 +404,11 @@ testsprite test create --plan-template > plan.json
 testsprite test create --plan-from ./checkout.plan.json --dry-run --output json
 ```
 
+> **Windows PowerShell 5.1 note:** `>` in `powershell.exe` writes UTF-16LE with
+> a BOM. The CLI sniffs UTF-8 / UTF-16LE / UTF-16BE BOMs on input, so plan
+> files created this way work as-is; for other tools that expect UTF-8, write
+> `Out-File -Encoding utf8` or use `pwsh` instead.
+
 `--plan-from` owns the complete test definition and does not support this setting; a supplied `--step-timeout` is warned about and ignored. Set it later with `test update --step-timeout <ms>`.
 
 #### `testsprite test create-batch`
