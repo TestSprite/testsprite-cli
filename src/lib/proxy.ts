@@ -36,15 +36,25 @@ export function maybeInstallProxyAgent(deps: ProxyDeps = {}): boolean {
   );
   if (!hasProxy) return false;
   const install = deps.install ?? setGlobalDispatcher;
-  // EnvHttpProxyAgent reads HTTPS_PROXY/HTTP_PROXY/NO_PROXY itself, per
-  // request, so NO_PROXY exemptions apply without extra plumbing here.
+  // The proxy URLs are read here, in undici's own order (lower-case first;
+  // undici itself falls back from HTTPS to the HTTP proxy), so a `host:port`
+  // value can get the `http://` curl assumes; undici alone rejects it.
+  // NO_PROXY comes from the same env, and `''` stops undici from re-reading
+  // process.env, so the agent has one source. Matching NO_PROXY entries is
+  // left to undici.
   //
-  // A malformed or unsupported proxy value (e.g. `socks5://...`) makes the
-  // agent throw. Because this runs at startup, an unguarded throw would abort
-  // every command before the CLI's own error handling — so fall back to the
-  // default (proxy-less) dispatcher and warn instead of crashing.
+  // A malformed or unsupported proxy value (e.g. `socks5h://` or `ftp://`)
+  // makes the agent throw. Because this runs at startup, an unguarded throw
+  // would abort every command before the CLI's own error handling — so fall
+  // back to the default (proxy-less) dispatcher and warn instead of crashing.
   try {
-    install(new EnvHttpProxyAgent());
+    install(
+      new EnvHttpProxyAgent({
+        httpProxy: withScheme(env.http_proxy ?? env.HTTP_PROXY),
+        httpsProxy: withScheme(env.https_proxy ?? env.HTTPS_PROXY),
+        noProxy: env.no_proxy ?? env.NO_PROXY ?? '',
+      }),
+    );
     return true;
   } catch (error) {
     const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
@@ -55,6 +65,11 @@ export function maybeInstallProxyAgent(deps: ProxyDeps = {}): boolean {
     );
     return false;
   }
+}
+
+function withScheme(value: string | undefined): string {
+  if (!value) return '';
+  return /^[a-z][a-z\d+.-]*:\/\//i.test(value) ? value : `http://${value}`;
 }
 
 /**
