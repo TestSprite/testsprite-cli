@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Dispatcher } from 'undici';
 import { fetch } from 'undici';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { maybeInstallProxyAgent } from './proxy.js';
 
 // A local proxy that records each CONNECT target and refuses the tunnel, so a
@@ -76,12 +76,6 @@ describe('maybeInstallProxyAgent', () => {
 
   describe('proxy values written without a scheme', () => {
     const cleanups: Array<() => Promise<unknown>> = [];
-    beforeEach(() => {
-      // undici reads NO_PROXY from process.env; keep a developer's loopback
-      // exemption from bypassing the test proxy.
-      vi.stubEnv('NO_PROXY', '');
-      vi.stubEnv('no_proxy', '');
-    });
     afterEach(async () => {
       vi.unstubAllEnvs();
       await Promise.all(cleanups.splice(0).map(cleanup => cleanup()));
@@ -109,7 +103,7 @@ describe('maybeInstallProxyAgent', () => {
 
     it.each([
       ['HTTPS_PROXY', 'https://127.0.0.1:PORT/me'],
-      ['HTTP_PROXY', 'http://127.0.0.1:PORT/me'],
+      ['http_proxy', 'http://127.0.0.1:PORT/me'],
     ] as const)('routes through a host:port %s value as http://', async (name, target) => {
       const result = await routeThrough({ [name]: '127.0.0.1:PORT' }, target);
       expect(result.installed).toBe(true);
@@ -144,26 +138,38 @@ describe('maybeInstallProxyAgent', () => {
     });
 
     it('still lets NO_PROXY send a matching host direct', async () => {
-      vi.stubEnv('no_proxy', '127.0.0.1');
       const result = await routeThrough(
-        { HTTPS_PROXY: '127.0.0.1:PORT' },
+        { HTTPS_PROXY: '127.0.0.1:PORT', no_proxy: '127.0.0.1' },
         'https://127.0.0.1:PORT/me',
       );
       expect(result.installed).toBe(true);
       expect(result.seen).toEqual([]);
     });
 
-    it('still warns and falls back on an unsupported scheme', () => {
-      const errs: string[] = [];
-      const install = vi.fn();
-      const installed = maybeInstallProxyAgent({
-        env: { HTTPS_PROXY: 'ftp://127.0.0.1:2121' },
-        install,
-        stderr: line => errs.push(line),
-      });
-      expect(installed).toBe(false);
-      expect(install).not.toHaveBeenCalled();
-      expect(errs.join('\n')).toContain('ignoring proxy environment');
+    it('reads NO_PROXY from the same env as the proxy, not process.env', async () => {
+      vi.stubEnv('no_proxy', '127.0.0.1');
+      vi.stubEnv('NO_PROXY', '127.0.0.1');
+      const result = await routeThrough(
+        { HTTPS_PROXY: '127.0.0.1:PORT' },
+        'https://127.0.0.1:PORT/me',
+      );
+      expect(result.seen).toEqual([result.tunnel]);
     });
+
+    it.each(['socks5h://127.0.0.1:1080', 'ftp://127.0.0.1:2121'])(
+      'still warns and falls back on an unsupported scheme (%s)',
+      value => {
+        const errs: string[] = [];
+        const install = vi.fn();
+        const installed = maybeInstallProxyAgent({
+          env: { HTTPS_PROXY: value },
+          install,
+          stderr: line => errs.push(line),
+        });
+        expect(installed).toBe(false);
+        expect(install).not.toHaveBeenCalled();
+        expect(errs.join('\n')).toContain('ignoring proxy environment');
+      },
+    );
   });
 });

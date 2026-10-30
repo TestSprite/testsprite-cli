@@ -37,20 +37,22 @@ export function maybeInstallProxyAgent(deps: ProxyDeps = {}): boolean {
   if (!hasProxy) return false;
   const install = deps.install ?? setGlobalDispatcher;
   // The proxy URLs are read here, in undici's own order (lower-case first;
-  // HTTPS falls back to the HTTP proxy), so a `host:port` value can get the
-  // `http://` curl assumes; undici alone rejects it. `''` stops undici from
-  // re-reading process.env. EnvHttpProxyAgent still reads NO_PROXY itself,
-  // per request, so exemptions apply without extra plumbing here.
+  // undici itself falls back from HTTPS to the HTTP proxy), so a `host:port`
+  // value can get the `http://` curl assumes; undici alone rejects it.
+  // NO_PROXY comes from the same env, and `''` stops undici from re-reading
+  // process.env, so the agent has one source. Matching NO_PROXY entries is
+  // left to undici.
   //
-  // A malformed or unsupported proxy value (e.g. `ftp://...`) makes the
-  // agent throw. Because this runs at startup, an unguarded throw would abort
-  // every command before the CLI's own error handling — so fall back to the
-  // default (proxy-less) dispatcher and warn instead of crashing.
+  // A malformed or unsupported proxy value (e.g. `socks5h://` or `ftp://`)
+  // makes the agent throw. Because this runs at startup, an unguarded throw
+  // would abort every command before the CLI's own error handling — so fall
+  // back to the default (proxy-less) dispatcher and warn instead of crashing.
   try {
     install(
       new EnvHttpProxyAgent({
         httpProxy: withScheme(env.http_proxy ?? env.HTTP_PROXY),
         httpsProxy: withScheme(env.https_proxy ?? env.HTTPS_PROXY),
+        noProxy: env.no_proxy ?? env.NO_PROXY ?? '',
       }),
     );
     return true;

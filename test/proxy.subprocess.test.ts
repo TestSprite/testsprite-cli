@@ -81,7 +81,9 @@ beforeAll(async () => {
 afterAll(async () => {
   for (const socket of sockets) socket.destroy();
   await Promise.all(
-    [api, proxy].map(server => new Promise(resolveClose => server?.close(resolveClose))),
+    [api, proxy].map(server =>
+      server ? new Promise(resolveClose => server.close(resolveClose)) : undefined,
+    ),
   );
   if (tmpHome) rmSync(tmpHome, { recursive: true, force: true });
 });
@@ -91,7 +93,7 @@ function runCli(
   envOverrides: Record<string, string>,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   return new Promise((resolveResult, rejectResult) => {
-    const child = spawn('node', [BIN_PATH, ...args], {
+    const child = spawn(process.execPath, [BIN_PATH, ...args], {
       cwd: REPO_ROOT,
       env: {
         ...process.env,
@@ -120,7 +122,6 @@ function runCli(
 
 describe('proxy variables without a scheme (built CLI)', () => {
   it('sends auth status through a host:port proxy and exits 0', async () => {
-    tunnels.length = 0;
     const result = await runCli(['auth', 'status', '--output', 'json'], {
       TESTSPRITE_API_KEY: 'sk-user-proxy',
       TESTSPRITE_API_URL: unreachableApiUrl,
