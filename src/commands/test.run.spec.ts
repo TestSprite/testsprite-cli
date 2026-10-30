@@ -7204,11 +7204,11 @@ describe('runTestRun — --target-url reachability preflight wiring', () => {
 });
 
 describe('run card: failed step (#672)', () => {
-  it('prints failedStepIndex under failureKind for a failed run, numbered as `test result` prints it', () => {
-    const lines = renderRunResponseText(makeFailedRun()).split('\n');
+  it('prints failedStepIndex right after failureKind for a failed run', () => {
+    const lines = renderRunResponseText({ ...makeFailedRun(), failedStepIndex: 4 }).split('\n');
     const kind = lines.indexOf('failureKind assertion');
     expect(kind).toBeGreaterThanOrEqual(0);
-    expect(lines[kind + 1]).toBe('failedStepIndex 2');
+    expect(lines[kind + 1]).toBe('failedStepIndex 4');
   });
 
   it('prints it for a blocked run too', () => {
@@ -7216,10 +7216,13 @@ describe('run card: failed step (#672)', () => {
     expect(text.split('\n')).toContain('failedStepIndex 2');
   });
 
-  it('omits the line when the server reported no failed step, or the run passed', () => {
+  it('omits the line when the server reported no failed step', () => {
     expect(renderRunResponseText({ ...makeFailedRun(), failedStepIndex: null })).not.toContain(
       'failedStepIndex',
     );
+  });
+
+  it('omits the line for a passed run', () => {
     expect(renderRunResponseText({ ...makePassedRun(), failedStepIndex: 2 })).not.toContain(
       'failedStepIndex',
     );
@@ -7279,39 +7282,6 @@ describe('gh-output integration on single-test run --wait (Gap A)', () => {
     expect(stdoutLines.some(line => line.startsWith('::error') && line.includes('test_xyz'))).toBe(
       true,
     );
-  });
-
-  it('the text card and the annotation both name the failed step', async () => {
-    const { credentialsPath, fetchImpl } = singleRunHarness({
-      ...makeFailedRun(),
-      error: 'Expected heading to be visible',
-    });
-    const stdoutLines: string[] = [];
-    const err = await runTestRun(
-      {
-        profile: 'default',
-        output: 'text',
-        debug: false,
-        dryRun: false,
-        testId: 'test_xyz',
-        wait: true,
-        timeoutSeconds: 60,
-        ghOutput: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: () => undefined,
-        env: {} as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toMatchObject({ exitCode: 1 });
-    expect(stdoutLines.join('\n').split('\n')).toContain('failedStepIndex 2');
-    const annotations = stdoutLines.filter(line => line.startsWith('::error'));
-    expect(annotations).toHaveLength(1);
-    expect(annotations[0]).toContain('::status=failed Expected heading to be visible (step 2)');
   });
 
   it('under Actions with --output json: stdout stays parseable JSON, ::error:: goes to stderr', async () => {

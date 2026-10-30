@@ -34,7 +34,6 @@ export interface CiRunRow {
   /** This run's execution-result page link — anchors the Run column. */
   executionUrl?: string;
   error?: string;
-  failedStepIndex?: number;
 }
 
 export interface CiSummary {
@@ -242,7 +241,6 @@ export function summarizeSingleRun(run: {
   dashboardUrl?: string | null;
   executionUrl?: string | null;
   error?: string | null;
-  failedStepIndex?: number | null;
 }): CiSummary {
   const row: CiRunRow = {
     testId: String(run.testId ?? ''),
@@ -252,10 +250,6 @@ export function summarizeSingleRun(run: {
     ...(typeof run.dashboardUrl === 'string' ? { dashboardUrl: run.dashboardUrl } : {}),
     ...(typeof run.executionUrl === 'string' ? { executionUrl: run.executionUrl } : {}),
     ...(typeof run.error === 'string' && run.error.length > 0 ? { error: run.error } : {}),
-    ...((run.status === 'failed' || run.status === 'blocked') &&
-    typeof run.failedStepIndex === 'number'
-      ? { failedStepIndex: run.failedStepIndex }
-      : {}),
   };
   const passed = row.status === 'passed' ? 1 : 0;
   const timedOut = row.status === 'timeout' ? 1 : 0;
@@ -414,7 +408,6 @@ export function emitGithubOutputs(
     for (const row of summary.runs) {
       if (row.status === 'passed') continue;
       const detail = row.error !== undefined ? ` ${row.error}` : '';
-      const step = row.failedStepIndex !== undefined ? ` (step ${row.failedStepIndex})` : '';
       // Prefer this run's result page over the test-case page — on a failure the
       // result is what the reviewer wants to open. Falls back to the test-case
       // link (V2 runs, which have no execution page), then to nothing.
@@ -423,7 +416,7 @@ export function emitGithubOutputs(
       // Escape both halves: a raw multiline run error (or a testId) must not be
       // able to smuggle a second workflow command into the Actions stream.
       const title = `TestSprite ${escapeCommandProperty(row.title?.trim() || row.testId)}`;
-      const message = escapeCommandData(`status=${row.status}${detail}${step}${link}`);
+      const message = escapeCommandData(`status=${row.status}${detail}${link}`);
       // Severity mirrors the summary counters: never-dispatched rows are
       // warnings (they may not even gate the exit), real failures are errors.
       const severity = NON_DISPATCHED_STATUSES.has(row.status) ? 'warning' : 'error';
