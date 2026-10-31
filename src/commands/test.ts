@@ -16847,17 +16847,16 @@ function renderStepsText(page: Page<CliTestStep>): string {
   const statusWidth = 6; // "passed" / "failed" / "—"
   const descWidth = Math.max(11, ...page.items.map(s => descOf(s).length));
 
-  const header =
-    pad('  ', 2) +
-    pad('INDEX', indexWidth) +
-    '  ' +
-    pad('ACTION', actionWidth) +
-    '  ' +
-    pad('STATUS', statusWidth) +
-    '  ' +
-    pad('DESCRIPTION', descWidth) +
-    '  ' +
-    'UPDATED';
+  // Joined exactly like the rows below (marker column included), so every
+  // header lines up over its values.
+  const header = [
+    '  ',
+    pad('INDEX', indexWidth),
+    pad('ACTION', actionWidth),
+    pad('STATUS', statusWidth),
+    pad('DESCRIPTION', descWidth),
+    'UPDATED',
+  ].join('  ');
 
   const rows = page.items.flatMap(s => {
     const marker = s.outcomeContributesToFailure === true ? '* ' : '  ';
