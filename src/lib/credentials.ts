@@ -13,6 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { localValidationError } from './errors.js';
+import { readTextFileBomAware } from './text-file.js';
 
 export const DEFAULT_PROFILE = 'default';
 
@@ -193,7 +194,9 @@ export function serializeCredentials(file: CredentialsFile): string {
 export function readCredentialsFile(options: CredentialsOptions = {}): CredentialsFile {
   const path = resolvePath(options);
   if (!existsSync(path)) return {};
-  return parseCredentials(readFileSync(path, 'utf-8'));
+  // Shared BOM sniff (UTF-8, UTF-16LE, UTF-16BE). Writes stay UTF-8 with no BOM,
+  // so a UTF-16 file is normalised on the next save. The parser is unchanged.
+  return parseCredentials(readTextFileBomAware(path));
 }
 
 export function readProfile(

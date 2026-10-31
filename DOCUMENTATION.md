@@ -1319,7 +1319,7 @@ Every check reuses the same helpers the real commands use, so the report reflect
 
 ### Profiles & credentials
 
-Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, the `TESTSPRITE_API_KEY` / `TESTSPRITE_API_URL` env vars override the file, so CI can run without ever touching `~/.testsprite/credentials`.
+Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. When resaving this file from Windows PowerShell 5.1, follow the `Out-File -Encoding utf8` note under [`test create`](#testsprite-test-create). **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, the `TESTSPRITE_API_KEY` / `TESTSPRITE_API_URL` env vars override the file, so CI can run without ever touching `~/.testsprite/credentials`.
 
 ### Global flags
 
