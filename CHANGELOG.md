@@ -4,6 +4,10 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **`init` / `setup --skip-if-configured`: a saved key that no longer authenticates no longer reports success.** The saved-profile fast path skipped `GET /me` validation on the promise that the identity lookup in `runInit` would surface an expired key, but that lookup swallowed every error and printed a placeholder identity — a revoked key ended with `status: "initialized"`, exit 0, and the first real command failed later with a less obvious error. On the profile fast path, an auth failure (401/403) from the identity lookup now rethrows with the server's original message and next action (exit 3), and no summary is printed; exactly one `/me` call still happens on the path. Non-auth lookup failures keep the display-only placeholder, and the fresh-key path is unchanged. (#698)
+
 ## [0.15.0] - 2026-10-17
 
 ### Added

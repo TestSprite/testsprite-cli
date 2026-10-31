@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError, isAuthCode } from '../lib/errors.js';
 import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import { readProfile, writeProfile } from '../lib/credentials.js';
 import type { MeResponse } from './auth.js';
@@ -2054,8 +2054,9 @@ describe('runInit -- skipIfConfigured', () => {
   it('skips the API key prompt and reuses saved credentials when the profile exists', async () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs } = makeMemFs();
-    // Write a saved key before running setup.
-    writeProfile('default', { apiKey: 'sk-saved' }, { path: credentialsPath });
+    // Write a saved key before running setup. The key must be valid-format
+    // (sk-user-*) so runWhoami actually reaches GET /me with it.
+    writeProfile('default', { apiKey: 'sk-user-saved' }, { path: credentialsPath });
     // Provide a mock fetch that accepts /me so runWhoami (identity banner) succeeds.
     const fetchMock = makeOkFetch();
     const prompt = { secret: vi.fn(async () => 'sk-should-never-be-asked') };
@@ -2072,10 +2073,121 @@ describe('runInit -- skipIfConfigured', () => {
     // The prompt must never have fired.
     expect(prompt.secret).not.toHaveBeenCalled();
     // The saved key must be untouched.
-    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-saved');
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-saved');
+    // Exactly one /me call on this path: configure skipped, whoami ran.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     // The summary must still be emitted.
     const parsed = JSON.parse(captured.stdout.join('')) as { status: string };
     expect(parsed.status).toBe('initialized');
+  });
+
+  it('fails with the original auth error when a saved profile key is rejected (401)', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    // A saved key that the server no longer accepts (revoked / scopes lost).
+    writeProfile('default', { apiKey: 'sk-user-saved' }, { path: credentialsPath });
+    const prompt = { secret: vi.fn(async () => 'sk-should-never-be-asked') };
+
+    let thrown: unknown;
+    try {
+      await runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
+        ...deps,
+        credentialsPath,
+        fetchImpl: makeAuthFailFetch(),
+        fs: agentFs,
+        isTTY: false,
+        prompt,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    // The auth error propagates with the server's original message and
+    // nextAction, and its code maps to exit 3.
+    expect(thrown).toBeInstanceOf(ApiError);
+    const apiErr = thrown as ApiError;
+    expect(apiErr.code).toBe('AUTH_INVALID');
+    expect(apiErr.message).toBe('Invalid API key');
+    expect(apiErr.nextAction).toBe('Provide a valid key.');
+    expect(isAuthCode(apiErr.code)).toBe(true);
+    // The prompt must never have fired.
+    expect(prompt.secret).not.toHaveBeenCalled();
+    // No success summary — the throw unwinds before it prints.
+    expect(captured.stdout.join('')).not.toContain('initialized');
+  });
+
+  it('fails with the original auth error on 403 for a saved profile key', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    writeProfile('default', { apiKey: 'sk-user-saved' }, { path: credentialsPath });
+    const forbiddenFetch = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 'AUTH_FORBIDDEN',
+              message: 'Key lacks the required scopes.',
+              nextAction: 'Rotate the key with `testsprite setup`.',
+              requestId: 'r-2',
+            },
+          }),
+          { status: 403, headers: { 'content-type': 'application/json' } },
+        ),
+    ) as unknown as InitDeps['fetchImpl'];
+    const prompt = { secret: vi.fn(async () => 'sk-should-never-be-asked') };
+
+    await expect(
+      runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
+        ...deps,
+        credentialsPath,
+        fetchImpl: forbiddenFetch,
+        fs: agentFs,
+        isTTY: false,
+        prompt,
+      }),
+    ).rejects.toThrow('Key lacks the required scopes.');
+    expect(captured.stdout.join('')).not.toContain('initialized');
+  });
+
+  it('keeps the display-only fallback for a fresh key when the identity lookup fails', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    // Fresh key: configure validates it (200), then the whoami lookup fails
+    // (401). The fresh-key path keeps today's fallback — summary still prints.
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(ME), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 'AUTH_INVALID',
+              message: 'Invalid API key',
+              nextAction: 'Provide a valid key.',
+              requestId: 'r-3',
+            },
+          }),
+          { status: 401, headers: { 'content-type': 'application/json' } },
+        ),
+      ) as unknown as InitDeps['fetchImpl'];
+    const prompt = { secret: vi.fn(async () => 'sk-user-fresh') };
+
+    await runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'text' }), {
+      ...deps,
+      credentialsPath,
+      fetchImpl: fetchMock,
+      fs: agentFs,
+      isTTY: true,
+      prompt,
+    });
+
+    // The fallback placeholder identity is in the summary; no throw.
+    expect(captured.stdout.join('')).toContain('initialized');
   });
 
   it('proceeds to prompt when skipIfConfigured is true but no credentials exist', async () => {

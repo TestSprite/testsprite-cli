@@ -19,7 +19,7 @@ import {
 } from '../lib/client-factory.js';
 import { normalizeEnvVar, resolveProfileName } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
-import { CLIError, InterruptError, localValidationError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError, isAuthCode, localValidationError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import type { AuthDeps, ConfigureResult, MeResponse } from './auth.js';
 import { missingApiKeyError, runConfigure, runWhoami } from './auth.js';
@@ -558,6 +558,21 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     me = await runWhoami(opts, whoamiDeps);
   } catch (err) {
     if (err instanceof InterruptError) throw err;
+    // The saved-profile fast path skipped GET /me validation in runConfigure
+    // on the promise that this lookup would surface a dead key. When it
+    // fails with an auth error (401/403), the saved key cannot authenticate:
+    // rethrow with the server's original message and nextAction so the CLI
+    // exits 3 instead of printing a successful summary. Still exactly one
+    // /me call on this path — the rethrow adds none. Non-auth lookup
+    // failures and the fresh-key path (validated by configure above) keep
+    // the display-only fallback below.
+    if (
+      configured.source === 'profile' &&
+      err instanceof ApiError &&
+      isAuthCode(err.code)
+    ) {
+      throw err;
+    }
     // Whoami is display-only. If it fails after a successful configure,
     // continue with a minimal placeholder so the summary still prints.
     if (opts.debug) {
