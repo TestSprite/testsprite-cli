@@ -7856,7 +7856,7 @@ async function verifyInFlightRunEnvironment(
   if (currentEnvironment.id !== inFlightEnvironment.id) {
     throw incompatibleRun('its environment does not match the requested environment');
   }
-  return `--env ${currentEnvironment.name}`;
+  return `--env ${quoteEnvironmentName(currentEnvironment.name)}`;
 }
 
 export async function runTestRun(

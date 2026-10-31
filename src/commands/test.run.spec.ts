@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { quoteEnvironmentName } from '../lib/environment-tunnel.js';
 import { ApiError, CLIError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
@@ -2124,6 +2125,8 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
     { name: 'local-http', url: 'http://127.0.0.1:80' },
     { name: 'local-ipv6', url: 'http://[::1]:5173' },
     { name: 'local-https', url: 'https://localhost:8443' },
+    { name: 'QA West', url: 'https://qa-west.example.com' },
+    { name: "Owner's QA", url: 'https://owners-qa.example.com' },
   ])('auto-resume advice uses the resolved $name environment', async ({ name, url }) => {
     // Finding D (codex round-2): when --target-url is not supplied, the CLI now
     // fetches GET /runs/{currentRunId} to bind the REAL targetUrl to the
@@ -2200,7 +2203,7 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
     const advisory = stderrLines.join(' ');
     expect(advisory).toContain('run_default_target');
     expect(advisory).toContain(url);
-    expect(advisory).toContain(`testsprite test run test_xyz --env ${name}`);
+    expect(advisory).toContain(`testsprite test run test_xyz --env ${quoteEnvironmentName(name)}`);
     expect(advisory).not.toContain('--local');
     expect(advisory).not.toContain('--target-url');
   });
