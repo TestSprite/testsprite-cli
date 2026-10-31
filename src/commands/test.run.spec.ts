@@ -16,7 +16,7 @@ import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-facto
 import type { FetchImpl } from '../lib/http.js';
 import type { RunResponse, TriggerRunResponse, BatchRunFreshResponse } from '../lib/runs.types.js';
 import { takeTelemetryExtras } from '../lib/telemetry.js';
-import { runTestRun, runTestRunAll } from './test.js';
+import { renderRunResponseText, runTestRun, runTestRunAll } from './test.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -7481,14 +7481,33 @@ describe('early run receipt', () => {
   );
 
   it.each([
-    { links: {}, expected: undefined },
+    { links: {}, dashboard: undefined, execution: undefined },
+    {
+      links: { dashboardUrl: 'https://www.testsprite.com/dashboard/tests/test_xyz' },
+      dashboard: 'https://www.testsprite.com/dashboard/tests/test_xyz',
+      execution: undefined,
+    },
     {
       links: { executionUrl: 'https://www.testsprite.com/executions/run_abc' },
-      expected: 'https://www.testsprite.com/executions/run_abc',
+      dashboard: undefined,
+      execution: 'https://www.testsprite.com/executions/run_abc',
+    },
+    {
+      links: {
+        dashboardUrl: 'https://www.testsprite.com/dashboard/tests/test_xyz',
+        executionUrl: 'https://www.testsprite.com/executions/run_abc',
+      },
+      dashboard: 'https://www.testsprite.com/dashboard/tests/test_xyz',
+      execution: 'https://www.testsprite.com/executions/run_abc',
+    },
+    {
+      links: { executionUrl: '' },
+      dashboard: undefined,
+      execution: undefined,
     },
   ])(
-    'prints a no-wait receipt using only available server links ($expected)',
-    async ({ links, expected }) => {
+    'prints a no-wait receipt using only available server links (dashboard=$dashboard execution=$execution)',
+    async ({ links, dashboard, execution }) => {
       const stderr: string[] = [];
       const stdout: string[] = [];
       const response = { ...TRIGGER_RESP, ...links };
@@ -7510,11 +7529,108 @@ describe('early run receipt', () => {
       );
       expect(stderr).toContain('Run run_abc');
       expect(stderr.filter(line => line.startsWith('Dashboard:'))).toEqual(
-        expected ? [`Dashboard: ${expected}`] : [],
+        dashboard ? [`Dashboard: ${dashboard}`] : [],
+      );
+      expect(stderr.filter(line => line.startsWith('Execution:'))).toEqual(
+        execution ? [`Execution: ${execution}`] : [],
       );
       expect(stdout).toEqual([JSON.stringify(response, null, 2)]);
     },
   );
+});
+
+const DASHBOARD_LINK = 'https://www.testsprite.com/dashboard/tests/test_xyz';
+const EXECUTION_LINK = 'https://www.testsprite.com/executions/run_abc';
+
+describe('run text links keep the execution page off the dashboard label', () => {
+  it.each([
+    {
+      name: 'both urls',
+      links: { dashboardUrl: DASHBOARD_LINK, executionUrl: EXECUTION_LINK },
+      dashboard: DASHBOARD_LINK,
+      execution: EXECUTION_LINK,
+    },
+    {
+      name: 'dashboard only',
+      links: { dashboardUrl: DASHBOARD_LINK },
+      dashboard: DASHBOARD_LINK,
+      execution: undefined,
+    },
+    {
+      name: 'execution only',
+      links: { executionUrl: EXECUTION_LINK },
+      dashboard: undefined,
+      execution: EXECUTION_LINK,
+    },
+    {
+      name: 'execution empty',
+      links: { executionUrl: '' },
+      dashboard: undefined,
+      execution: undefined,
+    },
+  ])('no-wait text card and receipt ($name)', async ({ links, dashboard, execution }) => {
+    const stderr: string[] = [];
+    const stdout: string[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 600,
+      },
+      {
+        ...makeCreds(),
+        stdout: line => stdout.push(line),
+        stderr: line => stderr.push(line),
+        fetchImpl: makeFetch(() => ({ body: { ...TRIGGER_RESP, ...links } })),
+      },
+    );
+    const card = stdout.join('\n');
+    expect(card.includes(`dashboard   ${DASHBOARD_LINK}`)).toBe(dashboard !== undefined);
+    expect(card.includes(`execution   ${EXECUTION_LINK}`)).toBe(execution !== undefined);
+    expect(card).not.toContain('Dashboard:');
+    expect(card).not.toContain('Execution:');
+    expect(stderr.filter(line => line.startsWith('Dashboard:'))).toEqual(
+      dashboard ? [`Dashboard: ${dashboard}`] : [],
+    );
+    expect(stderr.filter(line => line.startsWith('Execution:'))).toEqual(
+      execution ? [`Execution: ${execution}`] : [],
+    );
+  });
+
+  it.each([
+    {
+      name: 'both urls',
+      run: { dashboardUrl: DASHBOARD_LINK, executionUrl: EXECUTION_LINK },
+      dashboard: true,
+      execution: true,
+    },
+    {
+      name: 'dashboard only',
+      run: { dashboardUrl: DASHBOARD_LINK },
+      dashboard: true,
+      execution: false,
+    },
+    {
+      name: 'execution only',
+      run: { executionUrl: EXECUTION_LINK },
+      dashboard: false,
+      execution: true,
+    },
+    {
+      name: 'execution null',
+      run: { executionUrl: null },
+      dashboard: false,
+      execution: false,
+    },
+  ])('finished run card ($name)', ({ run, dashboard, execution }) => {
+    const text = renderRunResponseText({ ...makePassedRun(), ...run });
+    expect(text.includes(`dashboard   ${DASHBOARD_LINK}`)).toBe(dashboard);
+    expect(text.includes(`execution   ${EXECUTION_LINK}`)).toBe(execution);
+    if (execution) expect(text).not.toContain(`dashboard   ${EXECUTION_LINK}`);
+  });
 });
 
 // ---------------------------------------------------------------------------

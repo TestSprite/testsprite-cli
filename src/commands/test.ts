@@ -7596,9 +7596,12 @@ export function renderRunResponseText(
   if (run.replay?.path === 'refused') {
     lines.push(`replay      refused${run.replay.reason ? ` (${run.replay.reason})` : ''}`);
   }
-  // Closing pointer: where to inspect this run in the Portal (video, steps,
-  // screenshots). Present only when withRunDashboardUrl could resolve it.
+  // The test-case page (`dashboard`) and this run's result page (`execution`)
+  // are different links. Print each only when the server sent a non-empty
+  // string. A null or absent `executionUrl` means this run has no execution
+  // page — do not invent one, and never label an execution URL as the dashboard.
   if (run.dashboardUrl) lines.push(`dashboard   ${run.dashboardUrl}`);
+  if (run.executionUrl) lines.push(`execution   ${run.executionUrl}`);
   return lines.join('\n');
 }
 
@@ -7647,10 +7650,12 @@ function renderTriggerRunText(r: TriggerRunResponse): string {
   if (r.codeVersion !== null) lines.push(`codeVersion ${r.codeVersion}`);
   if (r.environment) lines.push(`environment ${describeEnvironmentLine(r)}`);
   if (r.targetUrl !== null) lines.push(`targetUrl   ${r.targetUrl}`);
-  // Same line the run card prints after `--wait` (`renderRunResponseText`), so a
+  // Same lines the run card prints after `--wait` (`renderRunResponseText`), so a
   // bare `test run <id>` shows where to look without a second command. Only
-  // when the server sent one — absent means it had no correct link to give.
+  // when the server sent one — absent or empty means it had no correct link
+  // to give, and an execution URL is never labeled as the dashboard.
   if (r.dashboardUrl) lines.push(`dashboard   ${r.dashboardUrl}`);
+  if (r.executionUrl) lines.push(`execution   ${r.executionUrl}`);
   return lines.join('\n');
 }
 
@@ -8305,8 +8310,10 @@ export async function runTestRun(
     }
 
     stderrFn(`Run ${triggerResponse.runId}`);
-    const receiptUrl = triggerResponse.dashboardUrl ?? triggerResponse.executionUrl;
-    if (receiptUrl) stderrFn(`Dashboard: ${receiptUrl}`);
+    // The test-case link and this run's result page are different URLs.
+    // Never fold a missing dashboard link onto the execution URL.
+    if (triggerResponse.dashboardUrl) stderrFn(`Dashboard: ${triggerResponse.dashboardUrl}`);
+    if (triggerResponse.executionUrl) stderrFn(`Execution: ${triggerResponse.executionUrl}`);
 
     // Response-driven, not assumption-driven: the backend is the ground
     // truth for whether --target-url was actually applied — V3
