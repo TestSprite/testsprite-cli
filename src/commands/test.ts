@@ -9653,6 +9653,9 @@ interface CliBatchRunFreshResult {
   /** Poll-observed run timing → JUnit `testcase time`. Absent on timeout/error. */
   startedAt?: string | null;
   finishedAt?: string | null;
+  /** Terminal poll diagnostics; absent on passing rows. */
+  failureKind?: string | null;
+  failedStepIndex?: number | null;
 }
 
 /**
@@ -10981,6 +10984,43 @@ export async function runTestRunAll(
   // the documented `--timeout` ceiling.
   // NOTE: batchDeadlineMs is set in the D3 deferred-retry loop above and reused here.
 
+  function freshPollFailureFields(finalRun: RunResponse): Partial<CliBatchRunFreshResult> {
+    if (finalRun.status === 'passed') return {};
+    const synthesizedMessage =
+      (finalRun.status === 'failed' || finalRun.status === 'blocked') &&
+      (finalRun.failureKind !== null || finalRun.failedStepIndex !== null)
+        ? [
+            finalRun.failureKind ? `failureKind: ${finalRun.failureKind}` : undefined,
+            finalRun.failedStepIndex !== null
+              ? `failedStepIndex: ${finalRun.failedStepIndex}`
+              : undefined,
+          ]
+            .filter(Boolean)
+            .join(', ')
+        : undefined;
+    // Same first-line ≤200 cap as renderRunResponseText. Append diagnostics
+    // after the cap so a long raw error cannot drop them.
+    const rawLine =
+      finalRun.error && finalRun.error.trim().length > 0
+        ? (finalRun.error.split('\n')[0] ?? finalRun.error)
+        : undefined;
+    const rawCapped =
+      rawLine === undefined
+        ? undefined
+        : rawLine.length > 200
+          ? `${rawLine.slice(0, 200)}…`
+          : rawLine;
+    const errorMessage =
+      rawCapped && synthesizedMessage
+        ? `${rawCapped} (${synthesizedMessage})`
+        : rawCapped || synthesizedMessage;
+    return {
+      failureKind: finalRun.failureKind,
+      failedStepIndex: finalRun.failedStepIndex,
+      ...(errorMessage ? { error: { code: 'INTERNAL', message: errorMessage, exitCode: 1 } } : {}),
+    };
+  }
+
   async function pollFreshAccepted(entry: BatchRunFreshAccepted): Promise<CliBatchRunFreshResult> {
     const runId = entry.runId;
     const remainingMs = batchDeadlineMs - Date.now();
@@ -11023,9 +11063,7 @@ export async function runTestRunAll(
           ...(typeof finalRun.executionUrl === 'string'
             ? { executionUrl: finalRun.executionUrl }
             : {}),
-          ...(opts.ci && finalRun.error
-            ? { error: { code: 'INTERNAL', message: finalRun.error, exitCode: 1 } }
-            : {}),
+          ...freshPollFailureFields(finalRun),
         };
       } catch (err) {
         if (err instanceof InterruptError) throw err;
@@ -11085,9 +11123,7 @@ export async function runTestRunAll(
         ...(typeof finalRun.executionUrl === 'string'
           ? { executionUrl: finalRun.executionUrl }
           : {}),
-        ...(opts.ci && finalRun.error
-          ? { error: { code: 'INTERNAL', message: finalRun.error, exitCode: 1 } }
-          : {}),
+        ...freshPollFailureFields(finalRun),
         startedAt: finalRun.startedAt,
         finishedAt: finalRun.finishedAt,
       };
