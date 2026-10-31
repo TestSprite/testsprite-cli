@@ -4,6 +4,10 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **A UTF-16 credentials file is read, and the next save no longer deletes the key.** PowerShell 5.1 `>` / `Out-File`, and Notepad's "Unicode" / "Unicode big endian", resave `~/.testsprite/credentials` as UTF-16 with a BOM. Read as UTF-8, that file parsed as empty, so `doctor` reported no API key and the next `setup` or `auth` write replaced every saved profile. The shared BOM reader decodes it, and the next save writes UTF-8 without a BOM.
+
 ## [0.15.0] - 2026-10-17
 
 ### Added

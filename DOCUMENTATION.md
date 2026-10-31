@@ -404,6 +404,11 @@ testsprite test create --plan-template > plan.json
 testsprite test create --plan-from ./checkout.plan.json --dry-run --output json
 ```
 
+> **Windows PowerShell 5.1 note:** `>` in `powershell.exe` writes UTF-16LE with
+> a BOM. The CLI sniffs UTF-8 / UTF-16LE / UTF-16BE BOMs on input, so plan
+> files created this way work as-is; for other tools that expect UTF-8, write
+> `Out-File -Encoding utf8` or use `pwsh` instead.
+
 `--plan-from` owns the complete test definition and does not support this setting; a supplied `--step-timeout` is warned about and ignored. Set it later with `test update --step-timeout <ms>`.
 
 #### `testsprite test create-batch`
@@ -1314,7 +1319,7 @@ Every check reuses the same helpers the real commands use, so the report reflect
 
 ### Profiles & credentials
 
-Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, the `TESTSPRITE_API_KEY` / `TESTSPRITE_API_URL` env vars override the file, so CI can run without ever touching `~/.testsprite/credentials`.
+Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. When resaving this file from Windows PowerShell 5.1, follow the `Out-File -Encoding utf8` note under [`test create`](#testsprite-test-create). **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, the `TESTSPRITE_API_KEY` / `TESTSPRITE_API_URL` env vars override the file, so CI can run without ever touching `~/.testsprite/credentials`.
 
 ### Global flags
 
