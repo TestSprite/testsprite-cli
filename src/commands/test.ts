@@ -10998,7 +10998,22 @@ export async function runTestRunAll(
             .filter(Boolean)
             .join(', ')
         : undefined;
-    const errorMessage = finalRun.error || synthesizedMessage;
+    // Same first-line ≤200 cap as renderRunResponseText. Append diagnostics
+    // after the cap so a long raw error cannot drop them.
+    const rawLine =
+      finalRun.error && finalRun.error.trim().length > 0
+        ? (finalRun.error.split('\n')[0] ?? finalRun.error)
+        : undefined;
+    const rawCapped =
+      rawLine === undefined
+        ? undefined
+        : rawLine.length > 200
+          ? `${rawLine.slice(0, 200)}…`
+          : rawLine;
+    const errorMessage =
+      rawCapped && synthesizedMessage
+        ? `${rawCapped} (${synthesizedMessage})`
+        : rawCapped || synthesizedMessage;
     return {
       failureKind: finalRun.failureKind,
       failedStepIndex: finalRun.failedStepIndex,

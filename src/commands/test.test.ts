@@ -13116,7 +13116,11 @@ describe('test run --all --wait — pollFreshAccepted failure diagnostics (#448)
       status: 'failed',
       failureKind: 'assertion',
       failedStepIndex: 2,
-      error: { code: 'INTERNAL', message: 'button not visible', exitCode: 1 },
+      error: {
+        code: 'INTERNAL',
+        message: 'button not visible (failureKind: assertion, failedStepIndex: 2)',
+        exitCode: 1,
+      },
     });
   });
 
@@ -13133,7 +13137,11 @@ describe('test run --all --wait — pollFreshAccepted failure diagnostics (#448)
       status: 'failed',
       failureKind: 'timeout',
       failedStepIndex: 4,
-      error: { code: 'INTERNAL', message: 'step timed out', exitCode: 1 },
+      error: {
+        code: 'INTERNAL',
+        message: 'step timed out (failureKind: timeout, failedStepIndex: 4)',
+        exitCode: 1,
+      },
     });
   });
 
@@ -13154,6 +13162,24 @@ describe('test run --all --wait — pollFreshAccepted failure diagnostics (#448)
     const row = payload.accepted[0]!;
     expect(row.status).toBe('passed');
     expect(row).not.toHaveProperty('error');
+  });
+
+  it('caps a long raw error at 200 chars, then appends failureKind and failedStepIndex', async () => {
+    const payload = await runAllWait(
+      60,
+      terminalRunBody('failed', {
+        failureKind: 'assertion',
+        failedStepIndex: 2,
+        error: `${'x'.repeat(250)}\nstack line must not surface`,
+      }),
+    );
+    expect(payload.accepted[0]).toMatchObject({
+      error: {
+        code: 'INTERNAL',
+        message: `${'x'.repeat(200)}… (failureKind: assertion, failedStepIndex: 2)`,
+        exitCode: 1,
+      },
+    });
   });
 
   it('failed/blocked rows synthesize error from failureKind and failedStepIndex when raw error is absent', async () => {
