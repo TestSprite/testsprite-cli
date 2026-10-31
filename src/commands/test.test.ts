@@ -13155,6 +13155,45 @@ describe('test run --all --wait — pollFreshAccepted failure diagnostics (#448)
     expect(row.status).toBe('passed');
     expect(row).not.toHaveProperty('error');
   });
+
+  it('failed/blocked rows synthesize error from failureKind and failedStepIndex when raw error is absent', async () => {
+    const failed = await runAllWait(
+      60,
+      terminalRunBody('failed', {
+        failureKind: 'assertion',
+        failedStepIndex: 2,
+        error: null,
+      }),
+    );
+    expect(failed.accepted[0]).toMatchObject({
+      status: 'failed',
+      failureKind: 'assertion',
+      failedStepIndex: 2,
+      error: {
+        code: 'INTERNAL',
+        message: 'failureKind: assertion, failedStepIndex: 2',
+        exitCode: 1,
+      },
+    });
+
+    const blocked = await runAllWait(
+      60,
+      terminalRunBody('blocked', {
+        failureKind: null,
+        failedStepIndex: 0,
+        error: null,
+      }),
+    );
+    expect(blocked.accepted[0]).toMatchObject({
+      status: 'blocked',
+      failedStepIndex: 0,
+      error: {
+        code: 'INTERNAL',
+        message: 'failedStepIndex: 0',
+        exitCode: 1,
+      },
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

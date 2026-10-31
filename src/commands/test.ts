@@ -10986,12 +10986,23 @@ export async function runTestRunAll(
 
   function freshPollFailureFields(finalRun: RunResponse): Partial<CliBatchRunFreshResult> {
     if (finalRun.status === 'passed') return {};
+    const synthesizedMessage =
+      (finalRun.status === 'failed' || finalRun.status === 'blocked') &&
+      (finalRun.failureKind !== null || finalRun.failedStepIndex !== null)
+        ? [
+            finalRun.failureKind ? `failureKind: ${finalRun.failureKind}` : undefined,
+            finalRun.failedStepIndex !== null
+              ? `failedStepIndex: ${finalRun.failedStepIndex}`
+              : undefined,
+          ]
+            .filter(Boolean)
+            .join(', ')
+        : undefined;
+    const errorMessage = finalRun.error || synthesizedMessage;
     return {
       failureKind: finalRun.failureKind,
       failedStepIndex: finalRun.failedStepIndex,
-      ...(finalRun.error
-        ? { error: { code: 'INTERNAL', message: finalRun.error, exitCode: 1 } }
-        : {}),
+      ...(errorMessage ? { error: { code: 'INTERNAL', message: errorMessage, exitCode: 1 } } : {}),
     };
   }
 
