@@ -39,6 +39,7 @@ describe('readTextFileBomAware', () => {
   it('reads a UTF-16LE file written by PowerShell 5.1 `>` back intact', () => {
     const dir = mkdtempSync(join(tmpdir(), 'text-file-'));
     const path = join(dir, 'plan.json');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `path` is this test's own mkdtempSync file, never user input
     writeFileSync(path, encoded(PAYLOAD, 'utf16le'));
     expect(readTextFileBomAware(path)).toBe(PAYLOAD);
   });

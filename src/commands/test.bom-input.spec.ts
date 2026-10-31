@@ -35,6 +35,7 @@ function writeEncoded(dir: string, name: string, payload: string, enc: BomEncodi
     body.swap16();
     bytes = Buffer.concat([Buffer.from([0xfe, 0xff]), body]);
   }
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- `path` is this test's own mkdtempSync file, never user input
   writeFileSync(path, bytes);
   return path;
 }
@@ -60,7 +61,9 @@ describe('plan files saved with a BOM (PowerShell 5.1 `>`) lint cleanly', () => 
     const body = Buffer.from(JSON.stringify(PLAN, null, 2), 'utf16le');
     body.swap16();
     const path = join(dir, 'plan-utf16be-odd.json');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `path` is this test's own mkdtempSync file, never user input
     writeFileSync(path, Buffer.concat([Buffer.from([0xfe, 0xff]), body, Buffer.from([0x00])]));
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- credentials fixture inside the same mkdtempSync dir, never user input
     writeFileSync(
       join(dir, 'credentials'),
       '[default]\napi_url = http://localhost:13502\napi_key = sk-user-test\n',
@@ -99,6 +102,7 @@ describe('plan-from-dir caps the batch on raw bytes, not decoded length', () => 
     // 2.7 MB of ASCII decodes from ~5.4 MB of UTF-16LE.
     const padding = `{"padding":"${'x'.repeat(2_700_000)}"}`;
     writeEncoded(dir, '02-padding.json', padding, 'utf16le');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- credentials fixture inside the same mkdtempSync dir, never user input
     writeFileSync(
       join(dir, 'credentials'),
       '[default]\napi_url = http://localhost:13502\napi_key = sk-user-test\n',
