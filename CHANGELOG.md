@@ -4,6 +4,10 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `.` or `..` id or name can no longer redirect a request.** `project env delete <project-id> .. --confirm` resolved to `DELETE /projects/<project-id>/` and deleted the whole project. Any path segment that is `.` or `..` (also as `%2E%2E`) is now refused with `VALIDATION_ERROR` (exit 5) before a request is sent; `project env` also refuses `.` and `..` as an environment name (create, get, update, `--rename`, delete, set-default, dry runs included) before any request. Names that merely contain dots (`v1.2`, `..staging`) are unaffected.
+
 ## [0.15.0] - 2026-10-17
 
 ### Added

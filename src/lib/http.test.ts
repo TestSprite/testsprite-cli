@@ -447,6 +447,40 @@ describe('buildUrl', () => {
   });
 });
 
+describe('buildUrl dot segments', () => {
+  const base = 'https://api.example.com/api/cli/v1';
+
+  it.each([
+    '/projects/p1/env/..',
+    '/projects/p1/env/.',
+    '/projects/p1/env/%2E%2E',
+    '/projects/p1/env/%2e/x',
+  ])('refuses %s with VALIDATION_ERROR', path => {
+    expect(() => buildUrl(base, path)).toThrow(ApiError);
+    expect(() => buildUrl(base, path)).toThrowError(
+      expect.objectContaining({ code: 'VALIDATION_ERROR', exitCode: 5 }),
+    );
+  });
+
+  it('names the offending value', () => {
+    expect(() => buildUrl(base, '/projects/p1/env/..')).toThrowError(
+      expect.objectContaining({ nextAction: expect.stringContaining('".."') }),
+    );
+  });
+
+  it.each(['v1.2', '..staging', 'a..b', 'a.'])('keeps %s valid', name => {
+    expect(buildUrl(base, `/projects/p1/env/${encodeURIComponent(name)}`)).toBe(
+      `${base}/projects/p1/env/${name}`,
+    );
+  });
+
+  it('does not treat an encoded literal percent sequence as a dot segment', () => {
+    expect(buildUrl(base, `/projects/p1/env/${encodeURIComponent('%2E%2E')}`)).toBe(
+      `${base}/projects/p1/env/%252E%252E`,
+    );
+  });
+});
+
 describe('parseRetryAfter', () => {
   it('returns undefined for null/empty headers', () => {
     expect(parseRetryAfter(null)).toBeUndefined();

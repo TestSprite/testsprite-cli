@@ -148,12 +148,22 @@ function envPath(projectId: string, name?: string): string {
   return name === undefined ? base : `${base}/${encodeURIComponent(name)}`;
 }
 
-/** Trim + reject an empty environment name; the server owns every other rule. */
+/**
+ * Trim + reject an empty environment name and the dot names `.` and `..`
+ * (they would escape the route when used as a path segment, and could never
+ * be addressed again once created or renamed); the server owns every other rule.
+ */
 function requireEnvName(raw: string | undefined, flag: string): string {
   const name = raw?.trim() ?? '';
   if (name.length === 0) {
     throw localValidationError(
       `${flag} is required and must not be empty or whitespace-only`,
+      flag === '--rename' ? 'rename' : undefined,
+    );
+  }
+  if (name === '.' || name === '..') {
+    throw localValidationError(
+      `${flag} must not be "." or "..", which would escape the route. Use a descriptive name of 1-100 characters, unique within the project (for example "staging" or "local-dev").`,
       flag === '--rename' ? 'rename' : undefined,
     );
   }
