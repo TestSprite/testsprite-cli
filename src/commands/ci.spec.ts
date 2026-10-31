@@ -243,8 +243,41 @@ describe('buildGithubWorkflow', () => {
     expect(yaml).toMatch(/permissions:\n {2}contents: read\n {2}pull-requests: read\n/);
     expect(yaml).toContain('TESTSPRITE_API_KEY: ${{ secrets.TESTSPRITE_API_KEY }}');
     expect(yaml).toContain('GITHUB_TOKEN: ${{ github.token }}');
-    expect(yaml).toMatch(/if: always\(\)\n\s+uses: actions\/upload-artifact@v4/);
+    expect(yaml).toMatch(/if: always\(\)\n\s+uses: actions\/upload-artifact@v7/);
     expect(yaml).toContain('--summary-file testsprite-summary.json');
+  });
+
+  it('only uses action majors that run on Node 24', () => {
+    // GitHub removed Node 20 from hosted runners on 2026-09-23; an action that
+    // still declares `runs.using: node20` is forced onto Node 24 with a
+    // deprecation warning on every job. These are the first majors of each
+    // action that declare node24.
+    const firstNode24Major: Record<string, number> = {
+      'actions/checkout': 5,
+      'actions/setup-node': 5,
+      'actions/upload-artifact': 6,
+    };
+    const yaml = buildGithubWorkflow(WF_BASE);
+    const used = [...yaml.matchAll(/uses: ([\w-]+\/[\w-]+)@v(\d+)/g)];
+    expect(used.map(([, action]) => action).sort()).toEqual(Object.keys(firstNode24Major).sort());
+    for (const [, action, major] of used) {
+      expect(Number(major), action).toBeGreaterThanOrEqual(firstNode24Major[action!]!);
+    }
+    // setup-node v5+ caches dependencies on its own when package.json names a
+    // package manager; the job installs only the CLI, so that cache stays off.
+    expect(yaml).toMatch(
+      /uses: actions\/setup-node@v\d+\n\s+with:\n(?:\s+.+\n)*?\s+package-manager-cache: false\n/,
+    );
+  });
+
+  it('documents the same action versions it generates', () => {
+    const generated = new Set(
+      [...buildGithubWorkflow(WF_BASE).matchAll(/uses: (actions\/[\w-]+@v\d+)/g)].map(m => m[1]),
+    );
+    const docs = readFileSync(new URL('../../DOCUMENTATION.md', import.meta.url), 'utf8');
+    const documented = [...docs.matchAll(/uses: (actions\/[\w-]+@v\d+)/g)].map(m => m[1]);
+    expect(documented.length).toBeGreaterThan(0);
+    for (const ref of documented) expect(generated, ref).toContain(ref);
   });
 
   it('writes --timeout and the endpoint only when given, and sizes the job to fit', () => {
