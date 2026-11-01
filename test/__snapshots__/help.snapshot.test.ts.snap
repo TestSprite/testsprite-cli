@@ -10,21 +10,11 @@ Options:
   -h, --help                      display help for command
 
 Commands:
-  install [options] [targets...]  Write the TestSprite agent skills
-                                  (verification loop + first-run onboarding)
-                                  into a project for a coding agent. Target(s)
-                                  may be given positionally (e.g. \`agent
-                                  install cursor codex\`) and/or via --target;
-                                  the two are merged.
-  list                            List the agent targets and skills this CLI
-                                  can install and where each lands (run
-                                  \`testsprite agent status\` to see what is
-                                  installed here)
-  status [options]                Check installed TestSprite skill files
-                                  against this CLI version: ok, stale,
-                                  modified, unmarked, absent, or corrupt (exits
-                                  1 when anything needs attention, so it can
-                                  gate CI)
+  install [options] [targets...]  Write the TestSprite agent skills into a
+                                  project
+  list                            List installable agent targets and skills
+  status [options]                Check installed skill files against this CLI
+                                  version
   help [command]                  display help for command
 "
 `;
@@ -33,8 +23,8 @@ exports[`--help snapshots > agent install 1`] = `
 "Usage: testsprite agent install [options] [targets...]
 
 Write the TestSprite agent skills (verification loop + first-run onboarding)
-into a project for a coding agent. Target(s) may be given positionally (e.g.
-\`agent install cursor codex\`) and/or via --target; the two are merged.
+into a project for a coding agent. Targets may be positional (\`agent install
+cursor codex\`) and/or via --target; they are merged.
 
 Options:
   --target <t>    Agent target(s): claude, cursor, cline, antigravity, kiro,
@@ -78,10 +68,11 @@ Options:
   -h, --help      display help for command
 
 Commands:
-  status          Show the user, API key, env, and scopes bound to the active
-                  profile
-  remove          Remove credentials for the active profile
+  status          Show the active profile and its credentials
+  remove          Remove the stored API key for the active profile
   help [command]  display help for command
+
+To add credentials, run: testsprite setup
 "
 `;
 
@@ -102,7 +93,8 @@ Options:
                         kept)
   --dir <path>          Project root for the skill install (default: current
                         directory)
-  -y, --yes             Non-interactive: accept all defaults, never prompt
+  -y, --yes             Non-interactive: accept defaults, never prompt (needs
+                        --from-env or --api-key)
   --skip-if-configured  Skip the API key prompt when credentials already exist
                         for this profile (CI-safe idempotent re-run)
   -h, --help            display help for command
@@ -142,8 +134,8 @@ Options:
 Commands:
   run [options]              Run project tests, wait for results, and apply the
                              CI gate
-  init [options] <platform>  Write a CI workflow that runs your TestSprite
-                             tests (platform: github)
+  init [options] <platform>  Write a CI workflow that runs your test cases on
+                             pull requests (github)
   help [command]             display help for command
 "
 `;
@@ -151,7 +143,12 @@ Commands:
 exports[`--help snapshots > ci init 1`] = `
 "Usage: testsprite ci init [options] <platform>
 
-Write a CI workflow that runs your TestSprite tests (platform: github)
+Write a CI workflow (platform: github) that runs the project's TestSprite test
+cases against each
+pull request's preview deployment; each run spends credits. Replace the
+"REPLACE ME" step in the
+generated file with your preview URL. Needs the TESTSPRITE_API_KEY repo secret
+(see --set-secret).
 
 Options:
   --project <id>       project id to run (auto-detected if you have exactly
@@ -265,7 +262,8 @@ Options:
                         kept)
   --dir <path>          Project root for the skill install (default: current
                         directory)
-  -y, --yes             Non-interactive: accept all defaults, never prompt
+  -y, --yes             Non-interactive: accept defaults, never prompt (needs
+                        --from-env or --api-key)
   --skip-if-configured  Skip the API key prompt when credentials already exist
                         for this profile (CI-safe idempotent re-run)
   -h, --help            display help for command
@@ -282,39 +280,20 @@ Options:
 
 Commands:
   list [options]                     List projects visible to the API key
-  
-  Exit codes:
-    0  success
-    3  auth error
-    5  validation error (e.g., bad --page-size)
-   10  transport/network failure (UNAVAILABLE) — retry the command
   get <project-id>                   Get a project by id
   create [options]                   Create a new project
   update [options] <project-id>      Update project metadata
-  delete [options] <project-id>      Permanently delete a project and everything under it (sub-projects,
-  their tests, and backend fixtures). Requires --confirm.
-  
-  Exit codes:
-    0  success
-    3  auth error
-    4  project not found (or already deleted)
-    5  validation error (e.g., missing --confirm)
-  credential [options] <project-id>  Set the static backend credential injected
-                                     into every backend test
-                                     (Bearer token / API key / Basic token /
-                                     public). Free tier.
-  auto-auth [options] <project-id>   Configure the recurring-token
-                                     (auto-refresh login) for backend tests
-                                     (Pro).
-                                     A fresh token is fetched on each run and
-                                     injected into every backend test.
-  docs                               Manage project documents — the sources
-                                     plan generation feeds on
-  env                                Manage a project's environments — named
-                                     URL + test-account bundles that \`test run
-                                     --env <name>\` selects
+  delete [options] <project-id>      Permanently delete a project (requires
+                                     --confirm)
+  credential [options] <project-id>  Set the static credential injected into
+                                     backend tests
+  auto-auth [options] <project-id>   Configure auto-refresh login for backend
+                                     tests (paid)
+  docs                               Manage project documents (plan-generation
+                                     sources)
+  env                                Manage a project's environments
   sign-in                            Inspect or change how an environment signs
-                                     in to the app under test.
+                                     in
   help [command]                     display help for command
 "
 `;
@@ -327,23 +306,24 @@ Create a new project
 Options:
   --type <frontend|backend>    project type (required)
   --name <name>                project name (required)
-  --url <url>                  target URL (public http/https or a loopback http
-                               origin with an explicit port; required for
-                               frontend unless --local is used; also required
-                               for backend on the V3 execution path — see \`auth
-                               status\` for your routing)
+  --url <url>                  target URL (public http/https; a loopback http
+                               origin with an explicit port is frontend only;
+                               required for frontend unless --local; also
+                               required for backend on the V3 path, see \`auth
+                               status\`)
   --local <port>               shorthand for --url http://localhost:<port>
-                               (1-65535; excludes --url; runs open a tunnel
-                               automatically)
+                               (1-65535; excludes --url; frontend only; runs
+                               open a tunnel automatically)
   --skip-preflight             skip the local TCP listener check before project
                                creation
   --description <text>         not supported — projects have no description
                                (test-level descriptions are set on \`test
                                create\`)
-  --username <user>            optional auth username
-  --password <pw>              optional auth password (use --password-file for
-                               non-interactive)
-  --password-file <path>       read password from file instead of inline flag
+  --username <user>            optional auth username (give with --password)
+  --password <pw>              optional auth password, with --username
+                               (--password-file for non-interactive)
+  --password-file <path>       read password from file (if both are given,
+                               --password wins with a warning)
   --instruction <text>         optional FE plan-gen instruction hint
   --test-id-attributes <list>  comma-separated DOM attributes the engine should
                                prefer as locators, highest priority first (e.g.
@@ -361,10 +341,9 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > project docs upload 1`] = `
 "Usage: testsprite project docs upload [options] <file>
 
-Upload an API spec or PRD as a project source. Three steps:
-mint a presigned S3 URL, stream the file bytes to it, register the
-document — which starts processing + embedding. The local file is
-only read; nothing is written back to disk.
+Upload an API spec or PRD as a project source: mint a presigned S3 URL, stream the file
+to it, register the document — which starts processing + embedding and spends credits
+(see \`testsprite usage\`). The local file is only read.
 
 Exit codes:
   0  upload registered (processing started)
@@ -375,7 +354,8 @@ Exit codes:
  10  presigned S3 PUT failed — re-run to mint a fresh URL
 
 Options:
-  --project <id>             project id the document belongs to (required)
+  --project <id>             project id (required unless TESTSPRITE_PROJECT_ID
+                             is set)
   --role <role>              document role: api-doc (API spec, default) | prd
   --name <display-name>      display name for the document (default: file
                              basename)
@@ -414,16 +394,22 @@ Options:
   --skip-preflight               skip the local TCP listener check before
                                  creating
   --username <user>              test-account username the browser logs in with
-  --password <pw>                test-account password (prefer --password-file)
+  --password <pw>                test-account password (prefer --password-file,
+                                 exclusive)
   --password-file <path>         read the password from a file instead of the
                                  command line
-  --var <KEY=VALUE>              set a custom variable (repeatable); shown in
-                                 plain text by \`env get\` — not for secrets, use
-                                 --username/--password (default: [])
+  --var <KEY=VALUE>              set a custom variable (repeatable; max 50,
+                                 4096 bytes each, key [A-Za-z_][A-Za-z0-9_]*,
+                                 reserved names like url/username/password
+                                 rejected); shown in plain text by \`env get\`,
+                                 not for secrets (default: [])
   --sign-in <mode>               public, account, otp, or manual (aliases:
-                                 none, credentials, sso)
+                                 none, credentials, sso). manual: log in once
+                                 in the Portal, runs reuse that session (not
+                                 signed in until then). otp and manual: not for
+                                 local environments
   --otp-channel <email,sms>      OTP channels: email and/or sms; repeat or
-                                 comma-separate
+                                 comma-separate (default: email)
   --session-ttl <seconds|never>  SSO session reuse lifetime: 1–2592000 seconds
                                  or never (manual only)
   --set-default                  make this the project's default environment
@@ -440,7 +426,7 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > project env update 1`] = `
 "Usage: testsprite project env update [options] <project-id> <name>
 
-Change an environment's URL, credentials or name.
+Change an environment's URL, credentials, custom variables or name (sign-in mode: \`project sign-in set\`).
 Exit codes:
   0  success
   3  auth error
@@ -456,13 +442,16 @@ Options:
   --skip-preflight           skip the local TCP listener check before the
                              update
   --username <user>          new test-account username
-  --password <pw>            new test-account password (prefer --password-file)
+  --password <pw>            new test-account password (prefer --password-file,
+                             exclusive)
   --password-file <path>     read the new password from a file
   --clear-credentials        remove stored username and password; disable
                              account login
-  --var <KEY=VALUE>          merge a custom variable (repeatable); shown in
-                             plain text by \`env get\` — not for secrets, use
-                             --username/--password (default: [])
+  --var <KEY=VALUE>          merge a custom variable (repeatable; max 50, 4096
+                             bytes each, key [A-Za-z_][A-Za-z0-9_]*, reserved
+                             names like url/username/password rejected); shown
+                             in plain text by \`env get\`, not for secrets
+                             (default: [])
   --rename <new-name>        rename the environment (runs keep referring to it
                              by the new name)
   --idempotency-key <token>  opaque idempotency token. Defaults to a UUIDv4
@@ -499,11 +488,14 @@ Exit codes:
  10  transport/network failure (UNAVAILABLE) — retry the command
 
 Options:
-  --page-size <n>           service page-size hint (1-100, default 25)
+  --page-size <n>           page size (1-100, default 25); alone it returns one
+                            page plus a next --starting-token (add --max-items
+                            to auto-page)
   --starting-token <token>  opaque cursor from a previous list response
   --max-items <n>           stop after this many items across auto-paged pages
   --columns <list>          select/reorder text table columns (comma-separated
-                            keys)
+                            keys: id, name, type, from, org, url, created,
+                            defaultenv, envs)
   --no-header               suppress the text table header row
   -h, --help                display help for command
 
@@ -521,10 +513,8 @@ Options:
   -h, --help                  display help for command
 
 Commands:
-  get [options] <project-id>  Show the environment sign-in mode, credentials
-                              status, OTP channels, or SSO session.
-  set [options] <project-id>  Set the sign-in mode; choose OTP when creating a
-                              new environment.
+  get [options] <project-id>  Show the environment sign-in mode and status
+  set [options] <project-id>  Set the environment sign-in mode
   help [command]              display help for command
 "
 `;
@@ -547,16 +537,19 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > project sign-in set 1`] = `
 "Usage: testsprite project sign-in set [options] <project-id>
 
-Set the sign-in mode; choose OTP when creating a new environment.
+Set the sign-in mode. OTP can only be chosen at \`project env create --sign-in
+otp\`, never switched to or from.
+manual (log in once in the Portal; runs are not signed in until then) and otp
+are not available on local environments.
 
 Options:
-  --mode <mode>                  required: public, account, otp, or manual
-                                 (aliases: none, credentials, sso)
+  --mode <mode>                  required: public, account or manual (aliases:
+                                 none, credentials, sso)
   --env <name>                   environment name (defaults to the project
                                  default)
   --username <user>              test-account username (account only)
-  --password <pw>                test-account password (prefer --password-file;
-                                 account only)
+  --password <pw>                test-account password (prefer --password-file,
+                                 exclusive; account only)
   --password-file <path>         read the test-account password from a file
                                  (account only)
   --session-ttl <seconds|never>  SSO session reuse lifetime: 1–2592000 seconds
@@ -585,7 +578,8 @@ Options:
                                update
   --username <user>            new auth username
   --password <pw>              new auth password
-  --password-file <path>       read new password from file
+  --password-file <path>       read new password from file (if both are given,
+                               --password wins with a warning)
   --instruction <text>         new FE plan-gen instruction hint
   --test-id-attributes <list>  comma-separated DOM attributes the engine should
                                prefer as locators, highest priority first (e.g.
@@ -605,7 +599,7 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > test 1`] = `
 "Usage: testsprite test [options] [command]
 
-Inspect TestSprite tests
+Create, run and inspect tests
 
 Options:
   -h, --help                            display help for command
@@ -613,144 +607,37 @@ Options:
 Commands:
   list [options]                        List tests in a project
   get <test-id>                         Get a test by id
-  create [options]                      Create a test from saved code
-                                        (--code-file) or an agent-supplied plan
-                                        (--plan-from, FE-only)
-  create-batch [options]                Create multiple FE tests from a JSONL
-                                        of plan specs (FE-only)
-  scaffold [options]                    Emit a schema-correct starter test
-                                        definition (frontend plan JSON by
-                                        default, or a backend Python skeleton).
-                                        Pure-local: no network, no credentials.
+  create [options]                      Create a test from code (--code-file)
+                                        or a plan (--plan-from)
+  create-batch [options]                Create multiple FE tests from JSONL
+                                        plan specs
+  scaffold [options]                    Emit a starter FE plan or BE skeleton
+                                        (local)
   open [options] <test-id>              Open the test in the TestSprite
-                                        dashboard: prints the deep-link URL,
-                                        then spawns your default browser unless
-                                        --no-browser.
+                                        dashboard (prints the URL, then opens
+                                        your browser)
   steps [options] <test-id>             List the steps of the latest run (use
                                         --run-id for a specific run)
-  diff <run-a> <run-b>                  Compare two runs and print what
-                                        regressed: verdict, failureKind,
-                                        failedStepIndex, per-step status flips,
-                                        codeVersion drift. Exit 0 when verdicts
-                                        match, 1 when they differ.
-  lint [options]                        Validate plan/steps files offline with
-                                        the same validators \`create\` runs,
-                                        collecting EVERY problem. No network,
-                                        no credentials. Exit 0 when all valid,
-                                        5 otherwise.
-  result [options] <test-id>            Get the latest result for a test (default) or list prior runs (--history).
-  
-  --output json shape differs by mode:
-    (default)  single CliLatestResult object
-    --history  { runs: RunHistoryItem[], nextCursor: string|null, meta: RunHistoryMeta }
-  
-  Per-run detail: testsprite test wait <run-id>
-  Failure bundle:  testsprite test artifact get <run-id>
-  update [options] <test-id>            Update test metadata — name,
-                                        description, priority, step timeout
-  delete [options] <test-id>            Permanently delete a test. Requires
-                                        --confirm.
-  delete-batch [options] [test-ids...]  Permanently delete multiple tests in one command. Requires --confirm.
-  Use --all --project <id> to delete all tests in a project (optionally filtered by --status).
-  
-  Prints a per-test summary (Deleted N, Skipped M, Failed K) to stdout.
-  
-  Exit codes:
-    0  all targeted tests deleted (or --dry-run)
-    1  one or more deletions failed (server error)
-    5  validation error (missing --confirm, missing --project with --all, etc.)
-  
-  Note: a 404 "not found" response is counted as skipped in the summary, not an error.
-  run [options] [test-id...]            Trigger one or several test runs. Saved loopback environments open a tunnel automatically and wait for a verdict.
-  Use --all --project <id> for a wave-ordered batch run. Loopback environments share one tunnel.
-  
-  Exit codes:
-    0  passed (or queued without --wait)
-    1  failed / blocked / cancelled
-    3  auth error
-    4  test not found
-    5  validation error (e.g., bad URL, or positional + --all both set)
-    6  conflict (already running — see nextAction for the active runId)
-    7  timeout — resume with: testsprite test wait <run-id>, or stop it with: testsprite test cancel <run-id>
-   10  transport/network failure (UNAVAILABLE) — retry the command
-   11  rate limited — honor Retry-After, or the in-flight run cap was hit
-       (details.reason "inflight_cap"; see: testsprite test run --help)
-  
-  On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
-  
-  Ctrl-C during an ordinary --wait detaches; an owned tunnel cancels unfinished runs by default.
-  Stop a detached run with: testsprite test cancel <run-id>
-  Local environments: dev servers can take a minute per page through the tunnel.
-  For a heavy dev server, test a built server: npm run build, then your framework preview/start command.
-  wait [options] <run-id...>            Wait for one or more runs to reach a terminal status.
-  
-  With several run-ids the runs are polled concurrently under one shared
-  --timeout and a {results, summary} envelope is printed (worst status wins
-  the exit code), so every re-attach hint the CLI prints can be pasted as
-  ONE command.
-  
-  Exit codes:
-    0  passed
-    1  failed / blocked / cancelled
-    3  auth error
-    4  run not found (single run-id; with several ids a per-member poll error
-       is recorded as error:<CODE> in its row and folded into exit 7)
-    7  timeout or per-member poll error — resume with: testsprite test wait <run-id...>
-   10  transport/network failure (UNAVAILABLE) — retry the command
-   11  rate limited, and nothing else went wrong — polls are retried
-       automatically honoring Retry-After first, so this means the throttle
-       outlasted that budget while the runs were still fine. Back off, then
-       re-attach with test wait. (A throttle that instead consumes the whole
-       --timeout reports 7, and any real timeout or failure keeps 7 / 1.)
-  
-  On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
-  
-  Ctrl-C detaches only (the run keeps executing and billing); stop it for
-  real with: testsprite test cancel <run-id...>
-  rerun [options] [test-ids...]         Re-execute a test (or multiple) as a replay — FE replays the saved script, BE re-runs the dependency closure. Billed the same as a fresh run: 0.5 credits per FE rerun / 0.2 credits per BE rerun (legacy V2 accounts: FE rerun remains free).
-  
-  Exit codes:
-    0  passed (or queued without --wait)
-    1  failed / blocked / cancelled
-    3  auth error
-    4  test not found (single), or batch: nothing queued — every id had no replayable run
-    5  validation error, or --all resolved zero tests (pass --allow-empty to exit 0)
-    6  conflict (already running — see nextAction for the active runId)
-    7  timeout or deferred — resume with: testsprite test wait <run-id>, or stop it with: testsprite test cancel <run-id>
-   11  rate limited — honor Retry-After
-  
-  On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
-  
-  Ctrl-C during --wait detaches only (the run keeps executing and billing);
-  stop it for real with: testsprite test cancel <run-id>
-  flaky [options] <test-id>             Repeatedly replay a test to measure stability and surface flakiness.
-  Replays run with auto-heal OFF (strict verbatim) so healed drift cannot mask nondeterministic pass/fail.
-  
-  Exit codes:
-    0  stable (every attempt passed)
-    1  flaky or failing (at least one attempt did not pass)
-    3  auth error
-    4  test not found (no replayable run — trigger \`testsprite test run <id>\` first)
-    5  validation error
+  diff <run-a> <run-b>                  Compare two runs; exit 1 if their
+                                        verdicts differ
+  lint [options]                        Validate plan/steps files offline
+  result [options] <test-id>            Get the latest result, or list prior
+                                        runs (--history)
+  update [options] <test-id>            Update name, description, priority or
+                                        step timeout
+  delete [options] <test-id>            Permanently delete a test (requires
+                                        --confirm)
+  delete-batch [options] [test-ids...]  Permanently delete several tests
+                                        (requires --confirm)
+  run [options] [test-id...]            Run a test, or a whole project (--all)
+  wait [options] <run-id...>            Wait for one or more runs to finish
   code                                  Inspect and edit generated test code
   plan                                  Generate + accept AI test plans (V3),
                                         and manage FE plan-steps
   failure                               Export the latest-failure agent bundle
   artifact                              Download run-scoped artifact bundles
-  cancel <run-id...>                    Cancel one or more queued/running runs.
-  
-  Ctrl-C during --wait only detaches — it does NOT cancel the server-side
-  run. This is the real stop button. A frontend V3 run cancelled before a
-  terminal state has its original charge returned; an uncharged run says so.
-  Backend and V2 runs keep their existing billing behavior; an in-flight Lambda
-  finishes on its own and its result is discarded once cancelled.
-  
-  Exit codes:
-    0  cancelled (fresh or already-cancelled — naturally idempotent)
-    4  run id not found (single id), or ANY id not found (multi-id — outranks conflict)
-    6  run already terminal (passed/failed/blocked) — single id: 409; multi-id: any conflict
-  
-  Multi-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound}.
+  cancel <run-id...>                    Cancel queued/running runs (refunds an
+                                        unfinished FE V3 run)
   help [command]                        display help for command
 "
 `;
@@ -760,18 +647,18 @@ exports[`--help snapshots > test cancel 1`] = `
 
 Cancel one or more queued/running runs.
 
-Ctrl-C during --wait only detaches — it does NOT cancel the server-side
-run. This is the real stop button. A frontend V3 run cancelled before a
-terminal state has its original charge returned; an uncharged run says so.
-Backend and V2 runs keep their existing billing behavior; an in-flight Lambda
-finishes on its own and its result is discarded once cancelled.
+Ctrl-C during an ordinary --wait only detaches; it does NOT cancel the run (owned-tunnel
+runs are cancelled on interrupt, see \`test run --help\`). This is the real stop button.
+A frontend V3 run cancelled before a terminal state has its charge returned; backend and
+V2 runs keep their billing, and an in-flight Lambda finishes with its result discarded.
 
 Exit codes:
   0  cancelled (fresh or already-cancelled — naturally idempotent)
-  4  run id not found (single id), or ANY id not found (multi-id — outranks conflict)
-  6  run already terminal (passed/failed/blocked) — single id: 409; multi-id: any conflict
+  1  multi-id: a cancel request failed (auth/transport/server error; see summary.errors)
+  4  run id not found (single id), or ANY id not found (multi-id; outranks conflict)
+  6  run already terminal (passed/failed/blocked); multi-id: any conflict
 
-Multi-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound}.
+Multi-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound, errors}.
 
 Arguments:
   run-id      one or more run ids to cancel
@@ -806,67 +693,55 @@ Create a test from saved code (--code-file) or an agent-supplied plan
 (--plan-from, FE-only)
 
 Options:
-  --project <id>             project id (returned by \`testsprite project list\`)
+  --project <id>             project id (see \`testsprite project list\`)
   --type <type>              frontend|backend
-  --name <name>              human-readable test name (becomes \`title\` in
-                             storage)
+  --name <name>              human-readable test name
   --description <text>       optional human description (≤ 2000 chars)
   --priority <prio>          optional priority: p0/high, p1/medium, p2/low (p3
                              = low)
-  --step-timeout <ms>        per-test step timeout in milliseconds (1-60000);
-                             applied by the execution engine to every step of
-                             this test
+  --step-timeout <ms>        per-test step timeout in milliseconds (1-60000)
   --code-file <path>         file containing the test code (≤ 350 KB)
-  --plan-from <path>         JSON file with the full FE test definition —
-                             projectId, type, name, planSteps[] all live in the
-                             file (≤ 256 KB; mutually exclusive with
-                             --code-file). In this mode
+  --plan-from <path>         JSON file with the full FE test definition (≤ 256
+                             KB; excludes --code-file);
                              --project/--type/--name/--description/--priority/--step-timeout
-                             are ignored.
-  --plan-template            print a minimal valid plan-file skeleton to stdout
-                             and exit (pure-local: no network, no credentials,
-                             ignores every other flag). Pipe to a file and
-                             edit: \`--plan-template > plan.json\`. (default:
-                             false)
-  --run                      after create, trigger the test. Combine with
-                             --wait to block until terminal. (default: false)
+                             are ignored
+  --plan-template            print a plan-file skeleton to stdout and exit
+                             (local; ignores every other flag) (default: false)
+  --run                      after create, trigger the test (default: false)
   --wait                     with --run, poll until terminal status (default:
                              false)
-  --no-wait                  detach without opening an automatic environment
+  --no-wait                  with --run, detach: no waiting and no automatic
+                             tunnel (a loopback target is unreachable from the
+                             cloud)
+  --timeout <s>              with --run --wait, max seconds to wait (1-3600;
+                             default 600, or 1200 through a tunnel)
+  --target-url <url>         frontend tests only: run against this URL, using
+                             the environment for its origin (else a temporary
+                             one deleted after the run); with --env, that
+                             environment's settings; loopback URLs open a
                              tunnel
-  --timeout <s>              with --run --wait, max seconds to wait
-  --target-url <url>         frontend tests only: use the environment already
-                             pointing at this URL's origin, or a temporary one
-                             TestSprite deletes when the run finishes; with
-                             --env, use its settings against this URL; loopback
-                             URLs open a tunnel automatically
   --env <name>               with --run, select the named project environment;
                              loopback URLs open a tunnel automatically
-  --skip-preflight           skip the pre-charge reachability probe for a
-                             target URL. The probe runs from this machine, not
-                             from the Lambda that executes the test, so it can
-                             occasionally be wrong (e.g. an IP allowlist that
-                             permits the Lambda but not this machine); use this
-                             flag when you know better. Zero network calls when
-                             set. (default: false)
-  --idempotency-key <token>  opaque idempotency token (1-256 ASCII chars).
-                             Defaults to a UUIDv4 minted per invocation; pin
-                             one yourself for safe retries.
-  --produces <var>           BE only: variable name this test captures
-                             (repeatable). Drives dependency-aware wave
-                             ordering on \`test rerun\` and \`test run --all\`.
-                             (default: [])
-  --needs <var>              BE only: variable name this test consumes
-                             (repeatable). Use to declare upstream producer
-                             dependencies. (default: [])
-  --category <str>           BE only: test category. Use 'teardown' or
-                             'cleanup' to mark a final-wave cleanup test.
+  --skip-preflight           skip the pre-charge reachability probe of the
+                             target URL (it runs from this machine, not the
+                             cloud, so it can be wrong, e.g. behind an IP
+                             allowlist) (default: false)
+  --idempotency-key <token>  idempotency token (1-256 ASCII chars; default:
+                             random UUID per invocation, pin one for safe
+                             retries)
+  --produces <var>           BE only: variable this test captures (repeatable);
+                             orders waves in \`test run --all\` (default: [])
+  --needs <var>              BE only: variable this test consumes (repeatable);
+                             declares the upstream producer (default: [])
+  --category <str>           BE only: test category; 'teardown' or 'cleanup'
+                             marks a final-wave cleanup test (BE-only flags
+                             with --type frontend exit 5)
   -h, --help                 display help for command
 
 Plan file format (--plan-from <file>) — minimal valid example:
 
 {
-  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.15.0/schemas/plan.schema.json",
+  "$schema": "https://raw.githubusercontent.com/TestSprite/testsprite-cli/v0.16.0/schemas/plan.schema.json",
   "projectId": "prj_abc123",
   "type": "frontend",
   "name": "Login rejects an empty password",
@@ -882,16 +757,9 @@ Plan file format (--plan-from <file>) — minimal valid example:
   ]
 }
 
-Print this exact skeleton:      testsprite test create --plan-template
-Validate offline (no network):  testsprite test create --plan-from <file> --dry-run
-Multiple tests:                 test create-batch --plans <file.jsonl> | --plan-from-dir <dir>
-Full field reference: DOCUMENTATION.md -> "Plan file format"
+Validate offline:  testsprite test create --plan-from <file> --dry-run
+Many tests:        testsprite test create-batch --plans <file.jsonl>
 
-
-BE dependency authoring:
-  --produces/--needs drive wave ordering on \`test rerun\` + \`test run --all\`.
-  --category teardown  marks a final-wave cleanup test.
-  These flags are backend-only; supplying with --type frontend is an error (exit 5).
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
@@ -901,7 +769,9 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > test create-batch 1`] = `
 "Usage: testsprite test create-batch [options]
 
-Create multiple FE tests from a JSONL of plan specs (FE-only)
+Create multiple FE tests from a JSONL of plan specs (FE-only).
+Each JSONL line (or --plan-from-dir file) is a \`test create --plan-from\` plan;
+see \`test scaffold\`.
 
 Options:
   --plans <path>             JSONL file with one plan-from spec per line (≤ 50
@@ -912,48 +782,37 @@ Options:
                              --plans.
   --run                      after create, trigger each created test as a run
                              (default: false)
-  --max-concurrency <n>      with --run, max in-flight triggers at once (1-100,
-                             default: 50). The server caps run-triggers at
-                             60/min/key; the CLI throttles to 50/min and
-                             auto-retries RATE_LIMITED responses client-side —
-                             raising this value does not bypass the server cap.
-                             Separately, CLI run triggers are refused once 50
-                             of your runs are already in flight (server
-                             default; the refusal reports your account's real
-                             cap). Runs from every source count toward it, and
-                             a large batch can reach it on its own, so anything
-                             already running makes later triggers exit 11 with
-                             details.reason "inflight_cap" — not auto-retried,
-                             runs have to finish first. With --wait a slot is
-                             held until each run finishes, so lowering this
-                             flag keeps fewer runs in flight; without --wait it
-                             only paces dispatch, and a smaller batch is the
-                             lever.
+  --max-concurrency <n>      with --run: max in-flight triggers (1-100, default
+                             50; through a tunnel 1-10, default 5). Triggers
+                             are throttled to 50/min (server cap 60/min/key)
+                             and retried on rate limits. With --wait a slot is
+                             held until each run finishes; without --wait this
+                             only paces dispatch. Runs beyond what the account
+                             executes at once queue on the server.
   --wait                     with --run, poll each run until terminal status
                              (default: false)
   --no-wait                  detach without opening an automatic environment
                              tunnel
   --timeout <s>              with --run --wait, per-run max seconds to wait
                              (1-3600, default 600)
-  --target-url <url>         frontend tests only: use the environment already
-                             pointing at this URL's origin, or a temporary one
-                             TestSprite deletes when the run finishes; with
-                             --env, use its settings against this URL; loopback
-                             URLs open a tunnel automatically
-  --env <name>               with --run, select the named project environment
-                             for each test; loopback URLs open a tunnel
-                             automatically
-  --skip-preflight           skip the pre-charge reachability probe for a
-                             target URL. The probe runs from this machine, not
-                             from the Lambda that executes the test, so it can
-                             occasionally be wrong (e.g. an IP allowlist that
-                             permits the Lambda but not this machine); use this
-                             flag when you know better. Zero network calls when
-                             set. (default: false)
-  --idempotency-key <token>  opaque idempotency token for the batch create
-                             (1-256 ASCII chars). Defaults to a UUIDv4 minted
-                             per invocation; pin one yourself for safe retries.
+  --target-url <url>         with --run: frontend tests only: run against this
+                             URL, using the environment for its origin (else a
+                             temporary one deleted after the run); with --env,
+                             that environment's settings; loopback URLs open a
+                             tunnel
+  --env <name>               with --run, run each test in the named project
+                             environment; loopback URLs open a tunnel
+  --skip-preflight           with --run: skip the pre-charge reachability probe
+                             of the target URL (it runs from this machine, not
+                             the cloud, so it can be wrong, e.g. behind an IP
+                             allowlist) (default: false)
+  --idempotency-key <token>  idempotency token for the batch (1-256 ASCII
+                             chars; default: random UUID, pin one for safe
+                             retries)
   -h, --help                 display help for command
+
+Example:
+  testsprite test create-batch --plans plans.jsonl --run --wait
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
@@ -963,14 +822,20 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > test failure get 1`] = `
 "Usage: testsprite test failure get [options] <test-id>
 
-Write a self-contained failure-context bundle for a test's latest failing run
+Write the failure bundle for a test's latest failing run (same layout as \`test artifact get\`).
+
+Exit codes:
+  0  success
+  3  authentication error
+  4  test not found, or it has no failing run
+  5  validation error (bad --out)
+ 10  transport failure
 
 Options:
-  --out <dir>    Directory to write the §7 disk layout into (default: print
-                 wire envelope to stdout)
-  --failed-only  Trim to the failed step ±1. The bundle is already
-                 failure-focused server-side, so this is usually a no-op; use
-                 \`test steps <id>\` for the full run trail.
+  --out <dir>    directory to write the bundle into (default: print the
+                 envelope to stdout)
+  --failed-only  with --out: trim to the failed step ±1 (usually a no-op; \`test
+                 steps <id>\` has the full trail)
   -h, --help     display help for command
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
@@ -981,8 +846,9 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > test flaky 1`] = `
 "Usage: testsprite test flaky [options] <test-id>
 
-Repeatedly replay a test to measure stability and surface flakiness.
-Replays run with auto-heal OFF (strict verbatim) so healed drift cannot mask nondeterministic pass/fail.
+[deprecated] No replacement; run \`testsprite test run <test-id>\` again to sample a test case; removed in 0.17.0.
+Repeatedly replay a test case to measure stability.
+Replays run with auto-heal OFF (strict verbatim) so healing cannot mask a flaky pass/fail.
 
 Exit codes:
   0  stable (every attempt passed)
@@ -999,14 +865,9 @@ Options:
   -h, --help     display help for command
 
 Notes:
-  • Each replay is billed as a rerun — 0.5 credits for a frontend replay (verbatim
-    script), 0.2 credits for a backend replay (re-runs the dependency closure) —
-    same price as a fresh run, so \`--runs N\` costs roughly N×0.5 credits for a
-    frontend test (legacy V2 accounts: FE rerun remains free). A one-line advisory
-    is printed before a backend replay.
-  • Replays use auto-heal OFF so a flaky test is not silently "healed" into a pass;
-    this measures replay stability of the saved script against the configured URL.
-  • \`--output json\` emits a machine-readable stability report for CI gating.
+  • Each replay is billed as a rerun (0.5 credits per FE replay, 0.2 per BE replay), so
+    \`--runs N\` costs about N×0.5 for a frontend test (legacy V2 accounts: FE rerun is free).
+  • \`--output json\` emits a stability report for CI gating.
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
@@ -1032,16 +893,20 @@ exports[`--help snapshots > test list 1`] = `
 List tests in a project
 
 Options:
-  --project <id>            project id (returned by \`testsprite project list\`)
+  --project <id>            project id (required unless TESTSPRITE_PROJECT_ID
+                            is set)
   --env <name>              show frontend test statuses for the named project
                             environment
   --type <type>             filter by test type (frontend|backend)
   --created-from <source>   filter by where the test was authored
                             (portal|mcp|cli)
-  --status <list>           filter by normalized status (comma-separated). One
-                            of: draft, ready, queued, running, passed, failed,
-                            blocked, cancelled, unknown
-  --page-size <n>           service page-size hint (1-100, default 25)
+  --status <list>           filter by the status of each test case's latest
+                            result (comma-separated; accepted:
+                            passed|failed|blocked|cancelled|not_run; not_run =
+                            never ran)
+  --page-size <n>           fetch ONE page of N items (1-100) and print the
+                            next token (default: follow every page; --max-items
+                            caps that)
   --starting-token <token>  opaque cursor from a previous list response
   --cursor <token>          alias for --starting-token; accepted for parity
                             with \`test result --history\`
@@ -1067,12 +932,8 @@ Options:
 Commands:
   put [options] <test-id>  Replace an FE test's planSteps[] (BE tests return
                            400 → use 'test code put')
-  generate [options]       Generate AI test-case proposals for a project — runs
-                           only the missing pipeline stages and stages the
-                           results server-side for review (nothing is written
-                           locally)
-  accept [options]         Convert staged proposals into real test cases (free)
-                           — all of them, or a subset with --only
+  generate [options]       Generate AI test-case proposals for review
+  accept [options]         Turn staged proposals into test cases (free)
   help [command]           display help for command
 "
 `;
@@ -1084,24 +945,19 @@ Convert staged proposals into real test cases (free) — all of them, or a subse
 with --only
 
 Options:
-  --project <id>             project id (V3-native; V2 ids resolve through the
-                             migration bridge)
-  --only <ids...>            accept only these proposal ids (space- or
-                             comma-separated; the ids come from the \`test plan
-                             generate\` table). Accepting a subset discards the
-                             rest. ANY id that matches no staged proposal is a
-                             validation error — the request is never sent.
-  --idempotency-key <token>  opaque idempotency token (1-256 ASCII chars).
-                             Defaults to a UUIDv4 minted per invocation; pin
-                             one yourself for safe retries.
+  --project <id>             project id (or set TESTSPRITE_PROJECT_ID)
+  --only <ids...>            accept only these proposal ids from the \`test plan
+                             generate\` table (space- or comma-separated); the
+                             rest are discarded. Any id matching no staged
+                             proposal is a validation error.
+  --idempotency-key <token>  idempotency token (1-256 ASCII chars; default:
+                             random UUID per invocation, pin one for safe
+                             retries)
   -h, --help                 display help for command
 
-Notes:
-  - Accepting adds no charge of its own; generation already did the work.
-  - API test code is generated when the tests first run, not at accept.
-  - Accepting a subset discards the remaining staged proposals (the staging
-    area is cleared either way) — the output says how many were discarded.
-  - Nothing staged → exit 6 with a pointer at \`test plan generate\`.
+Accepting adds no charge. API test code is generated when the tests first run. The staging
+area is cleared either way (the output says how many proposals were discarded).
+Nothing staged: exit 6, pointing at \`test plan generate\`.
 
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
@@ -1112,34 +968,35 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > test plan generate 1`] = `
 "Usage: testsprite test plan generate [options]
 
-Generate AI test-case proposals for a project — runs only the missing pipeline
+Generate AI test-case proposals for a project: runs only the missing pipeline
 stages and stages the results server-side for review (nothing is written
 locally)
 
 Options:
-  --project <id>             project id (V3-native; V2 ids resolve through the
-                             migration bridge)
+  --project <id>             project id (or set TESTSPRITE_PROJECT_ID)
   --timeout <seconds>        total wait budget in seconds (1-3600, default
-                             1800; exploration takes minutes on a fresh
-                             frontend project)
-  --idempotency-key <token>  opaque idempotency token (1-256 ASCII chars).
-                             Defaults to a UUIDv4 minted per invocation; pin
-                             one yourself for safe retries.
+                             1800; exploration of a fresh frontend project
+                             takes minutes)
+  --idempotency-key <token>  idempotency token (1-256 ASCII chars; default:
+                             random UUID per invocation, pin one for safe
+                             retries)
   -h, --help                 display help for command
 
-Behavior:
-  - Runs the stages the project still needs (exploration for frontend,
-    strategy, proposals) and stops when proposals are staged for review.
-    Nothing is written to disk.
-  - Interrupt (exit 130/143/129) or timeout (exit 7): the stage in
-    progress finishes on its own, the rest wait. Run the same command
-    again to continue; it picks up where it left off. A stage that
-    already completed is never charged again.
-  - Workspace credits are spent per stage that runs; the result line reports
-    what THIS run charged (omitted when nothing new was charged).
-    \`testsprite usage\` shows your balance.
+Stages that run: exploration (frontend), strategy, proposals. On interrupt (exit 130/143/129)
+or timeout (exit 7) the running stage finishes on its own; re-run the same command to continue.
+A completed stage is never charged again. Workspace credits are spent per stage that runs;
+the result line reports what THIS run charged. \`testsprite usage\` shows your balance.
 
-Next step: review the printed table, then \`testsprite test plan accept\`.
+Next: review the printed table, then \`testsprite test plan accept\`.
+
+Exit codes:
+  0  proposals staged for review
+  1  a pipeline stage failed server-side (re-run to retry it)
+  3  authentication error
+  5  validation error
+  7  timeout (re-run to continue)
+ 11  rate limited
+ 12  insufficient credits
 
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
@@ -1150,7 +1007,7 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > test rerun 1`] = `
 "Usage: testsprite test rerun [options] [test-ids...]
 
-Re-execute a test (or multiple) as a replay — FE replays the saved script, BE re-runs the dependency closure. Billed the same as a fresh run: 0.5 credits per FE rerun / 0.2 credits per BE rerun (legacy V2 accounts: FE rerun remains free).
+[deprecated] Use \`testsprite test run\` instead; removed in 0.17.0. Re-execute a test case (or several) as a replay — FE replays the saved script, BE re-runs the dependency closure. Billed like a fresh run on V3 workspaces (0.5 credits per FE case, 0.2 per BE case). Legacy V2 accounts: reruns are free.
 
 Exit codes:
   0  passed (or queued without --wait)
@@ -1170,8 +1027,7 @@ stop it for real with: testsprite test cancel <run-id>
 Options:
   --all                       rerun all tests in the resolved project (requires
                               --project) (default: false)
-  --project <id>              project id (required with --all; returned by
-                              \`testsprite project list\`)
+  --project <id>              project id (required with --all)
   --skip-terminal             with --all: skip tests already in a terminal
                               status (passed|failed|blocked|cancelled)
                               (default: false)
@@ -1191,61 +1047,44 @@ Options:
                               600)
   --no-auto-heal              replay the saved script verbatim instead of
                               letting the agent repair it (default: auto-heal
-                              is ON for FE reruns). When heal engages, the
-                              agent re-authors the test and the new code
-                              replaces the stored version. Ignored for backend
-                              reruns. Costs: \`testsprite usage\`.
+                              is ON for FE reruns; a heal replaces the stored
+                              code). Ignored for backend reruns.
   --skip-dependencies         BE only: rerun only the named test without
                               expanding the producer/teardown closure (default:
                               false)
   --env <name>                replay against the named project environment —
-                              its test-account credentials, auto-auth and OTP
-                              settings (names: \`testsprite project env list
-                              <project-id>\`). Omit to keep using the project's
-                              default environment. Loopback URLs open a tunnel
-                              automatically. Applies to every test of a batch
-                              rerun.
+                              its credentials, auto-auth and OTP settings (see
+                              \`testsprite project env list <project-id>\`);
+                              loopback URLs open a tunnel. Default: the
+                              project's default environment. Applies to every
+                              test of a batch.
   --max-concurrency <n>       with a tunnel, max runs in flight (1-10, default
                               5); otherwise with --wait, max polls (1-100,
                               default 50)
-  --idempotency-key <key>     opaque key for safe retries (1–256 chars).
-                              Printed to stderr at --verbose if auto-generated.
+  --idempotency-key <key>     opaque key for safe retries (1–256 chars)
   --report <format>           with batch --wait: write a JUnit XML sidecar
                               report after polling (accepted: junit)
   --report-file <path>        output path for --report (atomic write)
   --report-suite-name <name>  optional JUnit <testsuite name=...> override
                               (default: testsprite:<projectId>)
-  --gh-output                 with batch --wait: emit GitHub-native output
-                              (::error:: annotations for failed/timed-out runs,
-                              ::warning:: for never-dispatched tests;
-                              job-summary table when $GITHUB_STEP_SUMMARY is
-                              set). Auto-enabled when GITHUB_ACTIONS=true
-  --summary-file <path>       with batch --wait: also write the reduced machine
-                              summary JSON {total, passed, failed, skipped,
-                              timedOut, runs[]} to this file
-  --allow-empty               with --all: exit 0 when the resolved test set is
-                              empty (no tests match
-                              --filter/--status/--skip-terminal, or the project
-                              has none). Default: fail with exit 5 — a
-                              zero-dispatch rerun is a CI false-green
+  --gh-output                 with batch --wait: emit GitHub annotations
+                              (::error:: failed/timed-out, ::warning:: never
+                              dispatched) and a job-summary table when
+                              $GITHUB_STEP_SUMMARY is set; auto-enabled when
+                              GITHUB_ACTIONS=true
+  --summary-file <path>       with batch --wait: also write summary JSON
+                              {total, passed, failed, skipped, timedOut,
+                              runs[]} to this file
+  --allow-empty               with --all: exit 0 when no tests match (default:
+                              exit 5, so an empty rerun is not a CI
+                              false-green)
   -h, --help                  display help for command
 
 Notes:
-  • Frontend reruns default to auto-heal; the server controls the default for a
-    fresh \`test run\`. Use --no-auto-heal to request a strict replay where supported.
-  • What still differs: rerun replays a SAVED run/script, so one has to exist;
-    \`test run\` starts fresh. A BE rerun also expands the dependency closure.
-  • Under --wait the per-request HTTP timeout is auto-raised to cover --timeout so a
-    slow trigger/poll under load is not cut at the 120s default (see --request-timeout).
-  • Batch --wait: rate-deferred tests appear in \`deferred[]\` and \`summary.deferred\`,
-    and force a non-zero exit — they are NOT counted in \`summary.total\` (dispatched only).
-  • rerun gets no server echo of the effective auto-heal decision, so a dropped
-    opt-out cannot be detected here the way \`test run --no-auto-heal\` detects it.
-
-Dry-run shape notes:
-  • --dry-run shows the BE rerun wire shape (includes \`closure{}\`); FE rerun responses
-    omit \`closure\` (or return it as null) since there is no dependency expansion.
-  • \`autoHeal\` defaults true for FE reruns; BE reruns ignore the field entirely.
+  • A rerun replays a SAVED run/script, so one must exist; \`test run\` starts fresh.
+    A BE rerun also expands the dependency closure.
+  • Batch --wait: rate-deferred tests appear in \`deferred[]\` / \`summary.deferred\` and force a
+    non-zero exit; they are not counted in \`summary.total\`.
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
@@ -1256,10 +1095,11 @@ exports[`--help snapshots > test result 1`] = `
 "Usage: testsprite test result [options] <test-id>
 
 Get the latest result for a test (default) or list prior runs (--history).
+"with --history" flags are ignored without --history (--env is rejected, exit
+5).
 
---output json shape differs by mode:
-  (default)  single CliLatestResult object
-  --history  { runs: RunHistoryItem[], nextCursor: string|null, meta: RunHistoryMeta }
+--output json: a single CliLatestResult, or with --history
+{ runs: RunHistoryItem[], nextCursor: string|null, meta: RunHistoryMeta }.
 
 Per-run detail: testsprite test wait <run-id>
 Failure bundle:  testsprite test artifact get <run-id>
@@ -1293,8 +1133,8 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > test run 1`] = `
 "Usage: testsprite test run [options] [test-id...]
 
-Trigger one or several test runs. Saved loopback environments open a tunnel automatically and wait for a verdict.
-Use --all --project <id> for a wave-ordered batch run. Loopback environments share one tunnel.
+Trigger a run of one or more test cases. Saved loopback environments open a tunnel automatically and wait for a verdict.
+Pass several <test-id>s, or use --all --project <id> [--filter <substr>], for a batch run (ids are grouped per project and sent 50 per request). Loopback environments share one tunnel.
 
 Exit codes:
   0  passed (or queued without --wait)
@@ -1305,64 +1145,49 @@ Exit codes:
   6  conflict (already running — see nextAction for the active runId)
   7  timeout — resume with: testsprite test wait <run-id>, or stop it with: testsprite test cancel <run-id>
  10  transport/network failure (UNAVAILABLE) — retry the command
- 11  rate limited — honor Retry-After, or the in-flight run cap was hit
-     (details.reason "inflight_cap"; see: testsprite test run --help)
+ 11  rate limited — honor Retry-After
+ 12  insufficient credits (non-retriable; top up)
+ 13  feature gated / workspace paused
 
 On failure/blocked/cancelled, run: testsprite test artifact get <run-id>
 
 Ctrl-C during an ordinary --wait detaches; an owned tunnel cancels unfinished runs by default.
 Stop a detached run with: testsprite test cancel <run-id>
-Local environments: dev servers can take a minute per page through the tunnel.
-For a heavy dev server, test a built server: npm run build, then your framework preview/start command.
+Dev servers can take a minute per page through a tunnel; prefer a built server (npm run build, then start).
 
 Options:
-  --target-url <url>          frontend tests only: use the environment already
-                              pointing at this URL's origin, or a temporary one
-                              TestSprite deletes when the run finishes; with
-                              --env, use its settings against this URL;
-                              loopback URLs open a tunnel automatically
-  --skip-preflight            skip the pre-charge reachability probe for a
-                              target URL. The probe runs from this machine, not
-                              from the Lambda that executes the test, so it can
-                              occasionally be wrong (e.g. an IP allowlist that
-                              permits the Lambda but not this machine); use
-                              this flag when you know better. Zero network
-                              calls when set. (default: false)
-  --local <port>              run against an app on THIS machine, reached
-                              through a TestSprite tunnel. The test runner
-                              navigates to http://localhost:<port> and its
-                              traffic is proxied back to you for as long as
-                              this command runs. Implies --wait (the tunnel
-                              closes when the command exits, so a detached run
-                              could not finish). Frontend tests only; a
-                              matching saved environment keeps its host
-                              spelling; several ids or --all share one tunnel
-                              (5 concurrent by default, at most 10). Before
-                              anything is minted or billed, the port is probed
-                              and a dead one is refused.
-  --local-host <host>         with --local, override which loopback address to
-                              name in the run's target URL — one of localhost,
-                              127.0.0.1, ::1 (default: saved matching host,
-                              else localhost). Use localhost if your app only
-                              answers on that name, or ::1 for an IPv6-only
-                              listener.
+  --target-url <url>          frontend tests only: run against this URL, using
+                              the environment for its origin (else a temporary
+                              one deleted after the run); with --env, that
+                              environment's settings; loopback URLs open a
+                              tunnel
+  --skip-preflight            skip the pre-charge reachability probe of the
+                              target URL (it runs from this machine, not the
+                              cloud, so it can be wrong, e.g. behind an IP
+                              allowlist) (default: false)
+  --local <port>              run against an app on THIS machine through a
+                              TestSprite tunnel (the runner opens
+                              http://localhost:<port>). Implies --wait.
+                              Frontend tests only; several ids or --all share
+                              one tunnel (5 concurrent, max 10). A dead port is
+                              refused before anything is billed.
+  --local-host <host>         with --local, loopback address in the target URL:
+                              localhost, 127.0.0.1, ::1 (default: saved
+                              matching host, else localhost). Use localhost if
+                              your app only answers on that name, ::1 for
+                              IPv6-only.
   --tunnel-client <id>        for a loopback environment or --local, attach to
                               a tunnel already running under \`testsprite tunnel
-                              start\` instead of opening a new one. The id is
-                              the non-secret handle that command prints; the
-                              tunnel stays owned by that process and is not
-                              closed when this run or batch finishes.
-  --no-cancel-on-interrupt    with a tunnel, skip automatic cancellation when
-                              an owned tunnel is about to close or a borrowed
-                              tunnel's owner disappears. An ordinary interrupt
-                              of a borrowed run never cancels it because its
-                              tunnel remains alive.
+                              start\` (use the id it prints) instead of opening
+                              one; that process keeps the tunnel open
+                              afterwards.
+  --no-cancel-on-interrupt    with a tunnel, do not auto-cancel runs when an
+                              owned tunnel closes or a borrowed tunnel's owner
+                              disappears
   --env <name>                run against the named project environment — its
-                              test-account credentials, auto-auth and OTP
-                              settings (names: \`testsprite project env list
-                              <project-id>\`). A loopback environment opens a
-                              tunnel automatically. The run opens that
-                              environment's URL. Omit --env to keep using the
+                              credentials, auto-auth and OTP settings (see
+                              \`testsprite project env list <project-id>\`); a
+                              loopback one opens a tunnel. Default: the
                               project's default environment. Also applies with
                               --all.
   --wait                      poll until terminal status or --timeout elapses
@@ -1372,88 +1197,69 @@ Options:
   --timeout <s>               with --wait, max seconds per run (1–3600; default
                               600, or 1200 through a tunnel)
   --idempotency-key <key>     opaque key for safe retries (1–256 chars); local
-                              batches append each test id. Auto-generated keys
-                              print to stderr in JSON, verbose or debug mode.
-  --all                       run all tests in the project (wave-ordered fresh
-                              run; uses --project or TESTSPRITE_PROJECT_ID).
-                              Mutually exclusive with <test-id>. (default:
-                              false)
-  --project <id>              project id (with --all, overrides
-                              TESTSPRITE_PROJECT_ID; returned by \`testsprite
-                              project list\`)
+                              batches append each test id
+  --all                       run all tests in the project in wave order (uses
+                              --project or TESTSPRITE_PROJECT_ID); excludes
+                              <test-id> (default: false)
+  --project <id>              project id for --all (overrides
+                              TESTSPRITE_PROJECT_ID)
   --filter <substr>           with --all: only run tests whose name contains
                               this substring (case-insensitive)
+  --status <list>             with --all: only run tests whose latest status
+                              matches one of these values (comma-separated;
+                              accepted:
+                              passed|failed|blocked|cancelled|not_run; not_run
+                              = never ran); --env only picks where to run
   --max-concurrency <n>       with a tunnel, max runs in flight through one
-                              tunnel (1-10, default 5); with --all --wait
-                              without a tunnel, max polls (1-100, default 50)
+                              tunnel (1-10, default 5); with --all or several
+                              ids and --wait without a tunnel, max polls
+                              (1-100, default 50)
   --report <format>           with a --wait batch (--all or several ids): write
                               a JUnit XML sidecar report after polling
                               (accepted: junit)
   --report-file <path>        output path for --report (atomic write)
   --report-suite-name <name>  optional JUnit <testsuite name=...> override
                               (default: testsprite:<projectId>)
-  --gh-output                 with --wait (single test or batch): emit
-                              GitHub-native output (::error:: annotations for
-                              failed/timed-out runs, ::warning:: for
-                              never-dispatched tests; job-summary table when
-                              $GITHUB_STEP_SUMMARY is set). Auto-enabled when
-                              GITHUB_ACTIONS=true
-  --summary-file <path>       with --wait (single test or batch): also write
-                              the reduced machine summary JSON {total, passed,
-                              failed, skipped, timedOut, runs[]} to this file
-  --allow-empty               with --all: exit 0 when the run dispatches ZERO
-                              tests (all skipped / empty project / --filter
-                              matched nothing). Default: fail with exit 5 — a
-                              zero-dispatch run is a CI false-green
-  --no-auto-heal              ask the server to replay stored test code instead
-                              of letting the agent heal it. The server controls
-                              whether fresh runs heal drifted generated code by
-                              default; when healing is enabled, the agent
-                              re-authors stale code rather than replaying a
-                              script that can only fail. Use this flag to
-                              request a strict replay for a regression gate or
-                              a reproduction you are bisecting. Code you wrote
-                              yourself is never re-authored. Where stored-code
-                              replay is unavailable, the server rejects this
-                              flag. Where replay is available but a test has no
-                              replayable stored code, the server may refuse the
-                              run instead of authoring it. An older server may
-                              ignore the flag; the CLI prints an [advisory]
-                              when the server reports that the opt-out did not
-                              take.
+  --gh-output                 with --wait: emit GitHub annotations (::error::
+                              failed/timed-out, ::warning:: never dispatched)
+                              and a job-summary table when $GITHUB_STEP_SUMMARY
+                              is set; auto-enabled when GITHUB_ACTIONS=true
+  --summary-file <path>       with --wait: also write summary JSON {total,
+                              passed, failed, skipped, timedOut, runs[]} to
+                              this file
+  --allow-empty               with --all: exit 0 when ZERO test cases are
+                              dispatched (default: exit 5, so an empty run is
+                              not a CI false-green)
+  --no-auto-heal              request strict replay of stored test code instead
+                              of letting the agent heal drifted generated code
+                              (the server decides the default); use for
+                              regression gates and bisects. Code you wrote
+                              yourself is never re-authored. The server rejects
+                              the flag where replay is unavailable and may
+                              refuse a test with no replayable code; the CLI
+                              prints an [advisory] if the opt-out did not take.
+  --skip-dependencies         Backend test cases only: run without the test
+                              cases they depend on (default: false)
   -h, --help                  display help for command
 
-Dependency-aware fresh run:
-  testsprite test run --all --project <id>                run all project tests in wave order
-  TESTSPRITE_PROJECT_ID=<id> testsprite test run --all    use env default project
-  testsprite test run <id> <id> --local 3000             several local tests, one tunnel
-  testsprite test run --all --project <id> --local 3000  all frontend tests, one tunnel
-  testsprite test run <id> <id> --local 3000 --max-concurrency 3
-  testsprite test run --all --filter <substr>             name-glob subset (uses --project/env)
-  testsprite test run --all --wait --report junit --report-file ./results.xml
-  project id precedence: --project wins over TESTSPRITE_PROJECT_ID
+Examples:
+  testsprite test run --all --project <id>                all test cases in the project, in wave order
+  testsprite test run <id> <id> <id>                      several test cases in one run (any number of ids; sent 50 per request)
+  testsprite test run <id> <id> --local 3000             several local test cases, one tunnel
+  testsprite test run --all --status failed --env staging test cases whose latest status is failed, run in staging
+  testsprite test run --all --filter <substr> --wait --report junit --report-file ./results.xml
 
-BE tests can declare --produces/--needs at create time to drive wave ordering
-(see \`testsprite test create --help\` for details).
+On the legacy backend-only engine, FE test cases are skipped (reported under skippedFrontend);
+run them with \`test run <id>\`. BE test cases can declare --produces/--needs at create time to order waves.
 
-Frontend tests: the current unified engine runs FE tests too (they are billed
-like any run). On the legacy backend-only engine FE tests cannot run — they are
-reported under skippedFrontend with an advisory; run those with 'test run <id>'.
-
-Concurrency limits:
-  - CLI run triggers are refused once 50 of your runs are already in
-    flight (server default; the refusal reports your real cap). Runs from every
-    source count toward it (CLI, portal, schedules, CI), but only CLI triggers
-    are refused on it.
-    At the cap this command accepts nothing and returns every id deferred,
-    which exits 7; resume with the printed ids once runs finish. (A single
-    \`test run <id>\` over the cap exits 11 with details.reason "inflight_cap",
-    and is not auto-retried — runs have to finish first.)
-    Poll what is already running with: testsprite test wait <run-id...>
-  - Separately, run triggers are throttled per minute. That one does clear on
-    its own and is retried for you.
-  - --max-concurrency here bounds the --wait poll fan-out, not dispatch, so it
-    has no effect on the cap. A smaller batch does.
+Queueing and limits:
+  - Each request starts one run; its results show queued until they start,
+    as in the Portal.
+  - A test case that already has a run in flight is a conflict (exit 6), not queued.
+  - Run triggers are limited to 60 per minute per API key; that limit clears on
+    its own and is retried for you. An older backend may still answer with
+    deferred ids: they are reported, not resent, and exit 7.
+  - --max-concurrency here bounds the --wait poll fan-out, not dispatch.
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
   testsprite --help
@@ -1466,9 +1272,13 @@ exports[`--help snapshots > test steps 1`] = `
 List the steps of the latest run (use --run-id for a specific run)
 
 Options:
-  --page-size <n>           service page size hint (1-100, default 25)
-  --max-items <n>           stop after this many items across auto-paged pages
-  --starting-token <token>  opaque cursor from a previous response
+  --page-size <n>           fetch ONE page of N steps (1-100) and print the
+                            next token (default: follow every page); ignored
+                            with --run-id
+  --max-items <n>           stop after this many items across auto-paged pages;
+                            ignored with --run-id
+  --starting-token <token>  opaque cursor from a previous response; ignored
+                            with --run-id
   --run-id <id>             Show steps of the specified run instead of the
                             latest run.
   -h, --help                display help for command
@@ -1494,7 +1304,7 @@ Commands:
   delete [options] <list-id>               Delete a test list and its schedules (requires --confirm)
   add [options] <list-id> <test-id...>     Add one or more tests to a test list
   remove [options] <list-id> <test-id...>  Remove one or more tests from a test list
-  run [options] <list-id>                  Run a test list (dispatch its cases and return pollable run ids). Loopback environments open a tunnel automatically and wait.
+  run [options] <list-id>                  Run a test list
   help [command]                           display help for command
 "
 `;
@@ -1591,8 +1401,17 @@ Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeou
 exports[`--help snapshots > testlist run 1`] = `
 "Usage: testsprite testlist run [options] <list-id>
 
-Run a test list (dispatch its cases and return pollable run ids). Loopback
-environments open a tunnel automatically and wait.
+Run a test list (dispatch its cases and return pollable run ids). Environments come from the list's --project-env mapping; loopback ones open one tunnel and wait (backend cases are skipped).
+
+Exit codes:
+  0  dispatched (or all passed with --wait)
+  1  a run failed / blocked / cancelled
+  3  auth error
+  4  a --case id is not in the list
+  6  nothing dispatched: every case conflicted (already running, or cannot run here)
+  7  timeout, or some cases were rate-deferred (retry the printed ids)
+ 12  insufficient credits (non-retriable; top up)
+ 13  feature gated / workspace paused
 
 Options:
   --case <test-id>            run only this case (repeatable; default: every
@@ -1614,14 +1433,13 @@ Options:
   --report-file <path>        output path for --report (atomic write)
   --report-suite-name <name>  JUnit <testsuite name=...> override (default:
                               testsprite:testlist:<listId>)
-  --gh-output                 with --wait: emit GitHub-native output (::error::
-                              annotations for failed/timed-out members,
-                              ::warning:: for never-dispatched ones;
-                              job-summary table when $GITHUB_STEP_SUMMARY is
-                              set). Auto-enabled when GITHUB_ACTIONS=true
-  --summary-file <path>       with --wait: also write the reduced machine
-                              summary JSON {total, passed, failed, skipped,
-                              timedOut, runs[]} to this file
+  --gh-output                 with --wait: emit GitHub annotations (::error::
+                              failed/timed-out, ::warning:: never dispatched)
+                              and a job-summary table when $GITHUB_STEP_SUMMARY
+                              is set; auto-enabled when GITHUB_ACTIONS=true
+  --summary-file <path>       with --wait: also write summary JSON {total,
+                              passed, failed, skipped, timedOut, runs[]} to
+                              this file
   -h, --help                  display help for command
 
 Global options (--dry-run, --output, --profile, --endpoint-url, --request-timeout, --verbose, --debug):
@@ -1656,50 +1474,49 @@ Options:
   -V, --version                output the version number
   --output <mode>              Output format (json|text) (default: "text")
   --profile <name>             Configuration profile to use
-  --endpoint-url <url>         Override the API endpoint host
-  --verbose                    Emit human-readable HTTP retry / backoff /
-                               polling-mode transitions to stderr. Less noisy
-                               than --debug; useful for diagnosing hangs
-                               without the full trace.
+  --endpoint-url <url>         API base URL (a full http(s) URL)
+  --verbose                    Log HTTP retry / backoff / polling transitions
+                               to stderr (lighter than --debug)
   --debug                      Print HTTP method/path, request id, latency,
                                retry decisions to stderr
   --dry-run                    Skip the network and credentials; emit a canned
-                               sample matching the OpenAPI contract. Useful for
-                               learning the CLI surface without an API key.
-                               Note: file inputs you pass
-                               (--plan-from/--plans/--steps) are still read and
-                               validated locally; only --code-file uses a
-                               placeholder.
-  --request-timeout <seconds>  Client-side per-request timeout in seconds
-                               (default: 120). Aborts any single fetch that
-                               does not complete within this deadline. Override
-                               via TESTSPRITE_REQUEST_TIMEOUT_MS env var
-                               (milliseconds). Range: 1–600. Does not affect
-                               the --timeout polling ceiling for \`test
-                               run/wait\`.
+                               sample matching the OpenAPI contract. Exception:
+                               run commands (\`test run\`, \`test rerun\`, \`test
+                               create --run\`, \`testlist run\`) with credentials
+                               and no explicit target may make read-only GETs
+                               to preview an automatic tunnel target; nothing
+                               is created or started. File inputs
+                               (--plan-from/--plans/--steps) are still read
+                               locally; --code-file uses a placeholder.
+  --request-timeout <seconds>  Per-request timeout in seconds (default 120;
+                               range 1–600, values outside are clamped). Does
+                               not affect the --timeout polling ceiling for
+                               \`test run/wait\`.
   -h, --help                   display help for command
 
 Commands:
-  setup [options]              Set up TestSprite: configure your API key and
-                               install the TestSprite agent skills for your
-                               coding agent
+  setup [options]              Configure your API key and install the agent
+                               skills
   auth                         Manage TestSprite credentials
   project                      Manage TestSprite projects
-  test                         Inspect TestSprite tests
+  test                         Create, run and inspect tests
   testlist                     Manage test lists (groups of tests)
   ci                           Run tests in CI and scaffold CI integration
-  schedule                     Manage TestSprite schedules
+  schedule                     Manage schedules (V3 workspace)
   tunnel                       Open a tunnel so TestSprite can reach an app on
                                this machine
   agent                        Install TestSprite guidance into coding-agent
-                               config (Claude Code, Cursor, Cline, Antigravity,
-                               Kiro, Windsurf, Copilot, Codex)
-  usage|credits                Show credit balance and plan/entitlement info
-                               (proactive pre-flight before a large test run)
-  doctor                       Diagnose CLI setup: version, Node, profile,
-                               endpoint, credentials, connectivity, skill
+                               config
+  usage|credits                Show credit balance and plan info
+  doctor                       Diagnose CLI setup: credentials, connectivity,
+                               skill
   completion [shell]           Print a shell completion script (bash|zsh|fish)
   help [command]               display help for command
+
+Environment:
+  TESTSPRITE_API_KEY (overrides stored credentials), TESTSPRITE_NO_UPDATE_NOTIFIER (disables
+  the version check); TESTSPRITE_API_URL, TESTSPRITE_PROFILE and TESTSPRITE_REQUEST_TIMEOUT_MS
+  (milliseconds) mirror --endpoint-url, --profile and --request-timeout.
 "
 `;
 
@@ -1712,29 +1529,21 @@ Options:
   -h, --help                  display help for command
 
 Commands:
-  start [options]             Open a tunnel and hold it until you stop the
-                              command (Ctrl-C)
+  start [options]             Open a tunnel and hold it until Ctrl-C
   list                        List live tunnel bindings for this account
-  status <client-id>          Report whether a tunnel client of yours is
-                              connected
-  stop [options] [client-id]  Destroy one tunnel credential or stop every live
-                              tunnel
+  status <client-id>          Report whether a tunnel client is connected
+  stop [options] [client-id]  Stop one tunnel, or all with --all
   help [command]              display help for command
 
-Frontend runs automatically open and close a tunnel when the selected environment URL
-is on this machine. Use these commands when you want one tunnel to serve several runs, or to check on
-one that a run reported as down.
-
-A tunnel lives only as long as \`tunnel start\` is running — there is no background
-daemon, because the credential that authorises an inbound network path into this machine
-is never written to disk.
+Frontend runs open and close a tunnel automatically when the environment URL is on this
+machine. Use these commands to share one tunnel across several runs or to check one a run
+reported as down. A tunnel lives only as long as \`tunnel start\` runs: there is no background
+daemon, because its credential is never written to disk.
 
 Examples:
-  testsprite tunnel start                                   # hold a tunnel open (Ctrl-C to stop)
-  testsprite test run <id> --env <name> --tunnel-client <id>
-  testsprite tunnel list
-  testsprite tunnel status <id>
-  testsprite tunnel stop <id>
+  testsprite tunnel start    # hold a tunnel open (Ctrl-C to stop)
+  testsprite test run <test-id> --env <name> --tunnel-client <client-id>
+  testsprite test run <test-id> --local 3000 --tunnel-client <client-id>
   testsprite tunnel stop --all --confirm
 
 "
@@ -1748,8 +1557,7 @@ List live tunnel bindings for this account
 Options:
   -h, --help  display help for command
 
-Shows each tunnel client id, connection status, creation time and expiry.
-Includes tunnels automatically opened for environments on this machine.
+Shows each tunnel client id, status, creation time and expiry, including tunnels opened automatically.
 
 Exit codes:
   0  listed (possibly empty)
@@ -1769,18 +1577,16 @@ exports[`--help snapshots > tunnel start 1`] = `
 Open a tunnel and hold it until you stop the command (Ctrl-C)
 
 Options:
-  --ttl <seconds>  requested lifetime of the tunnel credential (60–28800). The
-                   server clamps this, and the credential is deleted when the
-                   command exits regardless — the lifetime only matters if this
-                   process is killed without cleaning up.
+  --ttl <seconds>  requested credential lifetime (60–28800), clamped by the
+                   server; the credential is deleted on exit regardless, so
+                   this only matters if the process is killed
   -h, --help       display help for command
 
-Prints the client id to stderr as soon as it is minted, before connecting; pass it
-to \`test run <id> --env <name> --tunnel-client <id>\` for an environment on this machine.
-Frontend runs normally open their own tunnel automatically for a loopback environment URL.
+Prints the client id to stderr as soon as it is minted; pass it to
+\`test run <test-id> --env <name> --tunnel-client <client-id>\` for an environment on this machine.
 
-Dev servers can take a minute per page through the tunnel. For a heavy dev server,
-test a built server: \`npm run build\`, then your framework's preview/start command.
+Dev servers can take a minute per page through the tunnel; for a heavy one, test a built
+server (\`npm run build\`, then your framework's preview/start command).
 
 Exit codes:
   0  you stopped it (Ctrl-C is the normal way to end this command)
@@ -1809,6 +1615,7 @@ Use the client id printed by a run that automatically opened a tunnel.
 Exit codes:
   0  answered (the answer may be \`offline\`)
   4  no such tunnel for this account
+  5  client id is not a UUID
  10  could not reach TestSprite to ask
 
 
@@ -1831,14 +1638,15 @@ Options:
 Stopping one that is already gone succeeds. Revoking the credential
 also makes a running \`tunnel start\` exit within ~15 s.
 A run that automatically opened this tunnel loses access to its environment when you stop it.
-Stopping all requires --confirm; --dry-run previews sample ids without it.
+Stopping all requires --confirm and also revokes tunnels used by other terminals and CI jobs;
+--dry-run previews sample ids without it.
 
 Exit codes:
   0  stopped (or already absent), including an empty --all result
   1  at least one tunnel could not be stopped
   3  auth error — the key needs the \`run:tunnel\` scope
   4  server too old to list tunnels (with --all)
-  5  invalid arguments or --all without --confirm
+  5  invalid arguments (e.g. a client id that is not a UUID) or --all without --confirm
  10  could not reach TestSprite
 
 
