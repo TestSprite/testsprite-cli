@@ -818,7 +818,10 @@ export function addSetupOptions(
     .option('--no-agent', 'Skip the agent skill install (configure credentials only)')
     .option('--force', 'Overwrite an existing skill file (a .bak backup is kept)')
     .option('--dir <path>', 'Project root for the skill install (default: current directory)')
-    .option('-y, --yes', 'Non-interactive: accept all defaults, never prompt')
+    .option(
+      '-y, --yes',
+      'Non-interactive: accept defaults, never prompt (needs --from-env or --api-key)',
+    )
     .option(
       '--skip-if-configured',
       'Skip the API key prompt when credentials already exist for this profile (CI-safe idempotent re-run)',
@@ -893,8 +896,17 @@ export function createSetupCommand(deps: InitDeps = {}): Command {
   const defaultAgent: AgentTarget = 'claude';
 
   return addSetupOptions(new Command('setup'), validTargets, defaultAgent)
+    .summary('Configure your API key and install the agent skills')
     .description(SETUP_DESCRIPTION)
-    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .addHelpText(
+      'after',
+      '\nValidates the key (GET /me), saves it to your profile and writes the skills into the project\n' +
+        'directory. With --yes or no terminal (CI) the key must come from --from-env or --api-key\n' +
+        '(or --skip-if-configured with a saved key); otherwise setup exits 5.\n' +
+        '\nExample:\n' +
+        '  TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --yes --agent claude\n' +
+        GLOBAL_OPTS_HINT,
+    )
     .action(async (cmdOpts: SetupCmdOpts, command: Command) => {
       await runSetupAction(cmdOpts, command, deps);
     });

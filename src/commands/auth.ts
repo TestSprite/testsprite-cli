@@ -467,7 +467,9 @@ export async function runLogout(opts: CommonOptions, deps: AuthDeps = {}): Promi
 }
 
 export function createAuthCommand(deps: AuthDeps = {}): Command {
-  const auth = new Command('auth').description('Manage TestSprite credentials');
+  const auth = new Command('auth')
+    .description('Manage TestSprite credentials')
+    .addHelpText('after', '\nTo add credentials, run: testsprite setup');
 
   // `status` (primary; formerly `whoami`). Credential WRITES no longer live
   // here — `auth configure` is a hidden, deprecated alias for `setup` (attached
@@ -475,7 +477,10 @@ export function createAuthCommand(deps: AuthDeps = {}): Command {
 
   auth
     .command('status')
-    .description('Show the user, API key, env, and scopes bound to the active profile')
+    .summary('Show the active profile and its credentials')
+    .description(
+      'Show the active profile: user, API key id, endpoint, env, scopes and, when available, org, workspace and routing',
+    )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_cmdOpts, command: Command) => {
       await runWhoami(resolveCommonOptions(command, deps.env), deps);
@@ -493,7 +498,10 @@ export function createAuthCommand(deps: AuthDeps = {}): Command {
 
   auth
     .command('remove')
-    .description('Remove credentials for the active profile')
+    .summary('Remove the stored API key for the active profile')
+    .description(
+      'Remove the stored API key for the active profile, on this machine only. The key is not revoked (do that in the dashboard); TESTSPRITE_API_KEY is unaffected',
+    )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_cmdOpts, command: Command) => {
       await runLogout(resolveCommonOptions(command, deps.env), deps);

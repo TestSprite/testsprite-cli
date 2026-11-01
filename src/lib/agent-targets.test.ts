@@ -512,15 +512,16 @@ describe('content integrity — local run outcomes', () => {
     }
   });
 
-  it('installed verify skills qualify public environment tunnel preflight', () => {
+  it('installed verify skills describe --env with --local as a server-side decision', () => {
     const assets = [
       ['docs template', templateRaw],
       ['own-file skill body', renderForTarget('claude', 'testsprite-verify').content],
     ] as const;
 
     for (const [name, content] of assets) {
-      expect(content, name).toMatch(/can\s+(?:read|list) the project(?:'s)? environments/);
-      expect(content, name).toMatch(/server refuses[^.]*before dispatch/);
+      expect(content, name).toMatch(/--env <name> --local <port>`\s+sends/);
+      expect(content, name).toMatch(/applies it or refuses\s+before dispatch/);
+      expect(content, name).not.toMatch(/fails before a tunnel opens/);
     }
   });
 });

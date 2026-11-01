@@ -1440,6 +1440,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
 
   project
     .command('list')
+    .summary('List projects visible to the API key')
     .description(
       'List projects visible to the API key\n' +
         '\nExit codes:\n' +
@@ -1448,10 +1449,16 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
         '  5  validation error (e.g., bad --page-size)\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command',
     )
-    .option('--page-size <n>', 'service page-size hint (1-100, default 25)')
+    .option(
+      '--page-size <n>',
+      'page size (1-100, default 25); alone it returns one page plus a next --starting-token (add --max-items to auto-page)',
+    )
     .option('--starting-token <token>', 'opaque cursor from a previous list response')
     .option('--max-items <n>', 'stop after this many items across auto-paged pages')
-    .option('--columns <list>', 'select/reorder text table columns (comma-separated keys)')
+    .option(
+      '--columns <list>',
+      'select/reorder text table columns (comma-separated keys: id, name, type, from, org, url, created, defaultenv, envs)',
+    )
     .option('--no-header', 'suppress the text table header row')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts: ListFlagOpts, command: Command) => {
@@ -1488,12 +1495,11 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .option('--name <name>', 'project name (required)')
     .option(
       '--url <url>',
-      'target URL (public http/https or a loopback http origin with an explicit port; required for frontend unless --local is used; also required for backend on the V3 execution ' +
-        'path — see `auth status` for your routing)',
+      'target URL (public http/https; a loopback http origin with an explicit port is frontend only; required for frontend unless --local; also required for backend on the V3 path, see `auth status`)',
     )
     .option(
       '--local <port>',
-      'shorthand for --url http://localhost:<port> (1-65535; excludes --url; runs open a tunnel automatically)',
+      'shorthand for --url http://localhost:<port> (1-65535; excludes --url; frontend only; runs open a tunnel automatically)',
     )
     .addOption(
       new Option(
@@ -1506,9 +1512,15 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       '--description <text>',
       'not supported — projects have no description (test-level descriptions are set on `test create`)',
     )
-    .option('--username <user>', 'optional auth username')
-    .option('--password <pw>', 'optional auth password (use --password-file for non-interactive)')
-    .option('--password-file <path>', 'read password from file instead of inline flag')
+    .option('--username <user>', 'optional auth username (give with --password)')
+    .option(
+      '--password <pw>',
+      'optional auth password, with --username (--password-file for non-interactive)',
+    )
+    .option(
+      '--password-file <path>',
+      'read password from file (if both are given, --password wins with a warning)',
+    )
     .option('--instruction <text>', 'optional FE plan-gen instruction hint')
     .option(
       '--test-id-attributes <list>',
@@ -1572,7 +1584,10 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .option('--skip-preflight', 'skip the local TCP listener check before the update')
     .option('--username <user>', 'new auth username')
     .option('--password <pw>', 'new auth password')
-    .option('--password-file <path>', 'read new password from file')
+    .option(
+      '--password-file <path>',
+      'read new password from file (if both are given, --password wins with a warning)',
+    )
     .option('--instruction <text>', 'new FE plan-gen instruction hint')
     .option(
       '--test-id-attributes <list>',
@@ -1616,6 +1631,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
 
   project
     .command('delete <project-id>')
+    .summary('Permanently delete a project (requires --confirm)')
     .description(
       'Permanently delete a project and everything under it (sub-projects,\n' +
         'their tests, and backend fixtures). Requires --confirm.\n' +
@@ -1645,11 +1661,15 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
 
   project
     .command('credential <project-id>')
+    .summary('Set the static credential injected into backend tests')
     .description(
-      'Set the static backend credential injected into every backend test\n' +
-        '(Bearer token / API key / Basic token / public). Free tier.',
+      'Set the static backend credential injected into every backend test. Free tier.\n' +
+        "On V3 accounts it is stored on the project's default environment.",
     )
-    .requiredOption('--type <type>', 'public | "Bearer token" | "API key" | "basic token"')
+    .requiredOption(
+      '--type <type>',
+      'required: public | "Bearer token" | "API key" | "basic token" (exact, lowercase)',
+    )
     .option('--credential <value>', 'credential value (required unless --type public)')
     .option('--credential-file <path>', 'read the credential value from a file')
     .option(
@@ -1673,13 +1693,19 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
 
   project
     .command('auto-auth <project-id>')
+    .summary('Configure auto-refresh login for backend tests (paid)')
     .description(
-      'Configure the recurring-token (auto-refresh login) for backend tests (Pro).\n' +
-        'A fresh token is fetched on each run and injected into every backend test.',
+      'Configure the recurring-token (auto-refresh login) for backend tests (paid plans):\n' +
+        'a fresh token is fetched on each run and injected into every backend test.\n' +
+        'Each method needs its own flags (password: --login-url, --token-path, ...;\n' +
+        'refresh_token: --token-endpoint, --client-id, ...; aws_cognito_refresh: --region, ...).',
     )
     .requiredOption('--method <method>', 'password | refresh_token | aws_cognito_refresh')
     .requiredOption('--inject <where>', 'bearer | header | cookie')
-    .option('--disable', 'turn auto-auth off (keeps stored config)')
+    .option(
+      '--disable',
+      'turn auto-auth off, keeping stored config (--method and --inject are still required)',
+    )
     .option('--inject-key <name>', 'header/cookie name when --inject is header/cookie')
     // password method
     .option('--login-url <url>', 'login endpoint (method=password)')
@@ -1736,16 +1762,16 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       );
     });
 
-  const docs = new Command('docs').description(
-    'Manage project documents — the sources plan generation feeds on',
-  );
+  const docs = new Command('docs')
+    .summary('Manage project documents (plan-generation sources)')
+    .description('Manage project documents — the sources plan generation feeds on');
   docs
     .command('upload <file>')
+    .summary('Upload an API spec or PRD as a project source')
     .description(
-      'Upload an API spec or PRD as a project source. Three steps:\n' +
-        'mint a presigned S3 URL, stream the file bytes to it, register the\n' +
-        'document — which starts processing + embedding. The local file is\n' +
-        'only read; nothing is written back to disk.\n' +
+      'Upload an API spec or PRD as a project source: mint a presigned S3 URL, stream the file\n' +
+        'to it, register the document — which starts processing + embedding and spends credits\n' +
+        '(see `testsprite usage`). The local file is only read.\n' +
         '\nExit codes:\n' +
         '  0  upload registered (processing started)\n' +
         '  3  auth error\n' +
@@ -1754,7 +1780,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
         '  7  request timeout (also: backend predates the docs routes)\n' +
         ' 10  presigned S3 PUT failed — re-run to mint a fresh URL',
     )
-    .option('--project <id>', 'project id the document belongs to (required)')
+    .option('--project <id>', 'project id (required unless TESTSPRITE_PROJECT_ID is set)')
     .option('--role <role>', 'document role: api-doc (API spec, default) | prd')
     .option('--name <display-name>', 'display name for the document (default: file basename)')
     .option(

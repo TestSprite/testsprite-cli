@@ -471,8 +471,9 @@ function renderDoctor(report: DoctorReport): string {
 
 export function createDoctorCommand(deps: DoctorDeps = {}): Command {
   const cmd = new Command('doctor')
+    .summary('Diagnose CLI setup: credentials, connectivity, skill')
     .description(
-      'Diagnose CLI setup: version, Node, profile, endpoint, credentials, connectivity, skill',
+      'Diagnose CLI setup: version, Node, profile, endpoint, credentials, API connectivity, workspace routing, tunnel permission (run:tunnel) and the verify skill in this directory. Exit 1 if any check fails; warnings do not.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .addHelpText(
