@@ -3667,6 +3667,129 @@ describe('runTestRunAll — batch fresh run', () => {
   }
 
   it.each(['SIGINT', 'SIGTERM'] as const)(
+    'names unverified conflicts in text when no runs were accepted on %s',
+    async signal => {
+      const { credentialsPath } = makeCreds();
+      const shutdown = new ShutdownController();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const methods: string[] = [];
+      const error: unknown = await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          shutdown,
+          fetchImpl: makeFetch((url, init) => {
+            methods.push(init.method ?? 'GET');
+            if (init.method === 'POST') {
+              return {
+                body: {
+                  ...BATCH_FRESH_RESP,
+                  accepted: [],
+                  conflicts: [
+                    { testId: 'test_busy', currentRunId: 'run_busy' },
+                    { testId: 'test_busy_2', currentRunId: 'run_busy_2' },
+                    { testId: 'test_unknown', reason: 'in_flight' },
+                  ],
+                },
+              };
+            }
+            if (url.includes('/runs/')) {
+              shutdown.interrupt(signal);
+              throw shutdown.signal.reason;
+            }
+            return { body: { environments: [] } };
+          }),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+        },
+      ).catch((caught: unknown) => caught);
+      expect(error).toBe(shutdown.signal.reason);
+      expect(shutdown.isArmed).toBe(false);
+      expect(stdout.join('\n')).toBe(
+        'run_busy  unverified (not attached)\nrun_busy_2  unverified (not attached)',
+      );
+      expect(stderr.join('\n')).not.toContain('[auto-resume]');
+      expect(methods.filter(method => method !== 'GET')).toEqual(['POST']);
+    },
+  );
+
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'keeps unsent filtered test IDs when dispatch stops before metadata interruption on %s',
+    async signal => {
+      const { credentialsPath } = makeCreds();
+      const shutdown = new ShutdownController();
+      const stdout: string[] = [];
+      const methods: string[] = [];
+      const tests = Array.from({ length: 51 }, (_, i) => ({
+        id: `test_${i}`,
+        name: `selected ${i}`,
+        projectId: 'project_be',
+        type: i >= 2 && i < 50 ? 'frontend' : 'backend',
+      }));
+      let dispatches = 0;
+      const error: unknown = await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          nameFilter: 'selected',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          shutdown,
+          fetchImpl: makeFetch((url, init) => {
+            methods.push(init.method ?? 'GET');
+            if (url.includes('/tests?')) return { body: { items: tests, nextToken: null } };
+            if (init.method === 'POST') {
+              dispatches++;
+              if (dispatches > 1) return errorBody('PRECONDITION_FAILED');
+              return {
+                body: {
+                  ...BATCH_FRESH_RESP,
+                  accepted: [
+                    { testId: 'test_0', runId: 'run_new', enqueuedAt: '2026-06-09T10:00:00Z' },
+                  ],
+                  conflicts: [{ testId: 'test_1', currentRunId: 'run_busy' }],
+                  skippedFrontend: tests.slice(2, 50).map(test => test.id),
+                },
+              };
+            }
+            if (url.includes('/runs/run_busy')) {
+              shutdown.interrupt(signal);
+              throw shutdown.signal.reason;
+            }
+            return { body: { environments: [] } };
+          }),
+          stdout: line => stdout.push(line),
+          stderr: () => {},
+        },
+      ).catch((caught: unknown) => caught);
+      expect(error).toBe(shutdown.signal.reason);
+      expect(shutdown.isArmed).toBe(false);
+      expect(JSON.parse(stdout.join('\n'))).toMatchObject({
+        accepted: [{ testId: 'test_0', runId: 'run_new', status: 'running' }],
+        conflicts: [{ testId: 'test_1', currentRunId: 'run_busy' }],
+        notRunTestIds: ['test_50'],
+        skippedFrontend: tests.slice(2, 50).map(test => test.id),
+      });
+      expect(methods.filter(method => method !== 'GET')).toEqual(['POST', 'POST']);
+    },
+  );
+
+  it.each(['SIGINT', 'SIGTERM'] as const)(
     'preserves batch receipts and disarms the conflict metadata scope on %s',
     async signal => {
       const { credentialsPath } = makeCreds();

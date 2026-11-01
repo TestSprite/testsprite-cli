@@ -40,7 +40,12 @@ function passedRun(runId: string) {
 
 type Stage = 'request' | 'body' | 'idle' | 'complete';
 
-async function runBatch(stage: Stage, signal: 'SIGINT' | 'SIGTERM', output: 'json' | 'text') {
+async function runBatch(
+  stage: Stage,
+  signal: 'SIGINT' | 'SIGTERM',
+  output: 'json' | 'text',
+  scenario: 'mixed' | 'conflicts-only' | 'stopped-dispatch' = 'mixed',
+) {
   const directory = mkdtempSync(join(tmpdir(), 'batch-resume-signal-'));
   const preload = join(directory, 'preload.mjs');
   // The idle seam pauses getRun AFTER its real HTTP request has settled. It
@@ -78,6 +83,12 @@ async function runBatch(stage: Stage, signal: 'SIGINT' | 'SIGTERM', output: 'jso
   `,
   );
   const requests: Array<{ method: string; path: string }> = [];
+  const filteredIds = [
+    'test_new',
+    'test_busy',
+    ...Array.from({ length: 49 }, (_, i) => `test_${i + 2}`),
+  ];
+  let dispatches = 0;
   let ready!: () => void;
   const reached = new Promise<void>(resolveReady => {
     ready = resolveReady;
@@ -88,8 +99,39 @@ async function runBatch(stage: Stage, signal: 'SIGINT' | 'SIGTERM', output: 'jso
     requests.push({ method: req.method!, path: req.url! });
     let body: unknown;
     if (path === '/projects/project_signal/env') body = { environments: [] };
-    else if (path === '/tests/batch/run' && req.method === 'POST') body = batch;
-    else if (path.startsWith('/runs/')) {
+    else if (path === '/tests') {
+      body = {
+        items: filteredIds.map((id, i) => ({
+          id,
+          name: `selected ${id}`,
+          projectId: 'project_signal',
+          type: i >= 2 && i < 50 ? 'frontend' : 'backend',
+        })),
+        nextToken: null,
+      };
+    } else if (path === '/tests/batch/run' && req.method === 'POST') {
+      dispatches++;
+      if (scenario === 'stopped-dispatch' && dispatches > 1) {
+        res.writeHead(412, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: {
+              code: 'PRECONDITION_FAILED',
+              message: 'Dispatch stopped',
+              requestId: 'fixture',
+            },
+          }),
+        );
+        return;
+      }
+      body = {
+        ...batch,
+        ...(scenario === 'conflicts-only' ? { accepted: [] } : {}),
+        ...(scenario === 'stopped-dispatch'
+          ? { skippedFrontend: filteredIds.slice(2, 50), skippedIntegration: [] }
+          : {}),
+      };
+    } else if (path.startsWith('/runs/')) {
       if (
         path === '/runs/run_busy' &&
         !url.searchParams.has('waitSeconds') &&
@@ -126,6 +168,7 @@ async function runBatch(stage: Stage, signal: 'SIGINT' | 'SIGTERM', output: 'jso
       '--project',
       'project_signal',
       '--wait',
+      ...(scenario === 'stopped-dispatch' ? ['--filter', 'selected'] : []),
       '--timeout',
       '30',
       '--max-concurrency',
@@ -239,4 +282,45 @@ describe.skipIf(process.platform === 'win32')('batch conflict metadata signal re
     expect(payload.conflicts).toEqual([]);
     expect(result.stderr).not.toContain('Interrupted');
   }, 15_000);
+
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    for (const output of ['json', 'text'] as const) {
+      it(`no accepted runs, ${signal}, ${output}: preserves unverified conflict IDs`, async () => {
+        const result = await runBatch('request', signal, output, 'conflicts-only');
+        expect(result.code).toBe(signal === 'SIGINT' ? 130 : 143);
+        expect(result.signal).toBeNull();
+        if (output === 'text') {
+          expect(result.stdout.trim()).toBe('run_busy  unverified (not attached)');
+        } else {
+          expect(JSON.parse(result.stdout)).toMatchObject({
+            accepted: [],
+            conflicts: batch.conflicts,
+          });
+          expect(JSON.parse(result.stdout)).not.toHaveProperty('notRunTestIds');
+        }
+        expect(result.stderr).not.toContain('[auto-resume]');
+        expect(result.requests.filter(r => r.method !== 'GET')).toEqual([
+          { method: 'POST', path: '/api/cli/v1/tests/batch/run' },
+        ]);
+        expect(result.requests.some(r => r.path.includes('waitSeconds'))).toBe(false);
+      }, 15_000);
+    }
+
+    it(`stopped dispatch then metadata ${signal}: JSON names tests never sent`, async () => {
+      const result = await runBatch('request', signal, 'json', 'stopped-dispatch');
+      expect(result.code).toBe(signal === 'SIGINT' ? 130 : 143);
+      expect(result.signal).toBeNull();
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        accepted: [{ testId: 'test_new', runId: 'run_new', status: 'running' }],
+        conflicts: batch.conflicts,
+        notRunTestIds: ['test_50'],
+      });
+      expect(result.stderr).toContain('1 test was not dispatched: test_50');
+      expect(result.requests.filter(r => r.method !== 'GET')).toEqual([
+        { method: 'POST', path: '/api/cli/v1/tests/batch/run' },
+        { method: 'POST', path: '/api/cli/v1/tests/batch/run' },
+      ]);
+      expect(result.requests.some(r => r.path.includes('waitSeconds'))).toBe(false);
+    }, 15_000);
+  }
 });

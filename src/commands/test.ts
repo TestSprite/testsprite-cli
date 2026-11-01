@@ -11109,8 +11109,14 @@ export async function runTestRunAll(
             deferred,
             skippedFrontend,
             skippedIntegration,
+            ...(notRunTestIds.length > 0 ? { notRunTestIds } : {}),
           },
-          () => partialResults.map(r => `${r.runId}  ${r.status}`).join('\n'),
+          () =>
+            partialResults.length > 0
+              ? partialResults.map(r => `${r.runId}  ${r.status}`).join('\n')
+              : resumableConflicts
+                  .map(c => `${c.currentRunId}  unverified (not attached)`)
+                  .join('\n'),
         );
         if (accepted.length > 0) {
           err.runWaitContext = true;
