@@ -14205,30 +14205,23 @@ export function resolveDefaultArtifactDir(runId: string, cwd: string = process.c
 }
 
 /**
- * Validate that the parent directory of `resolvedDir` exists and is a
- * directory. Surfaces `VALIDATION_ERROR` (exit 5) — matches the convention
- * from `closeOutputFile` for single-file `--out` flags (P4 D4 convention).
+ * Validate the `--out` path for the bundle commands. Surfaces
+ * `VALIDATION_ERROR` (exit 5) — matches the convention from
+ * `closeOutputFile` for single-file `--out` flags (P4 D4 convention).
  *
- * The bundle directory itself (`resolvedDir`) may or may not exist;
- * `writeBundle` creates it if absent.
+ * #654: missing parent directories are no longer a refusal — the documented
+ * verify-skill and README commands name `. /.testsprite/runs/<run-id>/`
+ * before that folder exists, and `writeBundle` mkdirs missing parents
+ * recursively once the bundle passes its checks, the same way the default
+ * path is created. Kept: `--out` pointing at an existing FILE still exits 5.
  */
 export async function assertOutDirParentExists(resolvedDir: string): Promise<void> {
-  const parent = dirname(resolvedDir);
-  let parentStat;
-  try {
-    parentStat = await stat(parent);
-  } catch {
-    throw localValidationError('out', `parent directory does not exist: ${parent}`);
-  }
-  if (!parentStat.isDirectory()) {
-    throw localValidationError('out', `parent path is not a directory: ${parent}`);
-  }
-  // Also guard against --out pointing at an existing FILE (not a dir).
   let targetStat;
   try {
     targetStat = await stat(resolvedDir);
   } catch {
-    // Does not exist yet — fine; writeBundle will create it.
+    // Does not exist yet — fine; writeBundle will create it (and any
+    // missing parents) recursively.
     return;
   }
   if (!targetStat.isDirectory()) {
@@ -18514,7 +18507,7 @@ export function createTestArtifactCommand(deps: TestDeps): Command {
       '--out <dir>',
       [
         'Directory to write the §7 disk layout (default: ./.testsprite/runs/<run-id>/).',
-        'Parent must exist. The bundle dir itself is created if absent.',
+        'Missing parent directories are created; the bundle dir itself is created if absent.',
       ].join(' '),
     )
     .option(

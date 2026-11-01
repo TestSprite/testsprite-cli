@@ -4,6 +4,10 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Fixed
+
+- **`test artifact get` / `test failure get`: an explicit `--out` now creates missing parent directories.** The documented verify-skill and README commands (`--out ./.testsprite/runs/<run-id>/`, `--out ./.testsprite/failure`) exited 5 in a fresh project — the parent-existence pre-check refused them before any request, while the same directory was created when merely implied by the default path. Missing parents are now created the same way the default path is (recursively, by the bundle writer after the bundle passes its checks); a failed fetch still leaves nothing on disk. `--out` pointing at an existing file still exits 5, `--dry-run` still writes nothing, and single-file `--out` flags on other commands are unchanged. (#654)
+
 ## [0.15.0] - 2026-10-17
 
 ### Added

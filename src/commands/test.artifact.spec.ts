@@ -188,30 +188,10 @@ describe('assertOutDirParentExists', () => {
     await expect(assertOutDirParentExists(target)).resolves.toBeUndefined();
   });
 
-  it('throws VALIDATION_ERROR when parent does not exist', async () => {
-    const noParentBase = mkdtempSync(join(tmpdir(), 'cli-p4-noparent-'));
-    const target = join(noParentBase, 'does-not-exist-xyz', 'bundle');
-    await expect(assertOutDirParentExists(target))
-      .rejects.toMatchObject({
-        code: 'VALIDATION_ERROR',
-        details: expect.objectContaining({
-          reason: expect.stringContaining('parent directory does not exist'),
-        }),
-      })
-      .finally(() => rmSync(noParentBase, { recursive: true, force: true }));
-  });
-
-  it('throws VALIDATION_ERROR when parent is not a directory (is a file)', async () => {
+  it('resolves when the --out directory exists', async () => {
     const tmpDir = await mkdtemp(join(tmpdir(), 'cli-p4-parent-'));
-    const fileAsParent = join(tmpDir, 'file.txt');
-    await writeFile(fileAsParent, 'content');
-    const target = join(fileAsParent, 'bundle');
-    await expect(assertOutDirParentExists(target)).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      details: expect.objectContaining({
-        reason: expect.stringContaining('parent path is not a directory'),
-      }),
-    });
+    const target = join(tmpDir, 'bundle');
+    await expect(assertOutDirParentExists(target)).resolves.toBeUndefined();
   });
 
   it('throws VALIDATION_ERROR when --out points to an existing file', async () => {
@@ -292,6 +272,59 @@ describe('runArtifactGet', () => {
     expect(envelope.out).toBe(outDir);
     expect(envelope.snapshotId).toBe(SAMPLE_SNAPSHOT_ID);
     expect(envelope.meta.runId).toBe(SAMPLE_RUN_ID);
+  });
+
+  // ---- #654: explicit --out two levels under a missing directory ----
+
+  it('creates missing parents for an explicit --out two levels deep (#654)', async () => {
+    const { credentialsPath } = makeCreds();
+    const ctx = makeArtifactContext();
+    const tmpDir = await mkdtemp(join(tmpdir(), 'cli-p4-'));
+    const outDir = join(tmpDir, 'level-a', 'level-b', 'bundle');
+
+    const fetchImpl = makeFetch(() => ({ body: ctx }));
+
+    const result = await runArtifactGet(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        runId: SAMPLE_RUN_ID,
+        out: outDir,
+        failedOnly: false,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {} },
+    );
+
+    expect(result.bundle).toBeDefined();
+    expect(existsSync(join(outDir, 'meta.json'))).toBe(true);
+  });
+
+  it('a failed fetch leaves no directory behind for an explicit --out (#654)', async () => {
+    const { credentialsPath } = makeCreds();
+    const tmpDir = await mkdtemp(join(tmpdir(), 'cli-p4-'));
+    const outDir = join(tmpDir, 'level-a', 'level-b', 'bundle');
+
+    const fetchImpl = makeFetch(() => ({
+      status: 500,
+      body: { error: { code: 'INTERNAL', message: 'boom', requestId: 'req_x' } },
+    }));
+
+    await expect(
+      runArtifactGet(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          runId: SAMPLE_RUN_ID,
+          out: outDir,
+          failedOnly: false,
+        },
+        { credentialsPath, fetchImpl, stdout: () => {} },
+      ),
+    ).rejects.toThrow();
+
+    expect(existsSync(join(tmpDir, 'level-a'))).toBe(false);
   });
 
   // ---- Default dir: .testsprite/runs/<run-id>/ ----
@@ -528,29 +561,6 @@ describe('runArtifactGet', () => {
   });
 
   // ---- --out parent missing → exit 5 ----
-
-  it('--out with missing parent directory → VALIDATION_ERROR (exit 5)', async () => {
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: {} }));
-
-    const missingParentBase = mkdtempSync(join(tmpdir(), 'cli-p4-missing-parent-'));
-    const missingParent = join(missingParentBase, 'definitely-does-not-exist-xyz', 'bundle');
-    await expect(
-      runArtifactGet(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          runId: SAMPLE_RUN_ID,
-          out: missingParent,
-          failedOnly: false,
-        },
-        { credentialsPath, fetchImpl, stdout: () => {} },
-      ),
-    )
-      .rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
-      .finally(() => rmSync(missingParentBase, { recursive: true, force: true }));
-  });
 
   // ---- --out is a file → exit 5 ----
 
@@ -929,6 +939,32 @@ describe('runFailureGet M2 non-regression (requireRunId is opt-in)', () => {
     const meta = JSON.parse(readFileSync(join(outDir, 'meta.json'), 'utf8'));
     expect(meta.runIdIfAvailable).toBeNull();
     expect(meta.testId).toBe('test_m2');
+  });
+
+  // ---- #654: explicit --out two levels under a missing directory ----
+
+  it('creates missing parents for an explicit --out two levels deep (#654)', async () => {
+    const { credentialsPath } = makeCreds();
+    const ctx = makeArtifactContext();
+    const tmpDir = await mkdtemp(join(tmpdir(), 'cli-p4-'));
+    const outDir = join(tmpDir, 'level-a', 'level-b', 'bundle');
+
+    const fetchImpl = makeFetch(() => ({ body: ctx }));
+
+    const result = await runFailureGet(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_m2',
+        out: outDir,
+        failedOnly: false,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {} },
+    );
+
+    expect(result.bundle).toBeDefined();
+    expect(existsSync(join(outDir, 'meta.json'))).toBe(true);
   });
 });
 
