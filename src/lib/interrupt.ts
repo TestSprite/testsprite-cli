@@ -311,10 +311,6 @@ export interface BrokenPipeDeps {
   stdout?: NodeJS.EventEmitter;
   /** stderr stream. Defaults to `process.stderr`. */
   stderr?: NodeJS.EventEmitter;
-  /** Process exit. Defaults to `process.exit`. */
-  exit?: (code: number) => void;
-  /** Shutdown coordinator. Defaults to {@link globalShutdown}. */
-  shutdown?: ShutdownController;
 }
 
 /**
@@ -329,14 +325,17 @@ export interface BrokenPipeDeps {
 export function installBrokenPipeGuard(deps: BrokenPipeDeps = {}): void {
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
+  let stdoutBroken = false;
   stdout.on('error', (error: NodeJS.ErrnoException) => {
-    // Reader went away (`| head`, `| less` then q): exit cleanly like SIGPIPE
-    // rather than dumping an unhandled `write EPIPE` stack. Any other stdout
-    // error is a genuine, actionable failure, so re-throw it (Node's default).
+    // Reader went away (`| head`, `| less` then q). Once stdout has failed,
+    // later stream errors are consequences of the same closed pipe and cannot
+    // be reported to the reader either.
+    if (stdoutBroken) return;
     if (error.code === 'EPIPE') {
       // Do not exit or abort the shutdown signal here. The command must
       // continue through normal cleanup and verdict handling; process.exitCode
       // may only be assigned after async work and telemetry complete.
+      stdoutBroken = true;
       return;
     }
     throw error;
