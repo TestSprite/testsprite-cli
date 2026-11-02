@@ -363,7 +363,10 @@ describe('installBrokenPipeGuard', () => {
 
     expect(() => {
       stdout.emit('error', makeEpipe());
-      stdout.emit('error', Object.assign(new Error('write after close'), { code: 'ERR_STREAM_DESTROYED' }));
+      stdout.emit(
+        'error',
+        Object.assign(new Error('write after close'), { code: 'ERR_STREAM_DESTROYED' }),
+      );
     }).not.toThrow();
   });
 
