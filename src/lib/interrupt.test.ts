@@ -321,79 +321,49 @@ describe('installBrokenPipeGuard', () => {
     return Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
   }
 
-  it('exits 0 on stdout EPIPE (clean SIGPIPE-equivalent for `| head`)', () => {
+  it.each([false, true])(
+    'swallows stdout EPIPE without exiting or aborting (armed=%s)',
+    armed => {
+      const previousExitCode = process.exitCode;
+      try {
+        process.exitCode = undefined;
+        const stdout = new EventEmitter();
+        const stderr = new EventEmitter();
+        const exit = vi.fn();
+        const shutdown = new ShutdownController();
+        const disarm = armed ? shutdown.arm() : undefined;
+        installBrokenPipeGuard({ stdout, stderr, exit });
+
+        stdout.emit('error', makeEpipe());
+
+        // EPIPE is only an output failure. It must not decide the command's
+        // verdict or cancel an armed poll/tunnel lifecycle.
+        expect(exit).not.toHaveBeenCalled();
+        expect(shutdown.signal.aborted).toBe(false);
+        expect(shutdown.isArmed).toBe(armed);
+
+        // Model the actual race: the command determines its failing verdict
+        // only after EPIPE has been delivered. The guard must leave it intact.
+        process.exitCode = 1;
+        expect(process.exitCode).toBe(1);
+        disarm?.();
+      } finally {
+        process.exitCode = previousExitCode;
+      }
+    },
+  );
+
+  it('swallows repeated stdout EPIPE events while the command continues', () => {
     const stdout = new EventEmitter();
     const stderr = new EventEmitter();
     const exit = vi.fn();
-    const shutdown = new ShutdownController();
-    installBrokenPipeGuard({ stdout, stderr, exit, shutdown });
+    installBrokenPipeGuard({ stdout, stderr, exit });
 
-    stdout.emit('error', makeEpipe());
-    expect(exit).toHaveBeenCalledWith(0);
-    expect(shutdown.signal.aborted).toBe(false);
-  });
-
-  it('preserves a pending non-zero exit code on disarmed stdout EPIPE', () => {
-    const previousExitCode = process.exitCode;
-    try {
-      process.exitCode = 1;
-      const stdout = new EventEmitter();
-      const stderr = new EventEmitter();
-      const exit = vi.fn();
-      installBrokenPipeGuard({ stdout, stderr, exit, shutdown: new ShutdownController() });
-
+    expect(() => {
       stdout.emit('error', makeEpipe());
-
-      expect(exit).toHaveBeenCalledWith(1);
-    } finally {
-      process.exitCode = previousExitCode;
-    }
-  });
-
-  it.each([
-    { label: 'defaults success to 0', pendingExitCode: undefined, expectedExitCode: 0 },
-    { label: 'preserves a pending failure', pendingExitCode: 1, expectedExitCode: 1 },
-  ])('armed scope: stdout EPIPE $label while requesting graceful cleanup', async ({
-    pendingExitCode,
-    expectedExitCode,
-  }) => {
-    const previousExitCode = process.exitCode;
-    try {
-      process.exitCode = pendingExitCode;
-      const stdout = new EventEmitter();
-      const stderr = new EventEmitter();
-      const exit = vi.fn();
-      const shutdown = new ShutdownController();
-      const disarm = shutdown.arm();
-      const cleanup = vi.fn();
-      const lifetime = new Promise<void>(resolve => {
-        shutdown.signal.addEventListener(
-          'abort',
-          () => {
-            queueMicrotask(() => {
-              cleanup();
-              disarm();
-              resolve();
-            });
-          },
-          { once: true },
-        );
-      });
-      installBrokenPipeGuard({ stdout, stderr, exit, shutdown });
-
       stdout.emit('error', makeEpipe());
-
-      expect(exit).not.toHaveBeenCalled();
-      expect(shutdown.signal.aborted).toBe(true);
-      const reason = shutdown.signal.reason as InterruptError;
-      expect(reason).toBeInstanceOf(InterruptError);
-      expect(reason.exitCode).toBe(expectedExitCode);
-      await lifetime;
-      expect(cleanup).toHaveBeenCalledOnce();
-      expect(shutdown.isArmed).toBe(false);
-    } finally {
-      process.exitCode = previousExitCode;
-    }
+    }).not.toThrow();
+    expect(exit).not.toHaveBeenCalled();
   });
 
   it('re-throws a non-EPIPE stdout error instead of silently swallowing it', () => {
