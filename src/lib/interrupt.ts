@@ -329,9 +329,6 @@ export interface BrokenPipeDeps {
 export function installBrokenPipeGuard(deps: BrokenPipeDeps = {}): void {
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
-  const exit = deps.exit ?? ((code: number) => process.exit(code));
-  const shutdown = deps.shutdown ?? globalShutdown;
-
   stdout.on('error', (error: NodeJS.ErrnoException) => {
     // Reader went away (`| head`, `| less` then q): exit cleanly like SIGPIPE
     // rather than dumping an unhandled `write EPIPE` stack. Any other stdout
