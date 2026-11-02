@@ -352,8 +352,9 @@ describe('installBrokenPipeGuard', () => {
 
   it('armed scope: stdout EPIPE preserves a pending failure while requesting graceful cleanup', async () => {
     const previousExitCode = process.exitCode;
-    process.exitCode = 1;
-    const stdout = new EventEmitter();
+    try {
+      process.exitCode = 1;
+      const stdout = new EventEmitter();
     const stderr = new EventEmitter();
     const exit = vi.fn();
     const shutdown = new ShutdownController();
@@ -383,8 +384,10 @@ describe('installBrokenPipeGuard', () => {
     expect(reason.exitCode).toBe(1);
     await lifetime;
     expect(cleanup).toHaveBeenCalledOnce();
-    expect(shutdown.isArmed).toBe(false);
-    process.exitCode = previousExitCode;
+      expect(shutdown.isArmed).toBe(false);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
   });
 
   it('re-throws a non-EPIPE stdout error instead of silently swallowing it', () => {
