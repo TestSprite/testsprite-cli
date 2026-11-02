@@ -4945,7 +4945,10 @@ async function runBatchRun(
       out.print(
         {
           results: partialResults,
-          creation: { results: createResponse.results, summary: createResponse.summary },
+          creation: {
+            results: createResponse.results,
+            summary: createResponse.summary,
+          },
         },
         () => partialResults.map(r => `${r.testId}  ${r.runId || '-'}  ${r.status}`).join('\n'),
       );
@@ -4991,7 +4994,10 @@ async function runBatchRun(
         : batchRunResults;
     out.print({
       results: enrichedResults,
-      creation: { results: createResponse.results, summary: createResponse.summary },
+      creation: {
+        results: createResponse.results,
+        summary: createResponse.summary,
+      },
     });
   } else if (!opts.wait) {
     // Text mode, no --wait: statuses are non-terminal by design ('queued'),
