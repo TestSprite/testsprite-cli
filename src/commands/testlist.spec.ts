@@ -411,6 +411,23 @@ describe('testlist run', () => {
     expect(err.exitCode).toBe(5);
   });
 
+  it("#569: --report-file '' without --report junit → VALIDATION_ERROR before dispatch", async () => {
+    const { env } = makeCreds();
+    let dispatched = false;
+    const fetchImpl = makeFetch(() => {
+      dispatched = true;
+      return { body: RUN_ACCEPTED };
+    });
+    const err = (await runTestlistRun(
+      { ...runBase, output: 'json' as const, listId: 'list-1', reportFile: '' },
+      { env, fetchImpl, stdout: () => {} },
+    ).catch(e => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.code).toBe('VALIDATION_ERROR');
+    expect(err.exitCode).toBe(5);
+    expect(dispatched).toBe(false);
+  });
+
   it('--case filters send a testIds body', async () => {
     const { env } = makeCreds();
     let sentBody: unknown;
