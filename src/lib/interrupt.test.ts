@@ -355,35 +355,35 @@ describe('installBrokenPipeGuard', () => {
     try {
       process.exitCode = 1;
       const stdout = new EventEmitter();
-    const stderr = new EventEmitter();
-    const exit = vi.fn();
-    const shutdown = new ShutdownController();
-    const disarm = shutdown.arm();
-    const cleanup = vi.fn();
-    const lifetime = new Promise<void>(resolve => {
-      shutdown.signal.addEventListener(
-        'abort',
-        () => {
-          queueMicrotask(() => {
-            cleanup();
-            disarm();
-            resolve();
-          });
-        },
-        { once: true },
-      );
-    });
-    installBrokenPipeGuard({ stdout, stderr, exit, shutdown });
+      const stderr = new EventEmitter();
+      const exit = vi.fn();
+      const shutdown = new ShutdownController();
+      const disarm = shutdown.arm();
+      const cleanup = vi.fn();
+      const lifetime = new Promise<void>(resolve => {
+        shutdown.signal.addEventListener(
+          'abort',
+          () => {
+            queueMicrotask(() => {
+              cleanup();
+              disarm();
+              resolve();
+            });
+          },
+          { once: true },
+        );
+      });
+      installBrokenPipeGuard({ stdout, stderr, exit, shutdown });
 
-    stdout.emit('error', makeEpipe());
+      stdout.emit('error', makeEpipe());
 
-    expect(exit).not.toHaveBeenCalled();
-    expect(shutdown.signal.aborted).toBe(true);
-    const reason = shutdown.signal.reason as InterruptError;
-    expect(reason).toBeInstanceOf(InterruptError);
-    expect(reason.exitCode).toBe(1);
-    await lifetime;
-    expect(cleanup).toHaveBeenCalledOnce();
+      expect(exit).not.toHaveBeenCalled();
+      expect(shutdown.signal.aborted).toBe(true);
+      const reason = shutdown.signal.reason as InterruptError;
+      expect(reason).toBeInstanceOf(InterruptError);
+      expect(reason.exitCode).toBe(1);
+      await lifetime;
+      expect(cleanup).toHaveBeenCalledOnce();
       expect(shutdown.isArmed).toBe(false);
     } finally {
       process.exitCode = previousExitCode;
