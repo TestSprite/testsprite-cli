@@ -474,7 +474,7 @@ export class HttpClient {
       signal: options.signal,
       schema: RERUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
-    }).then(r => r.body);
+    }).then(r => withoutDeprecationAdvisories(r.body));
   }
 
   /**
@@ -494,7 +494,7 @@ export class HttpClient {
       signal: options.signal,
       schema: BATCH_RERUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
-    }).then(r => r.body);
+    }).then(r => withoutDeprecationAdvisories(r.body));
   }
 
   /**
@@ -1635,4 +1635,22 @@ function isTimeoutError(err: unknown): boolean {
     return (err as { name?: string }).name === 'TimeoutError';
   }
   return false;
+}
+
+/**
+ * Drop server-sent `feature: 'deprecation'` advisories from a rerun response.
+ * The CLI owns the deprecation signal itself (one stderr line plus the JSON
+ * `deprecations` key), so passing the server's through would announce the same
+ * thing twice. Matched on the machine-readable `feature`, never on message
+ * text; other advisories (autoHeal) are kept and an emptied list is removed.
+ */
+function withoutDeprecationAdvisories<T extends { advisories?: { feature: string }[] }>(
+  body: T,
+): T {
+  if (!body.advisories) return body;
+  const kept = body.advisories.filter(a => a.feature !== 'deprecation');
+  if (kept.length === body.advisories.length) return body;
+  const next: { advisories?: { feature: string }[] } = { ...body, advisories: kept };
+  if (kept.length === 0) delete next.advisories;
+  return next as T;
 }
