@@ -333,7 +333,26 @@ describe('installBrokenPipeGuard', () => {
     expect(shutdown.signal.aborted).toBe(false);
   });
 
-  it('armed scope: stdout EPIPE requests graceful cleanup instead of exiting immediately', async () => {
+  it('preserves a pending non-zero exit code on disarmed stdout EPIPE', () => {
+    const previousExitCode = process.exitCode;
+    try {
+      process.exitCode = 1;
+      const stdout = new EventEmitter();
+      const stderr = new EventEmitter();
+      const exit = vi.fn();
+      installBrokenPipeGuard({ stdout, stderr, exit, shutdown: new ShutdownController() });
+
+      stdout.emit('error', makeEpipe());
+
+      expect(exit).toHaveBeenCalledWith(1);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
+  });
+
+  it('armed scope: stdout EPIPE preserves a pending failure while requesting graceful cleanup', async () => {
+    const previousExitCode = process.exitCode;
+    process.exitCode = 1;
     const stdout = new EventEmitter();
     const stderr = new EventEmitter();
     const exit = vi.fn();
@@ -361,10 +380,11 @@ describe('installBrokenPipeGuard', () => {
     expect(shutdown.signal.aborted).toBe(true);
     const reason = shutdown.signal.reason as InterruptError;
     expect(reason).toBeInstanceOf(InterruptError);
-    expect(reason.exitCode).toBe(0);
+    expect(reason.exitCode).toBe(1);
     await lifetime;
     expect(cleanup).toHaveBeenCalledOnce();
     expect(shutdown.isArmed).toBe(false);
+    process.exitCode = previousExitCode;
   });
 
   it('re-throws a non-EPIPE stdout error instead of silently swallowing it', () => {
