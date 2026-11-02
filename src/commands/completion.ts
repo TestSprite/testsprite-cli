@@ -1,5 +1,5 @@
 /**
- * `testsprite completion [bash|zsh|fish]` — emit a shell completion script.
+ * `testsprite completion [bash|zsh|fish|powershell]` — emit a shell completion script.
  *
  * The command names, per-group subcommands, and global flags are NOT hardcoded:
  * `index.ts` builds a {@link CompletionSpec} by walking the fully-assembled
@@ -11,12 +11,14 @@
  *   bash:  eval "$(testsprite completion bash)"          (add to ~/.bashrc)
  *   zsh:   testsprite completion zsh > ~/.zsh/_testsprite (on your fpath)
  *   fish:  testsprite completion fish | source           (add to config.fish)
+ *   pwsh:  testsprite completion powershell | Out-String | Invoke-Expression
+ *          (append to $PROFILE; `pwsh` is accepted as an alias)
  */
 
 import { Command } from 'commander';
 import { localValidationError } from '../lib/errors.js';
 
-export const SUPPORTED_SHELLS = ['bash', 'zsh', 'fish'] as const;
+export const SUPPORTED_SHELLS = ['bash', 'zsh', 'fish', 'powershell'] as const;
 export type Shell = (typeof SUPPORTED_SHELLS)[number];
 
 export interface CompletionSpec {
@@ -39,12 +41,31 @@ export function isShell(value: string): value is Shell {
   return (SUPPORTED_SHELLS as readonly string[]).includes(value);
 }
 
+/**
+ * Spellings that mean the same shell. `pwsh` is what PowerShell 7 users type and
+ * what `$SHELL` holds on some setups, but both render the same script, so the
+ * alias is normalised rather than duplicated as a second shell.
+ */
+const SHELL_ALIASES: Record<string, Shell> = { pwsh: 'powershell' };
+
+/** Resolve a user-supplied or detected shell name to a supported {@link Shell}. */
+export function normalizeShell(value: string): Shell | undefined {
+  const name = value.trim().toLowerCase().replace(/\.exe$/, '');
+  if (isShell(name)) return name;
+  return SHELL_ALIASES[name];
+}
+
 /** Best-effort shell detection from `$SHELL` (e.g. "/bin/zsh" -> "zsh"). */
 export function detectShell(env: NodeJS.ProcessEnv): Shell | undefined {
   const shellPath = env.SHELL ?? '';
   const rawBase = shellPath.split(/[/\\]/).pop() ?? '';
-  const base = rawBase.toLowerCase().replace(/\.exe$/, '');
-  return isShell(base) ? base : undefined;
+  const detected = normalizeShell(rawBase);
+  if (detected !== undefined) return detected;
+  // Windows normally leaves $SHELL unset, including inside PowerShell. PSModulePath
+  // is present in every PowerShell session and in nothing else, so it is the only
+  // signal available there — and it is only consulted when $SHELL told us nothing.
+  if (shellPath === '' && (env.PSModulePath ?? '') !== '') return 'powershell';
+  return undefined;
 }
 
 export function renderCompletion(shell: Shell, spec: CompletionSpec): string {
@@ -55,6 +76,8 @@ export function renderCompletion(shell: Shell, spec: CompletionSpec): string {
       return renderZsh(spec);
     case 'fish':
       return renderFish(spec);
+    case 'powershell':
+      return renderPowerShell(spec);
   }
 }
 
@@ -125,15 +148,58 @@ function renderFish(spec: CompletionSpec): string {
   return lines.join('\n');
 }
 
+
+function renderPowerShell(spec: CompletionSpec): string {
+  const quoted = (values: string[]) => values.map(v => `'${v}'`).join(', ');
+  const subMap = Object.entries(spec.subcommands)
+    .map(([group, subs]) => `    '${group}' = @(${quoted(subs)})`)
+    .join('\n');
+  const lines = [
+    `# ${spec.program} PowerShell completion. Enable with:`,
+    `#   ${spec.program} completion powershell | Out-String | Invoke-Expression`,
+    `# Append that line to $PROFILE to keep it.`,
+    `Register-ArgumentCompleter -Native -CommandName '${spec.program}' -ScriptBlock {`,
+    '    param($wordToComplete, $commandAst, $cursorPosition)',
+    `    $commands = @(${quoted(spec.commands)})`,
+    `    $globalFlags = @(${quoted(spec.globalFlags)})`,
+    '    $subcommands = @{',
+    subMap,
+    '    }',
+    '',
+    '    $elements = @($commandAst.CommandElements | ForEach-Object { $_.Extent.Text })',
+    "    $first = if ($elements.Count -ge 2) { $elements[1] } else { $null }",
+    '    $previous = if ($elements.Count -ge 1) { $elements[-1] } else { $null }',
+    '',
+    '    $candidates = @()',
+    '    if ($previous -and $subcommands.ContainsKey($previous)) {',
+    '        $candidates = $subcommands[$previous]',
+    '    } elseif ($wordToComplete -like \'-*\') {',
+    '        $candidates = $globalFlags',
+    '    } elseif ($first -and $subcommands.ContainsKey($first)) {',
+    '        $candidates = $subcommands[$first]',
+    '    } else {',
+    '        $candidates = $commands',
+    '    }',
+    '',
+    '    $candidates |',
+    '        Where-Object { $_ -like "$wordToComplete*" } |',
+    '        ForEach-Object {',
+    "            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)",
+    '        }',
+    '}',
+  ];
+  return lines.join('\n');
+}
+
 export function createCompletionCommand(
   getSpec: () => CompletionSpec,
   deps: CompletionDeps = {},
 ): Command {
   return new Command('completion')
-    .description('Print a shell completion script (bash|zsh|fish)')
+    .description('Print a shell completion script (bash|zsh|fish|powershell)')
     .argument(
       '[shell]',
-      'Shell to generate for (bash|zsh|fish); auto-detected from $SHELL when omitted',
+      'Shell to generate for (bash|zsh|fish|powershell); auto-detected from $SHELL when omitted',
     )
     .addHelpText(
       'after',
@@ -141,11 +207,12 @@ export function createCompletionCommand(
         '\nExamples:\n' +
         '  eval "$(testsprite completion bash)"       # bash, current session\n' +
         '  testsprite completion zsh > ~/.zsh/_testsprite\n' +
-        '  testsprite completion fish | source        # fish, current session',
+        '  testsprite completion fish | source        # fish, current session\n' +
+        '  testsprite completion powershell | Out-String | Invoke-Expression',
     )
     .action((shellArg: string | undefined, _cmdOpts: unknown) => {
       const env = deps.env ?? process.env;
-      const shell = shellArg ?? detectShell(env);
+      const shell = shellArg === undefined ? detectShell(env) : normalizeShell(shellArg);
       if (shell === undefined) {
         throw localValidationError(
           'shell',

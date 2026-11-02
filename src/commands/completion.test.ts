@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CompletionSpec } from './completion.js';
-import { createCompletionCommand, detectShell, isShell, renderCompletion } from './completion.js';
+import { createCompletionCommand, detectShell, isShell, renderCompletion, normalizeShell } from './completion.js';
 
 const SPEC: CompletionSpec = {
   program: 'testsprite',
@@ -10,11 +10,29 @@ const SPEC: CompletionSpec = {
 };
 
 describe('isShell / detectShell', () => {
-  it('recognizes the three supported shells', () => {
+  it('recognizes the supported shells', () => {
     expect(isShell('bash')).toBe(true);
     expect(isShell('zsh')).toBe(true);
     expect(isShell('fish')).toBe(true);
-    expect(isShell('powershell')).toBe(false);
+    expect(isShell('powershell')).toBe(true);
+    expect(isShell('cmd')).toBe(false);
+  });
+
+  it('normalises the pwsh alias to powershell', () => {
+    expect(normalizeShell('pwsh')).toBe('powershell');
+    expect(normalizeShell('PowerShell.EXE')).toBe('powershell');
+    expect(normalizeShell('bash')).toBe('bash');
+    expect(normalizeShell('cmd')).toBeUndefined();
+  });
+
+  it('detects powershell from PSModulePath when $SHELL is unset', () => {
+    // Windows leaves $SHELL unset, including inside PowerShell.
+    expect(detectShell({ PSModulePath: 'C:\\Program Files\\WindowsPowerShell\\Modules' }))
+      .toBe('powershell');
+    // $SHELL wins when both are present.
+    expect(detectShell({ SHELL: '/bin/bash', PSModulePath: 'x' })).toBe('bash');
+    // Neither present.
+    expect(detectShell({})).toBeUndefined();
   });
 
   it('detects the shell from a $SHELL path', () => {
@@ -62,6 +80,47 @@ describe('renderCompletion', () => {
   });
 });
 
+describe('renderCompletion -- powershell', () => {
+  const script = renderCompletion('powershell', SPEC);
+
+  it('registers a native argument completer for the program', () => {
+    expect(script).toContain(
+      `Register-ArgumentCompleter -Native -CommandName '${SPEC.program}' -ScriptBlock {`,
+    );
+  });
+
+  it('embeds commands, subcommands and global flags from the spec', () => {
+    for (const command of SPEC.commands) expect(script).toContain(`'${command}'`);
+    for (const [group, subs] of Object.entries(SPEC.subcommands)) {
+      expect(script).toContain(`'${group}' = @(`);
+      for (const sub of subs) expect(script).toContain(`'${sub}'`);
+    }
+    for (const flag of SPEC.globalFlags) expect(script).toContain(`'${flag}'`);
+  });
+
+  it('completes a subcommand only after its group, and flags once one is typed', () => {
+    // The branch order in the script decides this, so assert the guards themselves.
+    expect(script).toContain('$subcommands.ContainsKey($previous)');
+    expect(script).toContain("$wordToComplete -like '-*'");
+    expect(script).toContain('$subcommands.ContainsKey($first)');
+  });
+
+  it('filters candidates by the word being completed and returns CompletionResult', () => {
+    expect(script).toContain('Where-Object { $_ -like "$wordToComplete*" }');
+    expect(script).toContain('[System.Management.Automation.CompletionResult]::new(');
+  });
+
+  it('is emitted end to end by the command', async () => {
+    const chunks: string[] = [];
+    const cmd = createCompletionCommand(() => SPEC, {
+      env: {},
+      stdout: (line: string) => chunks.push(line),
+    });
+    await cmd.parseAsync(['pwsh'], { from: 'user' });
+    expect(chunks.join('\n')).toContain('Register-ArgumentCompleter -Native');
+  });
+});
+
 describe('createCompletionCommand', () => {
   function run(args: string[], env: NodeJS.ProcessEnv): Promise<string[]> {
     const out: string[] = [];
@@ -81,7 +140,7 @@ describe('createCompletionCommand', () => {
 
   it('rejects an unsupported shell with VALIDATION_ERROR (exit 5)', async () => {
     const cmd = createCompletionCommand(() => SPEC, { env: {}, stdout: () => undefined });
-    await expect(cmd.parseAsync(['powershell'], { from: 'user' })).rejects.toMatchObject({
+    await expect(cmd.parseAsync(['cmd'], { from: 'user' })).rejects.toMatchObject({
       code: 'VALIDATION_ERROR',
     });
   });

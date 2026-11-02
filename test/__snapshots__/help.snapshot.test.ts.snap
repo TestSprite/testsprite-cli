@@ -1510,7 +1510,8 @@ Commands:
   usage|credits                Show credit balance and plan info
   doctor                       Diagnose CLI setup: credentials, connectivity,
                                skill
-  completion [shell]           Print a shell completion script (bash|zsh|fish)
+  completion [shell]           Print a shell completion script
+                               (bash|zsh|fish|powershell)
   help [command]               display help for command
 
 Environment:
