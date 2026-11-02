@@ -327,11 +327,13 @@ describe('installBrokenPipeGuard', () => {
       process.exitCode = undefined;
       const stdout = new EventEmitter();
       const stderr = new EventEmitter();
-      installBrokenPipeGuard({ stdout, stderr });
+      const exit = vi.fn();
+      installBrokenPipeGuard({ stdout, stderr, exit });
 
       stdout.emit('error', makeEpipe());
 
       // The command is still responsible for determining its final status.
+      expect(exit).not.toHaveBeenCalled();
       expect(process.exitCode).toBeUndefined();
       process.exitCode = 1; // Simulate the async test verdict resolving later.
       expect(process.exitCode).toBe(1);
@@ -345,7 +347,7 @@ describe('installBrokenPipeGuard', () => {
     const stderr = new EventEmitter();
     const shutdown = new ShutdownController();
     const disarm = shutdown.arm();
-    installBrokenPipeGuard({ stdout, stderr });
+    installBrokenPipeGuard({ stdout, stderr, shutdown });
 
     stdout.emit('error', makeEpipe());
 
