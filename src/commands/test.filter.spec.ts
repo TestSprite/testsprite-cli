@@ -127,7 +127,15 @@ describe('CLI name-filter validation', () => {
       args: [...command.args, '--project', 'project-1'],
     })),
     { name: 'test run single', args: ['test', 'run', 'test-alpha', '--no-wait'] },
+    {
+      name: 'test run multiple',
+      args: ['test', 'run', 'test-alpha', 'test-beta', '--no-wait'],
+    },
     { name: 'test rerun single', args: ['test', 'rerun', 'test-alpha', '--no-wait'] },
+    {
+      name: 'test rerun multiple',
+      args: ['test', 'rerun', 'test-alpha', 'test-beta', '--no-wait'],
+    },
   ];
 
   describe.each(commands)('$name', ({ args }) => {
