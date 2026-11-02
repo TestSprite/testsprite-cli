@@ -16,8 +16,8 @@
  * error and lets the command finish normally, preserving its eventual verdict
  * and exit code. EPIPE must not abort an armed wait or tunnel lifetime.
  *
- * `process` and the streams are injectable so the wiring is unit-testable
- * without spawning a subprocess or sending a real signal.
+ * The streams are injectable so the wiring is unit-testable without spawning a
+ * subprocess or sending a real signal.
  */
 
 import { setMaxListeners } from 'node:events';
@@ -149,8 +149,6 @@ export class ShutdownController {
     this.receivedCause = signal;
     this.controller.abort(new InterruptError(signal));
   }
-
-
 }
 
 /**
@@ -311,6 +309,10 @@ export interface BrokenPipeDeps {
   stdout?: NodeJS.EventEmitter;
   /** stderr stream. Defaults to `process.stderr`. */
   stderr?: NodeJS.EventEmitter;
+  /** @deprecated Retained for source compatibility; EPIPE no longer forces an exit. */
+  exit?: (code: number) => void;
+  /** @deprecated Retained for source compatibility; EPIPE no longer aborts shutdown. */
+  shutdown?: ShutdownController;
 }
 
 /**
