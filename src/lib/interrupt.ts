@@ -345,8 +345,9 @@ export interface BrokenPipeDeps {
  * Guard against `EPIPE` on stdout/stderr so piping to a reader that closes
  * early (`testsprite ... | head`) exits cleanly instead of crashing with an
  * unhandled `write EPIPE` stack. An armed stdout path requests graceful
- * shutdown before exiting 0; a disarmed one exits 0 immediately. Only `EPIPE`
- * is swallowed; any other stream error is left to surface normally.
+ * shutdown before applying the current exit code; a disarmed one exits with
+ * the current process exit code (or 0 when none is set). Only `EPIPE` is
+ * swallowed; any other stream error is left to surface normally.
  */
 export function installBrokenPipeGuard(deps: BrokenPipeDeps = {}): void {
   const stdout = deps.stdout ?? process.stdout;
