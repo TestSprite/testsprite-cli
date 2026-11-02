@@ -350,10 +350,16 @@ describe('installBrokenPipeGuard', () => {
     }
   });
 
-  it('armed scope: stdout EPIPE preserves a pending failure while requesting graceful cleanup', async () => {
+  it.each([
+    { label: 'defaults success to 0', pendingExitCode: undefined, expectedExitCode: 0 },
+    { label: 'preserves a pending failure', pendingExitCode: 1, expectedExitCode: 1 },
+  ])('armed scope: stdout EPIPE $label while requesting graceful cleanup', async ({
+    pendingExitCode,
+    expectedExitCode,
+  }) => {
     const previousExitCode = process.exitCode;
     try {
-      process.exitCode = 1;
+      process.exitCode = pendingExitCode;
       const stdout = new EventEmitter();
       const stderr = new EventEmitter();
       const exit = vi.fn();
@@ -381,7 +387,7 @@ describe('installBrokenPipeGuard', () => {
       expect(shutdown.signal.aborted).toBe(true);
       const reason = shutdown.signal.reason as InterruptError;
       expect(reason).toBeInstanceOf(InterruptError);
-      expect(reason.exitCode).toBe(1);
+      expect(reason.exitCode).toBe(expectedExitCode);
       await lifetime;
       expect(cleanup).toHaveBeenCalledOnce();
       expect(shutdown.isArmed).toBe(false);
