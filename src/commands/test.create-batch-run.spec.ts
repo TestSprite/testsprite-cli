@@ -1743,14 +1743,21 @@ it('a paused workspace outranks a mixed-in credits refusal from create-batch --r
 
 it('marks a dispatched batch run for recovery guidance on fan-out interruption', async () => {
   const { credentialsPath } = makeCreds();
-  const plansFile = writePlansJsonl([FE_SPEC]);
+  const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC]);
   const interruption = new InterruptError('SIGINT');
   const stdout: string[] = [];
   const stderr: string[] = [];
+  const creationResponse = {
+    results: [
+      { specIndex: 0, testId: 'test_one', status: 'created' },
+      { specIndex: 1, testId: null, status: 'error', error: { code: 'VALIDATION_ERROR', message: 'invalid spec' } },
+    ],
+    summary: { total: 2, created: 1, failed: 1 },
+  };
   const fetchImpl = (async (input: FetchInput) => {
     const url = String(input);
     if (url.includes('/tests/batch')) {
-      return new Response(JSON.stringify(makeBatchCreateResponse(['test_one'])));
+      return new Response(JSON.stringify(creationResponse));
     }
     if (url.includes('/tests/test_one/runs')) {
       return new Response(JSON.stringify(makeTriggerResponse('test_one', 'run_one')));
@@ -1785,6 +1792,13 @@ it('marks a dispatched batch run for recovery guidance on fan-out interruption',
   expect((error as InterruptError).runWaitContext).toBe(true);
   expect(JSON.parse(stdout.at(-1)!) as unknown).toMatchObject({
     results: [{ testId: 'test_one', runId: 'run_one', status: 'running' }],
+    creation: {
+      results: [
+        { specIndex: 0, testId: 'test_one', status: 'created' },
+        { specIndex: 1, testId: null, status: 'error' },
+      ],
+      summary: { total: 2, created: 1, failed: 1 },
+    },
   });
   expect(stderr.join('\n')).toContain('testsprite test wait run_one');
 });
