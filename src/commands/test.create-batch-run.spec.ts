@@ -1750,7 +1750,12 @@ it('marks a dispatched batch run for recovery guidance on fan-out interruption',
   const creationResponse = {
     results: [
       { specIndex: 0, testId: 'test_one', status: 'created' },
-      { specIndex: 1, testId: null, status: 'error', error: { code: 'VALIDATION_ERROR', message: 'invalid spec' } },
+      {
+        specIndex: 1,
+        testId: null,
+        status: 'error',
+        error: { code: 'VALIDATION_ERROR', message: 'invalid spec' },
+      },
     ],
     summary: { total: 2, created: 1, failed: 1 },
   };
