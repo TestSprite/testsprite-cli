@@ -1341,3 +1341,53 @@ describe('HttpClient retry-delay sleep bails on shutdown', () => {
     expect(calls).toBe(1);
   });
 });
+
+describe('rerun deprecation advisories', () => {
+  const rerunBody = {
+    runId: 'run_1',
+    status: 'queued',
+    enqueuedAt: '2026-10-20T00:00:00Z',
+    codeVersion: 'v1',
+    autoHeal: true,
+  };
+  const batchBody = {
+    accepted: [],
+    conflicts: [],
+    deferred: [],
+    closure: { byProject: [] },
+  };
+  const heal = { feature: 'autoHeal', message: 'not honored yet' };
+  const dep = { feature: 'deprecation', message: 'use test run' };
+  const clientFor = (body: unknown): HttpClient =>
+    makeClient((async () => jsonResponse(body)) as unknown as typeof fetch);
+  const opts = { idempotencyKey: 'k1' };
+
+  it('drops a server deprecation advisory but keeps the autoHeal one', async () => {
+    const r = await clientFor({ ...rerunBody, advisories: [heal, dep] }).triggerRerun(
+      't1',
+      { source: 'cli' },
+      opts,
+    );
+    expect(r.advisories).toEqual([heal]);
+  });
+
+  it('removes the advisories key when only a deprecation advisory was sent', async () => {
+    const r = await clientFor({ ...rerunBody, advisories: [dep] }).triggerRerun(
+      't1',
+      { source: 'cli' },
+      opts,
+    );
+    expect('advisories' in r).toBe(false);
+  });
+
+  it('leaves a response without advisories untouched', async () => {
+    const r = await clientFor(rerunBody).triggerRerun('t1', { source: 'cli' }, opts);
+    expect(r).toEqual(rerunBody);
+  });
+
+  it('applies the same filter to the batch rerun response', async () => {
+    const client = clientFor({ ...batchBody, advisories: [dep, heal] });
+    const r = await client.triggerBatchRerun({ testIds: ['a'], source: 'cli' } as never, opts);
+    expect(r.advisories).toEqual([heal]);
+  });
+});
