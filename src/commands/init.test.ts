@@ -69,20 +69,30 @@ function makeOkFetch(): InitDeps['fetchImpl'] {
 }
 
 /** Mock fetch that returns 401 for any request (simulates bad key). */
-function makeAuthFailFetch(): InitDeps['fetchImpl'] {
+function makeAuthFailFetch(
+  overrides: {
+    status?: number;
+    code?: string;
+    message?: string;
+    nextAction?: string;
+    requestId?: string;
+  } = {},
+): InitDeps['fetchImpl'] {
+  const {
+    status = 401,
+    code = 'AUTH_INVALID',
+    message = 'Invalid API key',
+    nextAction = 'Provide a valid key.',
+    requestId = 'r-1',
+  } = overrides;
   return vi.fn(
     async () =>
       new Response(
         JSON.stringify({
-          error: {
-            code: 'AUTH_INVALID',
-            message: 'Invalid API key',
-            nextAction: 'Provide a valid key.',
-            requestId: 'r-1',
-          },
+          error: { code, message, nextAction, requestId },
         }),
         {
-          status: 401,
+          status,
           headers: { 'content-type': 'application/json' },
         },
       ),
@@ -2079,6 +2089,64 @@ describe('runInit -- skipIfConfigured', () => {
     // The summary must still be emitted.
     const parsed = JSON.parse(captured.stdout.join('')) as { status: string };
     expect(parsed.status).toBe('initialized');
+  });
+
+  it('fails with AUTH_INVALID instead of reporting success when the saved key is rejected', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    // A key that is still on disk but no longer accepted by the server.
+    // Valid format so the failure comes from the server, not the local format check.
+    writeProfile('default', { apiKey: 'sk-user-revoked-key' }, { path: credentialsPath });
+
+    // `--skip-if-configured` skips the configure-time GET /me, so whoami is the
+    // only call that reaches the server. Before this fix its 401 was swallowed
+    // and the run still printed an `initialized` summary with exit 0.
+    await expect(
+      runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
+        ...deps,
+        credentialsPath,
+        fetchImpl: makeAuthFailFetch(),
+        fs: agentFs,
+        isTTY: false,
+      }),
+    ).rejects.toMatchObject({ code: 'AUTH_INVALID', exitCode: 3 });
+
+    // No success summary may reach stdout.
+    expect(captured.stdout.join('')).not.toContain('initialized');
+  });
+
+  it('preserves the server error detail when the saved key is forbidden', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    writeProfile('default', { apiKey: 'sk-user-revoked-key' }, { path: credentialsPath });
+
+    // 403 rather than 401: a key the server still recognises but no longer
+    // authorises must fail the same way. The failure also has to carry the
+    // server's own remediation text and requestId through, because that is what
+    // an operator needs to open a support ticket -- a generic "setup failed"
+    // would lose both.
+    await expect(
+      runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
+        ...deps,
+        credentialsPath,
+        fetchImpl: makeAuthFailFetch({
+          status: 403,
+          code: 'AUTH_FORBIDDEN',
+          message: 'API key is not permitted for this organization',
+          nextAction: 'Ask an organization admin to grant access.',
+          requestId: 'r-403',
+        }),
+        fs: agentFs,
+        isTTY: false,
+      }),
+    ).rejects.toMatchObject({
+      code: 'AUTH_FORBIDDEN',
+      exitCode: 3,
+      requestId: 'r-403',
+      nextAction: 'Ask an organization admin to grant access.',
+    });
+
+    expect(captured.stdout.join('')).not.toContain('initialized');
   });
 
   it('proceeds to prompt when skipIfConfigured is true but no credentials exist', async () => {
