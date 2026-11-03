@@ -26,6 +26,7 @@ import {
   BATCH_RUN_RATE_LIMIT,
   BATCH_RUN_RATE_MAX_OUTER_RETRIES,
   DEFAULT_BATCH_RUN_CONCURRENCY,
+  PLAN_TEMPLATE_TEXT,
   createTestCommand,
   isTransientRateLimit,
   runCreate,
@@ -3507,5 +3508,256 @@ describe('create run environment', () => {
     }
     expect(environments).toEqual(['staging', 'staging', 'staging', 'staging']);
     expect(stderr.filter(line => line === 'batch-run summary: 1/1 triggered')).toHaveLength(2);
+  });
+});
+
+// #376: --wait / --timeout (and create-batch --max-concurrency) act on the
+// runs --run triggers. Without --run they are refused like --env, before any
+// request, instead of creating the test(s), running nothing and exiting 0.
+describe('create run chain flags without --run (#376)', () => {
+  function refusingDeps(files: ReturnType<typeof fixtures>): {
+    deps: {
+      credentialsPath: string;
+      fetchImpl: typeof globalThis.fetch;
+      stdout: () => void;
+      stderr: () => void;
+    };
+    calls: () => number;
+  } {
+    let calls = 0;
+    return {
+      deps: {
+        credentialsPath: files.credentialsPath,
+        fetchImpl: (async () => {
+          calls++;
+          throw new Error('unexpected network');
+        }) as typeof globalThis.fetch,
+        stdout: () => {},
+        stderr: () => {},
+      },
+      calls: () => calls,
+    };
+  }
+
+  const codeFileArgs = (files: ReturnType<typeof fixtures>) => [
+    'create',
+    '--project',
+    'project_1',
+    '--type',
+    'frontend',
+    '--name',
+    'example',
+    '--code-file',
+    files.codeFile,
+  ];
+
+  const cases: Array<{
+    label: string;
+    field: string;
+    args: (files: ReturnType<typeof fixtures>) => string[];
+  }> = [
+    {
+      label: 'create --code-file --wait',
+      field: 'wait',
+      args: f => [...codeFileArgs(f), '--wait'],
+    },
+    {
+      label: 'create --code-file --timeout',
+      field: 'timeout',
+      args: f => [...codeFileArgs(f), '--timeout', '30'],
+    },
+    {
+      label: 'create --plan-from --wait',
+      field: 'wait',
+      args: f => ['create', '--plan-from', f.planFile, '--wait'],
+    },
+    {
+      label: 'create --plan-from --timeout',
+      field: 'timeout',
+      args: f => ['create', '--plan-from', f.planFile, '--timeout', '30'],
+    },
+    {
+      label: 'create-batch --plans --wait',
+      field: 'wait',
+      args: f => ['create-batch', '--plans', f.plansFile, '--wait'],
+    },
+    {
+      label: 'create-batch --plans --timeout',
+      field: 'timeout',
+      args: f => ['create-batch', '--plans', f.plansFile, '--timeout', '30'],
+    },
+    {
+      label: 'create-batch --plans --max-concurrency',
+      field: 'max-concurrency',
+      args: f => ['create-batch', '--plans', f.plansFile, '--max-concurrency', '5'],
+    },
+    {
+      label: 'create-batch --plan-from-dir --max-concurrency',
+      field: 'max-concurrency',
+      args: f => ['create-batch', '--plan-from-dir', f.planDir, '--max-concurrency', '5'],
+    },
+  ];
+
+  it.each(cases)(
+    '$label without --run → exit 5 on that flag, zero network',
+    async ({ field, args }) => {
+      const files = fixtures();
+      const { deps, calls } = refusingDeps(files);
+      const command = createTestCommand(deps);
+      const err = await command.parseAsync(args(files), { from: 'user' }).catch(e => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5, details: { field } });
+      expect(err.nextAction).toContain(`--${field} requires --run`);
+      expect(err.nextAction).toContain(`Add --run, or remove --${field}`);
+      expect(calls()).toBe(0);
+    },
+  );
+
+  it('the run helpers refuse the same flags without run: true', async () => {
+    const files = fixtures();
+    const { deps, calls } = refusingDeps(files);
+    const common = { profile: 'default', output: 'json' as const, debug: false };
+    const codeFileOpts = {
+      ...common,
+      projectId: 'project_1',
+      type: 'frontend' as const,
+      name: 'example',
+      codeFile: files.codeFile,
+    };
+    for (const [field, invoke] of [
+      ['wait', () => runCreate({ ...codeFileOpts, wait: true }, deps)],
+      ['timeout', () => runCreate({ ...codeFileOpts, timeout: 30, timeoutIsDefault: false }, deps)],
+      ['wait', () => runCreateFromPlan({ ...common, planFrom: files.planFile, wait: true }, deps)],
+      [
+        'timeout',
+        () =>
+          runCreateFromPlan(
+            { ...common, planFrom: files.planFile, timeout: 30, timeoutIsDefault: false },
+            deps,
+          ),
+      ],
+      ['wait', () => runCreateBatch({ ...common, plans: files.plansFile, wait: true }, deps)],
+      [
+        'timeout',
+        () => runCreateBatch({ ...common, plans: files.plansFile, timeoutSeconds: 30 }, deps),
+      ],
+      [
+        'max-concurrency',
+        () => runCreateBatch({ ...common, plans: files.plansFile, maxConcurrency: 5 }, deps),
+      ],
+    ] as const) {
+      const err = await invoke().catch(e => e);
+      expect(err).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5, details: { field } });
+    }
+    expect(calls()).toBe(0);
+  });
+
+  it('the run helpers treat a timeout without timeoutIsDefault as given', async () => {
+    const files = fixtures();
+    const { deps, calls } = refusingDeps(files);
+    const common = { profile: 'default', output: 'json' as const, debug: false };
+    const codeFileOpts = {
+      ...common,
+      projectId: 'project_1',
+      type: 'frontend' as const,
+      name: 'example',
+      codeFile: files.codeFile,
+    };
+    for (const invoke of [
+      () => runCreate({ ...codeFileOpts, timeout: 30 }, deps),
+      () => runCreateFromPlan({ ...common, planFrom: files.planFile, timeout: 30 }, deps),
+    ]) {
+      const err = await invoke().catch(e => e);
+      expect(err).toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'timeout' },
+      });
+    }
+    expect(calls()).toBe(0);
+    // Control: the CLI's parsed default (timeoutIsDefault: true) is not a given --timeout.
+    // No fetchImpl here, so --dry-run answers from its canned sample.
+    const dryDeps = { credentialsPath: files.credentialsPath, stdout: () => {}, stderr: () => {} };
+    await expect(
+      runCreate({ ...codeFileOpts, dryRun: true, timeout: 600, timeoutIsDefault: true }, dryDeps),
+    ).resolves.toBeDefined();
+    await expect(
+      runCreateFromPlan(
+        { ...common, planFrom: files.planFile, dryRun: true, timeout: 600, timeoutIsDefault: true },
+        dryDeps,
+      ),
+    ).resolves.toBeDefined();
+  });
+
+  it.each([
+    { label: '--wait', flags: ['--wait'] },
+    { label: '--timeout', flags: ['--timeout', '30'] },
+  ])(
+    'create --plan-template $label still prints the template and exits 0 (it ignores every other flag)',
+    async ({ flags }) => {
+      const files = fixtures();
+      const { deps, calls } = refusingDeps(files);
+      const out: string[] = [];
+      const command = createTestCommand({ ...deps, stdout: line => out.push(line) });
+      await expect(
+        command.parseAsync(['create', '--plan-template', ...flags], { from: 'user' }),
+      ).resolves.toBe(command);
+      expect(out.join('\n')).toBe(PLAN_TEMPLATE_TEXT);
+      expect(calls()).toBe(0);
+    },
+  );
+
+  it('control: the same flags with --run are accepted and reach the run', async () => {
+    const files = fixtures();
+    const triggered: string[] = [];
+    let polls = 0;
+    const fetchImpl = makeFetch((url, init) => {
+      if (url.endsWith('/tests/batch')) return { body: makeBatchCreateResponse(['test_batch']) };
+      if (url.endsWith('/tests') && init.method === 'POST')
+        return {
+          body: {
+            testId: 'test_created',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-09-22T00:00:00Z',
+          },
+        };
+      if (url.includes('/runs') && init.method === 'POST') {
+        triggered.push(url);
+        return { body: makeTriggerResponse('test_created', 'run_created') };
+      }
+      if (url.includes('/runs/run_created')) {
+        polls++;
+        return { body: makePassedRun('test_created', 'run_created') };
+      }
+      return { body: { items: [], nextToken: null } };
+    });
+    const deps = {
+      credentialsPath: files.credentialsPath,
+      fetchImpl,
+      sleep: instantSleep,
+      stdout: () => {},
+      stderr: () => {},
+    };
+    for (const args of [
+      [...codeFileArgs(files), '--run', '--wait', '--timeout', '30'],
+      ['create', '--plan-from', files.planFile, '--run', '--wait', '--timeout', '30'],
+      [
+        'create-batch',
+        '--plans',
+        files.plansFile,
+        '--run',
+        '--wait',
+        '--timeout',
+        '30',
+        '--max-concurrency',
+        '5',
+      ],
+    ]) {
+      const command = createTestCommand(deps);
+      await expect(command.parseAsync(args, { from: 'user' })).resolves.toBe(command);
+    }
+    expect(triggered).toHaveLength(3);
+    expect(polls).toBeGreaterThanOrEqual(3);
   });
 });
