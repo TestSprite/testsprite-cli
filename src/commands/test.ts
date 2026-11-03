@@ -10986,6 +10986,7 @@ export async function runTestRunAll(
   // resolvable in-flight run stay hard (nothing to wait on).
   // An in-flight run may belong to another deployment/environment. CI can
   // only use runs accepted by this invocation to judge its own change.
+  const metadataConflicts = conflicts;
   // A `no_producer` / `producer_in_flight` conflict's `currentRunId` is the
   // result the server seeded BLOCKED before dispatch. It is reported with the
   // server's reason and exit 6, as a single `test run` reports it, not polled.
@@ -11025,6 +11026,8 @@ export async function runTestRunAll(
     }
     return listing;
   };
+  // Keep the metadata stage graceful even between tracked HTTP requests.
+  const disarmResolve = shutdownOf(deps).arm();
   const resumedOrRefused = await Promise.all(
     resumableConflicts.map(
       async (c): Promise<{ entry: BatchRunFreshAccepted } | { refused: RunConflict }> => {
@@ -11091,7 +11094,43 @@ export async function runTestRunAll(
         return { entry: { testId: c.testId, runId: inFlightRunId, enqueuedAt: notBefore } };
       },
     ),
-  );
+  )
+    .catch((err: unknown) => {
+      if (err instanceof InterruptError) {
+        const partialResults: CliBatchRunFreshResult[] = accepted.map(e => ({
+          testId: e.testId,
+          runId: e.runId,
+          status: 'running',
+        }));
+        out.print(
+          {
+            accepted: partialResults,
+            conflicts: metadataConflicts,
+            deferred,
+            skippedFrontend,
+            skippedIntegration,
+            ...(notRunTestIds.length > 0 ? { notRunTestIds } : {}),
+          },
+          () =>
+            partialResults.length > 0
+              ? partialResults.map(r => `${r.runId}  ${r.status}`).join('\n')
+              : resumableConflicts
+                  .map(c => `${c.currentRunId}  unverified (not attached)`)
+                  .join('\n'),
+        );
+        if (accepted.length > 0) {
+          err.runWaitContext = true;
+          stderrFn(
+            interruptDetachMessage(
+              err,
+              accepted.map(e => e.runId),
+            ),
+          );
+        }
+      }
+      throw err;
+    })
+    .finally(disarmResolve);
   const resumableEntries: BatchRunFreshAccepted[] = [];
   for (const outcome of resumedOrRefused) {
     if ('entry' in outcome) {
