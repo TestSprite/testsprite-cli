@@ -170,6 +170,55 @@ describe('buildJUnitReport', () => {
     expect(xml).toContain('</testsuites>');
   });
 
+  it('#515: disambiguates same-name tests so standard consumers keep both failures', () => {
+    // GitLab hashes suite/class/name: two rows sharing classname+name collapse
+    // into one row (one failure, one diagnostic). The stable logical testId —
+    // not the ephemeral runId — joins the standard identity, for the colliding
+    // group only.
+    const xml = buildJUnitReport({
+      suiteName: 'testsprite:testlist:list-1',
+      classname: 'testlist:list-1',
+      results: [
+        makeResult({ testId: 'test_a', runId: 'run_a', status: 'failed', name: 'Checkout', durationSeconds: 2.5 }),
+        makeResult({ testId: 'test_b', runId: 'run_b', status: 'failed', name: 'Checkout', durationSeconds: 2.5 }),
+      ],
+    });
+    const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]);
+    expect(new Set(names).size).toBe(2);
+    expect(names).toContain('Checkout [test_a]');
+    expect(names).toContain('Checkout [test_b]');
+    expect(xml).toContain('<failure message="failed" type="failed">');
+    expect((xml.match(/<failure /g) ?? []).length).toBe(2);
+  });
+
+  it('#515: keeps unique display names untouched (no suffix noise)', () => {
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'test_a', status: 'passed', name: 'Checkout' }),
+        makeResult({ testId: 'test_b', status: 'passed', name: 'Signup' }),
+      ],
+    });
+    expect(xml).toContain('name="Checkout" testId="test_a"');
+    expect(xml).toContain('name="Signup" testId="test_b"');
+  });
+
+  it('#515: same name under different classnames stays unsuffixed', () => {
+    // Distinct classnames are already distinct identities for standard
+    // consumers; only rows sharing classname+name need the suffix.
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_default',
+      results: [
+        makeResult({ testId: 'test_a', status: 'failed', name: 'Checkout', classname: 'proj_one' }),
+        makeResult({ testId: 'test_b', status: 'failed', name: 'Checkout', classname: 'proj_two' }),
+      ],
+    });
+    expect(xml).toContain('classname="proj_one" name="Checkout"');
+    expect(xml).toContain('classname="proj_two" name="Checkout"');
+  });
+
   it('counts passed tests without child elements', () => {
     const xml = buildJUnitReport({
       suiteName: 'Batch',

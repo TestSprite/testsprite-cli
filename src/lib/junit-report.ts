@@ -168,12 +168,14 @@ function failureMessage(result: JUnitTestResult): string {
   return result.status;
 }
 
-function renderTestcase(result: JUnitTestResult, classname: string): string {
+function renderTestcase(result: JUnitTestResult, classname: string, displayName?: string): string {
   const outcome = classifyJUnitOutcome(result.status, result.error);
   // A readable CI test tab keys on `name`: prefer the human test name, fall back
   // to the id. The UUID is preserved as a `testId` attribute (ignored by
   // renderers, read by machine consumers) so the switch loses no information.
-  const name = escapeXml(result.name?.trim() || result.testId);
+  // `displayName` carries the precomputed disambiguated name for colliding
+  // groups (see resolveJUnitDisplayNames).
+  const name = escapeXml(displayName ?? (result.name?.trim() || result.testId));
   const cls = escapeXml(classname);
   const time = formatTime(result.durationSeconds);
   const idAttr = ` testId="${escapeXml(result.testId)}"`;
@@ -220,6 +222,32 @@ function renderTestcase(result: JUnitTestResult, classname: string): string {
 }
 
 /**
+ * Standard JUnit consumers (GitLab, Jenkins) key a testcase on classname+name
+ * and ignore extra attributes, so rows sharing both collapse into one — a
+ * same-name pair from a multi-project list then loses one verdict and one
+ * run's diagnostics (#515). The stable logical testId — not the ephemeral
+ * runId, which would break cross-run comparison — joins the standard identity
+ * for colliding groups only: unique names render exactly as before.
+ */
+function resolveJUnitDisplayNames(
+  results: ReadonlyArray<JUnitTestResult>,
+  fallbackClassname: string,
+): Array<string | undefined> {
+  const groups = new Map<string, number>();
+  const keys = results.map(result => {
+    const classname = result.classname ?? fallbackClassname;
+    const rawName = result.name?.trim() || result.testId;
+    const key = `${classname}\u0000${rawName}`;
+    groups.set(key, (groups.get(key) ?? 0) + 1);
+    return key;
+  });
+  return results.map((result, index) => {
+    if (groups.get(keys[index]!) === 1) return undefined;
+    return `${result.name?.trim() || result.testId} [${result.testId}]`;
+  });
+}
+
+/**
  * Build a JUnit XML document from batch results, including skipped members. Per-`testcase` `time` is
  * the run's wall-clock duration (from `startedAt`/`finishedAt`); the `testsuite`
  * `time` is their sum. `time` falls back to `0` for a run with no timing.
@@ -242,7 +270,10 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
   }
 
   const suiteName = escapeXml(opts.suiteName);
-  const testcases = results.map(r => renderTestcase(r, r.classname ?? opts.classname)).join('\n');
+  const displayNames = resolveJUnitDisplayNames(results, opts.classname);
+  const testcases = results
+    .map((r, index) => renderTestcase(r, r.classname ?? opts.classname, displayNames[index]))
+    .join('\n');
 
   return [
     XML_DECL,

@@ -11,6 +11,7 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 ### Fixed
 
 - **`project credential` and `project auto-auth` no longer crash on an unreadable `--credential-file`, `--password-file`, `--client-secret-file` or `--refresh-token-file`.** A missing, unreadable or non-regular file now exits 5 (`VALIDATION_ERROR`) with the usual error envelope instead of an unhandled Node error (exit 1), and `--dry-run` no longer reads these files, matching `project create` and `project update`. Thanks @OkeyAmy (#283).
+- **`--report junit` keeps same-name tests distinct.** Two list members sharing a human title (a multi-project list's `Checkout` from each project, or the same title twice within one project) were emitted with identical `classname`/`name`, and standard JUnit consumers such as GitLab — which key a testcase on those fields and ignore the extra `testId`/`runId` attributes — collapsed the pair into one row, dropping one verdict and one run's diagnostics. Colliding rows now carry the stable logical test id in the standard `name` (`Checkout [test_a]`); unique names render exactly as before. (#515)
 
 ## [0.16.0] - 2026-10-30
 
