@@ -5,7 +5,6 @@ import {
   readEnvironmentPreflight,
   ENVIRONMENT_PREFLIGHT_TIMEOUT_MS,
   assertNoTunnelOptions,
-  severalIdsWithoutTunnel,
   quoteEnvironmentName,
   groupEnvironmentTargets,
   emitEnvironmentDispatchPartial,
@@ -29,7 +28,7 @@ import {
 } from 'node:fs';
 import { rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Command } from 'commander';
 import { openInBrowser } from '../lib/browser.js';
 import {
@@ -87,6 +86,13 @@ import {
 import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
 import { VERSION } from '../version.js';
+import {
+  emitDeprecationEntry,
+  REMOVED_IN,
+  TEST_FLAKY_DEPRECATION,
+  TEST_RERUN_DEPRECATION,
+  type DeprecationEntry,
+} from '../lib/deprecate.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import {
   fetchSinglePage,
@@ -140,9 +146,11 @@ import { classifyBillingRefusal } from '../lib/billing-refusal.js';
 import {
   allConflictsInFlight,
   billingConflictLink,
+  conflictNextAction,
   insufficientCreditsConflictError,
   isAllCreditsRefusal,
   isPausedRefusal,
+  isProducerBlock,
   pausedConflictError,
   summarizeConflicts,
   type RunConflict,
@@ -594,6 +602,12 @@ export interface TestDeps {
    * `sleep` / `fetchImpl` / `shutdown`.
    */
   createTunnelClient?: (options: TunnelClientOptions) => TunnelClientHandle;
+  /**
+   * Deprecation entries surfaced as a trailing `deprecations` key on JSON
+   * object payloads. Set only by the deprecated commands' actions; every
+   * `Output` built from these deps picks it up, so no print site changes.
+   */
+  deprecations?: readonly DeprecationEntry[];
 }
 
 /** The effective shutdown handle for a command invocation. */
@@ -1046,7 +1060,7 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
   // sending. Friendlier error than waiting for the server's 400 with
   // a list of accepted tokens — and lets the user fix typos without
   // a round trip.
-  validateStatusFilter(opts.status);
+  validateListStatusFilter(opts.status);
 
   const out = makeOutput(opts.output, deps);
   if (opts.output === 'text') {
@@ -1063,7 +1077,7 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
     projectId,
     type: opts.type,
     createdFrom: opts.createdFrom,
-    status: opts.status,
+    status: opts.status === undefined ? undefined : expandNotRun(opts.status),
     ...(environment !== undefined ? { environment } : {}),
   };
 
@@ -1088,32 +1102,7 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
     }
   } catch (err) {
     if (err instanceof InterruptError) throw err;
-    if (
-      err instanceof ApiError &&
-      err.code === 'VALIDATION_ERROR' &&
-      err.getDetail('field') === 'environment' &&
-      Array.isArray(err.getDetail('available')) &&
-      environment !== undefined
-    ) {
-      const available = (err.getDetail('available') as unknown[]).filter(
-        (name): name is string => typeof name === 'string',
-      );
-      if (available.length > 0 && !err.nextAction.includes(available.join(', '))) {
-        const hint = `Flag \`--env\` is invalid: unknown environment '${environment}'; use one of: ${available.join(', ')}.`;
-        throw new ApiError(
-          {
-            code: err.code,
-            message: err.message,
-            nextAction: err.nextAction ? `${hint} ${err.nextAction}` : hint,
-            requestId: err.requestId,
-            details: err.details,
-          },
-          err.httpStatus,
-          err.retryAfterMs,
-        );
-      }
-    }
-    throw err;
+    throw withUnknownEnvironmentHint(err, environment);
   }
 
   if (environment !== undefined) {
@@ -1121,24 +1110,10 @@ export async function runList(opts: ListOptions, deps: TestDeps = {}): Promise<P
     if (opts.output === 'text' && opts.noHeader) {
       stderr(`Frontend test status requested for environment '${environment}'.`);
     }
-    if (
-      page.items.length > 0 &&
-      !page.items.some(
-        test => test.headlineEnvironment !== undefined || test.statusByEnvironment !== undefined,
-      )
-    ) {
-      // An older server ignores `environment` and returns unfiltered
-      // statuses; printing them would look like a filtered answer.
-      throw ApiError.fromEnvelope({
-        error: {
-          code: 'UNSUPPORTED',
-          message: 'This server does not support `test list --env` yet.',
-          nextAction: 'Run the command without --env, or retry after the server is upgraded.',
-          requestId: 'local',
-          details: {},
-        },
-      });
-    }
+    assertEnvironmentStatusesPresent(page.items, {
+      message: 'This server does not support `test list --env` yet.',
+      nextAction: 'Run the command without --env, or retry after the server is upgraded.',
+    });
   }
   out.print(page, data =>
     renderTestListText(data as Page<CliTest>, {
@@ -2676,9 +2651,11 @@ export async function runDeleteBatch(
     );
   }
 
-  // Validate --status filter.
+  // Validate --status filter. An empty value is refused: read as "no filter",
+  // `--status ''` would delete every test in the project.
   if (opts.statusFilter !== undefined) {
-    validateStatusFilter(opts.statusFilter);
+    assertStatusSelectorNotEmpty(opts.statusFilter, RUN_STATUS_VALUES);
+    validateListStatusFilter(opts.statusFilter);
   }
 
   const client = makeClient(opts, deps);
@@ -2709,9 +2686,9 @@ export async function runDeleteBatch(
     let allTests = allPage.items;
 
     // --status filter.
-    if (opts.statusFilter !== undefined && opts.statusFilter !== '') {
+    if (opts.statusFilter !== undefined) {
       const allowed = new Set(
-        opts.statusFilter
+        expandNotRun(opts.statusFilter)
           .split(',')
           .map(s => s.trim())
           .filter(s => s.length > 0),
@@ -2949,10 +2926,8 @@ export const PLAN_TEMPLATE_TEXT: string = JSON.stringify(PLAN_TEMPLATE_WITH_SCHE
 const PLAN_TEMPLATE_HELP_TEXT =
   '\nPlan file format (--plan-from <file>) — minimal valid example:\n\n' +
   `${PLAN_TEMPLATE_TEXT}\n\n` +
-  'Print this exact skeleton:      testsprite test create --plan-template\n' +
-  'Validate offline (no network):  testsprite test create --plan-from <file> --dry-run\n' +
-  'Multiple tests:                 test create-batch --plans <file.jsonl> | --plan-from-dir <dir>\n' +
-  'Full field reference: DOCUMENTATION.md -> "Plan file format"\n';
+  'Validate offline:  testsprite test create --plan-from <file> --dry-run\n' +
+  'Many tests:        testsprite test create-batch --plans <file.jsonl>\n';
 
 /** Per-spec result from `POST /tests/batch`. */
 export interface CliBatchSpecResult {
@@ -3043,9 +3018,133 @@ const MAX_BATCH_BODY_BYTES = 5 * 1024 * 1024;
 const MAX_BATCH_RERUN_IDS = 50;
 
 /**
+ * Maximum testIds per `POST /tests/batch/run` request. A larger selection is
+ * sent as several sequential requests, one project at a time (the endpoint
+ * refuses ids from different projects in one request).
+ */
+const MAX_BATCH_RUN_IDS = 50;
+
+/** One `POST /tests/batch/run` request: a project and (unless it is `--all`) its ids. */
+interface BatchRunUnit {
+  projectId: string;
+  testIds?: string[];
+}
+
+/**
+ * Group `ids` by project in first-seen order and cut each group into windows
+ * of `MAX_BATCH_RUN_IDS`. `chunk: false` keeps one request per project, for a
+ * caller whose contract is a single request (`ci run`).
+ */
+function planBatchRunUnits(
+  ids: readonly string[],
+  projectOf: (testId: string) => string,
+  chunk: boolean,
+): BatchRunUnit[] {
+  const byProject = new Map<string, string[]>();
+  for (const id of ids) {
+    const project = projectOf(id);
+    const group = byProject.get(project);
+    if (group) group.push(id);
+    else byProject.set(project, [id]);
+  }
+  const units: BatchRunUnit[] = [];
+  for (const [projectId, group] of byProject) {
+    if (!chunk) {
+      units.push({ projectId, testIds: group });
+      continue;
+    }
+    for (let i = 0; i < group.length; i += MAX_BATCH_RUN_IDS) {
+      units.push({ projectId, testIds: group.slice(i, i + MAX_BATCH_RUN_IDS) });
+    }
+  }
+  return units;
+}
+
+/**
+ * Append `suffix` to an idempotency key within 256 chars. A base that does not
+ * fit is cut and tagged with a digest of the whole key, so two long keys that
+ * differ only in their tail still get different request keys.
+ */
+function suffixedIdempotencyKey(base: string, suffix: string): string {
+  const room = 256 - suffix.length;
+  if (base.length <= room) return `${base}${suffix}`;
+  const digest = createHash('sha256').update(base).digest('hex').slice(0, 16);
+  return `${base.slice(0, room - digest.length - 1)}~${digest}${suffix}`;
+}
+
+/**
+ * Fold the responses of a request sequence into the one response the rest of
+ * the command reads. A single response is returned untouched.
+ */
+function mergeBatchRunResponses(
+  responses: readonly BatchRunFreshResponse[],
+  suppressDashboardUrl: boolean,
+): BatchRunFreshResponse {
+  const first = responses[0]!;
+  if (responses.length === 1 && !suppressDashboardUrl) return first;
+  const integrations = responses.flatMap(r => (r.integration ? [r.integration] : []));
+  return {
+    ...first,
+    accepted: responses.flatMap(r => r.accepted),
+    conflicts: responses.flatMap(r => r.conflicts),
+    deferred: responses.flatMap(r => r.deferred),
+    skippedFrontend: responses.flatMap(r => r.skippedFrontend),
+    skippedIntegration: responses.flatMap(r => r.skippedIntegration),
+    ...(integrations.length > 0
+      ? {
+          integration: {
+            existing: integrations.reduce((n, i) => n + i.existing, 0),
+            runsAfterWave: integrations.some(i => i.runsAfterWave),
+            mayGenerate: integrations.some(i => i.mayGenerate),
+          },
+        }
+      : {}),
+    // A project-level link names one project (and one execution); once the
+    // batch spans several requests or projects no single page is right.
+    ...(suppressDashboardUrl || (responses.length > 1 && 'dashboardUrl' in first)
+      ? { dashboardUrl: null }
+      : {}),
+  };
+}
+
+/**
+ * Resolve the owning project of every id with an authoritative `GET /tests/<id>`
+ * (a handful in flight at a time). An unknown id fails the whole call with its
+ * own NOT_FOUND before anything is dispatched, so an id in a later chunk cannot
+ * be discovered after an earlier chunk already ran.
+ */
+async function resolveTestProjects(
+  client: HttpClient,
+  ids: readonly string[],
+  known: ReadonlyMap<string, Pick<CliTest, 'type' | 'projectId'>> | undefined,
+): Promise<Map<string, string>> {
+  const resolved = new Map<string, string>();
+  const pending: string[] = [];
+  for (const id of ids) {
+    const projectId = known?.get(id)?.projectId;
+    if (projectId) resolved.set(id, projectId);
+    else pending.push(id);
+  }
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const id = pending[next++];
+      if (id === undefined) return;
+      const test = await client.get<CliTest>(`/tests/${encodeURIComponent(id)}`);
+      if (!test.projectId) {
+        throw localValidationError('test-id', `could not determine the project of test ${id}`);
+      }
+      resolved.set(id, test.projectId);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(8, pending.length) }, worker));
+  return resolved;
+}
+
+/**
  * Dedupe `RerunAdvisory[]` by `feature`+`message`. Used to aggregate
  * `advisories` across chunked batch-rerun dispatch requests (initial dispatch
- * + D3 deferred-retry attempts) into a single list, and to collapse repeated
+ * dispatch) into a single list, and to collapse repeated
  * per-attempt advisories in `test flaky` into a single summary line.
  */
 function dedupeRerunAdvisories(entries: RerunAdvisory[]): RerunAdvisory[] {
@@ -3207,23 +3306,6 @@ export const DEFAULT_BATCH_RUN_CONCURRENCY = 50;
 /** Hard upper bound for --max-concurrency. Values above this are rejected with exit 5 (VALIDATION_ERROR). */
 export const MAX_BATCH_CONCURRENCY = 100;
 
-/**
- * The server's DEFAULT in-flight run cap. Runs from every source count
- * toward it (CLI, portal, schedules, CI), but only CLI run triggers are
- * refused on it; a portal or schedule run over the cap is not. Exceeding it
- * answers RATE_LIMITED with `details.reason: "inflight_cap"`, whose details
- * carry the account's real `cap` and `current`.
- *
- * Quoted in help text only — the server owns the real number and rejects on
- * its own value, so this is documentation, never a client-side gate.
- *
- * Distinct from `--max-concurrency`, whose meaning differs per command: on
- * `create --run` it bounds in-flight triggers, and with `--wait` a slot is
- * held until that run finishes, so lowering it there does bound how many runs
- * are in flight. On `run --all` it bounds the `--wait` poll fan-out only.
- */
-export const SERVER_INFLIGHT_RUN_CAP = 50;
-
 /** Client-side run-trigger throttle: 50 triggers per 60-second rolling window per key (sits just under the server's 60/min/key cap). */
 export const BATCH_RUN_RATE_LIMIT = 50;
 /** Rolling window duration (ms) for the client-side trigger rate throttle. */
@@ -3294,16 +3376,6 @@ export function resolveRateLimitRetryMs(err: ApiError): number {
   );
   return Math.min((retryAfterSec ?? 60) * 1000, 120_000);
 }
-
-/**
- * D3: max automatic retry attempts for deferred tests under `--wait`.
- * Each attempt is preceded by a Retry-After-aware sleep (server value if
- * present, else 61s default), clamped to the remaining `--timeout` budget.
- * Only active under `--wait`; the non-wait path is unchanged.
- */
-export const MAX_DEFERRED_RETRIES = 3;
-/** D3: default deferred-retry sleep when no Retry-After is available (ms). */
-export const DEFERRED_RETRY_DEFAULT_SLEEP_MS = 61_000;
 
 /**
  * Returns `true` when a `RATE_LIMITED` error is the **transient per-minute**
@@ -7043,6 +7115,8 @@ interface RunTestRunOptions extends CommonOptions {
    * `TriggerRunBody.autoHeal` for why an explicit `true` is never sent.
    */
   autoHeal?: false;
+  /** BE only: run just the named test without expanding the producer/teardown closure. */
+  skipDependencies?: boolean;
   /**
    * Skip the pre-charge --target-url reachability preflight (zero
    * network calls). Also set by a delegating caller (`runCreate`/
@@ -7742,13 +7816,10 @@ function warnIfOptOutIgnored(
   label: string,
   /**
    * States already reported by an earlier dispatch in the same invocation.
-   * `test run --all` can dispatch more than once — the deferred-retry leg
-   * re-sends the opt-out, so it has to be checked too, or the tests a rate
-   * limit pushed into the retry would be the only ones running unwarned. Those
-   * are also the likeliest to land on a differently-configured instance during a
-   * rollout, which is why this dedupes on the OUTCOME rather than firing once:
-   * a retry whose echo disagrees with the first attempt's is new information and
-   * still warns.
+   * `test run --all` dispatches one request per project and window of ids, and
+   * during a rollout they can land on differently-configured instances, which is
+   * why this dedupes on the OUTCOME rather than firing once: a request whose
+   * echo disagrees with an earlier one is new information and still warns.
    */
   reported?: Set<string>,
 ): void {
@@ -7960,6 +8031,7 @@ export async function runTestRun(
         // handle, the same reason `dashboardUrl` is suppressed under
         // --dry-run rather than pointing at the canned sample id.
         ...(isTunnelRun ? { tunnelClientId: '<minted at run time>' } : {}),
+        ...(opts.skipDependencies ? { skipDependencies: true } : {}),
         ...(environment !== undefined ? { environment } : {}),
       },
       idempotencyKey,
@@ -8149,6 +8221,8 @@ export async function runTestRun(
         // Present ONLY as `false`. Omission is how the protected
         // default is requested — see `TriggerRunBody.autoHeal`.
         ...(opts.autoHeal === false ? { autoHeal: false as const } : {}),
+        // Present only when asked for; an older backend strips it.
+        ...(opts.skipDependencies ? { skipDependencies: true as const } : {}),
         // The client ID only. The secret stays in this process and never
         // reaches a request body, an idempotency row, or an audit line.
         ...(tunnelSession ? { tunnelClientId: tunnelSession.clientId } : {}),
@@ -8335,6 +8409,19 @@ export async function runTestRun(
       )
     ) {
       emitTargetUrlMismatchAdvisory(stderrFn, effectiveTargetUrl, triggerResponse.targetUrl);
+    }
+    // Like the target URL above, an unconfirmed field is reported, not fatal: an
+    // older backend strips it and the run goes ahead with the test cases it depends on,
+    // as a Portal run does.
+    // A run joined from a 409 was not started by this request, so it has no echo.
+    if (
+      opts.skipDependencies &&
+      !resumedFromConflict &&
+      triggerResponse.skipDependencies !== true
+    ) {
+      stderrFn(
+        '[advisory] This backend did not confirm --skip-dependencies, so the run may also include the test cases this one depends on, as a Portal run does.',
+      );
     }
 
     if (!opts.wait) {
@@ -9264,18 +9351,19 @@ export function createTestCancelCommand(deps: TestDeps): Command {
   const cancel = new Command('cancel');
   cancel
     .argument('<run-id...>', 'one or more run ids to cancel')
+    .summary('Cancel queued/running runs (refunds an unfinished FE V3 run)')
     .description(
       'Cancel one or more queued/running runs.\n' +
-        '\nCtrl-C during --wait only detaches — it does NOT cancel the server-side\n' +
-        'run. This is the real stop button. A frontend V3 run cancelled before a\n' +
-        'terminal state has its original charge returned; an uncharged run says so.\n' +
-        'Backend and V2 runs keep their existing billing behavior; an in-flight Lambda\n' +
-        'finishes on its own and its result is discarded once cancelled.\n' +
+        '\nCtrl-C during an ordinary --wait only detaches; it does NOT cancel the run (owned-tunnel\n' +
+        'runs are cancelled on interrupt, see `test run --help`). This is the real stop button.\n' +
+        'A frontend V3 run cancelled before a terminal state has its charge returned; backend and\n' +
+        'V2 runs keep their billing, and an in-flight Lambda finishes with its result discarded.\n' +
         '\nExit codes:\n' +
         '  0  cancelled (fresh or already-cancelled — naturally idempotent)\n' +
-        '  4  run id not found (single id), or ANY id not found (multi-id — outranks conflict)\n' +
-        '  6  run already terminal (passed/failed/blocked) — single id: 409; multi-id: any conflict\n' +
-        '\nMulti-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound}.',
+        '  1  multi-id: a cancel request failed (auth/transport/server error; see summary.errors)\n' +
+        '  4  run id not found (single id), or ANY id not found (multi-id; outranks conflict)\n' +
+        '  6  run already terminal (passed/failed/blocked); multi-id: any conflict\n' +
+        '\nMulti-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound, errors}.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (runIds: string[], _cmdOpts: unknown, command: Command) => {
@@ -9501,6 +9589,8 @@ export interface RunTestRunAllOptions extends CommonOptions {
   projectId?: string;
   /** --filter <substr>: only run tests whose name contains this substring (case-insensitive). */
   nameFilter?: string;
+  /** --status <list>: only run tests whose status (in `environment`, when set) is one of these. */
+  statusFilter?: string;
   /** --wait: block until terminal or --timeout. */
   wait: boolean;
   /** Polling / overall deadline in seconds. Default 600, max 3600. */
@@ -9554,6 +9644,20 @@ export interface RunTestRunAllOptions extends CommonOptions {
   githubTrigger?: CiGithubTrigger;
   /** Skip the pre-charge target URL reachability probe. */
   skipPreflight?: boolean;
+  /** See `RunTestRunOptions.skipDependencies`; sent on every dispatch leg. */
+  skipDependencies?: boolean;
+  /**
+   * Run exactly these tests (`test run <id> <id> ...`) instead of a whole project.
+   * Each id's project is read first and the ids are dispatched per project.
+   */
+  testIds?: string[];
+  /** Tests whose type/project the caller already read, so the resolver does not read them again. */
+  knownTests?: ReadonlyMap<string, Pick<CliTest, 'type' | 'projectId'>>;
+  /**
+   * Set by the explicit-ids resolver: each test's own project, for dashboard
+   * links and the JUnit classname of a batch that spans several projects.
+   */
+  projectIdByTestId?: ReadonlyMap<string, string>;
 }
 
 /**
@@ -9597,6 +9701,7 @@ export async function writeBatchJUnitReportIfRequested(
     reportFile?: string;
     reportSuiteName?: string;
     projectId?: string;
+    projectIdByTestId?: ReadonlyMap<string, string>;
   },
   results: readonly (JUnitTestResult & {
     createdAt?: string | null;
@@ -9618,6 +9723,7 @@ export async function writeBatchJUnitReportIfRequested(
   const enriched: JUnitTestResult[] = results.map(r => ({
     ...r,
     name: nameByTestId?.get(r.testId) ?? (r.testTitle?.trim() ? r.testTitle : undefined) ?? r.name,
+    classname: r.classname ?? opts.projectIdByTestId?.get(r.testId),
     durationSeconds:
       r.durationSeconds ?? durationSecondsBetween(r.startedAt, r.finishedAt, r.createdAt),
   }));
@@ -9627,6 +9733,18 @@ export async function writeBatchJUnitReportIfRequested(
     results: enriched,
   });
   await writeJUnitReportFile(opts.reportFile, xml);
+}
+
+/** `buildTestNameMap` over several projects, merged. */
+async function buildTestNameMapForProjects(
+  client: HttpClient,
+  projectIds: readonly string[],
+): Promise<Map<string, string>> {
+  const merged = new Map<string, string>();
+  for (const projectId of projectIds) {
+    for (const [id, name] of await buildTestNameMap(client, projectId)) merged.set(id, name);
+  }
+  return merged;
 }
 
 /**
@@ -9658,8 +9776,8 @@ interface CliBatchRunFreshResult {
 /**
  * Cancel runs the caller can no longer use, without letting the cleanup itself
  * become the failure. Used when a batch dispatched successfully but the CLI
- * then discovered the dispatch was wrong to keep (the backend did not confirm
- * `--target-url`, so accepted runs may use a different target).
+ * then discovered the dispatch was wrong to keep (the backend did not confirm a
+ * field it was sent, such as `--target-url` or `--skip-dependencies`).
  * Leaving them would bill the user for a verdict nobody asked for.
  *
  * Every error is swallowed to a warning on purpose: the caller is already about
@@ -9674,7 +9792,7 @@ async function cancelRunsBestEffort(
 ): Promise<void> {
   if (runIds.length === 0) return;
   stderrFn(
-    `[${label}] cancelling ${runIds.length} run${runIds.length !== 1 ? 's' : ''} dispatched against the wrong target…`,
+    `[${label}] cancelling ${runIds.length} run${runIds.length !== 1 ? 's' : ''} the backend did not confirm…`,
   );
   for (const runId of runIds) {
     try {
@@ -10037,11 +10155,19 @@ export async function runTestRunAll(
   deps: TestDeps = {},
 ): Promise<BatchRunFreshResponse | undefined> {
   assertIdempotencyKey(opts.idempotencyKey);
+  validateStatusSelector(opts.statusFilter);
   const environment = normalizeEnvironmentName(opts.environment);
-  const projectId = resolveProjectId(opts.projectId, deps);
-  requireProjectId(projectId);
+  // Explicit ids carry their own projects, read once the client exists; an
+  // `--all` run needs the one project up front.
+  const explicitIds = (opts.testIds?.length ?? 0) > 0;
+  let projectId = '<resolved per test>';
+  if (!explicitIds) {
+    const resolvedProjectId = resolveProjectId(opts.projectId, deps);
+    requireProjectId(resolvedProjectId);
+    projectId = resolvedProjectId;
+  }
   // Carry the resolved id into reports, including when it came from the env.
-  opts = { ...opts, projectId };
+  opts = { ...opts, projectId: explicitIds ? undefined : projectId };
   if (
     !Number.isInteger(opts.maxConcurrency) ||
     opts.maxConcurrency < 1 ||
@@ -10060,7 +10186,7 @@ export async function runTestRunAll(
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const out = makeOutput(opts.output, deps);
 
-  if (opts.dryRun && opts.targetUrl === undefined && !opts.noWait) {
+  if (opts.dryRun && opts.targetUrl === undefined && !opts.noWait && !explicitIds) {
     let target: ResolvedRunTarget | undefined;
     try {
       target = await resolveEnvironmentRunTarget({
@@ -10105,9 +10231,18 @@ export async function runTestRunAll(
       path: '/api/cli/v1/tests/batch/run',
       body: {
         projectId,
-        testIds: opts.nameFilter ? ['<filtered by --filter>'] : undefined,
+        testIds: explicitIds
+          ? [...new Set(opts.testIds)]
+          : opts.nameFilter || opts.statusFilter !== undefined
+            ? [
+                opts.statusFilter !== undefined
+                  ? '<filtered by --filter/--status>'
+                  : '<filtered by --filter>',
+              ]
+            : undefined,
         source: 'cli' as const,
         ...(opts.autoHeal === false ? { autoHeal: false as const } : {}),
+        ...(opts.skipDependencies ? { skipDependencies: true as const } : {}),
         ...(environment !== undefined ? { environment } : {}),
         ...(opts.targetUrl !== undefined ? { targetUrl: opts.targetUrl } : {}),
       },
@@ -10120,7 +10255,11 @@ export async function runTestRunAll(
         sampleJUnitReportXml(opts.projectId, opts.reportSuiteName),
       );
     }
-    out.print(opts.ci || opts.targetUrl !== undefined ? envelope : (batchRunSample ?? envelope));
+    out.print(
+      opts.ci || opts.targetUrl !== undefined || explicitIds || opts.skipDependencies
+        ? envelope
+        : (batchRunSample ?? envelope),
+    );
     return undefined;
   }
 
@@ -10141,17 +10280,18 @@ export async function runTestRunAll(
   // gated batch makes no billable call at all.
 
   const environmentCache = deps.environmentCache ?? new Map();
-  const automaticTarget = opts.environmentResolutionComplete
-    ? undefined
-    : await resolveEnvironmentRunTarget({
-        client,
-        cache: environmentCache,
-        projectId,
-        environment,
-        targetUrl: opts.targetUrl,
-        noWait: opts.noWait,
-        stderr: stderrFn,
-      });
+  const automaticTarget =
+    opts.environmentResolutionComplete || explicitIds
+      ? undefined
+      : await resolveEnvironmentRunTarget({
+          client,
+          cache: environmentCache,
+          projectId,
+          environment,
+          targetUrl: opts.targetUrl,
+          noWait: opts.noWait,
+          stderr: stderrFn,
+        });
   if (automaticTarget) {
     await runTestRunLocalBatch(
       {
@@ -10177,8 +10317,31 @@ export async function runTestRunAll(
   assertNoTunnelOptions(opts);
 
   assertFreshRunWaitOptions(opts, true);
-  // Portal deep links for batch output: every test in the batch belongs to
-  // opts.projectId, so per-item dashboardUrl needs no extra wire data. The
+  // Explicit ids: read each id's project before anything is dispatched. The
+  // batch endpoint refuses a request whose ids span projects, and refuses it
+  // whole for an unknown id, so grouping and existence have to be settled here.
+  const projectOf = new Map<string, string>();
+  const explicitTestIds = explicitIds ? [...new Set(opts.testIds)] : [];
+  if (explicitIds) {
+    for (const [id, project] of await resolveTestProjects(
+      client,
+      explicitTestIds,
+      opts.knownTests,
+    )) {
+      projectOf.set(id, project);
+    }
+    projectId = projectOf.get(explicitTestIds[0]!)!;
+    const several = new Set(projectOf.values()).size > 1;
+    opts = {
+      ...opts,
+      projectId: several ? undefined : projectId,
+      projectIdByTestId: projectOf,
+    };
+  }
+  const multiProject = new Set(projectOf.values()).size > 1;
+  const projectOfTest = (testId: string): string => projectOf.get(testId) ?? projectId;
+  // Portal deep links for batch output: a test belongs to its own project
+  // (opts.projectId for `--all`), so per-item dashboardUrl needs no extra wire data. The
   // project-level URL closes out text-mode output ("watch the wave here").
   // Both stay undefined for unknown API hosts (resolvePortalBase contract).
   const batchApiUrl = resolveApiUrl(opts, deps);
@@ -10202,7 +10365,7 @@ export async function runTestRunAll(
     // TODO: drop the resolvePortalUrl fallback once the server dashboardUrl has
     // shipped in every environment — it only serves runs from an older backend.
     if (typeof item.dashboardUrl === 'string') return item;
-    const dashboardUrl = resolvePortalUrl(batchApiUrl, projectId, item.testId);
+    const dashboardUrl = resolvePortalUrl(batchApiUrl, projectOfTest(item.testId), item.testId);
     return dashboardUrl !== undefined ? { ...item, dashboardUrl } : item;
   };
 
@@ -10211,11 +10374,12 @@ export async function runTestRunAll(
     stderrFn(`idempotency-key: ${idempotencyKey}`);
   }
 
-  // Every dispatch leg (first and deferred retries) sends the same fields.
+  // Every dispatch request sends the same fields.
   // `autoHeal` is present ONLY as `false`; omission requests the protected default.
   const dispatchFields = {
     source: 'cli' as const,
     ...(opts.autoHeal === false ? { autoHeal: false as const } : {}),
+    ...(opts.skipDependencies ? { skipDependencies: true as const } : {}),
     ...(environment !== undefined ? { environment } : {}),
     ...(opts.targetUrl !== undefined ? { targetUrl: opts.targetUrl } : {}),
     ...(opts.admission !== undefined ? { admission: opts.admission } : {}),
@@ -10243,6 +10407,16 @@ export async function runTestRunAll(
           'Use a backend that supports batch target URL overrides, or retry without --target-url.',
       });
     }
+    if (opts.skipDependencies && response.skipDependencies !== true) {
+      out.push({
+        field: 'skipDependencies',
+        reason: 'skip-dependencies-not-honored',
+        message:
+          'This backend did not confirm --skip-dependencies, so the accepted runs may also include the test cases they depend on.',
+        nextAction:
+          'Use a backend that supports --skip-dependencies on batch runs, or retry without --skip-dependencies.',
+      });
+    }
     if (opts.admission !== undefined && response.admission !== opts.admission) {
       out.push({
         field: 'admission',
@@ -10267,6 +10441,8 @@ export async function runTestRunAll(
   async function assertBatchTargetEcho(
     response: BatchRunFreshResponse,
     previouslyAccepted: readonly BatchRunFreshAccepted[],
+    /** A later request: the caller reports or awaits the stopped dispatch, so no artifacts are written here. */
+    stoppedDispatch = false,
   ): Promise<void> {
     const unhonored = unhonoredDispatchFields(response);
     if (unhonored.length === 0) return;
@@ -10288,7 +10464,7 @@ export async function runTestRunAll(
       'run',
     );
 
-    if (opts.wait) {
+    if (opts.wait && !stoppedDispatch) {
       const notAwaited =
         `Not awaited: the batch stopped because a later dispatch did not confirm ${field}. ` +
         'This run was confirmed and is still running; read it with testsprite test wait <run-id>.';
@@ -10349,30 +10525,23 @@ export async function runTestRunAll(
   }
 
   // Resolve testIds: fetch all tests in the project, apply --filter.
-  let testIds: string[] | undefined;
-  if (opts.nameFilter !== undefined && opts.nameFilter !== '') {
-    // We need to resolve the full test set to apply the name filter.
-    const allPage = await paginate<CliTest>(
-      async ({ pageSize, cursor }) =>
-        client.get<Page<CliTest>>('/tests', {
-          query: { projectId, pageSize, cursor },
-        }),
-      {},
-    );
-    const needle = opts.nameFilter.toLowerCase();
-    const filtered = allPage.items.filter(t => t.name.toLowerCase().includes(needle));
-    const before = allPage.items.length;
-    const skipped = before - filtered.length;
-    if (skipped > 0) {
-      stderrFn(
-        `--filter: skipped ${skipped} test${skipped !== 1 ? 's' : ''} whose name does not contain "${opts.nameFilter}".`,
-      );
-    }
+  let testIds: string[] | undefined = explicitIds ? explicitTestIds : undefined;
+  const nameFiltered = opts.nameFilter !== undefined && opts.nameFilter !== '';
+  const statusFiltered = opts.statusFilter !== undefined;
+  if (!explicitIds && (nameFiltered || statusFiltered)) {
+    // The name and status filters are applied here, so the full test set is read.
+    const filtered = await resolveAllProjectTests({
+      client,
+      projectId,
+      statusFilter: opts.statusFilter,
+      nameFilter: opts.nameFilter,
+      stderr: stderrFn,
+      latestStatus: true,
+    });
     testIds = filtered.map(t => t.id);
     if (testIds.length === 0) {
-      stderrFn(
-        `No tests found in project ${projectId} matching --filter "${opts.nameFilter}" — nothing to run.`,
-      );
+      const selectors = describeRunSelectors(opts);
+      stderrFn(`No tests found in project ${projectId} matching ${selectors} — nothing to run.`);
       const emptyResponse: BatchRunFreshResponse = {
         accepted: [],
         conflicts: [],
@@ -10389,7 +10558,7 @@ export async function runTestRunAll(
       // and fail unless --allow-empty, so a renamed test can't turn a filtered
       // gate permanently green. Returns here only under --allow-empty.
       await finishZeroDispatchBatch({
-        reason: `--filter "${opts.nameFilter}" matched no tests in project ${projectId}`,
+        reason: `${selectors} matched no tests in project ${projectId}`,
         skipped: [],
         allowEmpty: opts.allowEmpty === true,
         opts,
@@ -10405,30 +10574,209 @@ export async function runTestRunAll(
   // When no --filter, omit testIds → server runs ALL tests in the project
   // (BE tests on the legacy V2 wave engine; FE + BE on the V3 unified engine).
 
-  let batchResp: BatchRunFreshResponse;
-  try {
-    batchResp = await client.triggerBatchRunFresh(
-      {
-        projectId,
-        ...(testIds !== undefined ? { testIds } : {}),
-        ...dispatchFields,
-      },
-      { idempotencyKey },
-    );
-  } catch (err) {
-    // A whole-batch refusal under `ci run` is a funnel outcome — every API
-    // refusal gets one (validation by the server's `details.reason`, 402/403
-    // as billing, the rest as other).
-    if (opts.ci && err instanceof ApiError) {
-      recordTelemetryExtras({ ciRunOutcome: ciRefusalOutcome(err) });
-    }
-    throw err;
-  }
+  // One request per project and window of MAX_BATCH_RUN_IDS ids, sent one at a
+  // time. `--all` without a filter names no ids and stays a single request, and
+  // `ci run` keeps its one-request contract whatever the filter matched.
+  const dispatchUnits: BatchRunUnit[] =
+    testIds !== undefined ? planBatchRunUnits(testIds, projectOfTest, !opts.ci) : [{ projectId }];
   // Shared across every dispatch this invocation makes — see the `reported` param.
   const optOutReported = new Set<string>();
-  warnIfOptOutIgnored(opts.autoHeal, batchResp.autoHeal, stderrFn, 'these runs', optOutReported);
 
-  await assertBatchTargetEcho(batchResp, []);
+  /**
+   * Report a dispatch that stopped part-way and is not awaited: no `--wait`, a
+   * first request that failed, or an interrupt (under `--wait` a later failure
+   * is awaited instead — see `stoppedError`). The runs earlier requests
+   * accepted keep executing (and billing) and nothing polls them from here, so
+   * their ids and the ids never sent are what the caller needs; the error keeps
+   * its own code and so its own exit code.
+   */
+  async function reportStoppedDispatch(
+    err: unknown,
+    done: readonly BatchRunFreshResponse[],
+    undispatched: readonly BatchRunUnit[],
+  ): Promise<unknown> {
+    const { deduped: acceptedDone, dropped: droppedDone } = dedupeBatchRunFreshAccepted(
+      done.flatMap(r => r.accepted),
+    );
+    // A producer two requests both accepted is polled once elsewhere; here
+    // nothing is polled, but the extra run is still executing and must be named.
+    warnDroppedDuplicateRuns(acceptedDone, droppedDone, stderrFn);
+    const keptRunIds = new Map(acceptedDone.map(r => [r.testId, r.runId]));
+    const extraRunIds = droppedDone
+      .filter(r => r.runId !== keptRunIds.get(r.testId))
+      .map(r => r.runId);
+    const waitRunIds = [...acceptedDone.map(r => r.runId), ...new Set(extraRunIds)];
+    const conflictsDone = done.flatMap(r => r.conflicts);
+    const deferredDone = done.flatMap(r => r.deferred);
+    const skippedFrontendDone = done.flatMap(r => r.skippedFrontend);
+    const skippedIntegrationDone = done.flatMap(r => r.skippedIntegration);
+    const notRunTestIds = undispatched.flatMap(u => u.testIds ?? []);
+    const reason = err instanceof Error ? err.message : String(err);
+    const partial = {
+      accepted: acceptedDone.map(withBatchDashboardUrl),
+      conflicts: conflictsDone,
+      deferred: deferredDone,
+      ...(skippedFrontendDone.length > 0 ? { skippedFrontend: skippedFrontendDone } : {}),
+      ...(skippedIntegrationDone.length > 0 ? { skippedIntegration: skippedIntegrationDone } : {}),
+      notRunTestIds,
+    };
+    if (opts.output === 'json' || acceptedDone.length > 0) {
+      out.print(partial, () => acceptedDone.map(r => `${r.runId}  accepted`).join('\n'));
+    }
+    const waitHint =
+      waitRunIds.length > 0
+        ? `${waitRunIds.length} accepted run${waitRunIds.length !== 1 ? 's are' : ' is'} still executing and not awaited: testsprite test wait ${waitRunIds.join(' ')}`
+        : undefined;
+    const notRunHint = `${notRunTestIds.length} test${notRunTestIds.length !== 1 ? 's were' : ' was'} not dispatched: ${notRunTestIds.join(' ')}`;
+    stderrFn(`[run] Dispatch stopped (${reason}). ${[waitHint, notRunHint].join('. ')}.`);
+    if (opts.wait) {
+      // Best effort: the artifacts must never mask the error that stopped the dispatch.
+      try {
+        const notAwaited =
+          'Not awaited: the dispatch stopped before every test was sent. This run was accepted and is still running; read it with testsprite test wait <run-id>.';
+        const summary = summarizeAcceptedPayload(
+          JSON.stringify({
+            accepted: acceptedDone.map(item => ({
+              ...item,
+              status: 'error',
+              error: { message: notAwaited },
+            })),
+            deferred: deferredDone,
+            conflicts: conflictsDone,
+            skippedFrontend: skippedFrontendDone,
+            skippedIntegration: skippedIntegrationDone,
+            skipped: notRunTestIds.map(testId => ({
+              testId,
+              reason: `not dispatched: ${reason}`,
+            })),
+          }),
+          { foldSkippedBuckets: true },
+        );
+        emitCiArtifacts(
+          summary,
+          opts,
+          {
+            env: deps.env ?? process.env,
+            stdout: deps.stdout ?? (line => process.stdout.write(`${line}\n`)),
+            stderr: stderrFn,
+          },
+          'run',
+        );
+        await writeBatchJUnitReportIfRequested(
+          opts,
+          summary.runs.map(row => ({
+            testId: row.testId,
+            runId: row.runId,
+            status: isNonDispatchedStatus(row.status) ? 'skipped' : 'error',
+            ...(isNonDispatchedStatus(row.status)
+              ? { skipReason: row.error }
+              : { error: { code: 'UNSUPPORTED', message: row.error ?? reason, exitCode: 7 } }),
+          })),
+        );
+      } catch (artifactErr) {
+        if (artifactErr instanceof InterruptError) throw artifactErr;
+        stderrFn(
+          `[run] could not write the CI artifacts: ${artifactErr instanceof Error ? artifactErr.message : String(artifactErr)}; continuing`,
+        );
+      }
+    }
+    return withDispatchHints(err, [waitHint, notRunHint]);
+  }
+
+  /** The failed request's own error (so its exit code stands), with what the caller needs to do next prepended. */
+  function withDispatchHints(err: unknown, hints: ReadonlyArray<string | undefined>): unknown {
+    if (!(err instanceof ApiError)) return err;
+    return new ApiError(
+      {
+        code: err.code,
+        message: err.message,
+        nextAction: [...hints, err.nextAction].filter(Boolean).join('. '),
+        requestId: err.requestId,
+        details: err.details,
+      },
+      err.httpStatus,
+      err.retryAfterMs,
+      err.apiUrl,
+      err.serverNextAction,
+    );
+  }
+
+  /**
+   * Under --wait, a request that fails once earlier requests were accepted
+   * does not abandon those runs: nothing further is sent, they are polled to
+   * their verdicts, and this error — the failed request's own — is what the
+   * invocation exits with, ahead of any verdict-derived code.
+   */
+  let stoppedError: unknown;
+  /** Ids a stopped dispatch never sent (the requests after the failed one). */
+  let notRunTestIds: string[] = [];
+
+  const dispatchResponses: BatchRunFreshResponse[] = [];
+  for (const [unitIndex, unit] of dispatchUnits.entries()) {
+    let unitResp: BatchRunFreshResponse;
+    try {
+      unitResp = await client.triggerBatchRunFresh(
+        {
+          projectId: unit.projectId,
+          ...(unit.testIds !== undefined ? { testIds: unit.testIds } : {}),
+          ...dispatchFields,
+        },
+        {
+          idempotencyKey:
+            dispatchUnits.length === 1
+              ? idempotencyKey
+              : suffixedIdempotencyKey(idempotencyKey, `:chunk${unitIndex}`),
+        },
+      );
+    } catch (err) {
+      // A whole-batch refusal under `ci run` is a funnel outcome — every API
+      // refusal gets one (validation by the server's `details.reason`, 402/403
+      // as billing, the rest as other).
+      if (opts.ci && err instanceof ApiError) {
+        recordTelemetryExtras({ ciRunOutcome: ciRefusalOutcome(err) });
+      }
+      if (opts.wait && dispatchResponses.length > 0 && !(err instanceof InterruptError)) {
+        stoppedError = err;
+        notRunTestIds = dispatchUnits.slice(unitIndex).flatMap(u => u.testIds ?? []);
+        break;
+      }
+      if (dispatchUnits.length > 1) {
+        throw await reportStoppedDispatch(err, dispatchResponses, dispatchUnits.slice(unitIndex));
+      }
+      throw err;
+    }
+    warnIfOptOutIgnored(opts.autoHeal, unitResp.autoHeal, stderrFn, 'these runs', optOutReported);
+    try {
+      await assertBatchTargetEcho(
+        unitResp,
+        dispatchResponses.flatMap(r => r.accepted),
+        unitIndex > 0,
+      );
+    } catch (err) {
+      // The unconfirmed chunk is already cancelled; earlier chunks' runs keep
+      // executing and need reporting like any other later-chunk failure.
+      if (unitIndex > 0) {
+        if (opts.wait && !(err instanceof InterruptError)) {
+          stoppedError = err;
+          notRunTestIds = dispatchUnits.slice(unitIndex).flatMap(u => u.testIds ?? []);
+          break;
+        }
+        throw await reportStoppedDispatch(err, dispatchResponses, dispatchUnits.slice(unitIndex));
+      }
+      throw err;
+    }
+    dispatchResponses.push(unitResp);
+  }
+  let batchResp = mergeBatchRunResponses(dispatchResponses, multiProject);
+  if (dispatchResponses.length > 1) {
+    // Producers the server adds per request can land in two requests; the
+    // repeated test is polled once and the extra run is named, as on a retry.
+    const { deduped, dropped } = dedupeBatchRunFreshAccepted(batchResp.accepted);
+    if (dropped.length > 0) {
+      warnDroppedDuplicateRuns(deduped, dropped, stderrFn);
+      batchResp = { ...batchResp, accepted: deduped };
+    }
+  }
   if (opts.ci && batchResp.accepted.length > 0) {
     // Recorded as soon as the dispatch is confirmed, not after the wait: a job
     // cancelled mid-wait (a re-push under shape B's concurrency group, a manual
@@ -10455,14 +10803,11 @@ export async function runTestRunAll(
     legacyProjectDashboardUrl,
   );
 
-  // Mutable: D3 deferred-retry loop may append to `accepted`, drain `deferred`,
-  // and accumulate additional `conflicts` discovered during retries.
-  let accepted = batchResp.accepted.slice();
-  let deferred = batchResp.deferred.slice();
+  const accepted = batchResp.accepted.slice();
+  const deferred = batchResp.deferred.slice();
   let conflicts = batchResp.conflicts.slice();
   const skippedFrontend = batchResp.skippedFrontend.slice();
   const skippedIntegration = batchResp.skippedIntegration.slice();
-  let retryError: unknown;
 
   // Print advisory for skipped FE tests.
   if (skippedFrontend.length > 0) {
@@ -10577,7 +10922,11 @@ export async function runTestRunAll(
           // replacing it — accepted.length is 0 in this whole branch, so the
           // advisory printed earlier (guarded on accepted.length > 0) never
           // showed the link, and this is the only place it can.
-          nextAction: `Wait for the in-flight runs to complete, then retry, or use: testsprite test wait <run-id>${billingConflictLink(conflicts, batchApiUrl)}`,
+          nextAction: `${conflictNextAction(
+            conflicts,
+            () =>
+              'Wait for the in-flight runs to complete, then retry, or use: testsprite test wait <run-id>',
+          )}${billingConflictLink(conflicts, batchApiUrl)}`,
           requestId: 'local',
           details: { conflicts: conflicts.map(c => c.testId) },
         },
@@ -10596,7 +10945,9 @@ export async function runTestRunAll(
         emptyProject:
           skippedFrontend.length === 0 &&
           skippedIntegration.length === 0 &&
-          opts.nameFilter === undefined,
+          opts.nameFilter === undefined &&
+          opts.statusFilter === undefined &&
+          !explicitIds,
         projectId,
       });
     }
@@ -10605,144 +10956,27 @@ export async function runTestRunAll(
     return { ...batchResp, accepted, deferred, conflicts };
   }
 
-  // D3: budget-driven deferred-retry loop (only under --wait).
-  // Re-dispatches still-deferred tests until they all clear OR the --timeout
-  // budget is exhausted — a busy pool (the in-flight concurrency cap folds
-  // overflow into `deferred[]`) drains within the user's own timeout instead of
-  // giving up after a fixed few tries and failing the run. Each attempt sleeps
-  // 61s (clamped to the remaining budget); newly-accepted runs merge into
-  // `accepted`; if still deferred when the budget runs out, fall through to the
-  // existing exit-7 path. `maxDeferredAttempts` is a pure runaway backstop (the
-  // deadline check below is the real stop), scaled to the timeout so it never
-  // caps a legitimate long wait.
-  const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+  // A deferred id (rare: a busy project lock or a case that went in flight) was
+  // not dispatched and is not resent: it is reported below and exits 7.
   const batchDeadlineMs =
     deps.environmentTunnel?.deadlineMs ?? Date.now() + opts.timeoutSeconds * 1000;
-  // finding 1: reserve a poll window so the deferred-retry loop can't consume the
-  // ENTIRE --timeout and leave the fan-out poll with nothing — which would report
-  // already-finished runs as timeouts (exit 7) instead of their real verdicts
-  // (a genuine failure is exit 1, not 7). One third of the budget, capped at 60s.
-  const POLL_RESERVE_MS = Math.min(60_000, Math.floor((opts.timeoutSeconds * 1000) / 3));
-  const maxDeferredAttempts = Math.max(
-    MAX_DEFERRED_RETRIES,
-    Math.ceil(opts.timeoutSeconds / 60) + 2,
-  );
 
-  for (let attempt = 1; attempt <= maxDeferredAttempts && deferred.length > 0; attempt++) {
-    const remainingMs = batchDeadlineMs - Date.now();
-    if (remainingMs <= POLL_RESERVE_MS) {
-      stderrFn(
-        `[deferred-retry] reserving the remaining budget to poll dispatched runs — ${deferred.length} test${deferred.length !== 1 ? 's' : ''} still deferred.`,
-      );
-      break;
-    }
-    // §1: clamp to what's left ABOVE the reserve so the sleep itself can't run
-    // the budget to zero (the loop only reaches here when remainingMs >
-    // POLL_RESERVE_MS, so the difference is always positive).
-    const sleepMs = Math.min(DEFERRED_RETRY_DEFAULT_SLEEP_MS, remainingMs - POLL_RESERVE_MS);
+  // A stopped dispatch: say what was never sent, then carry on to await what was accepted.
+  const neverSent =
+    stoppedError === undefined
+      ? []
+      : notRunTestIds.length > 0
+        ? notRunTestIds
+        : deferred.map(d => d.testId);
+  const stoppedFailure = (): unknown =>
+    withDispatchHints(stoppedError, [
+      `${neverSent.length} test${neverSent.length !== 1 ? 's were' : ' was'} not dispatched: ${neverSent.join(' ')}`,
+    ]);
+  if (stoppedError !== undefined) {
     stderrFn(
-      `[deferred-retry] attempt ${attempt} — retrying ${deferred.length} deferred test${deferred.length !== 1 ? 's' : ''} in ${Math.round(sleepMs / 1000)}s`,
+      `[run] Dispatch stopped (${stoppedError instanceof Error ? stoppedError.message : String(stoppedError)}); awaiting the runs already accepted. ` +
+        `${neverSent.length} test${neverSent.length !== 1 ? 's were' : ' was'} not dispatched: ${neverSent.join(' ')}.`,
     );
-    await sleepFn(sleepMs);
-
-    const remainingAfterSleep = batchDeadlineMs - Date.now();
-    if (remainingAfterSleep <= POLL_RESERVE_MS) {
-      stderrFn(
-        `[deferred-retry] reserving the remaining budget to poll dispatched runs — ${deferred.length} test${deferred.length !== 1 ? 's' : ''} still deferred.`,
-      );
-      break;
-    }
-
-    const retryIds = deferred.map(d => d.testId);
-    // [P2] Bound the derived key to ≤256 chars. Caller-supplied keys may be up
-    // to 256 chars; appending `:deferred-retryN` (≤16 chars) could push past
-    // the server's 256-char limit and cause every retry to be rejected. Truncate
-    // the base key to leave room for the suffix before concatenating.
-    const retrySuffix = `:deferred-retry${attempt}`;
-    const retryBase =
-      idempotencyKey.length + retrySuffix.length > 256
-        ? idempotencyKey.slice(0, 256 - retrySuffix.length)
-        : idempotencyKey;
-    const retryKey = `${retryBase}${retrySuffix}`;
-    let retryResp: BatchRunFreshResponse;
-    try {
-      // The retry dispatch POST is deliberately NOT bound to the batch deadline
-      // via an AbortSignal. It is a state-CREATING call (it seeds runs); if the
-      // deadline fired mid-flight the abort would only cancel the CLIENT wait,
-      // leaving the server having possibly created the runs while this loop
-      // reports them as still-deferred — the user then retries with a fresh
-      // idempotency key and DUPLICATES the execution + charge. The per-request
-      // timeout (`--request-timeout`, default 120s) still bounds the call, and
-      // the sleeps + fan-out poll below remain deadline-aware; only this single
-      // dispatch may overrun the budget slightly, which is strictly safer than
-      // an indeterminate aborted-but-maybe-dispatched batch.
-      retryResp = await client.triggerBatchRunFresh(
-        {
-          projectId,
-          testIds: retryIds,
-          ...dispatchFields,
-        },
-        { idempotencyKey: retryKey },
-      );
-    } catch (err) {
-      if (err instanceof InterruptError) throw err;
-      if (
-        err instanceof ApiError &&
-        (err.code === 'UNSUPPORTED' || err.code === 'PRECONDITION_FAILED')
-      )
-        throw err;
-      if (opts.ci) retryError = err;
-      // If the retry itself errors, surface it and stop retrying.
-      stderrFn(
-        `[deferred-retry] attempt ${attempt} failed with error: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      break;
-    }
-
-    await assertBatchTargetEcho(retryResp, accepted);
-
-    // The retry re-sent the opt-out (see the dispatch above), so its echo has to
-    // be read as well; otherwise the tests a rate limit pushed into this leg are
-    // the only ones that run unwarned.
-    warnIfOptOutIgnored(
-      opts.autoHeal,
-      retryResp.autoHeal,
-      stderrFn,
-      'the retried runs',
-      optOutReported,
-    );
-
-    const newlyAccepted = retryResp.accepted;
-    const newlyDeferred = retryResp.deferred;
-    const newlyConflicted = retryResp.conflicts;
-    skippedFrontend.push(...retryResp.skippedFrontend);
-    skippedIntegration.push(...retryResp.skippedIntegration);
-
-    if (newlyAccepted.length > 0) {
-      stderrFn(
-        `[deferred-retry] attempt ${attempt}: ${newlyAccepted.length} test${newlyAccepted.length !== 1 ? 's' : ''} now accepted.`,
-      );
-      // A retry asks only for the still-deferred ids but can come back with
-      // tests the first dispatch already ran. Keeping both would poll the
-      // same test twice and overstate `summary.total`.
-      const { deduped, dropped } = dedupeBatchRunFreshAccepted(accepted.concat(newlyAccepted));
-      accepted = deduped;
-      warnDroppedDuplicateRuns(accepted, dropped, stderrFn);
-    }
-    if (newlyConflicted.length > 0) {
-      // [P1] Merge retry-returned conflicts into the running conflicts collection
-      // so the final summary, stderr output, and exit-code logic reflect them.
-      // Without this merge, tests deferred-then-conflicted on retry are invisible
-      // to the final accounting and can cause a false-zero conflicts count.
-      stderrFn(
-        `[deferred-retry] attempt ${attempt}: ${newlyConflicted.length} test${newlyConflicted.length !== 1 ? 's' : ''} in-flight (conflict).`,
-      );
-      conflicts = conflicts.concat(newlyConflicted);
-    }
-    deferred = newlyDeferred;
-    if (deferred.length === 0) {
-      stderrFn(`[deferred-retry] attempt ${attempt}: no tests remain rate-deferred.`);
-    }
   }
 
   // Gap B: an already-running case is not a dead end under --wait. A conflict
@@ -10752,8 +10986,14 @@ export async function runTestRunAll(
   // resolvable in-flight run stay hard (nothing to wait on).
   // An in-flight run may belong to another deployment/environment. CI can
   // only use runs accepted by this invocation to judge its own change.
-  const resumableConflicts = opts.ci ? [] : conflicts.filter(c => c.currentRunId);
-  const hardConflicts = opts.ci ? conflicts : conflicts.filter(c => !c.currentRunId);
+  // A `no_producer` / `producer_in_flight` conflict's `currentRunId` is the
+  // result the server seeded BLOCKED before dispatch. It is reported with the
+  // server's reason and exit 6, as a single `test run` reports it, not polled.
+  // Every other conflict with a run id is polled as before.
+  const isResumable = (c: RunConflict): boolean =>
+    !opts.ci && Boolean(c.currentRunId) && !isProducerBlock(c);
+  const resumableConflicts = conflicts.filter(isResumable);
+  const hardConflicts = conflicts.filter(c => !isResumable(c));
   // Only hard conflicts remain "conflicts" for the final accounting/exit; the
   // resumable ones become polled results below.
   conflicts = hardConflicts;
@@ -10879,7 +11119,7 @@ export async function runTestRunAll(
   warnDroppedDuplicateRuns(pollable, droppedFromMerge, stderrFn);
 
   if (pollable.length === 0) {
-    // Build final response with potentially-updated accepted/deferred from D3 retry loop.
+    // Build final response from the dispatch result.
     const finalResp: BatchRunFreshResponse = {
       accepted,
       conflicts,
@@ -10888,7 +11128,9 @@ export async function runTestRunAll(
       skippedIntegration,
       ...(batchResp.integration !== undefined ? { integration: batchResp.integration } : {}),
     };
-    if (!opts.ci) out.print(finalResp);
+    if (!opts.ci) {
+      out.print(notRunTestIds.length > 0 ? { ...finalResp, notRunTestIds } : finalResp);
+    }
     recordBatchOutcome({
       accepted: accepted.length,
       conflicts,
@@ -10896,15 +11138,24 @@ export async function runTestRunAll(
       skipped: skippedFrontend.length + skippedIntegration.length,
     });
     if (opts.ci) {
-      await finishCiBatch({ ...finalResp, accepted: [] }, opts, deps, undefined, retryError);
+      await finishCiBatch({ ...finalResp, accepted: [] }, opts, deps, undefined);
       return { ...batchResp, ...finalResp };
     }
     // Nothing to poll: surface deferred (rate-limit → exit 7) or all-conflict (exit 6),
     // mirroring the non-wait path so `--wait` never silently exits 0 on a no-op batch.
     // Emit the deferred/conflict summary + annotations first so CI shows them (the
     // pure zero-dispatch fall-through emits its OWN skipped-rows summary below).
-    if (deferred.length > 0 || conflicts.length > 0) {
-      const summary = summarizeAcceptedPayload(JSON.stringify(finalResp));
+    if (deferred.length > 0 || conflicts.length > 0 || stoppedError !== undefined) {
+      const summary = summarizeAcceptedPayload(
+        JSON.stringify({
+          ...finalResp,
+          skipped: notRunTestIds.map(testId => ({
+            testId,
+            reason: 'not dispatched: the dispatch stopped before this test was sent',
+          })),
+        }),
+        { foldSkippedBuckets: explicitIds },
+      );
       await writeBatchJUnitReportIfRequested(opts, skippedJUnitResultsFromSummary(summary));
       emitCiArtifacts(
         summary,
@@ -10917,6 +11168,7 @@ export async function runTestRunAll(
         'run',
       );
     }
+    if (stoppedError !== undefined) throw stoppedFailure();
     if (deferred.length > 0) {
       throw new CLIError(
         `Batch run incomplete: ${deferred.length} test${deferred.length !== 1 ? 's' : ''} rate-deferred (per-key run budget) — retry these individually after ~60s: ${deferred.map(d => d.testId).join(' ')}`,
@@ -10940,7 +11192,11 @@ export async function runTestRunAll(
               ? `${conflicts.length} test${conflicts.length !== 1 ? 's' : ''} already in flight`
               : summarizeConflicts(conflicts)
           }.`,
-          nextAction: `Wait for the in-flight runs to complete, then retry, or use: testsprite test wait <run-id>${billingConflictLink(conflicts, batchApiUrl)}`,
+          nextAction: `${conflictNextAction(
+            conflicts,
+            () =>
+              'Wait for the in-flight runs to complete, then retry, or use: testsprite test wait <run-id>',
+          )}${billingConflictLink(conflicts, batchApiUrl)}`,
           requestId: 'local',
           details: { conflicts: conflicts.map(c => c.testId) },
         },
@@ -10959,7 +11215,9 @@ export async function runTestRunAll(
       emptyProject:
         skippedFrontend.length === 0 &&
         skippedIntegration.length === 0 &&
-        opts.nameFilter === undefined,
+        opts.nameFilter === undefined &&
+        opts.statusFilter === undefined &&
+        !explicitIds,
       projectId,
     });
     // [P2] Return post-retry state (reached only under --allow-empty).
@@ -10979,13 +11237,13 @@ export async function runTestRunAll(
   // `timeoutSeconds`. Without this, runs that wait behind `--max-concurrency`
   // could push total wall-clock to ~ceil(N/concurrency) × timeout instead of
   // the documented `--timeout` ceiling.
-  // NOTE: batchDeadlineMs is set in the D3 deferred-retry loop above and reused here.
+  // NOTE: batchDeadlineMs is set after the dispatch above and reused here.
 
   async function pollFreshAccepted(entry: BatchRunFreshAccepted): Promise<CliBatchRunFreshResult> {
     const runId = entry.runId;
     const remainingMs = batchDeadlineMs - Date.now();
     if (remainingMs <= 0) {
-      // §1/§4: the retry loop reserves POLL_RESERVE_MS, but a slow fan-out can
+      // §1/§4: a slow fan-out can
       // still land here past the deadline. Do ONE bounded poll (1s) THROUGH the
       // backend wait-fallback before declaring timeout — a run that already
       // reached a verdict resolves for ~one request instead of a false timeout
@@ -11209,6 +11467,7 @@ export async function runTestRunAll(
     skippedFrontend,
     skippedIntegration,
     ...(batchResp.integration !== undefined ? { integration: batchResp.integration } : {}),
+    ...(notRunTestIds.length > 0 ? { notRunTestIds } : {}),
     summary: {
       passed,
       failed,
@@ -11220,9 +11479,21 @@ export async function runTestRunAll(
   };
   const freshNameMap =
     opts.report === 'junit' && opts.reportFile !== undefined
-      ? await buildTestNameMap(client, opts.projectId)
+      ? explicitIds
+        ? await buildTestNameMapForProjects(client, [...new Set(projectOf.values())])
+        : await buildTestNameMap(client, opts.projectId)
       : undefined;
-  const ciSummary = summarizeAcceptedPayload(JSON.stringify(jsonPayload));
+  const ciSummary = summarizeAcceptedPayload(
+    JSON.stringify({
+      ...jsonPayload,
+      // Never-sent ids are rows of their own, so the artifacts do not read as a complete batch.
+      skipped: notRunTestIds.map(testId => ({
+        testId,
+        reason: 'not dispatched: the dispatch stopped before this test was sent',
+      })),
+    }),
+    { foldSkippedBuckets: explicitIds },
+  );
   // JUnit rows carry the poll timing the stdout envelope deliberately omits.
   const timedResults = freshRunResults.map(r => ({
     ...r,
@@ -11273,7 +11544,7 @@ export async function runTestRunAll(
         opts,
         deps,
         freshNameMap,
-        retryError,
+        undefined,
         timedResults,
         executionReport,
       );
@@ -11301,6 +11572,10 @@ export async function runTestRunAll(
     },
     'run',
   );
+
+  // The failed request outranks every code below (deferred 7, failed verdict 1,
+  // credits 12, conflict 6): the runs it left behind have been awaited and reported.
+  if (stoppedError !== undefined) throw stoppedFailure();
 
   // Rate-deferred tests were never dispatched → the batch is incomplete (exit 7),
   // mirroring `test rerun --all`. Checked before the failed-run throw so the
@@ -11342,7 +11617,6 @@ export async function runTestRunAll(
     // Pure unresumed in-flight keeps the original "already in flight and could
     // not be resumed" wording; a paused-workspace refusal mixed in here isn't
     // something that "could not be resumed" — it was never resumable to begin with.
-    const ids = conflicts.map(c => c.testId).join(' ');
     // This is the one CONFLICT throw where `accepted` can be non-empty (a
     // mixed batch with some runs dispatched/resumed) — the advisory printed
     // earlier already showed the link in that case (guarded the same way), so
@@ -11353,17 +11627,22 @@ export async function runTestRunAll(
         code: 'CONFLICT',
         message: allConflictsInFlight(conflicts)
           ? `${conflicts.length} test${conflicts.length !== 1 ? 's' : ''} already in flight and could not be resumed — not run.`
-          : `${summarizeConflicts(conflicts)} — not run.`,
-        nextAction: `Wait for the in-flight run(s) to finish, then retry: ${ids}${link}`,
+          : `${summarizeConflicts(conflicts)} — ${
+              conflicts.every(isProducerBlock) ? 'blocked before dispatch' : 'not run'
+            }.`,
+        nextAction: `${conflictNextAction(
+          conflicts,
+          ids => `Wait for the in-flight run(s) to finish, then retry: ${ids.join(' ')}`,
+        )}${link}`,
         requestId: 'local',
         details: { conflicts: conflicts.map(c => c.testId) },
       },
     });
   }
 
-  // [P2] Return object reconstructed from post-retry mutable state (accepted,
-  // deferred, conflicts) so the caller always sees what was actually dispatched,
-  // not the stale initial batchResp. accepted here still holds the original
+  // Return object reconstructed from the dispatch result (accepted, deferred,
+  // conflicts) so the caller always sees what was actually dispatched.
+  // accepted here still holds the original
   // BatchRunFreshAccepted entries (with runId + enqueuedAt); the freshRunResults
   // fan-out is for exit-code logic only and is not part of the returned type.
   return { ...batchResp, accepted, deferred, conflicts };
@@ -11379,6 +11658,7 @@ interface RunTestRunLocalBatchOptions extends CommonOptions {
   all: boolean;
   projectId?: string;
   nameFilter?: string;
+  statusFilter?: string;
   localPort?: number;
   localHost?: LoopbackHost;
   skipPreflight: boolean;
@@ -11395,6 +11675,10 @@ interface RunTestRunLocalBatchOptions extends CommonOptions {
   allowEmpty: boolean;
   autoHeal?: false;
   environment?: string;
+  /** See `RunTestRunOptions.skipDependencies`; forwarded to every dispatch. */
+  skipDependencies?: boolean;
+  /** `--timeout` was not given: a batch run that needs no tunnel uses the ordinary default. */
+  timeoutIsDefault?: boolean;
 }
 
 interface LocalBatchResult {
@@ -11418,6 +11702,7 @@ export async function runTestRunLocalBatch(
   deps: TestDeps = {},
 ): Promise<void> {
   assertIdempotencyKey(opts.idempotencyKey);
+  validateStatusSelector(opts.statusFilter);
   const environment = normalizeEnvironmentName(opts.environment);
   if (
     !Number.isInteger(opts.maxConcurrency) ||
@@ -11443,14 +11728,29 @@ export async function runTestRunLocalBatch(
       : undefined);
   const projectId = opts.all ? resolveProjectId(opts.projectId, deps) : opts.projectId;
   if (opts.all) requireProjectId(projectId);
+  // Ids the tunnel path cannot carry (public targets, backend tests, no
+  // loopback environment) go out as batch runs. Their tests are read at most
+  // once here, so the batch resolver is handed what is already known.
+  const preflightKnown = new Map<string, Pick<CliTest, 'type' | 'projectId'>>();
+  const batchRunOptions = (): RunTestRunAllOptions => ({
+    ...opts,
+    projectId,
+    wait: opts.wait === true,
+    // The tunnel default (longer) only applies when a tunnel carries the runs.
+    ...(!opts.all && opts.timeoutIsDefault ? { timeoutSeconds: DEFAULT_RUN_TIMEOUT_SECONDS } : {}),
+    environmentResolutionComplete: true,
+    testIds: opts.all ? undefined : opts.testIds,
+    knownTests: preflightKnown,
+  });
 
   if (
     opts.localPort === undefined &&
     targetUrl !== undefined &&
     !parseLoopbackTargetUrl(targetUrl)
   ) {
-    if (!opts.all) severalIdsWithoutTunnel();
     assertNoTunnelOptions(opts);
+    // A public --target-url needs no tunnel, so the ids go out as one batch run.
+    if (!opts.all) return void (await runTestRunAll(batchRunOptions(), deps));
   }
   const dryRunTargets = new Map<string, ResolvedRunTarget>();
   const automaticDryRun = opts.dryRun && targetUrl === undefined;
@@ -11494,7 +11794,7 @@ export async function runTestRunLocalBatch(
     }
     if (!targets.length) {
       assertNoTunnelOptions(opts);
-      severalIdsWithoutTunnel();
+      return void (await runTestRunAll(batchRunOptions(), deps));
     }
     targetUrl = targets[0]!.targetUrl;
   }
@@ -11514,6 +11814,7 @@ export async function runTestRunLocalBatch(
                 tunnelClientId: opts.tunnelClientId ?? '<minted at run time>',
               }),
           ...(opts.autoHeal === false ? { autoHeal: false } : {}),
+          ...(opts.skipDependencies ? { skipDependencies: true } : {}),
           ...(environment !== undefined ? { environment } : {}),
         },
       }),
@@ -11540,22 +11841,14 @@ export async function runTestRunLocalBatch(
   let tests: Array<{ id: string; name?: string }> = opts.testIds.map(id => ({ id }));
   const knownTests = new Map<string, Pick<CliTest, 'type' | 'projectId'>>();
   if (opts.all) {
-    const page = await paginate<CliTest>(
-      async ({ pageSize, cursor }) =>
-        client.get<Page<CliTest>>('/tests', {
-          query: { projectId, pageSize, cursor },
-        }),
-      {},
-    );
-    const needle = opts.nameFilter?.toLowerCase();
-    const filtered = needle
-      ? page.items.filter(t => t.name.toLowerCase().includes(needle))
-      : page.items;
-    const omitted = page.items.length - filtered.length;
-    if (omitted > 0)
-      stderrFn(
-        `--filter: skipped ${omitted} test${omitted !== 1 ? 's' : ''} whose name does not contain "${opts.nameFilter}".`,
-      );
+    const filtered = await resolveAllProjectTests({
+      client,
+      projectId: projectId!,
+      statusFilter: opts.statusFilter,
+      nameFilter: opts.nameFilter,
+      stderr: stderrFn,
+      latestStatus: true,
+    });
     tests = filtered.map(t => {
       knownTests.set(t.id, { type: t.type, projectId: t.projectId ?? projectId! });
       return { id: t.id, name: t.name };
@@ -11575,6 +11868,7 @@ export async function runTestRunLocalBatch(
         if (err instanceof InterruptError) throw err;
         if (opts.localPort !== undefined) throw err;
       }
+      if (known?.projectId !== undefined) preflightKnown.set(test.id, known);
     }
     const target =
       (known?.projectId === projectId && known?.type !== 'backend'
@@ -11601,18 +11895,12 @@ export async function runTestRunLocalBatch(
     } else if (target) targets.set(test.id, target);
   }
   const firstTarget = targets.values().next().value as ResolvedRunTarget | undefined;
-  if (!firstTarget && !(opts.all && tests.length === 0) && skipped.length === 0) {
+  // Several ids with no tunnel target at all (public environment, or backend
+  // tests that never use one) are an ordinary batch run, skipped backend tests
+  // included.
+  if (!firstTarget && (!opts.all || (tests.length > 0 && skipped.length === 0))) {
     assertNoTunnelOptions(opts);
-    if (!opts.all) severalIdsWithoutTunnel();
-    return void (await runTestRunAll(
-      {
-        ...opts,
-        projectId: projectId!,
-        wait: opts.wait === true,
-        environmentResolutionComplete: true,
-      },
-      deps,
-    ));
+    return void (await runTestRunAll(batchRunOptions(), deps));
   }
   if (skipped.length)
     stderrFn(
@@ -11753,16 +12041,21 @@ export async function runTestRunLocalBatch(
   if (results.length === 0) {
     printResults();
     await finishZeroDispatchBatch({
-      reason: opts.nameFilter
-        ? `--filter "${opts.nameFilter}" matched no frontend tests in project ${projectId}`
-        : 'no runnable frontend tests in the project',
+      reason:
+        opts.nameFilter || opts.statusFilter !== undefined
+          ? `${describeRunSelectors(opts)} matched no frontend tests in project ${projectId}`
+          : 'no runnable frontend tests in the project',
       skipped: skipped.map(s => s.testId),
       allowEmpty: opts.allowEmpty,
       opts,
       deps,
       stderrFn,
       // A project with only backend tests is not empty: they were skipped, not absent.
-      emptyProject: opts.all && skipped.length === 0 && opts.nameFilter === undefined,
+      emptyProject:
+        opts.all &&
+        skipped.length === 0 &&
+        opts.nameFilter === undefined &&
+        opts.statusFilter === undefined,
       projectId,
       local: {
         // An automatic target was resolved from a saved environment; its port
@@ -11801,6 +12094,7 @@ export async function runTestRunLocalBatch(
   // Trigger requests are uninterruptible (the server may already have charged
   // the run), so an abort waits for them before cancelling and closing.
   const pendingTriggers = new Set<Promise<unknown>>();
+  let skipDependenciesUnconfirmedShown = false;
   const ticker = createTicker(stderrFn, opts.output === 'json' ? false : undefined);
   const setAbort = (reason: unknown, lost?: string) => {
     if (abortReason === undefined) {
@@ -11896,6 +12190,7 @@ export async function runTestRunLocalBatch(
                       }
                     : {}),
                   ...(opts.autoHeal === false ? { autoHeal: false as const } : {}),
+                  ...(opts.skipDependencies ? { skipDependencies: true as const } : {}),
                   ...(environment !== undefined ? { environment } : {}),
                 },
                 { idempotencyKey: key },
@@ -11906,6 +12201,16 @@ export async function runTestRunLocalBatch(
             response = (await triggering).body;
           } finally {
             pendingTriggers.delete(triggering);
+          }
+          if (
+            opts.skipDependencies &&
+            response.skipDependencies !== true &&
+            !skipDependenciesUnconfirmedShown
+          ) {
+            skipDependenciesUnconfirmedShown = true;
+            stderrFn(
+              '[advisory] This backend did not confirm --skip-dependencies, so the runs may also include the test cases they depend on, as a Portal run does.',
+            );
           }
           row.runId = response.runId;
           row.status = 'running';
@@ -12311,6 +12616,7 @@ function validateRerunOptions(opts: RunTestRerunOptions): boolean {
         'Remove --status, or add --all --project <id>.',
     );
   }
+  assertStatusSelectorNotEmpty(opts.statusFilter);
   if (opts.skipTerminal && !opts.all) {
     throw localValidationError(
       'skip-terminal',
@@ -13218,62 +13524,16 @@ async function runTestRerunCore(
       validateStatusFilter(opts.statusFilter);
     }
 
-    // Resolve all tests in the project — follow nextToken until exhausted so
-    // projects with >1 service page (>25 tests) are fully covered.
-    const allPage = await paginate<CliTest>(
-      async ({ pageSize, cursor }) =>
-        client.get<Page<CliTest>>('/tests', {
-          query: { projectId: opts.projectId!, pageSize, cursor },
-        }),
-      {},
-    );
-    let allTests = allPage.items;
-
-    // --skip-terminal: exclude tests already in a terminal status so an
-    // interrupted sweep doesn't re-replay finished tests.
-    if (opts.skipTerminal) {
-      const before = allTests.length;
-      allTests = allTests.filter(t => !TERMINAL_PUBLIC_STATUSES.has(t.status));
-      const skipped = before - allTests.length;
-      if (skipped > 0) {
-        stderrFn(
-          `--skip-terminal: skipped ${skipped} already-terminal test${skipped !== 1 ? 's' : ''} (passed|failed|blocked|cancelled).`,
-        );
-      }
-    }
-
-    // --status <list>: only dispatch tests whose status matches one of the
-    // listed values. Tokens are already validated above.
-    if (opts.statusFilter !== undefined && opts.statusFilter !== '') {
-      const allowed = new Set(
-        opts.statusFilter
-          .split(',')
-          .map(s => s.trim())
-          .filter(s => s.length > 0),
-      );
-      const before = allTests.length;
-      allTests = allTests.filter(t => allowed.has(t.status));
-      const skipped = before - allTests.length;
-      if (skipped > 0) {
-        stderrFn(
-          `--status filter: skipped ${skipped} test${skipped !== 1 ? 's' : ''} not matching status=${opts.statusFilter}.`,
-        );
-      }
-    }
-
-    // --filter <substr>: only dispatch tests whose name contains the
-    // substring (case-insensitive). Applied after --skip-terminal and --status.
-    if (opts.nameFilter !== undefined && opts.nameFilter !== '') {
-      const needle = opts.nameFilter.toLowerCase();
-      const before = allTests.length;
-      allTests = allTests.filter(t => t.name.toLowerCase().includes(needle));
-      const skipped = before - allTests.length;
-      if (skipped > 0) {
-        stderrFn(
-          `--filter: skipped ${skipped} test${skipped !== 1 ? 's' : ''} whose name does not contain "${opts.nameFilter}".`,
-        );
-      }
-    }
+    // Follows nextToken until exhausted so projects with >1 service page
+    // (>25 tests) are fully covered.
+    const allTests = await resolveAllProjectTests({
+      client,
+      projectId: opts.projectId!,
+      statusFilter: opts.statusFilter,
+      skipTerminal: opts.skipTerminal,
+      nameFilter: opts.nameFilter,
+      stderr: stderrFn,
+    });
 
     testIds = allTests.map(t => t.id);
     knownTests = new Map(
@@ -13455,20 +13715,11 @@ async function runTestRerunCore(
   };
 
   // Print dispatch summary
-  // Mutable: D3 deferred-retry loop may append to `accepted`/`conflicts` and
-  // drain `deferred` under --wait. `advisories` may also grow if a D3 retry
-  // response carries an advisory the initial dispatch didn't (defensive —
-  // in practice the same request shape produces the same advisory set).
-  let accepted = batchResp.accepted.slice();
-  let deferred = batchResp.deferred.slice();
-  let conflicts = batchResp.conflicts.slice();
-  // [P2] `notFound` is mutable: a deferred test may become un-replayable during
-  // the retry window; the retry response's notFound[] is merged into this set so
-  // the test is never reported as "resolved" when it actually vanished.
-  let notFound = (batchResp.notFound ?? []).slice();
-  // Mutable so a D3 deferred-retry response can contribute an
-  // advisory the initial dispatch didn't carry (defensive; see comment above).
-  let advisories = (batchResp.advisories ?? []).slice();
+  const accepted = batchResp.accepted.slice();
+  const deferred = batchResp.deferred.slice();
+  const conflicts = batchResp.conflicts.slice();
+  const notFound = (batchResp.notFound ?? []).slice();
+  const advisories = (batchResp.advisories ?? []).slice();
   const closureByProject = batchResp.closure.byProject;
   const addedProducersTotal = closureByProject.reduce((n, p) => n + p.addedProducers.length, 0);
 
@@ -13511,228 +13762,10 @@ async function runTestRerunCore(
     stderrFn(`nextAction: testsprite test rerun ${deferredIds}`);
   }
 
-  const emitRetryPartial = async (error: unknown, responses: BatchRerunResponse[] = []) => {
-    if (!deps.environmentTunnel) return;
-    const retried = new Set(
-      responses
-        .flatMap(response => [...response.accepted, ...response.conflicts, ...response.deferred])
-        .map(row => row.testId),
-    );
-    await emitEnvironmentDispatchPartial(
-      [
-        {
-          accepted,
-          conflicts,
-          deferred: deferred.filter(row => !retried.has(row.testId)),
-          notFound,
-        },
-        ...responses,
-      ],
-      testIds,
-      opts,
-      deps,
-      'rerun',
-      error,
-      deps.environmentTunnel,
-    );
-  };
-
-  // D3: budget-driven deferred-retry loop for rerun --all (only under --wait).
-  // Re-dispatches still-deferred tests until they all clear OR the --timeout
-  // budget is exhausted — a busy pool drains within the user's own timeout
-  // instead of giving up after a fixed few tries and failing the run. Each
-  // attempt sleeps 61s (clamped to the remaining budget); newly-accepted runs
-  // merge into `accepted`; if still deferred when the budget runs out, fall
-  // through to the existing exit-7 path. `maxDeferredAttempts` is a pure runaway
-  // backstop (the deadline check below is the real stop), scaled to the timeout.
-  const sleepFn = deps.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+  // A deferred id (rare: a busy project lock or a case that went in flight) was
+  // not dispatched and is not resent: it is reported below and exits 7.
   const batchDeadlineMs =
     deps.environmentTunnel?.deadlineMs ?? Date.now() + opts.timeoutSeconds * 1000;
-  // finding 1: reserve a poll window so the deferred-retry loop can't consume the
-  // ENTIRE --timeout and leave the fan-out poll with nothing — which would report
-  // already-finished runs as timeouts (exit 7) instead of their real verdicts
-  // (a genuine failure is exit 1, not 7). One third of the budget, capped at 60s.
-  const POLL_RESERVE_MS = Math.min(60_000, Math.floor((opts.timeoutSeconds * 1000) / 3));
-  const maxDeferredAttempts = Math.max(
-    MAX_DEFERRED_RETRIES,
-    Math.ceil(opts.timeoutSeconds / 60) + 2,
-  );
-
-  if (opts.wait) {
-    for (let attempt = 1; attempt <= maxDeferredAttempts && deferred.length > 0; attempt++) {
-      const remainingMs = batchDeadlineMs - Date.now();
-      if (remainingMs <= POLL_RESERVE_MS) {
-        stderrFn(
-          `[deferred-retry] reserving the remaining budget to poll dispatched runs — ${deferred.length} test${deferred.length !== 1 ? 's' : ''} still deferred.`,
-        );
-        break;
-      }
-      // §1: clamp to what's left ABOVE the reserve so the sleep itself can't run
-      // the budget to zero (the loop only reaches here when remainingMs >
-      // POLL_RESERVE_MS, so the difference is always positive).
-      const sleepMs = Math.min(DEFERRED_RETRY_DEFAULT_SLEEP_MS, remainingMs - POLL_RESERVE_MS);
-      stderrFn(
-        `[deferred-retry] attempt ${attempt} — retrying ${deferred.length} deferred test${deferred.length !== 1 ? 's' : ''} in ${Math.round(sleepMs / 1000)}s`,
-      );
-      try {
-        if (deps.environmentTunnel)
-          await sleepUntilOrInterrupt(sleepMs, shutdownOf(deps).signal, sleepFn);
-        else await sleepFn(sleepMs);
-      } catch (err) {
-        await emitRetryPartial(err);
-        throw err;
-      }
-
-      const remainingAfterSleep = batchDeadlineMs - Date.now();
-      if (remainingAfterSleep <= POLL_RESERVE_MS) {
-        stderrFn(
-          `[deferred-retry] reserving the remaining budget to poll dispatched runs — ${deferred.length} test${deferred.length !== 1 ? 's' : ''} still deferred.`,
-        );
-        break;
-      }
-
-      // Chunk the retry ids to stay within MAX_BATCH_RERUN_IDS cap.
-      const retryIds = deferred.map(d => d.testId);
-      const retryChunks: string[][] = [];
-      for (let i = 0; i < retryIds.length; i += MAX_BATCH_RERUN_IDS) {
-        retryChunks.push(retryIds.slice(i, i + MAX_BATCH_RERUN_IDS));
-      }
-
-      if (deps.environmentTunnel?.targets) {
-        const grouped = retryChunks.flatMap(chunk =>
-          groupEnvironmentTargets(
-            chunk,
-            deps.environmentTunnel!.targets!,
-            deps.environmentTunnel!.maxConcurrency,
-          ),
-        );
-        retryChunks.splice(0, retryChunks.length, ...grouped);
-      }
-      const retryChunkResponses: BatchRerunResponse[] = [];
-      try {
-        // Sequential, same reason as the initial dispatch above: concurrent
-        // chunks racing on per-request server-side closure dedup can
-        // double-trigger a shared BE producer/teardown.
-        for (let idx = 0; idx < retryChunks.length; idx++) {
-          const chunk = retryChunks[idx]!;
-          // [P2] Bound the derived key to ≤256 chars. Caller-supplied keys may
-          // be up to 256 chars; appending the suffix could exceed the server
-          // limit and cause every retry to be rejected. Truncate the base key
-          // to leave room for the longest possible suffix before concatenating.
-          const retrySuffix =
-            retryChunks.length === 1
-              ? `:deferred-retry${attempt}`
-              : `:deferred-retry${attempt}:chunk${idx}`;
-          const retryBase =
-            idempotencyKey.length + retrySuffix.length > 256
-              ? idempotencyKey.slice(0, 256 - retrySuffix.length)
-              : idempotencyKey;
-          const retryKey = `${retryBase}${retrySuffix}`;
-          // The retry chunk POST is deliberately NOT bound to the batch
-          // deadline via an AbortSignal — same reasoning as the fresh-run retry
-          // above: it seeds runs, so a mid-flight abort would leave the server
-          // possibly having dispatched while this loop reports the chunk as
-          // still-deferred, inviting a duplicate rerun on the user's next
-          // invocation. The per-request timeout still bounds it; the sleeps +
-          // poll stay deadline-aware.
-          if (deps.environmentTunnel?.targets?.has(chunk[0]!))
-            await deps.environmentTunnel.waitForCapacity(chunk.length);
-          const retryChunkResp = await client.triggerBatchRerun(
-            {
-              source: 'cli',
-              testIds: chunk,
-              ...(environment !== undefined ? { environment } : {}),
-              ...(deps.environmentTunnel?.targets?.has(chunk[0]!)
-                ? {
-                    tunnelClientId: deps.environmentTunnel.clientId,
-                    targetUrl: deps.environmentTunnel.targets.get(chunk[0]!)!.targetUrl,
-                  }
-                : {}),
-              // Always send the effective boolean, including an explicit
-              // `false` opt-out — see the matching comment on the initial
-              // dispatch call site above.
-              autoHeal: effectiveAutoHeal,
-              ...(opts.skipDependencies ? { skipDependencies: true } : {}),
-            },
-            { idempotencyKey: retryKey },
-          );
-          retryChunkResponses.push(retryChunkResp);
-          if (deps.environmentTunnel?.targets?.has(chunk[0]!))
-            await deps.environmentTunnel.confirm(
-              retryChunkResp,
-              retryChunkResp.accepted.map(row => row.runId),
-            );
-        }
-      } catch (err) {
-        if (deps.environmentTunnel) {
-          await emitRetryPartial(err, retryChunkResponses);
-          throw err;
-        }
-        if (err instanceof InterruptError) throw err;
-        stderrFn(
-          `[deferred-retry] attempt ${attempt} failed with error: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        break;
-      }
-
-      const { deduped: newlyAccepted, dropped: newlyDuplicate } = dedupeBatchRerunAccepted(
-        retryChunkResponses.flatMap(r => r.accepted),
-      );
-      const newlyDeferred = retryChunkResponses.flatMap(r => r.deferred);
-      const newlyConflicted = retryChunkResponses.flatMap(r => r.conflicts);
-      // [P2] Collect notFound[] from the retry response. A deferred test may be
-      // un-replayable by the time we retry (e.g. the test was deleted). Merge
-      // into the running notFound set and remove from deferred so it isn't
-      // reported as "resolved" in the final output.
-      const newlyNotFound = retryChunkResponses.flatMap(r => r.notFound ?? []);
-      // Merge any advisories the retry response carries into the
-      // running set (deduped — see the initial-dispatch comment above).
-      const newlyAdvisories = retryChunkResponses.flatMap(r => r.advisories ?? []);
-      if (newlyAdvisories.length > 0) {
-        advisories = dedupeRerunAdvisories(advisories.concat(newlyAdvisories));
-      }
-
-      warnDroppedDuplicateRuns(newlyAccepted, newlyDuplicate, stderrFn);
-      if (newlyAccepted.length > 0) {
-        stderrFn(
-          `[deferred-retry] attempt ${attempt}: ${newlyAccepted.length} test${newlyAccepted.length !== 1 ? 's' : ''} now accepted.`,
-        );
-        // A retry asks only for the still-deferred ids but can come back with
-        // a test an earlier attempt already ran; the extra run is reported.
-        const { deduped: mergedAccepted, dropped: droppedAcrossAttempts } =
-          dedupeBatchRerunAccepted(accepted.concat(newlyAccepted));
-        accepted = mergedAccepted;
-        warnDroppedDuplicateRuns(accepted, droppedAcrossAttempts, stderrFn);
-      }
-      if (newlyConflicted.length > 0) {
-        // [P1] Merge retry-returned conflicts into the running conflicts collection
-        // so the final summary, stderr output, and exit-code logic reflect them.
-        stderrFn(
-          `[deferred-retry] attempt ${attempt}: ${newlyConflicted.length} test${newlyConflicted.length !== 1 ? 's' : ''} in-flight (conflict).`,
-        );
-        conflicts = conflicts.concat(newlyConflicted);
-      }
-      if (newlyNotFound.length > 0) {
-        // [P2] Merge retry-discovered notFound ids and warn so the operator knows
-        // which tests vanished. Remove the now-un-replayable ids from `deferred`
-        // (newlyDeferred is the authoritative post-retry deferred set — it won't
-        // include these ids — but be explicit so the logic is clear).
-        stderrFn(
-          `[deferred-retry] attempt ${attempt}: ${newlyNotFound.length} test id${newlyNotFound.length !== 1 ? 's' : ''} not found on retry (deleted or never ran cleanly): ${newlyNotFound.join(' ')}`,
-        );
-        notFound = notFound.concat(newlyNotFound);
-        // Warn via the standard notFound stderr block (mirrors the initial dispatch).
-        for (const id of newlyNotFound) stderrFn(`  ${id}`);
-        stderrFn(
-          `  Skipped ids have no replayable run. Use 'testsprite test run <id>' for a first (fresh) run.`,
-        );
-      }
-      deferred = newlyDeferred;
-      if (deferred.length === 0) {
-        stderrFn(`[deferred-retry] attempt ${attempt}: all previously-deferred tests accepted.`);
-      }
-    }
-  }
 
   /**
    * Every requested id landed in `notFound` and nothing was queued. A rerun
@@ -13756,8 +13789,6 @@ async function runTestRerunCore(
   emitRerunAdvisories(stderrFn, advisories);
 
   if (!opts.wait) {
-    // [P2] Build output from post-retry mutable state so deferred/conflicts/notFound
-    // reflect what the D3 loop discovered, not just the initial batchResp.
     out.print({ ...batchResp, accepted, deferred, conflicts, notFound, advisories });
     if (deferred.length > 0) {
       throw new CLIError(
@@ -13881,7 +13912,6 @@ async function runTestRerunCore(
     string,
     Pick<RunResponse, 'createdAt' | 'startedAt' | 'finishedAt'>
   >();
-  // sleepFn is declared above in the D3 deferred-retry section (shared by fan-out).
 
   async function pollAccepted(entry: BatchRerunAccepted): Promise<CliRerunResult> {
     const resolveAlternate = makeBackendWaitFallback({
@@ -14414,16 +14444,14 @@ function renderArtifactGetWrittenText(data: {
  * opt-out.
  */
 const SKIP_PREFLIGHT_HELP =
-  'skip the pre-charge reachability probe for a target URL. The probe runs from this machine, not ' +
-  'from the Lambda that executes the test, so it can occasionally be wrong (e.g. an IP allowlist ' +
-  'that permits the Lambda but not this machine); use this flag when you know better. Zero network ' +
-  'calls when set.';
+  'skip the pre-charge reachability probe of the target URL (it runs from this machine, not the ' +
+  'cloud, so it can be wrong, e.g. behind an IP allowlist)';
 
 const TARGET_URL_HELP =
-  "frontend tests only: use the environment already pointing at this URL's origin, or a temporary one TestSprite deletes when the run finishes; with --env, use its settings against this URL; loopback URLs open a tunnel automatically";
+  "frontend tests only: run against this URL, using the environment for its origin (else a temporary one deleted after the run); with --env, that environment's settings; loopback URLs open a tunnel";
 
 export function createTestCommand(deps: TestDeps = {}): Command {
-  const test = new Command('test').description('Inspect TestSprite tests');
+  const test = new Command('test').description('Create, run and inspect tests');
 
   test
     .command('list')
@@ -14434,15 +14462,18 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     // the CLI error spec §2 ("missing required field"). `requireProjectId`
     // below raises `ApiError(VALIDATION_ERROR)` so JSON consumers can read
     // `error.code` and the exit code matches the catalog.
-    .option('--project <id>', 'project id (returned by `testsprite project list`)')
+    .option('--project <id>', 'project id (required unless TESTSPRITE_PROJECT_ID is set)')
     .option('--env <name>', 'show frontend test statuses for the named project environment')
     .option('--type <type>', 'filter by test type (frontend|backend)')
     .option('--created-from <source>', 'filter by where the test was authored (portal|mcp|cli)')
     .option(
       '--status <list>',
-      'filter by normalized status (comma-separated). One of: draft, ready, queued, running, passed, failed, blocked, cancelled, unknown',
+      `filter by the status of each test case's latest result (comma-separated; accepted: ${RUN_STATUS_VALUES.join('|')}; not_run = never ran)`,
     )
-    .option('--page-size <n>', 'service page-size hint (1-100, default 25)')
+    .option(
+      '--page-size <n>',
+      'fetch ONE page of N items (1-100) and print the next token (default: follow every page; --max-items caps that)',
+    )
     .option('--starting-token <token>', 'opaque cursor from a previous list response')
     .option(
       '--cursor <token>',
@@ -14489,38 +14520,37 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
   test
     .command('create')
+    .summary('Create a test from code (--code-file) or a plan (--plan-from)')
     .description(
       'Create a test from saved code (--code-file) or an agent-supplied plan (--plan-from, FE-only)',
     )
-    .option('--project <id>', 'project id (returned by `testsprite project list`)')
+    .option('--project <id>', 'project id (see `testsprite project list`)')
     .option('--type <type>', 'frontend|backend')
-    .option('--name <name>', 'human-readable test name (becomes `title` in storage)')
+    .option('--name <name>', 'human-readable test name')
     .option('--description <text>', 'optional human description (≤ 2000 chars)')
     .option('--priority <prio>', 'optional priority: p0/high, p1/medium, p2/low (p3 = low)')
-    .option(
-      '--step-timeout <ms>',
-      'per-test step timeout in milliseconds (1-60000); applied by the execution engine to every step of this test',
-    )
+    .option('--step-timeout <ms>', 'per-test step timeout in milliseconds (1-60000)')
     .option('--code-file <path>', 'file containing the test code (≤ 350 KB)')
     .option(
       '--plan-from <path>',
-      'JSON file with the full FE test definition — projectId, type, name, planSteps[] all live in the file ' +
-        '(≤ 256 KB; mutually exclusive with --code-file). In this mode --project/--type/--name/--description/--priority/--step-timeout are ignored.',
+      'JSON file with the full FE test definition (≤ 256 KB; excludes --code-file); ' +
+        '--project/--type/--name/--description/--priority/--step-timeout are ignored',
     )
     .option(
       '--plan-template',
-      'print a minimal valid plan-file skeleton to stdout and exit (pure-local: no network, no credentials, ' +
-        'ignores every other flag). Pipe to a file and edit: `--plan-template > plan.json`.',
+      'print a plan-file skeleton to stdout and exit (local; ignores every other flag)',
       false,
+    )
+    .option('--run', 'after create, trigger the test', false)
+    .option('--wait', 'with --run, poll until terminal status', false)
+    .option(
+      '--no-wait',
+      'with --run, detach: no waiting and no automatic tunnel (a loopback target is unreachable from the cloud)',
     )
     .option(
-      '--run',
-      'after create, trigger the test. Combine with --wait to block until terminal.',
-      false,
+      '--timeout <s>',
+      'with --run --wait, max seconds to wait (1-3600; default 600, or 1200 through a tunnel)',
     )
-    .option('--wait', 'with --run, poll until terminal status', false)
-    .option('--no-wait', 'detach without opening an automatic environment tunnel')
-    .option('--timeout <s>', 'with --run --wait, max seconds to wait')
     .option('--target-url <url>', TARGET_URL_HELP)
     .option(
       '--env <name>',
@@ -14529,32 +14559,25 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .option('--skip-preflight', SKIP_PREFLIGHT_HELP, false)
     .option(
       '--idempotency-key <token>',
-      'opaque idempotency token (1-256 ASCII chars). Defaults to a UUIDv4 minted per invocation; pin one yourself for safe retries.',
+      'idempotency token (1-256 ASCII chars; default: random UUID per invocation, pin one for safe retries)',
     )
     .option(
       '--produces <var>',
-      'BE only: variable name this test captures (repeatable). Drives dependency-aware wave ordering on `test rerun` and `test run --all`.',
+      'BE only: variable this test captures (repeatable); orders waves in `test run --all`',
       (val: string, prev: string[]) => [...(prev ?? []), val],
       [] as string[],
     )
     .option(
       '--needs <var>',
-      'BE only: variable name this test consumes (repeatable). Use to declare upstream producer dependencies.',
+      'BE only: variable this test consumes (repeatable); declares the upstream producer',
       (val: string, prev: string[]) => [...(prev ?? []), val],
       [] as string[],
     )
     .option(
       '--category <str>',
-      "BE only: test category. Use 'teardown' or 'cleanup' to mark a final-wave cleanup test.",
+      "BE only: test category; 'teardown' or 'cleanup' marks a final-wave cleanup test (BE-only flags with --type frontend exit 5)",
     )
     .addHelpText('after', PLAN_TEMPLATE_HELP_TEXT)
-    .addHelpText(
-      'after',
-      '\nBE dependency authoring:\n' +
-        '  --produces/--needs drive wave ordering on `test rerun` + `test run --all`.\n' +
-        '  --category teardown  marks a final-wave cleanup test.\n' +
-        '  These flags are backend-only; supplying with --type frontend is an error (exit 5).',
-    )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts: CreateFlagOpts, command: Command) => {
       if (cmdOpts.env !== undefined && cmdOpts.run !== true) {
@@ -14662,7 +14685,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
   test
     .command('create-batch')
-    .description('Create multiple FE tests from a JSONL of plan specs (FE-only)')
+    .summary('Create multiple FE tests from JSONL plan specs')
+    .description(
+      'Create multiple FE tests from a JSONL of plan specs (FE-only).\n' +
+        'Each JSONL line (or --plan-from-dir file) is a `test create --plan-from` plan; see `test scaffold`.',
+    )
     .option('--plans <path>', 'JSONL file with one plan-from spec per line (≤ 50 specs, ≤ 5 MB)')
     .option(
       '--plan-from-dir <dir>',
@@ -14671,21 +14698,26 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .option('--run', 'after create, trigger each created test as a run', false)
     .option(
       '--max-concurrency <n>',
-      'with --run, max in-flight triggers at once (1-100, default: 50). The server caps run-triggers at 60/min/key; the CLI throttles to 50/min and auto-retries RATE_LIMITED responses client-side — raising this value does not bypass the server cap. ' +
-        `Separately, CLI run triggers are refused once ${SERVER_INFLIGHT_RUN_CAP} of your runs are already in flight (server default; the refusal reports your account's real cap). Runs from every source count toward it, and a large batch can reach it on its own, so anything already running makes later triggers exit 11 with details.reason "inflight_cap" — not auto-retried, runs have to finish first. With --wait a slot is held until each run finishes, so lowering this flag keeps fewer runs in flight; without --wait it only paces dispatch, and a smaller batch is the lever.`,
+      'with --run: max in-flight triggers (1-100, default 50; through a tunnel 1-10, default 5). ' +
+        'Triggers are throttled to 50/min (server cap 60/min/key) and retried on rate limits. ' +
+        'With --wait a slot is held until each run finishes; without --wait this only paces dispatch. Runs beyond what the account executes at once queue on the server.',
     )
     .option('--wait', 'with --run, poll each run until terminal status', false)
     .option('--no-wait', 'detach without opening an automatic environment tunnel')
     .option('--timeout <s>', 'with --run --wait, per-run max seconds to wait (1-3600, default 600)')
-    .option('--target-url <url>', TARGET_URL_HELP)
+    .option('--target-url <url>', `with --run: ${TARGET_URL_HELP}`)
     .option(
       '--env <name>',
-      'with --run, select the named project environment for each test; loopback URLs open a tunnel automatically',
+      'with --run, run each test in the named project environment; loopback URLs open a tunnel',
     )
-    .option('--skip-preflight', SKIP_PREFLIGHT_HELP, false)
+    .option('--skip-preflight', `with --run: ${SKIP_PREFLIGHT_HELP}`, false)
     .option(
       '--idempotency-key <token>',
-      'opaque idempotency token for the batch create (1-256 ASCII chars). Defaults to a UUIDv4 minted per invocation; pin one yourself for safe retries.',
+      'idempotency token for the batch (1-256 ASCII chars; default: random UUID, pin one for safe retries)',
+    )
+    .addHelpText(
+      'after',
+      '\nExample:\n  testsprite test create-batch --plans plans.jsonl --run --wait',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts: CreateBatchFlagOpts, command: Command) => {
@@ -14710,8 +14742,10 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
   test
     .command('scaffold')
+    .summary('Emit a starter FE plan or BE skeleton (local)')
     .description(
-      'Emit a schema-correct starter test definition (frontend plan JSON by default, or a backend Python skeleton). Pure-local: no network, no credentials.',
+      'Emit a starter test definition (frontend plan JSON by default, or a backend Python skeleton). Local: no network or credentials.\n' +
+        "The plan's projectId comes from TESTSPRITE_PROJECT_ID if set, else a placeholder to replace.",
     )
     .option('--type <type>', 'frontend|backend (default: frontend)')
     .option('--out <path>', 'write the scaffold to a file instead of stdout')
@@ -14719,9 +14753,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .addHelpText(
       'after',
       '\nExamples:\n' +
-        '  testsprite test scaffold > first-test.plan.json\n' +
-        '  testsprite test scaffold --type backend --out tests/health.py\n' +
-        '  testsprite test scaffold --out plan.json   # then edit, and create with --plan-from plan.json',
+        '  testsprite test scaffold --out plan.json   # edit, then: test create --plan-from plan.json\n' +
+        '  testsprite test scaffold --type backend --out health.py',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts: ScaffoldFlagOpts, command: Command) => {
@@ -14739,7 +14772,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
   test
     .command('open <test-id>')
     .description(
-      'Open the test in the TestSprite dashboard: prints the deep-link URL, then spawns your default browser unless --no-browser.',
+      'Open the test in the TestSprite dashboard (prints the URL, then opens your browser)',
     )
     .option('--no-browser', 'print the URL only (SSH, headless, CI, agents)')
     .addHelpText('after', GLOBAL_OPTS_HINT)
@@ -14757,9 +14790,18 @@ export function createTestCommand(deps: TestDeps = {}): Command {
   test
     .command('steps <test-id>')
     .description('List the steps of the latest run (use --run-id for a specific run)')
-    .option('--page-size <n>', 'service page size hint (1-100, default 25)')
-    .option('--max-items <n>', 'stop after this many items across auto-paged pages')
-    .option('--starting-token <token>', 'opaque cursor from a previous response')
+    .option(
+      '--page-size <n>',
+      'fetch ONE page of N steps (1-100) and print the next token (default: follow every page); ignored with --run-id',
+    )
+    .option(
+      '--max-items <n>',
+      'stop after this many items across auto-paged pages; ignored with --run-id',
+    )
+    .option(
+      '--starting-token <token>',
+      'opaque cursor from a previous response; ignored with --run-id',
+    )
     .option('--run-id <id>', 'Show steps of the specified run instead of the latest run.')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testId: string, cmdOpts: StepsFlagOpts, command: Command) => {
@@ -14778,8 +14820,10 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
   test
     .command('diff <run-a> <run-b>')
+    .summary('Compare two runs; exit 1 if their verdicts differ')
     .description(
-      'Compare two runs and print what regressed: verdict, failureKind, failedStepIndex, per-step status flips, codeVersion drift. Exit 0 when verdicts match, 1 when they differ.',
+      'Compare two runs (run ids, see `test result --history`) and print what regressed: verdict, failureKind, failedStepIndex, per-step status flips, codeVersion drift. ' +
+        'Exit 0 when verdicts match, 1 when they differ, 3 auth, 4 run not found, 10 transport.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (runA: string, runB: string, _cmdOpts: unknown, command: Command) => {
@@ -14788,16 +14832,16 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
   test
     .command('lint')
+    .summary('Validate plan/steps files offline')
     .description(
-      'Validate plan/steps files offline with the same validators `create` runs, collecting EVERY problem. No network, no credentials. Exit 0 when all valid, 5 otherwise.',
+      'Validate plan/steps files offline with the same validators `create` runs, reporting EVERY problem. No network or credentials. Exit 0 when valid, 5 otherwise.\n' +
+        'Pass exactly one input flag.',
     )
     .option('--plan-from <file>', 'single plan JSON file')
-    .option(
-      '--plan-from-dir <dir>',
-      'directory of *.json plan files (each checked, all errors reported)',
-    )
+    .option('--plan-from-dir <dir>', 'directory of *.json plan files (non-recursive)')
     .option('--plans <file>', 'JSONL file with one plan spec per line (each line checked)')
     .option('--steps <file>', 'plan-steps JSON file (the shape `test plan put` ingests)')
+    .addHelpText('after', '\nExample:\n  testsprite test lint --plan-from plan.json')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(
       async (
@@ -14819,11 +14863,12 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
   test
     .command('result <test-id>')
+    .summary('Get the latest result, or list prior runs (--history)')
     .description(
       'Get the latest result for a test (default) or list prior runs (--history).\n' +
-        '\n--output json shape differs by mode:\n' +
-        '  (default)  single CliLatestResult object\n' +
-        '  --history  { runs: RunHistoryItem[], nextCursor: string|null, meta: RunHistoryMeta }\n' +
+        '"with --history" flags are ignored without --history (--env is rejected, exit 5).\n' +
+        '\n--output json: a single CliLatestResult, or with --history\n' +
+        '{ runs: RunHistoryItem[], nextCursor: string|null, meta: RunHistoryMeta }.\n' +
         '\nPer-run detail: testsprite test wait <run-id>\n' +
         'Failure bundle:  testsprite test artifact get <run-id>',
     )
@@ -14893,17 +14938,17 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
   test
     .command('update <test-id>')
-    .description('Update test metadata — name, description, priority, step timeout')
-    .option('--name <name>', 'new human-readable test name')
+    .summary('Update name, description, priority or step timeout')
+    .description(
+      'Update test metadata — name, description, priority, step timeout. At least one field is required.',
+    )
+    .option('--name <name>', 'new human-readable test name (≤ 200 chars)')
     .option('--description <text>', 'new human description (≤ 2000 chars)')
     .option('--priority <prio>', 'new priority: p0/high, p1/medium, p2/low (p3 = low)')
-    .option(
-      '--step-timeout <ms>',
-      'per-test step timeout in milliseconds (1-60000); applied by the execution engine to every step of this test',
-    )
+    .option('--step-timeout <ms>', 'per-test step timeout in milliseconds (1-60000)')
     .option(
       '--clear-step-timeout',
-      'clear the per-test step timeout and restore execution engine defaults',
+      'clear the per-test step timeout, restoring the default (cannot combine with --step-timeout)',
       false,
     )
     .option(
@@ -14924,7 +14969,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--idempotency-key <token>',
-      'opaque idempotency token (1-256 ASCII chars). Defaults to a UUIDv4 minted per invocation; pin one yourself for safe retries.',
+      'idempotency token (1-256 ASCII chars; default: random UUID per invocation, pin one for safe retries)',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testId: string, cmdOpts: UpdateFlagOpts, command: Command) => {
@@ -14954,11 +14999,15 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
   test
     .command('delete <test-id>')
-    .description('Permanently delete a test. Requires --confirm.')
-    .option('--confirm', 'required: explicit confirmation for the destructive operation', false)
+    .summary('Permanently delete a test (requires --confirm)')
+    .description(
+      'Permanently delete a test. Requires --confirm.\n' +
+        'Also removes it from test lists and deletes its steps and stored code; cannot be undone. Exit 4 if it does not exist.',
+    )
+    .option('--confirm', 'required: confirm the destructive operation', false)
     .option(
       '--idempotency-key <token>',
-      'opaque idempotency token (1-256 ASCII chars). Defaults to a UUIDv4 minted per invocation; pin one yourself for safe retries.',
+      'idempotency token (1-256 ASCII chars; default: random UUID per invocation, pin one for safe retries)',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testId: string, cmdOpts: DeleteFlagOpts, command: Command) => {
@@ -14979,25 +15028,27 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
   test
     .command('delete-batch [test-ids...]')
+    .summary('Permanently delete several tests (requires --confirm)')
     .description(
-      'Permanently delete multiple tests in one command. Requires --confirm.\n' +
-        'Use --all --project <id> to delete all tests in a project (optionally filtered by --status).\n' +
-        '\nPrints a per-test summary (Deleted N, Skipped M, Failed K) to stdout.\n' +
+      'Permanently delete multiple tests. Requires --confirm. With --all --project <id>, deletes every test in the project (optionally filtered by --status).\n' +
+        '\nPrints a per-test summary (Deleted N, Skipped M, Failed K); a not-found test counts as skipped.\n' +
         '\nExit codes:\n' +
         '  0  all targeted tests deleted (or --dry-run)\n' +
-        '  1  one or more deletions failed (server error)\n' +
-        '  5  validation error (missing --confirm, missing --project with --all, etc.)\n' +
-        '\nNote: a 404 "not found" response is counted as skipped in the summary, not an error.',
+        '  1  one or more deletions failed\n' +
+        '  5  validation error (e.g. missing --confirm, or --all without --project)',
     )
-    .option('--confirm', 'required: explicit confirmation for the destructive operation', false)
+    .option('--confirm', 'required: confirm the destructive operation', false)
     .option('--all', 'delete all tests in the resolved project (requires --project)', false)
-    .option(
-      '--project <id>',
-      'project id (required with --all; returned by `testsprite project list`)',
-    )
+    .option('--project <id>', 'project id (required with --all)')
     .option(
       '--status <list>',
-      `with --all: only delete tests whose status matches these values (comma-separated; accepted: ${PUBLIC_STATUSES.join('|')})`,
+      `with --all: only delete tests whose latest status matches one of these values (comma-separated; accepted: ${RUN_STATUS_VALUES.join('|')}; not_run = never ran)`,
+    )
+    .addHelpText(
+      'after',
+      '\nExamples:\n' +
+        '  testsprite test delete-batch <id> <id> --confirm\n' +
+        '  testsprite test delete-batch --all --project <id> --status failed --confirm',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testIdsArg: string[], cmdOpts: DeleteBatchFlagOpts, command: Command) => {
@@ -15020,9 +15071,10 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
   test
     .command('run [test-id...]')
+    .summary('Run a test, or a whole project (--all)')
     .description(
-      'Trigger one or several test runs. Saved loopback environments open a tunnel automatically and wait for a verdict.\n' +
-        'Use --all --project <id> for a wave-ordered batch run. Loopback environments share one tunnel.\n' +
+      'Trigger a run of one or more test cases. Saved loopback environments open a tunnel automatically and wait for a verdict.\n' +
+        'Pass several <test-id>s, or use --all --project <id> [--filter <substr>], for a batch run (ids are grouped per project and sent 50 per request). Loopback environments share one tunnel.\n' +
         '\nExit codes:\n' +
         '  0  passed (or queued without --wait)\n' +
         '  1  failed / blocked / cancelled\n' +
@@ -15033,49 +15085,42 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '  7  timeout — resume with: testsprite test wait <run-id>, ' +
         'or stop it with: testsprite test cancel <run-id>\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
-        ' 11  rate limited — honor Retry-After, or the in-flight run cap was hit\n' +
-        '     (details.reason "inflight_cap"; see: testsprite test run --help)\n' +
+        ' 11  rate limited — honor Retry-After\n' +
+        ' 12  insufficient credits (non-retriable; top up)\n' +
+        ' 13  feature gated / workspace paused\n' +
         '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>\n' +
         '\nCtrl-C during an ordinary --wait detaches; an owned tunnel cancels unfinished runs by default.\n' +
         'Stop a detached run with: testsprite test cancel <run-id>\n' +
-        'Local environments: dev servers can take a minute per page through the tunnel.\n' +
-        'For a heavy dev server, test a built server: npm run build, then your framework preview/start command.',
+        'Dev servers can take a minute per page through a tunnel; prefer a built server (npm run build, then start).',
     )
     .option('--target-url <url>', TARGET_URL_HELP)
     .option('--skip-preflight', SKIP_PREFLIGHT_HELP, false)
     .option(
       '--local <port>',
-      'run against an app on THIS machine, reached through a TestSprite tunnel. The test runner ' +
-        'navigates to http://localhost:<port> and its traffic is proxied back to you for as long ' +
-        'as this command runs. Implies --wait (the tunnel closes when the command exits, so a ' +
-        'detached run could not finish). Frontend tests ' +
-        'only; a matching saved environment keeps its host spelling; several ids or --all share one tunnel (5 concurrent by default, at most 10). ' +
-        'Before anything is minted or billed, the port is probed and a dead one is refused.',
+      'run against an app on THIS machine through a TestSprite tunnel (the runner opens ' +
+        'http://localhost:<port>). Implies --wait. Frontend tests only; several ids or --all share one ' +
+        'tunnel (5 concurrent, max 10). A dead port is refused before anything is billed.',
     )
     .option(
       '--local-host <host>',
-      `with --local, override which loopback address to name in the run's target URL — one of ` +
-        `${LOOPBACK_HOSTS.join(', ')} (default: saved matching host, else ${DEFAULT_LOCAL_HOST}). Use localhost if your app ` +
-        `only answers on that name, or ::1 for an IPv6-only listener.`,
+      `with --local, loopback address in the target URL: ${LOOPBACK_HOSTS.join(', ')} ` +
+        `(default: saved matching host, else ${DEFAULT_LOCAL_HOST}). Use localhost if your app only answers on that name, ::1 for IPv6-only.`,
     )
     .option(
       '--tunnel-client <id>',
-      'for a loopback environment or --local, attach to a tunnel already running under `testsprite tunnel start` instead ' +
-        'of opening a new one. The id is the non-secret handle that command prints; the tunnel ' +
-        'stays owned by that process and is not closed when this run or batch finishes.',
+      'for a loopback environment or --local, attach to a tunnel already running under `testsprite tunnel start` ' +
+        '(use the id it prints) instead of opening one; that process keeps the tunnel open afterwards.',
     )
     .option(
       '--no-cancel-on-interrupt',
-      'with a tunnel, skip automatic cancellation when an owned tunnel is about to close or a ' +
-        "borrowed tunnel's owner disappears. An ordinary interrupt of a borrowed run never " +
-        'cancels it because its tunnel remains alive.',
+      'with a tunnel, do not auto-cancel runs when an owned tunnel closes or a ' +
+        "borrowed tunnel's owner disappears",
     )
     .option(
       '--env <name>',
-      'run against the named project environment — its test-account credentials, auto-auth and ' +
-        'OTP settings (names: `testsprite project env list <project-id>`). A loopback environment opens a tunnel automatically. The run opens ' +
-        "that environment's URL. Omit --env to keep using " +
-        "the project's default environment. Also applies with --all.",
+      'run against the named project environment — its credentials, auto-auth and OTP settings ' +
+        '(see `testsprite project env list <project-id>`); a loopback one opens a tunnel. ' +
+        "Default: the project's default environment. Also applies with --all.",
     )
     .option('--wait', 'poll until terminal status or --timeout elapses', false)
     .option('--no-wait', 'detach without opening an automatic environment tunnel')
@@ -15085,24 +15130,25 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--idempotency-key <key>',
-      'opaque key for safe retries (1–256 chars); local batches append each test id. Auto-generated keys print to stderr in JSON, verbose or debug mode.',
+      'opaque key for safe retries (1–256 chars); local batches append each test id',
     )
     .option(
       '--all',
-      'run all tests in the project (wave-ordered fresh run; uses --project or TESTSPRITE_PROJECT_ID). Mutually exclusive with <test-id>.',
+      'run all tests in the project in wave order (uses --project or TESTSPRITE_PROJECT_ID); excludes <test-id>',
       false,
     )
-    .option(
-      '--project <id>',
-      'project id (with --all, overrides TESTSPRITE_PROJECT_ID; returned by `testsprite project list`)',
-    )
+    .option('--project <id>', 'project id for --all (overrides TESTSPRITE_PROJECT_ID)')
     .option(
       '--filter <substr>',
       'with --all: only run tests whose name contains this substring (case-insensitive)',
     )
     .option(
+      '--status <list>',
+      'with --all: only run tests whose latest status matches one of these values (comma-separated; accepted: passed|failed|blocked|cancelled|not_run; not_run = never ran); --env only picks where to run',
+    )
+    .option(
       '--max-concurrency <n>',
-      `with a tunnel, max runs in flight through one tunnel (1-10, default 5); with --all --wait without a tunnel, max polls (1-100, default ${DEFAULT_BATCH_RUN_CONCURRENCY})`,
+      `with a tunnel, max runs in flight through one tunnel (1-10, default 5); with --all or several ids and --wait without a tunnel, max polls (1-100, default ${DEFAULT_BATCH_RUN_CONCURRENCY})`,
     )
     .option(
       '--report <format>',
@@ -15115,58 +15161,47 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--gh-output',
-      'with --wait (single test or batch): emit GitHub-native output (::error:: annotations for failed/timed-out runs, ::warning:: for never-dispatched tests; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
+      'with --wait: emit GitHub annotations (::error:: failed/timed-out, ::warning:: never dispatched) and a job-summary table when $GITHUB_STEP_SUMMARY is set; auto-enabled when GITHUB_ACTIONS=true',
     )
     .option(
       '--summary-file <path>',
-      'with --wait (single test or batch): also write the reduced machine summary JSON {total, passed, failed, skipped, timedOut, runs[]} to this file',
+      'with --wait: also write summary JSON {total, passed, failed, skipped, timedOut, runs[]} to this file',
     )
     .option(
       '--allow-empty',
-      'with --all: exit 0 when the run dispatches ZERO tests (all skipped / empty project / --filter matched nothing). Default: fail with exit 5 — a zero-dispatch run is a CI false-green',
+      'with --all: exit 0 when ZERO test cases are dispatched (default: exit 5, so an empty run is not a CI false-green)',
     )
     .option(
       '--no-auto-heal',
-      'ask the server to replay stored test code instead of letting the agent heal it. ' +
-        'The server controls whether fresh runs heal drifted generated code by default; when ' +
-        'healing is enabled, the agent re-authors stale code rather than replaying a script ' +
-        'that can only fail. Use this flag to request a strict replay for a regression gate ' +
-        'or a reproduction you are bisecting. Code you wrote yourself is never re-authored. ' +
-        'Where stored-code replay is unavailable, the server rejects this flag. Where replay ' +
-        'is available but a test has no replayable stored code, the server may refuse the run ' +
-        'instead of authoring it. An older server may ignore the flag; the CLI prints an ' +
-        '[advisory] when the server reports that the opt-out did not take.',
+      'request strict replay of stored test code instead of letting the agent heal drifted ' +
+        'generated code (the server decides the default); use for regression gates and bisects. ' +
+        'Code you wrote yourself is never re-authored. The server rejects the flag where replay is ' +
+        'unavailable and may refuse a test with no replayable code; the CLI prints an [advisory] ' +
+        'if the opt-out did not take.',
+    )
+    .option(
+      '--skip-dependencies',
+      'Backend test cases only: run without the test cases they depend on',
+      false,
     )
     .addHelpText(
       'after',
-      '\nDependency-aware fresh run:\n' +
-        '  testsprite test run --all --project <id>                run all project tests in wave order\n' +
-        '  TESTSPRITE_PROJECT_ID=<id> testsprite test run --all    use env default project\n' +
-        '  testsprite test run <id> <id> --local 3000             several local tests, one tunnel\n' +
-        '  testsprite test run --all --project <id> --local 3000  all frontend tests, one tunnel\n' +
-        '  testsprite test run <id> <id> --local 3000 --max-concurrency 3\n' +
-        '  testsprite test run --all --filter <substr>             name-glob subset (uses --project/env)\n' +
-        '  testsprite test run --all --wait --report junit --report-file ./results.xml\n' +
-        '  project id precedence: --project wins over TESTSPRITE_PROJECT_ID\n' +
-        '\nBE tests can declare --produces/--needs at create time to drive wave ordering\n' +
-        '(see `testsprite test create --help` for details).\n' +
-        '\nFrontend tests: the current unified engine runs FE tests too (they are billed\n' +
-        'like any run). On the legacy backend-only engine FE tests cannot run — they are\n' +
-        "reported under skippedFrontend with an advisory; run those with 'test run <id>'.\n" +
-        '\nConcurrency limits:\n' +
-        `  - CLI run triggers are refused once ${SERVER_INFLIGHT_RUN_CAP} of your runs are already in\n` +
-        '    flight (server default; the refusal reports your real cap). Runs from every\n' +
-        '    source count toward it (CLI, portal, schedules, CI), but only CLI triggers\n' +
-        '    are refused on it.\n' +
-        '    At the cap this command accepts nothing and returns every id deferred,\n' +
-        '    which exits 7; resume with the printed ids once runs finish. (A single\n' +
-        '    `test run <id>` over the cap exits 11 with details.reason "inflight_cap",\n' +
-        '    and is not auto-retried — runs have to finish first.)\n' +
-        '    Poll what is already running with: testsprite test wait <run-id...>\n' +
-        '  - Separately, run triggers are throttled per minute. That one does clear on\n' +
-        '    its own and is retried for you.\n' +
-        '  - --max-concurrency here bounds the --wait poll fan-out, not dispatch, so it\n' +
-        '    has no effect on the cap. A smaller batch does.',
+      '\nExamples:\n' +
+        '  testsprite test run --all --project <id>                all test cases in the project, in wave order\n' +
+        '  testsprite test run <id> <id> <id>                      several test cases in one run (any number of ids; sent 50 per request)\n' +
+        '  testsprite test run <id> <id> --local 3000             several local test cases, one tunnel\n' +
+        '  testsprite test run --all --status failed --env staging test cases whose latest status is failed, run in staging\n' +
+        '  testsprite test run --all --filter <substr> --wait --report junit --report-file ./results.xml\n' +
+        '\nOn the legacy backend-only engine, FE test cases are skipped (reported under skippedFrontend);\n' +
+        'run them with `test run <id>`. BE test cases can declare --produces/--needs at create time to order waves.\n' +
+        '\nQueueing and limits:\n' +
+        '  - Each request starts one run; its results show queued until they start,\n' +
+        '    as in the Portal.\n' +
+        '  - A test case that already has a run in flight is a conflict (exit 6), not queued.\n' +
+        '  - Run triggers are limited to 60 per minute per API key; that limit clears on\n' +
+        '    its own and is retried for you. An older backend may still answer with\n' +
+        '    deferred ids: they are reported, not resent, and exit 7.\n' +
+        '  - --max-concurrency here bounds the --wait poll fan-out, not dispatch.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testIdArgs: string[], cmdOpts: RunFlagOpts, command: Command) => {
@@ -15210,6 +15245,15 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           '--filter only applies with --all (it narrows which project tests run). Remove --filter, or add --all with --project <id> or TESTSPRITE_PROJECT_ID.',
         );
       }
+      // --status narrows the --all set exactly as --filter does, with the same
+      // silent-ignore failure mode without --all.
+      if (cmdOpts.status !== undefined && !isAll) {
+        throw localValidationError(
+          'status',
+          '--status only applies with --all (it narrows which project tests run). Remove --status, or add --all with --project <id> or TESTSPRITE_PROJECT_ID.',
+        );
+      }
+      validateStatusSelector(cmdOpts.status);
       // --local resolution. Every one of these refuses BEFORE any network
       // call, which is the contract `--local` is sold on: a mistake in the
       // invocation must never reach a run row, a credit spend, or a minted
@@ -15232,7 +15276,6 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         ((command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false) ||
           cmdOpts.targetUrl !== undefined)
       ) {
-        if (!isAll && testIdArgs.length >= 2) severalIdsWithoutTunnel();
         assertNoTunnelOptions({
           tunnelClientId: cmdOpts.tunnelClient,
           cancelOnInterrupt: cmdOpts.cancelOnInterrupt,
@@ -15335,6 +15378,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             ...resolveCommonOptions(command, deps.env),
             projectId,
             nameFilter: cmdOpts.filter,
+            statusFilter: cmdOpts.status,
             wait: effectiveWait,
             noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
             concurrencyIsDefault: cmdOpts.maxConcurrency === undefined,
@@ -15363,6 +15407,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
               ? { targetUrl: cmdOpts.targetUrl }
               : {}),
             skipPreflight: cmdOpts.skipPreflight === true,
+            ...(cmdOpts.skipDependencies === true ? { skipDependencies: true } : {}),
           },
           deps,
         );
@@ -15400,11 +15445,13 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             all: isAll,
             projectId: cmdOpts.project,
             nameFilter: cmdOpts.filter,
+            statusFilter: cmdOpts.status,
             localPort,
             localHost,
             targetUrl: cmdOpts.targetUrl,
             noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
             concurrencyIsDefault: cmdOpts.maxConcurrency === undefined,
+            timeoutIsDefault: cmdOpts.timeout === undefined,
             skipPreflight: cmdOpts.skipPreflight === true,
             tunnelClientId: cmdOpts.tunnelClient,
             cancelOnInterrupt: cmdOpts.cancelOnInterrupt !== false,
@@ -15422,6 +15469,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             allowEmpty: cmdOpts.allowEmpty === true,
             ...(cmdOpts.autoHeal === false ? { autoHeal: false as const } : {}),
             environment: cmdOpts.env,
+            ...(cmdOpts.skipDependencies === true ? { skipDependencies: true } : {}),
           },
           deps,
         );
@@ -15453,6 +15501,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           // See the matching comment on the --all path above.
           ...(cmdOpts.autoHeal === false ? { autoHeal: false as const } : {}),
           environment: cmdOpts.env,
+          ...(cmdOpts.skipDependencies === true ? { skipDependencies: true } : {}),
         },
         deps,
       );
@@ -15460,25 +15509,21 @@ export function createTestCommand(deps: TestDeps = {}): Command {
 
   test
     .command('wait <run-id...>')
+    .summary('Wait for one or more runs to finish')
     .description(
       'Wait for one or more runs to reach a terminal status.\n' +
-        '\nWith several run-ids the runs are polled concurrently under one shared\n' +
-        '--timeout and a {results, summary} envelope is printed (worst status wins\n' +
-        'the exit code), so every re-attach hint the CLI prints can be pasted as\n' +
-        'ONE command.\n' +
+        '\nSeveral run-ids are polled concurrently under one shared --timeout and a\n' +
+        '{results, summary} envelope is printed (worst status wins the exit code).\n' +
         '\nExit codes:\n' +
         '  0  passed\n' +
         '  1  failed / blocked / cancelled\n' +
         '  3  auth error\n' +
-        '  4  run not found (single run-id; with several ids a per-member poll error\n' +
+        '  4  run not found (single run-id; with several, a per-member poll error\n' +
         '     is recorded as error:<CODE> in its row and folded into exit 7)\n' +
         '  7  timeout or per-member poll error — resume with: testsprite test wait <run-id...>\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
-        ' 11  rate limited, and nothing else went wrong — polls are retried\n' +
-        '     automatically honoring Retry-After first, so this means the throttle\n' +
-        '     outlasted that budget while the runs were still fine. Back off, then\n' +
-        '     re-attach with test wait. (A throttle that instead consumes the whole\n' +
-        '     --timeout reports 7, and any real timeout or failure keeps 7 / 1.)\n' +
+        ' 11  rate limited past the automatic Retry-After retries, runs still fine — back off,\n' +
+        '     then re-attach (a throttle that consumes the whole --timeout reports 7)\n' +
         '\nOn failure/blocked/cancelled, run: testsprite test artifact get <run-id>\n' +
         '\nCtrl-C detaches only (the run keeps executing and billing); stop it for\n' +
         'real with: testsprite test cancel <run-id...>',
@@ -15523,10 +15568,12 @@ export function createTestCommand(deps: TestDeps = {}): Command {
   // -------------------------------------------------------------------------
 
   test
-    .command('rerun [test-ids...]')
+    .command('rerun [test-ids...]', { hidden: true })
     .description(
-      'Re-execute a test (or multiple) as a replay — FE replays the saved script, BE re-runs the dependency closure. ' +
-        'Billed the same as a fresh run: 0.5 credits per FE rerun / 0.2 credits per BE rerun (legacy V2 accounts: FE rerun remains free).\n' +
+      '[deprecated] Use `testsprite test run` instead; removed in ' +
+        `${REMOVED_IN}. ` +
+        'Re-execute a test case (or several) as a replay — FE replays the saved script, BE re-runs the dependency closure. ' +
+        'Billed like a fresh run on V3 workspaces (0.5 credits per FE case, 0.2 per BE case). Legacy V2 accounts: reruns are free.\n' +
         '\nExit codes:\n' +
         '  0  passed (or queued without --wait)\n' +
         '  1  failed / blocked / cancelled\n' +
@@ -15542,10 +15589,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         'stop it for real with: testsprite test cancel <run-id>',
     )
     .option('--all', 'rerun all tests in the resolved project (requires --project)', false)
-    .option(
-      '--project <id>',
-      'project id (required with --all; returned by `testsprite project list`)',
-    )
+    .option('--project <id>', 'project id (required with --all)')
     .option(
       '--skip-terminal',
       'with --all: skip tests already in a terminal status (passed|failed|blocked|cancelled)',
@@ -15568,10 +15612,8 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--no-auto-heal',
-      'replay the saved script verbatim instead of letting the agent repair it (default: ' +
-        'auto-heal is ON for FE reruns). When heal engages, the agent re-authors the test and ' +
-        'the new code replaces the stored version. Ignored for backend reruns. ' +
-        'Costs: `testsprite usage`.',
+      'replay the saved script verbatim instead of letting the agent repair it (default: auto-heal ' +
+        'is ON for FE reruns; a heal replaces the stored code). Ignored for backend reruns.',
     )
     .option(
       '--skip-dependencies',
@@ -15580,18 +15622,15 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--env <name>',
-      'replay against the named project environment — its test-account credentials, auto-auth and ' +
-        'OTP settings (names: `testsprite project env list <project-id>`). Omit to keep using the ' +
-        "project's default environment. Loopback URLs open a tunnel automatically. Applies to every test of a batch rerun.",
+      'replay against the named project environment — its credentials, auto-auth and OTP settings ' +
+        '(see `testsprite project env list <project-id>`); loopback URLs open a tunnel. ' +
+        "Default: the project's default environment. Applies to every test of a batch.",
     )
     .option(
       '--max-concurrency <n>',
       `with a tunnel, max runs in flight (1-10, default 5); otherwise with --wait, max polls (1-100, default ${DEFAULT_BATCH_RUN_CONCURRENCY})`,
     )
-    .option(
-      '--idempotency-key <key>',
-      'opaque key for safe retries (1–256 chars). Printed to stderr at --verbose if auto-generated.',
-    )
+    .option('--idempotency-key <key>', 'opaque key for safe retries (1–256 chars)')
     .option(
       '--report <format>',
       'with batch --wait: write a JUnit XML sidecar report after polling (accepted: junit)',
@@ -15603,39 +15642,37 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--gh-output',
-      'with batch --wait: emit GitHub-native output (::error:: annotations for failed/timed-out runs, ::warning:: for never-dispatched tests; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
+      'with batch --wait: emit GitHub annotations (::error:: failed/timed-out, ::warning:: never dispatched) and a job-summary table when $GITHUB_STEP_SUMMARY is set; auto-enabled when GITHUB_ACTIONS=true',
     )
     .option(
       '--summary-file <path>',
-      'with batch --wait: also write the reduced machine summary JSON {total, passed, failed, skipped, timedOut, runs[]} to this file',
+      'with batch --wait: also write summary JSON {total, passed, failed, skipped, timedOut, runs[]} to this file',
     )
     .option(
       '--allow-empty',
-      'with --all: exit 0 when the resolved test set is empty (no tests match --filter/--status/--skip-terminal, or the project has none). Default: fail with exit 5 — a zero-dispatch rerun is a CI false-green',
+      'with --all: exit 0 when no tests match (default: exit 5, so an empty rerun is not a CI false-green)',
     )
     .addHelpText(
       'after',
       '\nNotes:\n' +
-        '  • Frontend reruns default to auto-heal; the server controls the default for a\n' +
-        '    fresh `test run`. Use --no-auto-heal to request a strict replay where supported.\n' +
-        '  • What still differs: rerun replays a SAVED run/script, so one has to exist;\n' +
-        '    `test run` starts fresh. A BE rerun also expands the dependency closure.\n' +
-        '  • Under --wait the per-request HTTP timeout is auto-raised to cover --timeout so a\n' +
-        '    slow trigger/poll under load is not cut at the 120s default (see --request-timeout).\n' +
-        '  • Batch --wait: rate-deferred tests appear in `deferred[]` and `summary.deferred`,\n' +
-        '    and force a non-zero exit — they are NOT counted in `summary.total` (dispatched only).\n' +
-        '  • rerun gets no server echo of the effective auto-heal decision, so a dropped\n' +
-        '    opt-out cannot be detected here the way `test run --no-auto-heal` detects it.',
-    )
-    .addHelpText(
-      'after',
-      '\nDry-run shape notes:\n' +
-        '  • --dry-run shows the BE rerun wire shape (includes `closure{}`); FE rerun responses\n' +
-        '    omit `closure` (or return it as null) since there is no dependency expansion.\n' +
-        '  • `autoHeal` defaults true for FE reruns; BE reruns ignore the field entirely.',
+        '  • A rerun replays a SAVED run/script, so one must exist; `test run` starts fresh.\n' +
+        '    A BE rerun also expands the dependency closure.\n' +
+        '  • Batch --wait: rate-deferred tests appear in `deferred[]` / `summary.deferred` and force a\n' +
+        '    non-zero exit; they are not counted in `summary.total`.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testIdsArg: string[], cmdOpts: RerunFlagOpts, command: Command) => {
+      // First statement, before any validation, so the notice precedes a usage error and
+      // appears exactly once per invocation (also under --dry-run and in both output modes).
+      const rerunDeprecation: DeprecationEntry = TEST_RERUN_DEPRECATION;
+      emitDeprecationEntry(
+        rerunDeprecation,
+        deps.stderr,
+        'Use `testsprite test run` with the same ids and flags, except: ' +
+          '--skip-terminal becomes --status not_run, and --status takes only ' +
+          `${RUN_STATUS_VALUES.join(', ')}.`,
+      );
+      const rerunDeps: TestDeps = { ...deps, deprecations: [rerunDeprecation] };
       // Commander's `--no-auto-heal` pattern makes `cmdOpts.autoHeal` default
       // `true` (unchanged by the user) and `false` when the user passes
       // `--no-auto-heal`. There is no explicit `--auto-heal` flag, so
@@ -15701,7 +15738,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           summaryFile: cmdOpts.summaryFile,
           allowEmpty: cmdOpts.allowEmpty === true,
         },
-        deps,
+        rerunDeps,
       );
     });
 
@@ -15710,10 +15747,12 @@ export function createTestCommand(deps: TestDeps = {}): Command {
   // -------------------------------------------------------------------------
 
   test
-    .command('flaky <test-id>')
+    .command('flaky <test-id>', { hidden: true })
     .description(
-      'Repeatedly replay a test to measure stability and surface flakiness.\n' +
-        'Replays run with auto-heal OFF (strict verbatim) so healed drift cannot mask nondeterministic pass/fail.\n' +
+      '[deprecated] No replacement; run `testsprite test run <test-id>` again to sample a test case; ' +
+        `removed in ${REMOVED_IN}.\n` +
+        'Repeatedly replay a test case to measure stability.\n' +
+        'Replays run with auto-heal OFF (strict verbatim) so healing cannot mask a flaky pass/fail.\n' +
         '\nExit codes:\n' +
         '  0  stable (every attempt passed)\n' +
         '  1  flaky or failing (at least one attempt did not pass)\n' +
@@ -15737,14 +15776,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .addHelpText(
       'after',
       '\nNotes:\n' +
-        '  • Each replay is billed as a rerun — 0.5 credits for a frontend replay (verbatim\n' +
-        '    script), 0.2 credits for a backend replay (re-runs the dependency closure) —\n' +
-        '    same price as a fresh run, so `--runs N` costs roughly N×0.5 credits for a\n' +
-        '    frontend test (legacy V2 accounts: FE rerun remains free). A one-line advisory\n' +
-        '    is printed before a backend replay.\n' +
-        '  • Replays use auto-heal OFF so a flaky test is not silently "healed" into a pass;\n' +
-        '    this measures replay stability of the saved script against the configured URL.\n' +
-        '  • `--output json` emits a machine-readable stability report for CI gating.',
+        '  • Each replay is billed as a rerun (0.5 credits per FE replay, 0.2 per BE replay), so\n' +
+        '    `--runs N` costs about N×0.5 for a frontend test (legacy V2 accounts: FE rerun is free).\n' +
+        '  • `--output json` emits a stability report for CI gating.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(
@@ -15753,6 +15787,14 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         cmdOpts: { runs?: string; untilFail?: boolean; timeout?: string },
         command: Command,
       ) => {
+        const flakyDeprecation: DeprecationEntry = TEST_FLAKY_DEPRECATION;
+        emitDeprecationEntry(
+          flakyDeprecation,
+          deps.stderr,
+          `To sample a test again, run \`testsprite test run ${testIdArg}\`.`,
+          true,
+        );
+        const flakyDeps: TestDeps = { ...deps, deprecations: [flakyDeprecation] };
         await runFlaky(
           {
             ...resolveCommonOptions(command, deps.env),
@@ -15761,7 +15803,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             untilFail: cmdOpts.untilFail === true,
             timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
           },
-          deps,
+          flakyDeps,
         );
       },
     );
@@ -16006,6 +16048,8 @@ interface RunFlagOpts {
   all?: boolean;
   project?: string;
   filter?: string;
+  /** --all: only run tests whose status matches. */
+  status?: string;
   maxConcurrency?: string;
   report?: string;
   reportFile?: string;
@@ -16024,6 +16068,8 @@ interface RunFlagOpts {
   autoHeal?: boolean;
   /** `--env <name>` — the project environment to run against. */
   env?: string;
+  /** `--skip-dependencies`: BE only, run just the named tests. */
+  skipDependencies?: boolean;
 }
 
 interface WaitFlagOpts {
@@ -16199,6 +16245,221 @@ function validateStatusFilter(raw: string | undefined): void {
       );
     }
   }
+}
+
+/**
+ * `--status` for `test list` and `test delete-batch`: the five latest-status
+ * values of `test run`, where `not_run` is the test cases that never ran. The
+ * older public values still work but are no longer advertised.
+ */
+function validateListStatusFilter(raw: string | undefined): void {
+  if (raw === undefined || raw === '') return;
+  for (const token of raw.split(',')) {
+    const trimmed = token.trim();
+    if (trimmed === '' || trimmed === 'not_run') continue;
+    if (!PUBLIC_STATUSES.includes(trimmed as CliPublicStatus)) {
+      throw localValidationError(
+        'status',
+        `must be one of: ${RUN_STATUS_VALUES.join(', ')} (comma-separated for multiple)`,
+        [...RUN_STATUS_VALUES],
+      );
+    }
+  }
+}
+
+/**
+ * A `--status` list with `not_run` spelled as the server's draft and ready.
+ * A list without `not_run` is returned unchanged.
+ */
+function expandNotRun(raw: string): string {
+  const tokens = raw.split(',').map(s => s.trim());
+  if (!tokens.includes('not_run')) return raw;
+  const expanded = tokens
+    .filter(s => s.length > 0)
+    .flatMap(s => (s === 'not_run' ? ['draft', 'ready'] : [s]));
+  return [...new Set(expanded)].join(',');
+}
+
+/**
+ * Strict `--status` selector for the run family. `validateStatusFilter` reads
+ * an empty value as "no filter", which is right for `test list`, but a run
+ * selector that selects nothing would silently dispatch the whole project (or
+ * filter every test out), so an empty or commas-only value is a usage error.
+ */
+function assertStatusSelectorNotEmpty(
+  raw: string | undefined,
+  accepted: ReadonlyArray<string> = PUBLIC_STATUSES,
+): void {
+  if (raw === undefined) return;
+  if (raw.split(',').every(token => token.trim() === '')) {
+    throw localValidationError(
+      'status',
+      `--status needs at least one status (accepted: ${accepted.join(', ')}); remove --status to select every test`,
+      [...accepted],
+    );
+  }
+}
+
+/**
+ * `test run --status` selects test cases by the status of their latest result.
+ * `not_run` is the test cases that never produced one (draft or ready).
+ */
+const RUN_STATUS_VALUES = ['passed', 'failed', 'blocked', 'cancelled', 'not_run'] as const;
+
+function validateStatusSelector(raw: string | undefined): void {
+  assertStatusSelectorNotEmpty(raw, RUN_STATUS_VALUES);
+  if (raw === undefined) return;
+  for (const token of raw.split(',')) {
+    const trimmed = token.trim();
+    if (trimmed === '') continue;
+    if (!(RUN_STATUS_VALUES as readonly string[]).includes(trimmed)) {
+      throw localValidationError(
+        'status',
+        `--status selects test cases by the status of their latest result, so '${trimmed}' is not accepted; ` +
+          `use one of: ${RUN_STATUS_VALUES.join(', ')} (comma-separated for multiple). ` +
+          'Use not_run for test cases that never ran; queued and running are not a latest status.',
+        [...RUN_STATUS_VALUES],
+      );
+    }
+  }
+}
+
+/** Add the available environment names to an unknown-environment rejection. */
+function withUnknownEnvironmentHint(err: unknown, environment: string | undefined): unknown {
+  if (
+    err instanceof ApiError &&
+    err.code === 'VALIDATION_ERROR' &&
+    err.getDetail('field') === 'environment' &&
+    Array.isArray(err.getDetail('available')) &&
+    environment !== undefined
+  ) {
+    const available = (err.getDetail('available') as unknown[]).filter(
+      (name): name is string => typeof name === 'string',
+    );
+    if (available.length > 0 && !err.nextAction.includes(available.join(', '))) {
+      const hint = `Flag \`--env\` is invalid: unknown environment '${environment}'; use one of: ${available.join(', ')}.`;
+      return new ApiError(
+        {
+          code: err.code,
+          message: err.message,
+          nextAction: err.nextAction ? `${hint} ${err.nextAction}` : hint,
+          requestId: err.requestId,
+          details: err.details,
+        },
+        err.httpStatus,
+        err.retryAfterMs,
+      );
+    }
+  }
+  return err;
+}
+
+/**
+ * An older server ignores `environment` and returns unfiltered statuses;
+ * acting on them would look like an environment-scoped answer.
+ */
+function assertEnvironmentStatusesPresent(
+  items: readonly CliTest[],
+  copy: { message: string; nextAction: string },
+): void {
+  if (
+    items.length > 0 &&
+    !items.some(
+      test => test.headlineEnvironment !== undefined || test.statusByEnvironment !== undefined,
+    )
+  ) {
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'UNSUPPORTED',
+        message: copy.message,
+        nextAction: copy.nextAction,
+        requestId: 'local',
+        details: {},
+      },
+    });
+  }
+}
+
+/**
+ * Every test of one project, narrowed client-side by `--skip-terminal`,
+ * `--status` and `--filter` in that order. The status of a test case is its
+ * headline `status` from an environment-free listing; `--env` only picks where
+ * a run goes. `latestStatus` reads `--status` as the run selector does
+ * (`not_run` = draft or ready); otherwise it is the public status set.
+ */
+async function resolveAllProjectTests(args: {
+  client: HttpClient;
+  projectId: string;
+  statusFilter?: string;
+  skipTerminal?: boolean;
+  nameFilter?: string;
+  stderr: (line: string) => void;
+  latestStatus?: boolean;
+}): Promise<CliTest[]> {
+  const { client, projectId, statusFilter, nameFilter, stderr } = args;
+  const statusSelected = statusFilter !== undefined && statusFilter !== '';
+  let items: CliTest[] = (
+    await paginate<CliTest>(
+      async ({ pageSize, cursor }) =>
+        client.get<Page<CliTest>>('/tests', {
+          query: { projectId, pageSize, cursor },
+        }),
+      {},
+    )
+  ).items;
+  const statusOf = (test: CliTest): CliPublicStatus => test.status;
+
+  if (args.skipTerminal) {
+    const before = items.length;
+    items = items.filter(t => !TERMINAL_PUBLIC_STATUSES.has(statusOf(t)));
+    const skipped = before - items.length;
+    if (skipped > 0) {
+      stderr(
+        `--skip-terminal: skipped ${skipped} already-terminal test${skipped !== 1 ? 's' : ''} (passed|failed|blocked|cancelled).`,
+      );
+    }
+  }
+  if (statusSelected) {
+    const allowed = new Set(
+      statusFilter
+        .split(',')
+        .map(s => s.trim())
+        .filter(s => s.length > 0)
+        .flatMap(s => (args.latestStatus && s === 'not_run' ? ['draft', 'ready'] : [s])),
+    );
+    const before = items.length;
+    items = items.filter(t => allowed.has(statusOf(t)));
+    const skipped = before - items.length;
+    if (skipped > 0) {
+      stderr(
+        args.latestStatus
+          ? `--status filter: skipped ${skipped} test${skipped !== 1 ? 's' : ''} whose latest status is not ${statusFilter}.`
+          : `--status filter: skipped ${skipped} test${skipped !== 1 ? 's' : ''} not matching status=${statusFilter}.`,
+      );
+    }
+  }
+  if (nameFilter !== undefined && nameFilter !== '') {
+    const needle = nameFilter.toLowerCase();
+    const before = items.length;
+    items = items.filter(t => t.name.toLowerCase().includes(needle));
+    const skipped = before - items.length;
+    if (skipped > 0) {
+      stderr(
+        `--filter: skipped ${skipped} test${skipped !== 1 ? 's' : ''} whose name does not contain "${nameFilter}".`,
+      );
+    }
+  }
+  return items;
+}
+
+/** The selectors a zero-match message names, in the order they are applied. */
+function describeRunSelectors(opts: { statusFilter?: string; nameFilter?: string }): string {
+  const parts: string[] = [];
+  if (opts.statusFilter !== undefined) parts.push(`--status ${opts.statusFilter}`);
+  if (opts.nameFilter !== undefined && opts.nameFilter !== '') {
+    parts.push(`--filter "${opts.nameFilter}"`);
+  }
+  return parts.join(' ');
 }
 
 function parseEnumFlag<T extends string>(
@@ -16426,11 +16687,15 @@ async function deleteTunnelForCleanup(
 const TEARDOWN_OPERATION_TIMEOUT_MS = 10_000;
 
 function makeOutput(mode: OutputMode, deps: TestDeps): Output {
-  return new Output(mode, {
-    stdout: deps.stdout,
-    stderr: deps.stderr,
-    rawStdout: deps.rawStdout,
-  });
+  return new Output(
+    mode,
+    {
+      stdout: deps.stdout,
+      stderr: deps.stderr,
+      rawStdout: deps.rawStdout,
+    },
+    { deprecations: deps.deprecations },
+  );
 }
 
 /**
@@ -17207,35 +17472,30 @@ function createTestCodeCommand(deps: TestDeps): Command {
   code
     .command('put <test-id>')
     .description('Replace test code with etag-guarded optimistic concurrency')
-    .option('--code-file <path>', 'file containing the new test code (≤ 350 KB)')
+    .option('--code-file <path>', 'new test code: required, a .py file, ≤ 350 KB')
     .option(
       '--expected-version <v>',
-      'expected current codeVersion (e.g. v3); sent as `If-Match`. Mutually exclusive with --force.',
+      'expected current codeVersion (e.g. v3), sent as `If-Match`; excludes --force. ' +
+        'Omit both to auto-fetch the current version (no protection against concurrent edits; pass it in scripts).',
     )
     .option(
       '--force',
-      'send `If-Match: *` to skip the etag check (audit-logged with force: true). Mutually exclusive with --expected-version.',
+      'send `If-Match: *` to skip the etag check (audit-logged); excludes --expected-version',
       false,
     )
     .option(
       '--language <lang>',
-      'set the stored code language; only "python" is supported (TestSprite executes test code as Python). Defaults to the existing language.',
+      'stored code language; only "python" is supported (default: the existing language)',
     )
     .option(
       '--idempotency-key <token>',
-      'opaque idempotency token (1-256 ASCII chars). Defaults to a UUIDv4 minted per invocation; pin one yourself for safe retries.',
+      'idempotency token (1-256 ASCII chars; default: random UUID per invocation, pin one for safe retries)',
     )
     .option(
       '--dry-run-simulate-error <code>',
-      'With --dry-run: synthesise an error envelope to preview the error path. Supported: PRECONDITION_FAILED (412).',
+      'with --dry-run: preview the 412 error path (supported: PRECONDITION_FAILED); without it --dry-run shows the success shape',
     )
-    .addHelpText(
-      'after',
-      '\nDry-run note: --dry-run always returns the happy response shape.\n' +
-        'To preview the 412 retry-hint path, combine with --dry-run-simulate-error PRECONDITION_FAILED.\n' +
-        '\n' +
-        GLOBAL_OPTS_HINT,
-    )
+    .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (testId: string, cmdOpts: CodePutFlagOpts, command: Command) => {
       const simulateError = cmdOpts.dryRunSimulateError;
       if (simulateError !== undefined && simulateError !== 'PRECONDITION_FAILED') {
@@ -18321,7 +18581,7 @@ function createTestPlanCommand(deps: TestDeps): Command {
     .description("Replace an FE test's planSteps[] (BE tests return 400 → use 'test code put')")
     .option(
       '--steps <path>',
-      'JSON file with { planSteps: [...] } (FE-only, ≤ 200 steps, ≤ 256 KB)',
+      'required: JSON file with { planSteps: [...] } (FE-only, ≤ 200 steps, ≤ 256 KB)',
     )
     .option(
       '--expected-step-count <n>',
@@ -18333,16 +18593,20 @@ function createTestPlanCommand(deps: TestDeps): Command {
     )
     .option(
       '--idempotency-key <token>',
-      'opaque idempotency token (1-256 ASCII chars). Defaults to a UUIDv4 minted per invocation; pin one yourself for safe retries.',
+      'idempotency token (1-256 ASCII chars; default: random UUID per invocation, pin one for safe retries)',
     )
     .option(
       '--dry-run-simulate-error <code>',
-      'With --dry-run: synthesise an error envelope to preview the error path. Supported: PRECONDITION_FAILED (412).',
+      'with --dry-run: preview the 412 error path (supported: PRECONDITION_FAILED); without it --dry-run shows the success shape',
     )
     .addHelpText(
       'after',
-      '\nDry-run note: --dry-run always returns the happy response shape.\n' +
-        'To preview the 412 retry-hint path, combine with --dry-run-simulate-error PRECONDITION_FAILED.\n' +
+      '\nExit codes:\n' +
+        '  0  steps replaced\n' +
+        '  3  authentication error\n' +
+        '  4  test not found\n' +
+        '  5  validation error (e.g. missing --steps, unreadable or invalid file)\n' +
+        '  6  step-count mismatch with --expected-step-count (HTTP 412)\n' +
         '\n' +
         GLOBAL_OPTS_HINT,
     )
@@ -18371,35 +18635,36 @@ function createTestPlanCommand(deps: TestDeps): Command {
     });
   plan
     .command('generate')
+    .summary('Generate AI test-case proposals for review')
     .description(
-      'Generate AI test-case proposals for a project — runs only the missing pipeline ' +
+      'Generate AI test-case proposals for a project: runs only the missing pipeline ' +
         'stages and stages the results server-side for review (nothing is written locally)',
     )
-    .option('--project <id>', 'project id (V3-native; V2 ids resolve through the migration bridge)')
+    .option('--project <id>', 'project id (or set TESTSPRITE_PROJECT_ID)')
     .option(
       '--timeout <seconds>',
       `total wait budget in seconds (1-3600, default ${PLAN_GENERATE_DEFAULT_TIMEOUT_SECONDS}; ` +
-        'exploration takes minutes on a fresh frontend project)',
+        'exploration of a fresh frontend project takes minutes)',
     )
     .option(
       '--idempotency-key <token>',
-      'opaque idempotency token (1-256 ASCII chars). Defaults to a UUIDv4 minted per invocation; pin one yourself for safe retries.',
+      'idempotency token (1-256 ASCII chars; default: random UUID per invocation, pin one for safe retries)',
     )
     .addHelpText(
       'after',
-      '\nBehavior:\n' +
-        '  - Runs the stages the project still needs (exploration for frontend,\n' +
-        '    strategy, proposals) and stops when proposals are staged for review.\n' +
-        '    Nothing is written to disk.\n' +
-        '  - Interrupt (exit 130/143/129) or timeout (exit 7): the stage in\n' +
-        '    progress finishes on its own, the rest wait. Run the same command\n' +
-        '    again to continue; it picks up where it left off. A stage that\n' +
-        '    already completed is never charged again.\n' +
-        '  - Workspace credits are spent per stage that runs; the result line reports\n' +
-        '    what THIS run charged (omitted when nothing new was charged).\n' +
-        '    `testsprite usage` shows your balance.\n' +
-        '\n' +
-        'Next step: review the printed table, then `testsprite test plan accept`.\n' +
+      '\nStages that run: exploration (frontend), strategy, proposals. On interrupt (exit 130/143/129)\n' +
+        'or timeout (exit 7) the running stage finishes on its own; re-run the same command to continue.\n' +
+        'A completed stage is never charged again. Workspace credits are spent per stage that runs;\n' +
+        'the result line reports what THIS run charged. `testsprite usage` shows your balance.\n' +
+        '\nNext: review the printed table, then `testsprite test plan accept`.\n' +
+        '\nExit codes:\n' +
+        '  0  proposals staged for review\n' +
+        '  1  a pipeline stage failed server-side (re-run to retry it)\n' +
+        '  3  authentication error\n' +
+        '  5  validation error\n' +
+        '  7  timeout (re-run to continue)\n' +
+        ' 11  rate limited\n' +
+        ' 12  insufficient credits\n' +
         '\n' +
         GLOBAL_OPTS_HINT,
     )
@@ -18419,28 +18684,25 @@ function createTestPlanCommand(deps: TestDeps): Command {
     });
   plan
     .command('accept')
+    .summary('Turn staged proposals into test cases (free)')
     .description(
       'Convert staged proposals into real test cases (free) — all of them, or a subset with --only',
     )
-    .option('--project <id>', 'project id (V3-native; V2 ids resolve through the migration bridge)')
+    .option('--project <id>', 'project id (or set TESTSPRITE_PROJECT_ID)')
     .option(
       '--only <ids...>',
-      'accept only these proposal ids (space- or comma-separated; the ids come from the ' +
-        '`test plan generate` table). Accepting a subset discards the rest. ANY id that ' +
-        'matches no staged proposal is a validation error — the request is never sent.',
+      'accept only these proposal ids from the `test plan generate` table (space- or comma-separated); ' +
+        'the rest are discarded. Any id matching no staged proposal is a validation error.',
     )
     .option(
       '--idempotency-key <token>',
-      'opaque idempotency token (1-256 ASCII chars). Defaults to a UUIDv4 minted per invocation; pin one yourself for safe retries.',
+      'idempotency token (1-256 ASCII chars; default: random UUID per invocation, pin one for safe retries)',
     )
     .addHelpText(
       'after',
-      '\nNotes:\n' +
-        '  - Accepting adds no charge of its own; generation already did the work.\n' +
-        '  - API test code is generated when the tests first run, not at accept.\n' +
-        '  - Accepting a subset discards the remaining staged proposals (the staging\n' +
-        '    area is cleared either way) — the output says how many were discarded.\n' +
-        '  - Nothing staged → exit 6 with a pointer at `test plan generate`.\n' +
+      '\nAccepting adds no charge. API test code is generated when the tests first run. The staging\n' +
+        'area is cleared either way (the output says how many proposals were discarded).\n' +
+        'Nothing staged: exit 6, pointing at `test plan generate`.\n' +
         '\n' +
         GLOBAL_OPTS_HINT,
     )
@@ -18495,11 +18757,10 @@ export function createTestArtifactCommand(deps: TestDeps): Command {
     // mirror the flat `test result/steps/get <id>` forms). Run-id semantics are
     // preserved: the positional is still a run-id, not a test-id.
     .command('get <run-id>', { isDefault: true })
+    .summary('Download the failure bundle for a run')
     .description(
       [
-        'Download the §7 failure-context bundle for a specific run.',
-        '',
-        'Default <dir>: ./.testsprite/runs/<run-id>/',
+        'Download the failure bundle for a run (result.json, failure.json, code, video, steps/, meta.json).',
         '',
         'Exit codes:',
         '  0  bundle written successfully',
@@ -18512,15 +18773,11 @@ export function createTestArtifactCommand(deps: TestDeps): Command {
     )
     .option(
       '--out <dir>',
-      [
-        'Directory to write the §7 disk layout (default: ./.testsprite/runs/<run-id>/).',
-        'Parent must exist. The bundle dir itself is created if absent.',
-      ].join(' '),
+      'directory to write the bundle into (default: ./.testsprite/runs/<run-id>/); the parent must exist',
     )
     .option(
       '--failed-only',
-      'Trim to the failed step ±1. The bundle is already failure-focused server-side, ' +
-        'so this is usually a no-op; use `test steps <id>` for the full run trail.',
+      'trim to the failed step ±1 (usually a no-op; `test steps <id>` has the full trail)',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(
@@ -18546,15 +18803,26 @@ function createTestFailureCommand(deps: TestDeps): Command {
     // `test failure get <test-id>` (grammar consistency). `failure summary`
     // still routes explicitly; only the bare-noun form falls through to `get`.
     .command('get <test-id>', { isDefault: true })
-    .description("Write a self-contained failure-context bundle for a test's latest failing run")
+    .summary("Write the failure bundle for a test's latest failing run")
+    .description(
+      [
+        "Write the failure bundle for a test's latest failing run (same layout as `test artifact get`).",
+        '',
+        'Exit codes:',
+        '  0  success',
+        '  3  authentication error',
+        '  4  test not found, or it has no failing run',
+        '  5  validation error (bad --out)',
+        ' 10  transport failure',
+      ].join('\n'),
+    )
     .option(
       '--out <dir>',
-      'Directory to write the §7 disk layout into (default: print wire envelope to stdout)',
+      'directory to write the bundle into (default: print the envelope to stdout)',
     )
     .option(
       '--failed-only',
-      'Trim to the failed step ±1. The bundle is already failure-focused server-side, ' +
-        'so this is usually a no-op; use `test steps <id>` for the full run trail.',
+      'with --out: trim to the failed step ±1 (usually a no-op; `test steps <id>` has the full trail)',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(
