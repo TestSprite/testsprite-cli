@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
@@ -10,6 +10,8 @@ export interface GitUtilsDeps {
   exists?: (p: string) => Promise<boolean>;
   /** lstat semantics (never follows symlinks); used to refuse writing through a symlinked .gitignore. */
   lstat?: (p: string) => Promise<GitUtilsStat>;
+  /** Sync lstat for diagnostics; a symlinked .gitignore is not trusted (git does not follow it). */
+  lstatSync?: (p: string) => GitUtilsStat;
   readFile?: (p: string) => Promise<string>;
   readFileSync?: (p: string) => string;
   /** Appends text to the file, creating it when missing. */
@@ -146,13 +148,19 @@ export function inspectTestspriteIgnore(
   const exists = deps.existsSync ?? existsSync;
   // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads the target repository's .gitignore file
   const read = deps.readFileSync ?? ((p: string) => readFileSync(p, 'utf8'));
+  const lstatOf = deps.lstatSync ?? defaultLstatSync;
   const root = findGitRoot(dir, deps);
   if (root === null) return { inRepo: false, ignored: false };
   let current = resolve(dir);
   while (true) {
     const candidate = join(current, '.gitignore');
     try {
-      if (exists(candidate) && isTestspriteIgnored(read(candidate))) {
+      // Git ignores a .gitignore that is a symlink, so its contents prove nothing.
+      if (
+        exists(candidate) &&
+        !lstatOf(candidate)?.isSymbolicLink &&
+        isTestspriteIgnored(read(candidate))
+      ) {
         return { inRepo: true, ignored: true };
       }
     } catch {
@@ -211,6 +219,15 @@ export async function ensureTestspriteIgnored(
   const separator = content.length === 0 || content.endsWith('\n') ? '' : '\n';
   await append(gitignorePath, `${separator}\n# TestSprite failure artifacts\n.testsprite/\n`);
   return true;
+}
+
+function defaultLstatSync(p: string): GitUtilsStat {
+  try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- inspects the target repository's .gitignore without following symlinks
+    return { isSymbolicLink: lstatSync(p).isSymbolicLink() };
+  } catch {
+    return null;
+  }
 }
 
 async function defaultLstat(p: string): Promise<GitUtilsStat> {

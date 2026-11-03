@@ -87,6 +87,8 @@ export interface DoctorDeps {
   nodeVersion?: string;
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
+  /** lstat for the Git checks (tests); a symlinked .gitignore is not trusted. */
+  lstatSync?: (p: string) => { isSymbolicLink: boolean } | null;
   /** Config resolver. Defaults to `loadConfig`; injectable for tests. */
   loadConfigFn?: typeof loadConfig;
 }
@@ -296,6 +298,7 @@ function checkGit(cwd: string, deps: DoctorDeps): [DoctorCheck, DoctorCheck] {
     const { inRepo, ignored } = inspectTestspriteIgnore(cwd, {
       existsSync: deps.existsSync,
       readFileSync: deps.readFileSync,
+      lstatSync: deps.lstatSync,
     });
     if (!inRepo) {
       return [

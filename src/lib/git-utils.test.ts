@@ -164,6 +164,18 @@ describe('git-utils', () => {
       });
     });
 
+    it('does not trust a symlinked .gitignore, which git itself ignores', () => {
+      files.clear();
+      files.set(join(repo, '.gitignore'), '.testsprite/\n');
+      const linked = join(repo, '.gitignore');
+      expect(
+        inspectTestspriteIgnore(join(repo, 'a'), {
+          ...deps(),
+          lstatSync: (p: string) => ({ isSymbolicLink: p === linked }),
+        }),
+      ).toEqual({ inRepo: true, ignored: false });
+    });
+
     it('reports not ignored when no .gitignore up to the root has the rule', () => {
       files.clear();
       files.set(join(repo, 'a', '.gitignore'), 'dist/\n');
