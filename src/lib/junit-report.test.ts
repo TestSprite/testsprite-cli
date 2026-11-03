@@ -444,3 +444,33 @@ describe('skippedJUnitResultsFromSummary', () => {
     ]);
   });
 });
+
+describe('per-row classname for batches spanning projects', () => {
+  it('uses a row classname over the suite classname', () => {
+    const xml = buildJUnitReport({
+      suiteName: 's',
+      classname: 'suite-class',
+      results: [
+        { testId: 'a', status: 'passed', classname: 'P1' },
+        { testId: 'b', status: 'passed' },
+      ],
+    });
+    expect(xml).toContain('classname="P1" name="a"');
+    expect(xml).toContain('classname="suite-class" name="b"');
+  });
+
+  it('names the suite from the projects the ids resolved to', () => {
+    const one = new Map([['a', 'P1']]);
+    const two = new Map([
+      ['a', 'P1'],
+      ['b', 'P2'],
+    ]);
+    expect(resolveBatchReportProjectId({ projectIdByTestId: one }, [])).toBe('P1');
+    expect(resolveBatchReportProjectId({ projectIdByTestId: two }, [{ projectId: 'P1' }])).toBe(
+      'multiple-projects',
+    );
+    expect(() => resolveBatchReportProjectId({}, [])).toThrowError(
+      expect.objectContaining({ details: expect.objectContaining({ field: 'project' }) }),
+    );
+  });
+});

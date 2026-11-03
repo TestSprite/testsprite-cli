@@ -847,6 +847,55 @@ describe('runDeleteBatch (dogfood L1796)', () => {
     expect(deletedIds).toEqual(['test_failed']);
   });
 
+  it('--all --status not_run deletes only the tests that never ran (draft, ready)', async () => {
+    const creds = makeCreds();
+    const deletedIds: string[] = [];
+
+    const allTests = [
+      { id: 'test_draft', status: 'draft' },
+      { id: 'test_ready', status: 'ready' },
+      { id: 'test_failed', status: 'failed' },
+      { id: 'test_running', status: 'running' },
+      { id: 'test_unknown', status: 'unknown' },
+    ];
+
+    const fetchImpl = makeFetch((url, init) => {
+      if (url.includes('/tests') && (!init.method || init.method === 'GET')) {
+        return { body: { items: allTests, nextToken: null } };
+      }
+      if (init.method === 'DELETE') {
+        const testId = url.split('/tests/')[1]!.split('?')[0]!;
+        deletedIds.push(decodeURIComponent(testId));
+        return { body: deleteResp(decodeURIComponent(testId)) };
+      }
+      return { body: {} };
+    });
+
+    for (const statusFilter of ['not_run', 'failed,not_run']) {
+      deletedIds.length = 0;
+      await runDeleteBatch(
+        {
+          testIds: [],
+          all: true,
+          projectId: 'project_abc',
+          statusFilter,
+          confirm: true,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, fetchImpl, stderr: () => {} },
+      );
+      expect(deletedIds.sort()).toEqual(
+        statusFilter === 'not_run'
+          ? ['test_draft', 'test_ready']
+          : ['test_draft', 'test_failed', 'test_ready'],
+      );
+    }
+  });
+
   it('exit 5 when --status contains an invalid token', async () => {
     const creds = makeCreds();
     const fetchImpl = makeFetch((url, init) => {
@@ -872,6 +921,48 @@ describe('runDeleteBatch (dogfood L1796)', () => {
         { ...creds, fetchImpl },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
+  it('exit 5 before any request when --all --status is empty, whitespace or commas only', async () => {
+    const creds = makeCreds();
+    // An empty --status used to be read as "no filter", so `--status ''`
+    // deleted every test in the project.
+    const requests: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      requests.push(`${init.method ?? 'GET'} ${url}`);
+      if (url.includes('/tests') && (!init.method || init.method === 'GET')) {
+        return { body: { items: [{ id: 'test_a', status: 'passed' }], nextToken: null } };
+      }
+      if (init.method === 'DELETE') return { body: deleteResp('test_a') };
+      return { body: {} };
+    });
+    for (const statusFilter of ['', '  ', ',', ' , ']) {
+      for (const dryRun of [false, true]) {
+        await expect(
+          runDeleteBatch(
+            {
+              testIds: [],
+              all: true,
+              projectId: 'project_abc',
+              statusFilter,
+              confirm: true,
+              output: 'json',
+              profile: 'default',
+              dryRun,
+              debug: false,
+              verbose: false,
+            },
+            { ...creds, fetchImpl, stdout: () => {}, stderr: () => {} },
+          ),
+        ).rejects.toMatchObject({
+          code: 'VALIDATION_ERROR',
+          nextAction: expect.stringContaining(
+            '--status needs at least one status (accepted: passed, failed, blocked, cancelled, not_run)',
+          ),
+        });
+      }
+    }
+    expect(requests).toEqual([]);
   });
 
   // ---- correctness-fix tests (code-review 2026-06-04) ----------------------

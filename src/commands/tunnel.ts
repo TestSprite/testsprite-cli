@@ -93,9 +93,9 @@ function assertTunnelClientId(clientId: string): void {
   throw ApiError.fromEnvelope({
     error: {
       code: 'VALIDATION_ERROR',
-      message:
-        "Tunnel client id must be a UUID (see 'testsprite tunnel status'/'tunnel start' output).",
-      nextAction: "Run 'testsprite tunnel start' to get a tunnel client id.",
+      message: "Tunnel client id must be a UUID (see 'testsprite tunnel list').",
+      nextAction:
+        "Run 'testsprite tunnel list' to see your tunnel client ids, or 'testsprite tunnel start' to open one.",
       requestId: 'local',
       details: { field: 'clientId', reason: 'must be a UUID' },
     },
@@ -727,18 +727,14 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
     .description('Open a tunnel so TestSprite can reach an app on this machine')
     .addHelpText(
       'after',
-      '\nFrontend runs automatically open and close a tunnel when the selected environment URL\n' +
-        'is on this machine. Use these commands when you want one tunnel to serve several runs, or to check on\n' +
-        'one that a run reported as down.\n' +
-        '\nA tunnel lives only as long as `tunnel start` is running — there is no background\n' +
-        'daemon, because the credential that authorises an inbound network path into this machine\n' +
-        'is never written to disk.\n' +
+      '\nFrontend runs open and close a tunnel automatically when the environment URL is on this\n' +
+        'machine. Use these commands to share one tunnel across several runs or to check one a run\n' +
+        'reported as down. A tunnel lives only as long as `tunnel start` runs: there is no background\n' +
+        'daemon, because its credential is never written to disk.\n' +
         '\nExamples:\n' +
-        '  testsprite tunnel start                                   # hold a tunnel open (Ctrl-C to stop)\n' +
-        '  testsprite test run <id> --env <name> --tunnel-client <id>\n' +
-        '  testsprite tunnel list\n' +
-        '  testsprite tunnel status <id>\n' +
-        '  testsprite tunnel stop <id>\n' +
+        '  testsprite tunnel start    # hold a tunnel open (Ctrl-C to stop)\n' +
+        '  testsprite test run <test-id> --env <name> --tunnel-client <client-id>\n' +
+        '  testsprite test run <test-id> --local 3000 --tunnel-client <client-id>\n' +
         '  testsprite tunnel stop --all --confirm\n',
     );
 
@@ -748,19 +744,18 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
     // where an embedded newline breaks out of the indented column. The detail
     // belongs in this command's own help, below.
     .description('Open a tunnel and hold it until you stop the command (Ctrl-C)')
+    .summary('Open a tunnel and hold it until Ctrl-C')
     .option(
       '--ttl <seconds>',
-      'requested lifetime of the tunnel credential (60–28800). The server clamps this, and the ' +
-        'credential is deleted when the command exits regardless — the lifetime only matters if ' +
-        'this process is killed without cleaning up.',
+      'requested credential lifetime (60–28800), clamped by the server; the credential is deleted ' +
+        'on exit regardless, so this only matters if the process is killed',
     )
     .addHelpText(
       'after',
-      '\nPrints the client id to stderr as soon as it is minted, before connecting; pass it\n' +
-        'to `test run <id> --env <name> --tunnel-client <id>` for an environment on this machine.\n' +
-        'Frontend runs normally open their own tunnel automatically for a loopback environment URL.\n' +
-        '\nDev servers can take a minute per page through the tunnel. For a heavy dev server,\n' +
-        "test a built server: `npm run build`, then your framework's preview/start command.\n" +
+      '\nPrints the client id to stderr as soon as it is minted; pass it to\n' +
+        '`test run <test-id> --env <name> --tunnel-client <client-id>` for an environment on this machine.\n' +
+        '\nDev servers can take a minute per page through the tunnel; for a heavy one, test a built\n' +
+        "server (`npm run build`, then your framework's preview/start command).\n" +
         '\nExit codes:\n' +
         '  0  you stopped it (Ctrl-C is the normal way to end this command)\n' +
         '  3  auth error — the key needs the `run:tunnel` scope; mint a new key\n' +
@@ -784,8 +779,7 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
     .description('List live tunnel bindings for this account')
     .addHelpText(
       'after',
-      '\nShows each tunnel client id, connection status, creation time and expiry.\n' +
-        'Includes tunnels automatically opened for environments on this machine.\n' +
+      '\nShows each tunnel client id, status, creation time and expiry, including tunnels opened automatically.\n' +
         '\nExit codes:\n' +
         '  0  listed (possibly empty)\n' +
         '  3  auth error — the key needs the `run:tunnel` scope\n' +
@@ -799,6 +793,7 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
 
   tunnel
     .command('status <client-id>')
+    .summary('Report whether a tunnel client is connected')
     .description('Report whether a tunnel client of yours is connected')
     .addHelpText(
       'after',
@@ -808,6 +803,7 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
         '\nExit codes:\n' +
         '  0  answered (the answer may be `offline`)\n' +
         '  4  no such tunnel for this account\n' +
+        '  5  client id is not a UUID\n' +
         ' 10  could not reach TestSprite to ask\n',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
@@ -817,6 +813,7 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
 
   tunnel
     .command('stop [client-id]')
+    .summary('Stop one tunnel, or all with --all')
     .description('Destroy one tunnel credential or stop every live tunnel')
     .option('--all', 'stop every live tunnel on this account', false)
     .option('--confirm', 'required with --all for this destructive operation', false)
@@ -825,13 +822,14 @@ export function createTunnelCommand(deps: TunnelDeps = {}): Command {
       '\nStopping one that is already gone succeeds. Revoking the credential\n' +
         'also makes a running `tunnel start` exit within ~15 s.\n' +
         'A run that automatically opened this tunnel loses access to its environment when you stop it.\n' +
-        'Stopping all requires --confirm; --dry-run previews sample ids without it.\n' +
+        'Stopping all requires --confirm and also revokes tunnels used by other terminals and CI jobs;\n' +
+        '--dry-run previews sample ids without it.\n' +
         '\nExit codes:\n' +
         '  0  stopped (or already absent), including an empty --all result\n' +
         '  1  at least one tunnel could not be stopped\n' +
         '  3  auth error — the key needs the `run:tunnel` scope\n' +
         '  4  server too old to list tunnels (with --all)\n' +
-        '  5  invalid arguments or --all without --confirm\n' +
+        '  5  invalid arguments (e.g. a client id that is not a UUID) or --all without --confirm\n' +
         ' 10  could not reach TestSprite\n',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
