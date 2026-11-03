@@ -1,64 +1,60 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+
+/** Result of an lstat call: `null` means the path does not exist. */
+export type GitUtilsStat = { isSymbolicLink: boolean } | null;
 
 export interface GitUtilsDeps {
   existsSync?: (p: string) => boolean;
   exists?: (p: string) => Promise<boolean>;
+  /** lstat semantics (never follows symlinks); used to refuse writing through a symlinked .gitignore. */
+  lstat?: (p: string) => Promise<GitUtilsStat>;
   readFile?: (p: string) => Promise<string>;
-  writeFile?: (p: string, content: string) => Promise<void>;
+  readFileSync?: (p: string) => string;
+  /** Appends text to the file, creating it when missing. */
+  appendFile?: (p: string, text: string) => Promise<void>;
 }
 
 /**
- * Checks if the specified directory is inside a Git repository by recursively walking
- * up the directory tree to check for a `.git` folder or file.
+ * Returns the nearest directory at or above `dir` that contains `.git` (a directory,
+ * or a file as in worktrees and submodules), or null. `dir` is resolved to an absolute
+ * path first so relative inputs walk the real tree.
  */
-export function isInsideGitRepo(dir: string, deps: GitUtilsDeps = {}): boolean {
+export function findGitRoot(dir: string, deps: GitUtilsDeps = {}): string | null {
   const exists = deps.existsSync ?? existsSync;
-
-  try {
-    let current = dir;
-    while (true) {
-      const gitDir = join(current, '.git');
-      if (exists(gitDir)) {
-        return true;
-      }
-      const parent = dirname(current);
-      if (parent === current) {
-        break;
-      }
-      current = parent;
-    }
-  } catch {
-    // Best-effort: if the filesystem check fails, treat as not a git repo.
+  let current = resolve(dir);
+  while (true) {
+    if (exists(join(current, '.git'))) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
   }
-  return false;
 }
 
-/**
- * Checks if the specified directory is inside a Git repository by recursively walking
- * up the directory tree to check for a `.git` folder or file (async).
- */
-export async function isInsideGitRepoAsync(dir: string, deps: GitUtilsDeps = {}): Promise<boolean> {
+/** Async variant of {@link findGitRoot}. Errors from the existence check propagate. */
+export async function findGitRootAsync(
+  dir: string,
+  deps: GitUtilsDeps = {},
+): Promise<string | null> {
   const exists = deps.exists ?? (async p => (deps.existsSync ?? existsSync)(p));
-
-  try {
-    let current = dir;
-    while (true) {
-      const gitDir = join(current, '.git');
-      if (await exists(gitDir)) {
-        return true;
-      }
-      const parent = dirname(current);
-      if (parent === current) {
-        break;
-      }
-      current = parent;
-    }
-  } catch {
-    // Best-effort: if the filesystem check fails, treat as not a git repo.
+  let current = resolve(dir);
+  while (true) {
+    if (await exists(join(current, '.git'))) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
   }
-  return false;
+}
+
+/** True when `dir` is inside a Git repository (`.git` directory or file found at or above it). */
+export function isInsideGitRepo(dir: string, deps: GitUtilsDeps = {}): boolean {
+  return findGitRoot(dir, deps) !== null;
+}
+
+/** Async variant of {@link isInsideGitRepo}. */
+export async function isInsideGitRepoAsync(dir: string, deps: GitUtilsDeps = {}): Promise<boolean> {
+  return (await findGitRootAsync(dir, deps)) !== null;
 }
 
 /**
@@ -139,29 +135,71 @@ export async function checkTestspriteIgnored(
 }
 
 /**
+ * Synchronous check for diagnostics: is `dir` inside a Git repository, and is
+ * `.testsprite/` ignored by a `.gitignore` between `dir` and the repository root
+ * (inclusive)? Reads files only; never shells out to git and never throws.
+ */
+export function inspectTestspriteIgnore(
+  dir: string,
+  deps: GitUtilsDeps = {},
+): { inRepo: boolean; ignored: boolean } {
+  const exists = deps.existsSync ?? existsSync;
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads the target repository's .gitignore file
+  const read = deps.readFileSync ?? ((p: string) => readFileSync(p, 'utf8'));
+  const root = findGitRoot(dir, deps);
+  if (root === null) return { inRepo: false, ignored: false };
+  let current = resolve(dir);
+  while (true) {
+    const candidate = join(current, '.gitignore');
+    try {
+      if (exists(candidate) && isTestspriteIgnored(read(candidate))) {
+        return { inRepo: true, ignored: true };
+      }
+    } catch {
+      // Unreadable .gitignore: treat as not ignoring and keep walking.
+    }
+    if (current === root) break;
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return { inRepo: true, ignored: false };
+}
+
+/**
  * Ensures that `.testsprite/` is ignored in the target directory's `.gitignore`.
- * If `.gitignore` doesn't exist, it will be created. If `.testsprite` is already
- * ignored, no changes are made.
+ * Does nothing outside a Git repository. If `.gitignore` is missing it is created;
+ * otherwise the entry is appended (never rewritten), so a concurrent edit is not lost.
+ * Refuses to write through a symlinked `.gitignore` (throws).
  *
- * Returns true if the file was modified or created, false if it was already ignored.
+ * Returns true if the file was modified or created, false if nothing was changed.
  */
 export async function ensureTestspriteIgnored(
   dir: string,
   deps: GitUtilsDeps = {},
 ): Promise<boolean> {
-  if (!(await isInsideGitRepoAsync(dir, deps))) {
+  const projectDir = resolve(dir);
+  if (!(await isInsideGitRepoAsync(projectDir, deps))) {
     return false;
   }
 
   const exists = deps.exists ?? (async p => (deps.existsSync ?? existsSync)(p));
   // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads the target repository's .gitignore file
   const read = deps.readFile ?? (p => fs.readFile(p, 'utf8'));
-  // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes the target repository's .gitignore file
-  const write = deps.writeFile ?? ((p, content) => fs.writeFile(p, content, 'utf8'));
+  const lstat = deps.lstat ?? defaultLstat;
+  const append =
+    deps.appendFile ??
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- appends to the target repository's .gitignore file
+    ((p, text) => fs.appendFile(p, text, 'utf8'));
 
-  const gitignorePath = join(dir, '.gitignore');
+  const gitignorePath = join(projectDir, '.gitignore');
+  const stat = await lstat(gitignorePath);
+  if (stat?.isSymbolicLink) {
+    throw new Error(`refusing to modify ${gitignorePath}: it is a symlink`);
+  }
+
   let content = '';
-  if (await exists(gitignorePath)) {
+  if (stat !== null || (await exists(gitignorePath))) {
     content = await read(gitignorePath);
   }
 
@@ -169,11 +207,19 @@ export async function ensureTestspriteIgnored(
     return false; // already ignored, no changes made
   }
 
-  // Ensure file ends with newline before appending
+  // Keep a leading newline when the file does not end with one so the entry starts on its own line.
   const separator = content.length === 0 || content.endsWith('\n') ? '' : '\n';
-  const appendContent = `${separator}\n# TestSprite failure artifacts\n.testsprite/\n`;
-  const newContent = `${content}${appendContent}`;
+  await append(gitignorePath, `${separator}\n# TestSprite failure artifacts\n.testsprite/\n`);
+  return true;
+}
 
-  await write(gitignorePath, newContent);
-  return true; // appended successfully
+async function defaultLstat(p: string): Promise<GitUtilsStat> {
+  try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- inspects the target repository's .gitignore without following symlinks
+    const s = await fs.lstat(p);
+    return { isSymbolicLink: s.isSymbolicLink() };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
 }

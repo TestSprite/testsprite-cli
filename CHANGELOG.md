@@ -4,6 +4,10 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **`setup` keeps `.testsprite/` out of Git.** Inside a Git repository, `testsprite setup` appends `.testsprite/` (where failure artifacts are written) to the project's `.gitignore` when it is not already ignored; skip it with `--no-gitignore`, and `--dry-run` only reports it. The entry is appended rather than rewritten, a symlinked `.gitignore` is not written through, and a failure here is a warning that never fails setup (it also runs when the agent skill install fails after credentials were saved). `testsprite doctor` gains `Git repository` and `Gitignore safety` checks (warnings only, never failures; the project directory up to the repository root is checked). Thanks to @sandman-sh (#257, closes #258).
+
 ## [0.16.0] - 2026-10-30
 
 ### Added

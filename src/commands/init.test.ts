@@ -177,6 +177,8 @@ function makeBaseOpts(overrides: Partial<Parameters<typeof runInit>[0]> = {}) {
     fromEnv: false,
     agent: 'claude' as AgentTarget,
     noAgent: false,
+    // Never touch the real repository .gitignore; the .gitignore tests opt in explicitly.
+    noGitignore: true,
     force: false,
     yes: false,
     ...overrides,
@@ -266,7 +268,7 @@ describe('runInit — session-only environment credentials', () => {
       ]);
       expect([...captured.stdout, ...captured.stderr].join('\n')).not.toContain(key);
       expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
-
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own temp credentials path, never user input.
       expect(existsSync(`${credentialsPath}.tmp.${process.pid}`)).toBe(false);
     },
   );
@@ -295,9 +297,10 @@ describe('runInit — session-only environment credentials', () => {
         ).rejects.toThrow(/temporary credentials.*clean/i);
         expect(captured.stdout).toEqual([]);
         expect(captured.stderr).toEqual([]);
-
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own temp path, never user input.
         expect(existsSync(tmp)).toBe(true);
       } finally {
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- cleanup of this test's own temp path.
         if (existsSync(tmp)) actual.unlinkSync(tmp);
       }
     },
@@ -319,7 +322,7 @@ describe('runInit — session-only environment credentials', () => {
       fetchImpl: makeOkFetch(),
       isTTY: false,
     });
-
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- checks this test's own temp path, never user input.
     expect(existsSync(tmp)).toBe(false);
     expect(JSON.parse(captured.stdout[0]!)).toMatchObject({
       credentials: { persisted: false, source: 'env' },
@@ -2159,6 +2162,7 @@ describe('runInit -- skipIfConfigured', () => {
           dir: CWD,
           skipIfConfigured: true,
           noAgent: true,
+          noGitignore: false,
           output: 'json',
         }),
         {
@@ -2185,6 +2189,7 @@ describe('runInit -- skipIfConfigured', () => {
           dir: CWD,
           skipIfConfigured: true,
           noAgent: true,
+          noGitignore: false,
           output: 'json',
         }),
         {
@@ -2224,6 +2229,84 @@ describe('runInit -- skipIfConfigured', () => {
       );
 
       expect(store.has(path.join(CWD, '.gitignore'))).toBe(false);
+    });
+
+    async function runWithFs(
+      agentFs: AgentFs,
+      overrides: Partial<Parameters<typeof makeBaseOpts>[0]> = {},
+    ) {
+      const { captured, deps } = makeCapture();
+      writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+      const run = runInit(
+        makeBaseOpts({
+          dir: CWD,
+          skipIfConfigured: true,
+          noAgent: true,
+          noGitignore: false,
+          output: 'json',
+          ...overrides,
+        }),
+        { ...deps, credentialsPath, fetchImpl: makeOkFetch(), fs: agentFs, isTTY: false },
+      );
+      return { captured, run };
+    }
+
+    it('appends without rewriting existing content (no trailing newline, CRLF)', async () => {
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.mkdir(path.join(CWD, '.git'));
+      await agentFs.writeFile(path.join(CWD, '.gitignore'), 'dist/\r\nnode_modules/');
+      const { run } = await runWithFs(agentFs);
+      await run;
+      expect(store.get(path.join(CWD, '.gitignore'))).toBe(
+        'dist/\r\nnode_modules/\n\n# TestSprite failure artifacts\n.testsprite/\n',
+      );
+    });
+
+    it('recognises .git as a file (worktree or submodule)', async () => {
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.writeFile(path.join(CWD, '.git'), 'gitdir: /elsewhere/.git/worktrees/x');
+      const { run } = await runWithFs(agentFs);
+      await run;
+      expect(store.get(path.join(CWD, '.gitignore'))).toContain('.testsprite/');
+    });
+
+    it('resolves a relative --dir before walking up to the repo root', async () => {
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.mkdir(path.join(process.cwd(), '.git'));
+      const { run } = await runWithFs(agentFs, { dir: path.join('rel', 'sub') });
+      await run;
+      expect(store.get(path.resolve('rel', 'sub', '.gitignore'))).toContain('.testsprite/');
+    });
+
+    it('refuses to write through a symlinked .gitignore and warns without failing setup', async () => {
+      const { fs: memFs, store } = makeMemFs();
+      await memFs.mkdir(path.join(CWD, '.git'));
+      await memFs.writeFile(path.join(CWD, '.gitignore'), 'dist/\n');
+      const linkPath = path.join(CWD, '.gitignore');
+      const symlinkFs: AgentFs = {
+        ...memFs,
+        lstat: async p =>
+          p === linkPath ? { isFile: false, isSymbolicLink: true } : memFs.lstat(p),
+      };
+      const { captured, run } = await runWithFs(symlinkFs);
+      await run;
+      expect(store.get(linkPath)).toBe('dist/\n');
+      expect(captured.stderr.join('\n')).toMatch(/\[warn\] Failed to update \.gitignore:.*symlink/);
+    });
+
+    it('still ignores .testsprite/ when the agent skill install fails after credentials were saved', async () => {
+      const { fs: memFs, store } = makeMemFs();
+      await memFs.mkdir(path.join(CWD, '.git'));
+      const failingFs: AgentFs = {
+        ...memFs,
+        writeFile: async (p, data, opts) => {
+          if (p.endsWith('SKILL.md') || p.includes('skills')) throw new Error('disk full');
+          return memFs.writeFile(p, data, opts);
+        },
+      };
+      const { run } = await runWithFs(failingFs, { noAgent: false, agent: 'claude' });
+      await expect(run).rejects.toThrow();
+      expect(store.get(path.join(CWD, '.gitignore'))).toContain('.testsprite/');
     });
 
     it('registers --no-gitignore option in addSetupOptions', () => {

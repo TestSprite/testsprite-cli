@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import {
   isInsideGitRepo,
   isInsideGitRepoAsync,
   isTestspriteIgnored,
   checkTestspriteIgnored,
   ensureTestspriteIgnored,
+  findGitRoot,
+  inspectTestspriteIgnore,
 } from './git-utils.js';
 
 describe('git-utils', () => {
@@ -112,81 +114,138 @@ describe('git-utils', () => {
     });
   });
 
+  describe('isTestspriteIgnored line endings and whitespace', () => {
+    it('handles CRLF content and trailing spaces', () => {
+      expect(isTestspriteIgnored('node_modules/\r\n.testsprite/  \r\n')).toBe(true);
+    });
+
+    it('handles content without a trailing newline', () => {
+      expect(isTestspriteIgnored('node_modules/\n.testsprite/')).toBe(true);
+    });
+  });
+
+  describe('findGitRoot', () => {
+    it('resolves a relative dir before walking up', () => {
+      const root = resolve('.');
+      const mockExists = (p: string) => p === join(root, '.git');
+      expect(findGitRoot(join('some', 'sub'), { existsSync: mockExists })).toBe(root);
+    });
+
+    it('treats .git as a file (worktree or submodule) the same as a directory', () => {
+      // existsSync is true for both files and directories; the walker only asks for existence.
+      const mockExists = (p: string) => p === join('/wt', '.git');
+      expect(findGitRoot('/wt/pkg', { existsSync: mockExists })).toBe(resolve('/wt'));
+    });
+  });
+
+  describe('inspectTestspriteIgnore', () => {
+    const repo = resolve('/repo');
+    const files = new Map<string, string>();
+    const deps = () => ({
+      existsSync: (p: string) => p === join(repo, '.git') || files.has(p),
+      readFileSync: (p: string) => files.get(p) ?? '',
+    });
+
+    it('reports not in repo when no .git is found', () => {
+      expect(inspectTestspriteIgnore('/nowhere/x', { existsSync: () => false })).toEqual({
+        inRepo: false,
+        ignored: false,
+      });
+    });
+
+    it('finds a rule in the repo-root .gitignore from a subdirectory', () => {
+      files.clear();
+      files.set(join(repo, '.gitignore'), 'node_modules/\n.testsprite/\n');
+      expect(inspectTestspriteIgnore(join(repo, 'a', 'b'), deps())).toEqual({
+        inRepo: true,
+        ignored: true,
+      });
+    });
+
+    it('reports not ignored when no .gitignore up to the root has the rule', () => {
+      files.clear();
+      files.set(join(repo, 'a', '.gitignore'), 'dist/\n');
+      expect(inspectTestspriteIgnore(join(repo, 'a'), deps())).toEqual({
+        inRepo: true,
+        ignored: false,
+      });
+    });
+  });
+
   describe('ensureTestspriteIgnored', () => {
-    it('creates .gitignore and appends .testsprite if file does not exist inside a git repo', async () => {
-      let writtenContent = '';
-      const mockExists = (p: string) => p === join('/foo', '.git');
-      const mockRead = async () => '';
-      const mockWrite = async (p: string, content: string) => {
-        writtenContent = content;
+    const repoDeps = (extra: Record<string, unknown> = {}) => {
+      const appended: Array<{ p: string; text: string }> = [];
+      return {
+        appended,
+        deps: {
+          existsSync: (p: string) => p === join('/foo', '.git'),
+          lstat: async () => null,
+          readFile: async () => '',
+          appendFile: async (p: string, text: string) => {
+            appended.push({ p, text });
+          },
+          ...extra,
+        },
       };
+    };
 
-      const result = await ensureTestspriteIgnored('/foo', {
-        existsSync: mockExists,
-        readFile: mockRead,
-        writeFile: mockWrite,
-      });
-
-      expect(result).toBe(true);
-      expect(writtenContent).toContain('.testsprite/');
+    it('creates .gitignore by appending the entry inside a git repo', async () => {
+      const { appended, deps } = repoDeps();
+      expect(await ensureTestspriteIgnored('/foo', deps)).toBe(true);
+      expect(appended).toEqual([
+        {
+          p: join(resolve('/foo'), '.gitignore'),
+          text: '\n# TestSprite failure artifacts\n.testsprite/\n',
+        },
+      ]);
     });
 
-    it('does not create or modify .gitignore if not inside a git repo', async () => {
-      let calledWrite = false;
-      const mockExists = () => false;
-      const mockRead = async () => '';
-      const mockWrite = async () => {
-        calledWrite = true;
-      };
-
-      const result = await ensureTestspriteIgnored('/foo', {
-        existsSync: mockExists,
-        readFile: mockRead,
-        writeFile: mockWrite,
-      });
-
-      expect(result).toBe(false);
-      expect(calledWrite).toBe(false);
+    it('does nothing outside a git repo', async () => {
+      const { appended, deps } = repoDeps({ existsSync: () => false });
+      expect(await ensureTestspriteIgnored('/foo', deps)).toBe(false);
+      expect(appended).toEqual([]);
     });
 
-    it('appends .testsprite if .gitignore exists but does not ignore it inside a git repo', async () => {
-      let writtenContent = '';
-      const mockExists = (p: string) =>
-        p === join('/foo', '.git') || p === join('/foo', '.gitignore');
-      const mockRead = async () => 'node_modules/\ndist/';
-      const mockWrite = async (p: string, content: string) => {
-        writtenContent = content;
-      };
-
-      const result = await ensureTestspriteIgnored('/foo', {
-        existsSync: mockExists,
-        readFile: mockRead,
-        writeFile: mockWrite,
+    it('appends only the new chunk and keeps a leading newline when the file has no trailing newline', async () => {
+      const { appended, deps } = repoDeps({
+        existsSync: (p: string) => p === join('/foo', '.git') || p === join('/foo', '.gitignore'),
+        lstat: async () => ({ isSymbolicLink: false }),
+        readFile: async () => 'node_modules/\ndist/',
       });
-
-      expect(result).toBe(true);
-      expect(writtenContent).toBe(
-        'node_modules/\ndist/\n\n# TestSprite failure artifacts\n.testsprite/\n',
-      );
+      expect(await ensureTestspriteIgnored('/foo', deps)).toBe(true);
+      expect(appended).toHaveLength(1);
+      expect(appended[0]!.text).toBe('\n\n# TestSprite failure artifacts\n.testsprite/\n');
     });
 
-    it('does not modify .gitignore if .testsprite is already ignored inside a git repo', async () => {
-      let calledWrite = false;
-      const mockExists = (p: string) =>
-        p === join('/foo', '.git') || p === join('/foo', '.gitignore');
-      const mockRead = async () => 'node_modules/\n.testsprite/';
-      const mockWrite = async () => {
-        calledWrite = true;
-      };
-
-      const result = await ensureTestspriteIgnored('/foo', {
-        existsSync: mockExists,
-        readFile: mockRead,
-        writeFile: mockWrite,
+    it('handles CRLF files without adding an extra separator newline', async () => {
+      const { appended, deps } = repoDeps({
+        lstat: async () => ({ isSymbolicLink: false }),
+        readFile: async () => 'dist/\r\n',
       });
+      expect(await ensureTestspriteIgnored('/foo', deps)).toBe(true);
+      expect(appended[0]!.text).toBe('\n# TestSprite failure artifacts\n.testsprite/\n');
+    });
 
-      expect(result).toBe(false);
-      expect(calledWrite).toBe(false);
+    it('does not modify .gitignore if .testsprite is already ignored', async () => {
+      const { appended, deps } = repoDeps({
+        lstat: async () => ({ isSymbolicLink: false }),
+        readFile: async () => 'node_modules/\n.testsprite/',
+      });
+      expect(await ensureTestspriteIgnored('/foo', deps)).toBe(false);
+      expect(appended).toEqual([]);
+    });
+
+    it('refuses to write through a symlinked .gitignore', async () => {
+      const { appended, deps } = repoDeps({ lstat: async () => ({ isSymbolicLink: true }) });
+      await expect(ensureTestspriteIgnored('/foo', deps)).rejects.toThrow(/symlink/);
+      expect(appended).toEqual([]);
+    });
+
+    it('detects the repo from a relative dir via the resolved path', async () => {
+      const root = resolve('.');
+      const { appended, deps } = repoDeps({ existsSync: (p: string) => p === join(root, '.git') });
+      expect(await ensureTestspriteIgnored(join('pkg', 'a'), deps)).toBe(true);
+      expect(appended[0]!.p).toBe(join(root, 'pkg', 'a', '.gitignore'));
     });
   });
 });

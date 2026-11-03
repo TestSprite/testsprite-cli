@@ -46,7 +46,7 @@ import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
 import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 import { VERSION } from '../version.js';
 import { SUPPORTED_NODE_RANGE, shouldRejectNodeVersion } from '../version-guard.js';
-import { isInsideGitRepo, checkTestspriteIgnored } from '../lib/git-utils.js';
+import { inspectTestspriteIgnore } from '../lib/git-utils.js';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -133,10 +133,11 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     config,
   });
 
+  const gitChecks = checkGit(cwd, deps);
   const checks: DoctorCheck[] = [
     { name: 'CLI version', status: 'ok', detail: VERSION },
     checkNodeVersion(nodeVersion),
-    checkGitRepo(cwd, deps),
+    gitChecks[0],
     { name: 'Profile', status: 'ok', detail: config.profile },
     endpointCheck,
     checkCredentials(hasKey, config.profile, opts.dryRun ?? false, credentialsReadError),
@@ -181,7 +182,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   );
 
   checks.push(checkSkill(cwd, deps));
-  checks.push(await checkGitignoreSafety(cwd, deps));
+  checks.push(gitChecks[1]);
 
   const failures = checks.filter(check => check.status === 'fail').length;
   const warnings = checks.filter(check => check.status === 'warn').length;
@@ -286,35 +287,48 @@ function checkSkill(cwd: string, deps: DoctorDeps): DoctorCheck {
   };
 }
 
-function checkGitRepo(cwd: string, deps: DoctorDeps): DoctorCheck {
-  const isGit = isInsideGitRepo(cwd, {
-    existsSync: deps.existsSync,
-  });
-  return {
-    name: 'Git repository',
-    status: isGit ? 'ok' : 'warn',
-    detail: isGit
-      ? 'initialized repository'
-      : 'not a Git repository; agent skills require Git tracking',
-  };
-}
-
-async function checkGitignoreSafety(cwd: string, deps: DoctorDeps): Promise<DoctorCheck> {
-  const isIgnored = await checkTestspriteIgnored(cwd, {
-    existsSync: deps.existsSync,
-    readFile: deps.readFileSync
-      ? async p => deps.readFileSync!(p)
-      : deps.existsSync
-        ? async () => ''
-        : undefined,
-  });
-  return {
-    name: 'Gitignore safety',
-    status: isIgnored ? 'ok' : 'warn',
-    detail: isIgnored
-      ? '.testsprite/ is ignored'
-      : '.testsprite/ is not ignored; run setup or add to .gitignore to avoid committing artifacts',
-  };
+/**
+ * Git repository + .gitignore safety, computed together from one pass over the
+ * project dir up to the repository root. Informational only: never fails doctor.
+ */
+function checkGit(cwd: string, deps: DoctorDeps): [DoctorCheck, DoctorCheck] {
+  try {
+    const { inRepo, ignored } = inspectTestspriteIgnore(cwd, {
+      existsSync: deps.existsSync,
+      readFileSync: deps.readFileSync,
+    });
+    if (!inRepo) {
+      return [
+        {
+          name: 'Git repository',
+          status: 'warn',
+          detail:
+            'not a Git repository; .testsprite/ failure artifacts are not tracked, nothing to ignore',
+        },
+        {
+          name: 'Gitignore safety',
+          status: 'ok',
+          detail: 'not applicable outside a Git repository',
+        },
+      ];
+    }
+    return [
+      { name: 'Git repository', status: 'ok', detail: 'inside a Git repository' },
+      {
+        name: 'Gitignore safety',
+        status: ignored ? 'ok' : 'warn',
+        detail: ignored
+          ? '.testsprite/ is ignored'
+          : '.testsprite/ is not ignored; run `testsprite setup` or add `.testsprite/` to .gitignore to avoid committing artifacts',
+      },
+    ];
+  } catch (err) {
+    const detail = `could not inspect Git state: ${err instanceof Error ? err.message : String(err)}`;
+    return [
+      { name: 'Git repository', status: 'warn', detail },
+      { name: 'Gitignore safety', status: 'ok', detail: 'skipped' },
+    ];
+  }
 }
 
 async function checkConnectivity(

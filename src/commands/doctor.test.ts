@@ -333,7 +333,7 @@ describe('runDoctor — failing checks exit non-zero', () => {
     'a real unreadable file does not leak EACCES into the Connectivity or Local tunnel checks',
     async () => {
       writeProfile('default', { apiKey: 'sk-brick' }, { path: credentialsPath });
-
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` lives in this suite's `mkdtempSync` temp dir, never user input
       chmodSync(credentialsPath, 0o000);
       const { capture, deps } = makeCapture();
       const report = await runDoctor(
@@ -440,6 +440,41 @@ describe('runDoctor — warnings do not fail', () => {
     expect(report.failures).toBe(0);
     const out = capture.stdout.join('\n');
     expect(out).toContain('[WARN] Git repository');
+  });
+
+  it('outside a Git repository emits one warning and no second gitignore warning', async () => {
+    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const report = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      { ...healthyDeps(credentialsPath, { existsSync: p => !p.endsWith('.git') }), ...deps },
+    );
+    expect(report.failures).toBe(0);
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('[WARN] Git repository');
+    expect(out).not.toMatch(/\[WARN\]\s+Gitignore safety/);
+    expect(out).not.toMatch(/require/i);
+    expect(out).not.toContain('run setup');
+  });
+
+  it('inside a repo subdirectory, a root .gitignore that ignores .testsprite/ is enough', async () => {
+    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const report = await runDoctor(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...healthyDeps(credentialsPath, {
+          cwd: '/repo/packages/app',
+          existsSync: p => p === '/repo/.git' || p === '/repo/.gitignore' || p.includes('skill'),
+          readFileSync: p => (p === '/repo/.gitignore' ? '.testsprite/\n' : ''),
+        }),
+        ...deps,
+      },
+    );
+    expect(report.failures).toBe(0);
+    const out = capture.stdout.join('\n');
+    expect(out).toMatch(/\[OK\]\s+Git repository/);
+    expect(out).toMatch(/\[OK\]\s+Gitignore safety/);
   });
 
   it('missing .gitignore or .testsprite/ not ignored is a warning, not a failure', async () => {

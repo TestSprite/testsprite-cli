@@ -6,12 +6,14 @@
  *      targets are settled here, before anything is written
  *   1. runConfigure  — writes the API-key profile (validates via GET /me first)
  *   2. runWhoami     — fetches identity for the post-configure banner
+ *   2.5 ensureTestspriteIgnored — appends .testsprite/ to .gitignore inside a Git repo (unless --no-gitignore)
  *   3. runInstall    — installs the TestSprite verification-loop skill (unless --no-agent)
  *   4. Summary print — JSON object or human text block
  *
  * Hard constraint: orchestrate existing exported primitives; never fork them.
  */
 
+import path from 'node:path';
 import { Command } from 'commander';
 import {
   parseRequestTimeoutFlag,
@@ -40,6 +42,7 @@ import {
   ensureTestspriteIgnored,
   checkTestspriteIgnored,
   isInsideGitRepoAsync,
+  type GitUtilsDeps,
 } from '../lib/git-utils.js';
 
 /** Mirrors auth.ts's DEFAULT_API_URL (kept in sync; auth.ts owns the canonical value). */
@@ -299,6 +302,29 @@ function shouldConfirmTargets(
 
 const CONFIRM_TARGETS_MAX_ATTEMPTS = 3;
 
+/** Resolve the project root used for the .git walk and .gitignore (relative --dir is resolved against cwd). */
+function resolveProjectDir(opts: InitOptions, deps: InitDeps): string {
+  return path.resolve(opts.dir ?? deps.cwd ?? process.cwd());
+}
+
+/** Route .gitignore access through the injected agent fs when present (tests); real fs otherwise. */
+function buildGitignoreDeps(deps: InitDeps): GitUtilsDeps {
+  const agentFs = deps.fs;
+  if (!agentFs) return {};
+  return {
+    exists: async p => (await agentFs.lstat(p)) !== null,
+    lstat: async p => {
+      const st = await agentFs.lstat(p);
+      return st === null ? null : { isSymbolicLink: st.isSymbolicLink };
+    },
+    readFile: p => agentFs.readFile(p),
+    appendFile: async (p, text) => {
+      const current = (await agentFs.lstat(p)) === null ? '' : await agentFs.readFile(p);
+      await agentFs.writeFile(p, current + text);
+    },
+  };
+}
+
 /**
  * Let an operator see and edit the detected set before anything is written.
  *
@@ -504,11 +530,8 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     }
 
     if (!opts.noGitignore) {
-      const projectDir = opts.dir ?? deps.cwd ?? process.cwd();
-      const gitignoreDeps = {
-        exists: deps.fs ? async (p: string) => (await deps.fs!.lstat(p)) !== null : undefined,
-        readFile: deps.fs ? (p: string) => deps.fs!.readFile(p) : undefined,
-      };
+      const projectDir = resolveProjectDir(opts, deps);
+      const gitignoreDeps = buildGitignoreDeps(deps);
       if (await isInsideGitRepoAsync(projectDir, gitignoreDeps)) {
         const isIgnored = await checkTestspriteIgnored(projectDir, gitignoreDeps);
         if (!isIgnored) {
@@ -588,6 +611,29 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   }
 
   // -------------------------------------------------------------------------
+  // Step 2.5: Ensure .testsprite/ is ignored in .gitignore
+  // -------------------------------------------------------------------------
+  // Runs before the agent install so a failing skill install (which re-throws)
+  // cannot skip it after credentials were already saved. Never blocks setup.
+  if (!opts.noGitignore) {
+    try {
+      const appended = await ensureTestspriteIgnored(
+        resolveProjectDir(opts, deps),
+        buildGitignoreDeps(deps),
+      );
+      if (appended) {
+        stderrFn(
+          '[info] Added .testsprite/ to .gitignore (failure artifacts stay local; pass --no-gitignore to skip)',
+        );
+      }
+    } catch (err) {
+      stderrFn(
+        `[warn] Failed to update .gitignore: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Step 3: Agent skill install (unless --no-agent)
   // -------------------------------------------------------------------------
   let installedTargets: AgentTarget[] | null = null;
@@ -642,31 +688,6 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
           `re-run 'testsprite agent install --target ${resolution.targets.join(',')}' after fixing the path`,
       );
       throw installErr;
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Step 3.5: Ensure .testsprite/ is ignored in .gitignore
-  // -------------------------------------------------------------------------
-  if (!opts.noGitignore) {
-    const projectDir = opts.dir ?? deps.cwd ?? process.cwd();
-    const gitignoreDeps = {
-      exists: deps.fs ? async (p: string) => (await deps.fs!.lstat(p)) !== null : undefined,
-      readFile: deps.fs ? (p: string) => deps.fs!.readFile(p) : undefined,
-      writeFile: deps.fs
-        ? (p: string, content: string) => deps.fs!.writeFile(p, content)
-        : undefined,
-    };
-    try {
-      const appended = await ensureTestspriteIgnored(projectDir, gitignoreDeps);
-      if (appended) {
-        stderrFn('[info] Added .testsprite/ to .gitignore to avoid committing artifacts');
-      }
-    } catch (err) {
-      // Non-blocking warning on gitignore setup error
-      stderrFn(
-        `[warn] Failed to update .gitignore: ${err instanceof Error ? err.message : String(err)}`,
-      );
     }
   }
 

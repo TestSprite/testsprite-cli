@@ -76,6 +76,8 @@ testsprite auth status
 
 Credentials are normally stored at `~/.testsprite/credentials` (INI-style, mode `0600`). With `setup --from-env`, an unwritable or read-only HOME (`EACCES`, `EPERM`, or `EROFS` while saving credentials) produces a stderr warning and setup continues using `TESTSPRITE_API_KEY` for this session. Its JSON summary includes `credentials: { persisted: false, source: "env" }`; successful authentication does not mean the key was saved. Keep `TESTSPRITE_API_KEY` available in every shell/process that invokes the CLI. Agent installation still needs a writable destination; use `--no-agent` when only session authentication is needed. Other setup errors still fail. See [Configuration](#configuration) for profiles, environment overrides, and scopes.
 
+Inside a Git repository, `setup` also appends `.testsprite/` (where failure artifacts are written) to the project's `.gitignore` unless it is already ignored, so an agent running `git add -A` does not commit them. The entry is appended, never rewritten; a symlinked `.gitignore` is left untouched with a warning, and a failure to update it is a warning, not a setup failure. Pass `--no-gitignore` to skip this; `--dry-run` only reports it. Outside a Git repository nothing is written.
+
 For an org-scoped API key, `auth status` additionally prints an `orgs:` line (every organization your account belongs to) and an `org binding:` line (the specific organization this key is bound to). Both are omitted for a personal key or an older backend that doesn't report them.
 
 ### 2. Create a project
@@ -1321,7 +1323,7 @@ testsprite usage --dry-run --output json
 
 #### `testsprite doctor`
 
-One-shot environment diagnostic. Runs a fixed checklist — CLI version, Node.js runtime, active profile, API endpoint, credentials, live connectivity + key validity (`GET /me`), and whether the verify skill is installed in the current project — and prints an OK/WARN/FAIL report. Exits non-zero only when a check **fails** (warnings, e.g. skill not installed, don't fail the process), so it can gate a CI step or an agent preflight:
+One-shot environment diagnostic. Runs a fixed checklist — CLI version, Node.js runtime, active profile, API endpoint, credentials, live connectivity + key validity (`GET /me`), whether the verify skill is installed in the current project, whether the project is inside a Git repository (`Git repository`), and whether `.testsprite/` is ignored by a `.gitignore` between the project directory and the repository root (`Gitignore safety`) — and prints an OK/WARN/FAIL report. Exits non-zero only when a check **fails** (warnings, e.g. skill not installed or not a Git repository, don't fail the process), so it can gate a CI step or an agent preflight:
 
 ```bash
 testsprite doctor
