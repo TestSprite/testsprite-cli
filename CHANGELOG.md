@@ -4,6 +4,10 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **`setup` keeps `.testsprite/` out of Git.** Inside a Git repository, `testsprite setup` appends `.testsprite/` (where failure artifacts are written) to the project's `.gitignore` when it is not already ignored; skip it with `--no-gitignore`, and `--dry-run` only reports it. The entry is appended rather than rewritten, a symlinked `.gitignore` is not written through, and a failure here is a warning that never fails setup (it also runs when the agent skill install fails after credentials were saved). `testsprite doctor` gains `Git repository` and `Gitignore safety` checks: inside a repository it warns (never fails) when no `.gitignore` between the project directory and the repository root ignores `.testsprite/`, and outside a repository both are informational. Thanks to @sandman-sh (#257, closes #258).
+
 ### Fixed
 
 - **`project credential` and `project auto-auth` no longer crash on an unreadable `--credential-file`, `--password-file`, `--client-secret-file` or `--refresh-token-file`.** A missing, unreadable or non-regular file now exits 5 (`VALIDATION_ERROR`) with the usual error envelope instead of an unhandled Node error (exit 1), and `--dry-run` no longer reads these files, matching `project create` and `project update`. Thanks @OkeyAmy (#283).
