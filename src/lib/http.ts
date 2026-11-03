@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import * as v from 'valibot';
 import type { ErrorCode } from './errors.js';
-import { ApiError, InterruptError, RequestTimeoutError, TransportError } from './errors.js';
+import {
+  ApiError,
+  InterruptError,
+  RequestTimeoutError,
+  TransportError,
+  localValidationError,
+} from './errors.js';
 import { buildUserAgent } from './client-tag.js';
 import {
   BATCH_RERUN_RESPONSE_SCHEMA,
@@ -1215,11 +1221,37 @@ function shortPath(pathOrUrl: string): string {
   }
 }
 
+/**
+ * `new URL()` resolves `.` and `..` path segments (including their
+ * percent-encoded forms), so an id or name of `..` would silently climb out
+ * of its route (`DELETE /projects/<id>/env/..` becomes `DELETE /projects/<id>/`).
+ * Refuse such a segment before any request is built.
+ */
+function assertNoDotSegments(path: string): void {
+  for (const segment of path.split('/')) {
+    let decoded = segment;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      // Malformed escape: URL parsing will not treat it as a dot segment.
+    }
+    if (decoded === '.' || decoded === '..') {
+      throw localValidationError(
+        'value',
+        `"${decoded}" is not a valid id or name: it would escape the route ("." and ".." are not allowed)`,
+        undefined,
+        'field',
+      );
+    }
+  }
+}
+
 export function buildUrl(
   baseUrl: string,
   path: string,
   query?: Record<string, string | number | boolean | undefined>,
 ): string {
+  assertNoDotSegments(path);
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
   const url = new URL(`${trimTrailingSlash(baseUrl)}${normalizedPath}`);
   if (query) {
