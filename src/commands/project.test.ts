@@ -737,6 +737,39 @@ describe('project read response validation', () => {
     expect(out).toEqual([]);
   });
 
+  it.each([
+    ['defaultEnvironment', { defaultEnvironment: {} }],
+    ['environmentCount', { environmentCount: 'x' }],
+    ['originMode', { originMode: 1 }],
+  ])('rejects a wrong-typed %s before the text renderer runs', async (_field, patch) => {
+    const out: string[] = [];
+    await expect(
+      runGet(
+        { profile: 'default', output: 'text', debug: false, projectId: PROJECT_FIXTURE.id },
+        {
+          ...makeCreds(),
+          fetchImpl: makeFetch(() => ({ body: { ...PROJECT_FIXTURE, ...patch } })),
+          stdout: line => out.push(line),
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+    expect(out).toEqual([]);
+  });
+
+  it('normalizes an omitted nextToken to the terminal null cursor', async () => {
+    const out: string[] = [];
+    const result = await runList(
+      { profile: 'default', output: 'json', debug: false, pageSize: 1 },
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch(() => ({ body: { items: [PROJECT_FIXTURE] } })),
+        stdout: line => out.push(line),
+      },
+    );
+    expect(result.nextToken).toBeNull();
+    expect(JSON.parse(out[0]!)).toEqual({ items: [PROJECT_FIXTURE], nextToken: null });
+  });
+
   it('preserves new server fields and enum values without inventing absent optional fields', async () => {
     const body = {
       ...PROJECT_FIXTURE,

@@ -24,11 +24,12 @@ import {
 } from '../lib/local-target.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { readSecretFileGuarded } from '../lib/secret-file.js';
-import { CLI_PROJECT_LIST_SCHEMA, CLI_PROJECT_SCHEMA } from '../lib/project-response-schema.js';
+import { CLI_PROJECT_LIST_SCHEMA, CLI_PROJECT_SCHEMA } from '../lib/response-schemas.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
 import {
+  fetchSinglePage,
   paginate,
   validatePaginationFlags,
   type FetchPageArgs,
@@ -181,7 +182,14 @@ export async function runList(
 
   let page: Page<CliProject>;
   if (useSinglePage) {
-    page = await fetchPage({ pageSize: paginationFlags.pageSize!, cursor: opts.startingToken });
+    page = await fetchSinglePage<CliProject>(
+      client,
+      '/projects',
+      paginationFlags.pageSize!,
+      opts.startingToken,
+      {},
+      CLI_PROJECT_LIST_SCHEMA,
+    );
   } else {
     page = await paginate<CliProject>(fetchPage, paginationFlags);
   }

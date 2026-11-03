@@ -13,10 +13,11 @@ describe('CLI_TEST_CODE_SCHEMA', () => {
     expect(v.parse(CLI_TEST_CODE_SCHEMA, body)).toEqual(body);
   });
 
-  it('normalizes an absent legacy codeVersion to null without inventing an etag', () => {
+  it('keeps an absent legacy codeVersion absent so --output json stays byte-identical', () => {
     const body = { testId: 'test_alpha', language: 'python', code: '' };
     const parsed = v.parse(CLI_TEST_CODE_SCHEMA, body);
-    expect(parsed.codeVersion).toBeNull();
+    expect(parsed).toEqual(body);
+    expect(parsed).not.toHaveProperty('codeVersion');
     expect(parsed).not.toHaveProperty('etag');
     expect(parsed).not.toHaveProperty('framework');
   });

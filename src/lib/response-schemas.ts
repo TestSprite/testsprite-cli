@@ -5,8 +5,13 @@
  * runtime validation, so a drifted or partial server response surfaced as
  * `undefined` output or an opaque TypeError deep inside a command. These
  * schemas are wired (opt-in, via `RequestOptions.schema`) into the typed
- * HttpClient helpers and selected command reads. Generic requests remain
- * schema-free unless the caller supplies a schema.
+ * HttpClient helpers `triggerRun`, `triggerRunWithMeta`, `triggerRerun`,
+ * `triggerBatchRerun`, `triggerBatchRunFresh`, `getRun`, `listTestRuns`,
+ * `cancelRun`, and — for the account surfaces below — the `client.get` call
+ * sites that own a `/me` or usage read, plus the `client.get` call sites that
+ * own the `project get` / `project list` and `test code get` / `code put`
+ * reads. Every other generic `get`/`post`/`put`/`patch`/`delete` caller stays
+ * schema-free and opt-in.
  *
  * Resilience rules (additive server changes must never hard-fail the CLI):
  *
@@ -60,7 +65,9 @@ import type {
   TunnelStatusResponse,
 } from './tunnel.types.js';
 import type { ConflictReason } from './conflict-reason.js';
+import type { CliProject } from '../commands/project.js';
 import type { CliTestCodeRead } from '../commands/test.js';
+import type { Page } from './pagination.js';
 
 /** Deployment environment the bound key belongs to; open on the wire (rule 2). */
 type AccountEnv = 'development' | 'staging' | 'production';
@@ -81,8 +88,9 @@ function openWireLiteral<TLiteral extends string>(): v.GenericSchema<unknown, TL
  * GET /tests/{id}/code. The inline and presigned fixtures in
  * test/mock-backend/fixtures.ts contain the required identity/source fields.
  * The code-put auto-fetch fixtures in commands/test.test.ts omit framework;
- * legacy codeVersion may be null/absent and already uses the explicit
- * If-Match fallback. Keep etag absence distinct from an explicit null.
+ * legacy codeVersion may be null/absent (kept as received so `--output json`
+ * stays byte-identical; `code put` treats both as the explicit If-Match
+ * fallback). Keep etag absence distinct from an explicit null.
  * A null code body is the draft/no-generated-code branch of runCodeGet.
  */
 export const CLI_TEST_CODE_SCHEMA: v.GenericSchema<unknown, CliTestCodeRead> = v.looseObject({
@@ -90,8 +98,37 @@ export const CLI_TEST_CODE_SCHEMA: v.GenericSchema<unknown, CliTestCodeRead> = v
   language: v.string(),
   framework: v.optional(v.string()),
   code: v.nullable(v.string()),
-  codeVersion: v.nullish(v.string(), null),
+  codeVersion: v.optional(v.nullable(v.string())),
   etag: v.optional(v.nullable(v.string())),
+});
+
+/**
+ * GET /projects/{id} and the rows of GET /projects. Optional fields stay
+ * absent when omitted: an absent `targetUrl` means "no answer", whereas
+ * `null` means "unset" (see `CliProject.targetUrl`). The renderer-consumed
+ * environment fields are typed so a drifted value cannot throw in the text
+ * renderer.
+ */
+export const CLI_PROJECT_SCHEMA: v.GenericSchema<unknown, CliProject> = v.looseObject({
+  id: v.string(),
+  name: v.string(),
+  type: openWireLiteral<CliProject['type']>(),
+  createdFrom: openWireLiteral<CliProject['createdFrom']>(),
+  createdAt: v.string(),
+  updatedAt: v.string(),
+  orgId: v.optional(v.string()),
+  orgName: v.optional(v.string()),
+  targetUrl: v.optional(v.nullable(v.string())),
+  defaultEnvironment: v.optional(v.nullable(v.string())),
+  environmentCount: v.optional(v.number()),
+  originMode: v.optional(openWireLiteral<NonNullable<CliProject['originMode']>>()),
+  testIdAttributes: v.optional(v.nullable(v.array(v.string()))),
+});
+
+/** GET /projects page; an omitted `nextToken` normalizes to the terminal `null` cursor. */
+export const CLI_PROJECT_LIST_SCHEMA: v.GenericSchema<unknown, Page<CliProject>> = v.looseObject({
+  items: v.array(CLI_PROJECT_SCHEMA),
+  nextToken: v.nullish(v.string(), null),
 });
 
 /**

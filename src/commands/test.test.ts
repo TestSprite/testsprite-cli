@@ -2123,6 +2123,51 @@ describe('runCodeGet', () => {
     expect(lines).toContain('(no code generated yet — run the test first)');
   });
 
+  it('null code with --out refuses to write and leaves an existing file unchanged', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-null-'));
+    const target = join(dir, 'existing.py');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- target is inside this test's own mkdtempSync directory, never user input.
+    writeFileSync(target, 'keep the original');
+    await expect(
+      runCodeGet(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_fe', out: target },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(() => ({ body: { ...TEST_CODE_INLINE, code: null } })),
+          stderr: () => undefined,
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- target is the fixture path created inside this test's own temp directory.
+    expect(readFileSync(target, 'utf8')).toBe('keep the original');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- dir is created by this test's mkdtempSync call, never user input.
+    expect(readdirSync(dir)).toEqual(['existing.py']);
+  });
+
+  it('dry-run with null code and --out reports zero bytes instead of throwing', async () => {
+    const { credentialsPath } = makeCreds();
+    const errs: string[] = [];
+    await runCodeGet(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: true,
+        testId: 'test_fe',
+        out: join(tmpdir(), 'cli-dry-run-never-written.py'),
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: { ...TEST_CODE_INLINE, code: null } })),
+        stderr: line => errs.push(line),
+        stdout: () => undefined,
+        rawStdout: () => undefined,
+      },
+    );
+    expect(errs.join('\n')).toContain('would write code body (0 bytes)');
+  });
+
   it('rejects an invalid auto-fetched codeVersion before sending code put', async () => {
     const { credentialsPath } = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-version-'));

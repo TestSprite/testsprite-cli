@@ -332,10 +332,15 @@ export interface CliTestCode {
 }
 
 /** The standalone code endpoint also serves draft, legacy, and newer server values. */
-export type CliTestCodeRead = Omit<CliTestCode, 'language' | 'framework' | 'code'> & {
+export type CliTestCodeRead = Omit<
+  CliTestCode,
+  'language' | 'framework' | 'code' | 'codeVersion'
+> & {
   language: string;
   framework?: string;
   code: string | null;
+  /** Legacy rows may omit it or send null; both mean "no version stamped yet". */
+  codeVersion?: string | null;
 };
 
 /** §6.4 TestStep wire shape. `null` is "not known", not "absent". */
@@ -5489,10 +5494,13 @@ export async function runCodeGet(
       },
     );
     if (opts.out !== undefined) {
+      // Null/empty first: isPresignedCodeUrl dereferences its argument.
       const bytes =
-        code.code !== null && isPresignedCodeUrl(code.code)
-          ? '<presigned-stream>'
-          : `${code.code?.length ?? 0}`;
+        code.code === null || code.code === ''
+          ? '0'
+          : isPresignedCodeUrl(code.code)
+            ? '<presigned-stream>'
+            : `${code.code.length}`;
       stderr(`[dry-run] would write code body (${bytes} bytes) to ${opts.out}`);
     }
     if (opts.output === 'json') {
@@ -5519,18 +5527,8 @@ export async function runCodeGet(
     if (opts.output === 'json') {
       out.print(code);
       wroteContent = true;
-    } else if (code.code !== null && isPresignedCodeUrl(code.code)) {
-      // Text mode: dump the source body. JSON consumers want the wire
-      // shape; humans (and agents shelling out via `> file.ts`) want
-      // ready-to-edit code. Stream chunk-wise so a multi-MB generated
-      // suite doesn't sit in memory waiting for the full download.
-      // `writeChunk` awaits the rawStdout drain promise so a slow
-      // downstream consumer (a file on a slow disk, an NFS mount,
-      // or a piped `gzip`) pauses the upstream reader rather than
-      // letting chunks accumulate in V8's heap.
-      await streamPresignedBody(code.code, out, deps);
-      wroteContent = true;
     } else if (code.code === '' || code.code === null) {
+      // Checked before isPresignedCodeUrl, which dereferences its argument.
       // P2-10: draft test with no code yet — empty body would produce
       // silent empty stdout. Print a friendly hint to stderr instead so
       // the operator knows what happened, and keep exit 0 when no `--out`.
@@ -5549,6 +5547,17 @@ export async function runCodeGet(
       }
       const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
       stderrFn('(no code generated yet — run the test first)');
+    } else if (isPresignedCodeUrl(code.code)) {
+      // Text mode: dump the source body. JSON consumers want the wire
+      // shape; humans (and agents shelling out via `> file.ts`) want
+      // ready-to-edit code. Stream chunk-wise so a multi-MB generated
+      // suite doesn't sit in memory waiting for the full download.
+      // `writeChunk` awaits the rawStdout drain promise so a slow
+      // downstream consumer (a file on a slow disk, an NFS mount,
+      // or a piped `gzip`) pauses the upstream reader rather than
+      // letting chunks accumulate in V8's heap.
+      await streamPresignedBody(code.code, out, deps);
+      wroteContent = true;
     } else {
       await out.writeChunk(code.code);
       wroteContent = true;
