@@ -12,8 +12,10 @@ import {
   RUN_RESPONSE_SCHEMA,
   TESTLIST_RUN_RESPONSE_SCHEMA,
   TRIGGER_RUN_RESPONSE_SCHEMA,
+  TUNNEL_LIST_RESPONSE_SCHEMA,
   TUNNEL_MINT_RESPONSE_SCHEMA,
   TUNNEL_STATUS_RESPONSE_SCHEMA,
+  EXECUTION_REPORT_RESPONSE_SCHEMA,
 } from './response-schemas.js';
 import type { CliTestListRunResponse } from './testlist.types.js';
 import type {
@@ -29,13 +31,20 @@ import type {
   ListRunsQuery,
   ListRunsResponse,
   CancelRunResponse,
+  ExecutionReportResponse,
 } from './runs.types.js';
 import type {
   CliAcceptPlansResponse,
   CliGeneratePlansResponse,
   CliGetPlansResponse,
 } from './plans.types.js';
-import type { MintTunnelBody, TunnelMintResponse, TunnelStatusResponse } from './tunnel.types.js';
+import type {
+  MintTunnelBody,
+  TunnelListResponse,
+  TunnelMintResponse,
+  TunnelStatusResponse,
+} from './tunnel.types.js';
+import type { ShutdownHandle } from './interrupt.js';
 
 export type FetchImpl = typeof globalThis.fetch;
 
@@ -123,7 +132,7 @@ export interface HttpClientOptions {
    */
   requestTimeoutMs?: number;
   /**
-   * Process-lifetime shutdown signal (DEV-331 piece 1). Composed into every
+   * Process-lifetime shutdown signal. Composed into every
    * outgoing fetch so an armed SIGINT/SIGTERM aborts an in-flight request
    * (a `--wait` long-poll can sit inside a single fetch for minutes) instead
    * of waiting out its window. Aborts with an `InterruptError` reason, which
@@ -132,6 +141,13 @@ export interface HttpClientOptions {
    * `globalShutdown.signal` via the client factory.
    */
   shutdownSignal?: AbortSignal;
+  /**
+   * Tracks the request through dispatch, body reading, and retries so a
+   * disarmed signal can let it drain.
+   * Unlike `shutdownSignal`, this does not cancel the request. Omit it for
+   * requests that should remain untracked.
+   */
+  shutdown?: Pick<ShutdownHandle, 'runCriticalOperation'>;
   /**
    * Upper bound (bytes) on a successful JSON response body the client will
    * buffer before parsing. A response whose declared `Content-Length` — or
@@ -235,11 +251,16 @@ const MAX_RATE_LIMITED_DELAY_MS = 60_000;
 
 /**
  * 429 reasons that name a STANDING condition rather than a passing throttle —
- * e.g. the per-user cap on live tunnel bindings. Retrying cannot succeed until
- * the caller frees the resource, so the retry budget is skipped and the
- * server's nextAction (e.g. `testsprite tunnel stop`) surfaces immediately.
+ * e.g. the per-user cap on live tunnel bindings, or already having the maximum
+ * number of runs in flight. Retrying cannot succeed until the caller frees the
+ * resource, so the retry budget is skipped and the server's nextAction (e.g.
+ * `testsprite tunnel stop`) surfaces immediately. `Retry-After` on these says
+ * when a retry COULD first succeed, not that the condition clears on its own.
  */
-export const STANDING_RATE_LIMIT_REASONS: ReadonlySet<string> = new Set(['tunnel_binding_limit']);
+export const STANDING_RATE_LIMIT_REASONS: ReadonlySet<string> = new Set([
+  'tunnel_binding_limit',
+  'inflight_cap',
+]);
 
 /** True for a RATE_LIMITED error whose envelope names a standing condition. */
 export function isStandingRateLimit(err: ApiError): boolean {
@@ -286,6 +307,7 @@ export class HttpClient {
   private readonly onServerVersion?: (info: { minVersion?: string }) => void;
   private readonly requestTimeoutMs: number;
   private readonly shutdownSignal?: AbortSignal;
+  private readonly shutdown?: Pick<ShutdownHandle, 'runCriticalOperation'>;
   private readonly maxResponseBytes: number;
   private readonly userAgent: string;
 
@@ -293,6 +315,7 @@ export class HttpClient {
     this.baseUrl = trimTrailingSlash(options.baseUrl);
     this.apiKey = options.apiKey;
     this.shutdownSignal = options.shutdownSignal;
+    this.shutdown = options.shutdown;
     // Resolved once: the tag is process-wide configuration, not per-request.
     this.userAgent = buildUserAgent(options.env ?? process.env);
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
@@ -307,8 +330,7 @@ export class HttpClient {
 
   /** The resolved facade base URL (trailing slash trimmed). Read-only —
    *  callers that bypass the client for a side-channel request (e.g. the
-   *  presigned S3 PUT) use it to reason about the facade's locality
-   *  (DEV-384 review F3). */
+   *  presigned S3 PUT) use it to reason about the facade's locality. */
   get resolvedBaseUrl(): string {
     return this.baseUrl;
   }
@@ -355,7 +377,7 @@ export class HttpClient {
   /**
    * Like `get` / `post` / etc. but returns the full `RequestResult` including
    * `requestId` and `status`, so callers can surface the requestId in
-   * happy-path output (dogfood item 1).
+   * happy-path output.
    */
   async getWithMeta<T>(path: string, options: RequestOptions<T> = {}): Promise<RequestResult<T>> {
     return this.requestWithMeta<T>('GET', path, options);
@@ -452,7 +474,7 @@ export class HttpClient {
       signal: options.signal,
       schema: RERUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
-    }).then(r => r.body);
+    }).then(r => withoutDeprecationAdvisories(r.body));
   }
 
   /**
@@ -472,7 +494,7 @@ export class HttpClient {
       signal: options.signal,
       schema: BATCH_RERUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
-    }).then(r => r.body);
+    }).then(r => withoutDeprecationAdvisories(r.body));
   }
 
   /**
@@ -507,7 +529,7 @@ export class HttpClient {
    */
   async triggerTestListRun(
     listId: string,
-    body: { testIds?: string[] },
+    body: { testIds?: string[]; tunnelClientId?: string; targetUrl?: string },
     options: { idempotencyKey: string; signal?: AbortSignal },
   ): Promise<CliTestListRunResponse> {
     return this.postWithMeta<CliTestListRunResponse>(
@@ -606,13 +628,25 @@ export class HttpClient {
   }
 
   /**
+   * GET /api/cli/v1/tunnel — list this account's live bindings.
+   * Secret-free, partition-scoped by the server; requires `run:tunnel`.
+   */
+  async listTunnels(options: { signal?: AbortSignal } = {}): Promise<TunnelListResponse> {
+    return this.get<TunnelListResponse>('/tunnel', {
+      signal: options.signal,
+      schema: TUNNEL_LIST_RESPONSE_SCHEMA,
+    });
+  }
+
+  /**
    * GET /api/cli/v1/tunnel/{clientId} — is this binding's client connected?
    *
    * A 404 covers unknown, another tenant's, and expired alike; the surface is
    * deliberately not an existence oracle for client ids. Callers must not
    * translate a transport failure or a non-200 into `offline` — "the tunnel is
    * down" and "we could not reach TestSprite to ask" are different answers,
-   * and collapsing them is what DEV-1005 was.
+   * and collapsing them would misreport a transient network failure as a
+   * dead tunnel.
    */
   async getTunnelStatus(
     clientId: string,
@@ -623,6 +657,21 @@ export class HttpClient {
       retry: options.retry,
       schema: TUNNEL_STATUS_RESPONSE_SCHEMA,
     });
+  }
+
+  /**
+   * The execution report — the GitHub App's PR-comment content — for one
+   * execution. `ready: false` asks the caller to poll again; the server keeps
+   * building the report meanwhile.
+   */
+  async getExecutionReport(
+    executionId: string,
+    options: { signal?: AbortSignal; retry?: boolean } = {},
+  ): Promise<ExecutionReportResponse> {
+    return this.get<ExecutionReportResponse>(
+      `/tests/executions/${encodeURIComponent(executionId)}/report`,
+      { signal: options.signal, retry: options.retry, schema: EXECUTION_REPORT_RESPONSE_SCHEMA },
+    );
   }
 
   /**
@@ -642,8 +691,8 @@ export class HttpClient {
 
   /**
    * POST /api/cli/v1/runs/{runId}/cancel
-   * User-initiated cancel of a queued/running run (DEV-331 piece 3). No
-   * body, no `Idempotency-Key` — the endpoint is naturally idempotent (D10):
+   * User-initiated cancel of a queued/running run. No
+   * body, no `Idempotency-Key` — the endpoint is naturally idempotent:
    * re-cancel → 200 `alreadyCancelled: true`; already-terminal (passed/
    * failed/blocked) → 409 CONFLICT; unknown/cross-tenant runId → 404.
    *
@@ -660,7 +709,7 @@ export class HttpClient {
   }
 
   /**
-   * POST /api/cli/v1/projects/{projectId}/plans/generate  (DEV-384 V3-B)
+   * POST /api/cli/v1/projects/{projectId}/plans/generate
    * Start whichever generation stage the project is missing next. The body
    * is empty by contract — the server decides which rung fires. 202 both
    * for `accepted` (a stage started) and `nothing_to_start` (proposals are
@@ -687,7 +736,7 @@ export class HttpClient {
   }
 
   /**
-   * GET /api/cli/v1/projects/{projectId}/plans  (DEV-384 V3-B)
+   * GET /api/cli/v1/projects/{projectId}/plans
    * Pure read: the facade-synthesized generation status, the staged
    * proposal list (stable proposalIds — what `accept --only` consumes),
    * and a best-effort credits block. When `waitSeconds` (1–25) is
@@ -705,7 +754,7 @@ export class HttpClient {
   }
 
   /**
-   * POST /api/cli/v1/projects/{projectId}/plans/accept  (DEV-384 V3-B)
+   * POST /api/cli/v1/projects/{projectId}/plans/accept
    * Convert staged proposals into real test cases. `only` is ALWAYS an
    * explicit, non-empty id list — the caller enforces the two §3.3 safety
    * rules (full list when the user didn't subset; an empty selection is a
@@ -743,7 +792,7 @@ export class HttpClient {
     requestId: string,
     effectiveSignal: AbortSignal = timeoutSignal,
   ): void {
-    // A user interrupt (DEV-331) outranks every other classification: once the
+    // A user interrupt outranks every other classification: once the
     // shutdown signal fired, whatever error surfaced from the aborted fetch or
     // body read is the interrupt. Throw its InterruptError reason so the wait
     // paths can render the honest detach UX — never a RequestTimeoutError, and
@@ -770,7 +819,15 @@ export class HttpClient {
     options: RequestOptions<T> = {},
   ): Promise<RequestResult<T>> {
     if (!this.apiKey) throw ApiError.authRequired();
+    const operation = () => this.requestWithMetaUntracked<T>(method, path, options);
+    return this.shutdown ? this.shutdown.runCriticalOperation(operation) : operation();
+  }
 
+  private async requestWithMetaUntracked<T>(
+    method: string,
+    path: string,
+    options: RequestOptions<T> = {},
+  ): Promise<RequestResult<T>> {
     const url = buildUrl(this.baseUrl, path, options.query);
     const requestId = options.requestId ?? newRequestId();
     const allowRetry = options.retry !== false;
@@ -798,7 +855,7 @@ export class HttpClient {
       const timeoutSignal = requestTimeout.signal;
       const composedSignals = [timeoutSignal];
       if (options.signal != null) composedSignals.push(options.signal);
-      // Shutdown composition (DEV-331): an armed SIGINT/SIGTERM aborts the
+      // Shutdown composition: an armed SIGINT/SIGTERM aborts the
       // in-flight fetch immediately (reason: InterruptError) instead of
       // letting a long-poll drain its window before the interrupt surfaces.
       if (this.shutdownSignal != null) composedSignals.push(this.shutdownSignal);
@@ -836,7 +893,7 @@ export class HttpClient {
           // The instanceof check matters even without `this.shutdownSignal`:
           // the polling path composes the shutdown signal into its per-
           // iteration caller signal, so the fetch can reject with the
-          // InterruptError reason directly (DEV-331).
+          // InterruptError reason directly.
           if (err instanceof InterruptError) throw err;
           // A timeout/abort during the fetch itself: classify it (RequestTimeoutError
           // when our deadline fired; otherwise rethrow the caller's abort unmodified).
@@ -1102,11 +1159,10 @@ export class HttpClient {
   }
 
   /**
-   * Retry-delay sleep that bails the moment the shutdown signal fires
-   * (DEV-331, codex finding 1): a RATE_LIMITED `Retry-After: 60` or a
-   * transport backoff must not delay the honest-detach exit by up to a
-   * minute — reject with the InterruptError reason immediately. Mirrors
-   * poll.ts::sleepUnlessInterrupted.
+   * Retry-delay sleep that bails the moment the shutdown signal fires: a
+   * RATE_LIMITED `Retry-After: 60` or a transport backoff must not delay the
+   * honest-detach exit by up to a minute — reject with the InterruptError
+   * reason immediately. Mirrors poll.ts::sleepUnlessInterrupted.
    */
   private sleepBeforeRetry(ms: number): Promise<void> {
     const signal = this.shutdownSignal;
@@ -1278,8 +1334,9 @@ async function safeReadJson(response: Response): Promise<unknown> {
   try {
     return await response.json();
   } catch (err) {
-    // Don't swallow client-side aborts/timeouts as a null body — the caller must
-    // be able to classify a mid-body-read timeout as a RequestTimeoutError.
+    // Don't swallow interrupts, aborts, or timeouts as a null body — the caller
+    // must preserve the interruption or classify a timeout correctly.
+    if (err instanceof InterruptError) throw err;
     if (isAbortError(err) || isTimeoutError(err)) throw err;
     return null;
   }
@@ -1578,4 +1635,22 @@ function isTimeoutError(err: unknown): boolean {
     return (err as { name?: string }).name === 'TimeoutError';
   }
   return false;
+}
+
+/**
+ * Drop server-sent `feature: 'deprecation'` advisories from a rerun response.
+ * The CLI owns the deprecation signal itself (one stderr line plus the JSON
+ * `deprecations` key), so passing the server's through would announce the same
+ * thing twice. Matched on the machine-readable `feature`, never on message
+ * text; other advisories (autoHeal) are kept and an emptied list is removed.
+ */
+function withoutDeprecationAdvisories<T extends { advisories?: { feature: string }[] }>(
+  body: T,
+): T {
+  if (!body.advisories) return body;
+  const kept = body.advisories.filter(a => a.feature !== 'deprecation');
+  if (kept.length === body.advisories.length) return body;
+  const next: { advisories?: { feature: string }[] } = { ...body, advisories: kept };
+  if (kept.length === 0) delete next.advisories;
+  return next as T;
 }

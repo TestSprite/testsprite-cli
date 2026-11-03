@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiError, InterruptError, RequestTimeoutError, TransportError } from './errors.js';
 import type { DebugEvent } from './http.js';
 import { HttpClient, REQUEST_TIMEOUT_DEFAULT_MS, buildUrl, parseRetryAfter } from './http.js';
+import { ShutdownController, installSignalHandlers } from './interrupt.js';
 import { VERSION } from '../version.js';
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
@@ -48,6 +49,176 @@ function makeClient(
     maxResponseBytes: options.maxResponseBytes,
   });
 }
+
+it('propagates an interrupt while reading an error response body', async () => {
+  const interruption = new InterruptError('SIGINT');
+  const response = errorEnvelopeResponse(400, 'VALIDATION_ERROR');
+  vi.spyOn(response, 'json').mockRejectedValue(interruption);
+  const fetchImpl = vi.fn(async () => response) as unknown as typeof fetch;
+
+  await expect(makeClient(fetchImpl).get('/me')).rejects.toBe(interruption);
+  expect(fetchImpl).toHaveBeenCalledOnce();
+});
+
+describe('in-flight request tracking', () => {
+  function streamingResponse(status: number) {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let startedReading!: () => void;
+    const reading = new Promise<void>(resolve => {
+      startedReading = resolve;
+    });
+    const body = new ReadableStream<Uint8Array>(
+      {
+        start(value) {
+          controller = value;
+        },
+        pull() {
+          startedReading();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    return {
+      response: new Response(body, { status }),
+      reading,
+      finish: (value: unknown) => {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify(value)));
+        controller.close();
+      },
+      fail: (error: unknown) => controller.error(error),
+    };
+  }
+
+  it.each([
+    { status: 200, body: { ok: true } },
+    {
+      status: 400,
+      body: {
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid request',
+          nextAction: 'Fix the request.',
+          requestId: 'req-1',
+        },
+      },
+    },
+  ])('tracks the response body until it settles with HTTP $status', async ({ status, body }) => {
+    const stream = streamingResponse(status);
+    const shutdown = new ShutdownController();
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl: async () => stream.response,
+      shutdown,
+    });
+
+    const pending = client.get('/me');
+    await stream.reading;
+    expect(shutdown.hasCriticalOperations).toBe(true);
+
+    stream.finish(body);
+    if (status === 200) {
+      expect(await pending).toEqual(body);
+    } else {
+      await expect(pending).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    }
+    expect(shutdown.hasCriticalOperations).toBe(false);
+  });
+
+  it('drains a disarmed signal while the response body is pending', async () => {
+    const stream = streamingResponse(200);
+    const shutdown = new ShutdownController();
+    const handlers = new Map<string, () => void>();
+    const exit = vi.fn();
+    const setExitCode = vi.fn();
+    installSignalHandlers({
+      shutdown,
+      on: (signal, handler) => handlers.set(signal, handler),
+      exit,
+      setExitCode,
+      stderr: () => {},
+    });
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      shutdown,
+      shutdownSignal: shutdown.signal,
+      fetchImpl: async (_input, init) => {
+        init?.signal?.addEventListener('abort', () => stream.fail(init.signal?.reason), {
+          once: true,
+        });
+        return stream.response;
+      },
+    });
+
+    const pending = client.get('/me').catch((err: unknown) => err);
+    await stream.reading;
+    expect(shutdown.hasCriticalOperations).toBe(true);
+
+    handlers.get('SIGINT')!();
+    expect(setExitCode).toHaveBeenCalledOnce();
+    expect(setExitCode).toHaveBeenCalledWith(130);
+    expect(exit).not.toHaveBeenCalled();
+    expect(await pending).toBe(shutdown.signal.reason);
+    expect(shutdown.hasCriticalOperations).toBe(false);
+  });
+
+  it('registers a fetch until it settles without changing its response', async () => {
+    const shutdown = new ShutdownController();
+    let resolveFetch!: (response: Response) => void;
+    const fetchImpl = vi.fn(
+      () =>
+        new Promise<Response>(resolve => {
+          resolveFetch = resolve;
+        }),
+    ) as unknown as typeof fetch;
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl,
+      shutdown,
+    });
+
+    const pending = client.get('/me');
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
+    expect(shutdown.hasCriticalOperations).toBe(true);
+
+    resolveFetch(jsonResponse({ ok: true }));
+    expect(await pending).toEqual({ ok: true });
+    expect(shutdown.hasCriticalOperations).toBe(false);
+  });
+
+  it('keeps a retried request registered through its backoff', async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new Error('socket hang up'))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const shutdown = new ShutdownController();
+    const tracking = vi.spyOn(shutdown, 'runCriticalOperation');
+    let resumeRetry!: () => void;
+    const retry = new Promise<void>(resolve => {
+      resumeRetry = resolve;
+    });
+    const sleep = vi.fn(() => retry);
+    const client = new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl,
+      shutdown,
+      sleep,
+      random: () => 0,
+    });
+
+    const pending = client.get('/me');
+    await vi.waitFor(() => expect(sleep).toHaveBeenCalledOnce());
+    expect(shutdown.hasCriticalOperations).toBe(true);
+    resumeRetry();
+    expect(await pending).toEqual({ ok: true });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(tracking).toHaveBeenCalledTimes(1);
+    expect(shutdown.hasCriticalOperations).toBe(false);
+  });
+});
 
 describe('default retry timer lifecycle', () => {
   it('forwards a caller abort signal to a single-attempt history request', async () => {
@@ -997,7 +1168,7 @@ describe('HttpClient per-request timeout', () => {
   });
 });
 
-describe('HttpClient shutdown signal (DEV-331 graceful detach)', () => {
+describe('HttpClient shutdown signal (graceful detach)', () => {
   /** Stalled fetch that rejects with the effective signal's reason on abort. */
   function stalledFetch(callCounter?: { count: number }): typeof fetch {
     return vi.fn(async (_input: unknown, init?: { signal?: AbortSignal }) => {
@@ -1115,7 +1286,7 @@ describe('HttpClient shutdown signal (DEV-331 graceful detach)', () => {
   });
 });
 
-describe('HttpClient retry-delay sleep bails on shutdown (DEV-331 codex finding 1)', () => {
+describe('HttpClient retry-delay sleep bails on shutdown', () => {
   it('a shutdown during a transport-retry sleep rejects with InterruptError immediately', async () => {
     // First fetch throws a transport error → the client schedules a retry
     // sleep. The injected sleep NEVER resolves, so only the shutdown race can
@@ -1168,5 +1339,55 @@ describe('HttpClient retry-delay sleep bails on shutdown (DEV-331 codex finding 
     expect(err).toBeInstanceOf(InterruptError);
     expect((err as InterruptError).signal).toBe('SIGTERM');
     expect(calls).toBe(1);
+  });
+});
+
+describe('rerun deprecation advisories', () => {
+  const rerunBody = {
+    runId: 'run_1',
+    status: 'queued',
+    enqueuedAt: '2026-10-20T00:00:00Z',
+    codeVersion: 'v1',
+    autoHeal: true,
+  };
+  const batchBody = {
+    accepted: [],
+    conflicts: [],
+    deferred: [],
+    closure: { byProject: [] },
+  };
+  const heal = { feature: 'autoHeal', message: 'not honored yet' };
+  const dep = { feature: 'deprecation', message: 'use test run' };
+  const clientFor = (body: unknown): HttpClient =>
+    makeClient((async () => jsonResponse(body)) as unknown as typeof fetch);
+  const opts = { idempotencyKey: 'k1' };
+
+  it('drops a server deprecation advisory but keeps the autoHeal one', async () => {
+    const r = await clientFor({ ...rerunBody, advisories: [heal, dep] }).triggerRerun(
+      't1',
+      { source: 'cli' },
+      opts,
+    );
+    expect(r.advisories).toEqual([heal]);
+  });
+
+  it('removes the advisories key when only a deprecation advisory was sent', async () => {
+    const r = await clientFor({ ...rerunBody, advisories: [dep] }).triggerRerun(
+      't1',
+      { source: 'cli' },
+      opts,
+    );
+    expect('advisories' in r).toBe(false);
+  });
+
+  it('leaves a response without advisories untouched', async () => {
+    const r = await clientFor(rerunBody).triggerRerun('t1', { source: 'cli' }, opts);
+    expect(r).toEqual(rerunBody);
+  });
+
+  it('applies the same filter to the batch rerun response', async () => {
+    const client = clientFor({ ...batchBody, advisories: [dep, heal] });
+    const r = await client.triggerBatchRerun({ testIds: ['a'], source: 'cli' } as never, opts);
+    expect(r.advisories).toEqual([heal]);
   });
 });

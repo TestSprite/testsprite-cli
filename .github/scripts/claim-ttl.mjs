@@ -1,9 +1,19 @@
 const MAINTAINER_PERMISSIONS = new Set(['admin', 'maintain', 'write']);
+// Labels that open an issue for claiming (issue-triage.yml uses the same list).
+const ACCEPT_LABELS = new Set(['accepted', 'good first issue', 'help wanted']);
 const HOUR_MS = 60 * 60 * 1000;
 
 function latestAssignment(events, login) {
   return events
     .filter(event => event.event === 'assigned' && event.assignee?.login === login)
+    .map(event => new Date(event.created_at))
+    .filter(date => !Number.isNaN(date.getTime()))
+    .sort((a, b) => b.getTime() - a.getTime())[0];
+}
+
+function latestAcceptance(events) {
+  return events
+    .filter(event => event.event === 'labeled' && ACCEPT_LABELS.has(event.label?.name))
     .map(event => new Date(event.created_at))
     .filter(date => !Number.isNaN(date.getTime()))
     .sort((a, b) => b.getTime() - a.getTime())[0];
@@ -33,21 +43,26 @@ function readHours(value, fallback) {
   return value === undefined ? fallback : Number(value);
 }
 
-export function evaluateClaim({ events, login, issueNumber, now, since, warn, ttl }) {
+export function evaluateClaim({ events, login, issueNumber, now, since, warn, ttl, opener }) {
   const assignedAt = latestAssignment(events, login);
   if (!assignedAt) return { action: 'skip', reason: 'no-assignment-event' };
   if (assignedAt < since) return { action: 'skip', reason: 'grandfathered' };
   if (hasOpenLinkedPr(events, login, issueNumber))
     return { action: 'skip', reason: 'linked-open-pr' };
 
-  const age = (now.getTime() - assignedAt.getTime()) / HOUR_MS;
+  // The opener's reservation and claim share one window: their clock starts
+  // when the issue was accepted, not when they claimed it.
+  const acceptedAt = login === opener ? latestAcceptance(events) : undefined;
+  const fromAcceptance = acceptedAt !== undefined && acceptedAt < assignedAt;
+  const start = fromAcceptance ? acceptedAt : assignedAt;
+  const age = (now.getTime() - start.getTime()) / HOUR_MS;
   if (age < warn) return { action: 'skip', reason: 'under-warning-age' };
-  return { action: age >= ttl ? 'expired' : 'warn', assignedAt };
+  return { action: age >= ttl ? 'expired' : 'warn', assignedAt, fromAcceptance };
 }
 
 export async function run({ github, context, core, env, now = new Date() }) {
-  const ttl = readHours(env.CLAIM_TTL_HOURS, 96);
-  const warn = readHours(env.CLAIM_WARN_HOURS, 72);
+  const ttl = readHours(env.CLAIM_TTL_HOURS, 72);
+  const warn = readHours(env.CLAIM_WARN_HOURS, 48);
   const since = new Date(env.CLAIM_TTL_SINCE);
   if (
     !Number.isFinite(ttl) ||
@@ -134,6 +149,7 @@ export async function run({ github, context, core, env, now = new Date() }) {
           since,
           warn,
           ttl,
+          opener: issue.user?.login,
         });
         if (evaluation.action === 'skip') {
           skip(evaluation.reason);
@@ -147,7 +163,7 @@ export async function run({ github, context, core, env, now = new Date() }) {
           per_page: 100,
         });
         const stage = evaluation.action;
-        const { assignedAt } = evaluation;
+        const { assignedAt, fromAcceptance } = evaluation;
         const marker = `<!-- claim-ttl:${stage}:${login}:${assignedAt.toISOString()} -->`;
         const alreadyCommented = comments.some(comment => (comment.body ?? '').includes(marker));
         if (stage === 'warn') {
@@ -158,7 +174,7 @@ export async function run({ github, context, core, env, now = new Date() }) {
           if (dryRun) {
             core.info(`DRY_RUN: would warn @${login} on #${issue.number}`);
           } else {
-            const body = `@${login}, your claim on this issue expires in about 24 hours unless you open a PR that links it (for example, \`Closes #${issue.number}\` or \`Part of #${issue.number}\`). You can re-claim later with \`/assign\` if the issue is still free.\n\n${marker}`;
+            const body = `@${login}, your claim on this issue expires in about ${ttl - warn} hours unless you open a PR that links it (for example, \`Closes #${issue.number}\` or \`Part of #${issue.number}\`). You can re-claim later with \`/assign\` if the issue is still free.\n\n${marker}`;
             await github.rest.issues.createComment({
               owner,
               repo,
@@ -193,7 +209,8 @@ export async function run({ github, context, core, env, now = new Date() }) {
             }
           }
           if (!alreadyCommented) {
-            const body = `@${login}, your claim expired after ${ttl} hours without a linked PR. This issue is open for others now, and you're welcome to \`/assign\` again if it's still free.\n\n${marker}`;
+            const counted = fromAcceptance ? ' (counted from when this issue was accepted)' : '';
+            const body = `@${login}, your claim expired after ${ttl} hours${counted} without a linked PR. This issue is open for others now, and you're welcome to \`/assign\` again if it's still free.\n\n${marker}`;
             await github.rest.issues.createComment({
               owner,
               repo,

@@ -1593,10 +1593,10 @@ describe('runTestWait — dashboardUrl on terminal output', () => {
 });
 
 // ---------------------------------------------------------------------------
-// DEV-331 piece 1 — graceful detach on SIGINT/SIGTERM during test wait
+// Graceful detach on SIGINT/SIGTERM during test wait
 // ---------------------------------------------------------------------------
 
-describe('runTestWait — InterruptError graceful detach (DEV-331)', () => {
+describe('runTestWait — InterruptError graceful detach', () => {
   function hangingFetch(): typeof globalThis.fetch {
     return (async (_input: FetchInput, init: RequestInit = {}) => {
       return new Promise<Response>((_resolve, reject) => {
@@ -1614,7 +1614,7 @@ describe('runTestWait — InterruptError graceful detach (DEV-331)', () => {
     }) as typeof globalThis.fetch;
   }
 
-  it('SIG-2/SIG-4: emits partial JSON to stdout, honest billing line to stderr, rethrows exit 130', async () => {
+  it('emits partial JSON to stdout, honest billing line to stderr, rethrows exit 130', async () => {
     const { credentialsPath } = makeCreds();
     const shutdown = new ShutdownController();
     const stdoutLines: string[] = [];
@@ -1658,7 +1658,7 @@ describe('runTestWait — InterruptError graceful detach (DEV-331)', () => {
     expect(stderrBlock).toContain('testsprite test wait run_abc');
   });
 
-  it('SIG-3: SIGTERM maps to exit 143', async () => {
+  it('SIGTERM maps to exit 143', async () => {
     const { credentialsPath } = makeCreds();
     const shutdown = new ShutdownController();
     const pending = runTestWait(

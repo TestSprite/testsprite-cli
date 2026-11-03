@@ -1,5 +1,5 @@
 /**
- * Unit tests for `runGenerationLadder` (DEV-384 V3-B).
+ * Unit tests for `runGenerationLadder`.
  *
  * All HTTP is a scripted fake `PlanLadderClient`; sleep is an instant no-op.
  * Deadline tests monkey-patch `Date.now` (same convention as poll.spec.ts).
@@ -251,7 +251,7 @@ describe('runGenerationLadder — stage progression', () => {
     expect(result.firstTrigger?.stage).toBe('proposals');
   });
 
-  it('DEV-1008: skippedCategories is read from the accepted trigger that carries it, not firstTrigger', async () => {
+  it('skippedCategories is read from the accepted trigger that carries it, not firstTrigger', async () => {
     const proposalsWithSkips = { ...accepted('proposals', []), skippedCategories: 2 };
     const client = makeClient(
       [accepted('strategy', ['proposals']), proposalsWithSkips],
@@ -268,7 +268,7 @@ describe('runGenerationLadder — stage progression', () => {
     expect(result.skippedCategories).toBe(2);
   });
 
-  it('DEV-1008: skippedCategories is null when no accepted trigger carried it', async () => {
+  it('skippedCategories is null when no accepted trigger carried it', async () => {
     const client = makeClient(
       [accepted('proposals', [])],
       [plansRead('proposing'), plansRead('idle', STAGED)],
@@ -395,12 +395,12 @@ describe('runGenerationLadder — billing guards', () => {
   });
 
   it('attached to an in-flight PROPOSALS stage: idle+empty reads NEVER re-POST (review fix)', async () => {
-    // The double-bill race from the DEV-384 review: attach to someone
-    // else's proposals run, watch it run, then hit a visibility gap
-    // (finished but batch not readable yet). Before the fix,
-    // `expectedRemaining = null` + observed-active meant an IMMEDIATE
-    // re-POST here — a duplicate append that wipes + re-bills server-side.
-    // `proposalsObserved` must arm guard #1 off the watched status.
+    // The double-bill race: attach to someone else's proposals run, watch it
+    // run, then hit a visibility gap (finished but batch not readable yet).
+    // `expectedRemaining = null` + observed-active alone would mean an
+    // IMMEDIATE re-POST here — a duplicate append that wipes + re-bills
+    // server-side. `proposalsObserved` must arm guard #1 off the watched
+    // status instead.
     const inFlight = makeApiError('CONFLICT', { reason: 'stage_in_flight' }, 409);
     const client = makeClient(
       [inFlight],
@@ -574,7 +574,7 @@ describe('runGenerationLadder — deadline', () => {
   });
 });
 
-describe('runGenerationLadder — shutdown handle (DEV-331)', () => {
+describe('runGenerationLadder — shutdown handle', () => {
   it('arms the shared shutdown handle for the ladder and disarms after', async () => {
     const shutdown = new ShutdownController();
     let armedDuringPoll = false;

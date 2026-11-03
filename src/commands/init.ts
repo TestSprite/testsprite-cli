@@ -17,12 +17,12 @@ import {
   parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
-import { normalizeEnvVar } from '../lib/config.js';
+import { normalizeEnvVar, resolveProfileName } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
-import { CLIError, localValidationError } from '../lib/errors.js';
+import { CLIError, InterruptError, localValidationError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import type { AuthDeps, ConfigureResult, MeResponse } from './auth.js';
-import { runConfigure, runWhoami } from './auth.js';
+import { missingApiKeyError, runConfigure, runWhoami } from './auth.js';
 import type { AgentDeps, AgentFs, InstallResult } from './agent.js';
 import { runInstall } from './agent.js';
 import { TARGETS, DEFAULT_SKILLS, type AgentTarget } from '../lib/agent-targets.js';
@@ -221,6 +221,7 @@ function toAuthDeps(deps: InitDeps, apiKey?: string, commandTag?: string): AuthD
     // If an explicit API key was provided, override the prompt so configure
     // never actually prompts the user.
     prompt: apiKey ? { secret: async (_q: string) => apiKey } : deps.prompt,
+    suppliedApiKey: Boolean(apiKey),
     // Telemetry attribution for the configure-validate GET /me. Passed only for
     // the configure step (see runInit) — never whoami — so each init run emits
     // exactly one cli.initialized event on the backend.
@@ -420,10 +421,10 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   // Non-interactive guard: no TTY + no key source → exit 5. Skipped under
   // --dry-run, which is documented to work without credentials or network.
   if (!isTTY && !hasKeySource && !skipWillApply && !opts.dryRun) {
-    throw new CLIError(
+    throw missingApiKeyError(
       'No API key available in non-interactive mode. ' +
         'Pass --api-key <key>, --from-env (reads TESTSPRITE_API_KEY), or run interactively.',
-      5,
+      resolveReportedEndpoint(opts, deps),
     );
   }
   // JSON-output guard: an interactive secret prompt writes to stdout and would
@@ -556,6 +557,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
   try {
     me = await runWhoami(opts, whoamiDeps);
   } catch (err) {
+    if (err instanceof InterruptError) throw err;
     // Whoami is display-only. If it fails after a successful configure,
     // continue with a minimal placeholder so the summary still prints.
     if (opts.debug) {
@@ -690,7 +692,7 @@ function renderInitText(data: unknown): string {
     );
   }
   lines.push('');
-  // DEV-279: an agent session already open when the skills landed won't re-read
+  // An agent session already open when the skills landed won't re-read
   // them. `agent install` emits the same line on stderr; setup owns its summary,
   // so it goes here. Only when bytes actually changed — `aggregateInstallAction`
   // reports 'installed'/'updated' for that, 'dry-run'/'skipped' otherwise.
@@ -710,7 +712,13 @@ function renderInitText(data: unknown): string {
     lines.push(
       '  # 2. Generate tests: ask your coding agent (the testsprite-onboard skill is installed),',
     );
-    lines.push('  #    or create one yourself, then run them (use the projectId from step 1):');
+    lines.push(
+      '  #    or have TestSprite propose them directly (uses credits), review them, then accept:',
+    );
+    lines.push('  testsprite test plan generate --project <projectId>');
+    lines.push('  testsprite test plan accept --project <projectId>');
+    lines.push('');
+    lines.push('  # 3. Run them (use the projectId from step 1):');
     lines.push('  testsprite test run --all --project <projectId>');
     lines.push('');
     lines.push('  # Manage installed agent skills');
@@ -719,8 +727,20 @@ function renderInitText(data: unknown): string {
       '  testsprite agent install --target=<t>   # re-install or install additional targets',
     );
   } else {
-    lines.push('  # 2. Create a test, then run it (use the projectId from step 1):');
-    lines.push('  testsprite test create --project <projectId> ...');
+    // Without an agent, this is the only place a new user learns that
+    // TestSprite can propose the first suite. Printing this runs and charges
+    // nothing; generating does use credits, which the line says. The
+    // hand-authored path stays visible as the fallback.
+    lines.push(
+      '  # 2. Let TestSprite propose your first tests (uses credits), review them, then accept:',
+    );
+    lines.push('  #    Backend project? Upload your API spec first:');
+    lines.push('  #    testsprite project docs upload ./openapi.yaml --project <projectId>');
+    lines.push('  testsprite test plan generate --project <projectId>');
+    lines.push('  testsprite test plan accept --project <projectId>');
+    lines.push('  #    Prefer to write one yourself: testsprite test create --plan-template');
+    lines.push('');
+    lines.push('  # 3. Run them (use the projectId from step 1):');
     lines.push('  testsprite test run --all --project <projectId>');
     lines.push(
       '  # Tip: `testsprite agent install` sets up the onboarding skill for your coding agent',
@@ -737,12 +757,12 @@ function renderInitText(data: unknown): string {
 // Command factory
 // ---------------------------------------------------------------------------
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
   return {
-    profile: globals.profile ?? 'default',
+    profile: resolveProfileName(globals.profile, env),
     output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
@@ -798,7 +818,10 @@ export function addSetupOptions(
     .option('--no-agent', 'Skip the agent skill install (configure credentials only)')
     .option('--force', 'Overwrite an existing skill file (a .bak backup is kept)')
     .option('--dir <path>', 'Project root for the skill install (default: current directory)')
-    .option('-y, --yes', 'Non-interactive: accept all defaults, never prompt')
+    .option(
+      '-y, --yes',
+      'Non-interactive: accept defaults, never prompt (needs --from-env or --api-key)',
+    )
     .option(
       '--skip-if-configured',
       'Skip the API key prompt when credentials already exist for this profile (CI-safe idempotent re-run)',
@@ -806,8 +829,12 @@ export function addSetupOptions(
 }
 
 /** Build {@link InitOptions} from raw Commander opts + globals. */
-function buildSetupOptions(cmdOpts: SetupCmdOpts, command: Command): InitOptions {
-  const common = resolveCommonOptions(command);
+function buildSetupOptions(
+  cmdOpts: SetupCmdOpts,
+  command: Command,
+  env?: NodeJS.ProcessEnv,
+): InitOptions {
+  const common = resolveCommonOptions(command, env);
 
   // Commander sets `agent: false` (boolean) when `--no-agent` is passed,
   // because `--no-agent` is the negation of `--agent <target>`.
@@ -851,7 +878,7 @@ async function runSetupAction(
   command: Command,
   deps: InitDeps,
 ): Promise<void> {
-  const opts = buildSetupOptions(cmdOpts, command);
+  const opts = buildSetupOptions(cmdOpts, command, deps.env);
 
   // When --yes is supplied without a key source, force isTTY=false so runInit
   // emits exit 5 with a clear message rather than hanging on a prompt in a
@@ -869,8 +896,17 @@ export function createSetupCommand(deps: InitDeps = {}): Command {
   const defaultAgent: AgentTarget = 'claude';
 
   return addSetupOptions(new Command('setup'), validTargets, defaultAgent)
+    .summary('Configure your API key and install the agent skills')
     .description(SETUP_DESCRIPTION)
-    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .addHelpText(
+      'after',
+      '\nValidates the key (GET /me), saves it to your profile and writes the skills into the project\n' +
+        'directory. With --yes or no terminal (CI) the key must come from --from-env or --api-key\n' +
+        '(or --skip-if-configured with a saved key); otherwise setup exits 5.\n' +
+        '\nExample:\n' +
+        '  TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --yes --agent claude\n' +
+        GLOBAL_OPTS_HINT,
+    )
     .action(async (cmdOpts: SetupCmdOpts, command: Command) => {
       await runSetupAction(cmdOpts, command, deps);
     });

@@ -1,4 +1,6 @@
 import { resolvePortalBase } from './facade.js';
+import { redactDeep } from './redact.js';
+import { classifyBillingRefusal, gateRefusalOf } from './billing-refusal.js';
 
 /**
  * Error codes shared with the backend facade and the MCP plugin.
@@ -177,10 +179,9 @@ export const TERMINATION_EXIT_CODES = {
 export type TerminationSignal = keyof typeof TERMINATION_EXIT_CODES;
 
 /**
- * User-initiated interrupt (SIGINT/SIGTERM/SIGHUP) observed while a
- * graceful-detach scope (the `--wait` polling window) was armed — see
- * `interrupt.ts::ShutdownController`. The `--wait` catch blocks render the
- * honest partial envelope + re-attach hint, then rethrow to `index.ts`.
+ * User-initiated interrupt (SIGINT/SIGTERM/SIGHUP) observed during an armed
+ * wait or a disarmed request. Run/wait paths mark the error so `index.ts` can give
+ * recovery guidance only when there is a run to re-attach to.
  *
  * Deliberately NOT in `ERROR_CODES` — on a signal the CLI
  * exits 130/143 without consulting the error catalog. The JSON-mode stderr
@@ -189,6 +190,7 @@ export type TerminationSignal = keyof typeof TERMINATION_EXIT_CODES;
  */
 export class InterruptError extends CLIError {
   readonly signal: TerminationSignal;
+  runWaitContext = false;
 
   constructor(signal: TerminationSignal) {
     super(`Interrupted by ${signal}.`, TERMINATION_EXIT_CODES[signal], 'INTERRUPTED');
@@ -217,11 +219,9 @@ export interface ErrorEnvelope {
 }
 
 /**
- * Server-returned API error. The CLI never invents `code`, `nextAction`,
- * or `requestId` — it forwards what the facade returned (or, for
- * locally-detected pre-flight conditions like a missing API key,
- * constructs an envelope with the same shape so the user sees identical
- * wording across paths).
+ * Server-returned API error. The CLI preserves the facade's nonempty
+ * `nextAction` and synthesizes one for billing refusals that omit it.
+ * Locally-detected pre-flight conditions use the same envelope shape.
  */
 export class ApiError extends CLIError {
   // `override`: CLIError now declares its own `code: string` (defaulting
@@ -236,8 +236,10 @@ export class ApiError extends CLIError {
   override readonly code: ErrorCode;
   readonly requestId: string;
   readonly nextAction: string;
+  readonly serverNextAction: string;
   readonly details: Record<string, unknown>;
   readonly httpStatus: number | undefined;
+  readonly apiUrl: string | undefined;
   /**
    * Parsed `Retry-After` header value in milliseconds, when present on the
    * HTTP response. Only set for `RATE_LIMITED` (429) responses where the
@@ -247,14 +249,32 @@ export class ApiError extends CLIError {
    */
   readonly retryAfterMs: number | undefined;
 
-  constructor(envelope: ErrorEnvelopeBody, httpStatus?: number, retryAfterMs?: number) {
+  constructor(
+    envelope: ErrorEnvelopeBody,
+    httpStatus?: number,
+    retryAfterMs?: number,
+    apiUrl?: string,
+    serverNextAction?: string,
+  ) {
     super(envelope.message, exitCodeFor(envelope.code));
     this.name = 'ApiError';
     this.code = envelope.code;
     this.requestId = envelope.requestId;
     this.nextAction = envelope.nextAction;
-    this.details = envelope.details;
+    this.serverNextAction = serverNextAction ?? envelope.nextAction;
+    // Redact at the single point every ApiError is constructed — server
+    // envelopes (fromEnvelope), locally-fabricated ones (authRequired,
+    // localValidationError), and any future direct `new ApiError(...)` — so
+    // `.details` and `.getDetail(...)` are already clean everywhere they are
+    // read: `Output.error`'s JSON envelope, `index.ts`'s hand-built ApiError
+    // envelope, and the AUTH_FORBIDDEN/CLIENT_TOO_OLD/AMBIGUOUS_ORG text-mode
+    // blocks in `index.ts` that print specific detail keys directly (those
+    // never go through `Output.error` at all, so redacting only at the
+    // render call sites would miss them). Server envelopes are already
+    // redacted server-side; this is defence in depth, not the only layer.
+    this.details = redactDeep(envelope.details);
     this.httpStatus = httpStatus;
+    this.apiUrl = apiUrl;
     this.retryAfterMs = retryAfterMs;
   }
 
@@ -270,7 +290,17 @@ export class ApiError extends CLIError {
     apiUrl?: string,
   ): ApiError {
     const envelope = parseEnvelopeBody(raw, httpStatus, apiUrl);
-    return new ApiError(envelope, httpStatus, retryAfterMs);
+    const serverNextAction = envelope.nextAction;
+    if (!envelope.nextAction) {
+      const refusal = classifyBillingRefusal({ ...envelope, apiUrl });
+      if (refusal) {
+        envelope.nextAction =
+          envelope.code === 'INSUFFICIENT_CREDITS'
+            ? insufficientCreditsNextAction(apiUrl)
+            : refusal.nextAction;
+      }
+    }
+    return new ApiError(envelope, httpStatus, retryAfterMs, apiUrl, serverNextAction);
   }
 
   /**
@@ -304,7 +334,32 @@ export class ApiError extends CLIError {
    * AUTH_REQUIRED template so the user sees the same thing whether the
    * miss was detected before or after sending the request.
    */
-  static authRequired(requestId = 'local'): ApiError {
+  /**
+   * `profile` is supplied only when a NON-default profile was selected — by
+   * `--profile` or by `TESTSPRITE_PROFILE`. Naming it matters because the
+   * selection is invisible otherwise: a typo in either one picks a profile
+   * that has no credentials, and the generic message sends the reader off to
+   * configure the default profile they already have.
+   */
+  static authRequired(requestId = 'local', profile?: string): ApiError {
+    if (profile !== undefined) {
+      return new ApiError({
+        code: 'AUTH_REQUIRED',
+        // `message` stays byte-identical to the default-profile case: the
+        // wording is stable per error code, so callers can pattern-match on it.
+        // The profile belongs in the remediation and in `details`, which are
+        // the per-error context.
+        message: 'Authentication is required.',
+        nextAction:
+          `No credentials are stored for profile "${profile}". Run \`testsprite setup --profile ${profile}\`` +
+          ' to configure it, or drop the profile selection if you did not mean to use one' +
+          ' (`--profile` flag, TESTSPRITE_PROFILE env var). `testsprite doctor` prints the profile in use.',
+        requestId,
+        // Safe to echo: every credential read passes the profile name through
+        // `assertValidProfileName` first, so it matches /^[A-Za-z0-9._-]+$/.
+        details: { profile },
+      });
+    }
     return new ApiError({
       code: 'AUTH_REQUIRED',
       message: 'Authentication is required.',
@@ -525,6 +580,71 @@ function parseEnvelopeBody(raw: unknown, httpStatus?: number, apiUrl?: string): 
   }
   const obj = raw as Record<string, unknown>;
 
+  const wireCode = typeof obj.code === 'string' ? obj.code : '';
+  // The exact wire codes the workspace-gate body can send — checked on their
+  // own (not just the open-ended `_limit_exceeded` suffix) so a body with no
+  // HTTP status attached still has something narrow to match against.
+  const isKnownGateWireCode =
+    wireCode === 'feature_not_entitled' ||
+    wireCode === 'workspace_paused' ||
+    wireCode === 'environment_limit_exceeded' ||
+    wireCode === 'testlist_limit_exceeded' ||
+    wireCode === 'schedule_limit_exceeded' ||
+    wireCode === 'github_repo_limit_exceeded' ||
+    wireCode === 'fixture_limit_exceeded' ||
+    wireCode === 'project_limit_exceeded';
+  // Only take this raw shape for the HTTP statuses the gate actually answers
+  // with (402/403) — matching purely on `code` let an unrelated 429 body that
+  // happens to end in `_limit_exceeded` (e.g. a future `rate_limit_exceeded`)
+  // get reclassified as a non-retriable FEATURE_GATED and stop being retried.
+  // With no status at all, only the exact known codes above qualify: the
+  // open-ended suffix match is too permissive without a status to corroborate it.
+  const takesRawGateShape =
+    httpStatus === 402 || httpStatus === 403
+      ? isKnownGateWireCode || /_limit_exceeded$/.test(wireCode)
+      : httpStatus === undefined && isKnownGateWireCode;
+  if (takesRawGateShape) {
+    // A `reason` on the body is the server's and passes through as-is.
+    // Otherwise the wire code says which gate refusal it is, named as the
+    // gate names it.
+    const reason =
+      typeof obj.reason === 'string' && obj.reason !== ''
+        ? obj.reason
+        : wireCode.endsWith('_limit_exceeded')
+          ? 'limit_exceeded'
+          : wireCode === 'workspace_paused'
+            ? 'paused'
+            : 'not_entitled';
+    const details: Record<string, unknown> = { reason };
+    for (const key of [
+      'feature',
+      'plan',
+      'limit',
+      'current',
+      'requiredPlan',
+      'orgId',
+      'billingUrl',
+      'action',
+      'pauseKind',
+      'pauseTarget',
+    ]) {
+      if (obj[key] !== undefined && obj[key] !== null) details[key] = obj[key];
+    }
+    if (gateRefusalOf(reason) === 'limit_exceeded' && details.feature === undefined) {
+      details.feature = wireCode.slice(0, -'_limit_exceeded'.length);
+    }
+    return {
+      code: 'FEATURE_GATED',
+      message:
+        typeof obj.message === 'string'
+          ? obj.message
+          : 'This action is unavailable on the current plan.',
+      nextAction: typeof obj.nextAction === 'string' ? obj.nextAction : '',
+      requestId: typeof obj.requestId === 'string' ? obj.requestId : 'unknown',
+      details,
+    };
+  }
+
   // Raw Nest/Express 404 shape: `{ message, error: "Not Found", statusCode }`.
   // The current parser was matching `obj.error` (a string) and falling to
   // `Server error.` while losing the actual `message` from the body
@@ -541,7 +661,7 @@ function parseEnvelopeBody(raw: unknown, httpStatus?: number, apiUrl?: string): 
         ? `${message} — endpoint not available on the current backend deployment.`
         : message,
       nextAction: isRouteMissing404
-        ? 'Verify the CLI is targeting the right environment (check `testsprite auth status` for `env`), and confirm the backend has the corresponding M3.3 piece deployed.'
+        ? 'Verify the CLI is targeting the right environment (check `testsprite auth status` for `env`), and confirm that backend deployment includes this endpoint — it may need a newer backend release.'
         : '',
       requestId: 'unknown',
       details: { statusCode: obj.statusCode },

@@ -1,5 +1,5 @@
 /**
- * §8.1 / M2.1 piece 4 — tests for the stdout-purity helper itself.
+ * §8.1 — tests for the stdout-purity helper itself.
  *
  * The helper guards `--output json` mode: if a future code change
  * pollutes stdout with a banner or progress line, every command's

@@ -30,6 +30,22 @@ export { TERMINATION_EXIT_CODES, type TerminationSignal } from './errors.js';
 /** Back-compat alias: SIGINT's conventional exit code. */
 export const SIGINT_EXIT_CODE = TERMINATION_EXIT_CODES.SIGINT;
 
+export const INTERRUPT_EXIT_BACKSTOP_MS = 3_000;
+
+export function armInterruptExitBackstop(
+  code: number,
+  deps: {
+    setTimer?: (callback: () => void, delayMs: number) => Pick<NodeJS.Timeout, 'unref'>;
+    exit?: (code: number) => void;
+  } = {},
+): void {
+  const timer = (deps.setTimer ?? setTimeout)(
+    () => (deps.exit ?? process.exit)(code),
+    INTERRUPT_EXIT_BACKSTOP_MS,
+  );
+  timer.unref();
+}
+
 /**
  * Structural view of {@link ShutdownController} threaded through the DI
  * surfaces (`TestDeps`, `PollOptions`) — commands and the polling loop need
@@ -40,13 +56,13 @@ export interface ShutdownHandle {
   readonly signal: AbortSignal;
   /** Enter a graceful-detach scope. Returns the disposer that leaves it. */
   arm(): () => void;
-  /** Run and track cleanup that a repeated signal may briefly wait for. */
+  /** Run and track work that a repeated signal may briefly wait for. */
   runCriticalOperation<T>(operation: () => Promise<T>): Promise<T>;
 }
 
 /**
  * Process-lifetime coordinator between the signal handler and the `--wait`
- * polling paths (DEV-331 piece 1).
+ * polling paths.
  *
  * Two modes, chosen by whether a graceful-detach scope is armed when the
  * signal arrives:
@@ -57,12 +73,12 @@ export interface ShutdownHandle {
  *   the cleanup (finalize the ticker, print the honest partial envelope +
  *   re-attach hint, rethrow to `index.ts` → exit 130/143/129).
  * - **Disarmed** (no wait in progress — prompts, one-shot commands, local
- *   FS work): the handler prints the generic explanation and exits
- *   immediately, preserving the pre-DEV-331 behavior. An abort nobody
- *   observes must never leave the process hanging at e.g. a readline prompt.
+ *   FS work): the handler prints the generic explanation. An in-flight HTTP
+ *   request can unwind through the top-level catch; idle work such as a
+ *   readline prompt exits immediately because it cannot observe the abort.
  *
  * A repeated signal still provides a bounded escape hatch: the second waits
- * briefly only when critical cleanup is in flight, and the third exits at once.
+ * briefly when cleanup or an HTTP request is in flight, and the third exits at once.
  */
 export class ShutdownController {
   private readonly controller = new AbortController();
@@ -104,13 +120,13 @@ export class ShutdownController {
     };
   }
 
-  /** Whether teardown currently has work whose abrupt loss is security-sensitive. */
+  /** Whether cleanup or an HTTP request is in flight and needs time to settle. */
   get hasCriticalOperations(): boolean {
     return this.criticalOperations.size > 0;
   }
 
   /**
-   * Register cleanup before it starts and remove it automatically when it
+   * Register an operation before it starts and remove it automatically when it
    * settles. Rejections retain their original semantics for the caller.
    */
   runCriticalOperation<T>(operation: () => Promise<T>): Promise<T> {
@@ -122,7 +138,7 @@ export class ShutdownController {
     return tracked;
   }
 
-  /** Wait until all current and directly chained critical cleanup settles. */
+  /** Wait until all current and directly chained tracked work settles. */
   async waitForCriticalOperations(): Promise<void> {
     while (this.criticalOperations.size > 0) {
       await Promise.allSettled([...this.criticalOperations]);
@@ -183,12 +199,14 @@ export interface InterruptDeps {
   stderr?: (line: string) => void;
   /** Process exit. Defaults to `process.exit`. */
   exit?: (code: number) => void;
+  /** Set the exit code while allowing in-flight work to drain. */
+  setExitCode?: (code: number) => void;
   /** Shutdown coordinator. Defaults to {@link globalShutdown}. */
   shutdown?: ShutdownController;
 }
 
 const CRITICAL_OPERATION_GRACE_MS = 2_000;
-/** How often the grace period re-checks whether teardown is still running. */
+/** How often the grace period re-checks whether tracked work is still running. */
 const CRITICAL_OPERATION_POLL_MS = 10;
 
 function afterDelay(ms: number): Promise<void> {
@@ -226,10 +244,11 @@ async function waitForCriticalOperationsWithGrace(shutdown: ShutdownController):
  * single top-level call in `index.ts`; not designed to be installed twice.
  *
  * First signal, armed scope: abort-only — the `--wait` catch paths own the
- * honest-detach UX and the exit (DEV-331 D1: Ctrl-C = detach, never cancel).
- * First signal, disarmed: print the generic explanation + exit `128+signum`.
- * Second signal: exit immediately unless critical cleanup is registered; when
- * it is, wait at most two seconds before exiting. Third signal: always exit
+ * honest-detach UX and the exit (Ctrl-C detaches; it never cancels the run).
+ * First signal, disarmed: print the generic explanation, then drain an in-flight
+ * request or exit `128+signum` immediately when idle.
+ * Second signal: exit immediately unless cleanup or a request is registered;
+ * when it is, wait at most two seconds before exiting. Third signal: always exit
  * immediately, including while that grace period is active.
  */
 export function installSignalHandlers(deps: InterruptDeps = {}): void {
@@ -241,9 +260,8 @@ export function installSignalHandlers(deps: InterruptDeps = {}): void {
   const stderr =
     deps.stderr ??
     ((line: string) => {
-      // A signal handler calls process.exit() right after writing, which can
-      // truncate an async process.stderr.write() when stderr is a pipe. Write
-      // synchronously so the interrupt hint is flushed before the process exits.
+      // An idle or repeated signal can call process.exit() right after writing,
+      // truncating an async stderr write when stderr is a pipe.
       try {
         writeSync(process.stderr.fd, `${line}\n`);
       } catch {
@@ -251,6 +269,11 @@ export function installSignalHandlers(deps: InterruptDeps = {}): void {
       }
     });
   const exit = deps.exit ?? ((code: number) => process.exit(code));
+  const setExitCode =
+    deps.setExitCode ??
+    ((code: number) => {
+      process.exitCode = code;
+    });
   const shutdown = deps.shutdown ?? globalShutdown;
   let signalCount = 0;
   let graceGeneration = 0;
@@ -270,8 +293,8 @@ export function installSignalHandlers(deps: InterruptDeps = {}): void {
         // credential delete is registered only after the poll loop unwinds. A
         // second signal that arrives in between — which is what a reflexive
         // double Ctrl-C actually does — would otherwise hard-exit and strand a
-        // live inbound credential until its TTL, the exact outcome the grace
-        // period exists to prevent.
+        // live inbound credential until its TTL. An ordinary in-flight request
+        // is registered too, so it gets the same bounded grace period.
         if (!shutdown.hasCriticalOperations && !shutdown.isArmed) {
           exit(TERMINATION_EXIT_CODES[signal]);
           return;
@@ -292,14 +315,16 @@ export function installSignalHandlers(deps: InterruptDeps = {}): void {
         shutdown.interrupt(signal);
         return;
       }
-      // Disarmed (no --wait in progress): legacy immediate exit. Record the
-      // signal first so a second one takes the hard-exit branch even when
-      // `exit` is injected and does not terminate (unit tests).
+      // Record the signal first so a second one takes the escalation path.
       shutdown.interrupt(signal);
       // Blank line first so the message starts on its own row rather than
       // trailing the progress ticker's in-place line.
       stderr('');
       stderr(formatInterruptMessage(signal));
+      if (shutdown.hasCriticalOperations) {
+        setExitCode(TERMINATION_EXIT_CODES[signal]);
+        return;
+      }
       exit(TERMINATION_EXIT_CODES[signal]);
     });
   }

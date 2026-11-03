@@ -160,6 +160,91 @@ describe('Output', () => {
   });
 });
 
+// `Output.print`'s success data is the user's OWN content — generated test
+// code, plans, backend-test fixtures — and must round-trip byte-identical
+// (`test code get --output json` -> edit -> `test code put`, `test plan get`
+// -> `test plan put`). It is never redacted, in JSON or text mode, no matter
+// what a key is named or what a string inside it looks like. Redaction lives
+// only at error/debug/dry-run render boundaries — see the `Output.error`
+// block below and `redact.ts`'s module doc.
+describe('Output.print — success data prints verbatim, never redacted', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  it('json success output prints a password key and an embedded Bearer token unchanged', () => {
+    const payload = {
+      code: "const headers = { Authorization: 'Bearer mock-token-abc123' };",
+      plan: { password: 'fixture-value' },
+      tokens: [{ apiKey: 'sk-live-should-round-trip' }],
+    };
+    new Output('json').print(payload);
+    const written = logSpy.mock.calls[0]?.[0] as string;
+    expect(JSON.parse(written)).toEqual(payload);
+  });
+
+  it('text success output hands the renderer the untouched object', () => {
+    const payload = {
+      code: "headers: { Authorization: 'Bearer abc.def-123' }",
+      password: 'hunter2',
+    };
+    new Output('text').print(payload, data => JSON.stringify(data));
+    const written = logSpy.mock.calls[0]?.[0] as string;
+    expect(JSON.parse(written)).toEqual(payload);
+  });
+
+  it('username and environment names print unchanged (never touched either way)', () => {
+    new Output('json').print({
+      username: 'qa+demo@example.com',
+      environment: { name: 'production' },
+    });
+    const printed = JSON.parse(logSpy.mock.calls[0]?.[0] as string) as {
+      username: string;
+      environment: { name: string };
+    };
+    expect(printed.username).toBe('qa+demo@example.com');
+    expect(printed.environment.name).toBe('production');
+  });
+});
+
+describe('Output.error — recursive secret redaction', () => {
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    errorSpy.mockRestore();
+  });
+
+  it('error envelope redacts nested secrets', () => {
+    new Output('json').error({
+      code: 'VALIDATION_ERROR',
+      message: 'bad request',
+      details: { echoedCredentials: { password: 'hunter2', apiKey: 'sk-should-not-leak' } },
+    });
+    const written = errorSpy.mock.calls[0]?.[0] as string;
+    expect(written).not.toContain('hunter2');
+    expect(written).not.toContain('sk-should-not-leak');
+    expect(JSON.parse(written)).toEqual({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'bad request',
+        nextAction: '',
+        requestId: 'local',
+        details: { echoedCredentials: { password: '[REDACTED]', apiKey: '[REDACTED]' } },
+      },
+    });
+  });
+});
+
 describe('Output.writeChunk — backpressure', () => {
   it('forwards the chunk to a sync rawStdout writer', async () => {
     const chunks: string[] = [];
@@ -197,5 +282,39 @@ describe('Output.writeChunk — backpressure', () => {
     resolveDrain!();
     await writePromise;
     expect(writeResolved).toBe(true);
+  });
+});
+
+describe('Output deprecations option', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  const entry = { command: 'test rerun', replacement: 'test run', removedIn: '0.17.0' };
+
+  it('appends deprecations as the last key of a JSON object payload', () => {
+    new Output('json', {}, { deprecations: [entry] }).print({ a: 1, b: 2 });
+    const written = JSON.parse(logSpy.mock.calls[0]?.[0] as string);
+    expect(Object.keys(written)).toEqual(['a', 'b', 'deprecations']);
+    expect(written.deprecations).toEqual([entry]);
+  });
+
+  it('is absent without the option', () => {
+    new Output('json').print({ a: 1 });
+    expect(JSON.parse(logSpy.mock.calls[0]?.[0] as string)).toEqual({ a: 1 });
+  });
+
+  it('leaves array payloads untouched', () => {
+    new Output('json', {}, { deprecations: [entry] }).print([1, 2]);
+    expect(JSON.parse(logSpy.mock.calls[0]?.[0] as string)).toEqual([1, 2]);
+  });
+
+  it('does not touch text mode', () => {
+    new Output('text', {}, { deprecations: [entry] }).print({ a: 1 }, () => 'rendered');
+    expect(logSpy).toHaveBeenCalledWith('rendered');
   });
 });

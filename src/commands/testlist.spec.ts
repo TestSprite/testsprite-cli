@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -474,6 +474,7 @@ describe('testlist run', () => {
     const { env } = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-testlist-conflict-'));
     const summaryFile = join(dir, 'summary.json');
+    const reportFile = join(dir, 'report.xml');
     const stdout: string[] = [];
     const fetchImpl = makeFetch(() => ({
       body: {
@@ -490,10 +491,17 @@ describe('testlist run', () => {
         wait: true,
         ghOutput: true,
         summaryFile,
+        report: 'junit',
+        reportFile,
       },
       { env, fetchImpl, stdout: l => stdout.push(l), stderr: () => {}, sleep: instantSleep },
     ).catch(e => e)) as CLIError;
     expect(err.exitCode).toBe(6);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const xml = readFileSync(reportFile, 'utf8');
+    expect(xml).toContain('tests="1" failures="0" errors="0" skipped="1"');
+    expect(xml).toContain('testId="case-a"');
+    expect(xml).toContain('<skipped message="already in flight (not dispatched)"/>');
     // The exit-6 is surfaced in CI (annotation + summary file), not a bare throw.
     expect(stdout.some(l => l.startsWith('::warning') && l.includes('case-a'))).toBe(true);
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
@@ -703,18 +711,21 @@ describe('testlist run', () => {
   it('--report junit without --wait → VALIDATION_ERROR', async () => {
     const { env } = makeCreds();
     const fetchImpl = makeFetch(() => ({ body: RUN_ACCEPTED }));
+    const reportDir = mkdtempSync(join(tmpdir(), 'cli-testlist-report-'));
     const err = (await runTestlistRun(
-      { ...runBase, listId: 'list-1', report: 'junit', reportFile: '/tmp/x.xml' },
+      { ...runBase, listId: 'list-1', report: 'junit', reportFile: join(reportDir, 'x.xml') },
       { env, fetchImpl, stdout: () => {} },
-    ).catch(e => e)) as ApiError;
+    )
+      .catch(e => e)
+      .finally(() => rmSync(reportDir, { recursive: true, force: true }))) as ApiError;
     expect(err.code).toBe('VALIDATION_ERROR');
   });
 
-  it('--gh-output without --wait → VALIDATION_ERROR, no network (silent no-op is the bug it prevents)', async () => {
+  it('--gh-output without --wait → VALIDATION_ERROR, no dispatch (silent no-op is the bug it prevents)', async () => {
     const { env } = makeCreds();
     let called = false;
-    const fetchImpl = makeFetch(() => {
-      called = true;
+    const fetchImpl = makeFetch((_url, init) => {
+      if (init.method === 'POST') called = true;
       return { body: RUN_ACCEPTED };
     });
     const err = (await runTestlistRun(
@@ -725,17 +736,20 @@ describe('testlist run', () => {
     expect(called).toBe(false);
   });
 
-  it('--summary-file without --wait → VALIDATION_ERROR, no network', async () => {
+  it('--summary-file without --wait → VALIDATION_ERROR, no dispatch', async () => {
     const { env } = makeCreds();
     let called = false;
-    const fetchImpl = makeFetch(() => {
-      called = true;
+    const fetchImpl = makeFetch((_url, init) => {
+      if (init.method === 'POST') called = true;
       return { body: RUN_ACCEPTED };
     });
+    const summaryDir = mkdtempSync(join(tmpdir(), 'cli-testlist-summary-'));
     const err = (await runTestlistRun(
-      { ...runBase, listId: 'list-1', summaryFile: '/tmp/x.json' },
+      { ...runBase, listId: 'list-1', summaryFile: join(summaryDir, 'x.json') },
       { env, fetchImpl, stdout: () => {} },
-    ).catch(e => e)) as ApiError;
+    )
+      .catch(e => e)
+      .finally(() => rmSync(summaryDir, { recursive: true, force: true }))) as ApiError;
     expect(err.code).toBe('VALIDATION_ERROR');
     expect(called).toBe(false);
   });
@@ -759,6 +773,7 @@ describe('testlist run', () => {
     const { env } = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-testlist-nf-'));
     const summaryFile = join(dir, 'summary.json');
+    const reportFile = join(dir, 'report.xml');
     const fetchImpl = makeFetch((_url, init) => {
       if ((init.method ?? 'GET') === 'POST')
         return { body: { ...RUN_ACCEPTED, notFound: ['ghost'] } };
@@ -773,6 +788,8 @@ describe('testlist run', () => {
         wait: true,
         ghOutput: true,
         summaryFile,
+        report: 'junit',
+        reportFile,
       },
       { env, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
     ).catch(e => e)) as CLIError;
@@ -792,6 +809,11 @@ describe('testlist run', () => {
     expect(notFoundRow?.status).toBe('not_found');
     // The cause is testlist-specific — NOT `test rerun`'s "no replayable run".
     expect(notFoundRow?.error).toBe('not a member of this list (not dispatched)');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const xml = readFileSync(reportFile, 'utf8');
+    expect(xml).toContain('tests="2" failures="0" errors="0" skipped="1"');
+    expect(xml).toContain('testId="ghost"');
+    expect(xml).toContain('<skipped message="not a member of this list (not dispatched)"/>');
   });
 
   it('--dry-run never hits the network', async () => {
@@ -858,6 +880,48 @@ describe('testlist run', () => {
     expect(err.exitCode).toBe(7);
   });
 
+  it('includes deferred and refused members in the JUnit count and skipped reasons', async () => {
+    const { env } = makeCreds();
+    const stderrLines: string[] = [];
+    const dir = mkdtempSync(join(tmpdir(), 'cli-testlist-pending-'));
+    const summaryFile = join(dir, 'summary.json');
+    const reportFile = join(dir, 'report.xml');
+    const fetchImpl = makeFetch((_url, init) =>
+      (init.method ?? 'GET') === 'POST'
+        ? {
+            body: {
+              ...RUN_ACCEPTED,
+              conflicts: [{ testId: 'refused', reason: 'billing_hold', message: 'Card declined.' }],
+              deferred: [{ testId: 'later' }],
+            },
+          }
+        : { body: makeRun('passed') },
+    );
+    const err = (await runTestlistRun(
+      { ...runBase, listId: 'list-1', wait: true, report: 'junit', reportFile, summaryFile },
+      {
+        env,
+        fetchImpl,
+        stdout: () => {},
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e)) as CLIError;
+    expect(err.exitCode).toBe(7);
+    expect(stderrLines.join('\n')).toContain(
+      'Upgrade: /pricing; billing: /dashboard/settings/billing.',
+    );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    expect(JSON.parse(readFileSync(summaryFile, 'utf8'))).toMatchObject({ total: 3, skipped: 2 });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const xml = readFileSync(reportFile, 'utf8');
+    expect(xml).toContain('tests="3" failures="0" errors="0" skipped="2"');
+    expect(xml).toContain('testId="refused"');
+    expect(xml).toContain('<skipped message="Card declined. (not dispatched)"/>');
+    expect(xml).toContain('testId="later"');
+    expect(xml).toContain('<skipped message="rate-deferred (not dispatched)"/>');
+  });
+
   it('waitRequestTimeoutMs raises the request timeout to cover --timeout under --wait', () => {
     // Non-wait: unchanged (no raise).
     expect(waitRequestTimeoutMs({ wait: false, timeoutSeconds: 600 })).toBeUndefined();
@@ -915,7 +979,7 @@ describe('testlist run — insufficient credits → exit 12 + telemetry facts', 
     },
   );
 
-  it('a billing_hold all-conflict keeps exit 6 and is named in the message', async () => {
+  it('a billing_hold all-conflict exits 13 with a billing action', async () => {
     const { env } = makeCreds();
     const fetchImpl = makeFetch(() => ({
       body: {
@@ -927,11 +991,38 @@ describe('testlist run — insufficient credits → exit 12 + telemetry facts', 
     const err = (await runTestlistRun(
       { ...runBase, listId: 'list-1' },
       { env, fetchImpl, stdout: () => {} },
+    ).catch(e => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.code).toBe('FEATURE_GATED');
+    expect(err.exitCode).toBe(13);
+    expect(err.message).toBe('Card declined.');
+    expect(err.nextAction).toContain('/dashboard/settings/billing');
+    expect(takeTelemetryExtras()).toMatchObject({ conflictReason: 'billing_hold' });
+  });
+
+  it('a mixed billing_hold + in-flight all-conflict batch still carries the upgrade link', async () => {
+    // Not a uniform billing_hold refusal (isPausedRefusal requires every
+    // conflict to be billing_hold/insufficient_credits) — falls to the generic
+    // "nothing dispatched" CLIError, which must not drop the link just because
+    // the batch isn't uniform.
+    const { env } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: {
+        accepted: [],
+        conflicts: [
+          { testId: 'case-a', reason: 'billing_hold', message: 'Card declined.' },
+          { testId: 'case-b', reason: 'in_flight', currentRunId: 'run_existing' },
+        ],
+        deferred: [],
+      },
+    }));
+    const err = (await runTestlistRun(
+      { ...runBase, listId: 'list-1' },
+      { env, fetchImpl, stdout: () => {} },
     ).catch(e => e)) as CLIError;
     expect(err).toBeInstanceOf(CLIError);
     expect(err.exitCode).toBe(6);
-    expect(err.message).toContain('1 billing hold');
-    expect(takeTelemetryExtras()).toMatchObject({ conflictReason: 'billing_hold' });
+    expect(err.message).toContain('Upgrade: /pricing; billing: /dashboard/settings/billing.');
   });
 
   it('--wait records dispatch counts + disjoint verdict counts', async () => {
@@ -963,3 +1054,31 @@ describe('testlist run — insufficient credits → exit 12 + telemetry facts', 
     expect(takeTelemetryExtras()).toEqual({ accepted: 1, conflicts: 0, deferred: 0, skipped: 0 });
   });
 });
+
+it.each([null, '2026-08-01T00:00:05.000Z'])(
+  'uses polled run timing for test-list JUnit with startedAt=%s',
+  async startedAt => {
+    const { env } = makeCreds();
+    const reportFile = join(mkdtempSync(join(tmpdir(), 'testlist-junit-timing-')), 'report.xml');
+    const stdout: string[] = [];
+    await runTestlistRun(
+      { ...runBase, output: 'json', listId: 'list-1', wait: true, report: 'junit', reportFile },
+      {
+        env,
+        fetchImpl: makeFetch((_url, init) => ({
+          body: init.method === 'POST' ? RUN_ACCEPTED : { ...makeRun('passed'), startedAt },
+        })),
+        stdout: line => stdout.push(line),
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads the JUnit report this test wrote to its own temp dir, never user input
+    const xml = readFileSync(reportFile, 'utf8');
+    const time = startedAt === null ? '30' : '25';
+    expect(xml).toContain(`skipped="0" time="${time}">`);
+    expect(xml).toContain(`runId="run_abc" time="${time}">`);
+    expect(stdout[0]).not.toContain('durationSeconds');
+    expect(stdout[0]).not.toContain('createdAt');
+  },
+);

@@ -8,10 +8,10 @@
  * the full http+fetch path is wired against MSW).
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   applyFailedOnly,
   assertContextIntegrity,
@@ -29,6 +29,7 @@ import {
   type AssertContextIntegrityOptions,
 } from './bundle.js';
 import type { CliFailureContext } from '../commands/test.js';
+import { ShutdownController } from './interrupt.js';
 
 const baseCtx: CliFailureContext = {
   snapshotId: 'snap_abc',
@@ -653,9 +654,59 @@ describe('resolveBundleDir', () => {
 
 describe('streamUrlToFile retry', () => {
   const noSleep = () => Promise.resolve();
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'stream-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('releases an interrupted body stream and removes its partial file', async () => {
+    const dest = join(dir, 'out.bin');
+    const shutdown = new ShutdownController();
+    let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+    let requestSignal: AbortSignal | undefined;
+    let calls = 0;
+    const fetchImpl = async (_url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      if (++calls > 1) throw new Error('retry after interrupted stream');
+      requestSignal = init?.signal ?? undefined;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          bodyController = controller;
+          controller.enqueue(new TextEncoder().encode('partial artifact'));
+        },
+      });
+      requestSignal?.addEventListener(
+        'abort',
+        () => bodyController.error(new DOMException('The operation was aborted', 'AbortError')),
+        { once: true },
+      );
+      return new Response(body);
+    };
+    const pending = streamUrlToFile(
+      'https://example.com/x',
+      dest,
+      fetchImpl as typeof fetch,
+      {
+        sleep: noSleep,
+        shutdownSignal: shutdown.signal,
+        shutdown,
+      } as Parameters<typeof streamUrlToFile>[3],
+    ).catch((err: unknown) => err);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture path built from this test's own mkdtempSync() dir, never user input
+    await vi.waitFor(() => expect(existsSync(dest)).toBe(true));
+    const trackedDuringBody = shutdown.hasCriticalOperations;
+    shutdown.interrupt('SIGINT');
+    if (!requestSignal?.aborted) bodyController.error(shutdown.signal.reason);
+    expect(await pending).toBe(shutdown.signal.reason);
+    expect(trackedDuringBody).toBe(true);
+    expect(shutdown.hasCriticalOperations).toBe(false);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture path built from this test's own mkdtempSync() dir, never user input
+    expect(existsSync(dest)).toBe(false);
+  });
 
   it('succeeds on the first attempt: file written, fetchImpl called once', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'stream-test-'));
     const dest = join(dir, 'out.bin');
     let calls = 0;
     const fetchImpl = async () => {
@@ -669,7 +720,6 @@ describe('streamUrlToFile retry', () => {
   });
 
   it('retries on transport error and succeeds: fetchImpl called twice, file written', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'stream-test-'));
     const dest = join(dir, 'out.bin');
     let calls = 0;
     const fetchImpl = async () => {
@@ -694,7 +744,7 @@ describe('streamUrlToFile retry', () => {
     try {
       await streamUrlToFile(
         'https://example.com/x?X-Amz-Signature=secret-token',
-        '/tmp/will-not-be-written',
+        join(dir, 'will-not-be-written'),
         fetchImpl as typeof globalThis.fetch,
         { sleep: noSleep },
       );
@@ -722,7 +772,7 @@ describe('streamUrlToFile retry', () => {
     try {
       await streamUrlToFile(
         presignedUrl,
-        '/tmp/will-not-be-written',
+        join(dir, 'will-not-be-written'),
         fetchImpl as typeof globalThis.fetch,
         { sleep: noSleep },
       );
@@ -741,7 +791,6 @@ describe('streamUrlToFile retry', () => {
   });
 
   it('disables automatic redirects so unsafe redirect targets cannot bypass URL validation', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'stream-test-'));
     const dest = join(dir, 'out.bin');
     const redirects: Array<RequestInit['redirect']> = [];
     const fetchImpl = async (_url: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
@@ -764,7 +813,7 @@ describe('streamUrlToFile retry', () => {
     await expect(
       streamUrlToFile(
         'https://example.com/x',
-        '/tmp/will-not-be-written',
+        join(dir, 'will-not-be-written'),
         fetchImpl as typeof globalThis.fetch,
         {
           sleep: ms => {

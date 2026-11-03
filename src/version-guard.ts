@@ -3,12 +3,14 @@
  *
  * The CLI targets modern Node (see `engines.node` in package.json). Running on
  * an older runtime tends to fail later with a cryptic ESM/syntax error, so the
- * entrypoint (`src/index.ts`) uses {@link shouldRejectNodeVersion} to exit early
+ * entrypoint (`src/index.ts`) uses {@link rejectUnsupportedNodeVersion} to exit early
  * with a clear, actionable message instead.
  *
  * The logic lives here (rather than inline) so it can be unit-tested against the
  * real implementation the entrypoint uses — not a copy.
  */
+
+import { writeSync } from 'node:fs';
 
 /** Canonical supported range, pinned to package.json by the unit test. */
 export const SUPPORTED_NODE_ENGINE = '^20.19.0 || ^22.13.0 || >=24';
@@ -62,4 +64,32 @@ export function shouldRejectNodeVersion(nodeVersion: string): boolean {
   if (major === 22) return minor < MIN_NODE_22_MINOR;
   if (major === 23) return true;
   return false;
+}
+
+export interface RejectUnsupportedNodeDeps {
+  writeStderr?: (message: string) => void;
+  exit?: (code: number) => void;
+}
+
+/** Write synchronously so an immediate exit cannot truncate piped stderr. */
+export function rejectUnsupportedNodeVersion(
+  nodeVersion: string,
+  deps: RejectUnsupportedNodeDeps = {},
+): void {
+  if (!shouldRejectNodeVersion(nodeVersion)) return;
+
+  const writeStderr =
+    deps.writeStderr ??
+    ((message: string) => {
+      try {
+        writeSync(process.stderr.fd, message);
+      } catch {
+        // Best-effort: the runtime still exits when stderr is unavailable.
+      }
+    });
+  const exit = deps.exit ?? ((code: number) => process.exit(code));
+  writeStderr(
+    `Error: testsprite requires Node.js ${SUPPORTED_NODE_RANGE} (found ${nodeVersion}).\nInstall a supported Node.js release from https://nodejs.org\n`,
+  );
+  exit(1);
 }

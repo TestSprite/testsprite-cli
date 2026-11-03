@@ -11,7 +11,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CLIError, ApiError } from '../lib/errors.js';
+import { CLIError, ApiError, InterruptError } from '../lib/errors.js';
 import type { FlakyReport } from '../lib/flaky.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { RerunAdvisory } from '../lib/runs.types.js';
@@ -211,6 +211,67 @@ describe('createTestCommand — flaky subcommand exposed', () => {
 // ---------------------------------------------------------------------------
 
 describe('runFlaky', () => {
+  it('does not start a rerun after the test-type lookup is interrupted', async () => {
+    const interruption = new InterruptError('SIGINT');
+    let postCount = 0;
+    const fetchImpl = (async (_input: FetchInput, init: RequestInit = {}) => {
+      if (init.method === 'POST') postCount += 1;
+      throw interruption;
+    }) as FetchImpl;
+    const { deps } = makeDeps(fetchImpl);
+
+    await expect(
+      runFlaky(
+        {
+          profile: 'default',
+          output: 'text',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+          testId: 'test_x',
+          runs: 2,
+          untilFail: false,
+          timeoutSeconds: 600,
+        },
+        deps,
+      ),
+    ).rejects.toBe(interruption);
+    expect(postCount).toBe(0);
+  });
+
+  it('propagates an interruption during a rerun trigger without starting another attempt', async () => {
+    const interruption = new InterruptError('SIGINT');
+    const { fetchImpl: baseFetch } = makeFlakyFetch({ statuses: [] });
+    let postCount = 0;
+    const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+      if (init.method === 'POST') {
+        postCount += 1;
+        throw interruption;
+      }
+      return baseFetch(input, init);
+    }) as FetchImpl;
+    const { deps, stdout } = makeDeps(fetchImpl);
+
+    await expect(
+      runFlaky(
+        {
+          profile: 'default',
+          output: 'json',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+          testId: 'test_x',
+          runs: 3,
+          untilFail: false,
+          timeoutSeconds: 600,
+        },
+        deps,
+      ),
+    ).rejects.toBe(interruption);
+    expect(postCount).toBe(1);
+    expect(stdout).toEqual([]);
+  });
+
   it('reports STABLE and exits 0 when every attempt passes', async () => {
     const { fetchImpl, triggerCount } = makeFlakyFetch({
       statuses: ['passed', 'passed', 'passed'],

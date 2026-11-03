@@ -21,9 +21,22 @@ import {
   makeHttpClient,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
-import { loadConfig } from '../lib/config.js';
-import { ApiError, CLIError, RequestTimeoutError, localValidationError } from '../lib/errors.js';
+import {
+  loadConfig,
+  resolveProfileName,
+  DEFAULT_API_URL,
+  normalizeEnvVar,
+  type Config,
+} from '../lib/config.js';
+import {
+  ApiError,
+  CLIError,
+  InterruptError,
+  RequestTimeoutError,
+  localValidationError,
+} from '../lib/errors.js';
 import type { FetchImpl } from '../lib/http.js';
+import { globalShutdown } from '../lib/interrupt.js';
 import type { CliOrgBinding, CliOrgSummary } from '../lib/org-render.js';
 import { formatOrgBinding, formatOrgsSummary, formatPersonalScopeHint } from '../lib/org-render.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
@@ -63,6 +76,8 @@ export interface DoctorDeps {
   env?: NodeJS.ProcessEnv;
   credentialsPath?: string;
   fetchImpl?: FetchImpl;
+  /** Process shutdown signal; injected for interrupt tests. */
+  shutdownSignal?: AbortSignal;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
   /** Project dir for the skill check. Defaults to `process.cwd()`. */
@@ -71,6 +86,8 @@ export interface DoctorDeps {
   nodeVersion?: string;
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
+  /** Config resolver. Defaults to `loadConfig`; injectable for tests. */
+  loadConfigFn?: typeof loadConfig;
 }
 
 type CommonOptions = FactoryCommonOptions;
@@ -81,12 +98,27 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   const cwd = deps.cwd ?? process.cwd();
   const nodeVersion = deps.nodeVersion ?? process.versions.node;
 
-  const config = loadConfig({
-    profile: opts.profile,
-    endpointUrl: opts.endpointUrl,
-    env,
-    credentialsPath: deps.credentialsPath,
-  });
+  const loadConfigFn = deps.loadConfigFn ?? loadConfig;
+  let config: ReturnType<typeof loadConfig>;
+  // Set when the credentials file exists but the OS refuses the read (e.g. a
+  // Windows ACL locked out by an affected CLI version): degrade, don't crash.
+  let credentialsReadError: string | undefined;
+  try {
+    config = loadConfigFn({
+      profile: opts.profile,
+      endpointUrl: opts.endpointUrl,
+      env,
+      credentialsPath: deps.credentialsPath,
+    });
+  } catch (error) {
+    if (!isFsPermissionError(error)) throw error;
+    credentialsReadError = error.code;
+    config = {
+      profile: resolveProfileName(opts.profile, env),
+      apiUrl: opts.endpointUrl ?? normalizeEnvVar(env.TESTSPRITE_API_URL) ?? DEFAULT_API_URL,
+      apiKey: normalizeEnvVar(env.TESTSPRITE_API_KEY),
+    };
+  }
   const endpointCheck = checkEndpoint(config.apiUrl);
   const hasKey = Boolean(config.apiKey);
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
@@ -94,6 +126,10 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   const connectivity = await checkConnectivity(opts, deps, {
     hasKey,
     endpointOk: endpointCheck.status === 'ok',
+    // Pass the already-resolved config down so the client below never re-reads
+    // the credentials file — with an ACL-bricked file a second read throws the
+    // same EPERM and surfaces as a bogus Connectivity failure.
+    config,
   });
 
   const checks: DoctorCheck[] = [
@@ -101,7 +137,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     checkNodeVersion(nodeVersion),
     { name: 'Profile', status: 'ok', detail: config.profile },
     endpointCheck,
-    checkCredentials(hasKey, config.profile, opts.dryRun ?? false),
+    checkCredentials(hasKey, config.profile, opts.dryRun ?? false, credentialsReadError),
     connectivity.check,
   ];
 
@@ -138,6 +174,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     await checkLocalTunnel(opts, deps, {
       hasKey,
       endpointOk: endpointCheck.status === 'ok',
+      config,
     }),
   );
 
@@ -160,6 +197,17 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     throw new CLIError(`doctor: ${failures} check(s) failed, ${warnings} warning(s)`, 1);
   }
   return report;
+}
+
+/** True for EPERM/EACCES fs errors — the signature of an unreadable credentials file. */
+function isFsPermissionError(error: unknown): error is NodeJS.ErrnoException {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    ((error as { code?: unknown }).code === 'EPERM' ||
+      (error as { code?: unknown }).code === 'EACCES')
+  );
 }
 
 function checkNodeVersion(nodeVersion: string): DoctorCheck {
@@ -187,7 +235,22 @@ function checkEndpoint(apiUrl: string): DoctorCheck {
   }
 }
 
-function checkCredentials(hasKey: boolean, profile: string, dryRun: boolean): DoctorCheck {
+function checkCredentials(
+  hasKey: boolean,
+  profile: string,
+  dryRun: boolean,
+  readError?: string,
+): DoctorCheck {
+  if (readError) {
+    return {
+      name: 'Credentials',
+      status: hasKey ? 'warn' : 'fail',
+      detail:
+        `credentials file exists but cannot be read (${readError}); its ACL may be locked out ` +
+        'by an earlier CLI version — delete the file and re-run `testsprite setup`' +
+        (hasKey ? ' (TESTSPRITE_API_KEY is set, so commands still work)' : ''),
+    };
+  }
   if (hasKey) {
     // Never print any part of the key (security). Confirm presence only.
     return {
@@ -223,7 +286,7 @@ function checkSkill(cwd: string, deps: DoctorDeps): DoctorCheck {
 async function checkConnectivity(
   opts: CommonOptions,
   deps: DoctorDeps,
-  ctx: { hasKey: boolean; endpointOk: boolean },
+  ctx: { hasKey: boolean; endpointOk: boolean; config: Config },
 ): Promise<{
   check: DoctorCheck;
   v3Enabled?: boolean;
@@ -243,6 +306,8 @@ async function checkConnectivity(
       credentialsPath: deps.credentialsPath,
       fetchImpl: deps.fetchImpl,
       stderr: deps.stderr,
+      config: ctx.config,
+      shutdownSignal: deps.shutdownSignal,
     });
     const me = await client.get<MeIdentity>('/me', { schema: ME_IDENTITY_SCHEMA });
     const who = me.userId ? ` (userId ${me.userId})` : '';
@@ -253,6 +318,7 @@ async function checkConnectivity(
       org: me.org,
     };
   } catch (error) {
+    if (error instanceof InterruptError) throw error;
     if (error instanceof ApiError) {
       if (
         error.code === 'AUTH_REQUIRED' ||
@@ -274,7 +340,7 @@ async function checkConnectivity(
 }
 
 /**
- * Can this key open a tunnel to this machine (`test run --local`)?
+ * Can this key open a tunnel for an environment on this machine?
  *
  * A READ, not a mint. `GET /tunnel/<random-uuid>` runs the same scope guard
  * and the same environment-configured check as the mint, and answers 404 for
@@ -282,19 +348,16 @@ async function checkConnectivity(
  * one of the caller's few concurrent live bindings or any rate-limit budget on
  * a diagnostic.
  *
- * The case this exists for: `run:tunnel` is the first scope deliberately kept
- * OUT of the grandfather grant, so a key minted before it — most keys in the
- * wild — gets a 403 the first time someone tries `--local`, and the remedy is
- * to mint a NEW key rather than to re-authenticate. Nothing else in the CLI
- * says that until a run has already been refused.
+ * Keys deliberately narrowed without `run:tunnel` receive a 403. Older
+ * servers may also exclude the scope from their legacy-key grant.
  *
- * Never `fail`: a caller who does not use `--local` should not see `doctor`
+ * Never `fail`: a caller who does not use a tunnel should not see `doctor`
  * exit 1 over a surface that is not even configured in their environment.
  */
 async function checkLocalTunnel(
   opts: CommonOptions,
   deps: DoctorDeps,
-  ctx: { hasKey: boolean; endpointOk: boolean },
+  ctx: { hasKey: boolean; endpointOk: boolean; config: Config },
 ): Promise<DoctorCheck> {
   const name = 'Local tunnel';
   if (opts.dryRun) return { name, status: 'warn', detail: 'skipped under --dry-run' };
@@ -302,6 +365,10 @@ async function checkLocalTunnel(
   if (!ctx.endpointOk) return { name, status: 'warn', detail: 'skipped; endpoint URL is invalid' };
 
   const controller = new AbortController();
+  const shutdownSignal = deps.shutdownSignal ?? globalShutdown.signal;
+  const onShutdown = () => controller.abort(shutdownSignal.reason);
+  if (shutdownSignal.aborted) onShutdown();
+  else shutdownSignal.addEventListener('abort', onShutdown, { once: true });
   const probeTimer = setTimeout(() => {
     controller.abort(new RequestTimeoutError(DOCTOR_TUNNEL_PROBE_TIMEOUT_MS));
   }, DOCTOR_TUNNEL_PROBE_TIMEOUT_MS);
@@ -314,9 +381,9 @@ async function checkLocalTunnel(
         credentialsPath: deps.credentialsPath,
         fetchImpl: deps.fetchImpl,
         stderr: deps.stderr,
-        // The retry sleeper listens to the client shutdown signal, so using
-        // the probe deadline here bounds attempts and Retry-After sleeps as
-        // one operation rather than timing each fetch independently.
+        config: ctx.config,
+        // The retry sleeper listens to the client shutdown signal. Compose
+        // the probe deadline with process shutdown so either aborts the fetch.
         shutdownSignal: controller.signal,
       },
     );
@@ -330,6 +397,7 @@ async function checkLocalTunnel(
       detail: 'unexpected: the server resolved a probe id that should belong to nobody',
     };
   } catch (error) {
+    if (error instanceof InterruptError) throw error;
     if (!(error instanceof ApiError)) {
       return {
         name,
@@ -338,27 +406,32 @@ async function checkLocalTunnel(
       };
     }
     if (error.code === 'NOT_FOUND') {
-      return { name, status: 'ok', detail: 'available; this key can open a tunnel (--local)' };
+      return {
+        name,
+        status: 'ok',
+        detail: 'available; this key can open a tunnel for an environment on this machine',
+      };
     }
     if (error.code === 'AUTH_FORBIDDEN') {
       return {
         name,
         status: 'warn',
         detail:
-          'this API key cannot open a tunnel — it predates the `run:tunnel` scope. ' +
-          'Mint a new API key in the dashboard to use `test run --local`.',
+          'this API key does not have the `run:tunnel` scope. ' +
+          'Mint a new API key with that scope in the dashboard to run an environment on this machine.',
       };
     }
     if (error.code === 'UNAVAILABLE') {
       return {
         name,
         status: 'warn',
-        detail: '`test run --local` is not available on this endpoint',
+        detail: 'tunnels for environments on this machine are not available on this endpoint',
       };
     }
     return { name, status: 'warn', detail: `could not check (${error.code})` };
   } finally {
     clearTimeout(probeTimer);
+    shutdownSignal.removeEventListener('abort', onShutdown);
   }
 }
 
@@ -398,8 +471,9 @@ function renderDoctor(report: DoctorReport): string {
 
 export function createDoctorCommand(deps: DoctorDeps = {}): Command {
   const cmd = new Command('doctor')
+    .summary('Diagnose CLI setup: credentials, connectivity, skill')
     .description(
-      'Diagnose CLI setup: version, Node, profile, endpoint, credentials, connectivity, skill',
+      'Diagnose CLI setup: version, Node, profile, endpoint, credentials, API connectivity, workspace routing, tunnel permission (run:tunnel) and the verify skill in this directory. Exit 1 if any check fails; warnings do not.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .addHelpText(
@@ -410,18 +484,18 @@ export function createDoctorCommand(deps: DoctorDeps = {}): Command {
         '  testsprite doctor && testsprite test run <id>   # gate a command on a healthy setup',
     )
     .action(async (_cmdOpts, command: Command) => {
-      await runDoctor(resolveCommonOptions(command), deps);
+      await runDoctor(resolveCommonOptions(command, deps.env), deps);
     });
 
   return cmd;
 }
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
   return {
-    profile: globals.profile ?? 'default',
+    profile: resolveProfileName(globals.profile, env),
     output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,

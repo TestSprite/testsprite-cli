@@ -8,7 +8,7 @@
  *   - kind discriminator: 'flag' renders `Flag \`--field\`` in nextAction;
  *     'field' renders `Field \`field\`` in nextAction
  *   - Envelope snapshot tests: full VALIDATION_ERROR envelope byte-for-byte per
- *     helper per violation type (codex round-2 finding #3 regression net)
+ *     helper per violation type, guarding against silent regressions
  *   - allowEmpty / minLength precedence documented + tested
  */
 import { describe, expect, it } from 'vitest';
@@ -95,7 +95,7 @@ describe('requireString', () => {
     expect(err.nextAction).toMatch(/Flag `--code-file`/);
   });
 
-  // --- Envelope snapshot tests (codex round-2, finding #3) ---
+  // --- Envelope snapshot tests ---
 
   it('envelope snapshot: missing value (undefined), kind=field', () => {
     const err = asValidationError(thrownFrom(() => requireString('projectId', undefined)));
@@ -206,7 +206,7 @@ describe('requireEnum', () => {
     expect(err.nextAction).toMatch(/Flag `--test-type`/);
   });
 
-  // --- Envelope snapshot tests (codex round-2, finding #1 + #3) ---
+  // --- Envelope snapshot tests ---
 
   it('envelope snapshot: wrong value, 2-item enum, kind=field', () => {
     const err = asValidationError(thrownFrom(() => requireEnum('type', 'observe', accepted)));
@@ -349,7 +349,7 @@ describe('requireArrayLength', () => {
     expect(err.nextAction).toMatch(/Flag `--page-size`/);
   });
 
-  // --- Envelope snapshot tests (codex round-2, finding #3) ---
+  // --- Envelope snapshot tests ---
 
   it('envelope snapshot: non-array value, kind=field', () => {
     const err = asValidationError(

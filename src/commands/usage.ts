@@ -12,13 +12,14 @@
  */
 
 import { Command } from 'commander';
+import { formatWorkspaceStatus, type WorkspaceStatus } from '../lib/workspace-status.js';
 import {
   emitDryRunBanner,
   makeHttpClient,
   parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
-import { loadConfig } from '../lib/config.js';
+import { loadConfig, resolveProfileName } from '../lib/config.js';
 import { resolvePortalBase } from '../lib/facade.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { CliOrgBinding, CliOrgSummary } from '../lib/org-render.js';
@@ -93,6 +94,8 @@ export interface ActiveOrg {
   /** Monthly per-seat credit allowance for the org's plan. */
   includedCredits: number;
   seats: number;
+  /** Billing standing (paused / pending / ok). Absent on an older backend. */
+  workspace?: WorkspaceStatus;
 }
 
 export interface UsageDeps {
@@ -251,6 +254,10 @@ function renderUsage(u: UsageResponse, portalBase?: string): string {
     lines.push('--- organization ---');
     lines.push(`org:          ${org.name} (${org.role})`);
     lines.push(`plan:         ${org.plan}`);
+    // A paused workspace cannot spend this balance at all; a payment-pending
+    // one keeps spending but gets no refill. Both are worth a line here.
+    const standing = formatWorkspaceStatus(org.workspace);
+    if (standing) lines.push(`state:        ${standing}`);
     // Labeled `balance:` (not `credits:`) — `--output json` exposes the
     // legacy per-user number under `.credits`, and giving the org wallet the
     // same label in text mode would make one word mean two different values.
@@ -353,6 +360,7 @@ function renderUsage(u: UsageResponse, portalBase?: string): string {
 export function createUsageCommand(deps: UsageDeps = {}): Command {
   const cmd = new Command('usage')
     .alias('credits')
+    .summary('Show credit balance and plan info')
     .description(
       'Show credit balance and plan/entitlement info (proactive pre-flight before a large test run)',
     )
@@ -374,18 +382,18 @@ export function createUsageCommand(deps: UsageDeps = {}): Command {
         '  organization-bound.',
     )
     .action(async (_cmdOpts, command: Command) => {
-      await runUsage(resolveCommonOptions(command), deps);
+      await runUsage(resolveCommonOptions(command, deps.env), deps);
     });
 
   return cmd;
 }
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
   return {
-    profile: globals.profile ?? 'default',
+    profile: resolveProfileName(globals.profile, env),
     output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,

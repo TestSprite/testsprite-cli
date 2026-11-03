@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
-import { ApiError } from '../lib/errors.js';
+import { ApiError, InterruptError } from '../lib/errors.js';
 import type { CancelRunResponse } from '../lib/runs.types.js';
 import { runTestCancel, type CliCancelSummary } from './test.js';
 
@@ -293,6 +293,31 @@ describe('runTestCancel — single id happy path', () => {
 // ---------------------------------------------------------------------------
 
 describe('runTestCancel — multi-id summary + exit precedence (CXL-11)', () => {
+  it('stops cancelling remaining runs after an interrupted request', async () => {
+    const { credentialsPath } = makeCreds();
+    const interruption = new InterruptError('SIGINT');
+    const cancelled: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      cancelled.push(url);
+      if (cancelled.length === 1) throw interruption;
+      return { body: makeCancelResponse('run_2') };
+    });
+
+    await expect(
+      runTestCancel(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: false,
+          runIds: ['run_1', 'run_2'],
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toBe(interruption);
+    expect(cancelled).toHaveLength(1);
+  });
+
   it('all cancelled/alreadyCancelled → exit 0, summary buckets correct', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(url => {

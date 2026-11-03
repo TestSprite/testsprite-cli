@@ -3,6 +3,7 @@ import { rename, stat, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { localValidationError, TransportError } from './errors.js';
+import { isNonDispatchedStatus, type CiSummary } from './gh-output.js';
 
 export type JUnitReportFormat = 'junit';
 
@@ -13,7 +14,11 @@ export interface JUnitTestResult {
   status: string;
   /** Observed on polled runs; used for classname when --project is omitted. */
   projectId?: string;
+  /** This row's own `classname`, when the batch spans several projects. */
+  classname?: string;
   error?: { code: string; message: string; exitCode?: number };
+  /** Why a member was skipped before dispatch. */
+  skipReason?: string;
   /**
    * Human-readable test name for the `testcase name` attribute. Falls back to
    * `testId` when absent (older data / a run whose name could not be resolved).
@@ -22,7 +27,7 @@ export interface JUnitTestResult {
   name?: string;
   /**
    * Wall-clock duration of the run in seconds, for `testcase time`. Derived from
-   * the poll result's `startedAt`/`finishedAt`; omitted when timing is absent
+   * the poll result's `startedAt` (or `createdAt`) and `finishedAt`; omitted when timing is absent
    * (rendered as `0`, the pre-fix behaviour).
    */
   durationSeconds?: number;
@@ -30,12 +35,15 @@ export interface JUnitTestResult {
 
 /**
  * Duration in seconds between two ISO timestamps, or `undefined` when either is
- * missing / unparseable / negative (clock skew). Kept ≥ 0.
+ * missing / unparseable / negative (clock skew). Prefer startedAt, falling back
+ * to createdAt on servers that do not record a start. Kept ≥ 0.
  */
 export function durationSecondsBetween(
   startedAt: string | null | undefined,
   finishedAt: string | null | undefined,
+  createdAt?: string | null,
 ): number | undefined {
+  startedAt = startedAt ?? createdAt;
   if (!startedAt || !finishedAt) return undefined;
   const start = Date.parse(startedAt);
   const end = Date.parse(finishedAt);
@@ -116,12 +124,17 @@ export function assertJUnitReportOptions(opts: JUnitReportFlagOptions): void {
  * Prefer explicit `--project`, then ids observed on polled run rows.
  */
 export function resolveBatchReportProjectId(
-  opts: { projectId?: string },
+  opts: { projectId?: string; projectIdByTestId?: ReadonlyMap<string, string> },
   results: ReadonlyArray<{ projectId?: string }>,
 ): string {
   if (opts.projectId) return opts.projectId;
+  // Explicit ids that span several projects have no single `--project`; each
+  // row carries its own project as its classname and the suite gets this token.
+  const known = new Set(opts.projectIdByTestId?.values());
+  if (known.size > 1) return 'multiple-projects';
   const fromPoll = results.map(r => r.projectId).find((id): id is string => !!id);
   if (fromPoll) return fromPoll;
+  if (known.size === 1) return [...known][0]!;
   throw localValidationError(
     'project',
     '--report junit requires --project <id> when the project cannot be inferred from run results',
@@ -144,7 +157,7 @@ type JUnitOutcome = 'passed' | 'failure' | 'error' | 'skipped';
 
 function classifyJUnitOutcome(status: string, error?: JUnitTestResult['error']): JUnitOutcome {
   if (status === 'passed') return 'passed';
-  if (status === 'skipped') return 'skipped';
+  if (isNonDispatchedStatus(status)) return 'skipped';
   if (status === 'error' || error?.exitCode === 3) return 'error';
   return 'failure';
 }
@@ -197,7 +210,9 @@ function renderTestcase(result: JUnitTestResult, classname: string): string {
     );
     lines.push(`      <error message="${message}" type="${type}">${body}</error>`);
   } else if (outcome === 'skipped') {
-    lines.push(`      <skipped/>`);
+    lines.push(
+      `      <skipped message="${escapeXml(result.skipReason ?? failureMessage(result))}"/>`,
+    );
   }
 
   lines.push('    </testcase>');
@@ -205,7 +220,7 @@ function renderTestcase(result: JUnitTestResult, classname: string): string {
 }
 
 /**
- * Build a JUnit XML document from batch poll results. Per-`testcase` `time` is
+ * Build a JUnit XML document from batch results, including skipped members. Per-`testcase` `time` is
  * the run's wall-clock duration (from `startedAt`/`finishedAt`); the `testsuite`
  * `time` is their sum. `time` falls back to `0` for a run with no timing.
  */
@@ -227,7 +242,7 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
   }
 
   const suiteName = escapeXml(opts.suiteName);
-  const testcases = results.map(r => renderTestcase(r, opts.classname)).join('\n');
+  const testcases = results.map(r => renderTestcase(r, r.classname ?? opts.classname)).join('\n');
 
   return [
     XML_DECL,
@@ -238,6 +253,25 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
     '</testsuites>',
     '',
   ].join('\n');
+}
+
+/**
+ * The summary's non-dispatched rows (deferred / conflict / not-found) as
+ * skipped JUnit results. Accepted rows carry run statuses and today never
+ * match `isNonDispatchedStatus`, but the two vocabularies are only disjoint
+ * by convention: `skipped` is a word both could use. So a member already in
+ * `dispatched` (the polled results the caller is writing) is left out here
+ * rather than trusted to stay apart, which keeps `tests` from counting one
+ * member twice if the server ever reports such a status for an admitted run.
+ */
+export function skippedJUnitResultsFromSummary(
+  summary: CiSummary,
+  dispatched: ReadonlyArray<Pick<JUnitTestResult, 'testId'>> = [],
+): JUnitTestResult[] {
+  const alreadyIncluded = new Set(dispatched.map(row => row.testId));
+  return summary.runs
+    .filter(row => isNonDispatchedStatus(row.status) && !alreadyIncluded.has(row.testId))
+    .map(row => ({ testId: row.testId, status: 'skipped', skipReason: row.error ?? row.status }));
 }
 
 async function assertReportFileParent(rawPath: string): Promise<string> {

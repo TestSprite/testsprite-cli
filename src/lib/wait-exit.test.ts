@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { resolveWaitFailure, type WaitMemberResult } from './wait-exit.js';
+import { resolveWaitFailure, waitMemberError, type WaitMemberResult } from './wait-exit.js';
 import { ApiError, CLIError } from './errors.js';
+import { classifyBillingRefusal } from './billing-refusal.js';
 
 const OPTS = { timeoutSeconds: 600 };
 const err = (code: string, exitCode: number): WaitMemberResult['error'] => ({
@@ -10,6 +11,107 @@ const err = (code: string, exitCode: number): WaitMemberResult['error'] => ({
 });
 
 describe('resolveWaitFailure — --wait fan-out exit-code precedence', () => {
+  it('preserves billing refusal details and links from a member error', () => {
+    const action = 'Renew at https://portal.example/dashboard-v3/o/org-1/settings/billing.';
+    const f = resolveWaitFailure(
+      [
+        {
+          status: 'error',
+          testId: 't1',
+          runId: 'r1',
+          error: {
+            code: 'FEATURE_GATED',
+            message: 'Workspace paused.',
+            exitCode: 13,
+            nextAction: action,
+            requestId: 'req_hold',
+            details: { reason: 'billing_hold', state: 'paused', orgId: 'org-1' },
+            apiUrl: 'https://unknown-api.example',
+          } as WaitMemberResult['error'],
+        },
+      ],
+      OPTS,
+    ) as ApiError;
+    expect(f.code).toBe('FEATURE_GATED');
+    expect(f.nextAction).toBe(action);
+    expect(f.details.reason).toBe('billing_hold');
+    expect(classifyBillingRefusal(f)?.links.billing).toBe(
+      'https://portal.example/dashboard-v3/o/org-1/settings/billing',
+    );
+  });
+
+  it('does not turn a rollout member error into an upgrade hint', () => {
+    const rollout = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'FEATURE_GATED',
+          message: 'Rollout is disabled.',
+          nextAction: 'Wait for rollout.',
+          requestId: 'req_rollout',
+          details: { reason: 'rollout' },
+        },
+      },
+      403,
+    );
+    const f = resolveWaitFailure(
+      [{ status: 'error', testId: 't2', runId: 'r2', error: waitMemberError(rollout) }],
+      OPTS,
+    ) as ApiError;
+    expect(f.details.reason).toBe('rollout');
+    expect(f.nextAction).toBe('Wait for rollout.');
+    expect(classifyBillingRefusal(f)).toBeUndefined();
+    // The reason survives (asserted above); the runId/testId merge must too —
+    // a rollout member error must not become a bare `{ reason: 'rollout' }`
+    // with no run to point the caller at.
+    expect(f.details.runId).toBe('r2');
+    expect(f.details.testId).toBe('t2');
+  });
+
+  it('waitMemberError keeps the enumerable member-error shape exactly {code, message, exitCode} — even for a rollout gate', () => {
+    // The envelope metadata (nextAction/details/requestId/apiUrl) that
+    // resolveWaitFailure needs must travel out of band, never as enumerable
+    // properties: this object is what lands verbatim in `--output json`
+    // stdout's `accepted[]` / `results[]`, and it must stay byte-identical
+    // to what it was before billing refusals existed.
+    const rollout = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'FEATURE_GATED',
+          message: 'Rollout is disabled.',
+          nextAction: 'Wait for rollout.',
+          requestId: 'req_rollout',
+          details: { reason: 'rollout' },
+        },
+      },
+      403,
+    );
+    const memberError = waitMemberError(rollout);
+    expect(Object.keys(memberError).sort()).toEqual(['code', 'exitCode', 'message'].sort());
+    expect(JSON.stringify(memberError)).toBe(
+      JSON.stringify({ code: 'FEATURE_GATED', message: 'Rollout is disabled.', exitCode: 13 }),
+    );
+  });
+
+  it('merges the server details with runId/testId for a paused-workspace member built through waitMemberError', () => {
+    const hold = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'FEATURE_GATED',
+          message: 'Workspace paused.',
+          nextAction: 'Renew at https://portal.example/dashboard/settings/billing.',
+          requestId: 'req_hold',
+          details: { reason: 'billing_hold', state: 'paused' },
+        },
+      },
+      403,
+    );
+    const f = resolveWaitFailure(
+      [{ status: 'error', testId: 't3', runId: 'r3', error: waitMemberError(hold) }],
+      OPTS,
+    ) as ApiError;
+    expect(f.details).toMatchObject({ reason: 'billing_hold', runId: 'r3', testId: 't3' });
+    expect(f.nextAction).toContain('/dashboard/settings/billing');
+  });
   it('all passed → null (exit 0)', () => {
     expect(resolveWaitFailure([{ status: 'passed' }, { status: 'passed' }], OPTS)).toBeNull();
   });
@@ -106,6 +208,46 @@ describe('resolveWaitFailure — --wait fan-out exit-code precedence', () => {
     ) as ApiError;
     expect(f.exitCode).toBe(12);
     expect(f.code).toBe('INSUFFICIENT_CREDITS');
+  });
+
+  it('a paused workspace outranks a plain credits shortfall when every operational member is a billing refusal', () => {
+    // Narrow exception to the table above: paying credits cannot resume a
+    // paused workspace, so a mixed paused+credits batch must surface paused
+    // (exit 13), not let INSUFFICIENT_CREDITS's higher table position win.
+    const hold = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'FEATURE_GATED',
+          message: 'Workspace paused.',
+          nextAction: '',
+          requestId: 'req_hold',
+          details: { reason: 'billing_hold', state: 'paused' },
+        },
+      },
+      403,
+    );
+    const credits = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'INSUFFICIENT_CREDITS',
+          message: 'Need more credits.',
+          nextAction: '',
+          requestId: 'req_credits',
+          details: { required: 2 },
+        },
+      },
+      402,
+    );
+    const f = resolveWaitFailure(
+      [
+        { status: 'error', runId: 'r1', testId: 't1', error: waitMemberError(credits) },
+        { status: 'error', runId: 'r2', testId: 't2', error: waitMemberError(hold) },
+      ],
+      OPTS,
+    ) as ApiError;
+    expect(f.code).toBe('FEATURE_GATED');
+    expect(f.exitCode).toBe(13);
+    expect(f.details.reason).toBe('billing_hold');
   });
 
   it('CLIENT_TOO_OLD (14) outranks a transient RATE_LIMITED (11) — non-retriable wins (§5)', () => {

@@ -18,8 +18,13 @@
  * Callers pass the flag name so the envelope names the flag the user actually
  * typed — one helper serves `--password-file` today and the remaining
  * credential/auto-auth file flags once they are migrated.
+ *
+ * The check (is this a regular file?) and the use (read its bytes) happen
+ * against a single open file descriptor rather than against the path twice,
+ * so nothing can be swapped in between: whatever `openSync` resolved is
+ * exactly what `fstatSync` classifies and `readFileSync` reads.
  */
-import { readFileSync, statSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readFileSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import { localValidationError } from './errors.js';
 
@@ -40,26 +45,65 @@ import { localValidationError } from './errors.js';
 export function readSecretFileGuarded(flag: string, path: string): string {
   const absolute = isAbsolute(path) ? path : resolve(process.cwd(), path);
 
-  let stat;
+  let fd: number;
   try {
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- this is the guard itself: `absolute` is the user-supplied `--*-file` path after isAbsolute()/resolve() normalization, and this statSync().isFile() check (below) plus the try/catch mapping every errno to a typed VALIDATION_ERROR is exactly the mitigation for a non-literal fs path here.
-    stat = statSync(absolute);
+    // O_NONBLOCK matters here specifically because this is a *-file flag:
+    // a plain `open(path, O_RDONLY)` on a FIFO with no writer blocks the
+    // calling thread until one connects (POSIX fifo(7)), and since this is
+    // a synchronous fs call on Node's single main thread, that blocks the
+    // entire CLI process -- including its SIGINT handler, since delivering
+    // that signal to JS requires the (blocked) event loop to run. The old
+    // statSync()-first code rejected a FIFO instantly via `isFile()` before
+    // ever opening it; O_NONBLOCK restores that instant-fail behavior by
+    // making the open itself return right away instead of waiting for a
+    // writer, so the existing fstatSync().isFile() check below still does
+    // the rejecting. It has no effect on a regular file's read semantics.
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- this is the guard itself: `absolute` is the user-supplied --*-file path after isAbsolute()/resolve(); everything after (fstat, then read) uses the fd this open() returns, not the path string, which is the mitigation for a non-literal fs path here.
+    fd = openSync(absolute, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
   } catch (err) {
+    // Opening a directory succeeds on POSIX (the fstat().isFile() check
+    // below is the gate for that case) but can fail right here on other
+    // platforms, and not always with the same errno a directory produces
+    // elsewhere. Classify the failure by re-stat'ing the path once,
+    // diagnostically, before falling back to errno-based mapping: nothing is
+    // read as a result, so this cannot reintroduce a check-then-use race —
+    // it only decides which message to throw for an open() that already
+    // failed.
+    let isDir = false;
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- diagnostic only, to pick an error message for the open() failure above; no data is read from `absolute` here or afterward.
+      isDir = statSync(absolute).isDirectory();
+    } catch {
+      // Path vanished or became inaccessible between the failed open() and
+      // this diagnostic stat — fall through to the errno-based mapping,
+      // which still accurately reports that the open() failed.
+    }
+    if (isDir) {
+      throw localValidationError(flag, `not a regular file: ${path}`);
+    }
     throw secretFileError(flag, path, err, 'stat');
   }
 
-  // A directory would otherwise reach readFileSync and throw EISDIR on Linux
-  // while resolving to an empty read on some platforms — reject it up front so
-  // the contract is the same everywhere.
-  if (!stat.isFile()) {
-    throw localValidationError(flag, `not a regular file: ${path}`);
-  }
-
   try {
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same guarded path as the statSync() above: `absolute` already passed the isFile() regular-file check, so this read is the guard's intended purpose (reading a user-supplied secret path), not an unvalidated pass-through.
-    return readFileSync(absolute, 'utf8').trim();
-  } catch (err) {
-    throw secretFileError(flag, path, err, 'read');
+    let stat;
+    try {
+      stat = fstatSync(fd);
+    } catch (err) {
+      throw secretFileError(flag, path, err, 'stat');
+    }
+
+    if (!stat.isFile()) {
+      throw localValidationError(flag, `not a regular file: ${path}`);
+    }
+
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `fd` is the open file descriptor from openSync() above, not a path string; the rule's non-literal-argument check does not distinguish the two, but there is no path re-resolution here for anything to race against.
+      return readFileSync(fd, 'utf8').trim();
+    } catch (err) {
+      throw secretFileError(flag, path, err, 'read');
+    }
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -83,6 +127,18 @@ function secretFileError(
   }
   if (code === 'EISDIR') {
     return localValidationError(flag, `not a regular file: ${path}`);
+  }
+  if (code === 'EMFILE' || code === 'ENFILE') {
+    // The old stat-then-read code's statSync() opens no file descriptor, so
+    // it always succeeded even with the process's fd table exhausted; only
+    // the later readFileSync (which does open one) could hit EMFILE/ENFILE,
+    // landing in the generic "cannot read" wording. The fd-based guard's
+    // openSync is the first fs call here, so the same exhaustion now surfaces
+    // at what looks like the "stat" step; route it to the same "cannot read"
+    // wording regardless of `verb` so fd-table exhaustion always reads the
+    // same as it did before, no matter which syscall actually hit the ceiling.
+    const reason = err instanceof Error ? err.message : 'unknown error';
+    return localValidationError(flag, `cannot read ${path}: ${reason}`);
   }
   const reason = err instanceof Error ? err.message : 'unknown error';
   return localValidationError(flag, `cannot ${verb} ${path}: ${reason}`);

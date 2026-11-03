@@ -1,6 +1,6 @@
 ---
 name: testsprite-onboard
-description: Stand up a complete, runnable TestSprite test suite for the current repo at first use — create a project (with a target URL and auth), derive a coherent set of tests from the codebase, batch-create them, and smoke-run a few to a green verdict so the user immediately has something worth running. Use ONLY when a repo has no TestSprite tests yet (a fresh project), right after `testsprite setup`, or when the user asks to "set up / bootstrap / seed tests". This is first-run setup, NOT change verification — once a project already has tests, use the testsprite-verify skill instead.
+description: Stand up a complete, runnable TestSprite test suite for the current repo at first use — create a project (with a target URL and auth), generate a coherent set of tests (or derive and batch-create them from the codebase), and smoke-run a few to a green verdict so the user has something worth running. Use ONLY when a repo has no TestSprite tests yet (a fresh project), right after `testsprite setup`, or when the user asks to "set up / bootstrap / seed tests". This is first-run setup, NOT change verification — once a project already has tests, use the testsprite-verify skill instead.
 ---
 
 <!--

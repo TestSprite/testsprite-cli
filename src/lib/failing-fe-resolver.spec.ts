@@ -215,11 +215,11 @@ describe('resolveFailingFrontendTestId', () => {
     expect(result.reason).toContain('2026-05-27T09:00:00Z');
   });
 
-  // DEV-393: dedicated pinned fixture must win over a fresher incidental
-  // failure — live-reproduced 2026-07-16 (a passingFrontendTestId fresh-run
-  // flip immediately outranked a dedicated "always red" fixture by
-  // updatedAt). See ResolverOptions.preferredId doc comment.
-  describe('preferredId (DEV-393 pinned-fixture preference)', () => {
+  // A dedicated pinned fixture must win over a fresher incidental failure —
+  // live-reproduced 2026-07-16 (a passingFrontendTestId fresh-run flip
+  // immediately outranked a dedicated "always red" fixture by updatedAt).
+  // See ResolverOptions.preferredId doc comment.
+  describe('preferredId (pinned-fixture preference)', () => {
     test('prefers the pinned id over a fresher candidate when the direct probe is non-ok', async () => {
       // Probe answers HTTP 500 (not ok, no throw) → falls through to the list
       // scan, where the in-candidates preference must still pick the pinned id.
@@ -271,7 +271,7 @@ describe('resolveFailingFrontendTestId', () => {
       expect(result.testId).toBe('test_new');
     });
 
-    // Codex F3: the direct probe makes the preference immune to the maxPages
+    // The direct probe makes the preference immune to the maxPages
     // list-scan cap — a pinned fixture beyond the last scanned page must
     // still win, without any list call at all on the happy path.
     test('direct probe wins without any list call when the pinned test is failed', async () => {
@@ -339,7 +339,7 @@ describe('resolveFailingFrontendTestId', () => {
       expect(routed.counts()).toEqual({ listCalls: 1, preferredCalls: 1 });
     });
 
-    test('direct probe on a pinned test from a DIFFERENT project falls through (codex round 2)', async () => {
+    test('direct probe on a pinned test from a DIFFERENT project falls through', async () => {
       // The pin points at a genuinely failed FE test — but in another
       // project. The old list scan (projectId-filtered server-side) would
       // never have returned it, so the direct probe must not let it win.

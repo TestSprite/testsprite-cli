@@ -1,25 +1,30 @@
-# backport-dispatch.yml — OPTIONAL latency optimization for DEV-352's
+# backport-dispatch.yml — OPTIONAL latency optimization for atlas's
 # auto-backport bot. Authored in atlas (release/public path), ships to the
 # PUBLIC repo via the snapshot per invariant I0 — this workflow only ever
 # runs on the public repo, never on atlas (see the repo guard below).
 #
-# NOT YET ARMED (2026-07-15): the atlas-side auto-backport.yml has a
-# scheduled SWEEP (every 30 min) that scans merged public PRs anonymously
-# and backports anything unabsorbed — the whole pipeline is fully
-# functional with ZERO public-repo credentials via that path alone. This
-# workflow instantly notifies atlas the moment a PR merges instead of
-# waiting for the next sweep (seconds vs. up to 30 minutes) — a nice-to-have,
-# not a requirement.
+# NOT ARMED by default: the atlas-side auto-backport.yml has a scheduled
+# SWEEP (every ~30 min) that scans merged public PRs anonymously and
+# backports anything unabsorbed — the whole pipeline is fully functional
+# with ZERO public-repo credentials via that path alone. This workflow only
+# shaves that latency down to seconds (instead of up to ~30 minutes) when a
+# dedicated credential is configured — a nice-to-have, never a requirement.
 #
-# Arming it means placing a GitHub App credential with contents:write on
-# the PRIVATE atlas repo into THIS PUBLIC repo's secrets — a real trust
-# decision (a compromised public-repo secret store would let an attacker
-# push to atlas) that is deliberately left to the operator, not decided by
-# this file. Until TESTSPRITE_HOB_APP_ID/TESTSPRITE_HOB_PRIVATE_KEY (or the
-# ALFHEIM_AGENT_* fallback) exist on the PUBLIC repo with contents:write on
-# atlas, this workflow no-ops cleanly (see the "not armed" step) — it does
-# NOT fail loud, so it stays quiet for every contributor watching the
-# Actions tab until the operator decides to enable it.
+# Arming it means creating a NEW, single-purpose GitHub App and never
+# reusing a broader-scoped one that already exists for something else:
+#   - permission: contents:write on the target repo, and ONLY that
+#   - installed ONLY on TestSprite/testsprite-cli-atlas — never org-wide
+#   - its App ID / private key stored as BACKPORT_DISPATCH_APP_ID /
+#     BACKPORT_DISPATCH_APP_PRIVATE_KEY secrets on THIS (public) repo
+# Placing a cross-repo push credential into a public repo's secret store is
+# a real trust decision (a compromised secret store would let an attacker
+# push to atlas) — left to the operator, not decided by this file, and
+# never satisfied by falling back to some other App this org already runs
+# for an unrelated purpose (broader install footprint, broader
+# permissions — a strictly worse blast radius for no benefit here). Until
+# both secrets above exist on this repo, this workflow no-ops cleanly (see
+# the final step) — it does NOT fail loud, so it stays quiet for every
+# contributor watching the Actions tab.
 #
 # SECURITY: this workflow reads ONLY event metadata (PR number, merge SHA,
 # base ref) — it never checks out the merged PR's code. That is what makes
@@ -43,13 +48,17 @@ jobs:
   notify:
     if: github.repository == 'TestSprite/testsprite-cli' && github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    env:
+      BACKPORT_DISPATCH_APP_ID: ${{ secrets.BACKPORT_DISPATCH_APP_ID }}
+      BACKPORT_DISPATCH_APP_PRIVATE_KEY: ${{ secrets.BACKPORT_DISPATCH_APP_PRIVATE_KEY }}
     steps:
       - id: app-token
+        if: env.BACKPORT_DISPATCH_APP_ID != ''
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.TESTSPRITE_HOB_APP_ID || secrets.ALFHEIM_AGENT_APP_ID }}
-          private-key: ${{ secrets.TESTSPRITE_HOB_PRIVATE_KEY || secrets.ALFHEIM_AGENT_PRIVATE_KEY }}
+          app-id: ${{ env.BACKPORT_DISPATCH_APP_ID }}
+          private-key: ${{ env.BACKPORT_DISPATCH_APP_PRIVATE_KEY }}
           owner: TestSprite
           repositories: testsprite-cli-atlas
           # Minimum required for POST /repos/{owner}/{repo}/dispatches (verified
@@ -77,7 +86,18 @@ jobs:
             -F "client_payload[merge_commit_sha]=$MERGE_SHA" \
             -F "client_payload[base_ref]=$BASE_REF"
 
-      - name: Not armed yet — the atlas sweep will pick this up
-        if: steps.app-token.outputs.token == ''
+      - name: No dedicated dispatch credential configured
+        if: env.BACKPORT_DISPATCH_APP_ID == ''
         run: |
-          echo "::notice::No cross-repo credential configured on this repo yet — atlas's scheduled sweep (auto-backport.yml, every 30 min) will pick up this merge instead of an instant dispatch. See DEV-352 / DEV-348 / DEV-350 for the operator decision to arm this."
+          echo "::notice::No dedicated backport-dispatch credential is configured on this repo — atlas's scheduled sweep picks up this merge within about half an hour instead of an instant dispatch."
+
+      # Distinct from the "not configured" case above: an ID is set but the
+      # mint step (continue-on-error: true) failed anyway, e.g. the App
+      # isn't actually installed on this repo, or the private key is wrong
+      # or missing. Both cases leave steps.app-token.outputs.token == '',
+      # so without this split a broken credential silently reads as "never
+      # armed" instead of "armed but broken".
+      - name: Dispatch credential configured but the token mint failed
+        if: env.BACKPORT_DISPATCH_APP_ID != '' && steps.app-token.outputs.token == ''
+        run: |
+          echo "::warning::BACKPORT_DISPATCH_APP_ID is configured but the token mint failed (check the App's installation on atlas and BACKPORT_DISPATCH_APP_PRIVATE_KEY) — falling back to the scheduled sweep this run."

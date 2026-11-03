@@ -1,6 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { Command } from 'commander';
+import { resolveProfileName } from '../lib/config.js';
 import type { CommonOptions as FactoryCommonOptions } from '../lib/client-factory.js';
 import { CLIError, localValidationError } from '../lib/errors.js';
 import type { OutputMode } from '../lib/output.js';
@@ -329,7 +330,7 @@ export type InstallAction =
 
 /**
  * Actions that mean bytes actually changed on disk — the trigger set for the
- * post-install reload hint (DEV-279). Covers both write modes: own-file
+ * post-install reload hint. Covers both write modes: own-file
  * (`written`/`updated`) and codex managed-section (`section-*`).
  */
 const CHANGED_ACTIONS: ReadonlySet<InstallAction> = new Set([
@@ -373,7 +374,7 @@ interface InstallOptions extends CommonOptions {
  * Per-invocation cache in front of {@link ownFileBodyFor}, so each (target, skill)
  * pair reads its asset once. `agent install` (which stamps the body's hash into the
  * marker) and `agent status` (which re-derives it) share this rather than keeping
- * private copies — they didn't, hence DEV-672.
+ * private copies that could silently disagree.
  */
 function makeOwnFileBodyResolver(): (target: AgentTarget, skill: string) => string {
   // Keyed on the pair: the same skill resolves to different bytes per target.
@@ -561,9 +562,9 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
 
         // We DO read the existing file (if present) to compute the
         // would-be byte count and emit the 32 KiB budget warning — without
-        // this the warning was silently absent on --dry-run runs (Fix 4).
+        // this the warning was silently absent on --dry-run runs.
         //
-        // [P3 round-2] Measure the ACTUAL composed result via the same
+        // Measure the ACTUAL composed result via the same
         // classifySection + composeManagedFile pipeline the real install
         // uses — `existing + section` double-counts the old block on the
         // replace path and misses the append separator. Read failures other
@@ -815,7 +816,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
     return items.map(r => `${r.target.padEnd(12)} ${r.action.padEnd(12)} ${r.path}`).join('\n');
   });
 
-  // 8b. Reload hint (DEV-279). A coding agent reads its skill/rule files at
+  // 8b. Reload hint. A coding agent reads its skill/rule files at
   // session start, so a session already open when we wrote the file won't pick
   // it up. Fire only when something actually changed on disk — silent on
   // skipped/unchanged/blocked/dry-run and in --output json. Targets are
@@ -856,7 +857,7 @@ export interface ListResult {
  * Display name for the AGENT column. Experimental targets get an "(exp.)" tag so
  * support maturity stays visible without a dedicated STATUS column — a bare
  * `ga`/`experimental` column reads like install state, which is `agent status`'s
- * job, not this catalog's (DEV-279).
+ * job, not this catalog's.
  */
 function agentDisplayName(target: AgentTarget, status: string): string {
   return status === 'experimental' ? `${target} (exp.)` : target;
@@ -890,7 +891,7 @@ export async function runList(opts: CommonOptions, deps: AgentDeps = {}): Promis
   // (with an "(exp.)" maturity tag), the skill, and where it lands. STATUS and
   // MODE stay in the JSON shape for back-compat but are dropped from the human
   // table — MODE is an internal write strategy, and STATUS (ga/experimental)
-  // reads like install state, which lives in `agent status` (DEV-279).
+  // reads like install state, which lives in `agent status`.
   out.print(results, data => {
     const items = data as ListResult[];
     const header = `${'AGENT'.padEnd(20)} ${'SKILL'.padEnd(20)} PATH`;
@@ -958,8 +959,9 @@ interface StatusOptions extends CommonOptions {
  * comparison for own-file targets.
  *
  * `canonicalBody` is already bound to THIS target by the caller and takes no
- * arguments, so the per-skill-only lookup that caused DEV-672 cannot be expressed
- * here. It is called only once an artifact is known to exist and carry a marker,
+ * arguments, so a lookup keyed on skill alone — which let install and status
+ * resolve different bodies for the same target — cannot be expressed here. It
+ * is called only once an artifact is known to exist and carry a marker,
  * so a row with nothing installed never touches the skill assets.
  */
 async function classifyOwnFileState(
@@ -1083,7 +1085,8 @@ export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Prom
   const dir = opts.dir !== undefined ? opts.dir.trim() : (deps.cwd ?? process.cwd());
   const root = path.resolve(dir);
 
-  // The SAME resolver the installer stamps its marker hashes from (DEV-672).
+  // The SAME resolver the installer stamps its marker hashes from — a
+  // separate copy here is exactly how install and status end up disagreeing.
   const ownFileBodyFor = makeOwnFileBodyResolver();
 
   const results: StatusResult[] = [];
@@ -1110,7 +1113,7 @@ export async function runStatus(opts: StatusOptions, deps: AgentDeps = {}): Prom
           target,
           skill,
           // Deferred, not resolved here: an absent artifact must not need the
-          // skill assets at all, as it didn't before DEV-672.
+          // skill assets at all.
           () => ownFileBodyFor(target, skill),
         ),
       });
@@ -1146,15 +1149,18 @@ function collect(v: string, prev: string[]): string[] {
 }
 
 export function createAgentCommand(deps: AgentDeps = {}): Command {
-  const agent = new Command('agent').description(
-    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Kiro, Windsurf, Copilot, Codex)',
-  );
+  const agent = new Command('agent')
+    .summary('Install TestSprite guidance into coding-agent config')
+    .description(
+      'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Kiro, Windsurf, Copilot, Codex)',
+    );
 
   agent
     .command('install [targets...]')
+    .summary('Write the TestSprite agent skills into a project')
     .description(
       'Write the TestSprite agent skills (verification loop + first-run onboarding) into a project for a coding agent. ' +
-        'Target(s) may be given positionally (e.g. `agent install cursor codex`) and/or via --target; the two are merged.',
+        'Targets may be positional (`agent install cursor codex`) and/or via --target; they are merged.',
     )
     .option(
       '--target <t>',
@@ -1205,6 +1211,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
 
   agent
     .command('list')
+    .summary('List installable agent targets and skills')
     .description(
       'List the agent targets and skills this CLI can install and where each lands (run `testsprite agent status` to see what is installed here)',
     )
@@ -1215,6 +1222,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
 
   agent
     .command('status')
+    .summary('Check installed skill files against this CLI version')
     .description(
       'Check installed TestSprite skill files against this CLI version: ok, stale, modified, unmarked, absent, or corrupt (exits 1 when anything needs attention, so it can gate CI)',
     )
@@ -1231,10 +1239,10 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
 // Per-file helpers (per convention: copy from auth.ts)
 // ---------------------------------------------------------------------------
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions>;
   return {
-    profile: globals.profile ?? 'default',
+    profile: resolveProfileName(globals.profile, env),
     output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,

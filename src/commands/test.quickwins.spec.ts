@@ -6,10 +6,11 @@
  * All HTTP is mocked; no real credentials required.
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { InterruptError } from '../lib/errors.js';
 import { runCreateBatch } from './test.js';
 import { runDeleteBatch } from './test.js';
 import type { CliBulkDeleteSummary } from './test.js';
@@ -139,11 +140,12 @@ describe('runCreateBatch --plan-from-dir (dogfood L1796)', () => {
 
   it('rejects when dir does not exist', async () => {
     const creds = makeCreds();
+    const noexistBase = mkdtempSync(join(tmpdir(), 'cli-pfd-noexist-'));
     await expect(
       runCreateBatch(
         {
           plans: '',
-          planFromDir: '/tmp/definitely-does-not-exist-qw-test',
+          planFromDir: join(noexistBase, 'definitely-does-not-exist-qw-test'),
           output: 'json',
           profile: 'default',
           dryRun: false,
@@ -152,7 +154,9 @@ describe('runCreateBatch --plan-from-dir (dogfood L1796)', () => {
         },
         creds,
       ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    )
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+      .finally(() => rmSync(noexistBase, { recursive: true, force: true }));
   });
 
   it('rejects when dir has no *.json files', async () => {
@@ -222,10 +226,11 @@ describe('runCreateBatch --plan-from-dir (dogfood L1796)', () => {
   it('rejects when both --plans and --plan-from-dir are supplied', async () => {
     const creds = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-pfd-mutual-'));
+    const plansFile = join(dir, 'some.jsonl');
     await expect(
       runCreateBatch(
         {
-          plans: '/tmp/some.jsonl',
+          plans: plansFile,
           planFromDir: dir,
           output: 'json',
           profile: 'default',
@@ -235,7 +240,9 @@ describe('runCreateBatch --plan-from-dir (dogfood L1796)', () => {
         },
         creds,
       ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    )
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+      .finally(() => rmSync(dir, { recursive: true, force: true }));
   });
 
   it('create-batch command exposes --plan-from-dir flag', async () => {
@@ -564,6 +571,37 @@ describe('runCreateBatch --plan-from-dir (dogfood L1796)', () => {
 // ---------------------------------------------------------------------------
 
 describe('runDeleteBatch (dogfood L1796)', () => {
+  it('stops deleting remaining tests after an interrupted request', async () => {
+    const creds = makeCreds();
+    const interruption = new InterruptError('SIGINT');
+    const deleted: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      if (init.method === 'DELETE') {
+        deleted.push(url);
+        if (deleted.length === 1) throw interruption;
+        return { body: deleteResp('test_b') };
+      }
+      return { body: {} };
+    });
+
+    await expect(
+      runDeleteBatch(
+        {
+          testIds: ['test_a', 'test_b'],
+          all: false,
+          confirm: true,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, fetchImpl, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toBe(interruption);
+    expect(deleted).toHaveLength(1);
+  });
+
   it('exit 5 when --confirm is not set', async () => {
     const creds = makeCreds();
     await expect(
@@ -809,6 +847,55 @@ describe('runDeleteBatch (dogfood L1796)', () => {
     expect(deletedIds).toEqual(['test_failed']);
   });
 
+  it('--all --status not_run deletes only the tests that never ran (draft, ready)', async () => {
+    const creds = makeCreds();
+    const deletedIds: string[] = [];
+
+    const allTests = [
+      { id: 'test_draft', status: 'draft' },
+      { id: 'test_ready', status: 'ready' },
+      { id: 'test_failed', status: 'failed' },
+      { id: 'test_running', status: 'running' },
+      { id: 'test_unknown', status: 'unknown' },
+    ];
+
+    const fetchImpl = makeFetch((url, init) => {
+      if (url.includes('/tests') && (!init.method || init.method === 'GET')) {
+        return { body: { items: allTests, nextToken: null } };
+      }
+      if (init.method === 'DELETE') {
+        const testId = url.split('/tests/')[1]!.split('?')[0]!;
+        deletedIds.push(decodeURIComponent(testId));
+        return { body: deleteResp(decodeURIComponent(testId)) };
+      }
+      return { body: {} };
+    });
+
+    for (const statusFilter of ['not_run', 'failed,not_run']) {
+      deletedIds.length = 0;
+      await runDeleteBatch(
+        {
+          testIds: [],
+          all: true,
+          projectId: 'project_abc',
+          statusFilter,
+          confirm: true,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, fetchImpl, stderr: () => {} },
+      );
+      expect(deletedIds.sort()).toEqual(
+        statusFilter === 'not_run'
+          ? ['test_draft', 'test_ready']
+          : ['test_draft', 'test_failed', 'test_ready'],
+      );
+    }
+  });
+
   it('exit 5 when --status contains an invalid token', async () => {
     const creds = makeCreds();
     const fetchImpl = makeFetch((url, init) => {
@@ -834,6 +921,48 @@ describe('runDeleteBatch (dogfood L1796)', () => {
         { ...creds, fetchImpl },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
+  it('exit 5 before any request when --all --status is empty, whitespace or commas only', async () => {
+    const creds = makeCreds();
+    // An empty --status used to be read as "no filter", so `--status ''`
+    // deleted every test in the project.
+    const requests: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      requests.push(`${init.method ?? 'GET'} ${url}`);
+      if (url.includes('/tests') && (!init.method || init.method === 'GET')) {
+        return { body: { items: [{ id: 'test_a', status: 'passed' }], nextToken: null } };
+      }
+      if (init.method === 'DELETE') return { body: deleteResp('test_a') };
+      return { body: {} };
+    });
+    for (const statusFilter of ['', '  ', ',', ' , ']) {
+      for (const dryRun of [false, true]) {
+        await expect(
+          runDeleteBatch(
+            {
+              testIds: [],
+              all: true,
+              projectId: 'project_abc',
+              statusFilter,
+              confirm: true,
+              output: 'json',
+              profile: 'default',
+              dryRun,
+              debug: false,
+              verbose: false,
+            },
+            { ...creds, fetchImpl, stdout: () => {}, stderr: () => {} },
+          ),
+        ).rejects.toMatchObject({
+          code: 'VALIDATION_ERROR',
+          nextAction: expect.stringContaining(
+            '--status needs at least one status (accepted: passed, failed, blocked, cancelled, not_run)',
+          ),
+        });
+      }
+    }
+    expect(requests).toEqual([]);
   });
 
   // ---- correctness-fix tests (code-review 2026-06-04) ----------------------
@@ -939,14 +1068,14 @@ describe('runDeleteBatch (dogfood L1796)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// DEV-331 (codex finding 2) — create-batch --run --wait interrupt partial
-// carries the dispatched runIds, not empty placeholders
+// create-batch --run --wait interrupt partial carries the dispatched runIds,
+// not empty placeholders
 // ---------------------------------------------------------------------------
 
-describe('create-batch --run --wait — InterruptError partial names dispatched runIds (DEV-331)', () => {
+describe('create-batch --run --wait — InterruptError partial names dispatched runIds', () => {
   it('interrupt mid-poll → partial rows carry the runIds recorded at trigger time', async () => {
     const creds = makeCreds();
-    const dir = mkdtempSync(join(tmpdir(), 'cli-dev331-cbrun-'));
+    const dir = mkdtempSync(join(tmpdir(), 'cli-create-batch-run-'));
     for (let i = 0; i < 2; i++) {
       writeFileSync(
         join(dir, `plan_${i}.json`),
@@ -987,6 +1116,10 @@ describe('create-batch --run --wait — InterruptError partial names dispatched 
           { status: 200, headers: { 'content-type': 'application/json' } },
         );
       }
+      if (init.method === 'GET' && /\/tests\/[^/]+$/.test(url))
+        return new Response(JSON.stringify({ type: 'frontend', projectId: 'project_1' }));
+      if (init.method === 'GET' && url.endsWith('/projects/project_abc/env'))
+        return new Response(JSON.stringify({ environments: [] }));
       // GET /runs/{id} long-poll: hang until aborted.
       return new Promise<Response>((_resolve, reject) => {
         const signal = init.signal;

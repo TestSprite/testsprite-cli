@@ -1,11 +1,19 @@
 import { createRequire } from 'node:module';
-import { describe, expect, it } from 'vitest';
+import { writeSync } from 'node:fs';
+import { describe, expect, it, vi } from 'vitest';
 import {
   MIN_SUPPORTED_NODE_MAJOR,
   SUPPORTED_NODE_ENGINE,
+  SUPPORTED_NODE_RANGE,
   parseMajorVersion,
+  rejectUnsupportedNodeVersion,
   shouldRejectNodeVersion,
 } from './version-guard.js';
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return { ...actual, writeSync: vi.fn() };
+});
 
 const require = createRequire(import.meta.url);
 const pkg: { engines: { node: string } } = require('../package.json') as {
@@ -64,5 +72,38 @@ describe('shouldRejectNodeVersion', () => {
   it('the running Node satisfies the guard (meta-test)', () => {
     // The test suite itself runs on a supported Node, so the guard must pass.
     expect(shouldRejectNodeVersion(process.versions.node)).toBe(false);
+  });
+});
+
+describe('rejectUnsupportedNodeVersion', () => {
+  it('does nothing on a supported runtime', () => {
+    const writeStderr = vi.fn();
+    const exit = vi.fn();
+    rejectUnsupportedNodeVersion('22.13.0', { writeStderr, exit });
+
+    expect(writeStderr).not.toHaveBeenCalled();
+    expect(exit).not.toHaveBeenCalled();
+  });
+
+  it('writes the unchanged error before exiting for an unsupported runtime', () => {
+    const events: string[] = [];
+    const writeStderr = vi.fn((message: string) => events.push(message));
+    const exit = vi.fn((code: number) => events.push(`exit ${code}`));
+    rejectUnsupportedNodeVersion('18.19.1', { writeStderr, exit });
+
+    const message = `Error: testsprite requires Node.js ${SUPPORTED_NODE_RANGE} (found 18.19.1).\nInstall a supported Node.js release from https://nodejs.org\n`;
+    expect(events).toEqual([message, 'exit 1']);
+  });
+
+  it('uses a synchronous stderr write by default', () => {
+    vi.mocked(writeSync).mockClear();
+    const exit = vi.fn();
+    rejectUnsupportedNodeVersion('20.18.0', { exit });
+
+    expect(writeSync).toHaveBeenCalledWith(
+      process.stderr.fd,
+      `Error: testsprite requires Node.js ${SUPPORTED_NODE_RANGE} (found 20.18.0).\nInstall a supported Node.js release from https://nodejs.org\n`,
+    );
+    expect(exit).toHaveBeenCalledWith(1);
   });
 });

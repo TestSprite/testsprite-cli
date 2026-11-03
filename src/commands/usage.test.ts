@@ -319,6 +319,68 @@ describe('runUsage — org wallet (activeOrg)', () => {
     expect(out).not.toContain('can trigger:');
   });
 
+  it('renders a `state:` line for a paused workspace, with the notice and its billing link', async () => {
+    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const paused: UsageResponse = {
+      ...meWithOrg,
+      activeOrg: {
+        ...meWithOrg.activeOrg!,
+        workspace: {
+          state: 'paused',
+          tier: 'Paused',
+          notice: {
+            title: 'Workspace paused',
+            message: 'This workspace is paused because its subscription ended.',
+            cta: 'Renew subscription',
+            billingUrl: 'https://portal.example/o/org-1/settings/billing',
+          },
+        },
+      },
+    };
+    await runUsage(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, credentialsPath, fetchImpl: makeFetch(paused) },
+    );
+    const out = capture.stdout.join('\n');
+    expect(out).toContain(
+      'state:        paused — This workspace is paused because its subscription ended. Renew subscription: https://portal.example/o/org-1/settings/billing',
+    );
+  });
+
+  it('renders a `state:` line for a payment-pending workspace and none while it is simply on its plan', async () => {
+    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const pending: UsageResponse = {
+      ...meWithOrg,
+      activeOrg: {
+        ...meWithOrg.activeOrg!,
+        workspace: { state: 'pending', tier: 'Standard', notice: null },
+      },
+    };
+    await runUsage(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, credentialsPath, fetchImpl: makeFetch(pending) },
+    );
+    expect(capture.stdout.join('\n')).toContain(
+      'state:        pending — a scheduled plan change or a payment retry is in progress',
+    );
+
+    const { capture: okCapture, deps: okDeps } = makeCapture();
+    const ok: UsageResponse = {
+      ...meWithOrg,
+      activeOrg: {
+        ...meWithOrg.activeOrg!,
+        workspace: { state: 'ok', tier: 'Standard', notice: null },
+      },
+    };
+    await runUsage(
+      { profile: 'default', output: 'text', debug: false },
+      { ...okDeps, credentialsPath, fetchImpl: makeFetch(ok) },
+    );
+    expect(okCapture.stdout.join('\n')).not.toContain('state:');
+  });
+
   it('low org balance triggers the top-up warning', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();

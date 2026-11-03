@@ -7,7 +7,7 @@ import { run } from './claim-ttl.mjs';
 const NOW = new Date('2026-09-30T00:00:00Z');
 const SINCE = '2026-09-24T00:00:00Z';
 const assignedAt = hours => new Date(NOW.getTime() - hours * 60 * 60 * 1000).toISOString();
-const claim = (login = 'contributor', hours = 96) => ({
+const claim = (login = 'contributor', hours = 72) => ({
   event: 'assigned',
   assignee: { login },
   created_at: assignedAt(hours),
@@ -97,15 +97,15 @@ function harness({
   return { execute, writes, of, warnings, failures, info, records, commentStore, calls };
 }
 
-test('an assignment younger than 72 hours is left alone', async () => {
-  const h = harness({ events: { 42: [claim('contributor', 71.99)] } });
+test('an assignment younger than 48 hours is left alone', async () => {
+  const h = harness({ events: { 42: [claim('contributor', 47.99)] } });
   await h.execute();
   assert.deepEqual(h.writes(), []);
   assert.equal(h.failures.length, 0);
 });
 
-test('warning starts at 72 hours and is posted only once for the same assignment', async () => {
-  const h = harness({ events: { 42: [claim('contributor', 72)] } });
+test('warning starts at 48 hours and is posted only once for the same assignment', async () => {
+  const h = harness({ events: { 42: [claim('contributor', 48)] } });
   await h.execute();
   await h.execute();
   assert.equal(h.of('createComment').length, 1);
@@ -116,47 +116,47 @@ test('warning starts at 72 hours and is posted only once for the same assignment
   assert.match(h.of('createComment')[0].body, /\/assign/);
   assert.match(
     h.of('createComment')[0].body,
-    /<!-- claim-ttl:warn:contributor:2026-09-27T00:00:00.000Z -->/,
+    /<!-- claim-ttl:warn:contributor:2026-09-28T00:00:00.000Z -->/,
   );
   assert.equal(h.failures.length, 0);
 });
 
 test('the latest assignment event defines the current claim', async () => {
-  const h = harness({ events: { 42: [claim('contributor', 120), claim('contributor', 73)] } });
+  const h = harness({ events: { 42: [claim('contributor', 120), claim('contributor', 49)] } });
   await h.execute();
   assert.equal(h.of('removeAssignees').length, 0);
   assert.equal(h.of('createComment').length, 1);
   assert.match(
     h.of('createComment')[0].body,
-    /claim-ttl:warn:contributor:2026-09-26T23:00:00.000Z/,
+    /claim-ttl:warn:contributor:2026-09-27T23:00:00.000Z/,
   );
 });
 
 test('a warning for an older assignment does not suppress this claim warning', async () => {
   const h = harness({
-    events: { 42: [claim('contributor', 150), claim('contributor', 72)] },
+    events: { 42: [claim('contributor', 150), claim('contributor', 48)] },
     comments: { 42: [{ body: '<!-- claim-ttl:warn:contributor:2026-09-23T18:00:00.000Z -->' }] },
   });
   await h.execute();
   assert.equal(h.of('createComment').length, 1);
   assert.match(
     h.of('createComment')[0].body,
-    /claim-ttl:warn:contributor:2026-09-27T00:00:00.000Z/,
+    /claim-ttl:warn:contributor:2026-09-28T00:00:00.000Z/,
   );
 });
 
-test('at 96 hours the assignee is removed and the issue is released', async () => {
+test('at 72 hours the assignee is removed and the issue is released', async () => {
   const h = harness();
   await h.execute();
   assert.equal(h.of('removeAssignees').length, 1);
   assert.deepEqual(h.of('removeAssignees')[0].assignees, ['contributor']);
   assert.equal(h.of('createComment').length, 1);
-  assert.match(h.of('createComment')[0].body, /expired after 96 hours/);
+  assert.match(h.of('createComment')[0].body, /expired after 72 hours/);
   assert.match(h.of('createComment')[0].body, /open for others/);
   assert.match(h.of('createComment')[0].body, /\/assign/);
   assert.match(
     h.of('createComment')[0].body,
-    /<!-- claim-ttl:expired:contributor:2026-09-26T00:00:00.000Z -->/,
+    /<!-- claim-ttl:expired:contributor:2026-09-27T00:00:00.000Z -->/,
   );
   assert.deepEqual(
     h.of('removeLabel').map(args => args.name),
@@ -169,7 +169,7 @@ test('at 96 hours the assignee is removed and the issue is released', async () =
 
 test('an existing expiry marker prevents a duplicate expiry comment', async () => {
   const h = harness({
-    comments: { 42: [{ body: '<!-- claim-ttl:expired:contributor:2026-09-26T00:00:00.000Z -->' }] },
+    comments: { 42: [{ body: '<!-- claim-ttl:expired:contributor:2026-09-27T00:00:00.000Z -->' }] },
   });
   await h.execute();
   assert.equal(h.of('removeAssignees').length, 1);
@@ -308,7 +308,7 @@ test('dry run reads and logs but makes no writes', async () => {
   assert.ok(h.info.some(message => message.includes('would expire')));
 
   const warning = harness({
-    events: { 42: [claim('contributor', 72)] },
+    events: { 42: [claim('contributor', 48)] },
     env: { DRY_RUN: 'true' },
   });
   await warning.execute();
@@ -355,7 +355,7 @@ test('invalid TTL settings fail before any writes', async () => {
   for (const env of [
     { CLAIM_TTL_HOURS: '0' },
     { CLAIM_WARN_HOURS: '-1' },
-    { CLAIM_WARN_HOURS: '96' },
+    { CLAIM_WARN_HOURS: '72' },
   ]) {
     const h = harness({ env });
     await h.execute();
@@ -368,11 +368,72 @@ test('scheduled workflow pins the policy and runs only in the public repo', () =
   const path = fileURLToPath(new URL('../workflows/claim-ttl.yml', import.meta.url));
   const workflow = readFileSync(path, 'utf8');
   assert.match(workflow, /^ {4}if: github\.repository == 'TestSprite\/testsprite-cli'$/m);
-  assert.match(workflow, /^ {2}CLAIM_TTL_HOURS: '96'$/m);
-  assert.match(workflow, /^ {2}CLAIM_WARN_HOURS: '72'$/m);
+  assert.match(workflow, /^ {2}CLAIM_TTL_HOURS: '48'$/m);
+  assert.match(workflow, /^ {2}CLAIM_WARN_HOURS: '24'$/m);
   assert.match(workflow, /^ {2}CLAIM_TTL_SINCE: '2026-09-24T00:00:00Z'$/m);
   assert.match(
     workflow,
     /^ {2}DRY_RUN: \$\{\{ inputs\.dry_run == true && 'true' \|\| 'false' \}\}$/m,
   );
+});
+
+const accepted = hours => ({
+  event: 'labeled',
+  label: { name: 'accepted' },
+  created_at: assignedAt(hours),
+});
+const openerIssue = {
+  number: 42,
+  user: { login: 'contributor' },
+  assignees: [{ login: 'contributor' }],
+  labels: [],
+};
+
+test('the opener’s window starts at acceptance, not at the claim', async () => {
+  // Accepted 72h ago, claimed by the opener 30h ago: the opener's 72h are up.
+  const h = harness({
+    issues: [openerIssue],
+    events: { 42: [accepted(72), claim('contributor', 30)] },
+  });
+  await h.execute();
+  assert.equal(h.of('removeAssignees').length, 1);
+  assert.match(h.of('createComment')[0].body, /counted from when this issue was accepted/);
+  // The marker still names the assignment, so a later re-claim gets its own notices.
+  assert.match(
+    h.of('createComment')[0].body,
+    /claim-ttl:expired:contributor:2026-09-28T18:00:00.000Z/,
+  );
+});
+
+test('a non-opener’s window starts at their own claim', async () => {
+  const h = harness({
+    issues: [{ ...openerIssue, user: { login: 'opener' } }],
+    events: { 42: [accepted(72), claim('contributor', 30)] },
+  });
+  await h.execute();
+  assert.deepEqual(h.writes(), []);
+});
+
+test('a linked draft PR keeps the opener’s claim past the window', async () => {
+  const h = harness({
+    issues: [openerIssue],
+    events: { 42: [accepted(72), claim('contributor', 30), linkedPr('contributor', 'open', true)] },
+  });
+  await h.execute();
+  assert.deepEqual(h.writes(), []);
+});
+
+test('the warning states the hours left under the configured policy', async () => {
+  const h = harness({
+    events: { 42: [claim('contributor', 24)] },
+    env: { CLAIM_TTL_HOURS: '48', CLAIM_WARN_HOURS: '24' },
+  });
+  await h.execute();
+  assert.match(h.of('createComment')[0].body, /expires in about 24 hours/);
+  const expired = harness({
+    events: { 42: [claim('contributor', 48)] },
+    env: { CLAIM_TTL_HOURS: '48', CLAIM_WARN_HOURS: '24' },
+  });
+  await expired.execute();
+  assert.match(expired.of('createComment')[0].body, /expired after 48 hours without a linked PR/);
 });

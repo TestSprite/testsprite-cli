@@ -1,4 +1,5 @@
-import { ApiError, CLIError, isAuthCode } from './errors.js';
+import { ApiError, CLIError, isAuthCode, isErrorCode } from './errors.js';
+import { classifyBillingRefusal, isPausedReason } from './billing-refusal.js';
 
 /**
  * One member of a `--wait` fan-out poll (a single dispatched run's outcome).
@@ -13,7 +14,80 @@ export interface WaitMemberResult {
   status: string;
   // `exitCode` is optional to accept the shared JUnit result shape; an error
   // with no exitCode is treated as the generic failure (1).
-  error?: { code: string; message: string; exitCode?: number };
+  error?: {
+    code: string;
+    message: string;
+    exitCode?: number;
+    nextAction?: string;
+    serverNextAction?: string;
+    requestId?: string;
+    details?: Record<string, unknown>;
+    apiUrl?: string;
+  };
+}
+
+/**
+ * Envelope metadata for a billing/feature-gate member error, keyed by the
+ * IDENTITY of the object `waitMemberError` returns. The enumerable shape of
+ * that object must stay exactly `{ code, message, exitCode }` — it lands
+ * verbatim in `--output json` stdout (`accepted[]` / `results[]`), and a
+ * `nextAction` / `details` / `apiUrl` riding along there would both leak
+ * internal fields to every consumer AND (since the guard below fires for
+ * every FEATURE_GATED, including `rollout`) attach billing-looking data to a
+ * refusal that isn't one. The extra fields `resolveWaitFailure` needs to
+ * reconstruct a faithful ApiError travel here instead, out of band.
+ */
+const memberEnvelopeMeta = new WeakMap<
+  NonNullable<WaitMemberResult['error']>,
+  {
+    nextAction?: string;
+    serverNextAction?: string;
+    requestId?: string;
+    details?: Record<string, unknown>;
+    apiUrl?: string;
+  }
+>();
+
+export function waitMemberError(
+  err: ApiError,
+): NonNullable<WaitMemberResult['error']> & { exitCode: number } {
+  const memberError = { code: err.code, message: err.message, exitCode: err.exitCode };
+  if (err.code === 'FEATURE_GATED' || classifyBillingRefusal(err)) {
+    memberEnvelopeMeta.set(memberError, {
+      nextAction: err.nextAction,
+      serverNextAction: err.serverNextAction,
+      requestId: err.requestId,
+      details: err.details,
+      apiUrl: err.apiUrl,
+    });
+  }
+  return memberError;
+}
+
+/**
+ * Read a member error's out-of-band envelope metadata, falling back to
+ * whatever the object carries as OWN enumerable properties. The fallback
+ * exists for callers that build a `WaitMemberResult['error']` by hand (a
+ * legacy/shared JUnit result shape, or a test fixture) rather than through
+ * `waitMemberError` — those never got a `memberEnvelopeMeta` entry, so their
+ * fields must still be read the old way.
+ */
+function memberMeta(error: NonNullable<WaitMemberResult['error']>): {
+  nextAction?: string;
+  serverNextAction?: string;
+  requestId?: string;
+  details?: Record<string, unknown>;
+  apiUrl?: string;
+} {
+  return (
+    memberEnvelopeMeta.get(error) ?? {
+      nextAction: error.nextAction,
+      serverNextAction: error.serverNextAction,
+      requestId: error.requestId,
+      details: error.details,
+      apiUrl: error.apiUrl,
+    }
+  );
 }
 
 /**
@@ -96,10 +170,50 @@ export function resolveWaitFailure(
   //    non-1 exit like 0/99). Routed through the ENVELOPE so `--output json`
   //    carries `error.code` — the machine-readable field this fix exists for;
   //    `ApiError.fromEnvelope` derives the exit via `exitCodeFor(code)`.
-  const operational = errored
-    .filter(r => isOperationalCode(r.error.exitCode ?? 1))
-    .sort((a, b) => priorityOf(a.error.exitCode!) - priorityOf(b.error.exitCode!))[0];
+  const operationalCandidates = errored.filter(r => isOperationalCode(r.error.exitCode ?? 1));
+  // Narrow exception to the table above (mirrors the identical rule in
+  // conflict-reason.ts's `isPausedRefusal`): when EVERY operational
+  // member is a billing refusal and at least one is a paused workspace, paused
+  // wins over a plain credits shortfall — topping up credits cannot resume a
+  // paused workspace. This does not reorder WAIT_EXIT_PRIORITY for any other
+  // code combination.
+  const isPausedMember = (r: (typeof operationalCandidates)[number]): boolean =>
+    r.error.code === 'FEATURE_GATED' && isPausedReason(memberMeta(r.error).details?.reason);
+  const isBillingRefusalMember = (r: (typeof operationalCandidates)[number]): boolean =>
+    r.error.code === 'INSUFFICIENT_CREDITS' || isPausedMember(r);
+  const operational =
+    operationalCandidates.length > 0 &&
+    operationalCandidates.every(isBillingRefusalMember) &&
+    operationalCandidates.some(isPausedMember)
+      ? operationalCandidates.find(isPausedMember)
+      : operationalCandidates.sort(
+          (a, b) => priorityOf(a.error.exitCode!) - priorityOf(b.error.exitCode!),
+        )[0];
   if (operational) {
+    const meta = memberMeta(operational.error);
+    if (meta.details && isErrorCode(operational.error.code)) {
+      // Merge the server's own details with the local runId/testId (never the
+      // reverse) so automation reading `error.details.runId`/`testId` keeps
+      // working for a billing refusal exactly as it does for any other typed
+      // error, while `reason` (billing_hold / rollout / …) survives untouched.
+      return new ApiError(
+        {
+          code: operational.error.code,
+          message: operational.error.message,
+          nextAction: meta.nextAction ?? '',
+          requestId: meta.requestId ?? 'local',
+          details: {
+            ...meta.details,
+            runId: operational.runId ?? null,
+            testId: operational.testId ?? null,
+          },
+        },
+        undefined,
+        undefined,
+        meta.apiUrl,
+        meta.serverNextAction,
+      );
+    }
     return ApiError.fromEnvelope({
       error: {
         code: operational.error.code,

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ApiError } from './errors.js';
+import { ApiError, InterruptError } from './errors.js';
 import { ErrCode } from '../vendor/tunnel-client/index.js';
 import type { TunnelClientOptions } from '../vendor/tunnel-client/index.js';
 import { TunnelLostError, openTunnelSession } from './tunnel-session.js';
@@ -407,6 +407,100 @@ describe('openTunnelSession — teardown', () => {
     await session.close();
     expect(destroyed).toEqual(['client-1']);
     expect(fake.calls.stop).toBe(1);
+  });
+});
+
+describe('openTunnelSession — onMinted', () => {
+  it('reports the minted id and expiry before the tunnel client exists', async () => {
+    const fake = fakeClientFactory();
+    const seen: Array<{ minted: unknown; clientsBuilt: number }> = [];
+    const session = await openTunnelSession(
+      {
+        log: () => {},
+        onMinted: minted => seen.push({ minted, clientsBuilt: fake.seen.length }),
+      },
+      { mint: async () => MINT, destroy: async () => {}, createClient: fake.factory },
+    );
+    // The whole point is that a process which dies while connecting has
+    // already told its caller which binding it is holding.
+    expect(seen).toEqual([
+      { minted: { clientId: MINT.clientId, expiresAt: MINT.expiresAt }, clientsBuilt: 0 },
+    ]);
+    await session.close();
+  });
+
+  it('has already reported the id when the initial connect fails', async () => {
+    const reported: string[] = [];
+    const fake = fakeClientFactory({ start: () => Promise.reject(new Error('control refused')) });
+    await expect(
+      openTunnelSession(
+        { log: () => {}, onMinted: ({ clientId }) => reported.push(clientId) },
+        { mint: async () => MINT, destroy: async () => {}, createClient: fake.factory },
+      ),
+    ).rejects.toBeInstanceOf(ApiError);
+    expect(reported).toEqual([MINT.clientId]);
+  });
+
+  it('keeps the signal error after a failed connect and credential cleanup', async () => {
+    const interrupted = new InterruptError('SIGINT');
+    const destroy = vi.fn(async () => {});
+    await expect(
+      openTunnelSession(
+        { log: () => {} },
+        {
+          mint: async () => MINT,
+          destroy,
+          createClient: fakeClientFactory({ start: () => Promise.reject(interrupted) }).factory,
+        },
+      ),
+    ).rejects.toBe(interrupted);
+    expect(destroy).toHaveBeenCalledWith(MINT.clientId);
+  });
+
+  it('never hands the secret to the callback', async () => {
+    const fake = fakeClientFactory();
+    let payload = '';
+    const session = await openTunnelSession(
+      { log: () => {}, onMinted: minted => (payload = JSON.stringify(minted)) },
+      { mint: async () => MINT, destroy: async () => {}, createClient: fake.factory },
+    );
+    expect(payload).not.toContain(MINT.secret);
+    await session.close();
+  });
+
+  it('deletes the binding and rethrows when the callback throws', async () => {
+    const callbackError = new Error('sink closed');
+    const destroy = vi.fn(async () => {});
+    await expect(
+      openTunnelSession(
+        {
+          log: () => {},
+          onMinted: () => {
+            throw callbackError;
+          },
+        },
+        { mint: async () => MINT, destroy, createClient: fakeClientFactory().factory },
+      ),
+    ).rejects.toBe(callbackError);
+    expect(destroy).toHaveBeenCalledWith(MINT.clientId);
+  });
+
+  it('is not called for an adopted client, which this process did not mint', async () => {
+    const onMinted = vi.fn();
+    const session = await openTunnelSession(
+      {
+        log: () => {},
+        onMinted,
+        adopt: { clientId: 'someone-elses', expiresAt: '2026-08-24T19:00:00.000Z' },
+      },
+      {
+        mint: vi.fn() as never,
+        destroy: vi.fn() as never,
+        createClient: fakeClientFactory().factory,
+      },
+    );
+    expect(onMinted).not.toHaveBeenCalled();
+    await session.close();
   });
 });
 

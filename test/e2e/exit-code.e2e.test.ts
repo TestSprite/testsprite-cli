@@ -1,5 +1,5 @@
 /**
- * Local e2e regression tests for the error-path exit contract (DEV-673).
+ * Local e2e regression tests for the error-path exit contract.
  *
  * On Windows, `process.exit(code)` on the error path raced the teardown of the
  * just-used TLS socket: libuv's Windows async-handle cleanup asserted
@@ -149,7 +149,7 @@ function runCli(args: string[]): Promise<SpawnResult> {
   });
 }
 
-describe('exit-code e2e — error paths exit by draining, with the documented code (DEV-673)', () => {
+describe('exit-code e2e — error paths exit by draining, with the documented code', () => {
   it('NOT_FOUND: exit 4 exactly, friendly error, natural drain, no crash text', async () => {
     const result = await runCli(['test', 'get', 'bogus-test-id-12345', '--endpoint-url', baseUrl]);
     expect(result.code).toBe(4);

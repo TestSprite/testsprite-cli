@@ -1,4 +1,4 @@
-# P1-3 — stale-bot: nudge then close inactive issues / PRs (actions/stale).
+# stale-bot: nudge then close inactive issues / PRs (actions/stale).
 #
 # Generous windows for an open-source repo (first-response SLA is 5 business days,
 # see CONTRIBUTING). Activity removes the `stale` label automatically, so a single

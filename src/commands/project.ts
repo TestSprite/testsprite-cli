@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { createReadStream, readFileSync, statSync, type Stats } from 'node:fs';
 import { basename, extname } from 'node:path';
 import { Readable } from 'node:stream';
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import {
   emitDryRunBanner,
   makeHttpClient,
@@ -10,13 +10,14 @@ import {
   resolveRequestTimeoutMs,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
+import { resolveProfileName } from '../lib/config.js';
 import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
+import { firstSuiteNextSteps } from '../lib/first-suite-hint.js';
 import type { FetchImpl, HttpClient } from '../lib/http.js';
 import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
 import {
   assertStoredLocalTargetListening,
   buildLocalTargetUrl,
-  DEFAULT_LOCAL_HOST,
   parseStoredLocalTarget,
   type LocalPortProbeDeps,
   type StoredLocalTarget,
@@ -35,6 +36,7 @@ import {
   type PaginationFlags,
 } from '../lib/pagination.js';
 import { createProjectEnvCommand } from './project-env.js';
+import { createProjectSignInCommand } from './project-sign-in.js';
 
 export interface CliProject {
   id: string;
@@ -75,6 +77,9 @@ export interface CliProject {
    * (see the `project create --type backend` note in CLAUDE.md).
    */
   targetUrl?: string | null;
+  /** Absent on older servers, V2 projects, or when the environment read failed. */
+  defaultEnvironment?: string | null;
+  environmentCount?: number;
   /** Present only when the stored project target is local to the developer machine. */
   originMode?: 'local';
   /**
@@ -133,7 +138,7 @@ export interface ProjectDeps {
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
   localPortProbeDeps?: LocalPortProbeDeps;
-  /** Graceful-detach coordinator (DEV-331); tests inject their own. */
+  /** Graceful-detach coordinator; tests inject their own. */
   shutdown?: ShutdownHandle;
 }
 
@@ -293,6 +298,9 @@ export async function runCreate(
   if (opts.password !== undefined && opts.password.trim().length === 0) {
     throw localValidationError('--password must not be empty or whitespace-only');
   }
+  if (opts.password !== undefined && opts.passwordFile !== undefined) {
+    stderr('Warning: --password takes precedence; --password-file was ignored.');
+  }
   if (opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
   }
@@ -313,13 +321,19 @@ export async function runCreate(
     localHost: opts.localHost,
     url: opts.targetUrl,
   });
-  const targetUrl = localTarget
-    ? buildLocalTargetUrl(localTarget.host, localTarget.port)
-    : opts.targetUrl;
+  // A loopback --url is the same stored target as --local, so it gets the same
+  // refusal before anything is sent.
+  if (localTarget && opts.type !== 'frontend') {
+    throw localValidationError(
+      'a --url on this machine (localhost, 127.0.0.1, [::1]) is frontend-only; give a backend project a public URL',
+    );
+  }
+  const targetUrl =
+    opts.targetUrl ??
+    (localTarget ? buildLocalTargetUrl(localTarget.host, localTarget.port) : undefined);
 
-  // P2-7: guard --url against localhost/RFC1918/non-http(s) (same rules as
-  // `test create --target-url`). Applies to both FE (required) and BE (optional).
-  if (opts.targetUrl !== undefined) {
+  // Keep the existing public-address guard for targets a loopback tunnel cannot reach.
+  if (opts.targetUrl !== undefined && !localTarget) {
     assertNotLocal(opts.targetUrl, {
       field: 'url',
       helpCommand: 'testsprite project create',
@@ -332,8 +346,8 @@ export async function runCreate(
   }
 
   if (opts.dryRun) {
-    // DEV-247: this path returns before makeClient() fires the banner, so emit it
-    // here — otherwise the canned sample can be mistaken for a live response.
+    // This path returns before makeClient() fires the banner, so emit it here
+    // — otherwise the canned sample can be mistaken for a live response.
     emitDryRunBanner(stderr);
     const idempotencyKey = opts.idempotencyKey ?? `cli-proj-create-${randomUUID()}`;
     // P2-6: gate idempotency-key output behind --verbose/--debug/json (matches
@@ -454,6 +468,16 @@ export async function runCreate(
     );
   }
 
+  // A new project with no tests is where activation stalls. Point at
+  // the generate -> accept path (text mode only: a JSON caller already holds
+  // the id; --dry-run returned above, its id is the canned sample). Printed
+  // after the URL advisory so a fix-first warning is never buried below it.
+  // A --local project is skipped: its record above already ends with the
+  // hand-written-plan next steps.
+  if (opts.output !== 'json' && resolvedId !== undefined && !localTarget) {
+    stderr(firstSuiteNextSteps(resolvedId, opts.type));
+  }
+
   return created;
 }
 
@@ -477,6 +501,9 @@ export interface CliUpdateProjectResponse {
   updatedFields?: string[];
   /** Absent-safe: not guaranteed on every backend response. */
   updatedAt?: string;
+  /** Present on servers that report which default environment was edited. */
+  environment?: { name: string; isDefault: true };
+  effects?: string[];
 }
 
 /** Resolve the updated project's id regardless of which field name the backend used. */
@@ -525,23 +552,23 @@ export async function runUpdate(
   if (opts.password !== undefined && opts.password.trim().length === 0) {
     throw localValidationError('--password must not be empty or whitespace-only');
   }
+  if (opts.password !== undefined && opts.passwordFile !== undefined) {
+    stderr('Warning: --password takes precedence; --password-file was ignored.');
+  }
   if (opts.name !== undefined && opts.name.length > 200) {
     throw localValidationError('--name must be at most 200 characters');
   }
-  // `--local <port>` is the one way to point a project at an app on this
-  // machine, on update exactly as on create. A loopback `--url` has no
-  // accepted form here and is redirected to `--local`. The project's type is
-  // not known client-side on update; the server refuses `--local` on a
-  // backend project.
+  // A loopback URL and --local shorthand use the same stored-target wire shape.
+  // The server owns project-type validation on update.
   const localTarget = parseStoredLocalTarget({
     local: opts.local,
     localHost: opts.localHost,
     url: opts.targetUrl,
   });
-  const targetUrl = localTarget
-    ? buildLocalTargetUrl(localTarget.host, localTarget.port)
-    : opts.targetUrl;
-  if (opts.targetUrl !== undefined) {
+  const targetUrl =
+    opts.targetUrl ??
+    (localTarget ? buildLocalTargetUrl(localTarget.host, localTarget.port) : undefined);
+  if (opts.targetUrl !== undefined && !localTarget) {
     assertNotLocal(opts.targetUrl, {
       field: 'url',
       helpCommand: 'testsprite project update',
@@ -574,7 +601,7 @@ export async function runUpdate(
   }
 
   if (opts.dryRun) {
-    // DEV-247: emit the banner here (this path returns before makeClient() does).
+    // Emit the banner here (this path returns before makeClient() does).
     emitDryRunBanner(stderr);
     const idempotencyKey = opts.idempotencyKey ?? `cli-proj-update-${randomUUID()}`;
     if (
@@ -950,7 +977,7 @@ function renderAutoAuthText(r: CliProjectAutoAuthResponse): string {
 }
 
 // ---------------------------------------------------------------------------
-// project docs upload — DEV-384 piece V3-D
+// project docs upload
 // ---------------------------------------------------------------------------
 
 /**
@@ -978,14 +1005,14 @@ const DOC_CONTENT_TYPES: Record<string, string> = {
 };
 const DEFAULT_DOC_CONTENT_TYPE = 'application/octet-stream';
 
-/** `POST /projects/{id}/docs/upload-url` response (V3-A facade). */
+/** `POST /projects/{id}/docs/upload-url` response (docs facade). */
 export interface CliDocsUploadUrlResponse {
   uploadUrl: string;
   s3Key: string;
   expiresInSeconds: number;
 }
 
-/** `POST /projects/{id}/docs` (register) response (V3-A facade). */
+/** `POST /projects/{id}/docs` (register) response (docs facade). */
 export interface CliDocsRegisterResponse {
   resourceId: string;
   displayName: string;
@@ -993,7 +1020,7 @@ export interface CliDocsRegisterResponse {
   processStatus: string;
 }
 
-/** Success result — the JSON-mode stdout shape (piece V3-D scope item 3). */
+/** Success result — the JSON-mode stdout shape. */
 export interface CliDocsUploadResult {
   resourceId: string;
   displayName: string;
@@ -1028,7 +1055,7 @@ interface DocsUploadOptions extends CommonOptions {
  * source so plan generation has inputs to feed on (closes the API-project
  * cold start at `no_processed_inputs`).
  *
- * Three-step flow against the V3-A facade routes:
+ * Three-step flow against the docs facade routes:
  *
  *   1. `POST /projects/{id}/docs/upload-url` — mints a one-hour presigned
  *      S3 PUT URL plus the S3 key to register afterwards.
@@ -1155,17 +1182,17 @@ export async function runDocsUpload(
   // transfer-encoding on presigned PUTs, and Node's fetch uses the explicit
   // header to keep identity framing with a streamed body.
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch.bind(globalThis);
-  // DEV-384 review F3: a remote facade must mint a non-local https URL.
+  // A remote facade must mint a non-local https URL.
   assertSafePresignedUploadUrl(minted.uploadUrl, client.resolvedBaseUrl);
   // Same flag > TESTSPRITE_REQUEST_TIMEOUT_MS > default resolution (and 1-600s
   // clamp) as makeHttpClient — this leg bypasses HttpClient, so resolve here.
   const requestTimeoutMs = resolveRequestTimeoutMs(opts, deps.env ?? process.env);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
-  // DEV-384 review F14b: compose the shutdown signal into the PUT abort
-  // (manual listeners, house style — no AbortSignal.any) and arm the
-  // graceful scope for the upload's duration, so Ctrl-C during a long PUT
-  // takes the honest DEV-331 detach path instead of being unabortable.
+  // Compose the shutdown signal into the PUT abort (manual listeners, house
+  // style — no AbortSignal.any) and arm the graceful scope for the upload's
+  // duration, so Ctrl-C during a long PUT takes the honest detach path
+  // instead of being unabortable.
   const shutdown = deps.shutdown ?? globalShutdown;
   const shutdownSignal = shutdown.signal;
   const onShutdownAbort = (): void => controller.abort(shutdownSignal.reason);
@@ -1179,7 +1206,7 @@ export async function runDocsUpload(
       headers: { 'content-type': contentType, 'content-length': String(stat.size) },
       body: Readable.toWeb(createReadStream(opts.file)) as unknown as RequestInit['body'],
       duplex: 'half',
-      // #342 review: assertSafePresignedUploadUrl vets the MINTED url, but a
+      // assertSafePresignedUploadUrl vets the MINTED url, but a
       // default `redirect: 'follow'` would let a 3xx from that host resend
       // the request to an unvetted Location (e.g. a 303 → 169.254.169.254) —
       // an SSRF-shaped hop the guard never sees. A real S3 presigned PUT never
@@ -1224,10 +1251,10 @@ export async function runDocsUpload(
     });
   } catch (cause) {
     if (cause instanceof ApiError) throw registerStepError(cause);
-    // DEV-384 review F4: a register timeout needs the same step-3 context —
-    // it is precisely the case where the caller can't tell whether the
-    // register landed. Class and exit 7 are preserved; only the text gains
-    // the upload-succeeded / safe-to-re-run explanation.
+    // A register timeout needs the same step-3 context — it is precisely the
+    // case where the caller can't tell whether the register landed. Class and
+    // exit 7 are preserved; only the text gains the upload-succeeded /
+    // safe-to-re-run explanation.
     if (cause instanceof RequestTimeoutError) {
       cause.message =
         `Document register timed out (step 3 of 3) — the S3 upload succeeded, and the ` +
@@ -1263,7 +1290,7 @@ function describeCause(cause: unknown): string {
 }
 
 /**
- * DEV-384 review F3 — defense-in-depth on the server-minted presigned URL.
+ * Defense-in-depth on the server-minted presigned URL.
  *
  * A REMOTE facade must mint a non-local `https:` URL; a localhost/private or
  * plain-http mint from a remote facade is exactly the anomaly to reject
@@ -1271,18 +1298,17 @@ function describeCause(cause: unknown): string {
  * otherwise send the user's file wherever that URL points, before any bytes
  * leave the machine. A facade that is ITSELF loopback (dev rig, localhost
  * e2e) is a deliberate operator configuration and is trusted to mint local
- * URLs — and ONLY loopback qualifies (#342 review): the gate is a positive,
- * fail-closed check, because gating on "anything `assertNotLocal` dislikes"
- * would silently disable the guard for an unparsable base URL or a
- * user-settable private-range endpoint (`--endpoint-url https://10.1.2.3`).
- * Literal checks only (same scope as `assertNotLocal`); no host
- * allow-listing by design.
+ * URLs — and ONLY loopback qualifies: the gate is a positive, fail-closed
+ * check, because gating on "anything `assertNotLocal` dislikes" would
+ * silently disable the guard for an unparsable base URL or a user-settable
+ * private-range endpoint (`--endpoint-url https://10.1.2.3`). Literal checks
+ * only (same scope as `assertNotLocal`); no host allow-listing by design.
  *
- * Known residual (#342 review): a loopback facade that is really a TUNNEL to a
- * remote backend (`ssh -L`, a localhost corporate proxy) is trusted here even
- * though the real conversation is remote and MITM-able upstream. This is
- * inherent to "loopback facade = trusted dev rig" and accepted — the CLI
- * cannot tell a dev rig from a tunnel by the base URL alone.
+ * Known residual: a loopback facade that is really a TUNNEL to a remote
+ * backend (`ssh -L`, a localhost corporate proxy) is trusted here even though
+ * the real conversation is remote and MITM-able upstream. This is inherent to
+ * "loopback facade = trusted dev rig" and accepted — the CLI cannot tell a
+ * dev rig from a tunnel by the base URL alone.
  */
 function assertSafePresignedUploadUrl(uploadUrl: string, facadeBaseUrl: string): void {
   if (isLoopbackFacade(facadeBaseUrl)) return;
@@ -1326,7 +1352,7 @@ function isLocalUrl(url: string): boolean {
 }
 
 /**
- * #342 review: the facade-trust gate for `assertSafePresignedUploadUrl`.
+ * The facade-trust gate for `assertSafePresignedUploadUrl`.
  * Positive and narrow — only an explicitly-loopback facade (`localhost`,
  * a `127.0.0.0/8` literal, or `[::1]`) is trusted to mint local upload URLs.
  * Anything else — including an unparsable base URL or a private-range
@@ -1412,6 +1438,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
 
   project
     .command('list')
+    .summary('List projects visible to the API key')
     .description(
       'List projects visible to the API key\n' +
         '\nExit codes:\n' +
@@ -1420,10 +1447,16 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
         '  5  validation error (e.g., bad --page-size)\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command',
     )
-    .option('--page-size <n>', 'service page-size hint (1-100, default 25)')
+    .option(
+      '--page-size <n>',
+      'page size (1-100, default 25); alone it returns one page plus a next --starting-token (add --max-items to auto-page)',
+    )
     .option('--starting-token <token>', 'opaque cursor from a previous list response')
     .option('--max-items <n>', 'stop after this many items across auto-paged pages')
-    .option('--columns <list>', 'select/reorder text table columns (comma-separated keys)')
+    .option(
+      '--columns <list>',
+      'select/reorder text table columns (comma-separated keys: id, name, type, from, org, url, created, defaultenv, envs)',
+    )
     .option('--no-header', 'suppress the text table header row')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts: ListFlagOpts, command: Command) => {
@@ -1434,7 +1467,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       // the contract-mandated exit code 5.
       await runList(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           pageSize: parseFlag(cmdOpts.pageSize, 'page-size'),
           startingToken: cmdOpts.startingToken,
           maxItems: parseFlag(cmdOpts.maxItems, 'max-items'),
@@ -1450,7 +1483,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .description('Get a project by id')
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (projectId: string, _cmdOpts, command: Command) => {
-      await runGet({ ...resolveCommonOptions(command), projectId }, deps);
+      await runGet({ ...resolveCommonOptions(command, deps.env), projectId }, deps);
     });
 
   project
@@ -1460,25 +1493,32 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .option('--name <name>', 'project name (required)')
     .option(
       '--url <url>',
-      'target URL (required for frontend unless --local is used; also required for backend on the V3 execution ' +
-        'path — see `auth status` for your routing)',
+      'target URL (public http/https; a loopback http origin with an explicit port is frontend only; required for frontend unless --local; also required for backend on the V3 path, see `auth status`)',
     )
     .option(
       '--local <port>',
-      'create a frontend project for an app on this machine (1-65535; excludes --url)',
+      'shorthand for --url http://localhost:<port> (1-65535; excludes --url; frontend only; runs open a tunnel automatically)',
     )
-    .option(
-      '--local-host <host>',
-      'loopback host: localhost, 127.0.0.1 (default), or ::1; requires --local',
+    .addOption(
+      new Option(
+        '--local-host <host>',
+        'deprecated loopback host override; requires --local',
+      ).hideHelp(),
     )
     .option('--skip-preflight', 'skip the local TCP listener check before project creation')
     .option(
       '--description <text>',
       'not supported — projects have no description (test-level descriptions are set on `test create`)',
     )
-    .option('--username <user>', 'optional auth username')
-    .option('--password <pw>', 'optional auth password (use --password-file for non-interactive)')
-    .option('--password-file <path>', 'read password from file instead of inline flag')
+    .option('--username <user>', 'optional auth username (give with --password)')
+    .option(
+      '--password <pw>',
+      'optional auth password, with --username (--password-file for non-interactive)',
+    )
+    .option(
+      '--password-file <path>',
+      'read password from file (if both are given, --password wins with a warning)',
+    )
     .option('--instruction <text>', 'optional FE plan-gen instruction hint')
     .option(
       '--test-id-attributes <list>',
@@ -1499,7 +1539,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       }
       await runCreate(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           type,
           name: cmdOpts.name,
           targetUrl: cmdOpts.url,
@@ -1525,19 +1565,27 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .command('update <project-id>')
     .description('Update project metadata')
     .option('--name <name>', 'new project name')
-    .option('--url <url>', 'new target URL (public; for an app on this machine use --local)')
     .option(
-      '--local <port>',
-      'point the project at an app on this machine (1-65535; excludes --url; frontend only)',
+      '--url <url>',
+      'new target URL (public http/https, or a loopback http origin with an explicit port)',
     )
     .option(
-      '--local-host <host>',
-      'loopback host: localhost, 127.0.0.1 (default), or ::1; requires --local',
+      '--local <port>',
+      'shorthand for --url http://localhost:<port> (1-65535; excludes --url; frontend only)',
+    )
+    .addOption(
+      new Option(
+        '--local-host <host>',
+        'deprecated loopback host override; requires --local',
+      ).hideHelp(),
     )
     .option('--skip-preflight', 'skip the local TCP listener check before the update')
     .option('--username <user>', 'new auth username')
     .option('--password <pw>', 'new auth password')
-    .option('--password-file <path>', 'read new password from file')
+    .option(
+      '--password-file <path>',
+      'read new password from file (if both are given, --password wins with a warning)',
+    )
     .option('--instruction <text>', 'new FE plan-gen instruction hint')
     .option(
       '--test-id-attributes <list>',
@@ -1557,7 +1605,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .action(async (projectId: string, cmdOpts: UpdateFlagOpts, command: Command) => {
       await runUpdate(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           projectId,
           name: cmdOpts.name,
           targetUrl: cmdOpts.url,
@@ -1581,6 +1629,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
 
   project
     .command('delete <project-id>')
+    .summary('Permanently delete a project (requires --confirm)')
     .description(
       'Permanently delete a project and everything under it (sub-projects,\n' +
         'their tests, and backend fixtures). Requires --confirm.\n' +
@@ -1599,7 +1648,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .action(async (projectId: string, cmdOpts: DeleteFlagOpts, command: Command) => {
       await runDelete(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           projectId,
           confirm: cmdOpts.confirm === true,
           idempotencyKey: cmdOpts.idempotencyKey,
@@ -1610,11 +1659,15 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
 
   project
     .command('credential <project-id>')
+    .summary('Set the static credential injected into backend tests')
     .description(
-      'Set the static backend credential injected into every backend test\n' +
-        '(Bearer token / API key / Basic token / public). Free tier.',
+      'Set the static backend credential injected into every backend test. Free tier.\n' +
+        "On V3 accounts it is stored on the project's default environment.",
     )
-    .requiredOption('--type <type>', 'public | "Bearer token" | "API key" | "basic token"')
+    .requiredOption(
+      '--type <type>',
+      'required: public | "Bearer token" | "API key" | "basic token" (exact, lowercase)',
+    )
     .option('--credential <value>', 'credential value (required unless --type public)')
     .option('--credential-file <path>', 'read the credential value from a file')
     .option(
@@ -1625,7 +1678,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .action(async (projectId: string, cmdOpts: CredentialFlagOpts, command: Command) => {
       await runCredential(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           projectId,
           authType: cmdOpts.type,
           credential: cmdOpts.credential,
@@ -1638,13 +1691,19 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
 
   project
     .command('auto-auth <project-id>')
+    .summary('Configure auto-refresh login for backend tests (paid)')
     .description(
-      'Configure the recurring-token (auto-refresh login) for backend tests (Pro).\n' +
-        'A fresh token is fetched on each run and injected into every backend test.',
+      'Configure the recurring-token (auto-refresh login) for backend tests (paid plans):\n' +
+        'a fresh token is fetched on each run and injected into every backend test.\n' +
+        'Each method needs its own flags (password: --login-url, --token-path, ...;\n' +
+        'refresh_token: --token-endpoint, --client-id, ...; aws_cognito_refresh: --region, ...).',
     )
     .requiredOption('--method <method>', 'password | refresh_token | aws_cognito_refresh')
     .requiredOption('--inject <where>', 'bearer | header | cookie')
-    .option('--disable', 'turn auto-auth off (keeps stored config)')
+    .option(
+      '--disable',
+      'turn auto-auth off, keeping stored config (--method and --inject are still required)',
+    )
     .option('--inject-key <name>', 'header/cookie name when --inject is header/cookie')
     // password method
     .option('--login-url <url>', 'login endpoint (method=password)')
@@ -1673,7 +1732,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .action(async (projectId: string, cmdOpts: AutoAuthFlagOpts, command: Command) => {
       await runAutoAuth(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           projectId,
           disable: cmdOpts.disable,
           method: cmdOpts.method,
@@ -1701,16 +1760,16 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       );
     });
 
-  const docs = new Command('docs').description(
-    'Manage project documents — the sources plan generation feeds on',
-  );
+  const docs = new Command('docs')
+    .summary('Manage project documents (plan-generation sources)')
+    .description('Manage project documents — the sources plan generation feeds on');
   docs
     .command('upload <file>')
+    .summary('Upload an API spec or PRD as a project source')
     .description(
-      'Upload an API spec or PRD as a project source (DEV-384). Three steps:\n' +
-        'mint a presigned S3 URL, stream the file bytes to it, register the\n' +
-        'document — which starts processing + embedding. The local file is\n' +
-        'only read; nothing is written back to disk.\n' +
+      'Upload an API spec or PRD as a project source: mint a presigned S3 URL, stream the file\n' +
+        'to it, register the document — which starts processing + embedding and spends credits\n' +
+        '(see `testsprite usage`). The local file is only read.\n' +
         '\nExit codes:\n' +
         '  0  upload registered (processing started)\n' +
         '  3  auth error\n' +
@@ -1719,7 +1778,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
         '  7  request timeout (also: backend predates the docs routes)\n' +
         ' 10  presigned S3 PUT failed — re-run to mint a fresh URL',
     )
-    .option('--project <id>', 'project id the document belongs to (required)')
+    .option('--project <id>', 'project id (required unless TESTSPRITE_PROJECT_ID is set)')
     .option('--role <role>', 'document role: api-doc (API spec, default) | prd')
     .option('--name <display-name>', 'display name for the document (default: file basename)')
     .option(
@@ -1730,7 +1789,7 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
     .action(async (file: string, cmdOpts: DocsUploadFlagOpts, command: Command) => {
       await runDocsUpload(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           file,
           projectId: cmdOpts.project,
           role: cmdOpts.role,
@@ -1741,9 +1800,10 @@ export function createProjectCommand(deps: ProjectDeps = {}): Command {
       );
     });
   project.addCommand(docs);
-  // DEV-1305: `project env <verb>` — the per-project environment surface
-  // (credentials, URL, default). Own module; `deps` threaded so tests inject.
+  // `project env <verb>` — the per-project environment surface (credentials,
+  // URL, default). Own module; `deps` threaded so tests inject.
   project.addCommand(createProjectEnvCommand(deps));
+  project.addCommand(createProjectSignInCommand(deps));
 
   return project;
 }
@@ -1847,13 +1907,13 @@ function parseFlag(raw: string | undefined, flagName: string): number | undefine
   return n;
 }
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
   // P2-8: validate --output before allowing silent fallback to 'text'.
   return {
-    profile: globals.profile ?? 'default',
+    profile: resolveProfileName(globals.profile, env),
     output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
@@ -1908,7 +1968,21 @@ const PROJECT_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliProject>> = [
     width: rows => Math.max(3, ...rows.map(project => renderProjectUrl(project).length)),
     render: renderProjectUrl,
   },
-  { header: 'CREATED', width: 0, render: project => project.createdAt },
+  {
+    header: 'CREATED',
+    width: rows => Math.max(7, ...rows.map(project => project.createdAt.length)),
+    render: project => project.createdAt,
+  },
+  {
+    header: 'DEFAULT ENV',
+    width: rows => Math.max(11, ...rows.map(project => (project.defaultEnvironment ?? '-').length)),
+    render: project => project.defaultEnvironment ?? '-',
+  },
+  {
+    header: 'ENVS',
+    width: 4,
+    render: project => project.environmentCount?.toString() ?? '-',
+  },
 ];
 
 function renderProjectUrl(project: CliProject): string {
@@ -1968,6 +2042,15 @@ function renderProjectText(p: CliProject): string {
   if (p.orgId !== undefined) {
     lines.push(`org:         ${p.orgName ?? '(name unknown)'} (${p.orgId})`);
   }
+  if ('defaultEnvironment' in p) {
+    lines.push(`defaultEnv:  ${p.defaultEnvironment ?? '-'}`);
+  }
+  if ('environmentCount' in p) {
+    const count = p.environmentCount;
+    lines.push(
+      `envs:        ${count}${count !== undefined && count > 0 ? ` (list with: testsprite project env list ${p.id})` : ''}`,
+    );
+  }
   // Presence, not truthiness — see the `targetUrl` docstring on `CliProject`.
   // `'targetUrl' in p` distinguishes "the backend answered 'no URL'" (render the
   // hint) from "this endpoint doesn't report it" (say nothing).
@@ -2013,14 +2096,16 @@ function renderCreateProjectText(
   if (localTarget) {
     const projectId = resolveCreatedProjectId(p) ?? '<project-id>';
     const url = buildLocalTargetUrl(localTarget.host, localTarget.port);
-    const hostFlag =
-      localTarget.host === DEFAULT_LOCAL_HOST ? '' : ` --local-host ${localTarget.host}`;
     lines.push(
       `Local project: TestSprite will reach ${url} only through a tunnel from this machine.`,
       'Next: write a plan and run it locally:',
-      `  In plan.json, set projectId to ${projectId}.`,
-      `  testsprite test create --project ${projectId} --plan-from plan.json`,
-      `  testsprite test run <test-id> --local ${localTarget.port}${hostFlag}`,
+      // The only next step a --local project gets (it has no first-suite hint),
+      // so it names how to get a plan file. `--plan-from` takes the project from
+      // the file and ignores `--project`, hence "set projectId" and no flag.
+      '  testsprite test create --plan-template > plan.json',
+      `  In plan.json, set projectId to ${projectId} and edit the steps.`,
+      '  testsprite test create --plan-from plan.json',
+      '  testsprite test run <test-id>',
       `Portal runs of this project stay blocked (free) until you set a public URL with: testsprite project update ${projectId} --url https://...`,
     );
   }
@@ -2033,13 +2118,24 @@ function renderUpdateText(r: CliUpdateProjectResponse, localTarget?: StoredLocal
     `updatedFields: ${r.updatedFields?.join(', ') ?? '(none)'}`,
   ];
   if (r.updatedAt !== undefined) lines.push(`updatedAt:     ${r.updatedAt}`);
+  if (r.environment !== undefined) {
+    lines.push(`environment: ${r.environment.name} (default)`);
+    const labels: Record<string, string> = {
+      'environment.url': 'Environment URL updated',
+      'environment.credentials': 'Environment credentials updated',
+      'project.name': 'Project name updated',
+      'project.instruction': 'Project instruction updated',
+      'project.testIdAttributes': 'Project test ID attributes updated',
+    };
+    for (const effect of r.effects ?? []) {
+      if (labels[effect]) lines.push(`effect:      ${labels[effect]}`);
+    }
+  }
   if (localTarget) {
     const url = buildLocalTargetUrl(localTarget.host, localTarget.port);
-    const hostFlag =
-      localTarget.host === DEFAULT_LOCAL_HOST ? '' : ` --local-host ${localTarget.host}`;
     lines.push(
       `Local project: TestSprite will reach ${url} only through a tunnel from this machine.`,
-      `Run its tests with: testsprite test run <test-id> --local ${localTarget.port}${hostFlag}`,
+      'Run its tests with: testsprite test run <test-id> (the CLI opens a tunnel automatically).',
     );
   }
   return lines.join('\n');
@@ -2052,7 +2148,7 @@ function renderDeleteText(r: CliDeleteProjectResponse): string {
 /**
  * `--project` resolution for `project docs upload` — mirrors test.ts's
  * resolveProjectId/requireProjectId so `TESTSPRITE_PROJECT_ID` works here the
- * same as on every other command (DEV-384 review F5). Flag wins over env.
+ * same as on every other command. Flag wins over env.
  */
 function requireDocsProjectId(projectId: string | undefined, deps: ProjectDeps): string {
   const explicit = projectId?.trim();

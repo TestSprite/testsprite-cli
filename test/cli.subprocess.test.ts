@@ -1018,7 +1018,7 @@ describe('--dry-run subprocess smoke', () => {
       'update',
       'proj_anything',
       '--password-file',
-      '/tmp/definitely-not-here-testsprite',
+      join(tmpHome, 'definitely-not-here-testsprite'),
       '--dry-run',
       '--output',
       'json',

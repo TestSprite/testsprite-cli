@@ -4,7 +4,55 @@
  * Extracted so the output-interceptor rephrasing logic (P10) is
  * unit-testable without spawning a full CLI process.
  */
+import type { PlanInterruptDetach, TunnelInterruptDetach } from '../commands/test.js';
+import type { InterruptError } from './errors.js';
 import type { OutputMode } from './output.js';
+
+/** The JSON-mode stderr envelope for a signal detach (errors.md §8.1). */
+export interface InterruptEnvelope {
+  error: {
+    code: 'INTERRUPTED';
+    message: string;
+    nextAction: string;
+    requestId: 'local';
+    details: Record<string, unknown>;
+  };
+}
+
+/**
+ * Build the `INTERRUPTED` envelope from whatever the interrupted command
+ * attached to the error. A tunnel run attaches `tunnelDetach` and
+ * `test plan generate` attaches `planDetach`; each carries its own
+ * `nextAction` so the envelope never contradicts the text line the catch
+ * block already printed. Otherwise a run wait gets the run-detach story
+ * (`test wait`) and any other request gets the generic check-state hint.
+ */
+export function buildInterruptEnvelope(err: InterruptError): InterruptEnvelope {
+  const { tunnelDetach, planDetach } = err as InterruptError & {
+    tunnelDetach?: TunnelInterruptDetach;
+    planDetach?: PlanInterruptDetach;
+  };
+  const nextAction =
+    tunnelDetach?.nextAction ??
+    planDetach?.nextAction ??
+    (err.runWaitContext
+      ? 'The server-side run (if any) keeps executing and billing. ' +
+        'Re-attach with: testsprite test wait <runId>, or stop it with: testsprite test cancel <runId> ' +
+        '(runId is in the partial JSON on stdout).'
+      : 'The request was interrupted. Check the current state before retrying; ' +
+        'a multi-item command may have processed some items.');
+  const details: Record<string, unknown> = { signal: err.signal };
+  if (tunnelDetach) {
+    details.runId = tunnelDetach.runId;
+    details.cancelOutcome = tunnelDetach.cancel;
+  } else if (planDetach) {
+    details.projectId = planDetach.projectId;
+    details.stagesRemaining = planDetach.stagesRemaining;
+  }
+  return {
+    error: { code: 'INTERRUPTED', message: err.message, nextAction, requestId: 'local', details },
+  };
+}
 
 /**
  * Global flags that belong before the subcommand, not after it.
@@ -94,6 +142,19 @@ export function renderAmbiguousOrgCandidates(candidates: unknown): string[] {
   }
   if (lines.length === 0) return [];
   lines.push('  hint: re-run with --project <id> to disambiguate.');
+  return lines;
+}
+
+/** Text-mode recovery handles for the account's tunnel binding limit. */
+export function renderTunnelBindingLimitIds(details: unknown): string[] {
+  if (!Array.isArray(details)) return [];
+  const ids = details.filter((value): value is string => typeof value === 'string');
+  if (ids.length === 0) return [];
+  const lines = ids.slice(0, 20).map(id => `  tunnel: ${id}`);
+  if (ids.length > 20) lines.push(`  … and ${ids.length - 20} more`);
+  lines.push(
+    '  hint: testsprite tunnel list · testsprite tunnel stop <client-id> · testsprite tunnel stop --all --confirm',
+  );
   return lines;
 }
 

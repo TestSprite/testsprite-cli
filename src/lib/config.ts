@@ -15,7 +15,7 @@ export interface LoadConfigOptions {
   credentialsPath?: string;
 }
 
-const DEFAULT_API_URL = 'https://api.testsprite.com';
+export const DEFAULT_API_URL = 'https://api.testsprite.com';
 
 /** Treat empty / whitespace-only env values as unset for `??` resolution chains. */
 export function normalizeEnvVar(value: string | undefined): string | undefined {
@@ -24,6 +24,29 @@ export function normalizeEnvVar(value: string | undefined): string | undefined {
 
 export function defaultConfigPath(): string {
   return join(homedir(), '.testsprite', 'config');
+}
+
+/**
+ * The single place the documented profile-resolution order lives:
+ *
+ *   `--profile` flag  >  `TESTSPRITE_PROFILE` env var  >  `"default"`
+ *
+ * Every command needs the resolved name before it can build a client (and
+ * `auth` / `setup` need it to read and write the right credentials section), so
+ * each one used to inline `flag ?? 'default'`. That collapsed to the literal
+ * `'default'` whenever the flag was absent and made the env var unreachable
+ * from every entry point — `loadConfig` never got the `undefined` its own `??`
+ * chain needs. Resolving here keeps the order in one place and keeps the
+ * blank-value normalization ({@link normalizeEnvVar}) that a hand-written
+ * `flag ?? env.TESTSPRITE_PROFILE ?? 'default'` would drop: an empty or
+ * whitespace-only value must fall back to the default profile, not fail the
+ * INI section-name guard on every command.
+ */
+export function resolveProfileName(
+  flagValue: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return flagValue ?? normalizeEnvVar(env.TESTSPRITE_PROFILE) ?? DEFAULT_PROFILE;
 }
 
 /**
@@ -39,7 +62,7 @@ export function defaultConfigPath(): string {
  */
 export function loadConfig(options: LoadConfigOptions = {}): Config {
   const env = options.env ?? process.env;
-  const profile = options.profile ?? normalizeEnvVar(env.TESTSPRITE_PROFILE) ?? DEFAULT_PROFILE;
+  const profile = resolveProfileName(options.profile, env);
   const credentialsPath = options.credentialsPath ?? defaultCredentialsPath();
   const fileEntry = readProfile(profile, { path: credentialsPath });
 

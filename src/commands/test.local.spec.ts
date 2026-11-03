@@ -1,5 +1,5 @@
 /**
- * `test run <test-id> --local <port>` — DEV-747 piece 3.
+ * `test run <test-id> --local <port>`.
  *
  * Every assertion here is about one of the two things that can silently cost a
  * user money: **charging for a run that was doomed before it started**, and
@@ -8,7 +8,7 @@
  * contract with the wallet and with the truth.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import net, { type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +20,7 @@ import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js'
 import { ShutdownController } from '../lib/interrupt.js';
 import type { JUnitReportFlagOptions } from '../lib/junit-report.js';
 import { TunnelLostError } from '../lib/tunnel-session.js';
+import { takeTelemetryExtras } from '../lib/telemetry.js';
 import type { TunnelClientOptions } from '../vendor/tunnel-client/index.js';
 import { ErrCode, TunnelClient } from '../vendor/tunnel-client/index.js';
 import type { RunResponse, TriggerRunResponse } from '../lib/runs.types.js';
@@ -138,6 +139,23 @@ function makeRecordingFetch(opts: {
 
     const custom = await opts.respond?.(call, init);
     if (custom !== undefined) return custom;
+
+    if (method === 'GET' && /\/tests\/[^/]+$/.test(url)) {
+      return new Response(JSON.stringify({ type: 'frontend', projectId: 'project_1' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (method === 'GET' && url.endsWith('/projects/project_1/env')) {
+      return new Response(
+        JSON.stringify({
+          environments: [
+            { id: 'env_local', name: 'local-dev', url: 'http://127.0.0.1:5173', isDefault: false },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
 
     if (method === 'POST' && url.endsWith('/tunnel')) {
       return new Response(JSON.stringify(opts.mintBody ?? MINT_BODY), {
@@ -292,7 +310,14 @@ describe('test run --local — before anything is minted or charged', () => {
     expect(thrown).toBeInstanceOf(ApiError);
     expect((thrown as ApiError).code).toBe('VALIDATION_ERROR');
     // The whole point: no run row, no credit spend, no tunnel credential.
-    expect(calls).toEqual([]);
+    expect(calls).toEqual([
+      { method: 'GET', url: 'http://localhost:13502/api/cli/v1/tests/test_xyz', body: undefined },
+      {
+        method: 'GET',
+        url: 'http://localhost:13502/api/cli/v1/projects/project_1/env',
+        body: undefined,
+      },
+    ]);
   });
 
   it('refuses --local together with --target-url without touching the network', async () => {
@@ -559,6 +584,109 @@ describe('test run --local — signal-safe lifecycle', () => {
 // ---------------------------------------------------------------------------
 
 describe('test run --local — happy path', () => {
+  it.each([false, true])(
+    'prints the minted client id before connect (connect fails: %s)',
+    async fails => {
+      const calls: Call[] = [];
+      const events: string[] = [];
+      const targetUrl = 'http://127.0.0.1:5173';
+      const pending = runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_xyz',
+          localPort: 5173,
+          wait: true,
+          timeoutSeconds: 30,
+          skipPreflight: true,
+        },
+        {
+          ...makeCreds(),
+          fetchImpl: makeRecordingFetch({ calls, targetUrl }),
+          stderr: line => events.push(line),
+          stdout: () => {},
+          sleep: async () => {},
+          createTunnelClient: () => {
+            events.push('factory');
+            return {
+              start: async () => {
+                if (fails) throw new Error('connect failed');
+              },
+              stop: async () => {},
+            };
+          },
+        },
+      );
+      if (fails) await expect(pending).rejects.toBeDefined();
+      else await pending;
+      expect(
+        events.findIndex(line => line.includes(`Minted tunnel client ${MINT_BODY.clientId}`)),
+      ).toBeGreaterThanOrEqual(0);
+      expect(events.findIndex(line => line.includes('Minted tunnel client'))).toBeLessThan(
+        events.indexOf('factory'),
+      );
+    },
+  );
+
+  it('records one local slot and one peak for a single-id run', async () => {
+    takeTelemetryExtras();
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        localPort: 5173,
+        wait: true,
+        timeoutSeconds: 30,
+        skipPreflight: true,
+      },
+      {
+        ...makeCreds(),
+        fetchImpl: makeRecordingFetch({ calls: [], targetUrl: 'http://127.0.0.1:5173' }),
+        stderr: () => {},
+        stdout: () => {},
+        sleep: async () => {},
+        createTunnelClient: fakeTunnel().factory,
+      },
+    );
+    expect(takeTelemetryExtras()).toMatchObject({ localConcurrencyLimit: 1, localPeakInFlight: 1 });
+  });
+  it('records the local slot but no traffic when a single trigger is refused', async () => {
+    takeTelemetryExtras();
+    await expect(
+      runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_xyz',
+          localPort: 5173,
+          wait: true,
+          timeoutSeconds: 30,
+          skipPreflight: true,
+        },
+        {
+          ...makeCreds(),
+          fetchImpl: makeRecordingFetch({
+            calls: [],
+            targetUrl: 'http://127.0.0.1:5173',
+            respond: call =>
+              call.method === 'POST' && call.url.includes('/tests/test_xyz/runs')
+                ? apiErrorResponse(409, 'CONFLICT', 'run in flight')
+                : undefined,
+          }),
+          stderr: () => {},
+          stdout: () => {},
+          sleep: async () => {},
+          createTunnelClient: fakeTunnel().factory,
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 6 });
+    // The slot is configured but nothing went through the tunnel.
+    expect(takeTelemetryExtras()).toMatchObject({ localConcurrencyLimit: 1, localPeakInFlight: 0 });
+  });
   it('lets --local satisfy --wait for both --gh-output and --summary-file', async () => {
     const port = 5173;
     const calls: Call[] = [];
@@ -663,6 +791,7 @@ describe('test run --local — happy path', () => {
       };
     });
 
+    const reportDir = mkdtempSync(join(tmpdir(), 'cli-local-unused-report-'));
     try {
       const { createTestCommand: createFreshTestCommand } = await import('./test.js');
       const command = createFreshTestCommand({
@@ -681,7 +810,7 @@ describe('test run --local — happy path', () => {
             '--report',
             'junit',
             '--report-file',
-            join(tmpdir(), 'unused-junit.xml'),
+            join(reportDir, 'unused-junit.xml'),
           ],
           { from: 'user' },
         ),
@@ -692,6 +821,7 @@ describe('test run --local — happy path', () => {
     } finally {
       vi.doUnmock('../lib/junit-report.js');
       vi.resetModules();
+      rmSync(reportDir, { recursive: true, force: true });
     }
   });
 
@@ -875,6 +1005,12 @@ describe('test run --local — teardown', () => {
       const url = String(input);
       const method = (init.method ?? 'GET').toUpperCase();
       calls.push({ method, url, body: undefined });
+      if (method === 'GET' && url.endsWith('/tests/test_xyz')) {
+        return new Response(JSON.stringify({ type: 'frontend', projectId: 'project_1' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       if (method === 'POST' && url.endsWith('/tunnel')) {
         return new Response(JSON.stringify(MINT_BODY), {
           status: 201,
@@ -968,10 +1104,14 @@ describe('test run --local — teardown', () => {
 
 describe('test run --local — detaching from a tunnel run tells the truth', () => {
   const optOutConsequence =
-    'Passing --no-cancel-on-interrupt keeps the run executing without its tunnel; it cannot ' +
-    'reach your app and is still billed.';
+    'Passing --no-cancel-on-interrupt keeps the run going in the cloud, and it is still billed. ' +
+    'The tunnel is closed, so steps that still need your machine will fail; the run can still ' +
+    'pass if it no longer needs to load anything from your machine.';
 
-  async function interruptRun(overrides: Partial<Parameters<typeof runTestRun>[0]> = {}) {
+  async function interruptRun(
+    overrides: Partial<Parameters<typeof runTestRun>[0]> = {},
+    signal: 'SIGINT' | 'SIGTERM' = 'SIGINT',
+  ) {
     const port = 5173;
     const calls: Call[] = [];
     const lines: string[] = [];
@@ -998,7 +1138,7 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
             calls,
             targetUrl: target,
             run: () => {
-              shutdown.interrupt('SIGINT');
+              shutdown.interrupt(signal);
               return { ...passedRun(target), status: 'running' };
             },
           }),
@@ -1037,7 +1177,7 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
         'closes with ' +
         'this process, so it was cancelled (exit 130). The run may already have been billed; a ' +
         "cancelled run's verdict is discarded. Start a new run with: testsprite test run " +
-        `test_xyz --local 5173. ${optOutConsequence}`,
+        `test_xyz --local 5173 --local-host 127.0.0.1. ${optOutConsequence}`,
     );
     expect(text).not.toMatch(/guaranteed failure|no further credits are spent/i);
     const tunnelDetach = (
@@ -1050,7 +1190,7 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
     expect(tunnelDetach?.nextAction).toBe(
       'Run run_abc was cancelled after SIGINT (exit 130) and its tunnel was closed. The run ' +
         "may already have been billed; a cancelled run's verdict is discarded. Start a new " +
-        `run with: testsprite test run test_xyz --local 5173. ${optOutConsequence}`,
+        `run with: testsprite test run test_xyz --local 5173 --local-host 127.0.0.1. ${optOutConsequence}`,
     );
   });
 
@@ -1111,12 +1251,23 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
     });
   });
 
-  it('honours --no-cancel-on-interrupt', async () => {
-    const { calls, lines } = await interruptRun({ cancelOnInterrupt: false });
-    expect(calls.some(c => c.method === 'POST' && c.url.includes('/cancel'))).toBe(false);
-    // Still honest: it must not silently look like a normal detach.
-    expect(lines.join('\n')).toMatch(/tunnel/i);
-  });
+  it.each([
+    ['SIGINT', 130],
+    ['SIGTERM', 143],
+  ] as const)(
+    'honours --no-cancel-on-interrupt after %s with exit %s',
+    async (signal, exitCode) => {
+      const { calls, lines, thrown } = await interruptRun({ cancelOnInterrupt: false }, signal);
+      expect(thrown).toMatchObject({ signal, exitCode });
+      expect(calls.some(c => c.method === 'DELETE' && c.url.includes('/tunnel/'))).toBe(true);
+      expect(lines.join('\n')).toContain(optOutConsequence);
+      expect(lines.join('\n')).toContain('testsprite test result test_xyz');
+      expect(lines.join('\n')).toContain('testsprite test wait run_abc');
+      expect(calls.some(c => c.method === 'POST' && c.url.includes('/cancel'))).toBe(false);
+      // Still honest: it must not silently look like a normal detach.
+      expect(lines.join('\n')).toMatch(/tunnel/i);
+    },
+  );
 
   it('treats an adopted tunnel interrupt as an ordinary detach', async () => {
     const port = 5173;
@@ -1191,6 +1342,15 @@ describe('test run --local — detaching from a tunnel run tells the truth', () 
           fetchImpl: makeRecordingFetch({
             calls,
             targetUrl: 'https://example.com',
+            respond: call =>
+              call.url.endsWith('/projects/project_1/env')
+                ? new Response(
+                    JSON.stringify({
+                      environments: [{ name: 'demo', url: 'https://example.com', isDefault: true }],
+                    }),
+                    { status: 200, headers: { 'content-type': 'application/json' } },
+                  )
+                : undefined,
             run: () => {
               shutdown.interrupt('SIGINT');
               return { ...passedRun('https://example.com'), status: 'running' };
@@ -2138,6 +2298,15 @@ describe('test run timeout defaults', () => {
       fetchImpl: makeRecordingFetch({
         calls: [],
         targetUrl,
+        respond: call =>
+          !local && call.url.endsWith('/projects/project_1/env')
+            ? new Response(
+                JSON.stringify({
+                  environments: [{ name: 'demo', url: targetUrl, isDefault: true }],
+                }),
+                { status: 200, headers: { 'content-type': 'application/json' } },
+              )
+            : undefined,
         run: () => ({ ...passedRun(targetUrl), status: 'running', retryAfterSeconds: 25 }),
       }),
       stdout: line => stdout.push(line),
@@ -2183,17 +2352,16 @@ describe('test run timeout defaults', () => {
 
   it.each(
     [
-      { localHost: undefined, targetUrl: 'http://127.0.0.1:5173', hostFlag: '' },
-      { localHost: '::1' as const, targetUrl: 'http://[::1]:5173', hostFlag: ' --local-host ::1' },
+      { localHost: undefined, targetUrl: 'http://127.0.0.1:5173' },
+      { localHost: '::1' as const, targetUrl: 'http://[::1]:5173' },
       {
         localHost: 'localhost' as const,
         targetUrl: 'http://localhost:5173',
-        hostFlag: ' --local-host localhost',
       },
     ].flatMap(host => (['text', 'json'] as const).map(output => ({ ...host, output }))),
   )(
-    'preserves $localHost in owned timeout recovery commands ($output)',
-    async ({ localHost, targetUrl, hostFlag, output }) => {
+    'preserves an explicit $localHost target in owned timeout recovery ($output)',
+    async ({ localHost, targetUrl, output }) => {
       vi.useFakeTimers();
       const stdout: string[] = [];
       const stderr: string[] = [];
@@ -2225,7 +2393,7 @@ describe('test run timeout defaults', () => {
       ).catch((err: unknown) => err);
       await vi.advanceTimersByTimeAsync(1000);
       const err = await pending;
-      const retry = `testsprite test run test_xyz --local 5173${hostFlag} --timeout 1800`;
+      const retry = `testsprite test run test_xyz --local 5173${localHost === 'localhost' ? '' : ` --local-host ${localHost ?? '127.0.0.1'}`} --timeout 1800`;
       expect(err).toMatchObject({ exitCode: 7, nextAction: expect.stringContaining(retry) });
       expect(stderr.join('\n')).toContain(retry);
       if (output === 'text') expect(stdout.join('\n')).toContain(targetUrl);
@@ -2240,7 +2408,7 @@ describe('test run timeout defaults', () => {
   it('explains the local default in run help', () => {
     const run = createTestCommand().commands.find(command => command.name() === 'run')!;
     expect(run.helpInformation().replace(/\s+/g, ' ')).toContain(
-      'default 600, or 1200 with --local',
+      'default 600, or 1200 through a tunnel',
     );
   });
 });
@@ -2354,11 +2522,412 @@ describe('local wait timeout telemetry', () => {
 });
 
 // ---------------------------------------------------------------------------
-// DEV-1305 — `--local <port> --env <name>`: the tunnel supplies the address, the
+// `--local <port> --env <name>`: the tunnel supplies the address, the
 // environment supplies the credentials.
 // ---------------------------------------------------------------------------
 
-describe('test run --local --env (DEV-1305)', () => {
+describe('test run --local --env', () => {
+  it('--local --env continues when the environment list is forbidden', async () => {
+    const calls: Call[] = [];
+    const stderr: string[] = [];
+    const result = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        localPort: 5173,
+        wait: true,
+        timeoutSeconds: 30,
+        environment: 'local-dev',
+        skipPreflight: true,
+      },
+      {
+        ...makeCreds(),
+        fetchImpl: makeRecordingFetch({
+          calls,
+          targetUrl: 'http://127.0.0.1:5173',
+          respond: call =>
+            call.url.endsWith('/projects/project_1/env')
+              ? apiErrorResponse(403, 'AUTH_FORBIDDEN', 'project read forbidden')
+              : undefined,
+        }),
+        stdout: () => {},
+        stderr: line => stderr.push(line),
+        sleep: async () => {},
+        createTunnelClient: fakeTunnel().factory,
+      },
+    );
+    expect(result).toMatchObject({ runId: 'run_abc', status: 'passed' });
+    expect(
+      calls.filter(call => call.method === 'POST' && call.url.endsWith('/tunnel')),
+    ).toHaveLength(1);
+    expect(calls.filter(call => call.method === 'POST' && call.url.includes('/runs'))).toHaveLength(
+      1,
+    );
+    expect(stderr.filter(line => line.includes('environment preflight'))).toEqual([]);
+  });
+
+  it('--local --env continues when the environment list fails transiently', async () => {
+    const calls: Call[] = [];
+    const stderr: string[] = [];
+    const result = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: true,
+        testId: 'test_xyz',
+        localPort: 5173,
+        wait: true,
+        timeoutSeconds: 30,
+        environment: 'local-dev',
+        skipPreflight: true,
+      },
+      {
+        ...makeCreds(),
+        fetchImpl: makeRecordingFetch({
+          calls,
+          targetUrl: 'http://127.0.0.1:5173',
+          respond: call => {
+            if (call.url.endsWith('/projects/project_1/env'))
+              throw new Error('network unavailable');
+            return undefined;
+          },
+        }),
+        stdout: () => {},
+        stderr: line => stderr.push(line),
+        sleep: async () => {},
+        createTunnelClient: fakeTunnel().factory,
+      },
+    );
+    expect(result).toMatchObject({ runId: 'run_abc', status: 'passed' });
+    expect(
+      calls.filter(call => call.method === 'POST' && call.url.endsWith('/tunnel')),
+    ).toHaveLength(1);
+    expect(calls.filter(call => call.method === 'POST' && call.url.includes('/runs'))).toHaveLength(
+      1,
+    );
+    expect(stderr.filter(line => line.includes('environment preflight'))).toHaveLength(1);
+    expect(stderr.join('\n')).not.toContain('network unavailable');
+  });
+
+  it.each([
+    { status: 404, code: 'NOT_FOUND' },
+    { status: 503, code: 'UNAVAILABLE' },
+  ])(
+    '--local --env continues when the environment list returns $status',
+    async ({ status, code }) => {
+      const calls: Call[] = [];
+      const result = await runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_xyz',
+          localPort: 5173,
+          wait: true,
+          timeoutSeconds: 30,
+          environment: 'local-dev',
+          skipPreflight: true,
+        },
+        {
+          ...makeCreds(),
+          fetchImpl: makeRecordingFetch({
+            calls,
+            targetUrl: 'http://127.0.0.1:5173',
+            respond: call =>
+              call.url.endsWith('/projects/project_1/env')
+                ? apiErrorResponse(status, code, 'environment list unavailable')
+                : undefined,
+          }),
+          stdout: () => {},
+          stderr: () => {},
+          sleep: async () => {},
+          createTunnelClient: fakeTunnel().factory,
+        },
+      );
+      expect(result).toMatchObject({ runId: 'run_abc', status: 'passed' });
+      expect(
+        calls.filter(call => call.method === 'POST' && call.url.endsWith('/tunnel')),
+      ).toHaveLength(1);
+      expect(
+        calls.filter(call => call.method === 'POST' && call.url.includes('/runs')),
+      ).toHaveLength(1);
+    },
+  );
+
+  it('--local test read failure reports a clear error', async () => {
+    const calls: Call[] = [];
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        localPort: 5173,
+        wait: true,
+        timeoutSeconds: 30,
+        skipPreflight: true,
+      },
+      {
+        ...makeCreds(),
+        fetchImpl: makeRecordingFetch({
+          calls,
+          targetUrl: 'http://127.0.0.1:5173',
+          respond: call =>
+            call.url.endsWith('/tests/test_xyz')
+              ? apiErrorResponse(404, 'NOT_FOUND', 'missing')
+              : undefined,
+        }),
+        stdout: () => {},
+        stderr: () => {},
+        createTunnelClient: fakeTunnel().factory,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ code: 'NOT_FOUND', exitCode: 4 });
+    expect(err.message).toContain('Cannot read test test_xyz for --local');
+    expect(calls.filter(call => call.url.endsWith('/tunnel'))).toEqual([]);
+  });
+
+  it('--local test read keeps an interrupt as an interrupt', async () => {
+    const calls: Call[] = [];
+    const interrupt = new InterruptError('SIGINT');
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        localPort: 5173,
+        wait: true,
+        timeoutSeconds: 30,
+        skipPreflight: true,
+      },
+      {
+        ...makeCreds(),
+        fetchImpl: makeRecordingFetch({
+          calls,
+          targetUrl: 'http://127.0.0.1:5173',
+          respond: call => {
+            if (call.url.endsWith('/tests/test_xyz')) throw interrupt;
+            return undefined;
+          },
+        }),
+        stdout: () => {},
+        stderr: () => {},
+        createTunnelClient: fakeTunnel().factory,
+      },
+    ).catch(e => e);
+    expect(err).toBe(interrupt);
+    expect(calls.filter(call => call.url.endsWith('/tunnel'))).toEqual([]);
+  });
+
+  it('sends public --env plus --local and cleans up after an old server refuses it', async () => {
+    const portProbe = vi.spyOn(net, 'connect');
+    const calls: Call[] = [];
+    const tunnel = fakeTunnel();
+    const serverMessage = 'This environment has a public URL and cannot use a tunnel.';
+    const fetchImpl = makeRecordingFetch({
+      calls,
+      targetUrl: 'http://localhost:5173',
+      respond: call => {
+        if (call.url.endsWith('/projects/project_1/env'))
+          return new Response(
+            JSON.stringify({
+              environments: [
+                {
+                  id: 'env_public',
+                  name: 'demo',
+                  url: 'https://demo.example.com',
+                  isDefault: false,
+                },
+              ],
+            }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        if (call.method === 'POST' && call.url.endsWith('/runs'))
+          return apiErrorResponse(400, 'VALIDATION_ERROR', serverMessage, {
+            reason: 'tunnel-public-environment',
+          });
+        return undefined;
+      },
+    });
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        localPort: 5173,
+        wait: true,
+        timeoutSeconds: 30,
+        environment: 'demo',
+        skipPreflight: true,
+      },
+      {
+        ...makeCreds(),
+        fetchImpl,
+        stdout: () => {},
+        stderr: () => {},
+        createTunnelClient: tunnel.factory,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      message: serverMessage,
+      nextAction: 'retry',
+      details: { reason: 'tunnel-public-environment' },
+    });
+    expect(
+      calls.filter(call => call.method === 'POST' && call.url.endsWith('/tunnel')),
+    ).toHaveLength(1);
+    const triggers = calls.filter(call => call.method === 'POST' && call.url.endsWith('/runs'));
+    expect(triggers).toHaveLength(1);
+    expect(triggers[0]?.body).toMatchObject({
+      environment: 'demo',
+      targetUrl: 'http://localhost:5173',
+      tunnelClientId: MINT_BODY.clientId,
+    });
+    expect(
+      calls.filter(call => call.method === 'DELETE' && call.url.includes('/tunnel/')),
+    ).toHaveLength(1);
+    expect(tunnel.calls).toEqual({ start: 1, stop: 1 });
+    expect(portProbe).not.toHaveBeenCalled();
+    portProbe.mockRestore();
+  });
+
+  it('backend --local rejects before port probe and mint', async () => {
+    const portProbe = vi.spyOn(net, 'connect');
+    const calls: Call[] = [];
+    const fetchImpl = makeRecordingFetch({
+      calls,
+      targetUrl: 'http://127.0.0.1:5173',
+      respond: call =>
+        call.method === 'GET' && call.url.endsWith('/tests/test_xyz')
+          ? new Response(JSON.stringify({ type: 'backend', projectId: 'project_1' }), {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            })
+          : undefined,
+    });
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        localPort: 5173,
+        wait: true,
+        timeoutSeconds: 30,
+      },
+      {
+        ...makeCreds(),
+        fetchImpl,
+        stdout: () => {},
+        stderr: () => {},
+        createTunnelClient: fakeTunnel().factory,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(err.nextAction).toContain('testsprite test run test_xyz');
+    expect(
+      calls.filter(call => call.url.endsWith('/tunnel') || call.url.includes('/runs')),
+    ).toEqual([]);
+    expect(portProbe).not.toHaveBeenCalled();
+    portProbe.mockRestore();
+  });
+
+  it('unknown --env plus --local refuses without minting', async () => {
+    const calls: Call[] = [];
+    const fetchImpl = makeRecordingFetch({ calls, targetUrl: 'http://127.0.0.1:5173' });
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        localPort: 5173,
+        wait: true,
+        timeoutSeconds: 30,
+        environment: 'missing',
+      },
+      {
+        ...makeCreds(),
+        fetchImpl,
+        stdout: () => {},
+        stderr: () => {},
+        createTunnelClient: fakeTunnel().factory,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(err.nextAction).toContain("unknown environment 'missing'; use one of: local-dev");
+    expect(
+      calls.filter(call => call.url.endsWith('/tunnel') || call.url.includes('/runs')),
+    ).toEqual([]);
+  });
+
+  it('loopback --env plus --local still mints and runs', async () => {
+    const calls: Call[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        localPort: 5173,
+        wait: true,
+        timeoutSeconds: 30,
+        environment: 'local-dev',
+        skipPreflight: true,
+      },
+      {
+        ...makeCreds(),
+        fetchImpl: makeRecordingFetch({ calls, targetUrl: 'http://127.0.0.1:5173' }),
+        stdout: () => {},
+        stderr: () => {},
+        sleep: async () => {},
+        createTunnelClient: fakeTunnel().factory,
+      },
+    );
+    expect(
+      calls.filter(call => call.method === 'POST' && call.url.endsWith('/tunnel')),
+    ).toHaveLength(1);
+    expect(calls.filter(call => call.method === 'POST' && call.url.includes('/runs'))).toHaveLength(
+      1,
+    );
+  });
+
+  it('bare --local still mints and runs', async () => {
+    const calls: Call[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        localPort: 5173,
+        wait: true,
+        timeoutSeconds: 30,
+        skipPreflight: true,
+      },
+      {
+        ...makeCreds(),
+        fetchImpl: makeRecordingFetch({ calls, targetUrl: 'http://127.0.0.1:5173' }),
+        stdout: () => {},
+        stderr: () => {},
+        sleep: async () => {},
+        createTunnelClient: fakeTunnel().factory,
+      },
+    );
+    expect(
+      calls.filter(call => call.method === 'POST' && call.url.endsWith('/tunnel')),
+    ).toHaveLength(1);
+    expect(calls.filter(call => call.method === 'POST' && call.url.includes('/runs'))).toHaveLength(
+      1,
+    );
+  });
+
   it('sends targetUrl + tunnelClientId + environment together on the trigger', async () => {
     const port = 5173;
     const calls: Call[] = [];

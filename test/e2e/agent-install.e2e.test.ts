@@ -233,6 +233,38 @@ describe('content integrity', () => {
       // Load-bearing onboard string: the skill body must reference setup
       expect(content).toContain('testsprite');
     });
+
+    it(`${target} testsprite-ci file lands and has correct structure`, () => {
+      const tmpDir = freshTmpDir();
+      runCli(['agent', 'install', `--target=${target}`, '--dir', tmpDir, '--output', 'json']);
+
+      const filePath = join(tmpDir, pathFor(target, 'testsprite-ci'));
+      expect(existsSync(filePath), `ci file must exist at ${filePath}`).toBe(true);
+      const content = readFileSync(filePath, 'utf8');
+
+      // Frontmatter check for the ci skill (same wrappers as onboard)
+      if (target === 'claude' || target === 'antigravity' || target === 'kiro') {
+        expect(content.startsWith('---'), `${target}/ci: should start with ---`).toBe(true);
+        expect(content).toContain('name: testsprite-ci');
+      } else if (target === 'cursor') {
+        expect(content.startsWith('---'), `cursor/ci: should start with ---`).toBe(true);
+        expect(content).toContain('alwaysApply: false');
+      } else if (target === 'cline') {
+        expect(content.startsWith('---'), `cline/ci: must NOT start with ---`).toBe(false);
+      } else if (target === 'windsurf') {
+        expect(content.startsWith('---'), `windsurf/ci: should start with ---`).toBe(true);
+        expect(content).toContain('trigger: model_decision');
+        expect(content.length, 'windsurf/ci: must fit the rules-file budget').toBeLessThan(12_000);
+      } else if (target === 'copilot') {
+        expect(content.startsWith('---'), `copilot/ci: should start with ---`).toBe(true);
+        expect(content).toContain("applyTo: '**'");
+      }
+
+      // Load-bearing ci strings: the flow the skill drives
+      expect(content).toContain('testsprite ci init github');
+      expect(content).toContain('deployment_status');
+      expect(content).toContain('TESTSPRITE_API_KEY');
+    });
   }
 
   // codex: ONE managed section containing BOTH verify body and onboard one-liner
@@ -793,7 +825,7 @@ describe('agent list', () => {
     expect(result.status).toBe(0);
 
     // Header must include AGENT and SKILL columns; STATUS/MODE were dropped from
-    // the text table in DEV-279 (still present in --output json).
+    // the text table (still present in --output json).
     expect(result.stdout).toContain('AGENT');
     expect(result.stdout).toContain('SKILL');
     expect(result.stdout).not.toContain('STATUS');
@@ -847,12 +879,12 @@ describe('agent list', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 11b. agent status — a fresh install of every target must read clean (DEV-672)
+// 11b. agent status — a fresh install of every target must read clean
 // ---------------------------------------------------------------------------
 
 describe('agent status after a full install', () => {
   // The install→status round trip had no e2e coverage at all, which is how a
-  // permanent false `stale` on the compact-body targets shipped (DEV-672).
+  // permanent false `stale` on the compact-body targets shipped.
   it('every target × skill reads ok and the command exits 0', () => {
     const tmpDir = freshTmpDir();
     const allTargets = Object.keys(TARGETS) as AgentTarget[];
@@ -876,7 +908,7 @@ describe('agent status after a full install', () => {
   });
 
   // `agent status`'s own error message sends the user to `agent install`, with
-  // `--force` for own-file targets. Under DEV-672 that advice was a dead end —
+  // `--force` for own-file targets. That advice used to be a dead end —
   // install saw the file as already current and skipped it, status still said
   // stale — so the loop is worth pinning, not just the plain round trip.
   it('re-running install with --force leaves every row ok and exits 0', () => {
@@ -919,17 +951,21 @@ describe('matrix coverage guard', () => {
   });
 
   it('SKILLS matches the documented, e2e-covered set (update this list when adding a skill)', () => {
-    expect(Object.keys(SKILLS)).toEqual(['testsprite-verify', 'testsprite-onboard']);
+    expect(Object.keys(SKILLS)).toEqual([
+      'testsprite-verify',
+      'testsprite-onboard',
+      'testsprite-ci',
+    ]);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Bootstrap tip (piece-3) — SKIPPED in e2e
+// Bootstrap tip — SKIPPED in e2e
 // Note: tip coverage lives in src/commands/auth.test.ts. Wiring a /me stub
 // for `auth configure` is disproportionate here; the unit tests cover the tip.
 // ---------------------------------------------------------------------------
 it.skip('bootstrap tip after auth configure — see auth.test.ts for tip coverage', () => {
-  // No-op: piece-3 unit tests in src/commands/auth.test.ts cover the tip.
+  // No-op: unit tests in src/commands/auth.test.ts cover the tip.
 });
 
 // ---------------------------------------------------------------------------

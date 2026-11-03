@@ -2,6 +2,7 @@ import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from './errors.js';
+import { ShutdownController } from './interrupt.js';
 import { assertTargetUrlReachable, probeTargetUrl } from './target-url-preflight.js';
 
 /** A fetch mock that resolves with the given status (default 200, body pre-cancelled-safe). */
@@ -43,6 +44,37 @@ function dnsRejecting(code: string): (hostname: string) => Promise<unknown> {
 }
 
 describe('probeTargetUrl — rule table', () => {
+  it('aborts and releases a tracked reachability probe on interrupt', async () => {
+    const shutdown = new ShutdownController();
+    let rejectFetch!: (reason: unknown) => void;
+    let requestSignal: AbortSignal | undefined;
+    const fetchImpl = vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+      requestSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        rejectFetch = reject;
+        requestSignal?.addEventListener(
+          'abort',
+          () => reject(new DOMException('The operation was aborted', 'AbortError')),
+          { once: true },
+        );
+      });
+    });
+    const pending = probeTargetUrl('https://example.com', {
+      dnsLookup: dnsResolving(),
+      fetchImpl: fetchImpl as typeof fetch,
+      shutdownSignal: shutdown.signal,
+      shutdown,
+    } as Parameters<typeof probeTargetUrl>[1]);
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledOnce());
+    const trackedDuringFetch = shutdown.hasCriticalOperations;
+    shutdown.interrupt('SIGINT');
+    rejectFetch(shutdown.signal.reason);
+    await expect(pending).rejects.toBe(shutdown.signal.reason);
+    expect(requestSignal?.aborted).toBe(true);
+    expect(trackedDuringFetch).toBe(true);
+    expect(shutdown.hasCriticalOperations).toBe(false);
+  });
+
   it('DNS NXDOMAIN, no proxy -> refuse', async () => {
     const outcome = await probeTargetUrl('https://dead.trycloudflare.com', {
       dnsLookup: dnsRejecting('ENOTFOUND'),
@@ -466,6 +498,7 @@ describe('assertTargetUrlReachable — call-site integration', () => {
     expect((err as ApiError).code).toBe('VALIDATION_ERROR');
     expect((err as ApiError).exitCode).toBe(5);
     expect((err as ApiError).nextAction).toContain('--skip-preflight');
+    expect((err as ApiError).message).toContain('--skip-preflight');
   });
 
   it('prints a [advisory] line (and does not throw) on a warn verdict', async () => {

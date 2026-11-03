@@ -11,10 +11,9 @@
 #     there is nothing here for the outbound snapshot to carry or exclude,
 #     and no risk of the two CodeQL configuration modes (default setup vs.
 #     workflow-based) conflicting on the public repo.
-#   - `dependency-review-action` has the same Advanced-Security requirement on
-#     private repos, so its job only executes once this file is running in
-#     the public mirror (see the job's own `if:`) — it still exists as a
-#     no-op step on every atlas PR/push rather than failing one.
+#   - `dependency-review-action` requires Advanced Security on private repos,
+#     so this job runs only in the public mirror. Let the action fail when the
+#     public dependency graph is unavailable; a skipped scan must not be green.
 #   - `eslint-plugin-security` lints only files changed in this PR/push (see
 #     the `lint-security` job), not the whole tree: a full-tree run surfaces
 #     ~380 pre-existing findings (almost entirely
@@ -22,29 +21,12 @@
 #     calls a config-file-reading CLI makes routinely — not a real
 #     vulnerability signal for this codebase shape).
 #
-#     ESLint lints whole FILES, though, so "changed files only" still dumps a
-#     legacy file's entire backlog the moment one line of it is touched — which
-#     is exactly what happened on the v0.6.0 release push (touching the ~11k-line
-#     `src/commands/test.ts` surfaced 128 pre-existing `detect-non-literal-fs-
-#     filename` errors and failed the job). Two layers fix that WITHOUT lowering
-#     any rule's severity or exempting the tree:
-#       (C) A committed `eslint-suppressions.security.json` baseline (ESLint's
-#           native bulk suppressions) records today's backlog, so pre-existing
-#           findings are not re-reported; a genuinely NEW fs call pushes the
-#           per-file count past the baseline and surfaces. It uses a dedicated
-#           filename (NOT ESLint's default `eslint-suppressions.json`) so the
-#           main `eslint .` lint — a different config that never enables these
-#           security rules — does not auto-read it and fail on "unused
-#           suppressions"; the security job passes `--suppressions-location`
-#           explicitly.
-#       (A) `.github/scripts/filter-changed-line-findings.mjs` then keeps only the
-#           remaining error findings that fall on lines THIS diff added/modified,
-#           so touching a legacy file never fails on its untouched lines.
-#     Net: every rule stays at its designed severity, new/changed code is held to
-#     it, and the existing tree is neither re-linted from scratch nor exempted.
-#     To retire baseline entries as they get fixed, run ESLint with
-#     `--prune-suppressions` in a maintenance PR (never regenerate it to hide new
-#     findings).
+#     ESLint lints whole FILES, but the checked-in changed-line filter
+#     fails only on error findings on lines added by this diff. Existing
+#     findings on untouched lines are reported in JSON and ignored by that
+#     filter; do not apply count-based bulk suppressions before filtering,
+#     because replacing an old finding with a new one can keep the count
+#     constant and hide the new finding.
 #   - Secret scanning: this repo's `ci.yml` already runs a gitleaks
 #     WORKING-TREE scan on every PR/push (added by atlas #274, 2026-07). This
 #     file adds the complementary FULL-HISTORY scan from #220 as its own job,
@@ -71,6 +53,11 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches: [main, dev, stg]
+  # Not auto-dispatched by anything (none of this file's jobs are required
+  # checks) — this is for an operator who wants the extra opinion on a wave
+  # branch by hand; see lint-security's workflow_dispatch base-resolution
+  # branch below for why a manual dispatch here is correct.
+  workflow_dispatch: {}
 
 # Least-privilege default (same convention as ci.yml). No job below needs
 # write; anything more must opt in locally.
@@ -122,6 +109,7 @@ jobs:
       - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
         with:
           fail-on-severity: high
+          fail-on-scopes: runtime
 
   # ── 3. ESLint with security rules (changed files only) ────────────────────
   # See header for why this is diff-scoped rather than full-tree.
@@ -176,6 +164,14 @@ jobs:
           elif [ "$EVENT_NAME" = "pull_request" ]; then
             echo "::error title=Security lint broken::pull_request base SHA ('${BASE_SHA:-<empty>}') is empty or unreachable even with fetch-depth: 0. A pull_request always supplies a resolvable base, so this means base resolution is broken, not that there is nothing to check. Failing the job instead of reporting a false green." >&2
             exit 1
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ] && git rev-parse --verify -q origin/dev >/dev/null 2>&1; then
+            # A manual dispatch (an operator running this by hand against a
+            # wave branch, say) supplies no base at all — diff against where
+            # this branch forked from dev, not HEAD^, so the lint covers the
+            # whole wave, not just its latest commit. fetch-depth: 0 above
+            # already makes origin/dev reachable.
+            RESOLVED_BASE="$(git merge-base HEAD origin/dev)"
+            BASE_DESC="$RESOLVED_BASE (fallback: workflow_dispatch supplied no base — merge-base with origin/dev instead)"
           elif git rev-parse --verify -q HEAD^ >/dev/null 2>&1; then
             RESOLVED_BASE="HEAD^"
             BASE_DESC="HEAD^ (fallback: push event supplied no usable base SHA — was '${BASE_SHA:-<empty>}' — so diffing HEAD's own commit instead of skipping)"
@@ -209,64 +205,22 @@ jobs:
             echo "EMPTY" > "$RUNNER_TEMP/lint-empty-reason.txt"
           fi
 
+      # The lint + changed-line verdict lives in a script so the release
+      # pipeline can run the identical check on a publish snapshot before it
+      # is pushed (see the script header for why that preview is needed).
       - name: Run security lint on changed files
+        env:
+          HEAD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # The file list is NUL-separated end-to-end: git diff/ls-files -z ->
-          # file -> xargs -0. Git filenames may contain a literal newline (or
-          # start with `-`), so converting to newlines (as this step used to,
-          # via `tr '\0' '\n'` + `xargs -d '\n'`) lets a filename like
-          # "src/x.ts\n--no-error-on-unmatched-pattern\nnot-a-real-file.ts"
-          # split into a real path, an injected ESLint OPTION, and a
-          # nonexistent path — ESLint then exits 0 having never linted the
-          # malicious file. NUL is the one byte git filenames cannot contain,
-          # so `-0`/`-z` is the only splitting mode that is actually safe
-          # here (the previous comment on this step claiming xargs was doing
-          # "NUL/newline-safe" splitting was false: the `tr` upstream had
-          # already destroyed the NUL delimiters before xargs ever saw the
-          # list). The trailing `--` additionally stops ESLint's own option
-          # parser at the file-list boundary, so no filename starting with
-          # `-` can be misread as a flag.
           if [ -f "$RUNNER_TEMP/lint-empty-reason.txt" ]; then
             echo "Zero files to lint (see the previous step's log for which base was used and why) — nothing to lint, reporting success on a genuine empty result, not a skip."
             exit 0
           fi
-          FILE_COUNT=$(tr -dc '\0' < "$RUNNER_TEMP/changed-ts-files.txt" | wc -c)
-          echo "Linting ${FILE_COUNT} file(s)."
-
-          # Read the NUL-separated list into an array (NUL-safe, single ESLint
-          # invocation so `--format json` emits ONE array) and lint with:
-          #   - the committed eslint-suppressions.security.json baseline (passed
-          #     explicitly so the main `eslint .` lint never reads it) so the
-          #     pre-existing backlog is not re-reported; and
-          #   - --pass-on-unpruned-suppressions so FIXING a baselined finding in
-          #     a changed file (its count drops) doesn't fail the job over a now-
-          #     stale suppression entry (prune it in a separate maintenance pass).
-          # The trailing `--` stops ESLint's option parser at the file boundary.
-          mapfile -d '' -t FILES < "$RUNNER_TEMP/changed-ts-files.txt"
-
-          # ESLint exits 1 when it reports findings and 2 on a fatal (config/crash)
-          # error; only 2 is a real failure here, because the changed-line filter
-          # below — not ESLint's own exit — decides pass/fail. Capture the report
-          # even on exit 1, but surface a genuine crash.
-          set +e
-          npx eslint --config eslint.security.config.mjs \
-            --suppressions-location=eslint-suppressions.security.json \
-            --pass-on-unpruned-suppressions --format json -- "${FILES[@]}" \
-            > "$RUNNER_TEMP/eslint-report.json"
-          ESLINT_EXIT=$?
-          set -e
-          if [ "$ESLINT_EXIT" -gt 1 ]; then
-            echo "::error title=Security lint crashed::ESLint exited ${ESLINT_EXIT} (fatal error, not a lint finding)."
-            cat "$RUNNER_TEMP/eslint-report.json" || true
-            exit "$ESLINT_EXIT"
-          fi
-
-          # Fail only on findings that land on lines this change added/modified
-          # (see the header note and .github/scripts/filter-changed-line-findings.mjs).
-          RESOLVED_BASE="$(cat "$RUNNER_TEMP/resolved-base.txt")" \
-          HEAD_SHA="${{ github.sha }}" \
-            node .github/scripts/filter-changed-line-findings.mjs "$RUNNER_TEMP/eslint-report.json"
+          bash .github/scripts/security-lint-changed.sh \
+            "$RUNNER_TEMP/changed-ts-files.txt" \
+            "$(cat "$RUNNER_TEMP/resolved-base.txt")" \
+            "$HEAD_SHA"
 
   # ── 4. Full-history secret scan (push only) ────────────────────────────────
   # Complements ci.yml's working-tree gitleaks job (every PR/push) with the
@@ -300,3 +254,21 @@ jobs:
 
       - name: Scan full git history for secrets
         run: gitleaks detect --no-banner --redact --source .
+
+  approve-review-guard:
+    name: Approving review guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Test approving review guard
+        run: node --test .github/scripts/check-approve-review-guard.test.mjs
+
+      - name: Check workflows and composite actions for approving reviews
+        run: node .github/scripts/check-approve-review-guard.mjs

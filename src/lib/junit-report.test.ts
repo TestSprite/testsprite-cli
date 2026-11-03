@@ -10,9 +10,11 @@ import {
   escapeXml,
   parseJUnitReportFormat,
   resolveBatchReportProjectId,
+  skippedJUnitResultsFromSummary,
   writeJUnitReportFile,
   type JUnitTestResult,
 } from './junit-report.js';
+import type { CiSummary } from './gh-output.js';
 
 describe('durationSecondsBetween', () => {
   it('computes seconds between two ISO timestamps', () => {
@@ -20,6 +22,22 @@ describe('durationSecondsBetween', () => {
       12.5,
     );
   });
+  it('uses createdAt when startedAt is null', () => {
+    expect(
+      durationSecondsBetween(null, '2026-08-17T10:00:12.500Z', '2026-08-17T10:00:00.000Z'),
+    ).toBe(12.5);
+  });
+
+  it('prefers startedAt over createdAt', () => {
+    expect(
+      durationSecondsBetween(
+        '2026-08-17T10:00:05.000Z',
+        '2026-08-17T10:00:12.500Z',
+        '2026-08-17T10:00:00.000Z',
+      ),
+    ).toBe(7.5);
+  });
+
   it('returns undefined when a timestamp is missing / unparseable / negative', () => {
     expect(durationSecondsBetween(null, '2026-08-17T10:00:00.000Z')).toBeUndefined();
     expect(durationSecondsBetween('2026-08-17T10:00:00.000Z', undefined)).toBeUndefined();
@@ -241,6 +259,24 @@ describe('buildJUnitReport', () => {
     expect(xml).toContain('<failure message="Timed out" type="timeout">');
   });
 
+  it('renders an undispatched member with its reason as a skipped testcase', () => {
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'ran', status: 'passed' }),
+        makeResult({
+          testId: 'missing',
+          status: 'skipped',
+          error: { code: 'NOT_DISPATCHED', message: 'not a member of this list (not dispatched)' },
+        }),
+      ],
+    });
+    expect(xml).toContain('tests="2" failures="0" errors="0" skipped="1"');
+    expect(xml).toContain('testId="missing" time="0">');
+    expect(xml).toContain('<skipped message="not a member of this list (not dispatched)"/>');
+  });
+
   it('maps API error status to error elements', () => {
     const xml = buildJUnitReport({
       suiteName: 'Batch',
@@ -376,5 +412,65 @@ describe('writeJUnitReportFile', () => {
       exitCode: 5,
     });
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('skippedJUnitResultsFromSummary', () => {
+  const summary: CiSummary = {
+    total: 3,
+    passed: 1,
+    failed: 0,
+    skipped: 2,
+    timedOut: 0,
+    runs: [
+      { testId: 'ran', status: 'passed' },
+      { testId: 'deferred', status: 'deferred', error: 'deferred: run in flight' },
+      // A dispatched run the server later reports under a non-dispatched
+      // word. It is already in the polled results, so it must not appear twice.
+      { testId: 'ran', status: 'skipped' },
+    ],
+  };
+
+  it('turns non-dispatched rows into skipped results with their reason', () => {
+    expect(skippedJUnitResultsFromSummary(summary)).toEqual([
+      { testId: 'deferred', status: 'skipped', skipReason: 'deferred: run in flight' },
+      { testId: 'ran', status: 'skipped', skipReason: 'skipped' },
+    ]);
+  });
+
+  it('leaves out members that are already in the polled results', () => {
+    expect(skippedJUnitResultsFromSummary(summary, [{ testId: 'ran' }])).toEqual([
+      { testId: 'deferred', status: 'skipped', skipReason: 'deferred: run in flight' },
+    ]);
+  });
+});
+
+describe('per-row classname for batches spanning projects', () => {
+  it('uses a row classname over the suite classname', () => {
+    const xml = buildJUnitReport({
+      suiteName: 's',
+      classname: 'suite-class',
+      results: [
+        { testId: 'a', status: 'passed', classname: 'P1' },
+        { testId: 'b', status: 'passed' },
+      ],
+    });
+    expect(xml).toContain('classname="P1" name="a"');
+    expect(xml).toContain('classname="suite-class" name="b"');
+  });
+
+  it('names the suite from the projects the ids resolved to', () => {
+    const one = new Map([['a', 'P1']]);
+    const two = new Map([
+      ['a', 'P1'],
+      ['b', 'P2'],
+    ]);
+    expect(resolveBatchReportProjectId({ projectIdByTestId: one }, [])).toBe('P1');
+    expect(resolveBatchReportProjectId({ projectIdByTestId: two }, [{ projectId: 'P1' }])).toBe(
+      'multiple-projects',
+    );
+    expect(() => resolveBatchReportProjectId({}, [])).toThrowError(
+      expect.objectContaining({ details: expect.objectContaining({ field: 'project' }) }),
+    );
   });
 });

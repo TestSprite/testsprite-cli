@@ -16,9 +16,11 @@ import {
 import { createProjectCommand } from './commands/project.js';
 import { createScheduleCommand } from './commands/schedule.js';
 import { createTunnelCommand } from './commands/tunnel.js';
-import { createTestCommand, type TunnelInterruptDetach } from './commands/test.js';
+import { createTestCommand } from './commands/test.js';
 import { createTestListCommand } from './commands/testlist.js';
 import { createUsageCommand } from './commands/usage.js';
+import { resolveProfileName } from './lib/config.js';
+import { classifyBillingRefusal } from './lib/billing-refusal.js';
 import { TARGETS, type AgentTarget } from './lib/agent-targets.js';
 import {
   ApiError,
@@ -27,11 +29,18 @@ import {
   RequestTimeoutError,
   extractNodeErrorCode,
 } from './lib/errors.js';
-import { installBrokenPipeGuard, installSignalHandlers } from './lib/interrupt.js';
+import {
+  armInterruptExitBackstop,
+  installBrokenPipeGuard,
+  installSignalHandlers,
+} from './lib/interrupt.js';
 import { Output, isOutputMode } from './lib/output.js';
 import { maybeInstallProxyAgent } from './lib/proxy.js';
+import { redactDeep } from './lib/redact.js';
 import {
+  buildInterruptEnvelope,
   renderAmbiguousOrgCandidates,
+  renderTunnelBindingLimitIds,
   renderCommanderError,
   rephraseUnknownOption,
 } from './lib/render-error.js';
@@ -40,22 +49,18 @@ import {
   classifyCliError,
   isTelemetryOptedOut,
   recordOutcome,
+  recordTelemetryExtras,
   resolveTelemetryAuth,
   type ResolvedTelemetryAuth,
   type WaitTimeoutTelemetry,
 } from './lib/telemetry.js';
 import { maybeNotifyUpdate } from './lib/update-check.js';
 import { VERSION } from './version.js';
-import { SUPPORTED_NODE_RANGE, shouldRejectNodeVersion } from './version-guard.js';
+import { rejectUnsupportedNodeVersion } from './version-guard.js';
 
 // Guard: exit early with a clear message on unsupported Node.js versions,
 // rather than failing later with a cryptic ESM/runtime error.
-if (shouldRejectNodeVersion(process.versions.node)) {
-  process.stderr.write(
-    `Error: testsprite requires Node.js ${SUPPORTED_NODE_RANGE} (found ${process.versions.node}).\nInstall a supported Node.js release from https://nodejs.org\n`,
-  );
-  process.exit(1);
-}
+rejectUnsupportedNodeVersion(process.versions.node);
 
 const program = new Command();
 
@@ -70,21 +75,20 @@ program
   .version(VERSION)
   .option('--output <mode>', 'Output format (json|text)', 'text')
   .option('--profile <name>', 'Configuration profile to use')
-  .option('--endpoint-url <url>', 'Override the API endpoint host')
+  .option('--endpoint-url <url>', 'API base URL (a full http(s) URL)')
   .option(
     '--verbose',
-    'Emit human-readable HTTP retry / backoff / polling-mode transitions to stderr. Less noisy than --debug; useful for diagnosing hangs without the full trace.',
+    'Log HTTP retry / backoff / polling transitions to stderr (lighter than --debug)',
   )
   .option('--debug', 'Print HTTP method/path, request id, latency, retry decisions to stderr')
   .option(
     '--dry-run',
-    'Skip the network and credentials; emit a canned sample matching the OpenAPI contract. Useful for learning the CLI surface without an API key. Note: file inputs you pass (--plan-from/--plans/--steps) are still read and validated locally; only --code-file uses a placeholder.',
+    'Skip the network and credentials; emit a canned sample matching the OpenAPI contract. Exception: run commands (`test run`, `test rerun`, `test create --run`, `testlist run`) with credentials and no explicit target may make read-only GETs to preview an automatic tunnel target; nothing is created or started. File inputs (--plan-from/--plans/--steps) are still read locally; --code-file uses a placeholder.',
   )
   .option(
     '--request-timeout <seconds>',
-    'Client-side per-request timeout in seconds (default: 120). Aborts any single fetch that does not complete within this deadline. ' +
-      'Override via TESTSPRITE_REQUEST_TIMEOUT_MS env var (milliseconds). ' +
-      'Range: 1–600. Does not affect the --timeout polling ceiling for `test run/wait`.',
+    'Per-request timeout in seconds (default 120; range 1–600, values outside are clamped). ' +
+      'Does not affect the --timeout polling ceiling for `test run/wait`.',
   );
 
 // `setup` is the primary onboarding command, listed FIRST in --help so a coding
@@ -125,7 +129,13 @@ program.addCommand(
   }),
 );
 program.addCommand(createTestListCommand());
-program.addCommand(createCiCommand({}));
+program.addCommand(
+  createCiCommand({
+    onWaitTimeout: context => {
+      waitTimeoutTelemetry = context;
+    },
+  }),
+);
 program.addCommand(createScheduleCommand({}));
 program.addCommand(createTunnelCommand({}));
 program.addCommand(createAgentCommand({}));
@@ -174,13 +184,6 @@ let telemetryEmit = false;
 // `auth remove` (which deletes the profile) is still reported on the key it used.
 let telemetryAuth: ResolvedTelemetryAuth | undefined;
 
-// True when the leaf command that is about to run carries a `--local` option
-// value — `test run --local <port>` or `project create --local <port>`.
-// Set before validation so test-run refusals still report attempts that a
-// backend-side mint/attach event never observes. Local project admission
-// failures have a separate zero-HTTP exception below.
-let telemetryLocal = false;
-
 // Local project admission failures must exit without any TestSprite HTTP,
 // including telemetry. Track companion flags even when --local is missing.
 let telemetryLocalProject = false;
@@ -226,6 +229,14 @@ function unknownRootCommandMaskedByHelp(args: readonly string[]): string | undef
   if (!first || first.startsWith('-') || isRegisteredRootCommand(first)) return undefined;
   return args.slice(1).some(arg => arg === '--help' || arg === '-h') ? first : undefined;
 }
+
+program.addHelpText(
+  'after',
+  '\nEnvironment:\n' +
+    '  TESTSPRITE_API_KEY (overrides stored credentials), TESTSPRITE_NO_UPDATE_NOTIFIER (disables\n' +
+    '  the version check); TESTSPRITE_API_URL, TESTSPRITE_PROFILE and TESTSPRITE_REQUEST_TIMEOUT_MS\n' +
+    '  (milliseconds) mirror --endpoint-url, --profile and --request-timeout.',
+);
 
 program.addHelpText('beforeAll', context => {
   if (context.command !== program) return '';
@@ -287,9 +298,9 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
   const commandPath = commandPathOf(actionCommand);
   // Record which leaf command ran, for the telemetry emit around parseAsync.
   ranCommandPath = commandPath;
-  // The raw --local opt is a port string; only its presence is
-  // recorded (see `telemetryLocal`'s own comment — never the value).
-  telemetryLocal = globals.local !== undefined;
+  // Preserve explicit --local attempts, including refusals and borrowed tunnels;
+  // only flag presence is recorded. Automatic tunnel paths record the same fact.
+  if (globals.local !== undefined) recordTelemetryExtras({ local: true });
   telemetryLocalProject =
     commandPath === 'project create' &&
     (globals.local !== undefined || globals.localHost !== undefined);
@@ -313,7 +324,7 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
       commandPath,
       output: isOutputMode(globals.output) ? globals.output : 'text',
       dryRun: globals.dryRun ?? false,
-      profile: globals.profile ?? 'default',
+      profile: resolveProfileName(globals.profile),
       cwd: process.cwd(),
       env: process.env,
       debug: globals.debug ?? false,
@@ -338,12 +349,12 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
   }
 });
 
-// Clean process lifecycle (DEV-331 piece 1, errors.md §8.1): during a `--wait`
+// Clean process lifecycle (errors.md §8.1): during a `--wait`
 // poll the scope is armed — the first SIGINT/SIGTERM/SIGHUP aborts gracefully
 // and the wait path prints an honest partial (the run KEEPS executing and
 // billing server-side) + re-attach hint before exiting 128+signum; a second
-// signal hard-exits. Outside an armed scope: a clear one-line message +
-// immediate exit (instead of Node's silent abrupt kill). Plus an EPIPE guard
+// signal hard-exits. Outside an armed scope: a clear one-line message, then
+// drain an in-flight request or exit immediately when idle. Plus an EPIPE guard
 // so piping to a reader that closes early (`| head`) exits cleanly instead of
 // dumping a raw `write EPIPE` stack.
 installSignalHandlers();
@@ -367,7 +378,6 @@ try {
         exitCode: 0,
         durationMs: Date.now() - telemetryStartedAt,
         ...telemetryGlobals(),
-        local: telemetryLocal,
       },
       { resolvedAuth: telemetryAuth },
     );
@@ -384,7 +394,7 @@ try {
   // user's error. The classification mirrors the exit-code mapping the
   // branches apply.
   //
-  // DEV-673: SET `process.exitCode` and let the event loop drain instead of
+  // SET `process.exitCode` and let the event loop drain instead of
   // forcing `process.exit()`. A forced exit tears the process down while the
   // just-completed HTTPS request's TLS socket is still mid-close; on Windows
   // libuv asserts on the half-closed handle (src/win/async.c) and the process
@@ -405,7 +415,6 @@ try {
           ...waitTimeoutTelemetry,
           durationMs: Date.now() - telemetryStartedAt,
           ...telemetryGlobals(),
-          local: telemetryLocal,
         },
         { resolvedAuth: telemetryAuth },
       );
@@ -417,6 +426,7 @@ try {
   const mode = isOutputMode(rawMode) ? rawMode : 'text';
   const output = new Output(mode);
   if (err instanceof ApiError) {
+    const billingRefusal = classifyBillingRefusal(err);
     const message =
       err.code === 'UNSUPPORTED' &&
       err.getDetail('reason') === 'tunnel-unsupported-for-backend-test'
@@ -429,13 +439,20 @@ try {
           message,
           nextAction: err.nextAction,
           requestId: err.requestId,
-          details: err.details,
+          // `err.details` is already redacted at ApiError construction (see
+          // `errors.ts`); redacting again here is defence in depth for this
+          // hand-built envelope specifically, independent of that.
+          details: redactDeep(err.details),
+          ...(billingRefusal ? { links: billingRefusal.links } : {}),
         },
       };
       process.stderr.write(`${JSON.stringify(envelope, null, 2)}\n`);
     } else {
       process.stderr.write(`Error: ${message}\n`);
       if (err.nextAction) process.stderr.write(`${err.nextAction}\n`);
+      if (billingRefusal) {
+        for (const line of billingRefusal.lines) process.stderr.write(`${line}\n`);
+      }
       if (err.requestId && err.requestId !== 'local')
         process.stderr.write(`requestId: ${err.requestId}\n`);
       // C1: surface requiredScopes / grantedScopes on AUTH_FORBIDDEN
@@ -467,39 +484,24 @@ try {
           process.stderr.write(`${line}\n`);
         }
       }
+      if (err.code === 'RATE_LIMITED' && err.getDetail('reason') === 'tunnel_binding_limit') {
+        for (const line of renderTunnelBindingLimitIds(err.getDetail('clientIds'))) {
+          process.stderr.write(`${line}\n`);
+        }
+      }
     }
     await flushThenSetExitCode(err.exitCode);
   } else if (err instanceof InterruptError) {
-    // Graceful detach (DEV-331 piece 1, errors.md §8.1): the wait-path catch
-    // block already printed the honest partial + re-attach hint. Exit with
-    // the conventional 128+signum code; `INTERRUPTED` is deliberately outside
-    // the error catalog. Note: Ctrl-C does NOT cancel the server-side run.
+    // A run wait may already have printed a partial result and re-attach hint.
+    // A disarmed request has no run ID, so its JSON hint describes checking
+    // current state before retrying. Both use the conventional 128+signum code.
     if (mode === 'json') {
-      const tunnelDetach = (err as InterruptError & { tunnelDetach?: TunnelInterruptDetach })
-        .tunnelDetach;
-      const envelope = {
-        error: {
-          code: 'INTERRUPTED',
-          message: err.message,
-          nextAction:
-            tunnelDetach?.nextAction ??
-            'The server-side run (if any) keeps executing and billing. ' +
-              'Re-attach with: testsprite test wait <runId>, or stop it with: testsprite test cancel <runId> ' +
-              '(runId is in the partial JSON on stdout).',
-          requestId: 'local',
-          details: {
-            signal: err.signal,
-            ...(tunnelDetach
-              ? { runId: tunnelDetach.runId, cancelOutcome: tunnelDetach.cancel }
-              : {}),
-          },
-        },
-      };
-      process.stderr.write(`${JSON.stringify(envelope, null, 2)}\n`);
+      process.stderr.write(`${JSON.stringify(buildInterruptEnvelope(err), null, 2)}\n`);
     } else {
       process.stderr.write(`Error: ${err.message}\n`);
     }
     await flushThenSetExitCode(err.exitCode);
+    armInterruptExitBackstop(err.exitCode);
   } else if (err instanceof RequestTimeoutError) {
     // Structured rendering for per-request timeouts: JSON mode emits a
     // machine-readable envelope; text mode emits the message with a hint.
@@ -533,7 +535,7 @@ try {
     //                               help`, `help test`, etc.)
     // Both are user-initiated "show me help" requests and must exit 0 per the
     // AWS-CLI convention. Failing to map 'commander.help' caused these paths
-    // to fall through to the generic `process.exit(5)` branch (dogfood P1-4).
+    // to fall through to the generic `process.exit(5)` branch.
     if (
       err.code === 'commander.helpDisplayed' ||
       err.code === 'commander.help' ||

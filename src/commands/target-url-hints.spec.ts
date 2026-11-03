@@ -9,20 +9,20 @@ import {
 } from './test.js';
 
 // What a per-run-target caller emits (`test create --target-url`). A project or
-// environment for an app on this machine is created with `--local <port>`, so
+// environment for an app on this machine can store a loopback URL, so
 // the text says that instead of sending the reader to find a public URL.
 const BOOTSTRAP_GUIDANCE =
   'TestSprite executes tests from the cloud, so the runner needs an address it can reach: ' +
   'a deployed or staging URL. For an app that only runs on this machine, create the project ' +
-  'or environment with `--local <port>` instead of a URL, then run with ' +
-  '`testsprite test run <test-id> --local <port>`. ';
+  'or environment with `--url http://localhost:<port>`, then run with ' +
+  '`testsprite test run <test-id> --env <name>`. ';
 
 const LOCAL_PROJECT_GUIDANCE =
-  'Use --local <port> instead of --url for an app on this machine. ' +
+  'Use --url http://localhost:<port> for an app on this machine. ' +
   'Local projects are frontend-only and require the V3 project platform. ';
 
 const RUNTIME_NEXT_ACTION =
-  "This looks like a local-dev target. Run it with `testsprite test run <test-id> --local <port>` instead — it tunnels this machine's loopback address to the test runner (frontend tests only; requires an API key with the `run:tunnel` scope). " +
+  "This looks like a local-dev target. Save `--url http://localhost:<port>` on an environment, then run `testsprite test run <test-id> --env <name>` — it tunnels this machine's loopback address to the test runner (frontend tests only; requires an API key with the `run:tunnel` scope). " +
   'See `testsprite test run --help` for accepted values.';
 
 async function rejectedBy(action: () => Promise<unknown>): Promise<ApiError> {
@@ -35,13 +35,11 @@ async function rejectedBy(action: () => Promise<unknown>): Promise<ApiError> {
   throw new Error('expected command to reject the local target');
 }
 
-// `project create/update --url` never accept a loopback address: an app on
-// this machine is named with `--local <port>` on both, so a loopback `--url`
-// (and a bind-all `0.0.0.0` / `::`, which is not loopback either) is
-// redirected to that flag. These two cases exercise the bind-all shape.
+// Project writes accept the supported loopback origins; bind-all addresses
+// remain invalid targets and retain their caller-specific guidance.
 const bootstrapCases: ReadonlyArray<readonly [string, string, string, () => Promise<unknown>]> = [
   [
-    'project create --url localhost',
+    'project create --url 0.0.0.0',
     'url',
     'testsprite project create',
     () =>
@@ -53,13 +51,13 @@ const bootstrapCases: ReadonlyArray<readonly [string, string, string, () => Prom
           dryRun: true,
           type: 'frontend',
           name: 'Local app',
-          targetUrl: 'http://localhost:3000',
+          targetUrl: 'http://0.0.0.0:3000',
         },
         { stdout: () => {}, stderr: () => {} },
       ),
   ],
   [
-    'project update --url 127.0.0.1',
+    'project update --url ::',
     'url',
     'testsprite project update',
     () =>
@@ -70,13 +68,13 @@ const bootstrapCases: ReadonlyArray<readonly [string, string, string, () => Prom
           debug: false,
           dryRun: true,
           projectId: 'project_local',
-          targetUrl: 'http://127.0.0.1:3000',
+          targetUrl: 'http://[::]:3000',
         },
         { stdout: () => {}, stderr: () => {} },
       ),
   ],
   [
-    'test create --target-url localhost',
+    'test create --target-url private',
     'target-url',
     'testsprite test create',
     () =>
@@ -90,13 +88,13 @@ const bootstrapCases: ReadonlyArray<readonly [string, string, string, () => Prom
           type: 'frontend',
           name: 'Local test',
           codeFile: 'unused-in-dry-run.py',
-          targetUrl: 'http://localhost:3000',
+          targetUrl: 'http://0.0.0.0:3000',
         },
         { stdout: () => {}, stderr: () => {} },
       ),
   ],
   [
-    'test create --plan-from --target-url localhost',
+    'test create --plan-from --target-url private',
     'target-url',
     'testsprite test create',
     () =>
@@ -105,11 +103,11 @@ const bootstrapCases: ReadonlyArray<readonly [string, string, string, () => Prom
         output: 'json',
         debug: false,
         planFrom: 'unread-because-target-is-rejected.json',
-        targetUrl: 'http://localhost:3000',
+        targetUrl: 'http://0.0.0.0:3000',
       }),
   ],
   [
-    'test create-batch --target-url localhost',
+    'test create-batch --target-url private',
     'target-url',
     'testsprite test create-batch',
     () =>
@@ -118,7 +116,7 @@ const bootstrapCases: ReadonlyArray<readonly [string, string, string, () => Prom
         output: 'json',
         debug: false,
         plans: 'unread-because-target-is-rejected.jsonl',
-        targetUrl: 'http://localhost:3000',
+        targetUrl: 'http://0.0.0.0:3000',
       }),
   ],
 ];
@@ -141,14 +139,14 @@ describe('local target nextAction by command phase', () => {
     },
   );
 
-  it('test run --target-url localhost keeps the exact runtime guidance', async () => {
+  it('test run --target-url private keeps the exact runtime guidance', async () => {
     const error = await rejectedBy(() =>
       runTestRun({
         profile: 'default',
         output: 'json',
         debug: false,
         testId: 'test_existing',
-        targetUrl: 'http://localhost:3000',
+        targetUrl: 'http://0.0.0.0:3000',
         wait: false,
         timeoutSeconds: 60,
       }),
@@ -161,12 +159,12 @@ describe('local target nextAction by command phase', () => {
     for (const [, , helpCommand, action] of bootstrapCases) {
       const { nextAction } = await rejectedBy(action);
       if (helpCommand.startsWith('testsprite project ')) {
-        expect(nextAction).toContain('Use --local <port> instead of --url');
+        expect(nextAction).toContain('Use --url http://localhost:<port>');
         expect(nextAction).not.toContain('<test-id>');
         continue;
       }
       expect(nextAction).toContain('a deployed or staging URL');
-      expect(nextAction).toContain('`--local <port>`');
+      expect(nextAction).toContain('`--url http://localhost:<port>`');
       // The deployed shape comes first; the per-run tunnel is not the only instruction.
       expect(nextAction.indexOf('a deployed or staging URL')).toBeLessThan(
         nextAction.indexOf('<test-id>'),
@@ -174,7 +172,7 @@ describe('local target nextAction by command phase', () => {
     }
   });
 
-  it('project update --local <port> is the one way to point a project at this machine', async () => {
+  it('project update --local <port> is shorthand for a stored loopback URL', async () => {
     // Same spelling as `project create`: the CLI builds the loopback URL and
     // sends the marker; a dry run validates the flags but dials nothing.
     const updated = await runProjectUpdate(
@@ -191,42 +189,31 @@ describe('local target nextAction by command phase', () => {
     expect(updated.updatedFields).toEqual(['targetUrl']);
   });
 
-  it('a loopback --url is refused on create AND update, and both point at --local <port>', async () => {
-    // A loopback address is never stored through `--url`: that flag has no
-    // opt-in, `--local` is the opt-in. The refusal names it, and never a flag
-    // the command does not have.
-    const attempts = [
-      () =>
-        runProjectCreate(
-          {
-            profile: 'default',
-            output: 'json',
-            debug: false,
-            dryRun: true,
-            type: 'frontend',
-            name: 'Local app',
-            targetUrl: 'http://localhost:3000',
-          },
-          { stdout: () => {}, stderr: () => {} },
-        ),
-      () =>
-        runProjectUpdate(
-          {
-            profile: 'default',
-            output: 'json',
-            debug: false,
-            dryRun: true,
-            projectId: 'project_local',
-            targetUrl: 'http://127.0.0.1:3000',
-          },
-          { stdout: () => {}, stderr: () => {} },
-        ),
-    ];
-    for (const attempt of attempts) {
-      const error = await rejectedBy(attempt);
-      expect(error.details).toMatchObject({ field: 'url' });
-      expect(error.nextAction).toContain('Use --local <port> instead of --url');
-      expect(error.nextAction).not.toContain('--origin-mode');
-    }
+  it('a loopback --url is accepted on create and update without rebuilding the address', async () => {
+    const created = await runProjectCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        type: 'frontend',
+        name: 'Local app',
+        targetUrl: 'http://127.0.0.1:3000/',
+      },
+      { stdout: () => {}, stderr: () => {} },
+    );
+    expect(created).toMatchObject({ targetUrl: 'http://127.0.0.1:3000/', originMode: 'local' });
+    const updated = await runProjectUpdate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'project_local',
+        targetUrl: 'http://[::1]:3000',
+      },
+      { stdout: () => {}, stderr: () => {} },
+    );
+    expect(updated.updatedFields).toEqual(['targetUrl']);
   });
 });

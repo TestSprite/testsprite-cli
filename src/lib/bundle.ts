@@ -41,7 +41,9 @@ import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import { createWriteStream } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { CliFailureContext, CliTestStep } from '../commands/test.js';
-import { ApiError, TransportError, localValidationError } from './errors.js';
+import { ApiError, InterruptError, TransportError, localValidationError } from './errors.js';
+import { globalShutdown, type ShutdownHandle } from './interrupt.js';
+import { defaultSleep, sleepUnlessInterrupted } from './poll-support.js';
 import { requireEnum } from './validate.js';
 import type { FetchImpl } from './http.js';
 
@@ -113,6 +115,8 @@ export interface WriteBundleOptions {
   failedOnly: boolean;
   /** Custom fetch impl for tests. Defaults to global `fetch`. */
   fetchImpl?: FetchImpl;
+  shutdownSignal?: AbortSignal;
+  shutdown?: Pick<ShutdownHandle, 'runCriticalOperation'>;
   /** Server requestId to embed in `.partial` on failure. */
   requestId?: string;
 }
@@ -468,6 +472,10 @@ export async function writeBundle(
 
   const dir = resolveBundleDir(options.dir);
   const fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+  const downloadDeps = {
+    shutdownSignal: options.shutdownSignal,
+    shutdown: options.shutdown,
+  };
   const meta = buildMeta(filtered);
   const codeExt = pickCodeExtension(filtered.code.language, filtered.code.framework);
 
@@ -503,7 +511,7 @@ export async function writeBundle(
       // bodies), stream the URL into the file rather than embedding
       // the URL in code.<ext>. M2's backend hasn't shipped the
       // >=100KB branch yet, but the contract supports it.
-      await streamUrlToFile(filtered.code.code, join(tmpDir, codeFile), fetchImpl);
+      await streamUrlToFile(filtered.code.code, join(tmpDir, codeFile), fetchImpl, downloadDeps);
     } else {
       await writeFile(join(tmpDir, codeFile), filtered.code.code, 'utf8');
     }
@@ -516,7 +524,12 @@ export async function writeBundle(
     // (some runs ship `.webm`, not `.mp4`).
     if (filtered.result.videoUrl) {
       const videoFile = `video.${pickVideoExtension(filtered.result.videoUrl)}`;
-      await streamUrlToFile(filtered.result.videoUrl, join(tmpDir, videoFile), fetchImpl);
+      await streamUrlToFile(
+        filtered.result.videoUrl,
+        join(tmpDir, videoFile),
+        fetchImpl,
+        downloadDeps,
+      );
       filesWritten.push(videoFile);
     }
 
@@ -527,6 +540,7 @@ export async function writeBundle(
         stepsTmpDir,
         fetchImpl,
         filesWritten,
+        downloadDeps,
       );
     }
 
@@ -714,6 +728,7 @@ async function writeStepArtifacts(
   stepsTmpDir: string,
   fetchImpl: FetchImpl,
   filesWritten: string[],
+  downloadDeps: Pick<WriteBundleOptions, 'shutdownSignal' | 'shutdown'>,
 ): Promise<void> {
   // stepIndex comes straight from the response and is used to build the
   // filename — reject anything that isn't a real index before composing a path.
@@ -724,13 +739,23 @@ async function writeStepArtifacts(
 
   if (step.screenshotUrl) {
     const file = `${prefix}-screenshot.png`;
-    await streamUrlToFile(step.screenshotUrl, assertNoEscape(stepsTmpDir, file), fetchImpl);
+    await streamUrlToFile(
+      step.screenshotUrl,
+      assertNoEscape(stepsTmpDir, file),
+      fetchImpl,
+      downloadDeps,
+    );
     filesWritten.push(`steps/${file}`);
   }
 
   if (step.htmlSnapshotUrl) {
     const file = `${prefix}-snapshot.html`;
-    await streamUrlToFile(step.htmlSnapshotUrl, assertNoEscape(stepsTmpDir, file), fetchImpl);
+    await streamUrlToFile(
+      step.htmlSnapshotUrl,
+      assertNoEscape(stepsTmpDir, file),
+      fetchImpl,
+      downloadDeps,
+    );
     filesWritten.push(`steps/${file}`);
   }
 
@@ -782,7 +807,12 @@ async function writeStepArtifacts(
         }
         const ext = sidecarExtension(entry.kind);
         const filename = `${prefix}-${entry.kind}-${i}.${ext}`;
-        await streamUrlToFile(entry.url, assertNoEscape(stepsTmpDir, filename), fetchImpl);
+        await streamUrlToFile(
+          entry.url,
+          assertNoEscape(stepsTmpDir, filename),
+          fetchImpl,
+          downloadDeps,
+        );
         filesWritten.push(`steps/${filename}`);
         return {
           kind: entry.kind,
@@ -834,22 +864,43 @@ export async function streamUrlToFile(
   url: string,
   filePath: string,
   fetchImpl: FetchImpl,
-  deps?: { sleep?: (ms: number) => Promise<void> },
+  deps?: {
+    sleep?: (ms: number) => Promise<void>;
+    shutdownSignal?: AbortSignal;
+    shutdown?: Pick<ShutdownHandle, 'runCriticalOperation'>;
+  },
 ): Promise<void> {
-  const sleepFn = deps?.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
+  const shutdownSignal = deps?.shutdownSignal ?? globalShutdown.signal;
+  const shutdown = deps?.shutdown ?? globalShutdown;
+  return shutdown.runCriticalOperation(() =>
+    streamUrlToFileTracked(url, filePath, fetchImpl, deps?.sleep ?? defaultSleep, shutdownSignal),
+  );
+}
+
+async function streamUrlToFileTracked(
+  url: string,
+  filePath: string,
+  fetchImpl: FetchImpl,
+  sleepFn: (ms: number) => Promise<void>,
+  shutdownSignal: AbortSignal,
+): Promise<void> {
   const artifactUrl = redactArtifactUrlForDetails(url);
   for (let attempt = 1; attempt <= STREAM_URL_MAX_RETRIES; attempt++) {
+    if (shutdownSignal.aborted) throw shutdownSignal.reason;
     let response: Response;
     try {
-      response = await fetchImpl(url, { redirect: 'error' });
+      response = await fetchImpl(url, { redirect: 'error', signal: shutdownSignal });
     } catch (err) {
+      if (err instanceof InterruptError || shutdownSignal.aborted)
+        throw shutdownSignal.reason ?? err;
       const message = err instanceof Error ? err.message : String(err);
       if (attempt < STREAM_URL_MAX_RETRIES) {
-        await sleepFn(STREAM_URL_RETRY_DELAY_MS);
+        await sleepUnlessInterrupted(sleepFn, STREAM_URL_RETRY_DELAY_MS, shutdownSignal);
         continue;
       }
       throw new TransportError(`Failed to download presigned URL ${artifactUrl}: ${message}`);
     }
+    if (shutdownSignal.aborted) throw shutdownSignal.reason;
     if (!response.ok) {
       // Non-2xx: the URL itself is bad (expired, unauthorized, not found).
       // Retrying the same URL won't help — surface immediately.
@@ -873,11 +924,19 @@ export async function streamUrlToFile(
       try {
         const buffer = Buffer.from(await response.arrayBuffer());
         await writeFile(filePath, buffer);
+        if (shutdownSignal.aborted) {
+          await rm(filePath, { force: true }).catch(() => undefined);
+          throw shutdownSignal.reason;
+        }
         return;
       } catch (err) {
+        if (err instanceof InterruptError || shutdownSignal.aborted) {
+          await rm(filePath, { force: true }).catch(() => undefined);
+          throw shutdownSignal.reason ?? err;
+        }
         const message = err instanceof Error ? err.message : String(err);
         if (attempt < STREAM_URL_MAX_RETRIES) {
-          await sleepFn(STREAM_URL_RETRY_DELAY_MS);
+          await sleepUnlessInterrupted(sleepFn, STREAM_URL_RETRY_DELAY_MS, shutdownSignal);
           continue;
         }
         throw new TransportError(`Failed to download presigned URL ${artifactUrl}: ${message}`);
@@ -895,11 +954,16 @@ export async function streamUrlToFile(
       const { Readable } = await import('node:stream');
       const nodeStream = Readable.fromWeb(webBody);
       await pipeline(nodeStream, fileSink as unknown as Writable);
+      if (shutdownSignal.aborted) throw shutdownSignal.reason;
       return;
     } catch (err) {
+      if (err instanceof InterruptError || shutdownSignal.aborted) {
+        await rm(filePath, { force: true }).catch(() => undefined);
+        throw shutdownSignal.reason ?? err;
+      }
       const message = err instanceof Error ? err.message : String(err);
       if (attempt < STREAM_URL_MAX_RETRIES) {
-        await sleepFn(STREAM_URL_RETRY_DELAY_MS);
+        await sleepUnlessInterrupted(sleepFn, STREAM_URL_RETRY_DELAY_MS, shutdownSignal);
         continue;
       }
       throw new TransportError(`Failed mid-download of ${artifactUrl}: ${message}`);

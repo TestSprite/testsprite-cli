@@ -712,7 +712,7 @@ describe('pollRunUntilTerminal — AbortSignal + timeout enforcement', () => {
 });
 
 // ---------------------------------------------------------------------------
-// onTransition callback (dogfood item 4)
+// onTransition callback
 // ---------------------------------------------------------------------------
 
 describe('pollRunUntilTerminal — onTransition callback', () => {
@@ -746,7 +746,7 @@ describe('pollRunUntilTerminal — onTransition callback', () => {
 });
 
 // ---------------------------------------------------------------------------
-// resolveAlternate hook (backend testId fallback — dogfood L1888, codex round-2)
+// resolveAlternate hook (backend testId fallback)
 // ---------------------------------------------------------------------------
 
 describe('pollRunUntilTerminal — resolveAlternate hook', () => {
@@ -805,7 +805,7 @@ describe('pollRunUntilTerminal — resolveAlternate hook', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Graceful detach — shutdown handle (DEV-331 piece 1)
+// Graceful detach — shutdown handle
 // ---------------------------------------------------------------------------
 
 describe('sleepUnlessInterrupted', () => {
@@ -828,6 +828,26 @@ describe('sleepUnlessInterrupted', () => {
 });
 
 describe('pollRunUntilTerminal — shutdown (SIGINT/SIGTERM graceful detach)', () => {
+  it('marks an interrupted run poll for recovery guidance', async () => {
+    const shutdown = new ShutdownController();
+    const client: RunClient = {
+      getRun: async () => {
+        expect(shutdown.isArmed).toBe(true);
+        shutdown.interrupt('SIGINT');
+        throw shutdown.signal.reason;
+      },
+    };
+
+    const err = await pollRunUntilTerminal(client, RUN_ID, {
+      timeoutSeconds: 60,
+      sleep: instantSleep,
+      shutdown,
+    }).catch(e => e);
+    expect(err).toBe(shutdown.signal.reason);
+    expect((err as InterruptError).runWaitContext).toBe(true);
+    expect(shutdown.isArmed).toBe(false);
+  });
+
   it('throws the InterruptError when the shutdown signal was already aborted (beats the deadline)', async () => {
     const shutdown = new ShutdownController();
     shutdown.interrupt('SIGINT');

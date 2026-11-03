@@ -172,6 +172,13 @@ beforeAll(async () => {
       return;
     }
 
+    // `--local` reads the test first (a backend test is refused before the
+    // port probe and the mint), so the fake must answer it as a frontend test.
+    if (method === 'GET' && url === `/api/cli/v1/tests/${TEST_ID}`) {
+      respondJson(res, 200, { id: TEST_ID, type: 'frontend', projectId: 'prj-e2e' });
+      return;
+    }
+
     if (method === 'POST' && url === `/api/cli/v1/tests/${TEST_ID}/runs`) {
       respondJson(res, 202, {
         runId: RUN_ID,
@@ -234,10 +241,10 @@ beforeAll(async () => {
     );
     // Acknowledge authentication, exactly once, the way the real control
     // plane does: it answers the client's `Auth` frame with `{"type":"Ack"}`,
-    // and `TunnelClient.start()` waits for that rather than for socket open
-    // (DEV-1007). A stub that stayed silent from the very first byte would no
-    // longer get past startup, and this suite would be exercising a startup
-    // timeout instead of the thing it is about.
+    // and `TunnelClient.start()` waits for that rather than for socket open.
+    // A stub that stayed silent from the very first byte would no longer get
+    // past startup, and this suite would be exercising a startup timeout
+    // instead of the thing it is about.
     //
     // One unmasked text frame, hand-built because this stub speaks the
     // handshake itself rather than pulling in a WebSocket library: 0x81 =

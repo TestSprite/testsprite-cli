@@ -32,33 +32,63 @@ describe('formatInterruptMessage', () => {
   });
 });
 
+it('unrefs the interrupt exit backstop and preserves the signal code', async () => {
+  const interruptModule = (await import('./interrupt.js')) as unknown as {
+    armInterruptExitBackstop?: (
+      code: number,
+      deps: {
+        setTimer: (callback: () => void, delayMs: number) => { unref: () => void };
+        exit: (code: number) => void;
+      },
+    ) => void;
+  };
+  let fire!: () => void;
+  const unref = vi.fn();
+  const exit = vi.fn();
+  const setTimer = vi.fn((callback: () => void, _delayMs: number) => {
+    fire = callback;
+    return { unref };
+  });
+
+  expect(interruptModule.armInterruptExitBackstop).toBeTypeOf('function');
+  interruptModule.armInterruptExitBackstop?.(143, { setTimer, exit });
+  expect(setTimer).toHaveBeenCalledWith(expect.any(Function), 3_000);
+  expect(unref).toHaveBeenCalledOnce();
+  expect(exit).not.toHaveBeenCalled();
+  fire();
+  expect(exit).toHaveBeenCalledWith(143);
+});
+
 /** Fresh handler map + controller per case: the disarmed path exits on the
  *  FIRST signal, so sequential signals on one install take the second-signal
- *  hard-exit branch (by design — DEV-331 SIG-5). */
+ *  hard-exit branch (by design). */
 function install(shutdown = new ShutdownController()) {
   const handlers = new Map<string, () => void>();
   const stderr: string[] = [];
   const exit = vi.fn();
+  const setExitCode = vi.fn();
   installSignalHandlers({
     on: (signal, handler) => handlers.set(signal, handler),
     stderr: line => stderr.push(line),
     exit,
+    setExitCode,
     shutdown,
   });
-  return { handlers, stderr, exit, shutdown };
+  return { handlers, stderr, exit, setExitCode, shutdown };
 }
 
 describe('installSignalHandlers', () => {
-  it('registers SIGINT, SIGTERM and SIGHUP with the conventional 128+signum exit codes', () => {
+  it('hard-exits with the conventional signal code when disarmed and idle', () => {
     for (const [signal, code] of [
       ['SIGINT', 130],
       ['SIGTERM', 143],
       ['SIGHUP', 129],
     ] as const) {
-      const { handlers, stderr, exit } = install();
+      const { handlers, stderr, exit, setExitCode } = install();
       expect([...handlers.keys()].sort()).toEqual(['SIGHUP', 'SIGINT', 'SIGTERM']);
       handlers.get(signal)!();
       expect(exit).toHaveBeenLastCalledWith(code);
+      expect(setExitCode).not.toHaveBeenCalled();
       // Disarmed handler emits a leading blank line then the explanation.
       expect(stderr[0]).toBe('');
       expect(stderr.join('\n')).toContain(`Interrupted (${signal})`);
@@ -66,6 +96,46 @@ describe('installSignalHandlers', () => {
     expect(SIGINT_EXIT_CODE).toBe(130);
     expect(TERMINATION_EXIT_CODES.SIGTERM).toBe(143);
     expect(TERMINATION_EXIT_CODES.SIGHUP).toBe(129);
+  });
+
+  it.each([
+    ['SIGINT', 130],
+    ['SIGTERM', 143],
+    ['SIGHUP', 129],
+  ] as const)('drains an in-flight disarmed request after %s', (signal, code) => {
+    const { handlers, stderr, exit, setExitCode, shutdown } = install();
+    void shutdown.runCriticalOperation(() => new Promise<void>(() => {}));
+
+    handlers.get(signal)!();
+
+    expect(shutdown.signal.reason).toMatchObject({ signal, exitCode: code });
+    expect(stderr).toEqual(['', formatInterruptMessage(signal)]);
+    expect(setExitCode).toHaveBeenCalledTimes(1);
+    expect(setExitCode).toHaveBeenCalledWith(code);
+    expect(exit).not.toHaveBeenCalled();
+  });
+
+  it('waits on the second signal when only an ordinary request is registered', async () => {
+    vi.useFakeTimers();
+    try {
+      const { handlers, exit, setExitCode, shutdown } = install();
+      void shutdown.runCriticalOperation(() => new Promise<void>(() => {}));
+
+      handlers.get('SIGINT')!();
+      expect(shutdown.isArmed).toBe(false);
+      expect(exit).not.toHaveBeenCalled();
+      expect(setExitCode).toHaveBeenCalledWith(130);
+
+      handlers.get('SIGTERM')!();
+      expect(exit).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1_999);
+      expect(exit).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(exit).toHaveBeenCalledTimes(1);
+      expect(exit).toHaveBeenCalledWith(143);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('writes the hint synchronously via writeSync before exit (survives a piped stderr)', () => {

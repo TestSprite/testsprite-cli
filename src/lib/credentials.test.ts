@@ -2,13 +2,17 @@ import {
   mkdtempSync,
   statSync,
   readFileSync,
+  readdirSync,
+  renameSync,
   writeFileSync,
   existsSync,
   mkdirSync,
   utimesSync,
+  unlinkSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type * as NodeFs from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_PROFILE,
@@ -16,6 +20,7 @@ import {
   defaultCredentialsPath,
   deleteProfile,
   ensureRestrictiveMode,
+  isCredentialsWritePermissionError,
   parseCredentials,
   readCredentialsFile,
   readProfile,
@@ -23,6 +28,16 @@ import {
   writeProfile,
 } from './credentials.js';
 import { ApiError } from './errors.js';
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof NodeFs>();
+  return {
+    ...actual,
+    writeFileSync: vi.fn(actual.writeFileSync),
+    unlinkSync: vi.fn(actual.unlinkSync),
+    renameSync: vi.fn(actual.renameSync),
+  };
+});
 
 let tmpRoot: string;
 let credentialsPath: string;
@@ -144,6 +159,243 @@ describe('readCredentialsFile / readProfile', () => {
 });
 
 describe('writeProfile', () => {
+  it.each(['EPERM', 'EBUSY', 'EACCES'] as const)(
+    'retries a transient %s while creating the lock on Windows',
+    code => {
+      const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+      const actualWrite = vi.mocked(writeFileSync).getMockImplementation()!;
+      const lockPath = `${credentialsPath}.lock`;
+      const transient = Object.assign(new Error('lock temporarily inaccessible'), { code });
+      vi.mocked(writeFileSync).mockImplementationOnce((...args) => {
+        expect(args[0]).toBe(lockPath);
+        throw transient;
+      });
+      Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+      try {
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath });
+        expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- `lockPath`/`credentialsPath` live in this suite's `mkdtempSync` temp dir, never user input; asserting on them is the point of the test
+        expect(existsSync(lockPath)).toBe(false);
+        expect(
+          vi.mocked(writeFileSync).mock.calls.filter(call => call[0] === lockPath),
+        ).toHaveLength(2);
+      } finally {
+        Object.defineProperty(process, 'platform', originalPlatform);
+        vi.mocked(writeFileSync).mockImplementation(actualWrite);
+      }
+    },
+  );
+
+  it('surfaces lock-create EPERM on non-Windows hosts', () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const actualWrite = vi.mocked(writeFileSync).getMockImplementation()!;
+    const error = Object.assign(new Error('lock permission denied'), { code: 'EPERM' });
+    vi.mocked(writeFileSync).mockImplementationOnce(() => {
+      throw error;
+    });
+    Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'linux' });
+    try {
+      expect(() =>
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath }),
+      ).toThrow(error);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `lockPath`/`credentialsPath` live in this suite's `mkdtempSync` temp dir, never user input; asserting on them is the point of the test
+      expect(existsSync(credentialsPath)).toBe(false);
+    } finally {
+      Object.defineProperty(process, 'platform', originalPlatform);
+      vi.mocked(writeFileSync).mockImplementation(actualWrite);
+    }
+  });
+
+  it('retries a transient Windows lock-release error without losing the saved profile', () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const actualUnlink = vi.mocked(unlinkSync).getMockImplementation()!;
+    const lockPath = `${credentialsPath}.lock`;
+    vi.mocked(unlinkSync).mockImplementationOnce(path => {
+      expect(path).toBe(lockPath);
+      throw Object.assign(new Error('lock delete pending'), { code: 'EPERM' });
+    });
+    Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+    try {
+      writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath });
+      expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `lockPath`/`credentialsPath` live in this suite's `mkdtempSync` temp dir, never user input; asserting on them is the point of the test
+      expect(existsSync(lockPath)).toBe(false);
+      expect(vi.mocked(unlinkSync).mock.calls.filter(call => call[0] === lockPath)).toHaveLength(2);
+    } finally {
+      Object.defineProperty(process, 'platform', originalPlatform);
+      vi.mocked(unlinkSync).mockImplementation(actualUnlink);
+    }
+  });
+
+  it('retries a transient Windows stale-lock removal error', () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const actualUnlink = vi.mocked(unlinkSync).getMockImplementation()!;
+    const lockPath = `${credentialsPath}.lock`;
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same suite temp dir; planting a lock body is how this test sets up contention
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({ pid: process.pid, createdAt: Date.now() - 60_000, token: 'stale' })}\n`,
+    );
+    vi.mocked(unlinkSync).mockImplementationOnce(path => {
+      expect(path).toBe(lockPath);
+      throw Object.assign(new Error('lock delete pending'), { code: 'EACCES' });
+    });
+    Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+    try {
+      writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath });
+      expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `lockPath`/`credentialsPath` live in this suite's `mkdtempSync` temp dir, never user input; asserting on them is the point of the test
+      expect(existsSync(lockPath)).toBe(false);
+    } finally {
+      Object.defineProperty(process, 'platform', originalPlatform);
+      vi.mocked(unlinkSync).mockImplementation(actualUnlink);
+    }
+  });
+
+  it('surfaces a persistent Windows lock-create EPERM instead of timing out as contention', () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const actualWrite = vi.mocked(writeFileSync).getMockImplementation()!;
+    const lockPath = `${credentialsPath}.lock`;
+    const denied = Object.assign(new Error('lock permission denied'), { code: 'EPERM' });
+    vi.mocked(writeFileSync).mockImplementation((...args) => {
+      if (args[0] === lockPath) throw denied;
+      return actualWrite(...args);
+    });
+    Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+    const started = Date.now();
+    try {
+      expect(() =>
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath }),
+      ).toThrow(denied);
+      // Retried for the transient window only, not the full 5 s lock wait.
+      expect(Date.now() - started).toBeLessThan(4_000);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` lives in this suite's `mkdtempSync` temp dir, never user input
+      expect(existsSync(credentialsPath)).toBe(false);
+    } finally {
+      Object.defineProperty(process, 'platform', originalPlatform);
+      vi.mocked(writeFileSync).mockImplementation(actualWrite);
+    }
+  });
+
+  it('surfaces a persistent Windows stale-lock removal error', () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const actualUnlink = vi.mocked(unlinkSync).getMockImplementation()!;
+    const lockPath = `${credentialsPath}.lock`;
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- same suite temp dir; planting a stale lock is how this test sets up the removal
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify({ pid: process.pid, createdAt: Date.now() - 60_000, token: 'stale' })}\n`,
+    );
+    const denied = Object.assign(new Error('stale lock cannot be removed'), { code: 'EPERM' });
+    vi.mocked(unlinkSync).mockImplementation(path => {
+      if (path === lockPath) throw denied;
+      return actualUnlink(path);
+    });
+    Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+    try {
+      expect(() =>
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath }),
+      ).toThrow(denied);
+    } finally {
+      Object.defineProperty(process, 'platform', originalPlatform);
+      vi.mocked(unlinkSync).mockImplementation(actualUnlink);
+    }
+  });
+
+  describe('replacing the credentials file', () => {
+    let originalPlatform: PropertyDescriptor;
+    let actualRename: typeof renameSync;
+
+    beforeEach(() => {
+      originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+      actualRename = vi.mocked(renameSync).getMockImplementation()!;
+      // An existing file is the case a scanner can hold open.
+      writeProfile('default', { apiKey: 'sk-old' }, { path: credentialsPath });
+    });
+
+    afterEach(() => {
+      Object.defineProperty(process, 'platform', originalPlatform);
+      vi.mocked(renameSync).mockImplementation(actualRename);
+    });
+
+    const renameCalls = () =>
+      vi.mocked(renameSync).mock.calls.filter(call => call[1] === credentialsPath);
+    const tempFilesLeft = () =>
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmpRoot` is this suite's own `mkdtempSync` temp dir, never user input
+      readdirSync(tmpRoot).filter(name => name.includes('.tmp.'));
+
+    it.each(['EPERM', 'EBUSY', 'EACCES'] as const)(
+      'retries a transient %s on Windows and saves the profile',
+      code => {
+        vi.mocked(renameSync).mockClear();
+        vi.mocked(renameSync).mockImplementationOnce(() => {
+          throw Object.assign(new Error('file in use'), { code });
+        });
+        Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath });
+
+        expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-new' });
+        expect(renameCalls()).toHaveLength(2);
+        expect(tempFilesLeft()).toEqual([]);
+      },
+    );
+
+    it('surfaces a persistent Windows EPERM as a write-permission error and keeps the old file', () => {
+      const denied = Object.assign(new Error('access denied'), { code: 'EPERM' });
+      vi.mocked(renameSync).mockImplementation((from, to) => {
+        if (to === credentialsPath) throw denied;
+        return actualRename(from, to);
+      });
+      Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+      const started = Date.now();
+
+      let thrown: unknown;
+      try {
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath });
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBe(denied);
+      // Still eligible for the session-only fallback `setup --from-env` offers.
+      expect(isCredentialsWritePermissionError(thrown)).toBe(true);
+      // Retried for the transient window only, then given up.
+      expect(renameCalls().length).toBeGreaterThan(1);
+      expect(Date.now() - started).toBeLessThan(4_000);
+      expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-old' });
+      expect(tempFilesLeft()).toEqual([]);
+    });
+
+    it('does not retry on non-Windows hosts', () => {
+      vi.mocked(renameSync).mockClear();
+      const denied = Object.assign(new Error('permission denied'), { code: 'EPERM' });
+      vi.mocked(renameSync).mockImplementationOnce(() => {
+        throw denied;
+      });
+      Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'linux' });
+
+      expect(() =>
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath }),
+      ).toThrow(denied);
+      expect(renameCalls()).toHaveLength(1);
+    });
+
+    it('does not retry an error that is not contention', () => {
+      vi.mocked(renameSync).mockClear();
+      const readOnly = Object.assign(new Error('read-only file system'), { code: 'EROFS' });
+      vi.mocked(renameSync).mockImplementationOnce(() => {
+        throw readOnly;
+      });
+      Object.defineProperty(process, 'platform', { ...originalPlatform, value: 'win32' });
+
+      expect(() =>
+        writeProfile('default', { apiKey: 'sk-new' }, { path: credentialsPath }),
+      ).toThrow(readOnly);
+      expect(renameCalls()).toHaveLength(1);
+    });
+  });
+
   it('creates the file with mode 0600 and writes the profile', () => {
     writeProfile(DEFAULT_PROFILE, { apiKey: 'sk-new' }, { path: credentialsPath });
     expect(existsSync(credentialsPath)).toBe(true);
@@ -254,43 +506,149 @@ describe('ensureRestrictiveMode', () => {
     expect(() => ensureRestrictiveMode(credentialsPath)).not.toThrow();
   });
 
-  it('tightens the Windows ACL with icacls instead of POSIX chmod', () => {
+  it('tightens the Windows ACL with icacls using /reset then /inheritance:r /grant:r *S-1-3-4:F', () => {
     mkdirSync(tmpRoot, { recursive: true });
     writeFileSync(credentialsPath, 'data', { mode: 0o666 });
     const spawn = vi.fn(() => ({ status: 0, signal: null, output: [], pid: 123 })) as never;
 
     ensureRestrictiveMode(credentialsPath, {
       platform: 'win32',
-      env: { USERNAME: 'alice' } as NodeJS.ProcessEnv,
       spawnSync: spawn,
     });
 
-    expect(spawn).toHaveBeenCalledWith(
+    // Step 1: /reset clears broken inheritance state.
+    expect(spawn).toHaveBeenNthCalledWith(1, 'icacls', [credentialsPath, '/reset'], {
+      shell: false,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    // Step 2: /inheritance:r removes inherited ACEs and /grant:r grants Full Control
+    // to the OWNER RIGHTS SID (*S-1-3-4), avoiding dependency on USERNAME resolution.
+    expect(spawn).toHaveBeenNthCalledWith(
+      2,
       'icacls',
-      [credentialsPath, '/inheritance:r', '/grant:r', 'alice:F'],
+      [credentialsPath, '/inheritance:r', '/grant:r', '*S-1-3-4:F'],
       {
         shell: false,
         stdio: 'ignore',
         windowsHide: true,
       },
     );
+    expect(spawn).toHaveBeenCalledTimes(2);
   });
 
-  it('warns on Windows when credentials ACL tightening cannot run', () => {
+  it('warns on Windows when icacls /reset fails with an error', () => {
     mkdirSync(tmpRoot, { recursive: true });
     writeFileSync(credentialsPath, 'data');
     const warnings: string[] = [];
-    const spawn = vi.fn(() => ({ status: 0, signal: null, output: [], pid: 123 })) as never;
+    const spawn = vi.fn(() => ({
+      error: new Error('spawnSync icacls ENOENT'),
+      status: null,
+      signal: null,
+      output: [],
+      pid: 123,
+    })) as never;
 
     ensureRestrictiveMode(credentialsPath, {
       platform: 'win32',
-      env: {} as NodeJS.ProcessEnv,
       spawnSync: spawn,
       warn: line => warnings.push(line),
     });
 
-    expect(spawn).not.toHaveBeenCalled();
-    expect(warnings.join('\n')).toContain('credentials file permissions were not tightened');
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(warnings.join('\n')).toContain(
+      'icacls failed while resetting credentials file permissions',
+    );
+  });
+
+  it('warns on Windows when icacls /reset exits non-zero', () => {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmpRoot` is this suite's own mkdtempSync temp dir, never user input
+    mkdirSync(tmpRoot, { recursive: true });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` is inside this suite's mkdtempSync temp dir, never user input
+    writeFileSync(credentialsPath, 'data');
+    const warnings: string[] = [];
+    const spawn = vi.fn(() => ({ status: 1, signal: null, output: [], pid: 123 })) as never;
+
+    ensureRestrictiveMode(credentialsPath, {
+      platform: 'win32',
+      spawnSync: spawn,
+      warn: line => warnings.push(line),
+    });
+
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(warnings.join('\n')).toContain('icacls /reset exited with status 1');
+  });
+
+  it('warns on Windows when /reset succeeds but /grant:r fails with an error', () => {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmpRoot` is this suite's own mkdtempSync temp dir, never user input
+    mkdirSync(tmpRoot, { recursive: true });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` is inside this suite's mkdtempSync temp dir, never user input
+    writeFileSync(credentialsPath, 'data');
+    const warnings: string[] = [];
+    const spawn = vi
+      .fn()
+      .mockReturnValueOnce({ status: 0, signal: null, output: [], pid: 123 })
+      .mockReturnValueOnce({
+        error: new Error('permission denied'),
+        status: null,
+        signal: null,
+        output: [],
+        pid: 123,
+      }) as never;
+
+    ensureRestrictiveMode(credentialsPath, {
+      platform: 'win32',
+      spawnSync: spawn,
+      warn: line => warnings.push(line),
+    });
+
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(warnings.join('\n')).toContain(
+      'icacls failed while tightening credentials file permissions',
+    );
+  });
+
+  it('warns on Windows when /reset succeeds but /grant:r exits non-zero', () => {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmpRoot` is this suite's own mkdtempSync temp dir, never user input
+    mkdirSync(tmpRoot, { recursive: true });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` is inside this suite's mkdtempSync temp dir, never user input
+    writeFileSync(credentialsPath, 'data');
+    const warnings: string[] = [];
+    const spawn = vi
+      .fn()
+      .mockReturnValueOnce({ status: 0, signal: null, output: [], pid: 123 })
+      .mockReturnValueOnce({ status: 5, signal: null, output: [], pid: 123 }) as never;
+
+    ensureRestrictiveMode(credentialsPath, {
+      platform: 'win32',
+      spawnSync: spawn,
+      warn: line => warnings.push(line),
+    });
+
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(warnings.join('\n')).toContain('icacls exited with status 5');
+  });
+
+  it('writes the ACL warning to stderr by default, without an injected warn sink', () => {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `tmpRoot` is this suite's own mkdtempSync temp dir, never user input
+    mkdirSync(tmpRoot, { recursive: true });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` is inside this suite's mkdtempSync temp dir, never user input
+    writeFileSync(credentialsPath, 'data');
+    const stderrWrites: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => {
+      stderrWrites.push(String(chunk));
+      return true;
+    }) as typeof process.stderr.write);
+    try {
+      ensureRestrictiveMode(credentialsPath, {
+        platform: 'win32',
+        spawnSync: vi.fn(() => ({ status: 1, signal: null, output: [], pid: 123 })) as never,
+      });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(stderrWrites.join('')).toContain('[warning]');
+    expect(stderrWrites.join('')).toContain('icacls /reset exited with status 1');
   });
 
   // POSIX-only premise: Windows has no 0644/0600 distinction to downgrade.

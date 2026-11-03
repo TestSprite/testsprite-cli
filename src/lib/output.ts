@@ -1,4 +1,6 @@
 import { localValidationError } from './errors.js';
+import type { DeprecationEntry } from './deprecate.js';
+import { redactDeep } from './redact.js';
 
 export type OutputMode = 'json' | 'text';
 
@@ -88,9 +90,21 @@ export class Output {
   private readonly stdoutWrite: (line: string) => void;
   private readonly stderrWrite: (line: string) => void;
   private readonly rawStdoutWrite: (text: string) => void | Promise<void>;
+  private readonly deprecations: readonly DeprecationEntry[] | undefined;
 
-  constructor(mode: OutputMode = 'text', streams: OutputStreams = {}) {
+  /**
+   * `options.deprecations` is appended as the LAST key of a JSON object
+   * payload from `print` (text mode, arrays and error envelopes are never
+   * touched), so a deprecated command's output stays the same document plus
+   * one trailing key.
+   */
+  constructor(
+    mode: OutputMode = 'text',
+    streams: OutputStreams = {},
+    options: { deprecations?: readonly DeprecationEntry[] } = {},
+  ) {
     this.mode = mode;
+    this.deprecations = options.deprecations?.length ? options.deprecations : undefined;
     this.stdoutWrite =
       streams.stdout ??
       (line => {
@@ -105,8 +119,25 @@ export class Output {
   }
 
   print(data: unknown, textRenderer?: (data: unknown) => string): void {
+    // Success data is the caller's OWN content — generated test code, plans,
+    // backend-test fixtures — and must round-trip byte-identical (`test code
+    // get --output json` -> edit -> `test code put`), even when it
+    // legitimately contains a literal `Authorization: Bearer …` header or a
+    // `password` fixture key. Never redacted here, in either mode. Secret
+    // redaction (see `redact.ts`) applies only at error and request-trace
+    // boundaries — `Output.error` below, the ApiError envelope in
+    // `index.ts`, and `--debug` tracing in `client-factory.ts` — never to a
+    // success payload.
     if (this.mode === 'json' || !textRenderer) {
-      this.stdoutWrite(JSON.stringify(data, null, 2));
+      const withDeprecations =
+        this.mode === 'json' &&
+        this.deprecations &&
+        typeof data === 'object' &&
+        data !== null &&
+        !Array.isArray(data)
+          ? { ...data, deprecations: this.deprecations }
+          : data;
+      this.stdoutWrite(JSON.stringify(withDeprecations, null, 2));
       return;
     }
     this.stdoutWrite(textRenderer(data));
@@ -141,7 +172,11 @@ export class Output {
           message: input.message,
           nextAction: input.nextAction ?? '',
           requestId: input.requestId ?? 'local',
-          details: input.details ?? {},
+          // Defence in depth: `details` from a server envelope is already
+          // redacted server-side and (for an ApiError) at construction — see
+          // `errors.ts` — but this render boundary redacts again so no path
+          // that builds an envelope by hand here can ever skip it.
+          details: redactDeep(input.details ?? {}),
         },
       };
       this.stderrWrite(JSON.stringify(envelope, null, 2));

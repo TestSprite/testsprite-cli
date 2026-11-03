@@ -13,8 +13,8 @@
  * deps. Per-command deps (auth's `prompt`, test's `rawStdout`) stay
  * with the command.
  */
-import { loadConfig } from './config.js';
-import { defaultCredentialsPath } from './credentials.js';
+import { loadConfig, type Config } from './config.js';
+import { DEFAULT_PROFILE, defaultCredentialsPath } from './credentials.js';
 import { ApiError, localValidationError } from './errors.js';
 import { facadeBaseUrl } from './facade.js';
 import type { DebugEvent, FetchImpl, HttpClientOptions } from './http.js';
@@ -24,9 +24,10 @@ import {
   REQUEST_TIMEOUT_MAX_MS,
   REQUEST_TIMEOUT_MIN_MS,
 } from './http.js';
-import { globalShutdown } from './interrupt.js';
+import { globalShutdown, type ShutdownHandle } from './interrupt.js';
 import type { OutputMode } from './output.js';
 import { createDryRunFetch } from './dry-run/fetch.js';
+import { redactDeep } from './redact.js';
 import { noteServerVersion } from './version-notice.js';
 import { VERSION } from '../version.js';
 
@@ -72,11 +73,20 @@ export interface ClientFactoryDeps {
   fetchImpl?: FetchImpl;
   stderr?: (line: string) => void;
   /**
-   * Shutdown signal composed into every outgoing fetch (DEV-331 piece 1).
+   * Shutdown signal composed into every outgoing fetch.
    * Defaults to `globalShutdown.signal` so an armed SIGINT/SIGTERM aborts an
    * in-flight request; tests inject their own controller's signal.
    */
   shutdownSignal?: AbortSignal;
+  /**
+   * Pre-resolved config. When supplied, the factory skips its own `loadConfig`
+   * call entirely. Callers that already resolved config (e.g. doctor, which
+   * must survive an unreadable credentials file) pass it through so the client
+   * never re-reads — and re-fails on — the file.
+   */
+  config?: Config;
+  /** Defaults to `globalShutdown` so disarmed signals can see in-flight requests. */
+  shutdown?: Pick<ShutdownHandle, 'runCriticalOperation'>;
 }
 
 /**
@@ -283,6 +293,24 @@ export function parseRequestTimeoutFlag(raw: string | undefined): number | undef
   return Math.round(n * 1000); // seconds → milliseconds
 }
 
+/**
+ * The profile name to echo in a missing-key error, or `undefined` to keep the
+ * generic wording.
+ *
+ * Two cases are deliberately not named. The default profile is the plain
+ * "not set up yet" case, where naming it adds nothing. And a name shaped like
+ * a TestSprite API key is withheld: the credentials-file guard only checks
+ * that a name is a safe INI section (`/^[A-Za-z0-9._-]+$/`), which every key
+ * format also satisfies, so `TESTSPRITE_PROFILE=$SOME_KEY_VAR` would otherwise
+ * print the key to stderr and into `details` under `--output json` — straight
+ * into a CI log.
+ */
+function nameableProfile(profile: string): string | undefined {
+  if (profile === DEFAULT_PROFILE) return undefined;
+  if (API_KEY_PREFIXES.some(prefix => profile.startsWith(prefix))) return undefined;
+  return profile;
+}
+
 export function makeHttpClient(opts: CommonOptions, deps: ClientFactoryDeps = {}): HttpClient {
   return new HttpClient(resolveHttpClientOptions(opts, deps));
 }
@@ -321,21 +349,24 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
       env,
       requestTimeoutMs,
       shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
+      shutdown: deps.shutdown ?? globalShutdown,
     };
   }
 
   const credentialsPath = deps.credentialsPath ?? defaultCredentialsPath();
-  const config = loadConfig({
-    profile: opts.profile,
-    endpointUrl: opts.endpointUrl,
-    env,
-    credentialsPath,
-  });
+  const config =
+    deps.config ??
+    loadConfig({
+      profile: opts.profile,
+      endpointUrl: opts.endpointUrl,
+      env,
+      credentialsPath,
+    });
   // Catch a malformed endpoint (from --endpoint-url / TESTSPRITE_API_URL /
   // credentials) before the auth check so a config typo surfaces as a clear
   // VALIDATION_ERROR rather than an opaque URL throw or a retried "fetch failed".
   assertValidEndpointUrl(config.apiUrl);
-  if (!config.apiKey) throw ApiError.authRequired();
+  if (!config.apiKey) throw ApiError.authRequired(undefined, nameableProfile(config.profile));
   assertValidApiKey(config.apiKey);
   return {
     baseUrl: facadeBaseUrl(config.apiUrl),
@@ -358,13 +389,23 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
     env,
     requestTimeoutMs,
     shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
+    shutdown: deps.shutdown ?? globalShutdown,
   };
 }
 
-function formatDebug(event: DebugEvent): string {
-  return `[debug ${new Date().toISOString()}] ${JSON.stringify(event)}`;
+/**
+ * `DebugEvent` today carries only method/url/attempt/status/errorCode/
+ * durationMs/requestId/delayMs — no headers or body — so there is nothing to
+ * redact in the current shape. This still routes through `redactDeep` so a
+ * future field (request/response headers or body added to `DebugEvent` for
+ * richer `--debug` tracing) is protected from day one rather than needing a
+ * second fix when that lands. Exported for direct unit coverage of that
+ * forward-compatibility contract.
+ */
+export function formatDebug(event: DebugEvent): string {
+  return `[debug ${new Date().toISOString()}] ${JSON.stringify(redactDeep(event))}`;
 }
 
-function formatDryRunDebug(event: DebugEvent): string {
-  return `[debug ${new Date().toISOString()}] ${JSON.stringify({ ...event, mode: 'dry-run' })}`;
+export function formatDryRunDebug(event: DebugEvent): string {
+  return `[debug ${new Date().toISOString()}] ${JSON.stringify(redactDeep({ ...event, mode: 'dry-run' }))}`;
 }

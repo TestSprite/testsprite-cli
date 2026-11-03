@@ -32,7 +32,7 @@
  * `WebSocket.close()` on an OPEN connection sends a Close frame and sets the
  * ready state to CLOSING — nothing more. It does not abort the underlying
  * connection and does not time out; that only happens for a CONNECTING
- * socket (`failWebsocketConnection`, upstream `client.ts` VENDOR DELTA #8's
+ * socket (`failWebsocketConnection`, upstream `client.ts` stop-on-CONNECTING
  * territory). If the peer never sends its own Close frame back — a redeploy
  * mid-handshake, a proxy that swallows the FIN, a server too busy to answer —
  * the ready state sits at CLOSING forever, the JS `'close'` event never
@@ -130,6 +130,56 @@ export const CLOSE_GRACE_MS = 1200;
  */
 const CONNECTED_CHANNEL = 'undici:client:connected';
 
+/**
+ * Companion channel for the case `CONNECTED_CHANNEL` cannot see: the process-
+ * global dispatcher may hand the upgrade request an already-open pooled
+ * keep-alive connection (e.g. one an earlier API call left idle), in which
+ * case no dial happens and no `connected` event fires. `sendHeaders` is
+ * published for every request on whichever socket carries it, upgrade
+ * requests included — payload is `{ request, headers, socket }`.
+ */
+const SEND_HEADERS_CHANNEL = 'undici:client:sendHeaders';
+
+/** The fields undici publishes for a request about to write its headers. */
+interface UpgradeRequest {
+  upgrade?: unknown;
+  path?: unknown;
+  origin?: unknown;
+}
+
+/** Does this `sendHeaders` request belong to the WebSocket upgrade for `target`? */
+export function upgradeRequestMatchesTarget(
+  request: UpgradeRequest | undefined,
+  target: URL,
+): boolean {
+  if (
+    typeof request?.upgrade !== 'string' ||
+    request.upgrade.toLowerCase() !== 'websocket' ||
+    typeof request.path !== 'string'
+  ) {
+    return false;
+  }
+  try {
+    // undici converts ws/wss to http/https for the handshake. A forward
+    // proxy can put the target's absolute URL in path and its own origin in
+    // origin; in that case the absolute request target identifies the peer.
+    const absolutePath = /^https?:\/\//.test(request.path);
+    if (!absolutePath && typeof request.origin !== 'string') return false;
+    const origin = new URL(absolutePath ? request.path : (request.origin as string));
+    const protocol = target.protocol === 'wss:' ? 'https:' : 'http:';
+    const defaultPort = protocol === 'https:' ? '443' : '80';
+    const path = absolutePath ? `${origin.pathname}${origin.search}` : request.path;
+    return (
+      origin.protocol === protocol &&
+      origin.hostname === target.hostname &&
+      (origin.port || defaultPort) === (target.port || defaultPort) &&
+      path === `${target.pathname}${target.search}`
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** The subset of `undici:client:connected`'s `connectParams` this filter reads. */
 export interface ConnectParams {
   hostname?: unknown;
@@ -203,7 +253,7 @@ export class WsCompatSocket {
   static readonly OPEN = 1;
 
   private readonly socket: UndiciWebSocket;
-  /** Captured via `undici:client:connected`, if it fired — see the class docstring. */
+  /** Captured via connected or the upgrade's sendHeaders event, including reused sockets. */
   private rawSocket: NetSocket | undefined;
   private closeListener: CloseListener | undefined;
   private closeSettled = false;
@@ -212,11 +262,21 @@ export class WsCompatSocket {
 
   constructor(url: URL | string) {
     this.unsubscribeConnected = this.captureRawSocket(url);
-    this.socket = new UndiciWebSocket(url);
-    // Whichever comes first, the capture window is over the moment this
-    // connection attempt is decided — see captureRawSocket's docstring.
-    this.socket.addEventListener('open', () => this.unsubscribeConnected(), { once: true });
-    this.socket.addEventListener('error', () => this.unsubscribeConnected(), { once: true });
+    try {
+      this.socket = new UndiciWebSocket(url);
+      // Whichever comes first, the capture window is over the moment this
+      // connection attempt is decided — see captureRawSocket's docstring.
+      this.socket.addEventListener('open', () => this.unsubscribeConnected(), { once: true });
+      this.socket.addEventListener('error', () => this.unsubscribeConnected(), { once: true });
+      this.socket.addEventListener(
+        'close',
+        (ev: CloseEvent) => this.settleClose(ev.code, Buffer.from(ev.reason ?? '', 'utf8')),
+        { once: true },
+      );
+    } catch (error) {
+      this.unsubscribeConnected();
+      throw error;
+    }
   }
 
   /**
@@ -224,11 +284,14 @@ export class WsCompatSocket {
    * `net.Socket` for THIS connection, filtered by target host/port so an
    * unrelated concurrent undici connection elsewhere in the process (e.g.
    * this CLI's own HTTP polling) is never mistaken for it. See the class
-   * docstring for why `close()` needs this at all. Returns an idempotent
+   * docstring for why `close()` needs this at all. The sendHeaders fallback
+   * also checks the upgrade path and query, then ends both subscriptions.
+   * Returns an idempotent
    * unsubscribe closure. Never throws: a diagnostics hook failing must not
    * break the connection it exists only to make teardown more graceful for.
    */
   private captureRawSocket(url: URL | string): () => void {
+    let unsubscribe = (): void => {};
     try {
       const target = typeof url === 'string' ? new URL(url) : url;
       const channel = diagnosticsChannel.channel(CONNECTED_CHANNEL);
@@ -242,9 +305,26 @@ export class WsCompatSocket {
           channel.unsubscribe(onConnected);
         }
       };
+      const sendChannel = diagnosticsChannel.channel(SEND_HEADERS_CHANNEL);
+      const onSendHeaders = (message: unknown): void => {
+        const { socket, request } = (message ?? {}) as {
+          socket?: unknown;
+          request?: UpgradeRequest;
+        };
+        if (socket !== undefined && upgradeRequestMatchesTarget(request, target)) {
+          this.rawSocket = socket as NetSocket;
+          unsubscribe();
+        }
+      };
+      unsubscribe = () => {
+        channel.unsubscribe(onConnected);
+        sendChannel.unsubscribe(onSendHeaders);
+      };
       channel.subscribe(onConnected);
-      return () => channel.unsubscribe(onConnected);
+      sendChannel.subscribe(onSendHeaders);
+      return unsubscribe;
     } catch {
+      unsubscribe();
       // Degrade to "no captured socket": close() still settles via the
       // synthetic-close path, just without the unref step.
       return () => {};
@@ -285,9 +365,6 @@ export class WsCompatSocket {
         // target of the synthetic close below, and either path must reach
         // this exact listener exactly once. See the class docstring.
         this.closeListener = listener as CloseListener;
-        this.socket.addEventListener('close', (ev: CloseEvent) => {
-          this.settleClose(ev.code, Buffer.from(ev.reason ?? '', 'utf8'));
-        });
         return this;
       case 'ping':
         // See the module docstring: undici answers PING internally, so there
@@ -303,6 +380,7 @@ export class WsCompatSocket {
   }
 
   close(code?: number, reason?: string): void {
+    this.unsubscribeConnected();
     this.socket.close(code, reason);
     this.armCloseGrace();
   }

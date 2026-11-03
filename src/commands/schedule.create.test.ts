@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ApiError } from '../lib/errors.js';
-import { runCreate } from './schedule.js';
+import { createScheduleCommand, runCreate } from './schedule.js';
 
 type FetchInput = Parameters<typeof globalThis.fetch>[0];
 
@@ -64,6 +64,34 @@ const VALID = {
 const sink = { stdout: () => {}, stderr: () => {} };
 
 describe('runCreate — validation', () => {
+  it('test-list target refuses --env locally', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runCreate(
+        { ...VALID, targetType: 'testList', targetId: 'tl_1', env: 'staging' },
+        { credentialsPath, fetchImpl: noNetwork(), ...sink },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      nextAction: expect.stringContaining(
+        'testsprite testlist update tl_1 --project-env <projectId>:<environmentName>',
+      ),
+      details: { field: 'environment', reason: 'not_supported_for_target' },
+    });
+  });
+
+  it('blank env rejects locally', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runCreate({ ...VALID, env: '   ' }, { credentialsPath, fetchImpl: noNetwork(), ...sink }),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'environment', reason: 'blank_value' },
+    });
+  });
+
   it.each(['name', 'targetId', 'cron'])('rejects a missing %s before any request', async field => {
     const { credentialsPath } = makeCreds();
     const opts = { ...VALID } as Record<string, unknown>;
@@ -120,6 +148,220 @@ describe('runCreate — request', () => {
 
   const postOf = (calls: Array<{ url: string; init: RequestInit }>) =>
     calls.find(c => (c.init.method ?? 'GET') === 'POST')!;
+
+  it('refuses a known old server before creating a pinned schedule', async () => {
+    const { credentialsPath } = makeCreds();
+    const methods: string[] = [];
+    const fetchImpl = makeFetch((_url, init) => {
+      methods.push(init.method ?? 'GET');
+      return {
+        body:
+          (init.method ?? 'GET') === 'GET'
+            ? { schedules: [{ scheduleId: 'sch_existing', targetType: 'project' }] }
+            : { scheduleId: 'sch_new' },
+      };
+    });
+    await expect(
+      runCreate({ ...VALID, env: 'staging' }, { credentialsPath, fetchImpl, ...sink }),
+    ).rejects.toMatchObject({
+      code: 'UNSUPPORTED',
+      exitCode: 7,
+      nextAction: expect.stringContaining('No schedule was created'),
+    });
+    expect(methods).toEqual(['GET']);
+  });
+
+  it.each([403, 404])(
+    'keeps echo verification when the capability read returns %s',
+    async status => {
+      const { credentialsPath } = makeCreds();
+      const methods: string[] = [];
+      const fetchImpl = makeFetch((_url, init) => {
+        const method = init.method ?? 'GET';
+        methods.push(method);
+        if (method === 'GET') {
+          return {
+            status,
+            body: {
+              error: {
+                code: status === 403 ? 'AUTH_FORBIDDEN' : 'NOT_FOUND',
+                message: 'unreadable',
+                requestId: 'r1',
+              },
+            },
+          };
+        }
+        return { body: { scheduleId: 'sch_new' } };
+      });
+      await expect(
+        runCreate({ ...VALID, env: 'staging' }, { credentialsPath, fetchImpl, ...sink }),
+      ).rejects.toMatchObject({
+        code: 'UNSUPPORTED',
+        nextAction: expect.stringContaining('Schedule sch_new was created and then removed'),
+        details: { scheduleId: 'sch_new', rolledBack: true },
+      });
+      expect(methods).toEqual(['GET', 'POST', 'DELETE']);
+    },
+  );
+
+  /** A server new enough to echo `environment`/`environmentMode` on the create response. */
+  function pinAwareFetch(mode: 'pinned' | 'inherit', environment: string | null = null) {
+    return makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'DELETE') return { body: { scheduleId: 'sch_new' } };
+      return url.includes('/tests')
+        ? { body: { items: [], nextToken: null } }
+        : { body: { scheduleId: 'sch_new', environment, environmentMode: mode } };
+    });
+  }
+
+  it('create forwards --env for a project target', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fetchImpl = makeFetch((url, init) => {
+      calls.push({ url, init });
+      return url.includes('/tests')
+        ? { body: { items: [], nextToken: null } }
+        : { body: { scheduleId: 'sch_new', environment: 'staging', environmentMode: 'pinned' } };
+    });
+    await runCreate({ ...VALID, env: 'staging' }, { credentialsPath, fetchImpl, ...sink });
+    expect(JSON.parse(String(postOf(calls).init.body)).environment).toBe('staging');
+  });
+
+  it('create without --env inherits', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fetchImpl = makeFetch((url, init) => {
+      calls.push({ url, init });
+      return url.includes('/tests')
+        ? { body: { items: [], nextToken: null } }
+        : { body: { scheduleId: 'sch_new', environment: null, environmentMode: 'inherit' } };
+    });
+    const output: string[] = [];
+    await runCreate(
+      { ...VALID, output: 'text' },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => output.push(line),
+        stderr: () => {},
+      },
+    );
+    expect(JSON.parse(String(postOf(calls).init.body))).not.toHaveProperty('environment');
+    expect(output.join('\n')).toContain('project default (inherits)');
+  });
+
+  it('create confirmation shows a pinned environment', async () => {
+    const { credentialsPath } = makeCreds();
+    const output: string[] = [];
+    await runCreate(
+      { ...VALID, output: 'text', env: 'staging' },
+      {
+        credentialsPath,
+        fetchImpl: pinAwareFetch('pinned', 'staging'),
+        stdout: line => output.push(line),
+        stderr: () => {},
+      },
+    );
+    expect(output.join('\n')).toContain('staging (pinned)');
+  });
+
+  it("create without --env on an old server keeps today's output (no mode line)", async () => {
+    // An old server has no idea what `environment`/`environmentMode` are and
+    // omits both from the response — this is not a rejection, just silence,
+    // so the confirmation card falls back to exactly what it printed before
+    // schedule environments existed.
+    const { credentialsPath } = makeCreds();
+    const output: string[] = [];
+    await runCreate(
+      { ...VALID, output: 'text' },
+      {
+        credentialsPath,
+        fetchImpl: happyFetch(),
+        stdout: line => output.push(line),
+        stderr: () => {},
+      },
+    );
+    expect(output.join('\n')).toBe('id: sch_new');
+  });
+
+  it('old server drops --env on create: rolls the schedule back and refuses', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fetchImpl = makeFetch((url, init) => {
+      calls.push({ url, init });
+      if ((init.method ?? 'GET') === 'DELETE') return { body: { scheduleId: 'sch_new' } };
+      if ((init.method ?? 'GET') === 'GET') return { body: { schedules: [] } };
+      // Old server: silently drops `environment`, never echoes a mode.
+      return { body: { scheduleId: 'sch_new' } };
+    });
+    const output: string[] = [];
+    await expect(
+      runCreate(
+        { ...VALID, env: 'staging' },
+        { credentialsPath, fetchImpl, stdout: line => output.push(line), stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'UNSUPPORTED', exitCode: 7 });
+
+    const del = calls.find(c => (c.init.method ?? 'GET') === 'DELETE');
+    expect(del).toBeDefined();
+    expect(del!.url).toContain('/schedules/sch_new');
+    expect(output).toEqual([]); // no success card for a schedule that was rolled back
+  });
+
+  it('old server drops --env on create: reports the id when the rollback delete itself fails', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'GET') return { body: { schedules: [] } };
+      if ((init.method ?? 'GET') === 'DELETE') {
+        return {
+          status: 500,
+          body: { error: { code: 'INTERNAL', message: 'boom', requestId: 'r1' } },
+        };
+      }
+      return { body: { scheduleId: 'sch_new' } };
+    });
+    await expect(
+      runCreate({ ...VALID, env: 'staging' }, { credentialsPath, fetchImpl, ...sink }),
+    ).rejects.toMatchObject({
+      code: 'UNSUPPORTED',
+      exitCode: 7,
+      nextAction: expect.stringContaining('sch_new'),
+    });
+  });
+
+  it('unknown env shows available names', async () => {
+    const { credentialsPath } = makeCreds();
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchImpl = makeFetch((_url, init) => {
+      bodies.push(JSON.parse(String(init.body)));
+      return {
+        status: 400,
+        body: {
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: 'Unknown environment.',
+            nextAction: 'Use one of: default, staging',
+            requestId: 'req_1',
+            details: {
+              field: 'environment',
+              requested: 'stagin',
+              available: ['default', 'staging'],
+              accepted: ['default', 'staging'],
+            },
+          },
+        },
+      };
+    });
+    await expect(
+      runCreate({ ...VALID, env: 'stagin' }, { credentialsPath, fetchImpl, ...sink }),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      nextAction: 'Use one of: default, staging',
+      details: { available: ['default', 'staging'] },
+    });
+    expect(bodies).toEqual([expect.objectContaining({ environment: 'stagin' })]);
+  });
 
   it('POSTs to /schedules with the mapped body', async () => {
     const { credentialsPath } = makeCreds();
@@ -210,6 +452,43 @@ describe('runCreate — request', () => {
     await expect(runCreate(VALID, { credentialsPath, fetchImpl, ...sink })).rejects.toBeInstanceOf(
       ApiError,
     );
+  });
+});
+
+describe('createScheduleCommand — wiring', () => {
+  it('create wires --env onto the request body', async () => {
+    const { credentialsPath } = makeCreds();
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const command = createScheduleCommand({
+      credentialsPath,
+      fetchImpl: makeFetch((url, init) => {
+        calls.push({ url, init });
+        return url.includes('/tests')
+          ? { body: { items: [], nextToken: null } }
+          : { body: { scheduleId: 'sch_new', environment: 'staging', environmentMode: 'pinned' } };
+      }),
+      ...sink,
+    });
+
+    await command.parseAsync(
+      [
+        'create',
+        '--name',
+        'Nightly',
+        '--target-type',
+        'project',
+        '--target-id',
+        'project_1',
+        '--cron',
+        '0 3 * * *',
+        '--env',
+        'staging',
+      ],
+      { from: 'user' },
+    );
+
+    const post = calls.find(c => (c.init.method ?? 'GET') === 'POST')!;
+    expect(JSON.parse(String(post.init.body))).toMatchObject({ environment: 'staging' });
   });
 });
 

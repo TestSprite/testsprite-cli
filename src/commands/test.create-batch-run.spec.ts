@@ -19,7 +19,8 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, CLIError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
+import { ShutdownController } from '../lib/interrupt.js';
 import type { RunResponse, TriggerRunResponse } from '../lib/runs.types.js';
 import {
   BATCH_RUN_RATE_LIMIT,
@@ -27,7 +28,9 @@ import {
   DEFAULT_BATCH_RUN_CONCURRENCY,
   createTestCommand,
   isTransientRateLimit,
+  runCreate,
   runCreateBatch,
+  runCreateFromPlan,
   runTestRun,
 } from './test.js';
 
@@ -1324,6 +1327,60 @@ describe('DEFAULT_BATCH_RUN_CONCURRENCY', () => {
 // ---------------------------------------------------------------------------
 
 describe('runCreateBatch --run: RATE_LIMITED outer retry', () => {
+  it('interrupts a disarmed trigger backoff without waiting for its timer', async () => {
+    const { credentialsPath } = makeCreds();
+    const plansFile = writePlansJsonl([FE_SPEC]);
+    const shutdown = new ShutdownController();
+    let sleepCompleted = false;
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch')) {
+        return { body: makeBatchCreateResponse(['test_rl']) };
+      }
+      return {
+        status: 429,
+        body: {
+          error: {
+            code: 'RATE_LIMITED',
+            message: 'Run trigger rate limit exceeded: 60 per minute per key.',
+            nextAction: 'Wait before retrying.',
+            requestId: 'req_rl',
+            details: { retryAfterSeconds: 60 },
+          },
+        },
+      };
+    });
+    const rejection = await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        maxConcurrency: 1,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        shutdown,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: () => {
+          shutdown.interrupt('SIGINT');
+          return new Promise<void>(resolve =>
+            setTimeout(() => {
+              sleepCompleted = true;
+              resolve();
+            }, 40),
+          );
+        },
+      },
+    ).catch((err: unknown) => err);
+    expect(rejection).toBe(shutdown.signal.reason);
+    expect(sleepCompleted).toBe(false);
+  });
+
   let logSpy: ReturnType<typeof vi.spyOn>;
   let errorSpy: ReturnType<typeof vi.spyOn>;
 
@@ -1548,6 +1605,188 @@ describe('runCreateBatch --run: RATE_LIMITED outer retry', () => {
     expect(result.error?.code).toBe('RATE_LIMITED');
     expect(result.error?.exitCode).toBe(11);
   }); // retryOnRateLimit: false → 1 HTTP call per outer attempt; extended timeout not needed
+});
+
+it('preserves a uniform billing gate from create-batch --run', async () => {
+  const { credentialsPath } = makeCreds();
+  const plansFile = writePlansJsonl([FE_SPEC]);
+  const fetchImpl = makeFetch(url =>
+    url.includes('/tests/batch')
+      ? { body: makeBatchCreateResponse(['test_gate_a', 'test_gate_b']) }
+      : {
+          status: 403,
+          body: {
+            error: {
+              code: 'FEATURE_GATED',
+              message: 'This workspace is paused.',
+              nextAction: '',
+              requestId: 'req_gate',
+              details: { reason: 'billing_hold', state: 'paused' },
+            },
+          },
+        },
+  );
+  const err = (await runCreateBatch(
+    {
+      profile: 'default',
+      output: 'json',
+      debug: false,
+      dryRun: false,
+      plans: plansFile,
+      run: true,
+      wait: false,
+      maxConcurrency: 1,
+      timeoutSeconds: 60,
+    },
+    { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+  ).catch(e => e)) as ApiError;
+  expect(err).toBeInstanceOf(ApiError);
+  expect(err.code).toBe('FEATURE_GATED');
+  expect(err.exitCode).toBe(13);
+  expect(err.nextAction).toContain('/dashboard/settings/billing');
+});
+
+it('preserves uniform insufficient credits from create-batch --run', async () => {
+  const { credentialsPath } = makeCreds();
+  const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC]);
+  const fetchImpl = makeFetch(url =>
+    url.includes('/tests/batch')
+      ? { body: makeBatchCreateResponse(['test_credit_a', 'test_credit_b']) }
+      : {
+          status: 402,
+          body: {
+            error: {
+              code: 'INSUFFICIENT_CREDITS',
+              message: 'Need 2 credits.',
+              nextAction: '',
+              requestId: 'req_credit',
+              details: { required: 2 },
+            },
+          },
+        },
+  );
+  const err = (await runCreateBatch(
+    {
+      profile: 'default',
+      output: 'json',
+      debug: false,
+      dryRun: false,
+      plans: plansFile,
+      run: true,
+      wait: false,
+      maxConcurrency: 2,
+      timeoutSeconds: 60,
+    },
+    { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+  ).catch(e => e)) as ApiError;
+  expect(err).toBeInstanceOf(ApiError);
+  expect(err.code).toBe('INSUFFICIENT_CREDITS');
+  expect(err.exitCode).toBe(12);
+  expect(err.nextAction).toContain('/pricing');
+});
+
+it('a paused workspace outranks a mixed-in credits refusal from create-batch --run', async () => {
+  // Every failure is a billing refusal, but not the SAME reason (hold vs
+  // credits) — the uniform-reason check alone would fall through to a
+  // generic exit 1. Paused wins: topping up credits cannot resume the
+  // workspace, so paused's exit 13 + link must survive the mix.
+  const { credentialsPath } = makeCreds();
+  const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC]);
+  const fetchImpl = makeFetch(url => {
+    if (url.includes('/tests/batch'))
+      return { body: makeBatchCreateResponse(['test_hold', 'test_credit']) };
+    if (url.includes('/tests/test_hold/runs'))
+      return {
+        status: 403,
+        body: {
+          error: {
+            code: 'FEATURE_GATED',
+            message: 'This workspace is paused.',
+            nextAction: '',
+            requestId: 'req_hold',
+            details: { reason: 'billing_hold', state: 'paused' },
+          },
+        },
+      };
+    return {
+      status: 402,
+      body: {
+        error: {
+          code: 'INSUFFICIENT_CREDITS',
+          message: 'Need 1 credit.',
+          nextAction: '',
+          requestId: 'req_credit',
+          details: { required: 1 },
+        },
+      },
+    };
+  });
+  const err = (await runCreateBatch(
+    {
+      profile: 'default',
+      output: 'json',
+      debug: false,
+      dryRun: false,
+      plans: plansFile,
+      run: true,
+      wait: false,
+      maxConcurrency: 2,
+      timeoutSeconds: 60,
+    },
+    { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+  ).catch(e => e)) as ApiError;
+  expect(err).toBeInstanceOf(ApiError);
+  expect(err.code).toBe('FEATURE_GATED');
+  expect(err.exitCode).toBe(13);
+  expect(err.nextAction).toContain('/dashboard/settings/billing');
+});
+
+it('marks a dispatched batch run for recovery guidance on fan-out interruption', async () => {
+  const { credentialsPath } = makeCreds();
+  const plansFile = writePlansJsonl([FE_SPEC]);
+  const interruption = new InterruptError('SIGINT');
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const fetchImpl = (async (input: FetchInput) => {
+    const url = String(input);
+    if (url.includes('/tests/batch')) {
+      return new Response(JSON.stringify(makeBatchCreateResponse(['test_one'])));
+    }
+    if (url.includes('/tests/test_one/runs')) {
+      return new Response(JSON.stringify(makeTriggerResponse('test_one', 'run_one')));
+    }
+    if (url.endsWith('/tests/test_one'))
+      return new Response(JSON.stringify({ type: 'frontend', projectId: 'project_1' }));
+    if (url.endsWith('/projects/project_alice/env'))
+      return new Response(JSON.stringify({ environments: [] }));
+    throw interruption;
+  }) as typeof fetch;
+  const error = await runCreateBatch(
+    {
+      profile: 'default',
+      output: 'json',
+      debug: false,
+      dryRun: false,
+      plans: plansFile,
+      run: true,
+      wait: true,
+      maxConcurrency: 1,
+      timeoutSeconds: 30,
+    },
+    {
+      credentialsPath,
+      fetchImpl,
+      shutdown: new ShutdownController(),
+      stdout: line => stdout.push(line),
+      stderr: line => stderr.push(line),
+    },
+  ).catch((err: unknown) => err);
+  expect(error).toBe(interruption);
+  expect((error as InterruptError).runWaitContext).toBe(true);
+  expect(JSON.parse(stdout.at(-1)!) as unknown).toMatchObject({
+    results: [{ testId: 'test_one', runId: 'run_one', status: 'running' }],
+  });
+  expect(stderr.join('\n')).toContain('testsprite test wait run_one');
 });
 
 // ---------------------------------------------------------------------------
@@ -3022,5 +3261,251 @@ describe('ROUND-2 (e): insufficient-credits 429 with Retry-After header is termi
       // Credits depletion is now re-mapped to INSUFFICIENT_CREDITS (exit 12)
       expect(result?.error?.code).toBe('INSUFFICIENT_CREDITS');
     }
+  });
+});
+function fixtures(): {
+  credentialsPath: string;
+  codeFile: string;
+  planFile: string;
+  plansFile: string;
+  planDir: string;
+} {
+  const dir = mkdtempSync(join(tmpdir(), 'cli-env-chain-'));
+  const credentialsPath = join(dir, 'credentials');
+  const codeFile = join(dir, 'test.py');
+  const planFile = join(dir, 'plan.json');
+  const plansFile = join(dir, 'plans.jsonl');
+  const plan = {
+    projectId: 'project_1',
+    type: 'frontend',
+    name: 'example',
+    planSteps: [{ type: 'action', description: 'open page' }],
+  };
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture paths under this helper's own mkdtempSync dir, never user input
+  writeFileSync(
+    credentialsPath,
+    '[default]\napi_url = http://localhost:13502\napi_key = sk-user-test\n',
+    { mode: 0o600 },
+  );
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture paths under this helper's own mkdtempSync dir, never user input
+  writeFileSync(codeFile, 'def test_example():\n    assert True\n');
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture paths under this helper's own mkdtempSync dir, never user input
+  writeFileSync(planFile, JSON.stringify(plan));
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture paths under this helper's own mkdtempSync dir, never user input
+  writeFileSync(plansFile, `${JSON.stringify(plan)}\n`);
+  return { credentialsPath, codeFile, planFile, plansFile, planDir: dir };
+}
+
+describe('create run environment', () => {
+  it('create and create-batch forward --env only with --run', async () => {
+    const files = fixtures();
+    const bodies: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const fetchImpl = (async (
+      input: Parameters<typeof globalThis.fetch>[0],
+      init: RequestInit = {},
+    ) => {
+      const url = String(input);
+      const body = init.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+      bodies.push({ url, body });
+      let response: unknown;
+      if (url.endsWith('/tests/batch'))
+        response = {
+          results: [{ specIndex: 0, status: 'created', testId: 'test_batch' }],
+          summary: { total: 1, created: 1, failed: 0 },
+        };
+      else if (url.endsWith('/tests'))
+        response = {
+          testId: 'test_created',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-09-22T00:00:00Z',
+        };
+      else if (url.includes('/runs'))
+        response = {
+          runId: 'run_created',
+          status: 'queued',
+          enqueuedAt: '2026-09-22T00:00:00Z',
+          codeVersion: 'v1',
+          targetUrl: 'https://example.com',
+        };
+      else response = { items: [], nextToken: null };
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof globalThis.fetch;
+    const deps = {
+      credentialsPath: files.credentialsPath,
+      fetchImpl,
+      stdout: () => {},
+      stderr: () => {},
+    };
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_1',
+        type: 'frontend',
+        name: 'example',
+        codeFile: files.codeFile,
+        run: true,
+        environment: 'staging',
+      },
+      deps,
+    );
+    await runCreateFromPlan(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        planFrom: files.planFile,
+        run: true,
+        environment: 'staging',
+      },
+      deps,
+    );
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        plans: files.plansFile,
+        run: true,
+        environment: 'staging',
+      },
+      deps,
+    );
+    expect(
+      bodies.filter(call => call.url.includes('/runs')).map(call => call.body.environment),
+    ).toEqual(['staging', 'staging', 'staging']);
+  });
+
+  it('--env without --run is a usage error with zero network', async () => {
+    const files = fixtures();
+    let calls = 0;
+    const deps = {
+      credentialsPath: files.credentialsPath,
+      fetchImpl: (async () => {
+        calls++;
+        throw new Error('unexpected network');
+      }) as typeof globalThis.fetch,
+      stdout: () => {},
+      stderr: () => {},
+    };
+    for (const invoke of [
+      () =>
+        runCreate(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            projectId: 'project_1',
+            type: 'frontend',
+            name: 'example',
+            codeFile: files.codeFile,
+            environment: 'staging',
+          },
+          deps,
+        ),
+      () =>
+        runCreateFromPlan(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            planFrom: files.planFile,
+            environment: 'staging',
+          },
+          deps,
+        ),
+      () =>
+        runCreateBatch(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            plans: files.plansFile,
+            environment: 'staging',
+          },
+          deps,
+        ),
+    ]) {
+      const err = await invoke().catch(e => e);
+      expect(err).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+      expect(err.nextAction).toContain('--env requires --run');
+    }
+    expect(calls).toBe(0);
+  });
+
+  it('command flags pass --env through each create chain', async () => {
+    const files = fixtures();
+    const environments: unknown[] = [];
+    const stderr: string[] = [];
+    const fetchImpl = (async (
+      input: Parameters<typeof globalThis.fetch>[0],
+      init: RequestInit = {},
+    ) => {
+      const url = String(input);
+      if (url.includes('/runs') && init.method === 'POST') {
+        environments.push(JSON.parse(String(init.body)).environment);
+      }
+      let response: unknown;
+      if (url.endsWith('/tests/batch'))
+        response = {
+          results: [{ specIndex: 0, status: 'created', testId: 'test_batch' }],
+          summary: { total: 1, created: 1, failed: 0 },
+        };
+      else if (url.endsWith('/tests'))
+        response = {
+          testId: 'test_created',
+          type: 'frontend',
+          codeVersion: 'v1',
+          createdAt: '2026-09-22T00:00:00Z',
+        };
+      else if (url.includes('/runs'))
+        response = {
+          runId: 'run_created',
+          status: 'queued',
+          enqueuedAt: '2026-09-22T00:00:00Z',
+          codeVersion: 'v1',
+          targetUrl: 'https://example.com',
+        };
+      else response = { items: [], nextToken: null };
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof globalThis.fetch;
+    const deps = {
+      credentialsPath: files.credentialsPath,
+      fetchImpl,
+      stdout: () => {},
+      stderr: (line: string) => stderr.push(line),
+    };
+    for (const args of [
+      [
+        'create',
+        '--project',
+        'project_1',
+        '--type',
+        'frontend',
+        '--name',
+        'example',
+        '--code-file',
+        files.codeFile,
+        '--run',
+        '--env',
+        'staging',
+      ],
+      ['create', '--plan-from', files.planFile, '--run', '--env', 'staging'],
+      ['create-batch', '--plans', files.plansFile, '--run', '--env', 'staging'],
+      ['create-batch', '--plan-from-dir', files.planDir, '--run', '--env', 'staging'],
+    ]) {
+      const command = createTestCommand(deps);
+      await expect(command.parseAsync(args, { from: 'user' })).resolves.toBe(command);
+    }
+    expect(environments).toEqual(['staging', 'staging', 'staging', 'staging']);
+    expect(stderr.filter(line => line === 'batch-run summary: 1/1 triggered')).toHaveLength(2);
   });
 });

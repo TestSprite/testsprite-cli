@@ -1,5 +1,5 @@
 /**
- * Local e2e for `test plan generate` / `test plan accept` (DEV-384 V3-B).
+ * Local e2e for `test plan generate` / `test plan accept`.
  *
  * Runs the REAL built binary (`dist/index.js`) under `--dry-run`: no network,
  * no credentials, zero charges — the dry-run client factory substitutes the
@@ -33,8 +33,8 @@ interface CliResult {
 }
 
 function runCli(args: string[], cwd?: string): CliResult {
-  // TESTSPRITE_PROJECT_ID is stripped for determinism: since F5 the plan
-  // leaves fall back to it, so a host/CI machine exporting it would flip
+  // TESTSPRITE_PROJECT_ID is stripped for determinism: the plan leaves fall
+  // back to it, so a host/CI machine exporting it would flip
   // the missing-project test (same hardening as test.plan.spec.ts).
   const env: NodeJS.ProcessEnv = { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' };
   delete env.TESTSPRITE_PROJECT_ID;
@@ -111,7 +111,7 @@ describe('test plan generate --dry-run (dist)', () => {
 });
 
 describe('test plan accept --dry-run (dist)', () => {
-  it('accept-all: exit 0, server truth + discard count (no derived split — F10)', () => {
+  it('accept-all: exit 0, server truth + discard count (no derived split)', () => {
     const result = runCli([
       '--dry-run',
       'test',
@@ -125,7 +125,7 @@ describe('test plan accept --dry-run (dist)', () => {
     expect(result.status).toBe(0);
     const body = JSON.parse(result.stdout) as Record<string, number>;
     expect(body.acceptedCount).toBe(2);
-    // The FE/API split was dropped (F10 — proposal type is project-derived).
+    // The FE/API split was dropped — proposal type is project-derived.
     expect(body.frontendCount).toBeUndefined();
     expect(body.backendCount).toBeUndefined();
     expect(body.discardedCount).toBe(0);
@@ -144,7 +144,7 @@ describe('test plan accept --dry-run (dist)', () => {
     ]);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('1 proposal accepted — 1 test case created');
-    expect(result.stdout).not.toContain('frontend,'); // split dropped (F10)
+    expect(result.stdout).not.toContain('frontend,'); // split dropped (type is project-derived)
     expect(result.stdout).toContain('(1 remaining proposal discarded)');
     expect(result.stdout).toContain('API test code is generated when the tests first run');
   });
@@ -179,7 +179,7 @@ describe('test plan --help surface (dist)', () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('Workspace credits are spent per stage that runs');
     expect(result.stdout).toContain('the result line reports');
-    expect(result.stdout).toContain('what THIS run charged'); // F1 delta semantics
+    expect(result.stdout).toContain('what THIS run charged'); // this-run delta, not the balance
     expect(result.stdout).toContain('`testsprite usage` shows your balance');
   });
 });

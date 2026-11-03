@@ -12,6 +12,7 @@ describe('createTicker — non-TTY (CI mode)', () => {
       () => {},
       false, // isTTY = false
       text => raw.push(text),
+      false, // noColor: explicit so NO_COLOR in the environment cannot flip the mode
     );
     ticker.update('some progress');
     expect(raw).toEqual([]);
@@ -23,6 +24,7 @@ describe('createTicker — non-TTY (CI mode)', () => {
       () => {},
       false,
       text => raw.push(text),
+      false, // noColor: explicit so NO_COLOR in the environment cannot flip the mode
     );
     ticker.finalize('done');
     expect(raw).toEqual([]);
@@ -34,6 +36,7 @@ describe('createTicker — non-TTY (CI mode)', () => {
       () => {},
       false,
       text => raw.push(text),
+      false, // noColor: explicit so NO_COLOR in the environment cannot flip the mode
     );
     ticker.finalize();
     expect(raw).toEqual([]);
@@ -80,6 +83,7 @@ describe('createTicker — TTY mode', () => {
       () => {},
       true, // isTTY = true
       text => raw.push(text),
+      false, // noColor: explicit so NO_COLOR in the environment cannot flip the mode
     );
     ticker.update('Run run_abc — running (3/8 steps elapsed=12s)');
     expect(raw).toHaveLength(1);
@@ -94,6 +98,7 @@ describe('createTicker — TTY mode', () => {
       () => {},
       true,
       text => raw.push(text),
+      false, // noColor: explicit so NO_COLOR in the environment cannot flip the mode
     );
     ticker.update('first tick');
     ticker.update('second tick');
@@ -110,6 +115,7 @@ describe('createTicker — TTY mode', () => {
       () => {},
       true,
       text => raw.push(text),
+      false, // noColor: explicit so NO_COLOR in the environment cannot flip the mode
     );
     ticker.update('working');
     ticker.finalize('done — passed');
@@ -125,6 +131,7 @@ describe('createTicker — TTY mode', () => {
       () => {},
       true,
       text => raw.push(text),
+      false, // noColor: explicit so NO_COLOR in the environment cannot flip the mode
     );
     ticker.update('progress');
     ticker.finalize();
@@ -138,6 +145,7 @@ describe('createTicker — TTY mode', () => {
       () => {},
       true,
       text => raw.push(text),
+      false, // noColor: explicit so NO_COLOR in the environment cannot flip the mode
     );
     // No update calls
     ticker.finalize();
@@ -151,6 +159,7 @@ describe('createTicker — TTY mode', () => {
       () => {},
       true,
       text => raw.push(text),
+      false, // noColor: explicit so NO_COLOR in the environment cannot flip the mode
     );
     ticker.update('x');
     const lengthAfterUpdate = raw.length;
@@ -160,22 +169,21 @@ describe('createTicker — TTY mode', () => {
     expect(raw[raw.length - 1]).toBe('\n');
   });
 
-  it('multiple finalize calls only move to fresh line once (idempotent-ish)', () => {
+  it('a second finalize() emits nothing: the live line is already closed', () => {
     const raw: string[] = [];
     const ticker = createTicker(
       () => {},
       true,
       text => raw.push(text),
+      false, // noColor: explicit so NO_COLOR in the environment cannot flip the mode
     );
     ticker.update('something');
     ticker.finalize();
-    const lenAfterFirst = raw.length;
-    // Second finalize: lastLength is 0 after first finalize? Let's check behavior.
-    // After finalize(), a newline was appended — but lastLength stays non-zero in impl
-    // Actually the spec doesn't guarantee idempotency, we just verify no crash.
-    expect(() => ticker.finalize()).not.toThrow();
-    // The raw array may grow but should not crash.
-    expect(raw.length).toBeGreaterThanOrEqual(lenAfterFirst);
+    // The failed-stage branch and the catch-all can both finalize; only the
+    // first may move to a fresh line, or the output gains a stray blank line.
+    ticker.finalize();
+    expect(raw.filter(text => text === '\n')).toHaveLength(1);
+    expect(raw).toHaveLength(2);
   });
 });
 
@@ -350,6 +358,7 @@ describe('createTicker — stderrWrite dependency injection', () => {
       line => stderrLines.push(line),
       true,
       text => raw.push(text),
+      false, // noColor: explicit so NO_COLOR in the environment cannot flip the mode
     );
     ticker.update('progress');
     // stderrWrite should not be called (rawWrite handles TTY in-place updates)
@@ -364,6 +373,7 @@ describe('createTicker — stderrWrite dependency injection', () => {
       line => stderrLines.push(line),
       true,
       () => {},
+      false, // noColor: explicit so NO_COLOR in the environment cannot flip the mode
     );
     expect(() => ticker.finalize('line')).not.toThrow();
   });
@@ -377,7 +387,8 @@ describe('createTicker — spy on process.stderr', () => {
       const ticker = createTicker(
         () => {},
         true, // force TTY
-        // No stderrRaw — should default to process.stderr.write
+        undefined, // no stderrRaw — should default to process.stderr.write
+        false, // noColor: explicit so NO_COLOR in the environment cannot flip the mode
       );
       ticker.update('test line');
       // The ticker prepends an ISO timestamp; verify the call happened and
@@ -486,5 +497,77 @@ describe('isNoColor', () => {
     expect(isNoColor({ OTHER_VAR: '1' })).toBe(false);
     // Per https://no-color.org/, an empty NO_COLOR does NOT disable color.
     expect(isNoColor({ NO_COLOR: '' })).toBe(false);
+  });
+});
+
+describe('createTicker — note() (standalone lines while the ticker is live)', () => {
+  it('TTY: clears the live line first, then writes the note on its own row through the raw writer', () => {
+    // One shared sink for BOTH writers so the byte order is what a terminal sees.
+    const bytes: string[] = [];
+    const stderrWrite = vi.fn((line: string) => bytes.push(`${line}\n`));
+    const rawWrite = vi.fn((text: string) => bytes.push(text));
+    const t = createTicker(stderrWrite, true, rawWrite, false);
+    t.update('exploring app… (resources 3/8, 4m10s)');
+    t.note('stage 1/3 exploration done 4m48s');
+    t.update('generating strategy… (10s)');
+    const stream = bytes.join('');
+    // The note must start at column 0 on a cleared row and end with \n; the
+    // next update redraws on the row below, never on the note's row.
+    const CLR = '\x1b[2K\r';
+    expect(stream.startsWith(CLR)).toBe(true);
+    expect(stream).toContain(
+      'exploring app… (resources 3/8, 4m10s)' + CLR + 'stage 1/3 exploration done 4m48s\n' + CLR,
+    );
+    expect(stream.endsWith('generating strategy… (10s)')).toBe(true);
+    expect(stderrWrite).not.toHaveBeenCalled();
+  });
+
+  it('TTY: with no live line yet, the note is written as is (no clear sequence)', () => {
+    const bytes: string[] = [];
+    const t = createTicker(
+      line => bytes.push(`${line}\n`),
+      true,
+      text => bytes.push(text),
+      false,
+    );
+    t.note('[hint] 2 stages: strategy, proposals.');
+    expect(bytes.join('')).toBe('[hint] 2 stages: strategy, proposals.\n');
+  });
+
+  it('TTY: finalize after a note does not emit a stray newline (the note already ended the row)', () => {
+    const bytes: string[] = [];
+    const t = createTicker(
+      line => bytes.push(`${line}\n`),
+      true,
+      text => bytes.push(text),
+      false,
+    );
+    t.update('working…');
+    t.note('stage 1/1 proposals done 8s');
+    t.finalize();
+    expect(bytes.join('')).toMatch(/done 8s\n$/);
+  });
+
+  it('non-TTY: the note goes to the line writer unchanged', () => {
+    const stderrWrite = vi.fn();
+    const rawWrite = vi.fn();
+    const t = createTicker(stderrWrite, false, rawWrite, false);
+    t.update('ignored');
+    t.note('[warn] something');
+    expect(stderrWrite).toHaveBeenCalledTimes(1);
+    expect(stderrWrite).toHaveBeenCalledWith('[warn] something');
+    expect(rawWrite).not.toHaveBeenCalled();
+  });
+
+  it('NO_COLOR: the note is its own line; no ANSI sequences anywhere', () => {
+    const lines: string[] = [];
+    const rawWrite = vi.fn();
+    const t = createTicker(line => lines.push(line), true, rawWrite, true);
+    t.update('exploring…');
+    t.note('stage 1/3 exploration done 4m48s');
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toBe('stage 1/3 exploration done 4m48s');
+    expect(rawWrite).not.toHaveBeenCalled();
+    expect(lines.join('')).not.toContain('\x1b');
   });
 });

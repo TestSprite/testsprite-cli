@@ -6,12 +6,14 @@ import {
   parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
-import { ApiError } from '../lib/errors.js';
+import { resolveProfileName } from '../lib/config.js';
+import { ApiError, InterruptError } from '../lib/errors.js';
 import type { FetchImpl, HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { formatScheduleFrequencyAdvisory, runsPerMonth } from '../lib/cron.js';
 import { renderTextTable, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
+import { historyRetentionNote, type HistoryRetentionMeta } from '../lib/history-retention.js';
 
 /** A schedule as returned by the API. */
 export interface CliSchedule {
@@ -21,6 +23,8 @@ export interface CliSchedule {
   targetType: 'project' | 'testList';
   /** Project id when `targetType` is `project`, else the test-list id. */
   targetId: string | null;
+  environment?: string | null;
+  environmentMode?: 'inherit' | 'pinned' | null;
   cron: string | null;
   timezone: string | null;
   startAt: string | null;
@@ -63,6 +67,7 @@ export interface CreateOptions extends CommonOptions {
   name?: string;
   targetType?: string;
   targetId?: string;
+  env?: string;
   cron?: string;
   timezone?: string;
   start?: string;
@@ -75,6 +80,7 @@ interface CreateScheduleRequest {
   name: string;
   targetType: 'project' | 'testList';
   targetId: string;
+  environment?: string;
   cron: string;
   timezone?: string;
   startAt?: string;
@@ -93,11 +99,20 @@ export interface CliCreateScheduleResponse {
    * this side knows how often the cron fires; neither knows both.
    */
   estimatedCreditsPerRun?: number | null;
+  /**
+   * Echoed back by a server that understands schedule environments — absent
+   * entirely on one that doesn't. That absence (not a falsy value) is what
+   * `runCreate` uses to detect an old server and refuse instead of confirming
+   * a pin that was never applied.
+   */
+  environment?: string | null;
+  environmentMode?: 'inherit' | 'pinned' | null;
 }
 
 export interface UpdateOptions extends CommonOptions {
   scheduleId: string;
   name?: string;
+  env?: string;
   cron?: string;
   timezone?: string;
   start?: string;
@@ -110,6 +125,7 @@ export interface UpdateOptions extends CommonOptions {
 
 interface UpdateScheduleRequest {
   name?: string;
+  environment?: string;
   enabled?: boolean;
   cron?: string;
   timezone?: string;
@@ -155,6 +171,7 @@ export interface CliScheduleRun {
 /** `GET /schedules/{id}/runs` response. Not paginated. */
 interface ScheduleRunListResponse {
   runs: CliScheduleRun[];
+  meta?: HistoryRetentionMeta;
 }
 
 // ---------------------------------------------------------------------------
@@ -224,11 +241,21 @@ export async function runCreate(
 
   const targetType = opts.targetType as 'project' | 'testList';
   const cron = opts.cron.trim();
+  const environment = normalizeScheduleEnvironmentName(opts.env);
+  if (targetType === 'testList' && environment !== undefined) {
+    throw environmentValidationError(
+      'not_supported_for_target',
+      `Test-list schedules inherit their list's environment bindings. ` +
+        `Use testsprite testlist update ${opts.targetId} ` +
+        '--project-env <projectId>:<environmentName> instead.',
+    );
+  }
 
   const body: CreateScheduleRequest = {
     name: opts.name,
     targetType,
     targetId: opts.targetId,
+    ...(environment !== undefined ? { environment } : {}),
     cron,
     ...(opts.timezone !== undefined ? { timezone: opts.timezone } : {}),
     ...(opts.start !== undefined ? { startAt: opts.start } : {}),
@@ -247,9 +274,15 @@ export async function runCreate(
   if (opts.dryRun) {
     emitDryRunBanner(stderr);
     // Carries a cost figure so the advisory below is exercised offline too.
+    // There is no real server round trip to confirm here, so the mode is
+    // synthesized straight from the flags being previewed, same as a
+    // compliant server would echo back.
     const sample: CliCreateScheduleResponse = {
       scheduleId: 'sch_dryrun_2026',
       estimatedCreditsPerRun: 5,
+      ...(targetType === 'project'
+        ? { environment: environment ?? null, environmentMode: environment ? 'pinned' : 'inherit' }
+        : {}),
     };
     emitCostAdvisory(sample, cron, stderr);
     out.print(sample, data => renderCreateScheduleText(data as CliCreateScheduleResponse));
@@ -257,15 +290,57 @@ export async function runCreate(
   }
 
   const client = makeClient(opts, deps);
+  if (environment !== undefined) {
+    await checkScheduleEnvironmentSupport(client);
+  }
   const created = await client.post<CliCreateScheduleResponse>('/schedules', {
     body,
     headers: { 'idempotency-key': idempotencyKey },
   });
 
+  if (targetType === 'project' && environment !== undefined) {
+    await confirmCreateEnvironmentPin(created, environment, client);
+  }
+
   emitCostAdvisory(created, cron, stderr);
 
   out.print(created, data => renderCreateScheduleText(data as CliCreateScheduleResponse));
   return created;
+}
+
+/**
+ * `--env` on create asks the server to pin the new schedule. An old server
+ * without this feature drops the field silently and echoes back a schedule
+ * with no environment mode at all — printing a confirmation on top of that
+ * would claim a pin that was never applied. Instead, best-effort undo the
+ * create (this command's own write, seconds old) and refuse.
+ */
+async function confirmCreateEnvironmentPin(
+  created: CliCreateScheduleResponse,
+  environment: string,
+  client: HttpClient,
+): Promise<void> {
+  if (created.environmentMode === 'pinned' && created.environment === environment) return;
+
+  let rolledBack = false;
+  try {
+    await client.delete(`/schedules/${encodeURIComponent(created.scheduleId)}`, {
+      headers: { 'idempotency-key': `cli-sched-create-rollback-${randomUUID()}` },
+    });
+    rolledBack = true;
+  } catch (err) {
+    if (err instanceof InterruptError) throw err;
+  }
+
+  throw unsupportedEnvironmentError(
+    rolledBack
+      ? `Schedule ${created.scheduleId} was created and then removed because this server did ` +
+          'not apply the requested environment.'
+      : `Schedule ${created.scheduleId} was created without a confirmed environment pin, and ` +
+          'the CLI could not remove it; remove it with: ' +
+          `testsprite schedule delete ${created.scheduleId} --confirm`,
+    { scheduleId: created.scheduleId, rolledBack },
+  );
 }
 
 /**
@@ -318,9 +393,11 @@ export async function runUpdate(
   if (opts.pause && opts.resume) {
     throw localValidationError('--pause and --resume cannot be combined');
   }
+  const environment = normalizeScheduleEnvironmentName(opts.env);
 
   const body: UpdateScheduleRequest = {
     ...(opts.name !== undefined ? { name: opts.name } : {}),
+    ...(environment !== undefined ? { environment } : {}),
     ...(opts.cron !== undefined ? { cron: opts.cron } : {}),
     ...(opts.timezone !== undefined ? { timezone: opts.timezone } : {}),
     ...(opts.start !== undefined ? { startAt: opts.start } : {}),
@@ -348,10 +425,35 @@ export async function runUpdate(
   }
 
   const client = makeClient(opts, deps);
+  if (environment !== undefined && !opts.dryRun) {
+    await checkScheduleEnvironmentSupport(client, opts.scheduleId);
+  }
   const updated = await client.patch<CliSchedule>(
     `/schedules/${encodeURIComponent(opts.scheduleId)}`,
     { body, headers: { 'idempotency-key': idempotencyKey } },
   );
+
+  // `--env` on update pins an existing schedule. An old server drops the
+  // field silently and echoes back no environment mode; unlike create there
+  // is nothing to roll back (the schedule pre-existed this command), so this
+  // just refuses rather than confirming a pin that was never applied. Other
+  // fields in the same request may still have gone through.
+  if (
+    environment !== undefined &&
+    !(updated.environmentMode === 'pinned' && updated.environment === environment)
+  ) {
+    throw unsupportedEnvironmentError(
+      `The server updated schedule ${updated.scheduleId} without confirming the environment ` +
+        `pin. Other requested fields (${
+          Object.keys(body)
+            .filter(key => key !== 'environment')
+            .join(', ') || 'none'
+        }) ` +
+        'may have been applied; inspect it with: ' +
+        `testsprite schedule get ${updated.scheduleId}`,
+      { scheduleId: updated.scheduleId, requestedFields: Object.keys(body) },
+    );
+  }
 
   out.print(updated, data => renderScheduleText(data as CliSchedule));
   return updated;
@@ -376,10 +478,9 @@ export async function runDelete(
         code: 'VALIDATION_ERROR',
         message: 'Refusing to delete without --confirm.',
         nextAction:
-          'This removes the schedule and its run history, and stops it firing (no ' +
-          'restore window — recreating it starts a fresh schedule). The CLI convention ' +
-          'is explicit confirmation for destructive operations. Re-run with --confirm. ' +
-          '(--dry-run also works without --confirm.)',
+          'This removes the schedule and stops it firing; past runs are kept but no longer ' +
+          'listed under it (no restore window). Re-run with --confirm ' +
+          '(--dry-run also works without it).',
         requestId: 'local',
         details: { field: 'confirm', reason: 'required for destructive operation' },
       },
@@ -416,10 +517,15 @@ export async function runRunList(
     `/schedules/${encodeURIComponent(opts.scheduleId)}/runs`,
   );
   const runs = response.runs ?? [];
-  out.print({ runs }, () =>
+  const outputResponse = { ...response, runs };
+  out.print(outputResponse, () =>
     renderRunListText(runs, { columns: opts.columns, noHeader: opts.noHeader }),
   );
-  return { runs };
+  if (opts.output === 'text') {
+    const note = historyRetentionNote(response.meta, client.resolvedBaseUrl);
+    if (note) (deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`)))(note);
+  }
+  return outputResponse;
 }
 
 // ---------------------------------------------------------------------------
@@ -459,7 +565,16 @@ const SCHEDULE_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliSchedule>> = [
     width: rows => Math.max(2, ...rows.map(s => (s.timezone ?? '').length)),
     render: s => s.timezone ?? '',
   },
-  { header: 'LAST RUN', width: 0, render: s => s.lastRunId ?? '' },
+  {
+    header: 'LAST RUN',
+    width: rows => Math.max(8, ...rows.map(s => (s.lastRunId ?? '').length)),
+    render: s => s.lastRunId ?? '',
+  },
+  {
+    header: 'ENVIRONMENT',
+    width: rows => Math.max(11, ...rows.map(s => scheduleEnvironmentText(s).length)),
+    render: scheduleEnvironmentText,
+  },
 ];
 
 function renderScheduleListText(
@@ -490,11 +605,118 @@ function renderScheduleText(s: CliSchedule): string {
     `updatedAt:  ${s.updatedAt}`,
   ];
   if (s.autoPausedAt) lines.push(`autoPaused: ${s.autoPausedAt}`);
+  if (s.environmentMode !== undefined) {
+    lines.push(`environment: ${scheduleEnvironmentText(s)}`);
+  }
   return lines.join('\n');
 }
 
+/**
+ * Renders the environment/mode strictly from the server's response — never
+ * from what the command asked for. When the response omits `environmentMode`
+ * altogether (an old server that has never heard of schedule environments),
+ * this stays silent about it, matching the confirmation text from before the
+ * feature existed rather than fabricating a claim the server never made.
+ * (A request that explicitly asked to pin and got no confirmation never
+ * reaches this renderer — `confirmCreateEnvironmentPin` refuses first.)
+ */
 function renderCreateScheduleText(r: CliCreateScheduleResponse): string {
-  return `id: ${r.scheduleId}`;
+  if (r.environmentMode === undefined) return `id: ${r.scheduleId}`;
+  return `id: ${r.scheduleId}\nenvironment: ${scheduleEnvironmentText(r)}`;
+}
+
+interface ScheduleEnvironmentFields {
+  environment?: string | null;
+  environmentMode?: 'inherit' | 'pinned' | null;
+}
+
+function scheduleEnvironmentText(schedule: ScheduleEnvironmentFields): string {
+  if (schedule.environmentMode === 'inherit') return 'project default (inherits)';
+  if (schedule.environmentMode === 'pinned' && schedule.environment) {
+    return `${schedule.environment} (pinned)`;
+  }
+  return '-';
+}
+
+function normalizeScheduleEnvironmentName(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const name = raw.trim();
+  if (name.length === 0) {
+    throw environmentValidationError('blank_value', '--env must be a non-empty environment name');
+  }
+  return name;
+}
+
+/** A missing mode on a project schedule proves that the server predates pins. */
+async function checkScheduleEnvironmentSupport(
+  client: HttpClient,
+  scheduleId?: string,
+): Promise<void> {
+  let schedules: CliSchedule[];
+  try {
+    schedules =
+      scheduleId === undefined
+        ? ((await client.get<ScheduleListResponse>('/schedules', { retry: false })).schedules ?? [])
+        : [
+            await client.get<CliSchedule>(`/schedules/${encodeURIComponent(scheduleId)}`, {
+              retry: false,
+            }),
+          ];
+  } catch (err) {
+    if (err instanceof InterruptError) throw err;
+    // A write-scoped key may not read schedules. Keep response confirmation
+    // for inconclusive probes and for a server with no existing schedules.
+    return;
+  }
+  if (
+    schedules.some(
+      schedule => schedule.targetType === 'project' && schedule.environmentMode === undefined,
+    )
+  ) {
+    throw unsupportedEnvironmentError(
+      scheduleId === undefined
+        ? 'No schedule was created. Upgrade the server before using schedule --env.'
+        : `No schedule changes were sent. Upgrade the server before using schedule --env on ${scheduleId}.`,
+      {
+        ...(scheduleId !== undefined ? { scheduleId } : {}),
+        reason: 'schedule-environments-unsupported',
+      },
+    );
+  }
+}
+
+/**
+ * Local validation failures on `--env` — mirrors the field the API itself
+ * uses (`environment`, the wire name) rather than the flag name, so a caller
+ * inspecting `details.field` sees the same value whether the rejection was
+ * caught locally or came back from the server.
+ */
+function environmentValidationError(reason: string, nextAction: string): ApiError {
+  return ApiError.fromEnvelope({
+    error: {
+      code: 'VALIDATION_ERROR',
+      message: 'Invalid request.',
+      nextAction,
+      requestId: 'local',
+      details: { field: 'environment', reason },
+    },
+  });
+}
+
+/** Exit 7 — a server that doesn't (yet) support schedule environments. */
+function unsupportedEnvironmentError(
+  nextAction: string,
+  details: Record<string, unknown>,
+): ApiError {
+  return ApiError.fromEnvelope({
+    error: {
+      code: 'UNSUPPORTED',
+      message: 'This server does not support schedule environments yet.',
+      nextAction,
+      requestId: 'local',
+      details,
+    },
+  });
 }
 
 const RUN_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliScheduleRun>> = [
@@ -540,10 +762,15 @@ function localValidationError(message: string): ApiError {
 // ---------------------------------------------------------------------------
 
 export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
-  const schedule = new Command('schedule').description('Manage TestSprite schedules');
+  const schedule = new Command('schedule')
+    .summary('Manage schedules (V3 workspace)')
+    .description(
+      'Manage TestSprite schedules. Needs a V3 workspace and an API key with the read:schedules / write:schedules scopes.',
+    );
 
   schedule
     .command('list')
+    .summary('List schedules visible to the API key')
     .description(
       'List schedules visible to the API key\n' +
         '\nExit codes:\n' +
@@ -559,7 +786,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
     .action(async (cmdOpts: { columns?: string; header?: boolean }, command: Command) => {
       await runList(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           columns: cmdOpts.columns,
           noHeader: cmdOpts.header === false,
         },
@@ -569,6 +796,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
 
   schedule
     .command('get <schedule-id>')
+    .summary('Get a schedule by id')
     .description(
       'Get a schedule by id\n' +
         '\nExit codes:\n' +
@@ -581,20 +809,23 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (scheduleId: string, _cmdOpts: unknown, command: Command) => {
-      await runGet({ ...resolveCommonOptions(command), scheduleId }, deps);
+      await runGet({ ...resolveCommonOptions(command, deps.env), scheduleId }, deps);
     });
 
   schedule
     .command('create')
+    .summary('Create a schedule (starts enabled; runs spend credits)')
     .description(
-      'Create a schedule\n' +
+      'Create a schedule. It starts enabled and each run spends credits (an estimate is printed);\n' +
+        'pause it with `schedule update <id> --pause`.\n' +
         '\nExit codes:\n' +
         '  0  success\n' +
         '  3  auth error\n' +
         '  4  target not found\n' +
         '  5  validation error (e.g., missing --cron)\n' +
         '  6  idempotency conflict\n' +
-        '  7  schedules are not available on this account\n' +
+        '  7  schedules are not available on this account, or (with --env) the server does ' +
+        'not support schedule environments yet\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
         ' 13  not available on your plan, or the plan limit is reached',
     )
@@ -602,11 +833,14 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
     .option('--target-type <project|testList>', 'what to run (required)')
     .option('--target-id <id>', 'project id or test-list id (required)')
     .option(
+      '--env <name>',
+      "Pin this project schedule to an environment; omit to always use the project's default environment",
+    )
+    .option(
       '--cron <expr>',
-      'standard 5-field cron (minute hour day-of-month month day-of-week), ' +
-        'e.g. "0 3 * * *". Day-of-week is 0-7, with both 0 and 7 = Sunday. ' +
-        'Constrain ' +
-        'day-of-month or day-of-week, not both. (required)',
+      'standard 5-field cron (minute hour day-of-month month day-of-week), e.g. "0 3 * * *". ' +
+        'Day-of-week 0-7 (0 and 7 = Sunday). Constrain day-of-month or day-of-week, not both. ' +
+        'Numeric fields only (* n a-b */n, lists); no names, ?, L, W or #. (required)',
     )
     .option('--timezone <tz>', 'IANA timezone (default UTC)')
     .option('--start <iso>', 'ISO 8601 start instant (default: a few minutes from now)')
@@ -617,10 +851,11 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
     .action(async (cmdOpts: Record<string, string | undefined>, command: Command) => {
       await runCreate(
         {
-          ...resolveCommonOptions(command),
+          ...resolveCommonOptions(command, deps.env),
           name: cmdOpts.name,
           targetType: cmdOpts.targetType,
           targetId: cmdOpts.targetId,
+          env: cmdOpts.env,
           cron: cmdOpts.cron,
           timezone: cmdOpts.timezone,
           start: cmdOpts.start,
@@ -634,6 +869,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
 
   schedule
     .command('update <schedule-id>')
+    .summary('Update a schedule, or pause/resume it')
     .description(
       'Update a schedule, or pause/resume it\n' +
         '\nExit codes:\n' +
@@ -642,15 +878,20 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
         '  4  not found\n' +
         '  5  validation error (e.g., no fields given)\n' +
         '  6  idempotency conflict\n' +
-        '  7  schedules are not available on this account\n' +
+        '  7  schedules are not available on this account, or (with --env) the server does ' +
+        'not support schedule environments yet\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
         ' 13  not available on your plan',
     )
     .option('--name <name>', 'new schedule name')
     .option(
+      '--env <name>',
+      'Pin this project schedule to an environment; omit to leave the current pin unchanged',
+    )
+    .option(
       '--cron <expr>',
-      'new standard 5-field cron, as printed by `schedule get`. Day-of-week is ' +
-        '0-7, with both 0 and 7 = Sunday. Constrain day-of-month or day-of-week, not both.',
+      'new standard 5-field cron, as printed by `schedule get`. Day-of-week 0-7 (0 and 7 = Sunday). ' +
+        'Constrain day-of-month or day-of-week, not both. Numeric fields only (no names, ?, L, W or #).',
     )
     .option('--timezone <tz>', 'new IANA timezone')
     .option('--start <iso>', 'new ISO 8601 start instant')
@@ -668,9 +909,10 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
       ) => {
         await runUpdate(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             scheduleId,
             name: cmdOpts.name as string | undefined,
+            env: cmdOpts.env as string | undefined,
             cron: cmdOpts.cron as string | undefined,
             timezone: cmdOpts.timezone as string | undefined,
             start: cmdOpts.start as string | undefined,
@@ -687,8 +929,10 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
 
   schedule
     .command('delete <schedule-id>')
+    .summary('Delete a schedule (requires --confirm)')
     .description(
-      'Delete a schedule and its run history. Requires --confirm.\n' +
+      'Delete a schedule and stop it firing. Past runs are kept but no longer listed under it.\n' +
+        'Requires --confirm.\n' +
         '\nExit codes:\n' +
         '  0  success\n' +
         '  3  auth error\n' +
@@ -710,7 +954,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
       ) => {
         await runDelete(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             scheduleId,
             confirm: cmdOpts.confirm === true,
             idempotencyKey: cmdOpts.idempotencyKey,
@@ -724,8 +968,10 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
 
   run
     .command('list <schedule-id>')
+    .summary("List a schedule's most recent runs")
     .description(
-      "List a schedule's past runs\n" +
+      "List a schedule's most recent runs (up to 100, within your plan's history window;\n" +
+        'JSON `meta.hiddenCount` shows how many are hidden)\n' +
         '\nExit codes:\n' +
         '  0  success\n' +
         '  3  auth error\n' +
@@ -745,7 +991,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
       ) => {
         await runRunList(
           {
-            ...resolveCommonOptions(command),
+            ...resolveCommonOptions(command, deps.env),
             scheduleId,
             columns: cmdOpts.columns,
             noHeader: cmdOpts.header === false,
@@ -762,12 +1008,12 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
   return {
-    profile: globals.profile ?? 'default',
+    profile: resolveProfileName(globals.profile, env),
     output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,

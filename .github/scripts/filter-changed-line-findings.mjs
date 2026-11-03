@@ -2,14 +2,11 @@
  * Fail the security lint only on ERROR-severity findings that land on lines
  * THIS change actually added or modified.
  *
- * This is the "changed-line" half of the gate. The other half — the
- * committed `eslint-suppressions.security.json` baseline — has already removed the
- * pre-existing backlog from the ESLint report before it reaches this script,
- * so what remains is genuinely new/excess findings; this step additionally
- * narrows them to the diff's own lines so a large legacy file (e.g.
- * `src/commands/test.ts`) does not fail a release just for being touched.
+ * This filter receives the raw ESLint report, including legacy findings.
+ * It narrows errors to the diff's own added lines so touching a large legacy
+ * file (e.g. `src/commands/test.ts`) does not fail on untouched code.
  *
- * Input:  argv[2] = path to an ESLint JSON report (already baseline-filtered)
+ * Input:  argv[2] = path to a raw ESLint JSON report
  *         env RESOLVED_BASE = base commit to diff against ('' = no base)
  *         env HEAD_SHA      = head commit (default 'HEAD')
  * Exit:   1 if any error finding falls on an added/changed line, else 0.
@@ -76,18 +73,14 @@ for (const result of report) {
 
 if (offenders.length > 0) {
   console.error(
-    `Security lint: ${offenders.length} finding(s) on lines this change added/modified ` +
-      `(and not in eslint-suppressions.security.json):\n`,
+    `Security lint: ${offenders.length} finding(s) on lines this change added/modified:\n`,
   );
   for (const o of offenders) console.error(`  ${o}`);
   console.error(
     '\nFix them, or if the call is genuinely safe, disable the specific rule at that line ' +
-      'with a justification comment. Do NOT regenerate the baseline to hide new findings.',
+      'with a justification comment.',
   );
   process.exit(1);
 }
 
-console.log(
-  'Security lint: no new findings on changed lines. ' +
-    '(The pre-existing backlog is baselined in eslint-suppressions.security.json.)',
-);
+console.log('Security lint: no error findings on changed lines.');

@@ -264,6 +264,23 @@ describe('LIST_RUNS_RESPONSE_SCHEMA', () => {
     failureKind: null,
   };
 
+  it('accepts optional plan metadata including unlimited retention and preserves it', () => {
+    const meta = {
+      testKind: 'frontend',
+      tier: 'Pro',
+      retentionDays: null,
+      hiddenCount: 0,
+      billingUrl: 'https://portal.example/dashboard-v3/o/org-1/settings/billing',
+    };
+    const parsed = v.safeParse(LIST_RUNS_RESPONSE_SCHEMA, {
+      runs: [HISTORY_ROW],
+      nextCursor: null,
+      meta,
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.output.meta).toEqual(meta);
+  });
+
   it('accepts a history row with codeVersion: null (pre-M3.2 rows, tests with no code body)', () => {
     const parsed = v.safeParse(LIST_RUNS_RESPONSE_SCHEMA, {
       runs: [{ ...HISTORY_ROW, codeVersion: null }],
@@ -365,6 +382,66 @@ describe('BATCH_RERUN_RESPONSE_SCHEMA — advisories (optional additive field)',
   });
 });
 
+describe('BATCH_RERUN_RESPONSE_SCHEMA — conflicts without a currentRunId', () => {
+  // A refusal that never started a run has no id to report. Requiring one
+  // failed the whole command, including the runs it had already dispatched.
+  it('accepts a conflict entry carrying no currentRunId', () => {
+    const parsed = v.safeParse(BATCH_RERUN_RESPONSE_SCHEMA, {
+      ...VALID_BATCH_RERUN,
+      conflicts: [{ testId: 'test_2' }],
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('accepts and preserves a no_producer conflict with its reason and message', () => {
+    const parsed = v.safeParse(BATCH_RERUN_RESPONSE_SCHEMA, {
+      ...VALID_BATCH_RERUN,
+      conflicts: [
+        {
+          testId: 'test_2',
+          reason: 'no_producer',
+          message: 'Missing upstream variable(s): "project_id" (no producer declared)',
+        },
+      ],
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.output.conflicts[0]?.currentRunId).toBeUndefined();
+      expect(parsed.output.conflicts[0]?.reason).toBe('no_producer');
+      expect(parsed.output.conflicts[0]?.message).toContain('no producer declared');
+    }
+  });
+
+  it('still accepts an in-flight conflict that DOES carry currentRunId', () => {
+    const parsed = v.safeParse(BATCH_RERUN_RESPONSE_SCHEMA, {
+      ...VALID_BATCH_RERUN,
+      conflicts: [{ testId: 'test_2', currentRunId: 'run_9', reason: 'in_flight' }],
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.output.conflicts[0]?.currentRunId).toBe('run_9');
+    }
+  });
+
+  // The three run-shaped responses answer the same question, so a client that
+  // handles one conflict entry should handle all three.
+  it('matches the fresh-run and test-list schemas, which already allowed this', () => {
+    const bare = { testId: 'test_2' };
+    expect(
+      v.safeParse(BATCH_RUN_FRESH_RESPONSE_SCHEMA, {
+        accepted: [],
+        conflicts: [bare],
+        deferred: [],
+        skippedFrontend: [],
+        skippedIntegration: [],
+      }).success,
+    ).toBe(true);
+    expect(
+      v.safeParse(BATCH_RERUN_RESPONSE_SCHEMA, { ...VALID_BATCH_RERUN, conflicts: [bare] }).success,
+    ).toBe(true);
+  });
+});
+
 describe('ME_IDENTITY_SCHEMA', () => {
   it('accepts a bare identity core with no org fields (older backend)', () => {
     const parsed = v.safeParse(ME_IDENTITY_SCHEMA, { userId: 'u_1', keyId: 'k_1' });
@@ -450,7 +527,7 @@ describe('BATCH_RUN_FRESH_RESPONSE_SCHEMA — project-level dashboardUrl contrac
   });
 });
 
-describe('DEV-1303 environment stamp — optional on every run-shaped payload', () => {
+describe('environment stamp — optional on every run-shaped payload', () => {
   const HISTORY_ROW_BASE = {
     runId: 'run_1',
     status: 'passed',

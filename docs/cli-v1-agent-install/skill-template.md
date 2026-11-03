@@ -27,8 +27,8 @@ project's TestSprite suite; before writing a new one, check `testsprite test lis
 for an existing test that already covers the behavior and extend it instead of
 duplicating.
 
-For a deployed change, wait until the deployment contains it and use its public
-`--target-url`. For a local-only change, use
+For a deployed change, wait until the deployment contains it, create a named
+environment for the public URL once, then select it with `--env <name>`. For a local-only change, use
 `testsprite test run <test-id> --local <port>` (frontend only; loopback hosts only).
 The CLI does not build or host the app. Honor the user's explicit tool choice.
 Local tunnels use `wss://control.tun.testsprite.com/ws` for their TLS control
@@ -42,8 +42,8 @@ re-signs TLS, export your organisation's root CA to a PEM file and set
 connects and TLS handshakes time out after 10 seconds. The first failed attempt
 starts a 60-second retry episode. A `TunnelHello` write does not reset it; the
 first inbound tunnel stream or 5 seconds of post-hello socket stability does.
-The deadline destroys an in-flight attempt. Exhaustion cancels and refunds an
-owned run and exits 10, while `tunnel start` exits 10. Only a server that
+The deadline destroys an in-flight attempt. Exhaustion requests cancellation
+of an owned run and exits 10, while `tunnel start` exits 10. Only a server that
 advertises no TLS endpoint uses legacy plaintext port 7400, with a one-time
 warning and the same retry rules. `tunnel start` reports `transport: tls|plaintext`.
 
@@ -107,7 +107,7 @@ If no project exists for an app running only locally, bootstrap a frontend proje
 ```bash
 testsprite project create --type frontend --name "<repo name>" --local <port>
 testsprite test create --plan-from plan.json --project <projectId>
-testsprite test run <test-id> --local <port> --output json
+testsprite test run <id> <id> --local <port> --output json
 ```
 
 Keep the app listening. `--local-host` accepts `localhost`, `127.0.0.1` (default),
@@ -115,8 +115,8 @@ or `::1`; the port probe fails with exit 5 if nothing listens (`--skip-preflight
 bypasses it). Local projects skip exploration: `test plan generate` is refused
 before charge (exit 6), so use `test create --plan-from` without `--run`, then
 `test run --local`. V2-only local-project creation is unsupported (exit 7).
-Portal runs are blocked for free until `project update <id> --url https://…`
-sets a public URL. Keep the existing `--url` / `--target-url` flow for deployed apps.
+The Portal shows local environments without a Run action. Select a deployed
+environment with `--env <name>` for a public app.
 
 ## 3. Decide what to test
 
@@ -170,8 +170,8 @@ language; you don't write browser code.
   agent what to verify; "date range" tells it nothing.
 - `description` — the condition + expected outcome in one sentence; disambiguates
   a short name.
-- `priority` — `p0` (must-pass) / `p1` (important paths) / `p2` (edge) / `p3`
-  (cosmetic). Pick honestly.
+- `priority` — `p0`/`high` (must-pass), `p1`/`medium` (important paths),
+  `p2`/`low` (edge); `p3` is treated as low. Pick honestly.
 - `planSteps` — `Array<{ type: 'action' | 'assertion', description: string }>`,
   max 200 steps / 256 KB. Describe user intent, not selectors.
 
@@ -252,72 +252,80 @@ Batch is **FE-only.** For 3 backend tests, run `test create --type backend
 
 ## 4. Run
 
-For a deployed target, use `--target-url <env-url> --wait --timeout 600` after
-that deployment contains the change. For a change running only on this machine,
+For a deployed target, create its environment once, then use `--env <name>`
+after deployment. Omit it for Default; unknown names fail with available names
+and never fall back. For a change running only on this machine,
 use `testsprite test run <test-id> --local <port>` (frontend only); it implies
 waiting and defaults to 1200 seconds. Create a missing test from a plan first,
 without `--run`, then run its id with `--local`.
 
 ```bash
+# One-time setup for a deployed target
+testsprite project env create <projectId> --name staging --url https://staging.example.com
+
 # (a) existing test
-testsprite test run <test-id> --target-url <env-url> --wait --timeout 600 --output json
-# (a-env) same, logging in with a named project environment's test account (see `project env list`)
-testsprite test run <test-id> --env <env-name> --wait --timeout 600 --output json
+testsprite test run <test-id> --env staging --wait --timeout 600 --output json
 
 # (b-FE) new FE test from plan
-testsprite test create --plan-from plan.json --run --wait --target-url <env-url> --timeout 600
+testsprite test create --plan-from plan.json --run --wait --env staging --timeout 600
 
 # (b-BE) new BE test from Python (backend create needs --project)
-testsprite test create --type backend --name "..." --project <projectId> --code-file foo.py --run --wait --target-url <env-url> --timeout 600
+testsprite test create --type backend --name "..." --project <projectId> --code-file foo.py --run --wait --timeout 600
 
 # (c) FE coverage set — create without --run, then trigger each created test
 testsprite test create-batch --plans plans.jsonl --output json   # prints the created test ids
-# then trigger each id: testsprite test run <test-id> --wait --target-url <env-url> --timeout 600
+# then trigger each id: testsprite test run <test-id> --env staging --wait --timeout 600
 
 # (d-FE) refine + re-run
 testsprite test plan put <test-id> --steps refined.json && \
-testsprite test run <test-id> --target-url <env-url> --wait --timeout 600
+testsprite test run <test-id> --env staging --wait --timeout 600
 ```
 
 Key behaviors:
 
-- `--target-url` must be an allowed project/environment URL. The CLI rejects
-  `localhost` / RFC1918 / link-local there. If the feature is only running
-  locally, use `--local <port>` instead of `--target-url` (frontend tests
-  only; needs `run:tunnel` — keys minted before that scope existed need to be
-  replaced, and the CLI names the missing scope with exit 3) — don't skip the run over this.
+- Environment `--url` takes a public http/https URL or a loopback http origin
+  with an explicit port (frontend only; it runs through an automatic tunnel,
+  like `--local <port>`); private and link-local addresses are refused.
+  Existing API keys work. `--env <name> --local <port>` sends
+  that environment's sign-in to your local app; the server applies it or refuses
+  before dispatch.
 - `--wait` long-polls until terminal and handles its own backoff — don't wrap it
   in a retry loop.
-- `--local` implies `--wait`, with a default timeout of 1200 seconds (ordinary
-  waits default to 600). Run one frontend test per invocation; parallel
-  invocations are fine, but `--all --local` is refused (exit 5). There are
+- `--local` implies `--wait`, with a default timeout of 1200 seconds per run (ordinary
+  waits default to 600). Run several local frontend tests in ONE command (`test run <id> <id> … --local <port>`) instead of starting one process per test. `--all --project <id> --local <port>` runs frontend tests and reports backend tests as skipped. One tunnel serves the invocation; `--max-concurrency` defaults to 5 and caps at 10. There are
   5 live tunnel bindings per user; `tunnel_binding_limit` is exit 11 and is not
   auto-retried. Reuse a live tunnel with `--tunnel-client` or stop an unused one.
-- Keep the early `Run <runId>` line on **stderr**, emitted as soon as the trigger
-  returns; `Dashboard: <url>` follows when supplied. Preserve the id even if
+  On a tunnel-limit error, run `testsprite tunnel list`, then `testsprite tunnel stop <id>`
+  or `testsprite tunnel stop --all --confirm` if every binding should be revoked.
+- Keep the early **stderr** run-id receipts (`Run <runId>` for one test, `[i/N] <testId> → run <runId>` for a batch); `Dashboard: <url>` follows when supplied. Preserve each id even if
   the wait later stops; stdout remains the normal JSON result channel.
-- An **owned** local run is cancelled by default when waiting stops (timeout,
+- An **owned** local run requests cancellation by default when waiting stops (timeout,
   Ctrl-C, or a polling failure), then its tunnel closes. Read the reported
-  cancellation outcome. A run cancelled before it finished is refunded.
+  cancellation outcome. For a V3 frontend run cancelled before a terminal verdict,
+  the backend attempts a refund. Inspect `refund.status`; cancellation does not
+  guarantee a refund.
   `--no-cancel-on-interrupt` detaches instead, but the owned tunnel still closes.
-  A borrower using `--tunnel-client` still does not cancel on Ctrl-C/SIGTERM and
-  never closes the adopted tunnel. If it observes that the owner disappeared,
-  however, it cancels its own run and reports `cancelled`, `already finished`,
-  or `skipped`; `--no-cancel-on-interrupt` skips that cancellation too. A run
-  cancelled before it finished is refunded. Read the named run before re-running.
+  An adopted run normally detaches without cancellation and never closes the
+  owner's tunnel. If the CLI confirms the owner has disappeared while the run is
+  active, it requests cancellation by default; `--no-cancel-on-interrupt` skips
+  that request. Read the named run before re-running.
 - Exit codes: `0` = passed; `1` = failed / blocked / cancelled; `7` = timeout
   or unsupported. An owned local timeout is inconclusive: start a **new**
   `testsprite test run <test-id> --local <port> --timeout 1800`; do not suggest
   `test wait` for that closed tunnel. Resume **ordinary or adopted-tunnel**
   waits with `testsprite test wait <run-id>` only while the target is reachable
   (and the adopted tunnel's owner remains alive).
-- A case last run through a tunnel stays local: a later Portal Run, schedule,
-  or bare CLI run is a free BLOCKED (`tunnel-required`, exit 6). Use `--local`
-  again or explicitly retarget with a public `--target-url`. V3 local runs use
+- A local environment has a loopback URL and needs `--local <port>` from that
+  machine. A bare CLI run selecting it, explicitly or as Default, is refused
+  before dispatch without charge (`tunnel-required`, exit 6). The Portal shows
+  local environments but offers no Run; backend Portal requests are refused
+  without charge. Schedules and test lists targeting them get a free BLOCKED
+  result. A deployed environment selected with `--env <name>` or made Default
+  runs normally even if the test ran through a tunnel before. V3 local runs use
   the agent path, never saved-code replay, and preserve the test's saved code.
 - Batch: `create-batch` creates frontend tests; adding `--run --wait` runs them
   against a deployed target. For local tests, create without `--run`, then call
-  `test run <id> --local <port>` separately for each id; inspect each verdict.
+  `test run <id> <id> … --local <port>` once for the generated ids; inspect each verdict.
 - `test code put` needs `--expected-version <codeVersion>`; stale etag → exit 6,
   re-fetch via `test get <id>` and retry. `--force` bypasses but is audit-logged.
 - Idempotency: the CLI auto-mints an `Idempotency-Key`; replays within 24h return

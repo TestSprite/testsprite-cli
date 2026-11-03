@@ -1,5 +1,5 @@
 /**
- * Wire types for the DEV-384 plan-generation surface:
+ * Wire types for the plan-generation surface:
  *
  *   `POST /api/cli/v1/projects/{id}/plans/generate` — start the next missing
  *        pipeline stage (202)
@@ -9,8 +9,8 @@
  *   `POST /api/cli/v1/projects/{id}/plans/accept`   — staged proposals → real
  *        test cases
  *
- * These mirror the backend facade's `cli-plans.types.ts` (V3-A) shape-for-
- * shape. The generation `status` is FACADE-SYNTHESIZED — no such enum exists
+ * These mirror the backend facade's `cli-plans.types.ts` shape-for-shape.
+ * The generation `status` is FACADE-SYNTHESIZED — no such enum exists
  * on the V3 pipeline itself (design-doc v3.1 §7, DR-31) — so the CLI treats
  * it as the complete truth and never tries to derive state from anything
  * else.
@@ -66,7 +66,7 @@ export interface CliPlanProposal {
   proposalId: string;
   title: string;
   description: string;
-  /** CLI priority vocabulary (`p1`..`p3`, mapped from V3 High/Medium/Low). */
+  /** Priority as the CLI shows it: `p0` (High), `p1` (Medium), `p2` (Low). */
   priority: string;
   category: string;
   feature: string;
@@ -120,12 +120,12 @@ export interface CliGeneratePlansResponse {
   stagesRemaining: CliGenerationStage[];
   enqueuedAt: string;
   /**
-   * DEV-1008 — `stage: proposals` on a backend project only. Strategy
-   * categories the proposals stage was NOT asked for because they carry no
-   * endpoint to attach a test case to (cross-cutting themes such as
-   * authorization or pagination). Absent when nothing was skipped and on
-   * every other stage. The stage is charged flat, so this is the only
-   * signal that the plan covers fewer categories than the strategy lists.
+   * `stage: proposals` on a backend project only. Strategy categories the
+   * proposals stage was NOT asked for because they carry no endpoint to
+   * attach a test case to (cross-cutting themes such as authorization or
+   * pagination). Absent when nothing was skipped and on every other stage.
+   * The stage is charged flat, so this is the only signal that the plan
+   * covers fewer categories than the strategy lists.
    */
   skippedCategories?: number;
 }

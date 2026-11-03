@@ -2,7 +2,8 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, CLIError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
+import { ShutdownController } from '../lib/interrupt.js';
 import { readProfile, writeProfile } from '../lib/credentials.js';
 import type { AuthDeps, MeResponse } from './auth.js';
 import { createAuthCommand, runConfigure, runLogout, runWhoami } from './auth.js';
@@ -51,6 +52,59 @@ beforeEach(() => {
 });
 
 describe('runConfigure', () => {
+  it('tracks and aborts the key-validation request before writing credentials', async () => {
+    const shutdown = new ShutdownController();
+    const { deps } = makeCapture();
+    let rejectFetch!: (reason: unknown) => void;
+    const fetchImpl = vi.fn(
+      (_input: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          rejectFetch = reject;
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+            once: true,
+          });
+        }),
+    );
+    const pending = runConfigure(
+      { profile: 'default', output: 'text', debug: false, fromEnv: true },
+      {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: 'sk-user-from-env' },
+        credentialsPath,
+        fetchImpl: fetchImpl as AuthDeps['fetchImpl'],
+        shutdownSignal: shutdown.signal,
+        shutdown,
+      } as AuthDeps,
+    );
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledOnce());
+    const trackedDuringFetch = shutdown.hasCriticalOperations;
+    shutdown.interrupt('SIGINT');
+    rejectFetch(shutdown.signal.reason);
+    await expect(pending).rejects.toBe(shutdown.signal.reason);
+    expect(trackedDuringFetch).toBe(true);
+    expect(shutdown.hasCriticalOperations).toBe(false);
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+  });
+
+  it('preserves an interrupt from key validation', async () => {
+    const interrupt = new InterruptError('SIGTERM');
+    const { deps } = makeCapture();
+    await expect(
+      runConfigure(
+        { profile: 'default', output: 'text', debug: false, fromEnv: true },
+        {
+          ...deps,
+          env: { TESTSPRITE_API_KEY: 'sk-user-from-env' },
+          credentialsPath,
+          fetchImpl: async () => {
+            throw interrupt;
+          },
+        },
+      ),
+    ).rejects.toBe(interrupt);
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+  });
+
   it('writes the env-supplied key when --from-env is set', async () => {
     const { capture, deps } = makeCapture();
     const result = await runConfigure(
@@ -179,7 +233,16 @@ describe('runConfigure', () => {
         { profile: 'default', output: 'text', debug: false, fromEnv: true },
         { ...deps, env: {}, credentialsPath },
       ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      message: expect.stringContaining(
+        'TESTSPRITE_API_KEY is not set in the environment. Set it and re-run with --from-env, or omit --from-env to enter the key interactively. Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey',
+      ),
+      nextAction:
+        'Set TESTSPRITE_API_KEY and re-run. Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey',
+      details: { field: 'TESTSPRITE_API_KEY', reason: 'missing' },
+    });
   });
 
   it('rejects a malformed endpoint before key validation fetch', async () => {
@@ -296,6 +359,54 @@ describe('runConfigure', () => {
     expect(capture.prelude.join('')).toContain('Configuring profile "default"');
   });
 
+  it('prints the API-key settings URL to stderr before the secret prompt', async () => {
+    const { capture, deps } = makeCapture();
+    const hint =
+      'Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey';
+    const prompt = {
+      secret: vi.fn(async () => {
+        expect(capture.stderr).toContain(hint);
+        expect(capture.stdout).toEqual([]);
+        return 'sk-user-typed';
+      }),
+    };
+
+    await runConfigure(
+      { profile: 'default', output: 'json', debug: false, fromEnv: false },
+      { ...deps, env: {}, credentialsPath, prompt, fetchImpl: meOkFetch },
+    );
+
+    expect(prompt.secret).toHaveBeenCalledWith('TestSprite API key: ');
+    expect(capture.stderr.filter(line => line === hint)).toHaveLength(1);
+    expect(JSON.parse(capture.stdout.join('\n'))).toMatchObject({ status: 'configured' });
+    expect(capture.stdout.join('\n')).not.toContain(hint);
+  });
+
+  it('names the API-keys page without an origin when the API endpoint is unknown', async () => {
+    const { capture, deps } = makeCapture();
+    await runConfigure(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        fromEnv: false,
+        endpointUrl: 'https://api.dev.example.com',
+      },
+      {
+        ...deps,
+        env: {},
+        credentialsPath,
+        prompt: { secret: async () => 'sk-user-typed' },
+        fetchImpl: meOkFetch,
+      },
+    );
+
+    expect(capture.stderr).toContain(
+      "Create or copy an API key on your TestSprite dashboard's API-keys page (/dashboard/settings/apikey).",
+    );
+    expect(capture.stderr.join('\n')).not.toContain('www.testsprite.com');
+  });
+
   it('routes the interactive prelude to stderr by default, keeping stdout for the result', async () => {
     // Regression: the prelude used to default to process.stdout, polluting the
     // result stream (and the JSON document under --output json). With no
@@ -370,14 +481,24 @@ describe('runConfigure', () => {
   });
 
   it('throws when interactive secret comes back empty', async () => {
-    const { deps } = makeCapture();
+    const { capture, deps } = makeCapture();
     const prompt = { secret: vi.fn(async () => '   ') };
     await expect(
       runConfigure(
         { profile: 'default', output: 'text', debug: false, fromEnv: false },
         { ...deps, env: {}, credentialsPath, prompt },
       ),
-    ).rejects.toBeInstanceOf(CLIError);
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.stringContaining(
+        'No API key provided. Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey',
+      ),
+      nextAction:
+        'Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey',
+    });
+    expect(capture.stderr).toContain(
+      'Create or copy an API key at https://www.testsprite.com/dashboard/settings/apikey',
+    );
   });
 
   it('honors --endpoint-url without prompting for the endpoint', async () => {
@@ -937,7 +1058,8 @@ describe('runWhoami', () => {
     );
     expect(capture.stdout.join('\n')).toContain('routing: v3');
     expect(capture.stderr.join('\n')).toContain('[advisory]');
-    expect(capture.stderr.join('\n')).toContain('--target-url');
+    expect(capture.stderr.join('\n')).toContain('rerun');
+    expect(capture.stderr.join('\n')).not.toContain('--target-url');
   });
 
   it('renders routing: v2 and NO advisory when v3Enabled is false', async () => {
@@ -989,6 +1111,73 @@ describe('runWhoami', () => {
       { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meOrg) },
     );
     expect(capture.stdout.join('\n')).toContain('org:    Acme QA (Standard, member)');
+  });
+
+  it('renders a `workspace:` line when the org is paused, with the notice and its billing link', async () => {
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const mePaused = new Response(
+      JSON.stringify({
+        ...sampleMe,
+        v3Enabled: true,
+        activeOrg: {
+          id: 'org-1',
+          name: 'Acme QA',
+          plan: 'Starter',
+          role: 'owner',
+          remaining: 400,
+          includedCredits: 400,
+          seats: 1,
+          workspace: {
+            state: 'paused',
+            tier: 'Paused',
+            notice: {
+              title: 'Workspace paused',
+              message: 'This workspace is paused because its subscription ended.',
+              cta: 'Renew subscription',
+              billingUrl: 'https://portal.example/o/org-1/settings/billing',
+            },
+          },
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(mePaused) },
+    );
+    const out = capture.stdout.join('\n');
+    expect(out).toContain('org:    Acme QA (Starter, owner)');
+    expect(out).toContain(
+      'workspace: paused — This workspace is paused because its subscription ended. Renew subscription: https://portal.example/o/org-1/settings/billing',
+    );
+  });
+
+  it('omits the `workspace:` line while the org is simply on its plan', async () => {
+    writeProfile('default', { apiKey: 'sk-user-min' }, { path: credentialsPath });
+    const { capture, deps } = makeCapture();
+    const meOk = new Response(
+      JSON.stringify({
+        ...sampleMe,
+        v3Enabled: true,
+        activeOrg: {
+          id: 'org-1',
+          name: 'Acme QA',
+          plan: 'Starter',
+          role: 'owner',
+          remaining: 400,
+          includedCredits: 400,
+          seats: 1,
+          workspace: { state: 'ok', tier: 'Starter', notice: null },
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+    await runWhoami(
+      { profile: 'default', output: 'text', debug: false },
+      { ...deps, env: {}, credentialsPath, fetchImpl: makeFetch(meOk) },
+    );
+    expect(capture.stdout.join('\n')).not.toContain('workspace:');
   });
 
   it('omits the org line when activeOrg is present but the caller is not V3-routed', async () => {

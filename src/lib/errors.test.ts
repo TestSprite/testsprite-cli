@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { classifyBillingRefusal } from './billing-refusal.js';
 import {
   ApiError,
   CLIError,
@@ -225,6 +226,30 @@ describe('ApiError.fromEnvelope', () => {
     });
     expect(err.code).toBe('NOT_FOUND');
   });
+
+  it('redacts nested secrets from server-supplied details at construction', () => {
+    const err = ApiError.fromEnvelope({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Invalid request.',
+        nextAction: 'Fix it.',
+        requestId: 'req_1',
+        details: {
+          // `field` names WHICH flag failed — must survive even though its
+          // value happens to be the literal word "password".
+          field: 'password',
+          nested: { password: 'hunter2', apiKey: 'sk-should-not-leak' },
+          list: [{ token: 'tok_abc' }, { authorization: 'Bearer xyz' }],
+        },
+      },
+    });
+    expect(err.details).toEqual({
+      field: 'password',
+      nested: { password: '[REDACTED]', apiKey: '[REDACTED]' },
+      list: [{ token: '[REDACTED]' }, { authorization: '[REDACTED]' }],
+    });
+    expect(err.getDetail('nested')).toEqual({ password: '[REDACTED]', apiKey: '[REDACTED]' });
+  });
 });
 
 describe('ApiError.authRequired', () => {
@@ -244,6 +269,192 @@ describe('ApiError.authRequired', () => {
 });
 
 describe('ApiError.fromEnvelope status fallback', () => {
+  it('maps a raw environment limit body to a feature gate', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        statusCode: 402,
+        code: 'environment_limit_exceeded',
+        message: 'Environment limit reached.',
+        billingUrl: 'https://portal.example/dashboard-v3/o/org-1/settings/billing',
+        orgId: 'org-1',
+        plan: 'Free',
+        feature: 'environment',
+        requiredPlan: 'Standard',
+        limit: 1,
+        current: 1,
+      },
+      402,
+      undefined,
+      'https://dev-api.example',
+    );
+    expect(err.code).toBe('FEATURE_GATED');
+    expect(err.exitCode).toBe(13);
+    expect(err.details).toMatchObject({ reason: 'limit_exceeded', orgId: 'org-1', limit: 1 });
+    expect(err.nextAction).toBe(
+      'Delete one and retry, or upgrade at https://portal.example/dashboard-v3/o/org-1/settings/billing for a higher limit.',
+    );
+    expect(classifyBillingRefusal(err)?.links.billing).toBe(
+      'https://portal.example/dashboard-v3/o/org-1/settings/billing',
+    );
+    expect(classifyBillingRefusal(err)?.lines).toEqual([
+      '  upgrade:   https://portal.example/pricing',
+    ]);
+  });
+
+  it.each(['environment', 'testlist', 'schedule', 'github_repo', 'fixture', 'project'])(
+    'maps raw %s_limit_exceeded to limit_exceeded',
+    feature => {
+      const err = ApiError.fromEnvelope(
+        {
+          code: `${feature}_limit_exceeded`,
+          message: 'Limit reached.',
+          statusCode: 402,
+          plan: 'Free',
+          limit: 1,
+          current: 1,
+        },
+        402,
+      );
+      expect(err.code).toBe('FEATURE_GATED');
+      expect(err.exitCode).toBe(13);
+      expect(err.details).toMatchObject({ reason: 'limit_exceeded', feature });
+    },
+  );
+
+  it('maps a future limit code by its suffix', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        code: 'newFeature2_limit_exceeded',
+        message: 'Limit reached.',
+        statusCode: 402,
+      },
+      402,
+    );
+    expect(err.code).toBe('FEATURE_GATED');
+    expect(err.details).toMatchObject({ reason: 'limit_exceeded', feature: 'newFeature2' });
+  });
+
+  it.each([['feature_not_entitled', 'not_entitled']])('maps raw %s to %s', (code, reason) => {
+    const err = ApiError.fromEnvelope({ code, message: 'Refused.', statusCode: 403 }, 403);
+    expect(err.code).toBe('FEATURE_GATED');
+    expect(err.details.reason).toBe(reason);
+    expect(err.nextAction).toContain('/dashboard/settings/billing');
+    expect(classifyBillingRefusal(err)?.links.pricing).toBe('/pricing');
+  });
+
+  it('maps a raw workspace pause body to a paused-workspace refusal', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        statusCode: 403,
+        code: 'workspace_paused',
+        message: 'This workspace is paused.',
+        billingUrl: 'https://portal.example/dashboard/settings/billing',
+      },
+      403,
+    );
+    expect(err.code).toBe('FEATURE_GATED');
+    expect(err.details).toMatchObject({ reason: 'paused' });
+    expect(err.details).not.toHaveProperty('state');
+    expect(err.nextAction).toContain('https://portal.example/dashboard/settings/billing');
+  });
+
+  it("keeps the raw paused body's own reason and pause fields", () => {
+    // The shape `WorkspaceGateException` sends for a paid workspace paused
+    // because it is over its target plan's limits, with the deprecated
+    // `billing_hold` a current backend still sends — which the wire-code
+    // fallback (`paused`) would never produce.
+    const err = ApiError.fromEnvelope(
+      {
+        statusCode: 403,
+        code: 'workspace_paused',
+        message:
+          "This workspace is paused: it is over the Standard plan's limits. Remove the extra items, or upgrade, in Settings → Billing to resume.",
+        reason: 'billing_hold',
+        holdState: 'paused',
+        pauseKind: 'scheduled_downgrade',
+        pauseTarget: 'Standard',
+        orgId: 'org-1',
+      },
+      403,
+    );
+    expect(err.details).toMatchObject({
+      reason: 'billing_hold',
+      pauseKind: 'scheduled_downgrade',
+      pauseTarget: 'Standard',
+      orgId: 'org-1',
+    });
+    expect(classifyBillingRefusal(err)?.reason).toBe('paused');
+    expect(err.nextAction).toBe(
+      'See /dashboard-v3/o/org-1/settings/billing to resume this workspace, then retry.',
+    );
+  });
+
+  it('a raw gate body with a reason this CLI does not know keeps it and gets no billing advice', () => {
+    const err = ApiError.fromEnvelope(
+      { statusCode: 403, code: 'feature_not_entitled', message: 'Refused.', reason: 'new_reason' },
+      403,
+    );
+    expect(err.code).toBe('FEATURE_GATED');
+    expect(err.details).toMatchObject({ reason: 'new_reason' });
+    expect(classifyBillingRefusal(err)).toBeUndefined();
+    expect(err.nextAction).toBe('');
+  });
+
+  it('synthesizes a pricing next action for a plan envelope without one', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'FEATURE_GATED',
+          message: 'Feature not available.',
+          nextAction: '',
+          requestId: 'req_plan',
+          details: { reason: 'plan', feature: 'schedule', plan: 'Free' },
+        },
+      },
+      403,
+      undefined,
+      'https://api.testsprite.com',
+    );
+    expect(err.nextAction).toContain('https://www.testsprite.com/pricing');
+  });
+
+  it('keeps a genuine 402 credits envelope in the credits family', () => {
+    const err = ApiError.fromEnvelope(
+      {
+        error: {
+          code: 'INSUFFICIENT_CREDITS',
+          message: 'Need more credits.',
+          nextAction: '',
+          requestId: 'req_credits',
+          details: { required: 2 },
+        },
+      },
+      402,
+    );
+    expect(err.code).toBe('INSUFFICIENT_CREDITS');
+    expect(err.exitCode).toBe(12);
+    expect(err.nextAction).toContain('/pricing');
+  });
+
+  it('a 429 body whose code happens to end in `_limit_exceeded` stays RATE_LIMITED, not a non-retriable feature gate', () => {
+    const err = ApiError.fromEnvelope(
+      { code: 'rate_limit_exceeded', message: 'Too many requests.' },
+      429,
+    );
+    expect(err.code).toBe('RATE_LIMITED');
+    expect(err.exitCode).toBe(11);
+  });
+
+  it('a raw gate body with no HTTP status only maps a known wire code, not the open-ended suffix', () => {
+    const known = ApiError.fromEnvelope({ code: 'workspace_paused', message: 'Paused.' });
+    expect(known.code).toBe('FEATURE_GATED');
+    const unknownSuffix = ApiError.fromEnvelope({
+      code: 'newFeature2_limit_exceeded',
+      message: 'Limit reached.',
+    });
+    expect(unknownSuffix.code).not.toBe('FEATURE_GATED');
+  });
+
   it.each([
     [400, 'VALIDATION_ERROR' as const],
     [401, 'AUTH_INVALID' as const],
@@ -308,7 +519,7 @@ describe('ApiError.fromEnvelope status fallback', () => {
     expect(err.code).toBe('NOT_FOUND');
     expect(err.message).toContain('Cannot POST /api/cli/v1/tests/abc/runs');
     expect(err.message).toContain('endpoint not available');
-    expect(err.nextAction).toContain('M3.3 piece');
+    expect(err.nextAction).toContain('includes this endpoint');
   });
 
   it('NestJS-shape 404 with a non-Cannot message falls back to plain message', () => {

@@ -116,7 +116,7 @@ export const testFixtures = [
     },
   },
   {
-    // M2.1 piece 1: distinct `blocked` row. Pre-M2.1 this fixture
+    // Distinct `blocked` row. Previously this fixture
     // would have collapsed to `failed`; the dedicated row keeps the
     // mock-backend handler tests honest about the new public value.
     id: FIXTURE_TEST_ID_BLOCKED,

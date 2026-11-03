@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from '../errors.js';
 import {
+  buildDryRunPathPattern,
   DRY_RUN_SAMPLE_ENTRIES,
   findSample,
   findSampleOrThrow,
@@ -25,7 +26,54 @@ describe('sampleJUnitReportXml', () => {
   });
 });
 
+describe('findSample skipDependencies echo', () => {
+  it.each(['/tests/test_a/runs', '/tests/batch/run'])(
+    'POST %s echoes skipDependencies only when the request carried it',
+    path => {
+      const echoed = findSample('POST', path, { skipDependencies: true })!.body() as Record<
+        string,
+        unknown
+      >;
+      expect(echoed.skipDependencies).toBe(true);
+      const plain = findSample('POST', path, { source: 'cli' })!.body() as Record<string, unknown>;
+      expect('skipDependencies' in plain).toBe(false);
+      const none = findSample('POST', path)!.body() as Record<string, unknown>;
+      expect('skipDependencies' in none).toBe(false);
+    },
+  );
+});
+
 describe('findSample', () => {
+  it('provides password-free project sign-in get and set samples', () => {
+    const get = findSample('GET', '/projects/p_x/sign-in?environment=default');
+    const set = findSample('PUT', '/projects/p_x/sign-in', {
+      mode: 'account',
+      password: 'secret-example',
+    });
+    expect(get?.operationId).toBe('getProjectSignIn');
+    expect(set?.operationId).toBe('setProjectSignIn');
+    expect(set?.body()).toMatchObject({
+      signIn: { mode: 'account', account: { passwordSet: true } },
+      changed: true,
+    });
+    expect(JSON.stringify(set?.body())).not.toContain('secret-example');
+  });
+  it('previews setting an existing OTP environment as unchanged', () => {
+    const set = findSample('PUT', '/projects/p_x/sign-in', { mode: 'otp' });
+    expect(set?.body()).toMatchObject({
+      environment: { authMode: 'otp', enableOtp: true },
+      signIn: { mode: 'otp' },
+      changed: false,
+    });
+  });
+  it('keeps tunnel collection and single-client samples distinct', () => {
+    const list = findSample('GET', '/tunnel');
+    const status = findSample('GET', '/tunnel/11111111-2222-4333-8444-555555555555');
+    expect(list?.operationId).toBe('listTunnels');
+    expect(list?.body()).toMatchObject({ tunnels: [{ status: 'online' }, { status: 'offline' }] });
+    expect(status?.operationId).toBe('getTunnelStatus');
+    expect(status?.body()).toMatchObject({ status: 'online' });
+  });
   it('resolves /me', () => {
     const e = findSample('GET', 'https://api.testsprite.com/api/cli/v1/me');
     expect(e?.operationId).toBe('whoami');
@@ -45,7 +93,7 @@ describe('findSample', () => {
     expect(e?.operationId).toBe('getProject');
   });
 
-  it('GET /projects/{id}/plans resolves getPlans, NOT getProject (DEV-384 ordering)', () => {
+  it('GET /projects/{id}/plans resolves getPlans, NOT getProject (ordering)', () => {
     // The plans entries are registered BEFORE getProject (first-match-wins);
     // this proves both directions of the non-shadowing contract.
     const plans = findSample('GET', 'https://api.testsprite.com/api/cli/v1/projects/p_x/plans');
@@ -54,7 +102,7 @@ describe('findSample', () => {
     expect(project?.operationId).toBe('getProject');
   });
 
-  it('POST /projects/{id}/plans/generate resolves generatePlans (DEV-384)', () => {
+  it('POST /projects/{id}/plans/generate resolves generatePlans', () => {
     const e = findSample(
       'POST',
       'https://api.testsprite.com/api/cli/v1/projects/p_x/plans/generate',
@@ -155,6 +203,18 @@ describe('findSample', () => {
     expect(failure?.operationId).toBe('getTestFailure');
   });
 
+  it('resolves /tests/executions/{id}/report without the /tests/{testId} family catching it', () => {
+    const report = findSample(
+      'GET',
+      'https://api.testsprite.com/api/cli/v1/tests/executions/exec_1/report',
+    );
+    expect(report?.operationId).toBe('getExecutionReport');
+    // Four segments never match the two-segment `getTest` pattern either way.
+    expect(
+      findSample('GET', 'https://api.testsprite.com/api/cli/v1/tests/executions')?.operationId,
+    ).toBe('getTest');
+  });
+
   it('resolves /tests/{id}/failure/summary distinct from /failure (M2.1 piece 3)', () => {
     // The summary endpoint must match BEFORE the bundle endpoint so a
     // dry-run user practising `failure summary` doesn't get the bundle
@@ -211,7 +271,7 @@ describe('findSample', () => {
           expect(body).toMatchObject({ id: expect.any(String), name: expect.any(String) });
           break;
         case 'docsUploadUrl':
-          // DEV-384 V3-D — CliDocsUploadUrlResponse wire shape.
+          // CliDocsUploadUrlResponse wire shape.
           expect(body).toMatchObject({
             uploadUrl: expect.any(String),
             s3Key: expect.any(String),
@@ -219,7 +279,7 @@ describe('findSample', () => {
           });
           break;
         case 'docsRegister':
-          // DEV-384 V3-D — CliDocsRegisterResponse wire shape.
+          // CliDocsRegisterResponse wire shape.
           expect(body).toMatchObject({
             resourceId: expect.any(String),
             displayName: expect.any(String),
@@ -454,7 +514,7 @@ describe('findSample', () => {
           });
           break;
         case 'cancelRun':
-          // DEV-331 piece 3 — POST /runs/{runId}/cancel → CancelRunResponse
+          // POST /runs/{runId}/cancel → CancelRunResponse
           // (RunResponse shape + alreadyCancelled).
           expect(body).toMatchObject({
             runId: expect.any(String),
@@ -470,8 +530,20 @@ describe('findSample', () => {
             deletedAt: expect.any(String),
           });
           break;
+        case 'getProjectSignIn':
+        case 'setProjectSignIn':
+          expect(body).toMatchObject({
+            projectId: expect.any(String),
+            environment: expect.objectContaining({
+              name: expect.any(String),
+              authMode: expect.any(String),
+            }),
+            signIn: expect.objectContaining({ mode: expect.any(String) }),
+          });
+          expect(body.nextAction === null || typeof body.nextAction === 'string').toBe(true);
+          break;
         case 'generatePlans':
-          // DEV-384 V3-B — POST /projects/{id}/plans/generate →
+          // POST /projects/{id}/plans/generate →
           // CliGeneratePlansResponse (202 trigger ack).
           expect(body).toMatchObject({
             status: 'accepted',
@@ -482,7 +554,7 @@ describe('findSample', () => {
           expect('stage' in body).toBe(true);
           break;
         case 'getPlans': {
-          // DEV-384 V3-B — GET /projects/{id}/plans → CliGetPlansResponse.
+          // GET /projects/{id}/plans → CliGetPlansResponse.
           // Every staged proposal must carry its stable proposalId (that id
           // is what `accept --only` consumes).
           expect(body).toMatchObject({
@@ -503,8 +575,8 @@ describe('findSample', () => {
           break;
         }
         case 'acceptPlans':
-          // DEV-384 V3-B — POST /projects/{id}/plans/accept → the server's
-          // real `{acceptedCount, caseKeys}` shape (DR-29: no codegen field).
+          // POST /projects/{id}/plans/accept → the server's real
+          // `{acceptedCount, caseKeys}` shape (DR-29: no codegen field).
           expect(body).toMatchObject({
             acceptedCount: expect.any(Number),
             caseKeys: expect.any(Array),
@@ -531,6 +603,28 @@ describe('findSample', () => {
           break;
         case 'listScheduleRuns':
           expect(body).toMatchObject({ runs: expect.any(Array) });
+          break;
+        case 'listTunnels':
+          expect(body).toMatchObject({ tunnels: expect.any(Array) });
+          expect((body as { tunnels: unknown[] }).tunnels).toHaveLength(2);
+          break;
+        case 'getTunnelStatus':
+          expect(body).toMatchObject({
+            clientId: expect.any(String),
+            status: expect.any(String),
+            expiresAt: expect.any(String),
+          });
+          break;
+        case 'getExecutionReport':
+          expect(body).toMatchObject({
+            ready: true,
+            markdown: expect.any(String),
+            report: expect.objectContaining({
+              executionId: expect.any(String),
+              stats: expect.objectContaining({ total: expect.any(Number) }),
+              tests: expect.any(Array),
+            }),
+          });
           break;
         default:
           throw new Error(`Unexpected operationId in samples: ${e.operationId}`);
@@ -660,8 +754,8 @@ describe('findSample', () => {
     expect(failingStep?.error).not.toBe('');
   });
 
-  // DEV-331 piece 3: POST /runs/{runId}/cancel must resolve to `cancelRun`,
-  // never fall through to the GET-only `getRun` entry despite sharing the
+  // POST /runs/{runId}/cancel must resolve to `cancelRun`, never fall
+  // through to the GET-only `getRun` entry despite sharing the
   // `/runs/{runId}` path prefix — findSample filters by method first.
   it('POST /runs/{runId}/cancel resolves cancelRun (not getRun)', () => {
     const e = findSample('POST', 'https://api.testsprite.com/api/cli/v1/runs/run_xyz/cancel');
@@ -681,8 +775,8 @@ describe('findSample', () => {
     expect(e?.operationId).toBe('getTest');
     const body = e?.body() as Record<string, unknown>;
     expect('priority' in body).toBe(true);
-    // First test in the sample has priority 'p1'.
-    expect(body.priority).toBe('p1');
+    // First test in the sample has priority 'Medium' (reads return High/Medium/Low).
+    expect(body.priority).toBe('Medium');
   });
 
   it('listTests sample items carry priority field (G1a)', () => {
@@ -777,11 +871,11 @@ describe('findSample', () => {
     expect(body.summary.total).toBeGreaterThanOrEqual(1);
   });
 
-  // DEV-384 piece V3-D: `project docs upload` dry-runs via an inline
-  // early-exit (zero network, stat only — the presigned PUT leg cannot be
-  // expressed through canned fetch samples). These two entries are
-  // documentation/shape-guards, same family as `deleteBatch`.
-  it('POST /projects/{id}/docs/upload-url resolves docsUploadUrl (V3-A wire shape)', () => {
+  // `project docs upload` dry-runs via an inline early-exit (zero network,
+  // stat only — the presigned PUT leg cannot be expressed through canned
+  // fetch samples). These two entries are documentation/shape-guards, same
+  // family as `deleteBatch`.
+  it('POST /projects/{id}/docs/upload-url resolves docsUploadUrl (wire shape)', () => {
     const e = findSample(
       'POST',
       'https://api.testsprite.com/api/cli/v1/projects/p_x/docs/upload-url',
@@ -994,5 +1088,42 @@ describe('schedule samples', () => {
     };
     expect(runs.runs[0]?.stats.failed).toBeGreaterThan(0);
     expect(runs.runs[0]?.status).toBe('failed');
+  });
+});
+
+describe('buildDryRunPathPattern (route-template regex escaping)', () => {
+  it('matches a literal dot, not "any character"', () => {
+    const pattern = buildDryRunPathPattern('/files/{name}.txt');
+    expect(pattern.test('/files/report.txt')).toBe(true);
+    // A wildcard dot would also accept this; a literal dot must not.
+    expect(pattern.test('/files/reportXtxt')).toBe(false);
+  });
+
+  it('matches literal parentheses, not a non-capturing group', () => {
+    const pattern = buildDryRunPathPattern('/(group)/{id}');
+    expect(pattern.test('/(group)/123')).toBe(true);
+    // Unescaped parens are pure grouping syntax with no literal-character
+    // meaning, so a builder that forgot to escape them would require the
+    // parens to be ABSENT from the URL instead of present.
+    expect(pattern.test('/group/123')).toBe(false);
+  });
+
+  it('matches a literal backslash + letter + plus, not a regex shorthand class', () => {
+    // Read as a regex fragment, an unescaped `\d+` means "one or more
+    // digits". The template's backslash, "d" and "+" must instead be
+    // required as four literal characters wherever they sit in the path.
+    const pattern = buildDryRunPathPattern('/pattern\\d+/{id}');
+    expect(pattern.test('/pattern\\d+/anything')).toBe(true);
+    expect(pattern.test('/pattern123/anything')).toBe(false);
+  });
+
+  it('still resolves every registered route exactly as before the escaping fix', () => {
+    // None of the registry's real templates contain regex metacharacters
+    // today, so escaping them is a no-op for the existing catalog: every
+    // entry's pattern must still match a path built from its own template.
+    for (const e of DRY_RUN_SAMPLE_ENTRIES) {
+      const samplePath = e.pathTemplate.replace(/\{[^}]+\}/g, 'sample_value');
+      expect(e.pattern.test(samplePath)).toBe(true);
+    }
   });
 });

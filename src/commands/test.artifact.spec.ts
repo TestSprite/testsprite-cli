@@ -25,7 +25,7 @@ import {
   runArtifactGet,
   runFailureGet,
 } from './test.js';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -189,13 +189,16 @@ describe('assertOutDirParentExists', () => {
   });
 
   it('throws VALIDATION_ERROR when parent does not exist', async () => {
-    const target = join(tmpdir(), 'does-not-exist-xyz', 'bundle');
-    await expect(assertOutDirParentExists(target)).rejects.toMatchObject({
-      code: 'VALIDATION_ERROR',
-      details: expect.objectContaining({
-        reason: expect.stringContaining('parent directory does not exist'),
-      }),
-    });
+    const noParentBase = mkdtempSync(join(tmpdir(), 'cli-p4-noparent-'));
+    const target = join(noParentBase, 'does-not-exist-xyz', 'bundle');
+    await expect(assertOutDirParentExists(target))
+      .rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        details: expect.objectContaining({
+          reason: expect.stringContaining('parent directory does not exist'),
+        }),
+      })
+      .finally(() => rmSync(noParentBase, { recursive: true, force: true }));
   });
 
   it('throws VALIDATION_ERROR when parent is not a directory (is a file)', async () => {
@@ -530,7 +533,8 @@ describe('runArtifactGet', () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(() => ({ body: {} }));
 
-    const missingParent = join(tmpdir(), 'definitely-does-not-exist-xyz', 'bundle');
+    const missingParentBase = mkdtempSync(join(tmpdir(), 'cli-p4-missing-parent-'));
+    const missingParent = join(missingParentBase, 'definitely-does-not-exist-xyz', 'bundle');
     await expect(
       runArtifactGet(
         {
@@ -543,7 +547,9 @@ describe('runArtifactGet', () => {
         },
         { credentialsPath, fetchImpl, stdout: () => {} },
       ),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    )
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+      .finally(() => rmSync(missingParentBase, { recursive: true, force: true }));
   });
 
   // ---- --out is a file → exit 5 ----
@@ -927,7 +933,7 @@ describe('runFailureGet M2 non-regression (requireRunId is opt-in)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// DEV-230 — noun-level pass-through aliases
+// Noun-level pass-through aliases
 //   `test failure <id>`   → `test failure get <id>`
 //   `test artifact <id>`  → `test artifact get <run-id>`
 // Implemented via Commander `isDefault: true` on each group's `get` subcommand.
@@ -937,7 +943,7 @@ describe('runFailureGet M2 non-regression (requireRunId is opt-in)', () => {
 //   artifact get    → GET /runs/{runId}/failure
 // ---------------------------------------------------------------------------
 
-describe('DEV-230 noun-level pass-through aliases', () => {
+describe('noun-level pass-through aliases', () => {
   it('`test failure <id>` routes to failure get (GET /tests/{id}/failure)', async () => {
     const { credentialsPath } = makeCreds();
     const urls: string[] = [];

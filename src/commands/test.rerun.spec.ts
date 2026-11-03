@@ -847,7 +847,7 @@ describe('R-FE2: auto-heal forwarded for FE paid', () => {
 
 // R-FE0: default-on — no --no-auto-heal flag → body sends autoHeal:true; advisory emitted
 describe('R-FE0: auto-heal default-on (no --no-auto-heal flag)', () => {
-  it('sends autoHeal:true by default; emits 0.2-credit advisory when server echoes autoHeal:true', async () => {
+  it('sends autoHeal:true by default; advisory names the re-authoring when server echoes autoHeal:true', async () => {
     const creds = makeCreds();
     const rerunResp = makeFeRerunResp({ autoHeal: true }); // server confirms auto-heal
     const stderrLines: string[] = [];
@@ -890,11 +890,16 @@ describe('R-FE0: auto-heal default-on (no --no-auto-heal flag)', () => {
     // Body must include autoHeal:true
     expect((sentBody as { autoHeal?: boolean }).autoHeal).toBe(true);
 
-    // Advisory must mention 0.2 credit and --no-auto-heal
+    // The advisory must name the CONSEQUENCE (the stored code is replaced) and
+    // the opt-out. It deliberately no longer quotes a credit figure: that number
+    // was the legacy V2 engage fee, and on V3 — now the majority of CLI volume —
+    // a heal is a full agent run billed as the run, with no extra charge at all
+    // (verified against `billing-pricing.ts`, which has no auto-heal action).
     const advisory = stderrLines.find(
-      l => l.includes('[advisory]') && l.includes('0.2') && l.includes('--no-auto-heal'),
+      l => l.includes('[advisory]') && l.includes('re-authors') && l.includes('--no-auto-heal'),
     );
     expect(advisory).toBeDefined();
+    expect(advisory).not.toContain('0.2');
   });
 });
 
@@ -1418,6 +1423,41 @@ describe('R-BE2: --skip-dependencies', () => {
 // ---------------------------------------------------------------------------
 
 describe('R-BE3: auto-heal on BE test — default-on suppresses warning', () => {
+  it('does not dispatch a rerun after the type lookup is interrupted', async () => {
+    const creds = makeCreds();
+    const interruption = new InterruptError('SIGINT');
+    let dispatched = false;
+    const fetchImpl = makeFetch((_url, init) => {
+      if (init.method === 'POST') {
+        dispatched = true;
+        return { body: makeBeRerunResp({ autoHeal: false }) };
+      }
+      throw interruption;
+    });
+
+    await expect(
+      runTestRerun(
+        {
+          testIds: ['test_be_consumer_01'],
+          all: false,
+          wait: false,
+          timeoutSeconds: 600,
+          autoHeal: true,
+          autoHealExplicit: false,
+          skipDependencies: false,
+          maxConcurrency: 10,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, sleep: instantSleep, fetchImpl, stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toBe(interruption);
+    expect(dispatched).toBe(false);
+  });
+
   it('auto-heal defaults true; BE type suppresses warning (autoHealExplicit:false); autoHeal:false sent explicitly', async () => {
     const creds = makeCreds();
     const rerunResp = makeBeRerunResp({ autoHeal: false });
@@ -1708,7 +1748,7 @@ describe('R-BAT: batch rerun (multi-id, no --wait)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Batch rerun (initial dispatch + deferred-retry) always sends an
+// Batch rerun (each dispatch request) always sends an
 // explicit autoHeal boolean, including an explicit `false` opt-out.
 // ---------------------------------------------------------------------------
 
@@ -1797,65 +1837,6 @@ describe('batch rerun always sends an explicit autoHeal boolean', () => {
     );
 
     expect((sentBody as { autoHeal?: boolean }).autoHeal).toBe(false);
-  });
-
-  it('the D3 deferred-retry dispatch also re-sends autoHeal:false explicitly', async () => {
-    const creds = makeCreds();
-    // test_2 is accepted immediately; test_1 is rate-deferred on the initial
-    // dispatch and only accepted on the D3 retry.
-    const initialBatchResp: BatchRerunResponse = {
-      accepted: [{ testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' }],
-      deferred: [{ testId: 'test_1', reason: 'rate_limited' }],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-    const retryBatchResp: BatchRerunResponse = {
-      accepted: [{ testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:05.000Z' }],
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-    const sentBodies: unknown[] = [];
-    let batchCallCount = 0;
-    const run1 = makeTerminalRun('run_b1', 'passed');
-    run1.testId = 'test_1';
-    const run2 = makeTerminalRun('run_b2', 'passed');
-    run2.testId = 'test_2';
-
-    const fetchImpl = makeFetch((url, init) => {
-      if (url.includes('/tests/batch/rerun')) {
-        batchCallCount++;
-        sentBodies.push(init.body ? JSON.parse(init.body as string) : null);
-        return { status: 202, body: batchCallCount === 1 ? initialBatchResp : retryBatchResp };
-      }
-      if (url.includes('/runs/run_b1')) return { body: run1 };
-      if (url.includes('/runs/run_b2')) return { body: run2 };
-      return errorBody('NOT_FOUND');
-    });
-
-    await runTestRerun(
-      {
-        testIds: ['test_1', 'test_2'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 600,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-        maxConcurrency: 10,
-        output: 'json',
-        profile: 'default',
-        dryRun: false,
-        debug: false,
-        verbose: false,
-      },
-      { ...creds, sleep: instantSleep, fetchImpl },
-    );
-
-    // 1 initial dispatch + 1 D3 retry that finally accepts the deferred test.
-    expect(batchCallCount).toBe(2);
-    expect((sentBodies[0] as { autoHeal?: boolean }).autoHeal).toBe(false);
-    expect((sentBodies[1] as { autoHeal?: boolean }).autoHeal).toBe(false);
   });
 });
 
@@ -3035,6 +3016,52 @@ describe('[fix-C] batch rerun: every test in-flight → CONFLICT exit 6', () => 
     expect((err as ApiError).message).toContain('already in flight');
   });
 
+  it('an all-billing_hold batch rerun exits 13 FEATURE_GATED, matching test run --all', async () => {
+    const creds = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/rerun'))
+        return {
+          status: 202,
+          body: {
+            accepted: [],
+            deferred: [],
+            conflicts: [
+              { testId: 'test_1', reason: 'billing_hold', message: 'Workspace paused.' },
+              { testId: 'test_2', reason: 'billing_hold', message: 'Workspace paused.' },
+            ],
+            closure: { byProject: [] },
+          },
+        };
+      return errorBody('NOT_FOUND');
+    });
+    const err = (await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: false,
+        timeoutSeconds: 600,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 10,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, sleep: instantSleep, fetchImpl },
+    ).catch(e => e)) as ApiError;
+    // Was a bare CONFLICT (exit 6, "already in flight") before this fix —
+    // a paused workspace is never resolved by waiting, so it must exit the same way a
+    // paused-workspace `test run --all` batch does.
+    expect(err.code).toBe('FEATURE_GATED');
+    expect(err.exitCode).toBe(13);
+    expect(err.message).toContain('Workspace paused');
+    expect(err.message).not.toContain('already in flight');
+    expect(err.nextAction).toContain('/dashboard/settings/billing');
+  });
+
   it('partial conflict (some accepted + some conflicts) still exits 0 on all-passed', async () => {
     const creds = makeCreds();
     const partialConflictResp: BatchRerunResponse = {
@@ -3527,9 +3554,12 @@ describe('[fix-D] --all resolves >50 tests: chunked batch requests, aggregated r
     );
 
     expect(batchCallCount).toBe(2);
-    expect(
-      stderrLines.some(l => l.includes('triggered more than once') && l.includes('1 test')),
-    ).toBe(true);
+    // The second chunk's producer run is real, executing, and unpolled — the
+    // warning has to name its id, not just count it.
+    const warned = stderrLines.join('\n');
+    expect(warned).toContain('1 duplicate dispatch');
+    expect(warned).toContain('polling run_producer_call1, not polling run_producer_call2');
+    expect(warned).toContain('testsprite test cancel <run-id>');
   });
 });
 
@@ -4197,23 +4227,10 @@ describe('D3: batch rerun summary surfaces deferred + conflicts', () => {
   it('--wait JSON summary includes deferred/conflicts counts (no silent undercount)', async () => {
     const creds = makeCreds();
     // Initial dispatch: 1 accepted, 1 deferred, 1 conflict.
-    // D3 retry loop will fire (opts.wait=true). The retry request only ever
-    // re-asks about the still-deferred testId (test_deferred), so a
-    // realistic retry response never re-returns test_1 as newly accepted.
-    // All 3 retry attempts keep returning the same deferred entry so
-    // `deferred` never drains.
     const initialBatchResp: BatchRerunResponse = {
       accepted: [{ testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' }],
       deferred: [{ testId: 'test_deferred', reason: 'rate_limited' }],
       conflicts: [{ testId: 'test_conf', currentRunId: 'run_conf' }],
-      closure: { byProject: [] },
-    };
-    // Retry responses: keep returning 1 deferred so the loop exhausts
-    // MAX_DEFERRED_RETRIES and falls through. No new accepted entries.
-    const retryBatchResp: BatchRerunResponse = {
-      accepted: [],
-      deferred: [{ testId: 'test_deferred', reason: 'rate_limited' }],
-      conflicts: [],
       closure: { byProject: [] },
     };
     let batchCallCount = 0;
@@ -4224,7 +4241,7 @@ describe('D3: batch rerun summary surfaces deferred + conflicts', () => {
     const fetchImpl = makeFetch(url => {
       if (url.includes('/tests/batch/rerun')) {
         batchCallCount++;
-        return { status: 202, body: batchCallCount === 1 ? initialBatchResp : retryBatchResp };
+        return { status: 202, body: initialBatchResp };
       }
       if (url.includes('/runs/run_b1')) return { body: run1 };
       return errorBody('NOT_FOUND');
@@ -4258,14 +4275,11 @@ describe('D3: batch rerun summary surfaces deferred + conflicts', () => {
       // exit 7 expected (deferred still present after retries) — printed first.
     }
 
-    // D3 loop ran all 3 retries: 1 initial + 3 retries = 4 total batch calls.
-    expect(batchCallCount).toBe(4);
+    // The deferred id is reported, never resent: one batch call.
+    expect(batchCallCount).toBe(1);
 
     const withSummary = printed.find(p => p.summary);
     expect(withSummary).toBeDefined();
-    // After D3 retries: accepted = 1 entry (test_1 from the initial dispatch;
-    // retries never re-return it). deferred = 1 (still undrained). conflicts
-    // = 1 (from initial).
     expect(withSummary!.summary).toMatchObject({
       passed: 1,
       failed: 0,
@@ -4817,295 +4831,6 @@ describe('G1d: BE rerun stderr summary splits producers and teardowns', () => {
 });
 
 // ---------------------------------------------------------------------------
-// [P1] rerun --all D3 deferred-retry: conflicts discovered on retry must be
-// merged into the running conflicts collection and appear in the final JSON.
-// ---------------------------------------------------------------------------
-
-describe('[codex-P1] rerun --all deferred-retry: retry-conflicts merged into final accounting', () => {
-  // Note: D3 retry loop is in the BATCH path. The single-testId path does not
-  // have deferred/conflict semantics (it calls POST /tests/{id}/runs/rerun, not
-  // the batch endpoint). Use two testIds (or --all) to exercise the batch path.
-
-  it('deferred→conflict on retry: JSON conflicts includes retry-discovered entry; exits 6 when all paths resolve to conflict', async () => {
-    const creds = makeCreds();
-
-    // Initial batch: 2 IDs submitted → 1 deferred, 0 accepted, 0 initial conflicts.
-    const initialBatchResp: BatchRerunResponse = {
-      accepted: [],
-      deferred: [{ testId: 'test_id_a', reason: 'rate_limited' }],
-      conflicts: [{ testId: 'test_id_b', currentRunId: 'run_b_inflight' }],
-      closure: { byProject: [] },
-    };
-    // Retry: the deferred test is now in-flight (conflict).
-    const retryBatchResp: BatchRerunResponse = {
-      accepted: [],
-      deferred: [],
-      conflicts: [{ testId: 'test_id_a', currentRunId: 'run_a_inflight' }],
-      closure: { byProject: [] },
-    };
-
-    let batchCallCount = 0;
-    const printed: Array<Record<string, unknown>> = [];
-    const stderrLines: string[] = [];
-
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCallCount++;
-        return { status: 202, body: batchCallCount === 1 ? initialBatchResp : retryBatchResp };
-      }
-      return {
-        status: 404,
-        body: {
-          error: {
-            code: 'NOT_FOUND',
-            message: 'not found',
-            nextAction: '',
-            requestId: 'r',
-            details: {},
-          },
-        },
-      };
-    });
-
-    try {
-      await runTestRerun(
-        {
-          // Two IDs → batch path (D3 retry loop active)
-          testIds: ['test_id_a', 'test_id_b'],
-          all: false,
-          wait: true,
-          timeoutSeconds: 300,
-          autoHeal: false,
-          autoHealExplicit: false,
-          skipDependencies: false,
-          maxConcurrency: 10,
-          output: 'json',
-          profile: 'default',
-          dryRun: false,
-          debug: false,
-          verbose: false,
-        },
-        {
-          ...creds,
-          sleep: instantSleep,
-          fetchImpl,
-          stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-          stderr: line => stderrLines.push(line),
-        },
-      );
-      throw new Error('Expected runTestRerun to throw exit 6');
-    } catch (err) {
-      // After D3 retry drains deferred→conflict: accepted=0, conflicts≥2 → exit 6
-      expect((err as ApiError).exitCode).toBe(6);
-    }
-
-    // The retry must have fired (at least 2 batch calls).
-    expect(batchCallCount).toBeGreaterThanOrEqual(2);
-
-    // The JSON output must carry BOTH the initial conflict AND the retry-discovered conflict
-    // (before fix the retry conflict was logged but not merged into the running conflicts var).
-    const withConflicts = printed.find(
-      p => Array.isArray(p.conflicts) && (p.conflicts as unknown[]).length > 0,
-    );
-    expect(withConflicts).toBeDefined();
-    const conflictIds = (withConflicts?.conflicts as Array<{ testId: string }>).map(c => c.testId);
-    // Both the initial conflict and the retry-discovered one must appear
-    expect(conflictIds).toContain('test_id_b'); // initial
-    expect(conflictIds).toContain('test_id_a'); // discovered on retry
-
-    // The stderr must log the conflict from the retry attempt
-    expect(stderrLines.some(l => l.includes('[deferred-retry]') && l.includes('conflict'))).toBe(
-      true,
-    );
-  });
-
-  it('partial deferred→conflict + accepted: retry-conflict appears in JSON summary.conflicts; exits 7 due to still-deferred', async () => {
-    const creds = makeCreds();
-
-    // Initial: 1 accepted, 2 deferred, 0 initial conflicts.
-    const initialBatchResp: BatchRerunResponse = {
-      accepted: [{ testId: 'test_ok', runId: 'run_ok', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-      deferred: [
-        { testId: 'test_deferred_a', reason: 'rate_limited' },
-        { testId: 'test_deferred_b', reason: 'rate_limited' },
-      ],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-    // Retry: one deferred accepted, one becomes conflict, one remains deferred (keeps looping).
-    const retryBatchResp: BatchRerunResponse = {
-      accepted: [
-        { testId: 'test_deferred_a', runId: 'run_da', enqueuedAt: '2026-06-09T10:00:01.000Z' },
-      ],
-      deferred: [{ testId: 'test_deferred_b', reason: 'rate_limited' }],
-      conflicts: [{ testId: 'test_deferred_newly_conflicted', currentRunId: 'run_inflight_c' }],
-      closure: { byProject: [] },
-    };
-
-    let batchCallCount = 0;
-    const printed: Array<Record<string, unknown>> = [];
-    const terminalRun = makeTerminalRun('run_ok', 'passed');
-    terminalRun.testId = 'test_ok';
-    const terminalRunDa = makeTerminalRun('run_da', 'passed');
-    terminalRunDa.testId = 'test_deferred_a';
-
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCallCount++;
-        return { status: 202, body: batchCallCount === 1 ? initialBatchResp : retryBatchResp };
-      }
-      if (url.includes('/runs/run_ok')) return { body: terminalRun };
-      if (url.includes('/runs/run_da')) return { body: terminalRunDa };
-      return {
-        status: 404,
-        body: {
-          error: {
-            code: 'NOT_FOUND',
-            message: 'not found',
-            nextAction: '',
-            requestId: 'r',
-            details: {},
-          },
-        },
-      };
-    });
-
-    try {
-      await runTestRerun(
-        {
-          testIds: ['test_ok', 'test_deferred_a', 'test_deferred_b'],
-          all: false,
-          wait: true,
-          timeoutSeconds: 10,
-          autoHeal: false,
-          autoHealExplicit: false,
-          skipDependencies: false,
-          maxConcurrency: 10,
-          output: 'json',
-          profile: 'default',
-          dryRun: false,
-          debug: false,
-          verbose: false,
-        },
-        {
-          ...creds,
-          sleep: instantSleep,
-          fetchImpl,
-          stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-          stderr: () => undefined,
-        },
-      );
-      throw new Error('Expected runTestRerun to throw exit 7 (still-deferred)');
-    } catch (err) {
-      // Still deferred after all retries → exit 7
-      expect((err as ApiError).exitCode).toBe(7);
-    }
-
-    const withSummary = printed.find(p => p.summary);
-    expect(withSummary).toBeDefined();
-    // Retry-discovered conflict must appear in summary.conflicts
-    expect((withSummary?.summary as Record<string, number>).conflicts).toBeGreaterThanOrEqual(1);
-    // Retry-discovered conflict must appear in the JSON conflicts array
-    const conflictIds = (withSummary?.conflicts as Array<{ testId: string }>).map(c => c.testId);
-    expect(conflictIds).toContain('test_deferred_newly_conflicted');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// [P2] rerun --all D3: idempotency key truncation stays ≤ 256 chars
-// ---------------------------------------------------------------------------
-
-describe('[codex-P2] rerun --all deferred-retry: idempotency key truncation', () => {
-  // Note: idempotency-key truncation only applies on the BATCH path (two+ IDs).
-  it('retry key does not exceed 256 chars when base key is at the 256-char limit', async () => {
-    const creds = makeCreds();
-
-    const longKey = 'k'.repeat(256);
-
-    const initialBatchResp: BatchRerunResponse = {
-      accepted: [{ testId: 'test_ok', runId: 'run_ok', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-      deferred: [{ testId: 'test_deferred', reason: 'rate_limited' }],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-    const retryBatchResp: BatchRerunResponse = {
-      accepted: [
-        { testId: 'test_deferred', runId: 'run_d', enqueuedAt: '2026-06-09T10:00:00.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-
-    const capturedKeys: string[] = [];
-    let batchCallCount = 0;
-    const terminalRunOk = makeTerminalRun('run_ok', 'passed');
-    terminalRunOk.testId = 'test_ok';
-    const terminalRunD = makeTerminalRun('run_d', 'passed');
-    terminalRunD.testId = 'test_deferred';
-
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        const key = (init.headers as Record<string, string>)?.['idempotency-key'] ?? '';
-        capturedKeys.push(key);
-        batchCallCount++;
-        return { status: 202, body: batchCallCount === 1 ? initialBatchResp : retryBatchResp };
-      }
-      if (url.includes('/runs/run_ok')) return { body: terminalRunOk };
-      if (url.includes('/runs/run_d')) return { body: terminalRunD };
-      return {
-        status: 404,
-        body: {
-          error: {
-            code: 'NOT_FOUND',
-            message: 'not found',
-            nextAction: '',
-            requestId: 'r',
-            details: {},
-          },
-        },
-      };
-    });
-
-    // Two testIds → batch path (D3 retry loop active)
-    await runTestRerun(
-      {
-        testIds: ['test_ok', 'test_deferred'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 300,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-        maxConcurrency: 10,
-        output: 'json',
-        profile: 'default',
-        dryRun: false,
-        debug: false,
-        verbose: false,
-        idempotencyKey: longKey,
-      },
-      {
-        ...creds,
-        sleep: instantSleep,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-      },
-    );
-
-    // All keys must be ≤ 256 chars
-    expect(capturedKeys.length).toBeGreaterThanOrEqual(2);
-    for (const key of capturedKeys) {
-      expect(key.length).toBeLessThanOrEqual(256);
-    }
-    // The retry key must differ from the base (suffix appended) but still fit
-    expect(capturedKeys[1]).not.toBe(longKey);
-    expect(capturedKeys[1]).toContain('deferred-retry');
-  });
-});
-
-// ---------------------------------------------------------------------------
 // [codex-P2] Finding 2 — rerun batch: return value === printed state
 //
 // `runTestRerun` (batch path) must return an object whose accepted/deferred/
@@ -5210,278 +4935,6 @@ describe('[codex-P2] batch rerun return value == printed state (non-wait)', () =
         : 0;
       expect(batchResult.accepted.length).toBe(printedAccepted);
     }
-  });
-});
-
-describe('[codex-P2] batch rerun --wait return value == printed state after D3 retry', () => {
-  it('return value conflicts includes retry-discovered conflict (mirrors printed JSON)', async () => {
-    const creds = makeCreds();
-
-    // Initial: 2 deferred, 0 accepted, 0 conflicts
-    const initialResp: BatchRerunResponse = {
-      accepted: [],
-      deferred: [
-        { testId: 'test_a', reason: 'rate_limited' },
-        { testId: 'test_b', reason: 'rate_limited' },
-      ],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-    // Retry: one accepted, one becomes conflict
-    const retryResp: BatchRerunResponse = {
-      accepted: [{ testId: 'test_a', runId: 'run_a', enqueuedAt: '2026-06-09T10:00:01.000Z' }],
-      deferred: [],
-      conflicts: [{ testId: 'test_b', currentRunId: 'run_b_inflight' }],
-      closure: { byProject: [] },
-    };
-
-    let batchCallCount = 0;
-    const terminalA = makeTerminalRun('run_a', 'passed');
-    terminalA.testId = 'test_a';
-    const printed: Array<Record<string, unknown>> = [];
-
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCallCount++;
-        return { status: 202, body: batchCallCount === 1 ? initialResp : retryResp };
-      }
-      if (url.includes('/runs/run_a')) return { body: terminalA };
-      return {
-        status: 404,
-        body: {
-          error: { code: 'NOT_FOUND', message: 'nf', nextAction: '', requestId: 'r', details: {} },
-        },
-      };
-    });
-
-    const result = (await runTestRerun(
-      {
-        testIds: ['test_a', 'test_b'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 300,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-        maxConcurrency: 10,
-        output: 'json',
-        profile: 'default',
-        dryRun: false,
-        debug: false,
-        verbose: false,
-      },
-      {
-        ...creds,
-        sleep: instantSleep,
-        fetchImpl,
-        stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-        stderr: () => undefined,
-      },
-    )) as BatchRerunResponse | undefined;
-
-    // The printed JSON (summary payload) must include the retry-discovered conflict
-    const withSummary = printed.find(p => p.summary);
-    expect(withSummary).toBeDefined();
-    expect((withSummary!.summary as Record<string, number>).conflicts).toBeGreaterThanOrEqual(1);
-
-    const conflictIds = (withSummary!.conflicts as Array<{ testId: string }>).map(c => c.testId);
-    expect(conflictIds).toContain('test_b');
-
-    // The RETURN VALUE must also carry the retry-discovered conflict
-    if (result !== undefined && result !== null && 'conflicts' in result) {
-      const retConflicts = (result as BatchRerunResponse).conflicts.map(c => c.testId);
-      expect(retConflicts).toContain('test_b');
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// [codex-P2] Finding 3 — rerun batch retry loop: notFound[] from retry merged
-//
-// When a deferred test becomes un-replayable during the retry window (the
-// server returns it in notFound[]), the CLI must:
-//   1. Merge it into the running notFound set used for stderr + JSON output.
-//   2. Not report it as "resolved" (i.e. not leave it in deferred or silently drop it).
-//   3. Surface it in the final JSON payload and summary.notFound count.
-// ---------------------------------------------------------------------------
-
-describe('[codex-P2] batch rerun deferred→notFound on retry surfaces in JSON + stderr', () => {
-  it('deferred test that becomes notFound on retry appears in JSON notFound[] and stderr [warn]', async () => {
-    const creds = makeCreds();
-
-    // Initial: 1 accepted, 1 deferred
-    const initialResp: BatchRerunResponse = {
-      accepted: [{ testId: 'test_ok', runId: 'run_ok', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-      deferred: [{ testId: 'test_deleted', reason: 'rate_limited' }],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-    // Retry: the deferred test vanished (notFound), nothing newly accepted
-    const retryResp: BatchRerunResponse = {
-      accepted: [],
-      deferred: [],
-      conflicts: [],
-      closure: { byProject: [] },
-      notFound: ['test_deleted'],
-    };
-
-    let batchCallCount = 0;
-    const terminalOk = makeTerminalRun('run_ok', 'passed');
-    terminalOk.testId = 'test_ok';
-    const printed: Array<Record<string, unknown>> = [];
-    const stderrLines: string[] = [];
-
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCallCount++;
-        return { status: 202, body: batchCallCount === 1 ? initialResp : retryResp };
-      }
-      if (url.includes('/runs/run_ok')) return { body: terminalOk };
-      return {
-        status: 404,
-        body: {
-          error: { code: 'NOT_FOUND', message: 'nf', nextAction: '', requestId: 'r', details: {} },
-        },
-      };
-    });
-
-    await runTestRerun(
-      {
-        testIds: ['test_ok', 'test_deleted'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 300,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-        maxConcurrency: 10,
-        output: 'json',
-        profile: 'default',
-        dryRun: false,
-        debug: false,
-        verbose: false,
-      },
-      {
-        ...creds,
-        sleep: instantSleep,
-        fetchImpl,
-        stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-        stderr: line => stderrLines.push(line),
-      },
-    );
-
-    // D3 retry must have been attempted (batchCallCount >= 2)
-    expect(batchCallCount).toBeGreaterThanOrEqual(2);
-
-    // The final JSON payload (with summary) must carry notFound
-    const withSummary = printed.find(p => p.summary);
-    expect(withSummary).toBeDefined();
-    const notFoundArr = withSummary!.notFound;
-    expect(Array.isArray(notFoundArr)).toBe(true);
-    expect(notFoundArr as string[]).toContain('test_deleted');
-
-    // summary.notFound must be non-zero
-    expect((withSummary!.summary as Record<string, number>).notFound).toBeGreaterThanOrEqual(1);
-
-    // stderr must contain a [warn] or [deferred-retry] message about the deleted test
-    const hasNotFoundWarn = stderrLines.some(
-      l => l.includes('test_deleted') && (l.includes('not found') || l.includes('warn')),
-    );
-    expect(hasNotFoundWarn).toBe(true);
-  });
-
-  it('deferred test that becomes notFound is removed from deferred (not double-counted)', async () => {
-    const creds = makeCreds();
-
-    // Initial: 2 deferred, 0 accepted → D3 retry fires under --wait.
-    const initialResp: BatchRerunResponse = {
-      accepted: [],
-      deferred: [
-        { testId: 'test_stays_deferred', reason: 'rate_limited' },
-        { testId: 'test_vanishes', reason: 'rate_limited' },
-      ],
-      conflicts: [],
-      closure: { byProject: [] },
-    };
-    // Retry: one stays deferred, one becomes notFound.
-    const retryResp: BatchRerunResponse = {
-      accepted: [],
-      deferred: [{ testId: 'test_stays_deferred', reason: 'rate_limited' }],
-      conflicts: [],
-      closure: { byProject: [] },
-      notFound: ['test_vanishes'],
-    };
-
-    let batchCallCount = 0;
-    const printed: Array<Record<string, unknown>> = [];
-    const stderrLines: string[] = [];
-
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCallCount++;
-        return { status: 202, body: batchCallCount === 1 ? initialResp : retryResp };
-      }
-      return {
-        status: 404,
-        body: {
-          error: { code: 'NOT_FOUND', message: 'nf', nextAction: '', requestId: 'r', details: {} },
-        },
-      };
-    });
-
-    try {
-      await runTestRerun(
-        {
-          testIds: ['test_stays_deferred', 'test_vanishes'],
-          all: false,
-          wait: true,
-          timeoutSeconds: 300,
-          autoHeal: false,
-          autoHealExplicit: false,
-          skipDependencies: false,
-          maxConcurrency: 10,
-          output: 'json',
-          profile: 'default',
-          dryRun: false,
-          debug: false,
-          verbose: false,
-        },
-        {
-          ...creds,
-          sleep: instantSleep,
-          fetchImpl,
-          stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-          stderr: line => stderrLines.push(line),
-        },
-      );
-      throw new Error('Expected exit 7 (still deferred)');
-    } catch (err) {
-      expect((err as { exitCode?: number }).exitCode).toBe(7);
-    }
-
-    // D3 retry must have been attempted.
-    expect(batchCallCount).toBeGreaterThanOrEqual(2);
-
-    // With accepted=0 the function prints { ...batchResp, accepted, deferred, conflicts, notFound }
-    // via `out.print(...)` and then throws exit 7 — no `summary` key on this path.
-    // Look for the printed payload directly.
-    expect(printed.length).toBeGreaterThanOrEqual(1);
-    const payload = printed[printed.length - 1]!;
-
-    // The printed payload must have notFound containing test_vanishes
-    expect(Array.isArray(payload.notFound)).toBe(true);
-    expect(payload.notFound as string[]).toContain('test_vanishes');
-
-    // test_vanishes must NOT appear in the deferred array (it moved to notFound)
-    const deferredIds = (payload.deferred as Array<{ testId: string }>).map(d => d.testId);
-    expect(deferredIds).not.toContain('test_vanishes');
-
-    // test_stays_deferred must still be in deferred
-    expect(deferredIds).toContain('test_stays_deferred');
-
-    // stderr must mention test_vanishes in a [deferred-retry] notFound warning
-    const hasWarn = stderrLines.some(l => l.includes('test_vanishes'));
-    expect(hasWarn).toBe(true);
   });
 });
 
@@ -5861,10 +5314,71 @@ describe('[finding-4] single FE rerun --wait: TimeoutError writes partial JSON t
 });
 
 // ---------------------------------------------------------------------------
-// DEV-331 piece 1 — graceful detach during batch rerun --wait (SIG-6)
+// Graceful detach during batch rerun --wait
 // ---------------------------------------------------------------------------
 
-describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatched runIds (DEV-331)', () => {
+describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatched runIds', () => {
+  it('marks a dispatched rerun for recovery guidance on fan-out interruption', async () => {
+    const creds = makeCreds();
+    const interruption = new InterruptError('SIGINT');
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0]) => {
+      if (String(input).includes('/tests/batch/rerun')) {
+        return new Response(
+          JSON.stringify({
+            accepted: [
+              { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+              { testId: 'test_2', runId: 'run_b2', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+            ],
+            deferred: [],
+            conflicts: [],
+            closure: { byProject: [] },
+          }),
+          { status: 202 },
+        );
+      }
+      if (/\/tests\/[^/]+$/.test(String(input)))
+        return new Response(JSON.stringify({ type: 'backend', projectId: 'project_1' }));
+      if (String(input).endsWith('/projects/project_1/env'))
+        return new Response(JSON.stringify({ environments: [] }));
+      throw interruption;
+    }) as FetchImpl;
+    const error = await runTestRerun(
+      {
+        testIds: ['test_1', 'test_2'],
+        all: false,
+        wait: true,
+        timeoutSeconds: 30,
+        autoHeal: false,
+        autoHealExplicit: false,
+        skipDependencies: false,
+        maxConcurrency: 1,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      {
+        ...creds,
+        fetchImpl,
+        shutdown: new ShutdownController(),
+        stdout: line => stdout.push(line),
+        stderr: line => stderr.push(line),
+      },
+    ).catch((err: unknown) => err);
+    expect(error).toBe(interruption);
+    expect((error as InterruptError).runWaitContext).toBe(true);
+    expect(JSON.parse(stdout.at(-1)!) as unknown).toMatchObject({
+      accepted: [
+        { testId: 'test_1', runId: 'run_b1', status: 'running' },
+        { testId: 'test_2', runId: 'run_b2', status: 'running' },
+      ],
+    });
+    expect(stderr.join('\n')).toContain('testsprite test wait run_b1');
+  });
+
   it('interrupt mid fan-out → stdout partial covers every accepted runId, honest stderr, exit 130', async () => {
     const creds = makeCreds();
     const shutdown = new ShutdownController();
@@ -5892,6 +5406,10 @@ describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatc
           headers: { 'content-type': 'application/json' },
         });
       }
+      if (/\/tests\/[^/]+$/.test(url))
+        return new Response(JSON.stringify({ type: 'backend', projectId: 'project_1' }));
+      if (url.endsWith('/projects/project_1/env'))
+        return new Response(JSON.stringify({ environments: [] }));
       return new Promise<Response>((_resolve, reject) => {
         const signal = init.signal;
         const rejectWithReason = (): void => {
@@ -5938,8 +5456,9 @@ describe('R-BAT: batch rerun --wait — InterruptError partial lists all dispatc
     const err = await pending.catch(e => e);
     expect(err).toBeInstanceOf(InterruptError);
     expect((err as InterruptError).exitCode).toBe(130);
+    expect((err as InterruptError).runWaitContext).toBe(true);
 
-    // SIG-6: the partial lists ALL dispatched runIds, marked running.
+    // The partial lists ALL dispatched runIds, marked running.
     const stdoutJson = JSON.parse(stdoutLines.join('\n')) as {
       accepted: Array<{ runId: string; status: string }>;
     };
@@ -6162,10 +5681,10 @@ describe('rerun --gh-output / --summary-file require a batch --wait (Gap B guard
 });
 
 // ---------------------------------------------------------------------------
-// DEV-1305 — `test rerun --env <name>`
+// `test rerun --env <name>`
 // ---------------------------------------------------------------------------
 
-describe('runTestRerun — --env (DEV-1305)', () => {
+describe('runTestRerun — --env', () => {
   const ME_ON = { userId: 'u_1' };
 
   interface Seen {
@@ -6274,5 +5793,129 @@ describe('runTestRerun — --env (DEV-1305)', () => {
     const rerun = seen.find(s => s.method === 'POST');
     expect(rerun?.body).toEqual({ source: 'cli', autoHeal: false });
     expect(seen.some(s => s.url.endsWith('/me'))).toBe(false);
+  });
+});
+
+it('uses polled run timing for batch rerun JUnit without changing JSON', async () => {
+  const reportFile = join(mkdtempSync(join(tmpdir(), 'rerun-junit-timing-')), 'report.xml');
+  const stdout: string[] = [];
+  await runTestRerun(
+    {
+      testIds: ['test_a', 'test_b'],
+      all: false,
+      wait: true,
+      timeoutSeconds: 600,
+      autoHeal: false,
+      autoHealExplicit: false,
+      skipDependencies: false,
+      maxConcurrency: 5,
+      output: 'json',
+      profile: 'default',
+      debug: false,
+      projectId: 'project_abc',
+      report: 'junit',
+      reportFile,
+    },
+    {
+      ...makeCreds(),
+      fetchImpl: makeFetch((url, init) => {
+        if (init.method === 'POST')
+          return {
+            body: {
+              accepted: [
+                { testId: 'test_a', runId: 'run_a', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+                { testId: 'test_b', runId: 'run_b', enqueuedAt: '2026-06-03T10:00:00.000Z' },
+              ],
+              conflicts: [],
+              deferred: [],
+              notFound: [],
+              closure: { byProject: [] },
+            },
+          };
+        if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
+        const runId = url.includes('run_a') ? 'run_a' : 'run_b';
+        return {
+          body: {
+            ...makeTerminalRun(runId, 'passed'),
+            startedAt: runId === 'run_a' ? null : '2026-06-03T10:00:05.000Z',
+          },
+        };
+      }),
+      stdout: line => stdout.push(line),
+      stderr: () => {},
+      sleep: instantSleep,
+    },
+  );
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads the JUnit report this test wrote to its own temp dir, never user input
+  const xml = readFileSync(reportFile, 'utf8');
+  expect(xml).toContain('skipped="0" time="55">');
+  expect(xml).toContain('testId="test_a" runId="run_a" time="30">');
+  expect(xml).toContain('testId="test_b" runId="run_b" time="25">');
+  expect(stdout[0]).not.toContain('durationSeconds');
+  expect(stdout[0]).not.toContain('createdAt');
+});
+
+// ---------------------------------------------------------------------------
+// A deferral from an older backend is reported, never resent.
+// ---------------------------------------------------------------------------
+
+describe('rerun --all --wait: deferred[] from an older backend is reported, not resent', () => {
+  it('sends one dispatch, never sleeps for the old resend, awaits the accepted run, exits 7', async () => {
+    const creds = makeCreds();
+    let posts = 0;
+    const sleeps: number[] = [];
+    const stderrLines: string[] = [];
+    const run1 = makeTerminalRun('run_b1', 'passed');
+    run1.testId = 'test_1';
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') {
+        posts++;
+        return {
+          status: 202,
+          body: {
+            accepted: [
+              { testId: 'test_1', runId: 'run_b1', enqueuedAt: '2026-10-22T10:00:00.000Z' },
+            ],
+            deferred: [{ testId: 'test_deferred', reason: 'rate_limited' }],
+            conflicts: [],
+            closure: { byProject: [] },
+          } satisfies BatchRerunResponse,
+        };
+      }
+      if (url.includes('/runs/run_b1')) return { body: run1 };
+      return errorBody('NOT_FOUND');
+    });
+    await expect(
+      runTestRerun(
+        {
+          testIds: ['test_1', 'test_deferred'],
+          all: false,
+          wait: true,
+          timeoutSeconds: 600,
+          autoHeal: false,
+          autoHealExplicit: false,
+          skipDependencies: false,
+          maxConcurrency: 10,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        {
+          ...creds,
+          fetchImpl,
+          sleep: async ms => {
+            sleeps.push(ms);
+          },
+          stdout: () => undefined,
+          stderr: line => stderrLines.push(line),
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 7 });
+    expect(posts).toBe(1);
+    expect(sleeps.filter(ms => ms >= 60_000)).toEqual([]);
+    expect(stderrLines.join('\n')).not.toContain('[deferred-retry]');
+    expect(stderrLines.join('\n')).toContain('test_deferred');
   });
 });

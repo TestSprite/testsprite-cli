@@ -4,7 +4,14 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [main, dev, stg]
+    branches: [main, dev, stg, 'backport/public-wave-**']
+  # backport/public-wave-** — same reason as ci.yml (see its comment): a
+  # deploy-key push from auto-backport.yml lands here as a real push event,
+  # which is what lets this job's check satisfy the dev branch ruleset (a
+  # workflow_dispatch re-drive cannot, per GitHub's docs, which is why this
+  # workflow no longer has that trigger). The only event-conditional step
+  # (the PR comment) already gates on github.event_name == 'pull_request'
+  # and simply skips for a push, wave branch or otherwise.
 
 permissions:
   contents: read

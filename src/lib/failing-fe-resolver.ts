@@ -51,7 +51,7 @@ export interface ResolverOptions {
    */
   maxPages?: number;
   /**
-   * DEV-393: the operator's pinned `failingFrontendTestId` (the static value
+   * The operator's pinned `failingFrontendTestId` (the static value
    * from fixtures.local.json). "Freshest failed" alone is fragile in a shared
    * project: any OTHER FE test that fails more recently than a dedicated,
    * permanently-red fixture silently steals the slot (live-reproduced
@@ -85,7 +85,7 @@ export async function resolveFailingFrontendTestId(opts: ResolverOptions): Promi
   const { baseUrl, apiKey, projectId, maxPages = 5, preferredId } = opts;
   const fetchImpl = opts.fetchImpl ?? fetch;
 
-  // DEV-393 (codex F3): probe the pinned fixture directly first, so the
+  // Probe the pinned fixture directly first, so the
   // preference cannot be defeated by the maxPages list-scan cap (a pinned
   // fixture beyond page `maxPages` would otherwise silently lose the slot to
   // an incidental fresher failure). Any probe error or non-failed status
@@ -103,7 +103,7 @@ export async function resolveFailingFrontendTestId(opts: ResolverOptions): Promi
       });
       if (resp.ok) {
         const test = (await resp.json()) as Partial<TestListItem> & { projectId?: string };
-        // The probe must honor the resolver's project scope (codex round 2):
+        // The probe must honor the resolver's project scope:
         // the list path filters by projectId server-side, so a pin that
         // points at a failed FE test in a DIFFERENT project must not win
         // here either. A response without a matching projectId (absent or
@@ -186,7 +186,7 @@ export async function resolveFailingFrontendTestId(opts: ResolverOptions): Promi
     };
   }
 
-  // DEV-393: a pinned, dedicated "always red" fixture wins over freshest
+  // A pinned, dedicated "always red" fixture wins over freshest
   // whenever it is still in the failed set — see the doc comment on
   // ResolverOptions.preferredId for why "freshest" alone is not enough.
   if (preferredId) {

@@ -16,6 +16,17 @@ can agree on the approach before you invest time — see CONTRIBUTING.md.
      community PRs unless the title starts with `docs`: claim an eligible issue
      with `/assign` first. See CONTRIBUTING.md → Contribution model. -->
 
+## Season 4 CLI Improvement Bonus
+
+<!-- Entering the Season 4 hackathon CLI bonus (Oct 16–29)? Tick the box and
+     add your Discord username so we can reach you (not on Discord? leave it
+     blank and we'll reach you on this PR). A bot confirms the entry in a
+     comment. Not entering? Leave this section as it is. -->
+
+- [ ] I'm entering this PR for the Season 4 CLI Improvement Bonus
+
+Discord username:
+
 ## Type of change
 
 - [ ] Bug fix (non-breaking change that fixes an issue)

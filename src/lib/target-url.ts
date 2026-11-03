@@ -36,7 +36,7 @@ import { ApiError } from './errors.js';
 // the rest of `127.0.0.0/8`, which `--local` cannot dial by name at all. See
 // `'loopback-other'` below for that distinction.
 const LOCAL_DEV_RUNTIME_HINT =
-  "This looks like a local-dev target. Run it with `testsprite test run <test-id> --local <port>` instead — it tunnels this machine's loopback address to the test runner (frontend tests only; requires an API key with the `run:tunnel` scope).";
+  "This looks like a local-dev target. Save `--url http://localhost:<port>` on an environment, then run `testsprite test run <test-id> --env <name>` — it tunnels this machine's loopback address to the test runner (frontend tests only; requires an API key with the `run:tunnel` scope).";
 
 // Creation-time callers that take a per-run target (`test create
 // --target-url`, which only applies with `--run`). A project or environment
@@ -47,8 +47,8 @@ const LOCAL_DEV_RUNTIME_HINT =
 const LOCAL_DEV_BOOTSTRAP_HINT =
   'TestSprite executes tests from the cloud, so the runner needs an address it can reach: ' +
   'a deployed or staging URL. For an app that only runs on this machine, create the project ' +
-  'or environment with `--local <port>` instead of a URL, then run with ' +
-  '`testsprite test run <test-id> --local <port>`.';
+  'or environment with `--url http://localhost:<port>`, then run with ' +
+  '`testsprite test run <test-id> --env <name>`.';
 
 /**
  * `0.0.0.0` / `::` bind every interface, so an app listening there IS reachable
@@ -59,7 +59,7 @@ const UNSPECIFIED_ADDRESS_REASON =
   'the unspecified address (0.0.0.0 / ::) is not allowed — use 127.0.0.1 or ::1 instead';
 
 const LOCAL_PROJECT_CREATE_HINT =
-  'Use --local <port> instead of --url for an app on this machine. ' +
+  'Use --url http://localhost:<port> for an app on this machine. ' +
   'Local projects are frontend-only and require the V3 project platform.';
 
 type TargetUrlHintContext = 'runtime' | 'bootstrap' | 'local-project-create';
@@ -236,12 +236,12 @@ export function disallowedIpReason(host: string): DisallowedIpClassification | u
 
 function disallowedIpv4Reason(address: string): DisallowedIpClassification | undefined {
   // Unspecified — binds every interface, including loopback. Named precisely
-  // rather than lumped in as "localhost" (DEV-1305): since a loopback URL is
-  // now a legitimate STORED target, calling `0.0.0.0` a localhost target
-  // produced a self-contradicting refusal — "localhost targets are not
-  // allowed" above a hint saying to use `localhost`. It is also simply not
-  // loopback: the server refuses it as a stored URL, so the accurate remedy is
-  // the loopback address the app is also reachable on.
+  // rather than lumped in as "localhost": since a loopback URL is now a
+  // legitimate STORED target, calling `0.0.0.0` a localhost target produced a
+  // self-contradicting refusal — "localhost targets are not allowed" above a
+  // hint saying to use `localhost`. It is also simply not loopback: the
+  // server refuses it as a stored URL, so the accurate remedy is the loopback
+  // address the app is also reachable on.
   if (address === '0.0.0.0') {
     return { reason: UNSPECIFIED_ADDRESS_REASON, hintKind: 'loopback' };
   }
@@ -308,7 +308,7 @@ function disallowedIpv4Reason(address: string): DisallowedIpClassification | und
  *
  * This is the SAME primitive `src/vendor/tunnel-client/client.ts`'s
  * `blockedTargetReason` already uses for the identical problem (see its
- * VENDOR.md deltas #7/#10) — the two host classifiers in this repo now
+ * VENDOR.md upstreamed entries #7/#10) — the two host classifiers in this repo now
  * share one mechanism instead of two independently maintained spelling
  * lists, so a future NAT64-shaped bypass can't reopen only one of them.
  *

@@ -1,5 +1,5 @@
 /**
- * `doctor` — the Local tunnel check (DEV-747 piece 3).
+ * `doctor` — the Local tunnel check.
  *
  * The check exists for one concrete failure: `run:tunnel` is the first scope
  * ever deliberately excluded from the grandfather grant, so every key minted
@@ -16,7 +16,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { ApiError, CLIError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
 import { runDoctor } from './doctor.js';
 
 type FetchInput = Parameters<typeof globalThis.fetch>[0];
@@ -66,6 +66,55 @@ async function tunnelCheck(status: number, body: unknown) {
 }
 
 describe('doctor — Local tunnel', () => {
+  it('propagates an interrupted connectivity request instead of reporting a failure', async () => {
+    const interrupt = new InterruptError('SIGINT');
+    const result = await runDoctor(
+      { profile: 'default', output: 'json', debug: false },
+      {
+        ...makeCreds(),
+        fetchImpl: async () => {
+          throw interrupt;
+        },
+        stdout: () => {},
+        stderr: () => {},
+      },
+    ).catch((error: unknown) => error);
+
+    expect(result).toBe(interrupt);
+  });
+
+  it('aborts and propagates an interrupted tunnel probe', async () => {
+    const shutdown = new AbortController();
+    let markProbeStarted!: () => void;
+    const probeStarted = new Promise<void>(resolve => {
+      markProbeStarted = resolve;
+    });
+    const fetchImpl = (async (input: FetchInput, init?: RequestInit): Promise<Response> => {
+      if (!String(input).includes('/tunnel/')) {
+        return new Response('{"userId":"u1"}', { status: 200 });
+      }
+      markProbeStarted();
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+      });
+    }) as typeof globalThis.fetch;
+    const pending = runDoctor(
+      { profile: 'default', output: 'json', debug: false },
+      {
+        ...makeCreds(),
+        fetchImpl,
+        shutdownSignal: shutdown.signal,
+        stdout: () => {},
+        stderr: () => {},
+      },
+    ).catch((error: unknown) => error);
+
+    await probeStarted;
+    const interrupt = new InterruptError('SIGTERM');
+    shutdown.abort(interrupt);
+    expect(await pending).toBe(interrupt);
+  });
+
   it('is OK when the surface answers a read (404 for an id nobody owns)', async () => {
     const check = await tunnelCheck(404, envelope('NOT_FOUND'));
     expect(check?.status).toBe('ok');
@@ -78,6 +127,8 @@ describe('doctor — Local tunnel', () => {
     // The whole reason the check exists: the remedy is a NEW key, not a
     // re-login, and nothing else in the CLI says so.
     expect(check?.detail).toMatch(/new API key/i);
+    expect(check?.detail).toContain('run:tunnel');
+    expect(check?.detail).not.toContain('predates');
   });
 
   it('warns — never fails — when the environment has no tunnel surface', async () => {

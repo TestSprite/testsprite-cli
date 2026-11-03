@@ -1,5 +1,5 @@
 /**
- * Local e2e for `project docs upload <file>` (DEV-384 piece V3-D).
+ * Local e2e for `project docs upload <file>`.
  *
  * Spawns the real built binary (`dist/index.js`) against a single local HTTP
  * stub that plays BOTH sides of the three-step flow:

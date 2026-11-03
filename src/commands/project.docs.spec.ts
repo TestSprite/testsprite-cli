@@ -1,14 +1,14 @@
 /**
- * Unit tests for `project docs upload <file>` (DEV-384 piece V3-D).
+ * Unit tests for `project docs upload <file>`.
  *
- * The command drives the three-step presigned-S3 flow against the V3-A facade:
+ * The command drives the three-step presigned-S3 flow against the docs facade:
  *   1. POST /projects/{id}/docs/upload-url  → { uploadUrl, s3Key, expiresInSeconds }
  *   2. HTTP PUT the file bytes to uploadUrl (streamed, never buffered)
  *   3. POST /projects/{id}/docs             → { resourceId, displayName, docRole, processStatus }
  *
  * Everything here runs against an injected fetchImpl — no network, no creds.
  */
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -603,10 +603,15 @@ describe('runDocsUpload — local validation (exit 5, zero network)', () => {
   }
 
   it('missing file → exit 5', async () => {
-    await expectLocalRejection(
-      { file: join(tmpdir(), 'definitely-not-there-xyz.json') },
-      /does not exist|not found|no such file/i,
-    );
+    const missingDir = mkdtempSync(join(tmpdir(), 'cli-docs-upload-missing-'));
+    try {
+      await expectLocalRejection(
+        { file: join(missingDir, 'definitely-not-there-xyz.json') },
+        /does not exist|not found|no such file/i,
+      );
+    } finally {
+      rmSync(missingDir, { recursive: true, force: true });
+    }
   });
 
   it('empty file → exit 5', async () => {
@@ -632,8 +637,7 @@ describe('runDocsUpload — local validation (exit 5, zero network)', () => {
     );
   });
 
-  // DEV-384 review F5 — docs upload must honor TESTSPRITE_PROJECT_ID like
-  // every other command.
+  // docs upload must honor TESTSPRITE_PROJECT_ID like every other command.
   it('picks up TESTSPRITE_PROJECT_ID when --project is absent', async () => {
     const { credentialsPath } = makeCreds();
     const { path } = makeFile('openapi.json', '{"openapi":"3.1.0"}');
@@ -670,7 +674,7 @@ describe('runDocsUpload — local validation (exit 5, zero network)', () => {
   });
 });
 
-describe('runDocsUpload — presigned-URL guard (DEV-384 review F3)', () => {
+describe('runDocsUpload — presigned-URL guard', () => {
   /** Creds pointing at a REMOTE facade (the guard is active). */
   function makeRemoteCreds(): { credentialsPath: string } {
     const dir = mkdtempSync(join(tmpdir(), 'cli-docs-remote-'));
@@ -931,10 +935,13 @@ describe('runDocsUpload — dry-run (zero network, stat only)', () => {
   it('dry-run still fails fast on a missing file (stat is allowed)', async () => {
     const { credentialsPath } = makeCreds();
     const { fetchImpl, calls } = makeDocsFetch();
+    const missingDir = mkdtempSync(join(tmpdir(), 'cli-docs-upload-dryrun-missing-'));
     const err = await runDocsUpload(
-      baseOpts({ file: join(tmpdir(), 'nope-dry-run.json'), dryRun: true }),
+      baseOpts({ file: join(missingDir, 'nope-dry-run.json'), dryRun: true }),
       { credentialsPath, fetchImpl },
-    ).catch((e: unknown) => e);
+    )
+      .catch((e: unknown) => e)
+      .finally(() => rmSync(missingDir, { recursive: true, force: true }));
     expect((err as ApiError).exitCode).toBe(5);
     expect(calls).toHaveLength(0);
   });

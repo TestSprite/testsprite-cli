@@ -1,5 +1,5 @@
 /**
- * Generation-ladder driver for `test plan generate` (DEV-384 V3-B).
+ * Generation-ladder driver for `test plan generate`.
  *
  * This is a NEW loop, deliberately not a reuse of `poll.ts`: the run poller
  * is hard-typed to runs (its `RunClient` contract, `isTerminalStatus` check,
@@ -14,7 +14,7 @@
  *  - **The shutdown handle is armed here** for the whole ladder (first POST
  *    included). Arm/disarm lives inside the run poller, not for free in the
  *    harness — without arming, Ctrl-C during a generate wait would hard-kill
- *    the process instead of running the honest-detach UX (DEV-331).
+ *    the process instead of running the honest-detach UX.
  *  - Long-poll preferred (`?waitSeconds = min(remaining, 25)`), with a
  *    plain-GET + fixed-sleep fallback when the server rejects `waitSeconds`
  *    with VALIDATION_ERROR (older deployment).
@@ -27,7 +27,7 @@
  *    a single `.any()` per session (it still calls it); only http.ts
  *    eliminated it outright (`composeAbortSignals`). This module composes
  *    explicitly, like http.ts — don't go hunting for a poll.ts replacement
- *    that isn't there (DEV-384 review F12).
+ *    that isn't there.
  *    A hung fetch can never overrun `--timeout` and an interrupt aborts the
  *    in-flight request instantly.
  *  - Every sleep is clamped to the remaining deadline and bails on interrupt.
@@ -119,7 +119,7 @@ export interface PlanLadderOptions {
   /** Injectable sleep (tests use an instant fake). */
   sleep?: (ms: number) => Promise<void>;
   /**
-   * Graceful-detach coordinator (DEV-331). The ladder arms it for its whole
+   * Graceful-detach coordinator. The ladder arms it for its whole
    * duration; a SIGINT/SIGTERM surfaces as `InterruptError` out of this
    * function and the caller renders the honest detach.
    */
@@ -151,11 +151,11 @@ export interface PlanLadderResult {
   /** How many trigger POSTs were accepted (stages this invocation started). */
   acceptedPosts: number;
   /**
-   * DEV-1008 — `skippedCategories` from the accepted trigger that carried it
-   * (the proposals rung), or `null` when no accepted trigger did. Read from
-   * the LAST such trigger, not `firstTrigger`: on a fresh backend project
-   * the first accepted POST starts strategy, and the field rides only on
-   * the proposals POST that follows.
+   * `skippedCategories` from the accepted trigger that carried it (the
+   * proposals rung), or `null` when no accepted trigger did. Read from the
+   * LAST such trigger, not `firstTrigger`: on a fresh backend project the
+   * first accepted POST starts strategy, and the field rides only on the
+   * proposals POST that follows.
    */
   skippedCategories: number | null;
 }
@@ -178,8 +178,8 @@ export const MAX_ACCEPTED_TRIGGER_POSTS = PLAN_GENERATION_STAGES.length;
 /**
  * Companion cap on TOTAL trigger POSTs (attaches included), so an
  * attach-dominated pathological sequence also fails fast instead of
- * silently burning the whole `--timeout` (DEV-384 review): the accepted
- * rungs + headroom for an attach per rung.
+ * silently burning the whole `--timeout`: the accepted rungs + headroom for
+ * an attach per rung.
  */
 export const MAX_TRIGGER_POSTS_TOTAL = PLAN_GENERATION_STAGES.length * 2;
 
@@ -303,10 +303,10 @@ async function ladderLoop(
   };
 
   const doTrigger = async (): Promise<TriggerOutcome> => {
-    // Fresh idempotency namespace per POST attempt — ATTACHES INCLUDED
-    // (DEV-384 review): a 409's key is never committed server-side, but
-    // reusing it would silently depend on that; a fresh key never can.
-    // Transport-level retries inside one POST still share the header.
+    // Fresh idempotency namespace per POST attempt — ATTACHES INCLUDED: a
+    // 409's key is never committed server-side, but reusing it would
+    // silently depend on that; a fresh key never can. Transport-level
+    // retries inside one POST still share the header.
     const key =
       state.triggerPosts === 0
         ? options.idempotencyKey
@@ -418,8 +418,8 @@ async function ladderLoop(
       if (isActiveGenerationStatus(status)) {
         state.observedActiveSinceTrigger = true;
         // Seeing the proposals stage RUN arms billing guard #1 regardless of
-        // who started it (DEV-384 review — the 409-attach path has no trigger
-        // response to arm it from).
+        // who started it — the 409-attach path has no trigger response to
+        // arm it from.
         if (status === 'proposing') state.proposalsObserved = true;
         state.consecutiveIdleGaps = 0;
         // Long-poll mode: the server already waited for us — loop immediately.
@@ -447,7 +447,7 @@ async function ladderLoop(
       // waitSeconds hold for an ACTIVE generation status (`getPlans` guards
       // its wait loop with `waitSeconds && isActiveGenerationStatus(...)`),
       // so an idle read returns immediately and an unpaced loop here would
-      // hammer the facade (DEV-384 review F13).
+      // hammer the facade.
       //
       // Billing guard #1: once the proposals rung is known to have started —
       // our own trigger said so (`stagesRemaining: []`) OR we watched it run
@@ -485,11 +485,10 @@ async function ladderLoop(
           error: {
             code: 'INTERNAL',
             message:
-              `Plan generation appears stuck: ${state.triggerPosts} trigger request(s) ` +
-              `(${state.acceptedPosts} accepted) but the server still reports no staged ` +
-              `proposals and nothing running.`,
+              `Plan generation is not making progress after ${state.triggerPosts} ` +
+              `${state.triggerPosts === 1 ? 'try' : 'tries'}: nothing new is staged and no stage is running.`,
             nextAction:
-              'Retry later or check the project in the Portal. If this persists, report the requestId to support@testsprite.com.',
+              'Wait a few minutes, then run the same command again. If this keeps happening, check the project in the Portal or contact support@testsprite.com.',
             requestId: 'local',
             details: {
               projectId,

@@ -855,7 +855,7 @@ describe('runList', () => {
     expect(out).toContain('antigravity');
     expect(out).toContain('kiro');
     expect(out).toContain('codex');
-    // DEV-279: maturity is a name tag now, not a STATUS/MODE column.
+    // Maturity is a name tag now, not a STATUS/MODE column.
     expect(out).toContain('cursor (exp.)');
     expect(out).not.toContain('claude (exp.)'); // claude is GA — untagged
     expect(out).not.toContain('own-file');
@@ -892,8 +892,8 @@ describe('runList', () => {
 
     const json = JSON.parse(capture.stdout.join('\n')) as ListResult[];
     expect(Array.isArray(json)).toBe(true);
-    // 8 targets × 2 default skills = 16 rows
-    expect(json).toHaveLength(16);
+    // 8 targets × 3 default skills = 24 rows
+    expect(json).toHaveLength(24);
     const targets = json.map(r => r.target);
     expect(targets).toContain('claude');
     expect(targets).toContain('cursor');
@@ -987,7 +987,7 @@ describe('runInstall — output modes', () => {
 });
 
 // ---------------------------------------------------------------------------
-// runInstall — reload hint (DEV-279)
+// runInstall — reload hint
 // ---------------------------------------------------------------------------
 
 describe('runInstall — reload hint', () => {
@@ -1349,7 +1349,7 @@ describe('runInstall — all own-file targets', () => {
 // ---------------------------------------------------------------------------
 
 describe('runInstall — dry-run all own-file targets', () => {
-  it('writes nothing for any of the seven own-file targets (default 2 skills = 14 would-write lines)', async () => {
+  it('writes nothing for any of the seven own-file targets (default 3 skills = 21 would-write lines)', async () => {
     const { store, fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -1369,9 +1369,9 @@ describe('runInstall — dry-run all own-file targets', () => {
     const stderrOut = capture.stderr.join('\n');
     // Banner appears once
     expect(stderrOut).toContain('[dry-run] no files written');
-    // 7 targets × 2 default skills = 14 would-write lines
+    // 7 targets × 3 default skills = 21 would-write lines
     const wouldWriteLines = stderrOut.split('\n').filter(l => l.includes('would write'));
-    expect(wouldWriteLines.length).toBe(14);
+    expect(wouldWriteLines.length).toBe(21);
   });
 });
 
@@ -1496,7 +1496,7 @@ describe('runInstall — default AgentFs (real disk)', () => {
   // `fs.symlinkSync` needs elevated privileges or Developer Mode on Windows
   // (EPERM otherwise) — not guaranteed on hosted CI runners. The underlying
   // guard (`inspectTargetPath` fail-closing via `lstat`) is exercised on
-  // POSIX runners; TODO(DEV-356): revisit if/when a reliable Windows
+  // POSIX runners; TODO: revisit if/when a reliable Windows
   // symlink-creation path (junctions, or an elevated runner) is available.
   it.skipIf(process.platform === 'win32')(
     'refuses to write through a symlinked parent dir (real disk) — exit 5',
@@ -1796,7 +1796,7 @@ describe('runInstall — symlink safety', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Backup collision (regression for round-2 finding: don't clobber backups)
+// Backup collision (regression: don't clobber backups)
 // ---------------------------------------------------------------------------
 
 describe('runInstall — backup collision', () => {
@@ -2414,12 +2414,12 @@ describe('[P2] codex --dry-run: symlink fail-close (same guard as real install)'
 });
 
 // ---------------------------------------------------------------------------
-// [P3 round-2] codex --dry-run budget: measure the COMPOSED result, not
-// existing+section (replace must not double-count the old block), and surface
-// non-ENOENT read failures instead of treating them as absence.
+// codex --dry-run budget: measure the COMPOSED result, not existing+section
+// (replace must not double-count the old block), and surface non-ENOENT read
+// failures instead of treating them as absence.
 // ---------------------------------------------------------------------------
 
-describe('[P3 round-2] codex --dry-run: composed-size precision + read-failure surfacing', () => {
+describe('codex --dry-run: composed-size precision + read-failure surfacing', () => {
   const BASE_OPTS_DRY = {
     profile: 'default' as const,
     output: 'text' as const,
@@ -2559,14 +2559,14 @@ describe('runInstall — multi-skill: default install writes BOTH skills (own-fi
     );
 
     const json = JSON.parse(capture.stdout.join('\n')) as InstallResult[];
-    expect(json.length).toBe(2);
+    expect(json.length).toBe(3);
     for (const r of json) {
       expect(Array.isArray(r.skills)).toBe(true);
       expect(r.skills.length).toBe(1);
     }
   });
 
-  it('text output FORMAT is unchanged: one row per result (target padEnd(12) action padEnd(12) path), 2 rows for default install', async () => {
+  it('text output FORMAT is unchanged: one row per result (target padEnd(12) action padEnd(12) path), 3 rows for default install', async () => {
     const { fs: agentFs } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -2584,7 +2584,7 @@ describe('runInstall — multi-skill: default install writes BOTH skills (own-fi
 
     const lines = capture.stdout.join('\n').split('\n').filter(Boolean);
     // 2 results → 2 lines
-    expect(lines.length).toBe(2);
+    expect(lines.length).toBe(3);
     // Each line has target, action, and path
     for (const line of lines) {
       expect(line).toContain('claude');
@@ -2788,7 +2788,7 @@ describe('runInstall — multi-skill: unknown --skill exits 5', () => {
 });
 
 describe('runInstall — multi-skill: multi-target own-file with default skills', () => {
-  it('default install to claude + cursor writes 4 files (2 targets × 2 skills)', async () => {
+  it('default install to claude + cursor writes 6 files (2 targets × 3 skills)', async () => {
     const { store, fs: agentFs, writeCalls } = makeMemFs();
     const { capture, deps } = makeCapture();
 
@@ -2818,21 +2818,23 @@ describe('runInstall — multi-skill: multi-target own-file with default skills'
     }
 
     const json = JSON.parse(capture.stdout.join('\n')) as InstallResult[];
-    expect(json.length).toBe(4);
+    expect(json.length).toBe(6);
     expect(json.every(r => r.action === 'written')).toBe(true);
   });
 });
 
 describe('runInstall — SKILLS registry / DEFAULT_SKILLS contract', () => {
-  it('DEFAULT_SKILLS contains exactly testsprite-verify and testsprite-onboard', () => {
+  it('DEFAULT_SKILLS contains exactly testsprite-verify, testsprite-onboard and testsprite-ci', () => {
     expect(DEFAULT_SKILLS).toContain('testsprite-verify');
     expect(DEFAULT_SKILLS).toContain('testsprite-onboard');
-    expect(DEFAULT_SKILLS.length).toBe(2);
+    expect(DEFAULT_SKILLS).toContain('testsprite-ci');
+    expect(DEFAULT_SKILLS.length).toBe(3);
   });
 
-  it('SKILLS registry contains both skills with required fields', () => {
+  it('SKILLS registry contains all three skills with required fields', () => {
     expect(SKILLS['testsprite-verify']).toBeDefined();
     expect(SKILLS['testsprite-onboard']).toBeDefined();
+    expect(SKILLS['testsprite-ci']).toBeDefined();
     for (const [name, spec] of Object.entries(SKILLS)) {
       expect(spec.name).toBe(name);
       expect(typeof spec.description).toBe('string');
@@ -2881,8 +2883,8 @@ describe('runStatus — agent status (issue #123)', () => {
   });
 
   // Sweeps every target rather than a sample: the compactBody ones (windsurf,
-  // copilot) read `stale` on a pristine install until DEV-672, and a future
-  // compactBody target is covered the day it is added.
+  // copilot) are the shape that misreported stale right after a fresh
+  // install, and a future compactBody target is covered the day it is added.
   it('fresh installs read ok — every target, own-file and codex managed section', async () => {
     const { fs: agentFs } = makeMemFs();
     const { deps } = makeCapture();
@@ -2911,7 +2913,7 @@ describe('runStatus — agent status (issue #123)', () => {
 
   // Inverse of the sweep above: on a compactBody target the FULL body is not
   // canonical, so an artifact carrying its hash must still read stale.
-  it('compact-body target: an artifact rendered from the FULL body still reads stale (DEV-672)', async () => {
+  it('compact-body target: an artifact rendered from the FULL body still reads stale', async () => {
     const { fs: agentFs, seedFile } = makeMemFs();
     const fullBody = loadSkillBodyFor('testsprite-verify');
     seedFile(
@@ -2932,8 +2934,9 @@ describe('runStatus — agent status (issue #123)', () => {
   });
 
   // Both non-ok states run against a full-body target AND a compactBody one:
-  // windsurf is the shape DEV-672 broke, and the field case is an outdated
-  // COMPACT body on disk, not the full-body artifact the guard above seeds.
+  // windsurf is the compactBody shape that needs its own coverage, and the
+  // field case is an outdated COMPACT body on disk, not the full-body
+  // artifact the guard above seeds.
   const NON_OK_TARGETS: AgentTarget[] = ['claude', 'windsurf'];
 
   it.each(NON_OK_TARGETS)(
@@ -2962,10 +2965,10 @@ describe('runStatus — agent status (issue #123)', () => {
   );
 
   // `agent status`'s error line sends the user to `agent install --force`. On a
-  // compact target under DEV-672 that was a dead end — install saw the file as
+  // compact target that used to be a dead end — install saw the file as
   // current and skipped it, status still said stale — so pin that the remedy
   // now clears the state it is printed for.
-  it('stale on a compact target: install --force clears it (DEV-672)', async () => {
+  it('stale on a compact target: install --force clears it', async () => {
     const { fs: agentFs, seedFile } = makeMemFs();
     const oldBody = '# TestSprite Verification Loop\n\nold body from a previous CLI release\n';
     const windsurfVerify = (rows: StatusResult[]): string | undefined =>

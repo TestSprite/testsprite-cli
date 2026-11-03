@@ -5,7 +5,7 @@
 
  */
 
-import type { RunConflict } from './conflict-reason.js';
+import type { ConflictReason, RunConflict } from './conflict-reason.js';
 
 /** Literal body sent to `POST /api/cli/v1/tests/{testId}/runs`. */
 export interface TriggerRunBody {
@@ -14,7 +14,7 @@ export interface TriggerRunBody {
   /** Optional override for the project's configured target URL. */
   targetUrl?: string;
   /**
-   * DEV-747: id of a tunnel client minted through `POST /api/cli/v1/tunnel`.
+   * Id of a tunnel client minted through `POST /api/cli/v1/tunnel`.
    *
    * An ID, never a proxy string — the caller does not choose the proxy host.
    * The server loads the binding, checks it belongs to the calling principal
@@ -25,13 +25,35 @@ export interface TriggerRunBody {
    */
   tunnelClientId?: string;
   /**
-   * DEV-1305: the NAME of the project environment whose credentials, auto-auth
-   * and OTP settings this run should use (`unique(project_id, name)` server
-   * side). Absent → the project's default environment, exactly as before.
-   * Composes with `targetUrl`/`tunnelClientId`: those pick WHERE the browser
-   * goes, this picks WHOSE credentials it logs in with.
+   * May the agent re-author this test when its stored code no longer
+   * executes?
+   *
+   * OMITTED on purpose whenever auto-heal is on. The field is tri-state on the
+   * wire and the CLI only ever sends one of its three states: `false`, for
+   * `--no-auto-heal`. Absent means "heal, but replay a user-authored body
+   * rather than rewriting it" — the server-side default — and sending an
+   * explicit `true` would mean something DIFFERENT and worse here: an
+   * unconditional heal that re-authors code the user wrote. So the default is
+   * expressed by saying nothing, which also means an older backend (the field
+   * is stripped by `whitelist: true`, never 400'd) behaves exactly as it does
+   * today for the default case.
+   */
+  autoHeal?: false;
+
+  /**
+   * The NAME of the project environment whose credentials, auto-auth and OTP
+   * settings this run should use (`unique(project_id, name)` server side).
+   * Absent → the project's default environment, exactly as before. Composes
+   * with `targetUrl`/`tunnelClientId`: those pick WHERE the browser goes,
+   * this picks WHOSE credentials it logs in with.
    */
   environment?: string;
+  /**
+   * BE only: run just the named test without expanding the producer/teardown
+   * closure. Sent only when the caller asked for it (never `false`); an older
+   * backend strips the field, so omitting it is the default on the wire.
+   */
+  skipDependencies?: boolean;
 }
 
 /** The environment a run resolved to — its credentials, its config, its address. */
@@ -48,10 +70,13 @@ export interface RunEnvironmentRef {
 
 /**
  * Body sent to `POST /api/cli/v1/tests/{testId}/runs/rerun`.
- * No `targetUrl` — rerun replays against the project's configured URL.
+ * Tunnel replay includes the saved environment URL verbatim; ordinary replay
+ * uses the configured URL.
  * `source` must be "cli" (not "cli-rerun" — that is not a valid RUN_SOURCES value).
  */
 export interface RerunRequest {
+  tunnelClientId?: string;
+  targetUrl?: string;
   source: 'cli';
   /** Opt into AI heal-on-drift. Paid + FE only. Server tier-gates and echoes effective value. */
   autoHeal?: boolean;
@@ -98,6 +123,7 @@ export interface RerunAdvisory {
  * `runId` is always non-null (minted synchronously before async invoke).
  */
 export interface RerunResponse {
+  tunnelClientId?: string;
   /** The named test's runId (minted synchronously before async Lambda invoke). */
   runId: string;
   status: 'queued';
@@ -129,6 +155,8 @@ export interface RerunResponse {
  * Mixed FE/BE testIds allowed; BE closure deduped server-side per project.
  */
 export interface BatchRerunRequest {
+  tunnelClientId?: string;
+  targetUrl?: string;
   source: 'cli';
   testIds: string[];
   autoHeal?: boolean;
@@ -151,10 +179,17 @@ export interface BatchRerunDeferred {
   reason: string;
 }
 
-/** One conflicted (already in-flight) testId in the batch rerun response. */
+/**
+ * One testId in the batch rerun response that did not dispatch.
+ *
+ * `currentRunId` is present only when the refusal points at a run already in
+ * flight; otherwise `reason` says why it did not start.
+ */
 export interface BatchRerunConflict {
   testId: string;
-  currentRunId: string;
+  currentRunId?: string;
+  reason?: ConflictReason;
+  message?: string;
 }
 
 /** Per-project closure summary in the batch rerun response. */
@@ -185,6 +220,7 @@ export interface BatchRerunClosure {
  *   chunked dispatch requests (see `dedupeRerunAdvisories` in `commands/test.ts`).
  */
 export interface BatchRerunResponse {
+  tunnelClientId?: string;
   accepted: BatchRerunAccepted[];
   deferred: BatchRerunDeferred[];
   conflicts: BatchRerunConflict[];
@@ -198,9 +234,20 @@ export interface BatchRerunResponse {
  * All fields are stamped at trigger time and cannot change for this runId.
  */
 export interface TriggerRunResponse {
+  tunnelClientId?: string;
   runId: string;
   status: 'queued';
   enqueuedAt: string;
+  /**
+   * The EFFECTIVE heal decision the server made for this run.
+   *
+   * OPTIONAL on purpose, and the absence is the load-bearing case: the backend
+   * runs `whitelist: true`, so a CLI sending `autoHeal` to a server that
+   * predates the field has it silently STRIPPED and the run heals anyway. An
+   * absent echo is how the CLI learns it is talking to such a server and that
+   * `--no-auto-heal` did nothing — without it the opt-out is unfalsifiable.
+   */
+  autoHeal?: boolean;
   /** codeVersion resolved at trigger time from the test row. */
   codeVersion: string;
   /** Resolved target URL (project default when --target-url absent). */
@@ -222,6 +269,12 @@ export interface TriggerRunResponse {
    * run has no execution page). Same present-or-absent contract.
    */
   executionUrl?: string;
+  /**
+   * `true` exactly when the request carried `skipDependencies: true` and this
+   * backend handled it; otherwise OMITTED. A CLI that sent the flag and gets no
+   * echo was served by a backend that stripped it and ran the full closure.
+   */
+  skipDependencies?: boolean;
 }
 
 /**
@@ -304,6 +357,12 @@ export interface RunResponse {
   error: string | null;
   videoUrl: string | null;
   stepSummary: RunStepSummary;
+  /**
+   * How the stored code was routed. `path: 'refused'` means the run was
+   * blocked before dispatch because the stored code could not be replayed;
+   * `reason` names why. Absent on older backends.
+   */
+  replay?: { path: string; reason?: string | null; caveat?: string | null };
   /** Optional hint from the server; honored by the polling loop. */
   retryAfterSeconds?: number;
   /**
@@ -343,7 +402,7 @@ export interface RunResponse {
 }
 
 // ---------------------------------------------------------------------------
-// DEV-331 piece 3 — cancel wire types
+// Cancel wire types
 // ---------------------------------------------------------------------------
 
 /** Credit outcome returned when cancellation applies V3 frontend billing rules. */
@@ -462,6 +521,11 @@ export interface RunHistoryMeta {
   note?: string;
   /** Portal URL where older run history can be viewed. */
   portalUrl?: string;
+  /** Plan-limited history details; absent on older backends and V2. */
+  tier?: string;
+  retentionDays?: number | null;
+  hiddenCount?: number;
+  billingUrl?: string;
 }
 
 /**
@@ -484,7 +548,7 @@ export interface ListRunsQuery {
   source?: RunSource;
   /** ISO timestamp (after client-side duration parsing). */
   since?: string;
-  /** DEV-1306: only runs whose credentials came from this environment (by name). */
+  /** Only runs whose credentials came from this environment (by name). */
   environment?: string;
 }
 
@@ -497,16 +561,51 @@ export interface ListRunsQuery {
  * BE-only engine — FE tests in the set are skipped server-side (advisory only).
  * `testIds` absent / empty → run ALL BE tests in the project.
  */
+/**
+ * Where a `ci run` came from on GitHub, read off the Actions event. Stamped on
+ * the execution so the Portal can link the run back to its pull request.
+ */
+export interface CiGithubTrigger {
+  repoOwner: string;
+  repoName: string;
+  branchName?: string;
+  /** 40-hex commit the preview was built from. */
+  commitSha?: string;
+  prNumber: number;
+}
+
 export interface BatchRunFreshRequest {
   projectId: string;
   testIds?: string[];
   source: 'cli';
+  /** See `TriggerRunBody.autoHeal`, including why `true` is never sent. */
+  autoHeal?: false;
   /** See `TriggerRunBody.environment` — applied to every test in the batch. */
   environment?: string;
+  /** See `TriggerRunBody.skipDependencies` — applies to every BE test in the batch. */
+  skipDependencies?: boolean;
+  /** Per-run URL override for the batch; echoed when the backend honors it. */
+  targetUrl?: string;
+  /**
+   * `'all'`: the server seeds every selected case into one execution and
+   * paces dispatch itself (as for a GitHub App run) instead of cutting the
+   * selection to the per-key budget and returning the rest as `deferred`.
+   * Default `'budget'` is today's behaviour. Echoed when honored.
+   */
+  admission?: 'budget' | 'all';
+  /** `github-pr-<N>`: run in a temporary clone of `environment` at `targetUrl`. Echoed when honored. */
+  previewName?: string;
+  githubTrigger?: CiGithubTrigger;
 }
 
 /** One accepted run in the batch fresh-run response. */
 export interface BatchRunFreshAccepted {
+  /**
+   * The `test_execution.id` this run was dispatched under (V3-served runs
+   * only; absent on a V2 backend). One execution usually covers the whole
+   * batch — `ci run` de-duplicates it to read the execution report.
+   */
+  executionId?: string;
   testId: string;
   /**
    * runId minted synchronously by `claimRunSlotOrThrow`. The backend partitions
@@ -536,6 +635,8 @@ export interface BatchRunFreshAccepted {
  */
 export interface BatchRunFreshResponse {
   accepted: BatchRunFreshAccepted[];
+  /** See `TriggerRunResponse.autoHeal`; absence means the same thing. */
+  autoHeal?: boolean;
   /**
    * A run-slot conflict. `currentRunId`, when present, is the id of the run
    * ALREADY in flight for this test — under `--wait` the CLI polls it to a
@@ -547,6 +648,13 @@ export interface BatchRunFreshResponse {
   skippedFrontend: string[];
   skippedIntegration: Array<{ testId: string }>;
   /**
+   * Backend projects only: the integration phase that follows the wave.
+   * `existing` integration tests run after it (0.2 credits each);
+   * `mayGenerate` means a first run may also generate new ones. Absent on
+   * older backends and for frontend projects.
+   */
+  integration?: { existing: number; runsAfterWave: boolean; mayGenerate: boolean };
+  /**
    * Project-level portal link the batch closes with ("watch it here"). Same
    * absent-vs-present contract as the per-run `dashboardUrl`: ABSENT ⇒ an older
    * backend (or the V2 engine, whose live page is the CLI's own
@@ -556,4 +664,69 @@ export interface BatchRunFreshResponse {
    * nothing rather than a dead link.
    */
   dashboardUrl?: string | null;
+  /**
+   * Exact echo of the request's `targetUrl` when the backend read the override.
+   * A missing or different echo makes the CLI refuse the batch rather than
+   * report a verdict for an unconfirmed target.
+   */
+  targetUrl?: string;
+  /** Echoes, same contract as `targetUrl`: absent means this backend never read the field. */
+  admission?: 'budget' | 'all';
+  previewName?: string;
+  /** See `TriggerRunResponse.skipDependencies`; same present-or-omitted contract. */
+  skipDependencies?: boolean;
+}
+
+// ─── Execution report (GET /tests/executions/{executionId}/report) ───────────
+
+/** One row of an execution report — one `test_result` of that execution. */
+export interface ExecutionReportTest {
+  /** The `test_result.id` (the CLI's run id). */
+  id: string;
+  title: string;
+  /** Display id of the case (e.g. `AUTH-002`); null when unresolved. */
+  slug: string | null;
+  status: 'PASSED' | 'FAILED' | 'BLOCKED' | (string & {});
+  /** Presigned PNG of a step snapshot; null when unavailable. */
+  screenshotUrl: string | null;
+  /** Raw failure text; set for FAILED rows. */
+  error: string | null;
+  /** Suggested fix prompt; set for FAILED rows. */
+  fix: string | null;
+  /** This result's own Portal page (`…/execution/{eid}/test/{rid}`). */
+  resultUrl?: string;
+}
+
+/**
+ * The execution report the GitHub App posts as its PR comment — the server's
+ * content model, returned verbatim so a later CI step can shape it itself.
+ */
+export interface ExecutionReport {
+  projectId: string;
+  executionId: string;
+  projectName: string;
+  orgId: string | null;
+  stats: { passed: number; failed: number; blocked: number; total: number };
+  allPassed: boolean;
+  /** Narrative run summary from the analyze pass; null when unavailable. */
+  narrative: string | null;
+  whatCouldBeBetter: string | null;
+  recommendedNextStep: string | null;
+  /** Ordered failed → blocked → passed. */
+  tests: ExecutionReportTest[];
+  /** The execution's Portal page. */
+  resultUrl: string;
+}
+
+/**
+ * `ready: false` means the execution is still running or its report is still
+ * being built (the build waits for the analyze pass); poll again after
+ * `retryAfterSeconds`. `report` and `markdown` are present only when ready.
+ */
+export interface ExecutionReportResponse {
+  ready: boolean;
+  retryAfterSeconds?: number;
+  report?: ExecutionReport;
+  /** The report rendered as GitHub-flavoured Markdown — the PR comment body. */
+  markdown?: string;
 }

@@ -14,26 +14,21 @@
  *   - Opt-out: skipped when `TESTSPRITE_NO_TELEMETRY` or the cross-tool
  *     `DO_NOT_TRACK` is set. Also skipped under `--dry-run` (no network) and
  *     when no leaf command actually ran (bare `--help` / parse errors).
- *   - Never on abort (SIGINT/SIGTERM): Ctrl-C must exit immediately, so the
- *     abort path emits nothing (awaiting would delay shutdown; fire-and-forget
- *     would be cut off before delivery anyway).
+ *   - On abort (SIGINT/SIGTERM) the event is still sent — `outcome: 'abort'`,
+ *     through the same bounded flush `index.ts` runs before setting the exit
+ *     code — and the extras the command recorded before the signal ride along
+ *     (a cancelled CI gate keeps its `gated` outcome and execution id).
  *
  * Privacy: the event is a fixed allowlist of low-cardinality, PII-free fields.
  * It NEVER carries target URLs, api keys, arg values, error messages, or
  * repository names — `errorCode` is a stable machine code, never the human
  * message, and the CI repository is reduced to a salted, truncated hash so
  * runs from one repo can be grouped without the slug ever leaving the runner.
- * `timeoutSeconds` is the one field derived from a flag, and it is allowed
- * for a narrow, checkable reason, not a case-by-case judgment call: it is the
- * literal integer value of `--timeout`/`--request-timeout` as typed by the
- * operator — not a path, not a URL, not free text, and not derived from
- * anything the target application returned. It carries no more information
- * than `exitCode` or `durationMs` already do, and is included so a `--wait`
- * timeout is distinguishable from a genuinely slow backend (see `errorOrigin`
- * below). Anyone auditing this allowlist can verify that reasoning against
- * the two call sites that set it (`RequestTimeoutError.timeoutMs`, and the
- * `ApiError` `details.timeoutSeconds` a `--wait` deadline conversion stamps)
- * without having to trust a one-off exception.
+ * Flag-derived values are limited to bounded numeric controls:
+ * `timeoutSeconds` is the operator's timeout (not a URL or free text) and
+ * distinguishes a wait deadline from a slow backend; `localConcurrencyLimit`
+ * is an integer 1–10 and lets local batch outcomes be grouped by load.
+ * `localPeakInFlight` is the observed count, also bounded by that limit.
  *
  * `errorOrigin` ('client' | 'server') and `timeoutSeconds` are sent by this
  * revision of the CLI. The telemetry endpoint validates against an allowlist
@@ -105,12 +100,8 @@ export interface TelemetryOutcomeInput extends Partial<WaitTimeoutTelemetry> {
   output?: string;
   dryRun?: boolean;
   /**
-   * True when the invocation requested a local tunnel target (`test run
-   * --local <port>`) — the flag's mere presence, never its port number or
-   * host. Reported regardless of outcome, including a zero-network refusal
-   * (dead port, `--local` combined with an incompatible flag): those are
-   * exactly the attempts nothing server-side ever sees, which is why this
-   * field is not redundant with a backend-side mint/attach analytics event.
+   * True when --local was present, including refusals and borrowed tunnels,
+   * or when this invocation automatically opened a saved-environment tunnel.
    */
   local?: boolean;
 }
@@ -216,18 +207,24 @@ export function buildCiContext(env: NodeJS.ProcessEnv): {
 export type TelemetryConflictReason =
   | 'in_flight'
   | 'insufficient_credits'
+  | 'paused'
   | 'billing_hold'
   | 'mcp_view_only'
   | 'local_address'
   | 'tunnel-required'
+  | 'no_producer'
+  | 'producer_in_flight'
   | 'error';
 
 /**
  * Low-cardinality facts a command records about its own outcome before it
  * returns, merged into the one event `index.ts` fires. Counts are non-negative
- * integers; enums are closed. Nothing here can carry an id, a URL, or a message.
+ * integers; enums are closed. Nothing here can carry a URL, a message, or an
+ * id that names a person or a repository — `executionId` is the server's own
+ * opaque UUID for the run, so the event can be joined to the execution's report.
  */
 export interface TelemetryExtras {
+  local?: boolean;
   /** Batch dispatch accounting (`test run --all`, `testlist run`). */
   accepted?: number;
   conflicts?: number;
@@ -238,6 +235,9 @@ export interface TelemetryExtras {
   failed?: number;
   blocked?: number;
   timedOut?: number;
+  /** Local tunnel pool limit (1–10) and observed peak, without ids or target details. */
+  localConcurrencyLimit?: number;
+  localPeakInFlight?: number;
   /** The most frequent conflict reason of the batch. */
   conflictReason?: TelemetryConflictReason;
   /** `ci init` facts. */
@@ -245,6 +245,49 @@ export interface TelemetryExtras {
   force?: boolean;
   workflowExisted?: boolean;
   projectResolved?: 'flag' | 'auto';
+  /** `ci run` facts: what the gate did, which execution it was, whether the report arrived. */
+  ciRunOutcome?: CiRunTelemetryOutcome;
+  executionId?: string;
+  reportReady?: boolean;
+}
+
+/**
+ * What a `ci run` invocation ended up doing. `gated` = tests were dispatched
+ * and the exit code is the verdict; `skipped_*` = nothing to gate (exit 0, no
+ * summary); `refused_*` = refused before or at dispatch; `empty` = nothing
+ * selected. The funnel step "`ci init` → first gated run" is computed from it.
+ */
+export type CiRunTelemetryOutcome =
+  | 'gated'
+  | 'skipped_draft'
+  | 'skipped_no_pr'
+  | 'refused_admission'
+  | 'refused_env'
+  | 'refused_preview_name'
+  | 'refused_loopback'
+  | 'refused_billing'
+  | 'refused_other'
+  | 'empty';
+
+/**
+ * The `ci run` outcome for an API refusal — at the environment pre-check or at
+ * the batch dispatch. Every refusal gets a value, so `refused_other` really is
+ * "any other refusal": a validation error is split by the server's
+ * `details.reason`; a 402/403 (credits, a feature gate) is `refused_billing`;
+ * a 401, 429 or anything else is `refused_other`.
+ */
+export function ciRefusalOutcome(err: {
+  code: string;
+  details?: Record<string, unknown>;
+}): CiRunTelemetryOutcome {
+  if (err.code === 'VALIDATION_ERROR') {
+    const reason = err.details?.reason;
+    if (reason === 'preview-name-taken') return 'refused_preview_name';
+    if (reason === 'private-or-local') return 'refused_loopback';
+    return 'refused_other';
+  }
+  if (err.code === 'INSUFFICIENT_CREDITS' || err.code === 'FEATURE_GATED') return 'refused_billing';
+  return 'refused_other';
 }
 
 /** What callers may hand the sanitizer: the typed shape, or an arbitrary bag it filters. */
@@ -259,22 +302,43 @@ const COUNT_KEYS = [
   'failed',
   'blocked',
   'timedOut',
+  'localConcurrencyLimit',
+  'localPeakInFlight',
 ] as const;
-const BOOLEAN_KEYS = ['force', 'workflowExisted'] as const;
-const ENUM_KEYS: { [K in 'conflictReason' | 'platform' | 'projectResolved']: ReadonlySet<string> } =
-  {
-    conflictReason: new Set<TelemetryConflictReason>([
-      'in_flight',
-      'insufficient_credits',
-      'billing_hold',
-      'mcp_view_only',
-      'local_address',
-      'tunnel-required',
-      'error',
-    ]),
-    platform: new Set(['github']),
-    projectResolved: new Set(['flag', 'auto']),
-  };
+const BOOLEAN_KEYS = ['force', 'workflowExisted', 'local', 'reportReady'] as const;
+/** Opaque server ids the beacon accepts — a UUID, nothing free-form. */
+const UUID_KEYS = ['executionId'] as const;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const ENUM_KEYS: {
+  [K in 'conflictReason' | 'platform' | 'projectResolved' | 'ciRunOutcome']: ReadonlySet<string>;
+} = {
+  conflictReason: new Set<TelemetryConflictReason>([
+    'in_flight',
+    'insufficient_credits',
+    'paused',
+    'billing_hold',
+    'mcp_view_only',
+    'local_address',
+    'tunnel-required',
+    'no_producer',
+    'producer_in_flight',
+    'error',
+  ]),
+  platform: new Set(['github']),
+  projectResolved: new Set(['flag', 'auto']),
+  ciRunOutcome: new Set<CiRunTelemetryOutcome>([
+    'gated',
+    'skipped_draft',
+    'skipped_no_pr',
+    'refused_admission',
+    'refused_env',
+    'refused_preview_name',
+    'refused_loopback',
+    'refused_billing',
+    'refused_other',
+    'empty',
+  ]),
+};
 
 /**
  * Keep only the allowlisted keys with a value of the right shape. Pure: this is
@@ -291,6 +355,10 @@ export function sanitizeTelemetryExtras(partial: TelemetryExtrasInput): Telemetr
   for (const key of BOOLEAN_KEYS) {
     const v = rec[key];
     if (typeof v === 'boolean') out[key] = v;
+  }
+  for (const key of UUID_KEYS) {
+    const v = rec[key];
+    if (typeof v === 'string' && UUID_RE.test(v)) out[key] = v;
   }
   for (const key of Object.keys(ENUM_KEYS) as Array<keyof typeof ENUM_KEYS>) {
     const v = rec[key];
@@ -313,6 +381,11 @@ let pendingExtras: TelemetryExtras = {};
  */
 export function recordTelemetryExtras(partial: TelemetryExtrasInput): void {
   pendingExtras = { ...pendingExtras, ...sanitizeTelemetryExtras(partial) };
+}
+
+/** Extend explicit --local telemetry to commands that automatically open a tunnel. */
+export function recordTelemetryTunnelOpened(opened: boolean): void {
+  if (opened) recordTelemetryExtras({ local: true });
 }
 
 /** Return everything recorded so far and clear the sink (one event per process). */
@@ -382,7 +455,7 @@ export interface TelemetryEvent extends Partial<WaitTimeoutTelemetry>, Telemetry
   nodeVersion?: string;
   output?: string;
   ci?: boolean;
-  /** Present (always `true`) only for a `test run --local` invocation; absent otherwise. */
+  /** Present (always `true`) for --local attempts or automatically opened tunnels. */
   local?: boolean;
   /** The validated `TESTSPRITE_CLIENT` tag (e.g. `github-action/v1`); absent when unset/invalid. */
   client?: string;
@@ -518,6 +591,8 @@ export function buildTelemetryEvent(
   extras: TelemetryExtrasInput = {},
 ): TelemetryEvent {
   const client = resolveClientTag(env);
+  const { local: runtimeLocal, ...sanitizedExtras } = sanitizeTelemetryExtras(extras);
+  const local = input.local === true || runtimeLocal === true;
   return {
     command: input.command,
     outcome: input.outcome,
@@ -533,11 +608,11 @@ export function buildTelemetryEvent(
     ci: isTruthyEnv(env.CI) || !isTTY,
     ...(client !== undefined ? { client } : {}),
     ...buildCiContext(env),
-    ...(input.local ? { local: true } : {}),
+    ...(local ? { local: true } : {}),
     ...(input.outcome === 'error' && input.reason === 'wait_timeout'
       ? {
           reason: 'wait_timeout',
-          ...(input.local &&
+          ...(local &&
           (input.cancelOutcome === 'cancelled' ||
             input.cancelOutcome === 'already_terminal' ||
             input.cancelOutcome === 'failed' ||
@@ -546,7 +621,7 @@ export function buildTelemetryEvent(
             : {}),
         }
       : {}),
-    ...sanitizeTelemetryExtras(extras),
+    ...sanitizedExtras,
   };
 }
 
@@ -562,8 +637,11 @@ export function resolveTelemetryAuth(
   opts: { profile?: string; endpointUrl?: string },
   deps: { env?: NodeJS.ProcessEnv; credentialsPath?: string } = {},
 ): ResolvedTelemetryAuth {
+  // No `?? 'default'`: `loadConfig` resolves the documented
+  // flag > TESTSPRITE_PROFILE > default order from the same env, and a
+  // pre-collapsed string here would hide the env var from it.
   const config = loadConfig({
-    profile: opts.profile ?? 'default',
+    profile: opts.profile,
     endpointUrl: opts.endpointUrl,
     env: deps.env ?? process.env,
     credentialsPath: deps.credentialsPath ?? defaultCredentialsPath(),
@@ -600,7 +678,7 @@ export async function recordOutcome(
     const config =
       deps.resolvedAuth ??
       loadConfig({
-        profile: input.profile ?? 'default',
+        profile: input.profile,
         endpointUrl: input.endpointUrl,
         env,
         credentialsPath: deps.credentialsPath ?? defaultCredentialsPath(),

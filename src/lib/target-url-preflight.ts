@@ -45,7 +45,8 @@
 
 import * as dns from 'node:dns';
 import { isIP } from 'node:net';
-import { ApiError } from './errors.js';
+import { ApiError, InterruptError } from './errors.js';
+import { globalShutdown, type ShutdownHandle } from './interrupt.js';
 import { isProxyAgentActive } from './proxy.js';
 import { disallowedIpReason } from './target-url.js';
 
@@ -59,6 +60,8 @@ export interface TargetUrlPreflightDeps {
   dnsLookup?: (hostname: string) => Promise<unknown>;
   /** HTTP probe hook. Defaults to the global `fetch`. Injectable for tests. */
   fetchImpl?: typeof fetch;
+  shutdownSignal?: AbortSignal;
+  shutdown?: Pick<ShutdownHandle, 'runCriticalOperation'>;
   /**
    * Whether a proxy dispatcher is actually installed for this process.
    * Defaults to `isProxyAgentActive()` (proxy.ts), which inspects the
@@ -121,10 +124,9 @@ function bareHost(hostname: string): string {
 
 /**
  * Probe `rawUrl` for the narrow refusal set described in the module
- * docstring. Pure decision function — never throws for a network failure
- * (every reachable failure classifies to `warn` or `refuse`); a malformed
- * URL degrades to `warn` rather than crashing (callers validate the URL
- * shape via `assertNotLocal` before this runs).
+ * docstring. Network failures classify to `warn` or `refuse`, while a process
+ * interruption propagates. A malformed URL degrades to `warn` rather than
+ * crashing (callers validate the URL shape via `assertNotLocal` before this runs).
  */
 export async function probeTargetUrl(
   rawUrl: string,
@@ -197,64 +199,74 @@ export async function probeTargetUrl(
   // configured — so this step (unlike the DNS step above) is proxy-aware
   // by construction, not just proxy-tolerant.
   const fetchImpl = deps.fetchImpl ?? fetch;
-  try {
-    const resp = await fetchImpl(rawUrl, {
-      method: 'GET',
-      // Never follow — see the module docstring. A 3xx is reachability
-      // proof on its own (handled immediately below); the redirect target
-      // is unvalidated and must not be dereferenced.
-      redirect: 'manual',
-      signal: AbortSignal.timeout(PREFLIGHT_TIMEOUT_MS),
-    });
-    // Never read the body — only the status matters here. Cancel it so the
-    // connection is released promptly instead of buffering a full page.
-    void resp.body?.cancel().catch(() => undefined);
-    if (resp.status >= 300 && resp.status < 400) {
-      // A redirect is a live-server signal (e.g. a real app 302ing an
-      // unauthenticated GET to a login page) — reachable, not refused. The
-      // Location header is deliberately never inspected or dereferenced.
+  const shutdownSignal = deps.shutdownSignal ?? globalShutdown.signal;
+  const shutdown = deps.shutdown ?? globalShutdown;
+  return shutdown.runCriticalOperation(async () => {
+    try {
+      const resp = await fetchImpl(rawUrl, {
+        method: 'GET',
+        // Never follow — see the module docstring. A 3xx is reachability
+        // proof on its own (handled immediately below); the redirect target
+        // is unvalidated and must not be dereferenced.
+        redirect: 'manual',
+        signal: AbortSignal.any([AbortSignal.timeout(PREFLIGHT_TIMEOUT_MS), shutdownSignal]),
+      });
+      // Never read the body — only the status matters here. Cancel it so the
+      // connection is released promptly instead of buffering a full page.
+      await resp.body?.cancel().catch(() => undefined);
+      if (shutdownSignal.aborted) throw shutdownSignal.reason;
+      if (resp.status >= 300 && resp.status < 400) {
+        // A redirect is a live-server signal (e.g. a real app 302ing an
+        // unauthenticated GET to a login page) — reachable, not refused. The
+        // Location header is deliberately never inspected or dereferenced.
+        return { verdict: 'ok' };
+      }
+      if (GATEWAY_ERROR_STATUSES.has(resp.status)) {
+        if (proxied) {
+          return {
+            verdict: 'warn',
+            reason: `--target-url responded HTTP ${resp.status} — not conclusive behind a configured proxy`,
+          };
+        }
+        return {
+          verdict: 'refuse',
+          reason: `--target-url responded HTTP ${resp.status} (gateway error — the target is unreachable)`,
+        };
+      }
+      if (resp.status >= 400) {
+        return { verdict: 'warn', reason: `--target-url responded HTTP ${resp.status}` };
+      }
       return { verdict: 'ok' };
-    }
-    if (GATEWAY_ERROR_STATUSES.has(resp.status)) {
-      if (proxied) {
+    } catch (err) {
+      if (shutdownSignal.aborted) throw shutdownSignal.reason;
+      if (err instanceof InterruptError) throw err;
+      if (errorHasCode(err, ['ECONNREFUSED'])) {
+        if (proxied) {
+          return {
+            verdict: 'warn',
+            reason:
+              'connection to --target-url was refused — not conclusive behind a configured proxy',
+          };
+        }
         return {
-          verdict: 'warn',
-          reason: `--target-url responded HTTP ${resp.status} — not conclusive behind a configured proxy`,
+          verdict: 'refuse',
+          reason: 'connection to --target-url was refused (ECONNREFUSED)',
         };
       }
-      return {
-        verdict: 'refuse',
-        reason: `--target-url responded HTTP ${resp.status} (gateway error — the target is unreachable)`,
-      };
-    }
-    if (resp.status >= 400) {
-      return { verdict: 'warn', reason: `--target-url responded HTTP ${resp.status}` };
-    }
-    return { verdict: 'ok' };
-  } catch (err) {
-    if (errorHasCode(err, ['ECONNREFUSED'])) {
-      if (proxied) {
+      if (isTimeoutError(err)) {
         return {
           verdict: 'warn',
-          reason:
-            'connection to --target-url was refused — not conclusive behind a configured proxy',
+          reason: `--target-url did not respond within ${PREFLIGHT_TIMEOUT_MS / 1000}s`,
         };
       }
-      return { verdict: 'refuse', reason: 'connection to --target-url was refused (ECONNREFUSED)' };
-    }
-    if (isTimeoutError(err)) {
+      // TLS errors and anything else unclassified: warn only — the refusal
+      // set stays narrow to exactly what that analysis measured.
       return {
         verdict: 'warn',
-        reason: `--target-url did not respond within ${PREFLIGHT_TIMEOUT_MS / 1000}s`,
+        reason: `could not reach --target-url (${err instanceof Error ? err.message : String(err)})`,
       };
     }
-    // TLS errors and anything else unclassified: warn only — the refusal
-    // set stays narrow to exactly what that analysis measured.
-    return {
-      verdict: 'warn',
-      reason: `could not reach --target-url (${err instanceof Error ? err.message : String(err)})`,
-    };
-  }
+  });
 }
 
 /** Shared wording so `--help` and every refuse/warn message agree on the escape hatch. */
@@ -282,7 +294,7 @@ export async function assertTargetUrlReachable(
     throw ApiError.fromEnvelope({
       error: {
         code: 'VALIDATION_ERROR',
-        message: `--target-url is not reachable: ${outcome.reason}.`,
+        message: `--target-url is not reachable: ${outcome.reason}. Retry with --skip-preflight if the preview is still warming up.`,
         nextAction:
           'This CLI probes reachability from where the CLI runs, not from the Lambda that ' +
           'executes the test — a false positive is possible (e.g. an IP allowlist that permits ' +

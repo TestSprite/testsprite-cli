@@ -389,7 +389,7 @@ describe('renderForTarget("copilot")', () => {
 });
 
 // ---------------------------------------------------------------------------
-// ownFileBodyFor — the single per-target canonical-body rule (DEV-672)
+// ownFileBodyFor — the single per-target canonical-body rule
 // ---------------------------------------------------------------------------
 
 describe('ownFileBodyFor', () => {
@@ -491,6 +491,37 @@ describe('content integrity — testsprite-verify auth commands', () => {
       expect(content, name).toContain('testsprite setup');
       expect(content, name).not.toContain('auth whoami');
       expect(content, name).not.toContain('auth configure');
+    }
+  });
+});
+
+describe('content integrity — local run outcomes', () => {
+  it('installed verify skills explain adopted owner loss and conditional refunds', () => {
+    const assets = [
+      ['docs template', templateRaw],
+      ['own-file skill body', renderForTarget('claude', 'testsprite-verify').content],
+      ['codex skill body', renderForTarget('codex', 'testsprite-verify').content],
+    ] as const;
+
+    for (const [name, content] of assets) {
+      expect(content, name).toMatch(/owner (?:has disappeared|disappeared|disappears|is gone)/);
+      expect(content, name).toContain('--no-cancel-on-interrupt');
+      expect(content, name).toMatch(/attempts a refund/);
+      expect(content, name).toContain('refund.status');
+      expect(content, name).toMatch(/does not\s+guarantee a refund/);
+    }
+  });
+
+  it('installed verify skills describe --env with --local as a server-side decision', () => {
+    const assets = [
+      ['docs template', templateRaw],
+      ['own-file skill body', renderForTarget('claude', 'testsprite-verify').content],
+    ] as const;
+
+    for (const [name, content] of assets) {
+      expect(content, name).toMatch(/--env <name> --local <port>`\s+sends/);
+      expect(content, name).toMatch(/applies it or refuses\s+before dispatch/);
+      expect(content, name).not.toMatch(/fails before a tunnel opens/);
     }
   });
 });
@@ -616,12 +647,12 @@ describe('SKILLS registry', () => {
 // ---------------------------------------------------------------------------
 
 describe('DEFAULT_SKILLS', () => {
-  it('equals ["testsprite-verify", "testsprite-onboard"]', () => {
-    expect(DEFAULT_SKILLS).toEqual(['testsprite-verify', 'testsprite-onboard']);
+  it('equals ["testsprite-verify", "testsprite-onboard", "testsprite-ci"]', () => {
+    expect(DEFAULT_SKILLS).toEqual(['testsprite-verify', 'testsprite-onboard', 'testsprite-ci']);
   });
 
-  it('has exactly two entries', () => {
-    expect(DEFAULT_SKILLS.length).toBe(2);
+  it('has exactly three entries', () => {
+    expect(DEFAULT_SKILLS.length).toBe(3);
   });
 });
 
@@ -951,5 +982,23 @@ describe('render marker placement (own-file targets)', () => {
     expect(() => renderOwnFileWithMarker('claude', 'testsprite-unknown', 'marker')).toThrow(
       'unknown skill',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The two ALWAYS-ON trigger strings (the SKILL.md description an
+// agent reads to decide whether to load the skill, and the codex AGENTS.md
+// one-liner) must name the generate path, since the body already leads with
+// it. The windsurf 12 000-char gate above bounds how long the description may
+// grow.
+// ---------------------------------------------------------------------------
+describe('the always-on onboard trigger strings name generation', () => {
+  it('testsprite-onboard description says the suite can be generated', () => {
+    expect(SKILLS['testsprite-onboard']!.description).toMatch(/generate/i);
+  });
+
+  it('ONBOARD_CODEX_LINE names test plan generate and test plan accept', () => {
+    expect(ONBOARD_CODEX_LINE).toContain('testsprite test plan generate');
+    expect(ONBOARD_CODEX_LINE).toContain('test plan accept');
   });
 });

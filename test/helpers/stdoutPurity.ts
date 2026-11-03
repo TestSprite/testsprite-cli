@@ -1,5 +1,5 @@
 /**
- * §8.1 / M2.1 piece 4 — stdout-purity helper for `--output json` mode.
+ * §8.1 — stdout-purity helper for `--output json` mode.
  *
  * Asserts that a CLI invocation in JSON mode produces exactly one
  * JSON document on stdout — no banners, progress lines, or extra

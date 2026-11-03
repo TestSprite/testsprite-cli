@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, CLIError, InterruptError, RequestTimeoutError } from './errors.js';
 import { VERSION } from '../version.js';
 import {
+  ciRefusalOutcome,
   batchOutcomeCounts,
   buildCiContext,
   buildTelemetryEvent,
@@ -331,6 +332,38 @@ describe('buildTelemetryEvent', () => {
     expect(event.local).toBe(true);
   });
 
+  it('preserves an explicit local flag when the runtime sink reports no owned tunnel', () => {
+    const event = buildTelemetryEvent(
+      { command: 'test run', outcome: 'error', exitCode: 5, durationMs: 1, local: true },
+      {},
+      false,
+      { local: false },
+    );
+    expect(event.local).toBe(true);
+  });
+
+  it('keeps timeout cancellation metadata when the runtime sink records an opened tunnel', () => {
+    const event = buildTelemetryEvent(
+      {
+        command: 'test run',
+        outcome: 'error',
+        exitCode: 7,
+        durationMs: 100,
+        local: false,
+        reason: 'wait_timeout',
+        cancelOutcome: 'cancelled',
+      },
+      {},
+      false,
+      { local: true },
+    );
+    expect(event).toMatchObject({
+      local: true,
+      reason: 'wait_timeout',
+      cancelOutcome: 'cancelled',
+    });
+  });
+
   it('omits the local key entirely for an ordinary invocation', () => {
     const event = buildTelemetryEvent(
       { command: 'test list', outcome: 'success', exitCode: 0, durationMs: 1 },
@@ -461,16 +494,21 @@ describe('recordOutcome', () => {
 
   it('uses pre-resolved auth and never reads the credentials file', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(okResponse());
-    await recordOutcome(base, {
-      env: {},
-      // Bogus path: if it were read, no key would resolve and the POST would skip.
-      credentialsPath: join(tmpdir(), 'cli-telemetry-missing', 'credentials'),
-      resolvedAuth: { apiKey: 'sk-user-pre', apiUrl: 'https://api.example.com' },
-      fetchImpl,
-    });
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
-    expect((init.headers as Record<string, string>)['x-api-key']).toBe('sk-user-pre');
+    // Bogus path: if it were read, no key would resolve and the POST would skip.
+    const missingCredsDir = mkdtempSync(join(tmpdir(), 'cli-telemetry-missing-'));
+    try {
+      await recordOutcome(base, {
+        env: {},
+        credentialsPath: join(missingCredsDir, 'credentials'),
+        resolvedAuth: { apiKey: 'sk-user-pre', apiUrl: 'https://api.example.com' },
+        fetchImpl,
+      });
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+      expect((init.headers as Record<string, string>)['x-api-key']).toBe('sk-user-pre');
+    } finally {
+      rmSync(missingCredsDir, { recursive: true, force: true });
+    }
   });
 
   it('skips when the pre-resolved auth carries no api-key', async () => {
@@ -702,6 +740,17 @@ describe('hashRepository / buildCiContext', () => {
 // ---------------------------------------------------------------------------
 
 describe('sanitizeTelemetryExtras', () => {
+  it('drops target URL fields and the retired legacy marker', () => {
+    expect(
+      sanitizeTelemetryExtras({
+        legacyTargetUrlUsed: true,
+        targetUrl: 'https://secret.example',
+        url: 'https://secret.example',
+      }),
+    ).toEqual({});
+    expect(sanitizeTelemetryExtras({ legacyTargetUrlUsed: 'true' })).toEqual({});
+  });
+
   it('keeps allowlisted keys of the right shape and drops everything else', () => {
     expect(
       sanitizeTelemetryExtras({
@@ -752,9 +801,67 @@ describe('sanitizeTelemetryExtras', () => {
     expect(sanitizeTelemetryExtras({ conflictReason: 'tunnel-required' })).toEqual({
       conflictReason: 'tunnel-required',
     });
+    // Both spellings of a paused workspace: the gate's name and the deprecated one.
+    expect(sanitizeTelemetryExtras({ conflictReason: 'paused' })).toEqual({
+      conflictReason: 'paused',
+    });
+    expect(sanitizeTelemetryExtras({ conflictReason: 'billing_hold' })).toEqual({
+      conflictReason: 'billing_hold',
+    });
+    // The two pre-dispatch blocks a backend consumer gets on the batch routes.
+    expect(sanitizeTelemetryExtras({ conflictReason: 'no_producer' })).toEqual({
+      conflictReason: 'no_producer',
+    });
+    expect(sanitizeTelemetryExtras({ conflictReason: 'producer_in_flight' })).toEqual({
+      conflictReason: 'producer_in_flight',
+    });
     expect(sanitizeTelemetryExtras({ platform: 'gitlab' })).toEqual({});
     expect(sanitizeTelemetryExtras({ projectResolved: 'guess' })).toEqual({});
     expect(sanitizeTelemetryExtras({ force: 'true' })).toEqual({});
+  });
+
+  it('ci run facts: the outcome enum, a UUID execution id and the report flag — nothing looser', () => {
+    const executionId = '7ceab81a-a20a-4141-aa89-f6886bdbb11c';
+    expect(
+      sanitizeTelemetryExtras({ ciRunOutcome: 'gated', executionId, reportReady: true }),
+    ).toEqual({ ciRunOutcome: 'gated', executionId, reportReady: true });
+    for (const outcome of [
+      'skipped_draft',
+      'skipped_no_pr',
+      'refused_admission',
+      'refused_env',
+      'refused_preview_name',
+      'refused_loopback',
+      'refused_billing',
+      'refused_other',
+      'empty',
+    ]) {
+      expect(sanitizeTelemetryExtras({ ciRunOutcome: outcome })).toEqual({ ciRunOutcome: outcome });
+    }
+    expect(sanitizeTelemetryExtras({ ciRunOutcome: 'passed' })).toEqual({});
+    // An execution id is the server's UUID or nothing: never a URL, a slug or a test id.
+    expect(sanitizeTelemetryExtras({ executionId: 'exec-1' })).toEqual({});
+    expect(sanitizeTelemetryExtras({ executionId: executionId.toUpperCase() })).toEqual({});
+    expect(
+      sanitizeTelemetryExtras({
+        executionId: `https://portal.example.com/execution/${executionId}`,
+      }),
+    ).toEqual({});
+    expect(sanitizeTelemetryExtras({ reportReady: 'yes' })).toEqual({});
+  });
+
+  it('ciRefusalOutcome: every API refusal gets a value', () => {
+    expect(
+      ciRefusalOutcome({ code: 'VALIDATION_ERROR', details: { reason: 'preview-name-taken' } }),
+    ).toBe('refused_preview_name');
+    expect(
+      ciRefusalOutcome({ code: 'VALIDATION_ERROR', details: { reason: 'private-or-local' } }),
+    ).toBe('refused_loopback');
+    expect(ciRefusalOutcome({ code: 'VALIDATION_ERROR', details: {} })).toBe('refused_other');
+    expect(ciRefusalOutcome({ code: 'INSUFFICIENT_CREDITS' })).toBe('refused_billing');
+    expect(ciRefusalOutcome({ code: 'FEATURE_GATED' })).toBe('refused_billing');
+    expect(ciRefusalOutcome({ code: 'RATE_LIMITED' })).toBe('refused_other');
+    expect(ciRefusalOutcome({ code: 'AUTH_ERROR' })).toBe('refused_other');
   });
 });
 

@@ -73,7 +73,7 @@ export interface PollOptions {
    * Lets the caller resolve a terminal `RunResponse` from an alternate
    * source when the run-surface row itself will never finalize.
    *
-   * The motivating case (dogfood L1888): backend-test run rows are written
+   * The motivating case: backend-test run rows are written
    * `queued` then orphaned server-side (`finalizeRun` is FE-only), so the
    * run-row poll would always hit `--timeout` → exit 7 even on a passing BE
    * test. The handler supplies a fallback that reads the testId-scoped
@@ -94,7 +94,7 @@ export interface PollOptions {
     signal: AbortSignal,
   ) => Promise<RunResponse | null>;
   /**
-   * Graceful-detach coordinator (DEV-331 piece 1). While the poll runs, the
+   * Graceful-detach coordinator. While the poll runs, the
    * scope is armed: a SIGINT/SIGTERM aborts `shutdown.signal` with an
    * `InterruptError` instead of killing the process, and this loop surfaces
    * it immediately — the in-flight long-poll fetch aborts (composed into the
@@ -123,12 +123,17 @@ export async function pollRunUntilTerminal(
   runId: string,
   options: PollOptions,
 ): Promise<RunResponse> {
-  // Arm the graceful-detach scope for the duration of the poll (DEV-331):
+  // Arm the graceful-detach scope for the duration of the poll:
   // while armed, a termination signal aborts instead of hard-killing the
   // process, and the wait-path catch blocks own the honest detach UX.
   const disarm = options.shutdown?.arm();
   try {
     return await pollLoop(client, runId, options);
+  } catch (err) {
+    if (err instanceof InterruptError && options.shutdown?.signal.aborted) {
+      err.runWaitContext = true;
+    }
+    throw err;
   } finally {
     disarm?.();
   }
@@ -341,11 +346,11 @@ async function pollIterations(
 
     // Non-terminal run tick. Give the caller a chance to resolve a terminal
     // verdict from an alternate source (e.g. the backend testId-scoped
-    // result when the run-surface row never finalizes — dogfood L1888).
+    // result when the run-surface row never finalizes).
     if (resolveAlternate) {
       // Bound the alternate lookup by the REMAINING --timeout (not the much
       // larger per-request HTTP timeout) so a stalled fallback read can't
-      // overrun the user's deadline (codex round-2).
+      // overrun the user's deadline.
       const altRemainingMs = deadlineMs - Date.now();
       if (altRemainingMs <= 0) {
         throw new TimeoutError(runId, timeoutSeconds);

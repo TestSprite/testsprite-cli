@@ -3,12 +3,18 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { ApiError } from '../lib/errors.js';
+import { ApiError, InterruptError } from '../lib/errors.js';
 import { writeProfile } from '../lib/credentials.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import { ErrCode } from '../vendor/tunnel-client/index.js';
 import type { TunnelClientOptions } from '../vendor/tunnel-client/index.js';
-import { createTunnelCommand, runTunnelStart, runTunnelStatus, runTunnelStop } from './tunnel.js';
+import {
+  createTunnelCommand,
+  runTunnelList,
+  runTunnelStart,
+  runTunnelStatus,
+  runTunnelStop,
+} from './tunnel.js';
 
 type FetchInput = Parameters<typeof globalThis.fetch>[0];
 
@@ -42,8 +48,51 @@ const PLAINTEXT_MINT_BODY = {
   expiresAt: MINT_BODY.expiresAt,
 };
 const VALID_CLIENT_ID = 'cf6e0843-9166-4eaa-918e-f085407eaca5';
-const INVALID_CLIENT_ID_MESSAGE =
-  "Tunnel client id must be a UUID (see 'testsprite tunnel status'/'tunnel start' output).";
+const INVALID_CLIENT_ID_MESSAGE = "Tunnel client id must be a UUID (see 'testsprite tunnel list').";
+const SECOND_CLIENT_ID = 'f8606d66-2140-49c5-9c45-8e4e36b587c9';
+const LIST_BODY = {
+  tunnels: [
+    {
+      clientId: VALID_CLIENT_ID,
+      status: 'online',
+      createdAt: null,
+      expiresAt: '2026-08-24T18:00:00.000Z',
+    },
+    { clientId: SECOND_CLIENT_ID, status: 'unknown', expiresAt: '2026-08-24T19:00:00.000Z' },
+  ],
+};
+
+describe('tunnel help', () => {
+  function helpFor(name?: string): string {
+    const root = createTunnelCommand();
+    const command = name ? root.commands.find(command => command.name() === name)! : root;
+    let text = '';
+    command.configureOutput({
+      writeOut: chunk => {
+        text += chunk;
+      },
+    });
+    command.outputHelp();
+    return text;
+  }
+
+  it('describes automatic environment tunnels and adopting an existing tunnel', () => {
+    const text = helpFor();
+    expect(text).toContain('automatically');
+    expect(text).toContain('test run <test-id> --env <name> --tunnel-client <client-id>');
+  });
+
+  it('start help suggests a built server for a heavy development server', () => {
+    const text = helpFor('start');
+    expect(text).toContain('a minute per page');
+    expect(text).toContain('npm run build');
+    expect(text).toContain('preview/start');
+  });
+
+  it.each(['list', 'status', 'stop'])('%s help explains automatic tunnel bindings', name => {
+    expect(helpFor(name)).toContain('automatically');
+  });
+});
 
 function makeFetch(
   handler: (
@@ -88,6 +137,36 @@ function fakeTunnel() {
 }
 
 describe('tunnel start', () => {
+  it('prints the minted id on stderr before constructing the tunnel client in JSON mode', async () => {
+    const events: string[] = [];
+    const stdout: string[] = [];
+    const shutdown = new ShutdownController();
+    const promise = runTunnelStart(
+      { profile: 'default', output: 'json', debug: false },
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch(method =>
+          method === 'POST' ? { status: 201, body: MINT_BODY } : { status: 204 },
+        ),
+        stdout: line => stdout.push(line),
+        stderr: line => events.push(line),
+        shutdown,
+        createTunnelClient: () => {
+          events.push('client factory');
+          return { start: async () => {}, stop: async () => {} };
+        },
+      },
+    );
+    await new Promise(resolve => setTimeout(resolve, 5));
+    shutdown.interrupt('SIGINT');
+    await promise;
+    expect(events[0]).toBe(
+      `Minted tunnel client ${MINT_BODY.clientId} (expires ${MINT_BODY.expiresAt}); connecting…`,
+    );
+    expect(events[1]).toBe('client factory');
+    expect(stdout).toHaveLength(1);
+    expect(JSON.parse(stdout[0]!)).toMatchObject({ clientId: MINT_BODY.clientId });
+  });
   it('reports a credential revoked during authentication as exit 10', async () => {
     const methods: string[] = [];
     const stdout: string[] = [];
@@ -510,6 +589,131 @@ describe('tunnel start', () => {
   });
 });
 
+describe('tunnel list', () => {
+  it.each(['text', 'json'] as const)('renders the collection in %s mode', async output => {
+    const lines: string[] = [];
+    const result = await runTunnelList(
+      { profile: 'default', output, debug: false },
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch(() => ({ body: LIST_BODY })),
+        stdout: line => lines.push(line),
+        stderr: () => {},
+      },
+    );
+    expect(result).toEqual(LIST_BODY);
+    if (output === 'json') {
+      expect(JSON.parse(lines[0]!)).toEqual(LIST_BODY);
+    } else {
+      expect(lines.join('\n')).toContain('CLIENT ID');
+      expect(lines.join('\n')).toContain('STATUS');
+      expect(lines.join('\n')).toContain(`${VALID_CLIENT_ID}  online`);
+      expect(lines.join('\n')).toMatch(/online\s+-\s+2026-08-24T18:00:00.000Z/);
+      expect(lines.join('\n')).toContain('Stop one: testsprite tunnel stop <client-id>');
+      expect(lines.join('\n')).toContain(
+        'Stop all of them: testsprite tunnel stop --all --confirm',
+      );
+      expect(lines.join('\n')).toContain(
+        '"unknown" means TestSprite could not check that connection just now',
+      );
+    }
+  });
+
+  it('prints the empty message and succeeds', async () => {
+    const lines: string[] = [];
+    await runTunnelList(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch(() => ({ body: { tunnels: [] } })),
+        stdout: line => lines.push(line),
+      },
+    );
+    expect(lines).toEqual(['No live tunnels.']);
+  });
+
+  it('keeps columns aligned when the server adds a longer status value', async () => {
+    const lines: string[] = [];
+    await runTunnelList(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch(() => ({
+          body: {
+            tunnels: [
+              {
+                clientId: VALID_CLIENT_ID,
+                status: 'reconnecting_later',
+                createdAt: null,
+                expiresAt: '2027-08-24T18:00:00Z',
+              },
+              {
+                clientId: SECOND_CLIENT_ID,
+                status: 'online',
+                createdAt: null,
+                expiresAt: '2027-08-24T19:00:00Z',
+              },
+            ],
+          },
+        })),
+        stdout: line => lines.push(line),
+      },
+    );
+    const [header, first, second] = lines[0]!.split('\n');
+    expect(first!.indexOf('2027-08-24T18:00:00Z')).toBe(header!.indexOf('EXPIRES'));
+    expect(second!.indexOf('2027-08-24T19:00:00Z')).toBe(header!.indexOf('EXPIRES'));
+  });
+
+  it('turns a 404 from an older server into an actionable NOT_FOUND with the same request id', async () => {
+    const error = await runTunnelList(
+      { profile: 'default', output: 'text', debug: false },
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch(() => ({
+          status: 404,
+          body: {
+            error: {
+              code: 'NOT_FOUND',
+              message: 'route missing',
+              nextAction: '',
+              requestId: 'req-old',
+              details: {},
+            },
+          },
+        })),
+      },
+    ).catch((err: unknown) => err);
+    expect(error).toMatchObject({
+      code: 'NOT_FOUND',
+      exitCode: 4,
+      requestId: 'req-old',
+      message: 'This TestSprite server cannot list tunnels yet.',
+      nextAction:
+        'Stop a tunnel you know the id of with `testsprite tunnel stop <client-id>`, or wait for it to expire.',
+    });
+  });
+
+  it('uses the canned sample under dry run without real network', async () => {
+    const fetchImpl = vi.fn();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    await runTunnelList(
+      { profile: 'default', output: 'json', debug: false, dryRun: true },
+      {
+        ...makeCreds(),
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        stdout: line => stdout.push(line),
+        stderr: line => stderr.push(line),
+      },
+    );
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(JSON.parse(stdout[0]!)).toMatchObject({
+      tunnels: [{ status: 'online' }, { status: 'offline' }],
+    });
+    expect(stderr.join('\n')).toContain('[dry-run]');
+  });
+});
+
 describe('tunnel start credential observation', () => {
   it.each(['poll', 'cleanup'] as const)(
     'uses the original profile endpoint and API key for %s after a profile change during connect',
@@ -774,13 +978,14 @@ describe('tunnel start credential observation', () => {
         expect(held.settled).toBe(false);
         expect(held.tunnel.calls.stop).toBe(0);
         expect(held.deletes).toBe(0);
-        expect(held.stderr).toHaveLength(1);
-        expect(held.stderr[0]).toMatch(/could not check.*credential.*continuing/i);
+        const warnings = () => held.stderr.filter(line => line.includes('could not check'));
+        expect(warnings()).toHaveLength(1);
+        expect(warnings()[0]).toMatch(/could not check.*credential.*continuing/i);
         recovered = true;
         await vi.advanceTimersByTimeAsync(15_000);
         recovered = false;
         await vi.advanceTimersByTimeAsync(30_000);
-        expect(held.stderr).toHaveLength(2);
+        expect(warnings()).toHaveLength(2);
         expect(held.settled).toBe(false);
       } finally {
         await held.cleanup();
@@ -795,7 +1000,9 @@ describe('tunnel start credential observation', () => {
       await vi.advanceTimersByTimeAsync(30_000);
       expect(held.reads).toHaveLength(2);
       expect(held.settled).toBe(false);
-      expect(held.stderr).toEqual([]);
+      expect(held.stderr).toEqual([
+        `Minted tunnel client ${MINT_BODY.clientId} (expires ${MINT_BODY.expiresAt}); connecting…`,
+      ]);
       held.shutdown.interrupt('SIGINT');
       await vi.advanceTimersByTimeAsync(0);
       await held.done;
@@ -938,6 +1145,220 @@ describe('tunnel status', () => {
 });
 
 describe('tunnel stop', () => {
+  it.each([
+    { clientId: VALID_CLIENT_ID, all: true, confirm: true, message: 'either' },
+    { clientId: undefined, all: false, confirm: false, message: 'provide a <client-id>' },
+    {
+      clientId: undefined,
+      all: false,
+      confirm: true,
+      message: '--confirm only applies with --all',
+    },
+    {
+      clientId: VALID_CLIENT_ID,
+      all: false,
+      confirm: true,
+      message: '--confirm only applies with --all',
+    },
+    {
+      clientId: undefined,
+      all: true,
+      confirm: false,
+      message: 'Refusing to stop every tunnel without --confirm.',
+    },
+  ])('rejects invalid stop arguments without network: $message', async args => {
+    const fetchImpl = vi.fn();
+    const error = await runTunnelStop(
+      { profile: 'default', output: 'text', debug: false, ...args } as Parameters<
+        typeof runTunnelStop
+      >[0],
+      { ...makeCreds(), fetchImpl: fetchImpl as unknown as typeof fetch },
+    ).catch((err: unknown) => err);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(error).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect((error as ApiError).message).toContain(args.message);
+    if (args.all && !args.confirm && !args.clientId) {
+      expect(error).toMatchObject({
+        nextAction:
+          'This revokes every live tunnel on this account, including ones another terminal or a CI job is using — their runs lose their route to your machine. Re-run with --confirm. To see what would be stopped: testsprite tunnel list.',
+        details: { field: 'confirm', reason: 'required for destructive operation' },
+      });
+    }
+  });
+
+  it.each([false, true])(
+    'previews every sample delete with confirm=%s and sends no real DELETE under dry run',
+    async confirm => {
+      const fetchImpl = vi.fn();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      await runTunnelStop(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          all: true,
+          confirm,
+          dryRun: true,
+        } as Parameters<typeof runTunnelStop>[0],
+        {
+          ...makeCreds(),
+          fetchImpl: fetchImpl as unknown as typeof fetch,
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+        },
+      );
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(stderr.join('\n')).toContain('WARNING: the preview below uses sample data');
+      expect(stderr.join('\n')).toContain('[dry-run]');
+      expect(stdout.join('\n')).toContain(
+        'DELETE /api/cli/v1/tunnel/00000000-0000-4000-8000-000000000001',
+      );
+      expect(stdout.join('\n')).toContain(
+        'DELETE /api/cli/v1/tunnel/00000000-0000-4000-8000-000000000002',
+      );
+    },
+  );
+
+  it('propagates an auth error from the initial list without attempting deletion', async () => {
+    const seen: string[] = [];
+    const error = await runTunnelStop(
+      { profile: 'default', output: 'text', debug: false, all: true, confirm: true },
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch((method, url) => {
+          seen.push(`${method} ${url}`);
+          return {
+            status: 403,
+            body: {
+              error: {
+                code: 'AUTH_FORBIDDEN',
+                message: 'Missing run:tunnel scope.',
+                nextAction: 'Mint a new key.',
+                requestId: 'req-scope',
+                details: { requiredScopes: ['run:tunnel'] },
+              },
+            },
+          };
+        }),
+      },
+    ).catch((err: unknown) => err);
+    expect(error).toMatchObject({ code: 'AUTH_FORBIDDEN', exitCode: 3, requestId: 'req-scope' });
+    expect(seen).toEqual(['GET http://localhost:13502/api/cli/v1/tunnel']);
+  });
+
+  it('returns an empty summary when there is nothing to stop', async () => {
+    const lines: string[] = [];
+    await runTunnelStop(
+      { profile: 'default', output: 'json', debug: false, all: true, confirm: true } as Parameters<
+        typeof runTunnelStop
+      >[0],
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch(() => ({ body: { tunnels: [] } })),
+        stdout: line => lines.push(line),
+      },
+    );
+    expect(JSON.parse(lines[0]!)).toEqual({
+      results: [],
+      summary: { total: 0, stopped: 0, failed: 0 },
+    });
+  });
+
+  it('deletes each listed id exactly once, sequentially, and reports the result', async () => {
+    const seen: string[] = [];
+    const lines: string[] = [];
+    await runTunnelStop(
+      { profile: 'default', output: 'json', debug: false, all: true, confirm: true } as Parameters<
+        typeof runTunnelStop
+      >[0],
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch((method, url) => {
+          seen.push(`${method} ${url}`);
+          return method === 'GET' ? { body: LIST_BODY } : { status: 204 };
+        }),
+        stdout: line => lines.push(line),
+      },
+    );
+    expect(seen).toEqual([
+      'GET http://localhost:13502/api/cli/v1/tunnel',
+      `DELETE http://localhost:13502/api/cli/v1/tunnel/${VALID_CLIENT_ID}`,
+      `DELETE http://localhost:13502/api/cli/v1/tunnel/${SECOND_CLIENT_ID}`,
+    ]);
+    expect(JSON.parse(lines[0]!)).toEqual({
+      results: [
+        { clientId: VALID_CLIENT_ID, stopped: true },
+        { clientId: SECOND_CLIENT_ID, stopped: true },
+      ],
+      summary: { total: 2, stopped: 2, failed: 0 },
+    });
+  });
+
+  it('propagates an interrupt during stop-all deletion', async () => {
+    const shutdown = new ShutdownController();
+    const lines: string[] = [];
+    const error = await runTunnelStop(
+      { profile: 'default', output: 'json', debug: false, all: true, confirm: true },
+      {
+        ...makeCreds(),
+        shutdown,
+        fetchImpl: (async (input: FetchInput, init: RequestInit = {}) => {
+          if (init.method === 'DELETE') {
+            shutdown.interrupt('SIGTERM');
+            throw shutdown.signal.reason;
+          }
+          return new Response(JSON.stringify(LIST_BODY), {
+            headers: { 'content-type': 'application/json' },
+          });
+        }) as typeof globalThis.fetch,
+        stdout: line => lines.push(line),
+      },
+    ).catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(InterruptError);
+    expect(error).toMatchObject({ exitCode: 143 });
+    expect(lines).toEqual([]);
+  });
+
+  it('prints all per-id results before failing a partial stop with exit 1', async () => {
+    const seen: string[] = [];
+    const lines: string[] = [];
+    const error = await runTunnelStop(
+      { profile: 'default', output: 'text', debug: false, all: true, confirm: true } as Parameters<
+        typeof runTunnelStop
+      >[0],
+      {
+        ...makeCreds(),
+        fetchImpl: makeFetch((method, url) => {
+          seen.push(`${method} ${url}`);
+          if (method === 'GET') return { body: LIST_BODY };
+          // A non-retryable refusal, so each id is attempted exactly once; a
+          // retryable one is retried by the HTTP layer (DELETE is idempotent).
+          return url.endsWith(VALID_CLIENT_ID)
+            ? {
+                status: 400,
+                body: {
+                  error: {
+                    code: 'VALIDATION_ERROR',
+                    message: 'server busy',
+                    nextAction: '',
+                    requestId: 'r1',
+                    details: {},
+                  },
+                },
+              }
+            : { status: 204 };
+        }),
+        stdout: line => lines.push(line),
+      },
+    ).catch((err: unknown) => err);
+    expect(error).toMatchObject({ exitCode: 1 });
+    expect(seen.filter(call => call.startsWith('DELETE'))).toHaveLength(2);
+    expect(lines.join('\n')).toContain(`failed   ${VALID_CLIENT_ID}  server busy`);
+    expect(lines.join('\n')).toContain(`stopped  ${SECOND_CLIENT_ID}`);
+    expect(lines.join('\n')).toContain('Stopped 1 of 2 tunnels.');
+    expect(lines.join('\n')).toContain('within ~15 s');
+  });
   it('deletes the binding and is idempotent', async () => {
     const seen: string[] = [];
     const fetchImpl = makeFetch((method, url) => {

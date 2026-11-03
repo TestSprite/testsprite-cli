@@ -44,12 +44,18 @@ import type {
   BatchRunFreshResponse,
   ListRunsResponse,
   CancelRunResponse,
+  ExecutionReportResponse,
 } from '../runs.types.js';
 import type {
   CliAcceptPlansResponse,
   CliGeneratePlansResponse,
   CliGetPlansResponse,
 } from '../plans.types.js';
+import type { TunnelListResponse, TunnelStatusResponse } from '../tunnel.types.js';
+import type {
+  CliProjectSignInResponse,
+  CliProjectSignInSetResponse,
+} from '../../commands/project-sign-in.js';
 
 const SAMPLE_USER_ID = '11111111-1111-4111-8111-111111111111';
 const SAMPLE_KEY_ID = 'key_dryrun_2026';
@@ -62,6 +68,8 @@ const SAMPLE_TEST_ID_BLOCKED = 'test_blocked_4f7a';
 export const SAMPLE_RUN_ID = 'run_abc';
 const SAMPLE_SCHEDULE_ID = 'sch_7d21ac48';
 const SAMPLE_SCHEDULE_RUN_ID = 'exec_5c08f1b2';
+const SAMPLE_TUNNEL_ID_1 = '00000000-0000-4000-8000-000000000001';
+const SAMPLE_TUNNEL_ID_2 = '00000000-0000-4000-8000-000000000002';
 // Documented sentinel for `test steps --run-id run_failed_sample --dry-run`:
 // keeps wait flows on the default passed sample while still demonstrating a
 // run-scoped failed step offline.
@@ -195,7 +203,7 @@ const tests: CliTest[] = [
     createdFrom: 'portal',
     status: 'failed',
     // G1a — priority label shown on one row so dry-run learners see the field.
-    priority: 'p1',
+    priority: 'Medium',
     createdAt: '2026-04-20T11:00:00.000Z',
     updatedAt: '2026-05-05T12:34:56.000Z',
     details: {
@@ -402,6 +410,47 @@ const failureSummary: CliFailureSummary = {
   recommendedFixTarget: failureContext.failure.recommendedFixTarget,
 };
 
+const SAMPLE_EXECUTION_ID = 'exec_dryrun0001';
+
+/** A ready execution report: one failed and one passed row, the App's Markdown shape in miniature. */
+const executionReportSample: ExecutionReportResponse = {
+  ready: true,
+  report: {
+    projectId: SAMPLE_PROJECT_ID,
+    executionId: SAMPLE_EXECUTION_ID,
+    projectName: 'Sample project',
+    orgId: null,
+    stats: { passed: 1, failed: 1, blocked: 0, total: 2 },
+    allPassed: false,
+    narrative: 'Dry-run sample: one regression in checkout, login passed.',
+    whatCouldBeBetter: 'Add coverage for password reset.',
+    recommendedNextStep: 'Fix the checkout selector and rerun.',
+    tests: [
+      {
+        id: SAMPLE_RUN_ID,
+        title: 'Checkout applies a coupon',
+        slug: 'CHK-002',
+        status: 'FAILED',
+        screenshotUrl: null,
+        error: 'AssertionError: expected the order total to drop',
+        fix: 'Apply the coupon before computing the total.',
+      },
+      {
+        id: `${SAMPLE_RUN_ID}-2`,
+        title: 'Login with a valid account',
+        slug: 'AUTH-001',
+        status: 'PASSED',
+        screenshotUrl: null,
+        error: null,
+        fix: null,
+      },
+    ],
+    resultUrl: `https://www.testsprite.com/dashboard-v3/projects/${SAMPLE_PROJECT_ID}/execution/${SAMPLE_EXECUTION_ID}`,
+  },
+  markdown:
+    '> [!WARNING]\n> ### Ran into trouble — 1 failed\n>\n> Dry-run sample: one regression in checkout, login passed.\n',
+};
+
 const passedRunSample: RunResponse = {
   runId: SAMPLE_RUN_ID,
   testId: SAMPLE_TEST_ID_PASSED,
@@ -550,10 +599,89 @@ export interface DryRunSampleEntry {
 
 const PATH_PREFIX = '/api/cli/v1';
 
+// Regex metacharacters that must be escaped when a literal string is spliced
+// into a `new RegExp(...)` source string, so the literal matches only itself.
+const REGEXP_METACHAR = /[.*+?^${}()|[\]\\]/g;
+
+function escapeRegExpLiteral(literal: string): string {
+  return literal.replace(REGEXP_METACHAR, '\\$&');
+}
+
+/**
+ * Build the matcher RegExp for a route template, e.g.
+ * `/tests/{testId}/code` → /^\/tests\/[^/]+\/code$/. Splits on the
+ * `{param}` placeholders first, then regex-escapes every literal segment in
+ * between (including any literal backslash) so a route literal containing a
+ * regex metacharacter is matched literally instead of being reinterpreted as
+ * part of the pattern.
+ */
+function buildPathPattern(pathTemplate: string): RegExp {
+  const regexSrc = pathTemplate
+    .split(/(\{[^}]+\})/g)
+    .map(part => (/^\{[^}]+\}$/.test(part) ? '[^/]+' : escapeRegExpLiteral(part)))
+    .join('');
+  return new RegExp(`^${regexSrc}$`);
+}
+
 const ENTRIES: DryRunSampleEntry[] = [
   entry('whoami', 'GET', '/me', me),
   entry('listProjects', 'GET', '/projects', pageOf(projects)),
-  // DEV-384 V3-B — plan-generation surface. All three MUST be registered
+  entry('getProjectSignIn', 'GET', '/projects/{projectId}/sign-in', {
+    projectId: SAMPLE_PROJECT_ID,
+    environment: {
+      id: 'env_dryrun',
+      name: 'default',
+      url: 'https://app.example.com',
+      isDefault: true,
+      authMode: 'public',
+      hasCredentials: false,
+      username: null,
+      enableOtp: false,
+      updatedAt: '2026-09-25T00:00:00.000Z',
+    },
+    signIn: { mode: 'public', account: null, otp: null, manual: null },
+    nextAction: null,
+  } satisfies CliProjectSignInResponse),
+  entry('setProjectSignIn', 'PUT', '/projects/{projectId}/sign-in', (request?: unknown) => {
+    const body = request as { mode?: string } | undefined;
+    const mode = body?.mode ?? 'manual';
+    return {
+      projectId: SAMPLE_PROJECT_ID,
+      environment: {
+        id: 'env_dryrun',
+        name: 'default',
+        url: 'https://app.example.com',
+        isDefault: true,
+        authMode: mode,
+        hasCredentials: mode === 'account',
+        username: mode === 'account' ? 'qa@example.com' : null,
+        enableOtp: mode === 'otp',
+        updatedAt: '2026-09-25T00:00:00.000Z',
+      },
+      signIn: {
+        mode,
+        account: mode === 'account' ? { username: 'qa@example.com', passwordSet: true } : null,
+        otp:
+          mode === 'otp'
+            ? { channels: ['email'], email: 'dryrun@inbox.example', phone: null }
+            : null,
+        manual:
+          mode === 'manual'
+            ? {
+                sessionReuseTtlSeconds: 3600,
+                hasValidSession: false,
+                needsReauth: true,
+                reason: 'never',
+                capturedAt: null,
+                expiresAt: null,
+              }
+            : null,
+      },
+      changed: mode !== 'otp',
+      nextAction: mode === 'manual' ? 'Log in once in the Portal.' : null,
+    } satisfies CliProjectSignInSetResponse;
+  }),
+  // Plan-generation surface. All three MUST be registered
   // BEFORE `getProject`: findSample is first-match-wins and the projects/*
   // family shares the `/projects/…` prefix, so the more specific plans
   // paths are listed first (same defensive convention as `/tests/{id}/runs`
@@ -626,7 +754,7 @@ const ENTRIES: DryRunSampleEntry[] = [
       caseKeys: ids.map(id => `case_dryrun_${id}`),
     } satisfies CliAcceptPlansResponse;
   }),
-  // DEV-384 piece V3-D — `project docs upload` two-step facade routes.
+  // `project docs upload` two-step facade routes.
   // Registered BEFORE the broader project patterns (design doc §7 ordering
   // rule; findSample is first-match-wins) and with `/docs/upload-url` before
   // `/docs`. NOT consumed by the command's dry-run path: `project docs
@@ -682,6 +810,14 @@ const ENTRIES: DryRunSampleEntry[] = [
   entry('getTestCode', 'GET', '/tests/{testId}/code', testCode),
   entry('listTestSteps', 'GET', '/tests/{testId}/steps', pageOf(testSteps)),
   entry('getTestResult', 'GET', '/tests/{testId}/result', latestResult),
+  // Execution report — static `executions/` prefix, four segments, so no
+  // `/tests/{testId}/…` pattern can shadow it; kept beside the other reads.
+  entry(
+    'getExecutionReport',
+    'GET',
+    '/tests/executions/{executionId}/report',
+    executionReportSample,
+  ),
   // `/failure/summary` MUST come before `/failure` so the regex matcher
   // doesn't shadow it with the bundle endpoint.
   entry('getTestFailureSummary', 'GET', '/tests/{testId}/failure/summary', failureSummary),
@@ -885,13 +1021,14 @@ const ENTRIES: DryRunSampleEntry[] = [
   // **MUST appear before `/tests` and `/tests/{testId}` generic matchers**
   // so the more-specific runs path wins. Canned response shape per the
   // runs-trigger design spec.
-  entry('triggerRun', 'POST', '/tests/{testId}/runs', {
+  entry('triggerRun', 'POST', '/tests/{testId}/runs', (req?: unknown): TriggerRunResponse => ({
     runId: SAMPLE_RUN_ID,
     status: 'queued',
     enqueuedAt: '2026-05-15T19:32:00.000Z',
     codeVersion: 'v1',
     targetUrl: SAMPLE_TARGET_URL,
-  } satisfies TriggerRunResponse),
+    ...echoSkipDependencies(req),
+  })),
   // M3.4 piece-3 — POST /tests/{testId}/runs/rerun (single rerun).
   // **MUST appear before `/tests/{testId}/runs` and `/tests/{testId}`** so the
   // more-specific `/runs/rerun` path wins over the generic runs trigger.
@@ -922,24 +1059,31 @@ const ENTRIES: DryRunSampleEntry[] = [
   // **MUST appear before `/tests/batch/rerun` and `/tests/batch` (create)**
   // so the more-specific `/batch/run` path wins. Shows `accepted[]` with
   // per-test runIds + `skippedFrontend[]` so dry-run learners see both shapes.
-  entry('triggerBatchRunFresh', 'POST', '/tests/batch/run', {
-    accepted: [
-      {
-        testId: SAMPLE_TEST_ID_FRESH_1,
-        runId: SAMPLE_BATCH_FRESH_RUN_ID_1,
-        enqueuedAt: '2026-06-09T10:00:00.000Z',
-      },
-      {
-        testId: SAMPLE_TEST_ID_FRESH_2,
-        runId: SAMPLE_BATCH_FRESH_RUN_ID_2,
-        enqueuedAt: '2026-06-09T10:00:00.000Z',
-      },
-    ],
-    conflicts: [],
-    deferred: [],
-    skippedFrontend: [],
-    skippedIntegration: [],
-  } satisfies BatchRunFreshResponse),
+  entry(
+    'triggerBatchRunFresh',
+    'POST',
+    '/tests/batch/run',
+    (req?: unknown) =>
+      ({
+        accepted: [
+          {
+            testId: SAMPLE_TEST_ID_FRESH_1,
+            runId: SAMPLE_BATCH_FRESH_RUN_ID_1,
+            enqueuedAt: '2026-06-09T10:00:00.000Z',
+          },
+          {
+            testId: SAMPLE_TEST_ID_FRESH_2,
+            runId: SAMPLE_BATCH_FRESH_RUN_ID_2,
+            enqueuedAt: '2026-06-09T10:00:00.000Z',
+          },
+        ],
+        conflicts: [],
+        deferred: [],
+        skippedFrontend: [],
+        skippedIntegration: [],
+        ...echoSkipDependencies(req),
+      }) satisfies BatchRunFreshResponse,
+  ),
   // M3.4 piece-3 — POST /tests/batch/rerun (batch rerun).
   // **MUST appear before `/tests/batch` (create)** so the more-specific
   // `/batch/rerun` path wins. Shows `accepted[]` with per-test runIds (C2)
@@ -979,7 +1123,7 @@ const ENTRIES: DryRunSampleEntry[] = [
   // returning status: "failed" for `test wait --dry-run`.
   entry('getRun', 'GET', `/runs/${SAMPLE_FAILED_RUN_ID}`, failedRunSample),
   entry('getRun', 'GET', '/runs/{runId}', passedRunSample),
-  // DEV-331 piece 3 — POST /runs/{runId}/cancel. Method-guarded in
+  // POST /runs/{runId}/cancel. Method-guarded in
   // `findSample` (POST vs `getRun`'s GET), so this can't be shadowed by the
   // broader `/runs/{runId}` pattern above despite sharing its path prefix.
   // `alreadyCancelled: false` — a fresh cancel is the more instructive shape
@@ -1038,7 +1182,37 @@ const ENTRIES: DryRunSampleEntry[] = [
   entry('deleteSchedule', 'DELETE', '/schedules/{scheduleId}', {
     scheduleId: SAMPLE_SCHEDULE_ID,
   }),
+  entry('listTunnels', 'GET', '/tunnel', {
+    tunnels: [
+      {
+        clientId: SAMPLE_TUNNEL_ID_1,
+        status: 'online',
+        createdAt: '2026-01-01T00:00:00.000Z',
+        expiresAt: '2026-01-01T01:00:00.000Z',
+      },
+      {
+        clientId: SAMPLE_TUNNEL_ID_2,
+        status: 'offline',
+        createdAt: null,
+        expiresAt: '2026-01-01T02:00:00.000Z',
+      },
+    ],
+  } satisfies TunnelListResponse),
+  entry('getTunnelStatus', 'GET', '/tunnel/{clientId}', {
+    clientId: SAMPLE_TUNNEL_ID_1,
+    status: 'online',
+    expiresAt: '2026-01-01T01:00:00.000Z',
+  } satisfies TunnelStatusResponse),
 ];
+
+/** What a backend that handles the field answers: `true` when asked, otherwise the key is omitted. */
+function echoSkipDependencies(req: unknown): { skipDependencies?: true } {
+  return req != null &&
+    typeof req === 'object' &&
+    (req as Record<string, unknown>).skipDependencies === true
+    ? { skipDependencies: true }
+    : {};
+}
 
 function entry(
   operationId: string,
@@ -1046,15 +1220,13 @@ function entry(
   pathTemplate: string,
   body: unknown | ((requestBody?: unknown) => unknown),
 ): DryRunSampleEntry {
-  // Convert `/tests/{testId}/code` → /^\/tests\/[^/]+\/code$/
-  const regexSrc = pathTemplate.replace(/\{[^}]+\}/g, '[^/]+').replace(/\//g, '\\/');
   const bodyFn =
     typeof body === 'function' ? (body as (requestBody?: unknown) => unknown) : () => body;
   return {
     operationId,
     method,
     pathTemplate,
-    pattern: new RegExp(`^${regexSrc}$`),
+    pattern: buildPathPattern(pathTemplate),
     body: bodyFn,
   };
 }
@@ -1085,7 +1257,7 @@ function pageOf<T>(items: T[]): Page<T> {
  * `undefined`. For dry-run paths that resolve samples DIRECTLY (bypassing the
  * dry-run fetch impl, which has its own loud INTERNAL envelope for this):
  * without the throw, a lost registry entry surfaces as a raw TypeError deep
- * in a renderer (DEV-384 review F6 — `samples.ts` is a real merge-conflict
+ * in a renderer (`samples.ts` is a real merge-conflict
  * hotspot, so a silently dropped entry is a live hazard, not a hypothetical).
  */
 export function findSampleOrThrow(
@@ -1143,3 +1315,6 @@ function extractPath(url: string): string {
 
 /** Test-only export so `samples.test.ts` can iterate the catalog. */
 export const DRY_RUN_SAMPLE_ENTRIES: ReadonlyArray<DryRunSampleEntry> = ENTRIES;
+
+/** Test-only export so `samples.test.ts` can verify the route-template matcher directly. */
+export const buildDryRunPathPattern = buildPathPattern;

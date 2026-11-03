@@ -5,12 +5,13 @@
  * sleep injection is wired through `TestDeps.sleep` to avoid real delays.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
+import type { ConflictReason } from '../lib/conflict-reason.js';
+import { ApiError, CLIError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import type { FetchImpl } from '../lib/http.js';
@@ -76,6 +77,7 @@ function makePassedRun(): RunResponse {
     finishedAt: '2026-05-15T10:00:30.000Z',
     codeVersion: 'v1',
     targetUrl: 'https://example.com',
+    environment: { id: 'env_default', name: 'default' },
     createdFrom: 'cli',
     failedStepIndex: null,
     failureKind: null,
@@ -83,6 +85,38 @@ function makePassedRun(): RunResponse {
     videoUrl: null,
     stepSummary: { total: 5, completed: 5, passedCount: 5, failedCount: 0 },
   };
+}
+
+const CURRENT_DEFAULT_ENVIRONMENTS = {
+  environments: [
+    { id: 'env_default', name: 'default', url: 'https://example.com', isDefault: true },
+  ],
+};
+
+// Discovery reads must not consume the trigger/poll timing of ordinary-run fixtures.
+function ordinaryRunDiscoveryResponse(
+  input: FetchInput,
+  init: RequestInit = {},
+): Response | undefined {
+  if ((init.method ?? 'GET') !== 'GET') return undefined;
+  const url =
+    typeof input === 'string'
+      ? input
+      : input instanceof URL
+        ? input.toString()
+        : (input as { url: string }).url;
+  const path = new URL(url).pathname;
+  const body = /\/tests\/[^/]+$/.test(path)
+    ? { type: 'frontend', projectId: 'project_1' }
+    : /\/projects\/[^/]+\/env$/.test(path)
+      ? CURRENT_DEFAULT_ENVIRONMENTS
+      : undefined;
+  return body === undefined
+    ? undefined
+    : new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
 }
 
 function makeFailedRun(): RunResponse {
@@ -207,8 +241,10 @@ describe('runTestRun — no-wait (fire and return)', () => {
     try {
       const { credentialsPath } = makeCreds();
       let abortedAt1250Ms = false;
-      const fetchImpl = (async (_input: FetchInput, init: RequestInit = {}) =>
-        new Promise<Response>((resolve, reject) => {
+      const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+        const discovery = ordinaryRunDiscoveryResponse(input, init);
+        if (discovery) return discovery;
+        return new Promise<Response>((resolve, reject) => {
           const signal = init.signal;
           setTimeout(() => {
             abortedAt1250Ms = signal?.aborted === true;
@@ -223,7 +259,8 @@ describe('runTestRun — no-wait (fire and return)', () => {
             reject(signal?.reason ?? new DOMException('aborted', 'AbortError'));
           if (signal?.aborted) rejectOnAbort();
           else signal?.addEventListener('abort', rejectOnAbort, { once: true });
-        })) as typeof globalThis.fetch;
+        });
+      }) as typeof globalThis.fetch;
 
       const outcomePromise = runTestRun(
         {
@@ -345,9 +382,281 @@ describe('runTestRun — no-wait (fire and return)', () => {
   });
 });
 
+describe('supported target URL command behavior', () => {
+  it('run forwards a target URL without a deprecation warning', async () => {
+    vi.resetModules();
+    const { createTestCommand } = await import('./test.js');
+    const { credentialsPath } = makeCreds();
+    const stderrLines: string[] = [];
+    const bodies: unknown[] = [];
+    const command = createTestCommand({
+      credentialsPath,
+      fetchImpl: makeFetch((_url, init) => {
+        bodies.push(JSON.parse(String(init.body)));
+        return { body: TRIGGER_RESP };
+      }),
+      stdout: () => {},
+      stderr: line => stderrLines.push(line),
+    });
+    await command.parseAsync(
+      ['run', 'test_xyz', '--target-url', 'https://staging.example.com', '--skip-preflight'],
+      { from: 'user' },
+    );
+    expect(bodies).toContainEqual({ source: 'cli', targetUrl: 'https://staging.example.com' });
+    expect(stderrLines.join('\n')).not.toContain('--target-url is deprecated');
+  });
+
+  it('keeps JSON output parseable without a target URL warning', async () => {
+    vi.resetModules();
+    const { createTestCommand } = await import('./test.js');
+    const { credentialsPath } = makeCreds();
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    const command = createTestCommand({
+      credentialsPath,
+      fetchImpl: makeFetch(() => ({ body: TRIGGER_RESP })),
+      stdout: line => stdoutLines.push(line),
+      stderr: line => stderrLines.push(line),
+    });
+    command.option('--output <mode>');
+    await command.parseAsync(
+      [
+        'run',
+        'test_xyz',
+        '--target-url',
+        'https://staging.example.com',
+        '--skip-preflight',
+        '--output',
+        'json',
+      ],
+      { from: 'user' },
+    );
+    expect(JSON.parse(stdoutLines.join(''))).toMatchObject({ runId: 'run_abc' });
+    expect(stderrLines.join('\n')).not.toContain('--target-url is deprecated');
+  });
+
+  it('does not mark a supported target URL as legacy telemetry', async () => {
+    vi.resetModules();
+    const { createTestCommand } = await import('./test.js');
+    const { takeTelemetryExtras } = await import('../lib/telemetry.js');
+    const { credentialsPath } = makeCreds();
+    const command = createTestCommand({
+      credentialsPath,
+      fetchImpl: makeFetch(() => ({ body: TRIGGER_RESP })),
+      stdout: () => {},
+      stderr: () => {},
+    });
+    await command.parseAsync(
+      ['run', 'test_xyz', '--target-url', 'https://staging.example.com', '--skip-preflight'],
+      { from: 'user' },
+    );
+    expect(takeTelemetryExtras()).toEqual({});
+  });
+
+  it('create with a target URL has no deprecation warning', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const stderrLines: string[] = [];
+    const command = createTestCommand({
+      stdout: () => undefined,
+      stderr: line => stderrLines.push(line),
+    });
+    await command.parseAsync(
+      ['create', '--plan-template', '--target-url', 'https://preview.example.com'],
+      { from: 'user' },
+    );
+    expect(stderrLines.join('\n')).not.toContain('--target-url is deprecated');
+  });
+
+  it('create-batch with a target URL has no deprecation warning', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const stderrLines: string[] = [];
+    const command = createTestCommand({
+      stdout: () => undefined,
+      stderr: line => stderrLines.push(line),
+    });
+    disableExits(command);
+    await command
+      .parseAsync(['create-batch', '--target-url', 'https://preview.example.com'], { from: 'user' })
+      .catch(() => undefined);
+    expect(stderrLines.join('\n')).not.toContain('--target-url is deprecated');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // runTestRun — --wait path
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The auto-heal field on the fresh-run wire
+//
+// The CLI only ever sends ONE of the field's three states: `false`, for
+// `--no-auto-heal`. Omission is how the server's protected default ("heal, but
+// replay a user-authored body rather than rewriting it") is requested, and an
+// explicit `true` would mean something different and worse — an unconditional
+// heal that re-authors code the user wrote. So both halves matter: the flag has
+// to reach the wire, and its absence has to leave the key OFF entirely.
+// ---------------------------------------------------------------------------
+describe('runTestRun / runTestRunAll — autoHeal on the wire', () => {
+  function captureBody(bodies: Record<string, unknown>[], resp: unknown): typeof globalThis.fetch {
+    return makeFetch((url, init) => {
+      if (init.body) bodies.push(JSON.parse(init.body as string) as Record<string, unknown>);
+      if (url.includes('/runs') || url.includes('/batch/run')) return { body: resp };
+      return { status: 404, body: {} };
+    });
+  }
+
+  const EMPTY_BATCH = {
+    accepted: [],
+    conflicts: [],
+    deferred: [],
+    skippedFrontend: [],
+    skippedIntegration: [],
+  };
+
+  const baseOpts = {
+    profile: 'default' as const,
+    output: 'json' as const,
+    debug: false,
+    dryRun: false,
+    wait: false,
+    timeoutSeconds: 60,
+  };
+
+  it('omits autoHeal entirely by default — absence IS the request', async () => {
+    const { credentialsPath } = makeCreds();
+    const bodies: Record<string, unknown>[] = [];
+    await runTestRun(
+      { ...baseOpts, testId: 'test_xyz' },
+      {
+        credentialsPath,
+        fetchImpl: captureBody(bodies, TRIGGER_RESP),
+        stdout: () => undefined,
+        sleep: instantSleep,
+      },
+    );
+    expect(bodies[0]).not.toHaveProperty('autoHeal');
+  });
+
+  it('sends autoHeal:false for --no-auto-heal', async () => {
+    const { credentialsPath } = makeCreds();
+    const bodies: Record<string, unknown>[] = [];
+    await runTestRun(
+      { ...baseOpts, testId: 'test_xyz', autoHeal: false },
+      {
+        credentialsPath,
+        fetchImpl: captureBody(bodies, TRIGGER_RESP),
+        stdout: () => undefined,
+        sleep: instantSleep,
+      },
+    );
+    expect(bodies[0]).toMatchObject({ autoHeal: false });
+  });
+
+  // `--all --wait` must resolve the server-controlled default identically.
+  it('omits autoHeal on the --all batch dispatch by default', async () => {
+    const { credentialsPath } = makeCreds();
+    const bodies: Record<string, unknown>[] = [];
+    await runTestRunAll(
+      { ...baseOpts, projectId: 'project_x', maxConcurrency: 5 },
+      {
+        credentialsPath,
+        fetchImpl: captureBody(bodies, EMPTY_BATCH),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        env: {} as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(() => undefined);
+    expect(bodies[0]).not.toHaveProperty('autoHeal');
+  });
+
+  it('sends autoHeal:false on the --all batch dispatch for --no-auto-heal', async () => {
+    const { credentialsPath } = makeCreds();
+    const bodies: Record<string, unknown>[] = [];
+    await runTestRunAll(
+      { ...baseOpts, projectId: 'project_x', maxConcurrency: 5, autoHeal: false },
+      {
+        credentialsPath,
+        fetchImpl: captureBody(bodies, EMPTY_BATCH),
+        stdout: () => undefined,
+        stderr: () => undefined,
+        env: {} as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(() => undefined);
+    expect(bodies[0]).toMatchObject({ autoHeal: false });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `--no-auto-heal` has to be falsifiable
+//
+// The backend runs `whitelist: true`, so a CLI sending `autoHeal` to a server
+// that predates the field has it silently STRIPPED: the request succeeds, the
+// run heals, and every surface reports success. Before the server echoed its
+// effective decision there was no signal anywhere — which also made the
+// sequencing this PR's own body contemplates (CLI shipping first) a silent
+// no-op rather than a loud one.
+// ---------------------------------------------------------------------------
+describe('runTestRun — --no-auto-heal opt-out advisory', () => {
+  const baseOpts = {
+    profile: 'default' as const,
+    output: 'json' as const,
+    debug: false,
+    dryRun: false,
+    wait: false,
+    timeoutSeconds: 60,
+    testId: 'test_xyz',
+  };
+
+  function run(respExtra: Record<string, unknown>, autoHeal: false | undefined) {
+    const { credentialsPath } = makeCreds();
+    const stderr: string[] = [];
+    const fetchImpl = makeFetch(url =>
+      url.includes('/runs')
+        ? { body: { ...TRIGGER_RESP, ...respExtra } }
+        : { status: 404, body: {} },
+    );
+    return runTestRun(
+      { ...baseOpts, ...(autoHeal === false ? { autoHeal } : {}) },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderr.push(line),
+        sleep: instantSleep,
+      },
+    ).then(() => stderr.join('\n'));
+  }
+
+  // An older backend: the field never comes back at all. The remedy is a
+  // different one (upgrade the endpoint), so the message says so.
+  it('warns when the server echoes nothing back', async () => {
+    const err = await run({}, false);
+    expect(err).toContain('[advisory]');
+    expect(err).toContain('does not support it yet');
+  });
+
+  // A server that knows the option and declined it.
+  it('warns when the server echoes autoHeal:true against an opt-out', async () => {
+    const err = await run({ autoHeal: true }, false);
+    expect(err).toContain('[advisory]');
+    expect(err).toContain('not applied by the server');
+  });
+
+  it('stays silent when the opt-out was honoured', async () => {
+    const err = await run({ autoHeal: false }, false);
+    expect(err).not.toContain('auto-heal');
+  });
+
+  // The advisory is about a DROPPED opt-out, so a caller who never asked for one
+  // must never see it — including against an old backend, where the absent echo
+  // would otherwise look identical to a drop.
+  it('stays silent when no opt-out was requested, even with no echo', async () => {
+    const err = await run({}, undefined);
+    expect(err).not.toContain('[advisory]');
+  });
+});
 
 describe('runTestRun — with --wait', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
@@ -432,19 +741,23 @@ describe('runTestRun — with --wait', () => {
 
   it('wait timeout → UNSUPPORTED error (exit 7) with nextAction containing run-id', async () => {
     const { credentialsPath } = makeCreds();
+    let elapsedMs = 0;
     const fetchImpl = makeFetch(url => {
       if (url.includes('/tests/') && url.includes('/runs') && !url.includes('/runs/run_abc')) {
         return { body: TRIGGER_RESP };
       }
-      // Always return non-terminal to force timeout
+      if (url.endsWith('/tests/test_xyz'))
+        return { body: { type: 'frontend', projectId: 'project_1' } };
+      if (url.endsWith('/projects/project_1/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
+      // The first running poll advances the clock past the deadline.
+      elapsedMs = 2000;
       return { body: { ...makePassedRun(), status: 'running' as const } };
     });
 
-    // Mock Date.now to force timeout after first check
-    let callCount = 0;
+    // Keep discovery and trigger setup outside the polling deadline advance.
     const base = Date.now();
     const realDateNow = Date.now;
-    Date.now = () => (callCount++ > 4 ? base + 2000 : base);
+    Date.now = () => base + elapsedMs;
 
     try {
       const err = await runTestRun(
@@ -653,7 +966,7 @@ describe('runTestRun — error scenarios', () => {
     expect((err as ApiError).exitCode).toBe(5);
   });
 
-  it('--target-url localhost rejected client-side (no network call)', async () => {
+  it('--target-url loopback with a path is rejected before network access', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = vi.fn(async () => {
       throw new Error('network should not be hit');
@@ -667,7 +980,7 @@ describe('runTestRun — error scenarios', () => {
         testId: 'test_xyz',
         wait: false,
         timeoutSeconds: 60,
-        targetUrl: 'http://localhost:3000',
+        targetUrl: 'http://localhost:3000/app',
       },
       {
         credentialsPath,
@@ -732,8 +1045,11 @@ describe('runTestRun — dry-run', () => {
   // a real trigger response) rather than the HTTP-descriptor envelope. This
   // makes `test run --dry-run --output json` consistent with `test rerun --dry-run`.
 
-  it('dry-run: no network call; prints TriggerRunResponse shape', async () => {
-    const { credentialsPath } = makeCreds();
+  it('dry-run keeps credentialless previews offline and prints TriggerRunResponse shape', async () => {
+    const credentialsPath = join(
+      mkdtempSync(join(tmpdir(), 'run-dry-no-creds-')),
+      'missing-credentials',
+    );
     const fetchImpl = vi.fn(async () => {
       throw new Error('should not hit network');
     });
@@ -902,6 +1218,7 @@ describe('runTestRun — target-url guard: allowed URLs pass through', () => {
         wait: false,
         timeoutSeconds: 60,
         targetUrl: 'https://example.com',
+        skipPreflight: true,
       },
       { credentialsPath, fetchImpl, stdout: () => {}, sleep: instantSleep },
     );
@@ -950,6 +1267,7 @@ describe('runTestRun — CONFLICT + --wait auto-resume (dogfood round-4)', () =>
       if (url.includes('/tests/') && url.includes('/runs')) {
         return { status: 409, body: conflictBody };
       }
+      if (url.endsWith('/projects/project_1/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
       // GET /runs/run_inflight — return terminal
       return { body: inflightRun };
     });
@@ -1065,6 +1383,7 @@ describe('runTestRun — CONFLICT + --wait auto-resume (dogfood round-4)', () =>
           },
         };
       }
+      if (url.endsWith('/projects/project_1/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
       // Extract runId from GET /runs/<runId>
       const match = /\/runs\/([^?/]+)/.exec(url);
       if (match?.[1]) seenGetRunIds.push(match[1]);
@@ -1112,6 +1431,542 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
     errorSpy.mockRestore();
   });
 
+  it('409 refuses to adopt an in-flight run on a different environment', async () => {
+    const { credentialsPath } = makeCreds();
+    let runReads = 0;
+    const fetchImpl = makeFetch((url, init) => {
+      if (init.method === 'POST') {
+        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_other' });
+      }
+      if (url.endsWith('/projects/project_1/env'))
+        return {
+          body: {
+            environments: [
+              {
+                id: 'env_staging',
+                name: 'staging',
+                url: 'https://staging.example.com',
+                isDefault: false,
+              },
+              { id: 'env_other', name: 'production', url: 'https://example.com', isDefault: true },
+            ],
+          },
+        };
+      if (url.includes('/runs/run_other')) {
+        runReads++;
+        return {
+          body: {
+            ...makePassedRun(),
+            runId: 'run_other',
+            environment: { id: 'env_other', name: 'production' },
+          },
+        };
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+        environment: 'staging',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
+    expect(err.message).toContain('run_other');
+    expect(err.message).toContain('does not match the requested environment');
+    expect(err.nextAction).toContain('run_other');
+    expect(runReads).toBe(1);
+  });
+
+  it('409 attaches to an in-flight run without environment information when --env is omitted', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch((url, init) =>
+      init.method === 'POST'
+        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_old' })
+        : { body: { ...makePassedRun(), runId: 'run_old', environment: undefined } },
+    );
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const result = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdout.push(line),
+        stderr: line => stderr.push(line),
+        sleep: instantSleep,
+      },
+    );
+    expect(result).toMatchObject({ runId: 'run_old', status: 'passed' });
+    expect(JSON.parse(stdout.join(''))).toMatchObject({ runId: 'run_old', status: 'passed' });
+    expect(stderr.some(line => line.includes('[advisory]') && line.includes('run_old'))).toBe(true);
+    // No environment was recorded to name, so the advisory must not invent one.
+    const advisory = stderr.find(line => line.includes('[advisory]'));
+    expect(advisory).toMatch(/then re-trigger\.$/);
+    expect(advisory).not.toContain('--env');
+  });
+
+  it('409 attaches to a failed in-flight run without environment information and preserves its exit code', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch((_url, init) =>
+      init.method === 'POST'
+        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_failed' })
+        : { body: { ...makeFailedRun(), runId: 'run_failed', environment: undefined } },
+    );
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdout.push(line),
+        stderr: line => stderr.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toBeInstanceOf(CLIError);
+    expect(err).toMatchObject({ exitCode: 1 });
+    expect(JSON.parse(stdout.join(''))).toMatchObject({ runId: 'run_failed', status: 'failed' });
+    expect(stderr.some(line => line.includes('[advisory]') && line.includes('run_failed'))).toBe(
+      true,
+    );
+  });
+
+  it('409 fails closed on a null (explicitly unrecorded) environment even when --env is omitted', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch((_url, init) =>
+      init.method === 'POST'
+        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_failed' })
+        : { body: { ...makeFailedRun(), runId: 'run_failed', environment: null } },
+    );
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    ).catch(e => e);
+    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
+    expect(err.message).toContain('its environment could not be verified');
+  });
+
+  it('409 fails closed on a null environment even with an explicit --env', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch((_url, init) =>
+      init.method === 'POST'
+        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_failed' })
+        : { body: { ...makeFailedRun(), runId: 'run_failed', environment: null } },
+    );
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+        environment: 'staging',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    ).catch(e => e);
+    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
+    expect(err.message).toContain('its environment could not be verified');
+  });
+
+  it('409 without environment information still rejects a different --target-url', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch((_url, init) =>
+      init.method === 'POST'
+        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_old' })
+        : { body: { ...makePassedRun(), runId: 'run_old', environment: undefined } },
+    );
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+        targetUrl: 'https://other.example.com',
+        skipPreflight: true,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    ).catch(e => e);
+    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
+    expect(err.message).toContain('different target URL');
+    expect(err.nextAction).toContain('run_old');
+  });
+
+  it('409 without environment information and a matching --target-url attaches', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch((_url, init) =>
+      init.method === 'POST'
+        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_old' })
+        : { body: { ...makePassedRun(), runId: 'run_old', environment: undefined } },
+    );
+    const stderr: string[] = [];
+    const result = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+        targetUrl: 'https://example.com', // matches makePassedRun()'s targetUrl
+        skipPreflight: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: line => stderr.push(line),
+        sleep: instantSleep,
+      },
+    );
+    expect(result).toMatchObject({ runId: 'run_old', status: 'passed' });
+    expect(stderr.some(line => line.includes('[advisory]') && line.includes('run_old'))).toBe(true);
+  });
+
+  it('409 without environment information fails closed when --env is explicit', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch((_url, init) =>
+      init.method === 'POST'
+        ? errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_old' })
+        : { body: { ...makePassedRun(), runId: 'run_old', environment: undefined } },
+    );
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+        environment: 'staging',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    ).catch(e => e);
+    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
+    expect(err.message).toContain('its environment could not be verified');
+  });
+
+  it('409 with no requested name adopts a run on the listed default environment', async () => {
+    const { credentialsPath } = makeCreds();
+    let envReads = 0;
+    const fetchImpl = makeFetch((url, init) => {
+      if (init.method === 'POST') {
+        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_default' });
+      }
+      if (url.endsWith('/projects/project_1/env')) {
+        envReads++;
+        return {
+          body: {
+            environments: [
+              { id: 'env_default', name: 'default', url: 'https://example.com', isDefault: true },
+            ],
+          },
+        };
+      }
+      return {
+        body: {
+          ...makePassedRun(),
+          runId: 'run_default',
+          environment: { id: 'env_default', name: 'default' },
+        },
+      };
+    });
+    const result = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    );
+    expect(result).toMatchObject({ runId: 'run_default', status: 'passed' });
+    expect(envReads).toBe(2);
+  });
+
+  it('409 adopts a named run only when the current environment id matches', async () => {
+    const { credentialsPath } = makeCreds();
+    let envReads = 0;
+    const fetchImpl = makeFetch((url, init) => {
+      if (init.method === 'POST')
+        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_staging' });
+      if (url.endsWith('/projects/project_1/env')) {
+        envReads++;
+        return {
+          body: {
+            environments: [
+              {
+                id: 'env_staging',
+                name: 'staging',
+                url: 'https://staging.example.com',
+                isDefault: false,
+              },
+            ],
+          },
+        };
+      }
+      return {
+        body: {
+          ...makePassedRun(),
+          runId: 'run_staging',
+          environment: { id: 'env_staging', name: 'staging' },
+        },
+      };
+    });
+    const result = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+        environment: 'staging',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    );
+    expect(result).toMatchObject({ runId: 'run_staging', status: 'passed' });
+    expect(envReads).toBe(2);
+  });
+
+  it.each([
+    ['in-flight run', (url: string) => url.includes('/runs/run_staging')],
+    ['environment list', (url: string) => url.endsWith('/projects/project_1/env')],
+  ])('409 keeps an interrupt while reading the %s', async (_label, interruptsOn) => {
+    const { credentialsPath } = makeCreds();
+    const interrupt = new InterruptError('SIGINT');
+    const fetchImpl = makeFetch((url, init) => {
+      if (init.method === 'POST')
+        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_staging' });
+      if (interruptsOn(url)) throw interrupt;
+      if (url.endsWith('/projects/project_1/env')) {
+        return {
+          body: {
+            environments: [
+              {
+                id: 'env_staging',
+                name: 'staging',
+                url: 'https://staging.example.com',
+                isDefault: false,
+              },
+            ],
+          },
+        };
+      }
+      return {
+        body: {
+          ...makePassedRun(),
+          runId: 'run_staging',
+          environment: { id: 'env_staging', name: 'staging' },
+        },
+      };
+    });
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+        environment: 'staging',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    ).catch(e => e);
+    expect(err).toBe(interrupt);
+  });
+
+  it('409 refuses a run on a deleted environment whose name was reused', async () => {
+    const { credentialsPath } = makeCreds();
+    let runReads = 0;
+    const fetchImpl = makeFetch((url, init) => {
+      if (init.method === 'POST')
+        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_old' });
+      if (url.endsWith('/projects/project_1/env'))
+        return {
+          body: {
+            environments: [
+              { id: 'env_new', name: 'staging', url: 'https://new.example.com', isDefault: false },
+            ],
+          },
+        };
+      if (url.includes('/runs/run_old')) {
+        runReads++;
+        return {
+          body: {
+            ...makePassedRun(),
+            runId: 'run_old',
+            environment: { id: 'env_deleted', name: 'staging' },
+          },
+        };
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+        environment: 'staging',
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    ).catch(e => e);
+    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
+    expect(err.message).toContain('run_old');
+    expect(err.message).toContain('does not match the requested environment');
+    expect(err.nextAction).toContain('run_old');
+    expect(runReads).toBe(1);
+  });
+
+  it('409 refuses an in-flight run on the previous default after the default changed', async () => {
+    const { credentialsPath } = makeCreds();
+    let runReads = 0;
+    const fetchImpl = makeFetch((url, init) => {
+      if (init.method === 'POST')
+        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_old' });
+      if (url.endsWith('/projects/project_1/env'))
+        return {
+          body: {
+            environments: [
+              { id: 'env_old', name: 'old', url: 'https://old.example.com', isDefault: false },
+              { id: 'env_new', name: 'new', url: 'https://new.example.com', isDefault: true },
+            ],
+          },
+        };
+      if (url.includes('/runs/run_old')) {
+        runReads++;
+        return {
+          body: {
+            ...makePassedRun(),
+            runId: 'run_old',
+            environment: { id: 'env_old', name: 'old', isDefault: true },
+          },
+        };
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    ).catch(e => e);
+    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
+    expect(err.message).toContain('run_old');
+    expect(err.message).toContain('does not match the requested environment');
+    expect(err.nextAction).toContain('run_old');
+    expect(runReads).toBe(1);
+  });
+
+  it.each([
+    // Either side lacking a usable id, or the listing failing outright, means
+    // the environments could not be COMPARED at all — that is a distinct
+    // reason from a verified, definite mismatch (covered separately below).
+    {
+      label: 'missing run id',
+      runId: null,
+      listStatus: 200,
+      expectedReason: 'its environment could not be verified',
+    },
+    {
+      label: 'missing current id',
+      runId: 'env_default',
+      listStatus: 200,
+      currentId: '',
+      expectedReason: 'its environment could not be verified',
+    },
+    {
+      label: 'failed lookup',
+      runId: 'env_default',
+      listStatus: 403,
+      expectedReason: 'its environment could not be verified',
+    },
+  ])('409 fails closed on $label', async ({ runId, listStatus, currentId, expectedReason }) => {
+    const { credentialsPath } = makeCreds();
+    let runReads = 0;
+    const fetchImpl = makeFetch((url, init) => {
+      if (init.method === 'POST')
+        return errorBody('CONFLICT', { reason: 'run_in_flight', currentRunId: 'run_pending' });
+      if (url.endsWith('/projects/project_1/env'))
+        return listStatus === 200
+          ? {
+              body: {
+                environments: [
+                  { id: currentId ?? 'env_default', name: 'default', isDefault: true },
+                ],
+              },
+            }
+          : errorBody('AUTH_FORBIDDEN');
+      if (url.includes('/runs/run_pending')) {
+        runReads++;
+        return {
+          body: {
+            ...makePassedRun(),
+            runId: 'run_pending',
+            environment: { id: runId, name: 'default' },
+          },
+        };
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        testId: 'test_xyz',
+        wait: true,
+        timeoutSeconds: 60,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    ).catch(e => e);
+    expect(err).toMatchObject({ code: 'CONFLICT', exitCode: 6 });
+    expect(err.nextAction).toContain('run_pending');
+    expect(err.message).toContain(expectedReason);
+    expect(runReads).toBe(1);
+  });
+
   it('CONFLICT reason=run_in_flight + --target-url matching in-flight run → auto-resume succeeds', async () => {
     // Arrange: POST → 409 run_in_flight; GET /runs/run_inflight → targetUrl matches
     const { credentialsPath } = makeCreds();
@@ -1133,6 +1988,7 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
       if (url.includes('/tests/') && url.includes('/runs')) {
         return { status: 409, body: conflictBody };
       }
+      if (url.endsWith('/projects/project_1/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
       // GET /runs/run_inflight_url_match  (fetch for URL verification + poll)
       return { body: inFlightRun };
     });
@@ -1185,6 +2041,7 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
       if (url.includes('/tests/') && url.includes('/runs')) {
         return { status: 409, body: conflictBody };
       }
+      if (url.endsWith('/projects/project_1/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
       // GET /runs/run_inflight_url_mismatch — for URL verification only
       const match = /\/runs\/([^?/]+)/.exec(url);
       if (match?.[1]) seenGetRunIds.push(match[1]);
@@ -1262,7 +2119,13 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
     expect((err as ApiError).exitCode).toBe(6);
   });
 
-  it('CONFLICT reason=run_in_flight + no --target-url → auto-resume, fetches real targetUrl from in-flight run', async () => {
+  it.each([
+    { name: 'staging', url: 'https://default.example.com' },
+    { name: 'local-dev', url: 'http://127.0.0.1:5173' },
+    { name: 'local-http', url: 'http://127.0.0.1:80' },
+    { name: 'local-ipv6', url: 'http://[::1]:5173' },
+    { name: 'local-https', url: 'https://localhost:8443' },
+  ])('auto-resume advice uses the resolved $name environment', async ({ name, url }) => {
     // Finding D (codex round-2): when --target-url is not supplied, the CLI now
     // fetches GET /runs/{currentRunId} to bind the REAL targetUrl to the
     // synthesised triggerResponse (instead of ''). The advisory must include the
@@ -1280,11 +2143,35 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
     const inFlightRun: RunResponse = {
       ...makePassedRun(),
       runId: 'run_default_target',
-      targetUrl: 'https://default.example.com',
+      targetUrl: url,
+      environment: { id: 'env_requested', name },
     };
+    let envReads = 0;
     const fetchImpl = makeFetch(url => {
       if (url.includes('/tests/') && url.includes('/runs')) {
         return { status: 409, body: conflictBody };
+      }
+      if (url.endsWith('/projects/project_1/env')) {
+        if (++envReads === 1)
+          return {
+            status: 403,
+            body: {
+              error: {
+                code: 'FORBIDDEN',
+                message: 'preflight unavailable',
+                nextAction: 'Retry',
+                requestId: 'r',
+                details: {},
+              },
+            },
+          };
+        return {
+          body: {
+            environments: [
+              { id: 'env_requested', name, url: inFlightRun.targetUrl, isDefault: false },
+            ],
+          },
+        };
       }
       return { body: inFlightRun };
     });
@@ -1297,6 +2184,7 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
         dryRun: false,
         testId: 'test_xyz',
         wait: true,
+        environment: name,
         // No targetUrl supplied
         timeoutSeconds: 60,
       },
@@ -1312,8 +2200,10 @@ describe('runTestRun — CONFLICT target-URL verification (codex round-1 finding
     // Advisory must mention the actual target URL (not '') and the cancel hint
     const advisory = stderrLines.join(' ');
     expect(advisory).toContain('run_default_target');
-    expect(advisory).toContain('https://default.example.com');
-    expect(advisory).toContain('--target-url');
+    expect(advisory).toContain(url);
+    expect(advisory).toContain(`testsprite test run test_xyz --env ${name}`);
+    expect(advisory).not.toContain('--local');
+    expect(advisory).not.toContain('--target-url');
   });
 });
 
@@ -1491,7 +2381,7 @@ describe('runTestRun — backend testId fallback (L1888)', () => {
     expect(stderr.join(' ')).toContain('test failure get test_be');
   });
 
-  it('frontend test is untouched — terminal run row resolves with zero testId lookups', async () => {
+  it('terminal frontend run resolves without backend result fallback', async () => {
     const { credentialsPath } = makeCreds();
     const router = beRunRouter({
       type: 'frontend',
@@ -1531,7 +2421,7 @@ describe('runTestRun — backend testId fallback (L1888)', () => {
       },
     );
     expect((result as RunResponse).status).toBe('passed');
-    expect(router.counts.type).toBe(0);
+    expect(router.counts.type).toBe(1);
     expect(router.counts.result).toBe(0);
   });
 });
@@ -1829,7 +2719,7 @@ describe('C2 — backend run renders steps: n/a (backend) in text mode', () => {
     expect(out).not.toContain('0/0');
   });
 
-  it('standalone BE run --wait: text probes /tests/{id} → n/a (backend); JSON never probes (DEV-282)', async () => {
+  it('standalone backend run renders n/a in text and preserves the JSON step summary', async () => {
     // Standalone `test run <id>` supplies NO type hint, and the run row is
     // terminal on the first poll (BE rows finalize server-side now), so
     // `beFallbackUsed` stays false. In TEXT mode the card must still read
@@ -1903,9 +2793,9 @@ describe('C2 — backend run renders steps: n/a (backend) in text mode', () => {
     expect(text.out).not.toContain('0/0');
     expect(text.urls.some(u => /\/tests\/be_282$/.test(u))).toBe(true);
 
-    // JSON mode: no extra probe; the wire envelope ships stepSummary verbatim.
+    // JSON mode performs discovery, then ships the wire stepSummary verbatim.
     const json = await runOnce('json');
-    expect(json.urls.some(u => /\/tests\/be_282$/.test(u))).toBe(false);
+    expect(json.urls.filter(u => /\/tests\/be_282$/.test(u))).toHaveLength(1);
     const parsed = JSON.parse(json.out);
     expect(parsed.status).toBe('passed');
     expect(parsed.stepSummary).toEqual({ total: 0, completed: 0, passedCount: 0, failedCount: 0 });
@@ -2091,7 +2981,9 @@ describe('runTestRun --wait: Fix 3 — RequestTimeoutError writes partial JSON t
   it('exit 7 AND stdout contains {runId, status:"running"} when poll throws RequestTimeoutError', async () => {
     const { credentialsPath } = makeCreds();
     let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async (_input, _init) => {
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount += 1;
       if (callCount === 1) {
         // Trigger succeeds
@@ -2156,14 +3048,16 @@ describe('runTestRun --wait: Fix 3 — RequestTimeoutError writes partial JSON t
 describe('runTestRun --wait: TimeoutError writes partial JSON to stdout', () => {
   it('exit 7 AND stdout contains {runId, status:"running"} when --timeout polling deadline is exceeded', async () => {
     const { credentialsPath } = makeCreds();
-    let dateCallCount = 0;
+    let elapsedMs = 0;
     let fetchCallCount = 0;
     const base = Date.now();
     const realDateNow = Date.now;
-    Date.now = () => (++dateCallCount > 6 ? base + 2000 : base);
+    Date.now = () => base + elapsedMs;
 
     try {
-      const fetchImpl: typeof globalThis.fetch = async () => {
+      const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+        const discovery = ordinaryRunDiscoveryResponse(input, init);
+        if (discovery) return discovery;
         ++fetchCallCount;
         if (fetchCallCount === 1) {
           return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -2171,6 +3065,7 @@ describe('runTestRun --wait: TimeoutError writes partial JSON to stdout', () => 
             headers: { 'content-type': 'application/json' },
           });
         }
+        elapsedMs = 2000;
         const runningRun: RunResponse = { ...makePassedRun(), status: 'running' };
         return new Response(JSON.stringify(runningRun), {
           status: 200,
@@ -2231,7 +3126,9 @@ describe('runTestRun --wait: TimeoutError writes partial JSON to stdout', () => 
 describe('runTestRun --wait: Fix 5 — first-run timeout hint', () => {
   function makeTriggerThenPassedFetch(): typeof globalThis.fetch {
     let callCount = 0;
-    return (async (_input, _init) => {
+    return (async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount += 1;
       if (callCount === 1) {
         return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -2338,7 +3235,9 @@ describe('[finding-C] runTestRun --wait RequestTimeoutError — text mode render
   it('text mode: stdout contains runId label line (not raw JSON) on RequestTimeoutError', async () => {
     const { credentialsPath } = makeCreds();
     let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async (_input, _init) => {
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount++;
       if (callCount === 1) {
         return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -2383,7 +3282,9 @@ describe('[finding-C] runTestRun --wait RequestTimeoutError — text mode render
   it('json mode: stdout has merged create-chain envelope when createContext supplied', async () => {
     const { credentialsPath } = makeCreds();
     let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async (_input, _init) => {
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount++;
       if (callCount === 1) {
         return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -2470,7 +3371,9 @@ describe('runTestRun --wait: RATE_LIMITED writes partial JSON to stdout, keeps e
   it('exit 11 (NOT reclassified to 7) AND stdout contains {runId, status:"running"} when poll exhausts RATE_LIMITED retries', async () => {
     const { credentialsPath } = makeCreds();
     let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async () => {
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount += 1;
       if (callCount === 1) {
         return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -2528,7 +3431,9 @@ describe('runTestRun --wait: RATE_LIMITED writes partial JSON to stdout, keeps e
   it('text mode: renders human-readable partial (not raw JSON), still exit 11', async () => {
     const { credentialsPath } = makeCreds();
     let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async () => {
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount += 1;
       if (callCount === 1) {
         return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -2571,7 +3476,9 @@ describe('runTestRun --wait: RATE_LIMITED writes partial JSON to stdout, keeps e
   it('honors Retry-After in the stderr hint when present', async () => {
     const { credentialsPath } = makeCreds();
     let callCount = 0;
-    const fetchImpl: typeof globalThis.fetch = async () => {
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       callCount += 1;
       if (callCount === 1) {
         return new Response(JSON.stringify(TRIGGER_RESP), {
@@ -2651,6 +3558,12 @@ describe('[finding-D] 409 conflict auto-resume no --target-url + RequestTimeoutE
       if (method === 'POST' && url.includes('/tests/') && url.endsWith('/runs')) {
         return new Response(JSON.stringify(conflictBody), {
           status: 409,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (method === 'GET' && url.endsWith('/projects/project_1/env')) {
+        return new Response(JSON.stringify(CURRENT_DEFAULT_ENVIRONMENTS), {
+          status: 200,
           headers: { 'content-type': 'application/json' },
         });
       }
@@ -2791,64 +3704,6 @@ describe('runTestRunAll — batch fresh run', () => {
     const e = caughtError as { exitCode?: number; code?: string };
     expect(e.exitCode).toBe(4);
     expect(e.code).toBe('NOT_FOUND');
-  });
-
-  it('POLL_RESERVE_MS: the retry loop clamps sleep so it never eats the reserved poll window', async () => {
-    const { credentialsPath } = makeCreds();
-    const baseNow = new Date('2026-06-09T10:00:00.000Z').getTime();
-    let nowMs = baseNow;
-    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
-    const sleeps: number[] = [];
-    const advancingSleep = (ms: number) => {
-      sleeps.push(ms);
-      nowMs += ms; // the sleep really consumes the budget
-      return Promise.resolve();
-    };
-    // A test that stays rate-deferred across every retry, nothing accepted — so the
-    // only sleeps are the D3 retry loop's (no poll fan-out to muddy the count).
-    const fetchImpl = makeFetch(
-      () =>
-        ({
-          body: {
-            accepted: [],
-            conflicts: [],
-            deferred: [{ testId: 'test_be_02' }],
-            skippedFrontend: [],
-            skippedIntegration: [],
-          } as BatchRunFreshResponse,
-        }) as never,
-    );
-    try {
-      await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 180,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          env: {} as NodeJS.ProcessEnv,
-          sleep: advancingSleep,
-        },
-      );
-    } catch {
-      // the still-deferred test surfaces exit 7 — expected; we assert the sleep budget.
-    } finally {
-      nowSpy.mockRestore();
-    }
-    // POLL_RESERVE_MS = min(60000, 180000/3) = 60000. The retry loop must leave at
-    // least the reserve, so the total slept never exceeds budget - reserve.
-    // (Reverting POLL_RESERVE_MS to 0 lets the loop sleep to ~180000 and fails this.)
-    const totalSlept = sleeps.reduce((a, b) => a + b, 0);
-    expect(sleeps.length).toBeGreaterThan(0);
-    expect(totalSlept).toBeLessThanOrEqual(180_000 - 60_000);
   });
 
   it('run --all --wait auto-resume: fetches the in-flight run for a createdAt floor and names its source', async () => {
@@ -3100,23 +3955,263 @@ describe('runTestRunAll — batch fresh run', () => {
     expect(post.body).toMatchObject({ projectId: 'project_env', source: 'cli' });
   });
 
-  it('--all --target-url → exit 5 (target-url has no effect on BE-only batch)', async () => {
+  it('--all --target-url → sends targetUrl on the batch request and advises about BE tests', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const { credentialsPath } = makeCreds();
+    const captured: Array<{ url: string; method: string; body: unknown }> = [];
+    const stderrLines: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      captured.push({ url, method, body: init.body ? JSON.parse(init.body as string) : undefined });
+      // Honored-signal echo — the server applied the override.
+      return { body: { ...BATCH_FRESH_RESP, targetUrl: 'https://pr-42.preview.example.com' } };
+    });
+    const test = createTestCommand({
+      credentialsPath,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: (line: string) => stderrLines.push(line),
+      sleep: instantSleep,
+    });
+
+    await test.parseAsync(
+      [
+        'run',
+        '--all',
+        '--project',
+        'proj_1',
+        '--target-url',
+        'https://pr-42.preview.example.com',
+        '--skip-preflight',
+      ],
+      { from: 'user' },
+    );
+
+    const post = captured.find(c => c.method === 'POST' && c.url.includes('/tests/batch/run'))!;
+    expect(post.body).toMatchObject({
+      projectId: 'proj_1',
+      source: 'cli',
+      targetUrl: 'https://pr-42.preview.example.com',
+    });
+    // The advisory names what the override does NOT cover, so a BE verdict
+    // against a different URL is never a surprise.
+    const advisory = stderrLines.find(l => l.includes('--target-url applies to frontend tests'));
+    expect(advisory).toBeDefined();
+    expect(advisory).toContain('https://pr-42.preview.example.com');
+  });
+
+  it('--all --target-url against a backend that ignores it → exit 7, and the dispatched runs are cancelled', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const { credentialsPath } = makeCreds();
+    const cancelled: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      const method = init.method ?? 'GET';
+      if (method === 'POST' && url.includes('/cancel')) {
+        cancelled.push(url);
+        return { body: { runId: 'x', status: 'cancelled', alreadyCancelled: false } };
+      }
+      // NO `targetUrl` echo: an older backend accepted the batch and silently
+      // ran the project's configured environment instead.
+      return { body: BATCH_FRESH_RESP };
+    });
+    const test = createTestCommand({
+      credentialsPath,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: () => undefined,
+      sleep: instantSleep,
+    });
+    disableExits(test);
+
+    const rejection = (await test
+      .parseAsync(
+        [
+          'run',
+          '--all',
+          '--project',
+          'proj_1',
+          '--target-url',
+          'https://pr-42.preview.example.com',
+          '--skip-preflight',
+        ],
+        { from: 'user' },
+      )
+      .catch((error: unknown) => error)) as ApiError;
+
+    // A verdict about a URL nobody tested is the exact failure this guards.
+    expect(rejection).toMatchObject({ code: 'UNSUPPORTED', exitCode: 7 });
+    expect(rejection.message).toContain('did not confirm --target-url');
+    // Both accepted runs receive a best-effort cancellation request.
+    expect(cancelled).toHaveLength(BATCH_FRESH_RESP.accepted.length);
+    expect(cancelled.join(' ')).toContain('run_fresh_01');
+    expect(cancelled.join(' ')).toContain('run_fresh_02');
+  });
+
+  it('--all --target-url with an empty value → exit 5 (the flag needs a URL)', async () => {
     const { createTestCommand } = await import('./test.js');
     const test = createTestCommand();
     disableExits(test);
-    const rejection = (await test
-      .parseAsync(['run', '--all', '--project', 'proj_1', '--target-url', 'https://example.com'], {
+    await expect(
+      test.parseAsync(['run', '--all', '--project', 'proj_1', '--target-url', ''], {
         from: 'user',
-      })
-      .catch((error: unknown) => error)) as ApiError;
-    expect(rejection).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
-    // The rejection explains why + how to fix it, without a
-    // cosmetic doubled period at the end (the reason clause itself already
-    // ends with "Remove --target-url.", and the `nextAction` template used
-    // to blindly append a second one).
-    expect(rejection.nextAction).toContain('Remove --target-url.');
-    expect(rejection.nextAction.endsWith('..')).toBe(false);
-    expect(rejection.nextAction.endsWith('.')).toBe(true);
+      }),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      nextAction: expect.stringContaining('needs a URL'),
+    });
+  });
+
+  it('writes every CI artifact and reports server refund status when the echo is wrong', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-wrong-target-'));
+    const reportFile = join(dir, 'report.xml');
+    const summaryFile = join(dir, 'summary.json');
+    const stepSummary = join(dir, 'step.md');
+    const stderr: string[] = [];
+    const fetchImpl = makeFetch((url, init) =>
+      url.endsWith('/cancel')
+        ? {
+            body: {
+              ...makePassedRun('run_fresh_01', 'test_be_01'),
+              status: 'cancelled',
+              alreadyCancelled: false,
+              refund: { status: 'not_charged' },
+            },
+          }
+        : (init.method ?? 'GET') === 'POST'
+          ? {
+              body: {
+                accepted: [
+                  {
+                    testId: 'test_be_01',
+                    runId: 'run_fresh_01',
+                    enqueuedAt: '2026-09-25T00:00:00Z',
+                  },
+                ],
+                deferred: [],
+                conflicts: [],
+                skippedFrontend: [],
+                skippedIntegration: [],
+                targetUrl: 'https://wrong.example.com',
+              },
+            }
+          : errorBody('NOT_FOUND'),
+    );
+    const err = await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+        targetUrl: 'https://preview.example.com',
+        skipPreflight: true,
+        report: 'junit',
+        reportFile,
+        summaryFile,
+        ghOutput: true,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderr.push(line),
+        env: { GITHUB_ACTIONS: 'true', GITHUB_STEP_SUMMARY: stepSummary } as NodeJS.ProcessEnv,
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ code: 'UNSUPPORTED', exitCode: 7 });
+    const readArtifact = (path: string): string | null =>
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- every path is under this test's own mkdtempSync temp dir, never user input
+      existsSync(path) ? readFileSync(path, 'utf8') : null;
+    expect(readArtifact(reportFile)).toContain('test_be_01');
+    expect(JSON.parse(readArtifact(summaryFile) ?? 'null')).toMatchObject({ total: 1, passed: 0 });
+    expect(readArtifact(stepSummary)).toContain('test_be_01');
+    expect(stderr.join('\n')).toContain('not_charged');
+    expect(stderr.some(line => line.startsWith('::error'))).toBe(true);
+  });
+
+  it.each([
+    ['UNSUPPORTED', 7, 'Batch URL overrides require a V3 account'],
+    ['PRECONDITION_FAILED', 6, 'Login-once environment has a different origin'],
+  ] as const)('surfaces the server %s refusal with exit %i', async (code, exitCode, message) => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      status: code === 'UNSUPPORTED' ? 422 : 412,
+      body: { error: { code, message, requestId: 'req_test' } },
+    }));
+    const err = await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: false,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+        targetUrl: 'https://preview.example.com',
+        skipPreflight: true,
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
+    ).catch(e => e);
+    expect(err).toMatchObject({ code, exitCode, message });
+  });
+
+  it('keeps dry-run offline and previews the URL in its request body', async () => {
+    const stdout: string[] = [];
+    const fetchImpl = vi.fn(() => {
+      throw new Error('network called');
+    }) as unknown as FetchImpl;
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: false,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+        dryRun: true,
+        targetUrl: 'https://preview.example.com',
+      },
+      { fetchImpl, stdout: line => stdout.push(line), stderr: () => undefined },
+    );
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(JSON.parse(stdout.join('\n'))).toMatchObject({
+      body: { projectId: 'project_be', targetUrl: 'https://preview.example.com' },
+    });
+  });
+
+  it('refuses --all --local with --target-url before network access', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const fetchImpl = vi.fn(() => {
+      throw new Error('network called');
+    }) as unknown as FetchImpl;
+    const test = createTestCommand({ fetchImpl, stdout: () => undefined, stderr: () => undefined });
+    disableExits(test);
+    await expect(
+      test.parseAsync(
+        [
+          'run',
+          '--all',
+          '--project',
+          'project_be',
+          '--local',
+          '3000',
+          '--target-url',
+          'https://preview.example.com',
+        ],
+        { from: 'user' },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      nextAction: expect.stringContaining('mutually exclusive'),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
   it('<test-id> --filter (without --all) → exit 5 (filter is --all-only)', async () => {
@@ -3160,6 +4255,79 @@ describe('runTestRunAll — batch fresh run', () => {
     expect(payload.accepted.every(r => r.status === 'passed')).toBe(true);
   });
 
+  it('writes a skipped JUnit testcase for a hard conflict counted in the CI summary', async () => {
+    const { credentialsPath } = makeCreds();
+    const stderrLines: string[] = [];
+    const dir = mkdtempSync(join(tmpdir(), 'cli-junit-undispatched-'));
+    const summaryFile = join(dir, 'summary.json');
+    const reportFile = join(dir, 'report.xml');
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') {
+        return {
+          body: {
+            accepted: [
+              {
+                testId: 'test_be_01',
+                runId: 'run_fresh_01',
+                enqueuedAt: '2026-06-09T10:00:00.000Z',
+              },
+            ],
+            conflicts: [
+              { testId: 'test_refused', reason: 'billing_hold', message: 'Card declined.' },
+            ],
+            deferred: [],
+            skippedFrontend: [],
+            skippedIntegration: [],
+          } satisfies BatchRunFreshResponse,
+        };
+      }
+      if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
+      return { body: makePassedRun('run_fresh_01', 'test_be_01') };
+    });
+    const rejection = (await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+        report: 'junit',
+        reportFile,
+        summaryFile,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        env: {} as NodeJS.ProcessEnv,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    ).catch((e: unknown) => e)) as ApiError;
+    expect(rejection).toMatchObject({ exitCode: 6 });
+    const link = 'Upgrade: /pricing; billing: /dashboard/settings/billing.';
+    expect(stderrLines.join('\n')).toContain(link);
+    // Exactly once: the accepted run made the advisory print the link already
+    // (accepted.length > 0), so the final CONFLICT nextAction must not repeat
+    // it — never "already in flight" for a paused workspace either.
+    expect(stderrLines.join('\n').split(link)).toHaveLength(2);
+    expect(rejection.nextAction).not.toContain('Upgrade:');
+    expect(rejection.message).not.toContain('already in flight');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const summary = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
+      total: number;
+      skipped: number;
+    };
+    expect(summary).toMatchObject({ total: 2, skipped: 1 });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const xml = readFileSync(reportFile, 'utf8');
+    expect(xml).toContain('tests="2" failures="0" errors="0" skipped="1"');
+    expect(xml).toContain('testId="test_refused"');
+    expect(xml).toContain('<skipped message="Card declined. (not dispatched)"/>');
+  });
+
   it('run --all --wait: past the shared deadline, a single-shot read resolves an already-terminal run to its verdict instead of a false timeout', async () => {
     const { credentialsPath } = makeCreds();
     const baseNow = new Date('2026-06-09T10:00:00.000Z').getTime();
@@ -3172,6 +4340,7 @@ describe('runTestRunAll — batch fresh run', () => {
     const fetchImpl = makeFetch((url, init) => {
       const method = init.method ?? 'GET';
       if (method === 'POST') return { body: BATCH_FRESH_RESP };
+      if (url.endsWith('/projects/project_be/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
 
       const runId = url.split('/runs/')[1]?.split('?')[0] ?? 'run_unknown';
       runFetches.push(runId);
@@ -3424,7 +4593,7 @@ describe('runTestRunAll — batch fresh run', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
     // Should print a non-empty JSON body (sample or envelope)
     expect(out.length).toBeGreaterThan(0);
-    // DEV-247: the canned sample must carry the "not from the server" banner.
+    // The canned sample must carry the "not from the server" banner.
     expect(err).toContain(DRY_RUN_BANNER);
   });
 
@@ -3476,315 +4645,6 @@ describe('runTestRunAll — batch fresh run', () => {
       ),
     ).rejects.toMatchObject({ exitCode: 7 });
   });
-});
-
-// ---------------------------------------------------------------------------
-// [P1] D3 deferred-retry: conflicts discovered during retries must be merged
-// into the running conflicts collection and appear in the final summary/JSON.
-// Without the fix the code only logged them; the final accounting still showed
-// only initial conflicts → everything-deferred→retried→conflicted would exit 0
-// with zero accepted/deferred/conflicts reported.
-// ---------------------------------------------------------------------------
-
-describe('[codex-P1] run --all deferred-retry: retry-conflicts merged into final accounting', () => {
-  it('deferred→conflict on retry: summary.conflicts reflects retry-returned conflicts; exits 6 when all paths resolve to conflict', async () => {
-    const { credentialsPath } = makeCreds();
-
-    // Initial dispatch: 1 deferred, 0 accepted, 0 initial conflicts.
-    const initialResp: BatchRunFreshResponse = {
-      accepted: [],
-      deferred: [{ testId: 'test_deferred' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    // Retry response: the deferred test is now in-flight (conflict).
-    const retryResp: BatchRunFreshResponse = {
-      accepted: [],
-      deferred: [],
-      conflicts: [{ testId: 'test_deferred' }],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-
-    let batchCallCount = 0;
-    const printed: Array<Record<string, unknown>> = [];
-    const stderrLines: string[] = [];
-
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCallCount++;
-        return { body: batchCallCount === 1 ? initialResp : retryResp };
-      }
-      return errorBody('NOT_FOUND');
-    });
-
-    try {
-      await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 300,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-          stderr: line => stderrLines.push(line),
-          sleep: instantSleep,
-        },
-      );
-      // Should not reach here: exit 6 because accepted=0 and conflicts>0 after retry
-      throw new Error('Expected runTestRunAll to throw');
-    } catch (err) {
-      // After D3 retries drain deferred→conflict: accepted=0, conflicts=[test_deferred]
-      // The code should throw CONFLICT (exit 6) because accepted=0 and conflicts>0.
-      expect((err as ApiError).exitCode).toBe(6);
-    }
-
-    // The retry must have fired (initial + 1 retry = 2 calls, since deferred drains)
-    expect(batchCallCount).toBeGreaterThanOrEqual(2);
-
-    // The final JSON payload must include the retry-discovered conflict, not just the initial []
-    const withConflicts = printed.find(
-      p => Array.isArray(p.conflicts) && (p.conflicts as unknown[]).length > 0,
-    );
-    expect(withConflicts).toBeDefined();
-    expect(
-      (withConflicts?.conflicts as Array<{ testId: string }>).some(
-        c => c.testId === 'test_deferred',
-      ),
-    ).toBe(true);
-  });
-
-  it('deferred→partially-conflict on retry: retry-conflicts appear in JSON summary; hard conflict exits 6', async () => {
-    const { credentialsPath } = makeCreds();
-
-    // Initial dispatch: 2 deferred, 1 accepted.
-    const initialResp: BatchRunFreshResponse = {
-      accepted: [{ testId: 'test_ok', runId: 'run_ok', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-      deferred: [{ testId: 'test_deferred_a' }, { testId: 'test_deferred_b' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    // Retry: one accepted, one becomes conflict.
-    const retryResp: BatchRunFreshResponse = {
-      accepted: [
-        {
-          testId: 'test_deferred_a',
-          runId: 'run_deferred_a',
-          enqueuedAt: '2026-06-09T10:00:01.000Z',
-        },
-      ],
-      deferred: [],
-      conflicts: [{ testId: 'test_deferred_b' }],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-
-    let batchCallCount = 0;
-    const printed: Array<Record<string, unknown>> = [];
-
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCallCount++;
-        return { body: batchCallCount === 1 ? initialResp : retryResp };
-      }
-      // Poll: both accepted runs return passed
-      if (url.includes('/runs/run_ok')) {
-        return {
-          body: {
-            runId: 'run_ok',
-            testId: 'test_ok',
-            projectId: 'project_be',
-            userId: 'u1',
-            status: 'passed',
-            source: 'cli',
-            createdAt: '2026-06-09T10:00:00.000Z',
-            startedAt: '2026-06-09T10:00:01.000Z',
-            finishedAt: '2026-06-09T10:00:30.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://api.example.com',
-            createdFrom: 'cli',
-            failedStepIndex: null,
-            failureKind: null,
-            error: null,
-            videoUrl: null,
-            stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-          } satisfies RunResponse,
-        };
-      }
-      if (url.includes('/runs/run_deferred_a')) {
-        return {
-          body: {
-            runId: 'run_deferred_a',
-            testId: 'test_deferred_a',
-            projectId: 'project_be',
-            userId: 'u1',
-            status: 'passed',
-            source: 'cli',
-            createdAt: '2026-06-09T10:00:00.000Z',
-            startedAt: '2026-06-09T10:00:01.000Z',
-            finishedAt: '2026-06-09T10:00:30.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://api.example.com',
-            createdFrom: 'cli',
-            failedStepIndex: null,
-            failureKind: null,
-            error: null,
-            videoUrl: null,
-            stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-          } satisfies RunResponse,
-        };
-      }
-      return errorBody('NOT_FOUND');
-    });
-
-    // test_deferred_b is a HARD conflict (no currentRunId) → not runnable, not
-    // resumable → the batch exits 6 even though the two accepted runs passed.
-    // The JSON payload is still printed BEFORE the exit-6 gate, so the merge
-    // assertions below hold.
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 300,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-          stderr: () => undefined,
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 6 });
-
-    // summary must include the retry-discovered conflict in the conflicts count
-    const withSummary = printed.find(p => p.summary);
-    expect(withSummary).toBeDefined();
-    expect((withSummary?.summary as Record<string, number>).conflicts).toBe(1);
-    expect((withSummary?.summary as Record<string, number>).passed).toBe(2); // both accepted runs passed
-    expect(
-      (withSummary?.conflicts as Array<{ testId: string }>).some(
-        c => c.testId === 'test_deferred_b',
-      ),
-    ).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// D3 deferred-retry is BUDGET-DRIVEN, not capped at a fixed attempt count:
-// a busy pool that keeps deferring for more than 3 tries still drains as long
-// as the --timeout budget remains. Before this fix the loop stopped after
-// MAX_DEFERRED_RETRIES (3) attempts and failed the run (exit 7) even with
-// budget left. instantSleep does not advance the clock, so the deadline never
-// trips here — the run resolves purely because the loop keeps retrying beyond 3.
-// ---------------------------------------------------------------------------
-
-describe('run --all deferred-retry: budget-driven (retries beyond the old fixed cap)', () => {
-  it('a pool that defers for 4 retries still accepts and passes when the timeout budget allows', async () => {
-    const { credentialsPath } = makeCreds();
-
-    const deferredResp: BatchRunFreshResponse = {
-      accepted: [],
-      deferred: [{ testId: 'test_busy' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const acceptedResp: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_busy', runId: 'run_busy', enqueuedAt: '2026-06-09T10:00:05.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-
-    let batchCallCount = 0;
-    const printed: Array<Record<string, unknown>> = [];
-
-    // Calls 1-4 (initial dispatch + 3 retries) defer; call 5 (the 4th retry —
-    // one past the old MAX_DEFERRED_RETRIES=3 cap) finally accepts.
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCallCount++;
-        return { body: batchCallCount >= 5 ? acceptedResp : deferredResp };
-      }
-      if (url.includes('/runs/run_busy')) {
-        return {
-          body: {
-            runId: 'run_busy',
-            testId: 'test_busy',
-            projectId: 'project_be',
-            userId: 'u1',
-            status: 'passed',
-            source: 'cli',
-            createdAt: '2026-06-09T10:00:00.000Z',
-            startedAt: '2026-06-09T10:00:05.000Z',
-            finishedAt: '2026-06-09T10:00:30.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://api.example.com',
-            createdFrom: 'cli',
-            failedStepIndex: null,
-            failureKind: null,
-            error: null,
-            videoUrl: null,
-            stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-          } satisfies RunResponse,
-        };
-      }
-      return errorBody('NOT_FOUND');
-    });
-
-    // Large budget → maxDeferredAttempts = max(3, ceil(600/60)+2) = 12, well
-    // past the 5 calls this test needs. Under the old fixed cap of 3 the loop
-    // would stop after call 4 with test_busy still deferred → exit 7.
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 600,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-
-    // The 5th POST (4th retry) is what accepts — proof the loop retried past 3.
-    expect(batchCallCount).toBe(5);
-    const payload = printed.find(p => p.summary && typeof p.summary === 'object');
-    expect(payload).toBeDefined();
-    expect((payload?.summary as { passed: number }).passed).toBe(1);
-  });
-
-  // NOTE: the deferred-retry dispatch POST is deliberately NOT bound to the
-  // batch deadline via an AbortSignal (aborting a state-creating dispatch
-  // mid-flight leaves the outcome indeterminate and can duplicate runs on the
-  // next invocation — see the comment at the call site). This isn't unit-tested
-  // by signal inspection because the HttpClient's own `--request-timeout` always
-  // attaches a request-scoped AbortSignal, so presence alone can't distinguish
-  // the (removed) deadline signal from the (kept) request-timeout one.
 });
 
 // ---------------------------------------------------------------------------
@@ -3862,6 +4722,152 @@ describe('run --all --wait: auto-resume already-running conflicts (Gap B)', () =
     expect(summary.passed).toBe(1);
     expect(summary.conflicts).toBe(0);
     expect(summary.total).toBe(1);
+  });
+
+  function inFlightRunRead(overrides: Partial<RunResponse>): RunResponse {
+    return {
+      runId: 'run_inflight',
+      testId: 'test_busy',
+      projectId: 'project_1',
+      userId: 'u1',
+      status: 'passed',
+      source: 'cli',
+      createdAt: '2026-06-09T10:00:00.000Z',
+      startedAt: '2026-06-09T10:00:05.000Z',
+      finishedAt: '2026-06-09T10:00:30.000Z',
+      codeVersion: 'v1',
+      targetUrl: 'https://example.com',
+      createdFrom: 'cli',
+      failedStepIndex: null,
+      failureKind: null,
+      error: null,
+      videoUrl: null,
+      stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
+      ...overrides,
+    };
+  }
+  const ENV_LISTING = {
+    environments: [
+      { id: 'env_default', name: 'default', url: 'https://example.com', isDefault: true },
+      { id: 'env_staging', name: 'staging', url: 'https://staging.example.com', isDefault: false },
+    ],
+  };
+  function batchWithOneInFlight(inFlight: RunResponse) {
+    const conflictResp: BatchRunFreshResponse = {
+      accepted: [],
+      deferred: [],
+      conflicts: [{ testId: 'test_busy', currentRunId: 'run_inflight' }],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const calls: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      calls.push(`${init.method ?? 'GET'} ${url.replace(/^https?:\/\/[^/]+/, '')}`);
+      if ((init.method ?? 'GET') === 'POST') {
+        // Echo the batch target like a current backend, so the echo guard
+        // (`target-url-not-honored`) is not what this test exercises.
+        const sent =
+          typeof init.body === 'string' ? (JSON.parse(init.body) as { targetUrl?: string }) : {};
+        return {
+          body: sent.targetUrl ? { ...conflictResp, targetUrl: sent.targetUrl } : conflictResp,
+        };
+      }
+      if (url.endsWith('/projects/project_1/env')) return { body: ENV_LISTING };
+      if (url.includes('/runs/run_inflight')) return { body: inFlight };
+      return errorBody('NOT_FOUND');
+    });
+    return { fetchImpl, calls };
+  }
+  const batchOpts = {
+    profile: 'default',
+    output: 'json' as const,
+    debug: false,
+    projectId: 'project_1',
+    wait: true,
+    timeoutSeconds: 60,
+    maxConcurrency: 5,
+  };
+
+  it('--env: an in-flight run on ANOTHER environment is not attached — it stays a hard conflict (exit 6)', async () => {
+    const { credentialsPath } = makeCreds();
+    const { fetchImpl, calls } = batchWithOneInFlight(
+      inFlightRunRead({ environment: { id: 'env_default', name: 'default' } }),
+    );
+    const stderr: string[] = [];
+    const err = await runTestRunAll(
+      { ...batchOpts, environment: 'staging' },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: l => stderr.push(l),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ exitCode: 6 });
+    // The in-flight run was read and the project's environments listed, but it
+    // was never polled as this batch's own result.
+    expect(calls.filter(c => c.includes('/runs/run_inflight')).length).toBe(1);
+    expect(calls.some(c => c.endsWith('/projects/project_1/env'))).toBe(true);
+    expect(stderr.some(l => l.includes('does not match the requested environment'))).toBe(true);
+    expect(stderr.some(l => l.includes('polling in-flight run'))).toBe(false);
+  });
+
+  it('--env: an in-flight run on THAT environment is attached and polled', async () => {
+    const { credentialsPath } = makeCreds();
+    const { fetchImpl } = batchWithOneInFlight(
+      inFlightRunRead({ environment: { id: 'env_staging', name: 'staging' } }),
+    );
+    const printed: Array<Record<string, unknown>> = [];
+    await runTestRunAll(
+      { ...batchOpts, environment: 'staging' },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    );
+    const summary = printed.find(p => p.summary)?.summary as { passed: number; conflicts: number };
+    expect(summary).toMatchObject({ passed: 1, conflicts: 0 });
+  });
+
+  it('no --env: an in-flight run that records an environment must be on the project default', async () => {
+    const { credentialsPath } = makeCreds();
+    const { fetchImpl } = batchWithOneInFlight(
+      inFlightRunRead({ environment: { id: 'env_pr_8', name: 'github-pr-8' } }),
+    );
+    const stderr: string[] = [];
+    const err = await runTestRunAll(batchOpts, {
+      credentialsPath,
+      fetchImpl,
+      stdout: () => {},
+      stderr: l => stderr.push(l),
+      sleep: instantSleep,
+    }).catch(e => e);
+    expect(err).toMatchObject({ exitCode: 6 });
+    expect(stderr.some(l => l.includes('not attaching'))).toBe(true);
+  });
+
+  it('--target-url: an in-flight run against another URL is not attached', async () => {
+    const { credentialsPath } = makeCreds();
+    const { fetchImpl } = batchWithOneInFlight(
+      inFlightRunRead({ targetUrl: 'https://pr-9.preview.example.com' }),
+    );
+    const stderr: string[] = [];
+    const err = await runTestRunAll(
+      { ...batchOpts, targetUrl: 'https://pr-8.preview.example.com', skipPreflight: true },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => {},
+        stderr: l => stderr.push(l),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err).toMatchObject({ exitCode: 6 });
+    expect(stderr.some(l => l.includes('it targets https://pr-9.preview.example.com'))).toBe(true);
   });
 
   it('a hard conflict (no currentRunId) still exits 6 when nothing is pollable', async () => {
@@ -3965,101 +4971,6 @@ describe('run --all --wait: auto-resume already-running conflicts (Gap B)', () =
         },
       ),
     ).rejects.toMatchObject({ exitCode: 6 });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// [P2] D3 idempotency key truncation: derived retry keys stay ≤ 256 chars
-// ---------------------------------------------------------------------------
-
-describe('[codex-P2] run --all deferred-retry: idempotency key truncation', () => {
-  it('retry idempotency key does not exceed 256 chars when base key is at the 256-char limit', async () => {
-    const { credentialsPath } = makeCreds();
-
-    // A caller-supplied key exactly at the 256-char limit
-    const longKey = 'k'.repeat(256);
-
-    const initialResp: BatchRunFreshResponse = {
-      accepted: [],
-      deferred: [{ testId: 'test_deferred' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const retryResp: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_deferred', runId: 'run_d', enqueuedAt: '2026-06-09T10:00:00.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-
-    const capturedIdempotencyKeys: string[] = [];
-    let batchCallCount = 0;
-
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        const key = (init.headers as Record<string, string>)?.['idempotency-key'] ?? '';
-        capturedIdempotencyKeys.push(key);
-        batchCallCount++;
-        return { body: batchCallCount === 1 ? initialResp : retryResp };
-      }
-      if (url.includes('/runs/run_d')) {
-        return {
-          body: {
-            runId: 'run_d',
-            testId: 'test_deferred',
-            projectId: 'project_be',
-            userId: 'u1',
-            status: 'passed',
-            source: 'cli',
-            createdAt: '2026-06-09T10:00:00.000Z',
-            startedAt: '2026-06-09T10:00:01.000Z',
-            finishedAt: '2026-06-09T10:00:30.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://api.example.com',
-            createdFrom: 'cli',
-            failedStepIndex: null,
-            failureKind: null,
-            error: null,
-            videoUrl: null,
-            stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-          } satisfies RunResponse,
-        };
-      }
-      return errorBody('NOT_FOUND');
-    });
-
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 300,
-        maxConcurrency: 5,
-        idempotencyKey: longKey,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    );
-
-    // All captured keys must be ≤ 256 chars
-    for (const key of capturedIdempotencyKeys) {
-      expect(key.length).toBeLessThanOrEqual(256);
-    }
-    // The retry key must differ from the base key (suffix was appended)
-    expect(capturedIdempotencyKeys.length).toBeGreaterThanOrEqual(2);
-    expect(capturedIdempotencyKeys[1]).not.toBe(longKey);
-    expect(capturedIdempotencyKeys[1]).toContain('deferred-retry');
   });
 });
 
@@ -4354,6 +5265,36 @@ describe('runTestRunAll — zero-dispatch fails the CI gate', () => {
     ).rejects.toMatchObject({ exitCode: 5 });
   });
 
+  it('writes matching summary and JUnit for a batch with only a hard conflict', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-junit-conflict-'));
+    const summaryFile = join(dir, 'summary.json');
+    const reportFile = join(dir, 'report.xml');
+    const fetchImpl = makeFetch(() => ({
+      body: {
+        ...EMPTY_BATCH,
+        conflicts: [{ testId: 'test_refused', reason: 'billing_hold', message: 'Card declined.' }],
+      } satisfies BatchRunFreshResponse,
+    }));
+    await expect(
+      runTestRunAll(baseOpts({ wait: true, report: 'junit', reportFile, summaryFile }) as never, {
+        credentialsPath,
+        fetchImpl,
+        env: {} as NodeJS.ProcessEnv,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      }),
+    ).rejects.toMatchObject({ exitCode: 13, code: 'FEATURE_GATED' });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    expect(JSON.parse(readFileSync(summaryFile, 'utf8'))).toMatchObject({ total: 1, skipped: 1 });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const xml = readFileSync(reportFile, 'utf8');
+    expect(xml).toContain('tests="1" failures="0" errors="0" skipped="1"');
+    expect(xml).toContain('testId="test_refused"');
+    expect(xml).toContain('<skipped message="Card declined. (not dispatched)"/>');
+  });
+
   it('--allow-empty makes the same empty batch resolve (exit 0)', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
@@ -4457,7 +5398,7 @@ describe('runTestRunAll — zero-dispatch fails the CI gate', () => {
     const out: string[] = [];
     const fetchImpl = makeFetch(() => ({ body: { ...EMPTY_BATCH, skippedFrontend: ['fe_1'] } }));
     await expect(
-      runTestRunAll(baseOpts({ ghOutput: true, summaryFile }) as never, {
+      runTestRunAll(baseOpts({ ghOutput: true, summaryFile, wait: true }) as never, {
         credentialsPath,
         fetchImpl,
         stdout: (l: string) => out.push(l),
@@ -4877,11 +5818,11 @@ describe('[finding-5] runTestRunAll --wait: RequestTimeoutError during fan-out p
 });
 
 // ---------------------------------------------------------------------------
-// DEV-331 piece 1 — graceful detach on SIGINT during test run --wait
+// Graceful detach on SIGINT during test run --wait
 // ---------------------------------------------------------------------------
 
-describe('runTestRun --wait — InterruptError graceful detach (DEV-331)', () => {
-  it('SIG-1: trigger succeeds, poll interrupted → partial to stdout + honest stderr + exit 130', async () => {
+describe('runTestRun --wait — InterruptError graceful detach', () => {
+  it('trigger succeeds, poll interrupted → partial to stdout + honest stderr + exit 130', async () => {
     const { credentialsPath } = makeCreds();
     const shutdown = new ShutdownController();
     const stdoutLines: string[] = [];
@@ -4890,19 +5831,14 @@ describe('runTestRun --wait — InterruptError graceful detach (DEV-331)', () =>
     // Trigger POST resolves; the subsequent GET /runs/{id} long-poll hangs
     // until the composed signal aborts (real-fetch contract).
     const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
-      const url =
-        typeof input === 'string'
-          ? input
-          : input instanceof URL
-            ? input.toString()
-            : (input as { url: string }).url;
+      const discovery = ordinaryRunDiscoveryResponse(input, init);
+      if (discovery) return discovery;
       if (init.method === 'POST') {
         return new Response(JSON.stringify(TRIGGER_RESP), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
       }
-      void url;
       return new Promise<Response>((_resolve, reject) => {
         const signal = init.signal;
         const rejectWithReason = (): void => {
@@ -5506,6 +6442,7 @@ describe('gh-output integration on single-test run --wait (Gap A)', () => {
       },
     ).catch(e => e);
     expect(err).toMatchObject({ exitCode: 1 });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
     const artifact = JSON.parse(readFileSync(summaryFile, 'utf8')) as {
       total: number;
       passed: number;
@@ -5597,9 +6534,13 @@ describe('run --gh-output / --summary-file still require --wait (Gap A guard)', 
     const { createTestCommand } = await import('./test.js');
     const test = createTestCommand();
     disableExits(test);
+    const summaryDir = mkdtempSync(join(tmpdir(), 'cli-run-summary-'));
+    const summaryFile = join(summaryDir, 'x.json');
     await expect(
-      test.parseAsync(['run', 'test_xyz', '--summary-file', '/tmp/x.json'], { from: 'user' }),
-    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+      test.parseAsync(['run', 'test_xyz', '--summary-file', summaryFile], { from: 'user' }),
+    )
+      .rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 })
+      .finally(() => rmSync(summaryDir, { recursive: true, force: true }));
   });
 });
 
@@ -5648,7 +6589,9 @@ describe('early run receipt', () => {
           stdout: line => stdout.push(line),
           stderr: line => stderr.push(line),
           shutdown: new ShutdownController(),
-          fetchImpl: async (_input, init) => {
+          fetchImpl: async (input, init) => {
+            const discovery = ordinaryRunDiscoveryResponse(input, init);
+            if (discovery) return discovery;
             if (init?.method === 'POST')
               return new Response(JSON.stringify({ ...TRIGGER_RESP, dashboardUrl }));
             enteredPoll();
@@ -5717,12 +6660,14 @@ describe('early run receipt', () => {
           ...makeCreds(),
           stdout: () => {},
           stderr: line => stderr.push(line),
-          fetchImpl: makeFetch((_url, init) => {
+          fetchImpl: makeFetch((url, init) => {
             if (init.method === 'POST')
               return errorBody('CONFLICT', {
                 reason: 'run_in_flight',
                 currentRunId: 'run_resumed',
               });
+            if (url.endsWith('/projects/project_1/env'))
+              return { body: CURRENT_DEFAULT_ENVIRONMENTS };
             reads++;
             if (reads > 1) receiptAtPoll = [...stderr];
             return { body: { ...makePassedRun(), runId: 'run_resumed' } };
@@ -6109,7 +7054,7 @@ describe('telemetry extras recorded by the run commands', () => {
   });
 });
 
-describe('runTestRunAll — billing hold on the batch route', () => {
+describe('runTestRunAll — paused workspace on the batch route', () => {
   beforeEach(() => {
     takeTelemetryExtras();
   });
@@ -6126,17 +7071,18 @@ describe('runTestRunAll — billing hold on the batch route', () => {
     maxConcurrency: 10,
   };
 
-  /** The server's answer when the WHOLE batch is refused for a billing hold —
+  /** The server's answer when the WHOLE batch is refused because the workspace is paused —
    * the same 403 FEATURE_GATED envelope the single-run route returns. */
   const HOLD_403 = {
     status: 403,
     body: {
       error: {
         code: 'FEATURE_GATED',
-        message: 'Billing hold: this workspace cannot start new runs until payment is resolved.',
+        message:
+          'This workspace is paused because its subscription ended. Subscribe again, or move it to the Free plan, in Settings → Billing to resume.',
         nextAction: 'Resolve the payment on the billing page, then retry.',
         requestId: 'req_403',
-        details: { reason: 'billing_hold', state: 'unpaid' },
+        details: { reason: 'billing_hold', state: 'paused' },
       },
     },
   };
@@ -6160,19 +7106,19 @@ describe('runTestRunAll — billing hold on the batch route', () => {
     expect(err).toBeInstanceOf(ApiError);
     expect(err.code).toBe('FEATURE_GATED');
     expect(err.exitCode).toBe(13);
-    expect(err.message).toContain('Billing hold');
+    expect(err.message).toContain('This workspace is paused');
     expect(err.nextAction).toBe('Resolve the payment on the billing page, then retry.');
     expect(err.requestId).toBe('req_403');
     expect(err.getDetail('reason')).toBe('billing_hold');
-    expect(err.getDetail('state')).toBe('unpaid');
+    expect(err.getDetail('state')).toBe('paused');
   });
 
-  it('defensive fallback: an older backend folding every case into billing_hold conflicts keeps exit 6', async () => {
+  it('an older backend folding every case into billing_hold conflicts exits 13', async () => {
     const { credentialsPath } = makeCreds();
     const allHold: BatchRunFreshResponse = {
       accepted: [],
       conflicts: [
-        { testId: 'test_be_01', reason: 'billing_hold', message: 'Billing hold.' },
+        { testId: 'test_be_01', reason: 'billing_hold', message: 'This workspace is paused.' },
         { testId: 'test_be_02', reason: 'billing_hold' },
       ],
       deferred: [],
@@ -6194,19 +7140,355 @@ describe('runTestRunAll — billing hold on the batch route', () => {
         sleep: instantSleep,
       },
     ).catch(e => e)) as ApiError;
-    expect(err.code).toBe('CONFLICT');
-    expect(err.exitCode).toBe(6);
+    expect(err.code).toBe('FEATURE_GATED');
+    expect(err.exitCode).toBe(13);
+    // The envelope the CLI builds names the gate's refusal; the conflicts'
+    // deprecated wire spelling still reaches telemetry unchanged.
+    expect(err.getDetail('reason')).toBe('paused');
+    expect(err.nextAction).toContain('/dashboard/settings/billing');
     // The cause is still named on stderr, not blanket "already in flight".
-    expect(stderrLines.join('\n')).toContain('2 billing hold');
+    expect(stderrLines.join('\n')).toContain('2 workspace paused');
     expect(takeTelemetryExtras()).toMatchObject({ conflicts: 2, conflictReason: 'billing_hold' });
   });
 });
 
+describe('runTestRunAll — pure in-flight conflict wording is restored to origin/dev', () => {
+  it.each([false, true])(
+    'wait=%s: an all in-flight batch keeps the original "already in flight" text',
+    async wait => {
+      const { credentialsPath } = makeCreds();
+      const allInFlight: BatchRunFreshResponse = {
+        accepted: [],
+        // No `reason` at all — the legacy/absent-reason shape, which must still
+        // read exactly as it did on origin/dev, not the reason-aware summary
+        // (that summary is for when some OTHER reason is present instead).
+        conflicts: [{ testId: 'test_be_01' }, { testId: 'test_be_02' }],
+        deferred: [],
+        skippedFrontend: [],
+        skippedIntegration: [],
+      };
+      const fetchImpl = makeFetch((_url, init) => {
+        if ((init.method ?? 'GET') === 'POST') return { body: allInFlight };
+        return { body: { items: [], nextToken: null } };
+      });
+      const err = (await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => undefined,
+          stderr: () => undefined,
+          sleep: instantSleep,
+        },
+      ).catch(e => e)) as ApiError;
+      expect(err.code).toBe('CONFLICT');
+      expect(err.exitCode).toBe(6);
+      expect(err.message).toBe('Batch run: nothing was queued — 2 tests already in flight.');
+    },
+  );
+
+  it('a hard (unresumable) in-flight conflict mixed with an accepted run keeps the original "could not be resumed" wording', async () => {
+    const { credentialsPath } = makeCreds();
+    const mixedResp: BatchRunFreshResponse = {
+      accepted: [
+        { testId: 'test_be_01', runId: 'run_fresh_01', enqueuedAt: '2026-06-09T10:00:00.000Z' },
+      ],
+      // No `currentRunId` → a HARD conflict (nothing to auto-resume/poll), and
+      // no `reason` → the legacy pure in-flight shape.
+      conflicts: [{ testId: 'test_be_02' }],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: mixedResp };
+      if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
+      return { body: makePassedRun() };
+    });
+    const err = (await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(e => e)) as ApiError;
+    expect(err.code).toBe('CONFLICT');
+    expect(err.exitCode).toBe(6);
+    expect(err.message).toBe('1 test already in flight and could not be resumed — not run.');
+  });
+});
+
+describe('test run --all: dependency refusals in the batch advisory', () => {
+  it('names no_producer and producer_in_flight instead of repeating "not dispatched"', async () => {
+    const { credentialsPath } = makeCreds();
+    const resp: BatchRunFreshResponse = {
+      accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
+      conflicts: [
+        { testId: 't2', reason: 'no_producer', message: 'Missing "x"' },
+        { testId: 't3', reason: 'producer_in_flight', currentRunId: 'run_other' },
+      ],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: resp };
+      return { body: { items: [], nextToken: null } };
+    });
+    const stderr: string[] = [];
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: false,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderr.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(() => undefined);
+    const advisory = stderr.find(l => l.includes('not dispatched')) ?? '';
+    expect(advisory).toContain(
+      '2 tests not dispatched (1 no producer for its variables, 1 producer running in another run), skipped: t2 t3',
+    );
+  });
+});
+
+describe('test run --all --wait: a consumer seeded blocked is not auto-resumed', () => {
+  // The server answers no_producer / producer_in_flight with the id of the
+  // result it seeded BLOCKED for this request, before dispatch.
+  it.each([
+    [
+      'producer_in_flight',
+      '1 producer running in another run — blocked before dispatch.',
+      'Wait for the in-flight run(s) to finish, then retry: t2',
+    ],
+    [
+      'no_producer',
+      '1 no producer for its variables — blocked before dispatch.',
+      'Add or accept a test case that captures the missing variable (or supply it from the environment), then retry: t2',
+    ],
+  ] as const)(
+    '%s: reports the refusal with exit 6, never polls its seeded result',
+    async (reason, message, nextAction) => {
+      const { credentialsPath } = makeCreds();
+      const resp: BatchRunFreshResponse = {
+        accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
+        conflicts: [{ testId: 't2', reason, currentRunId: 'run_seeded_blocked' }],
+        deferred: [],
+        skippedFrontend: [],
+        skippedIntegration: [],
+      };
+      const urls: string[] = [];
+      const fetchImpl = makeFetch((url, init) => {
+        urls.push(url);
+        if ((init.method ?? 'GET') === 'POST') return { body: resp };
+        if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
+        if (url.includes('run_seeded_blocked')) {
+          return {
+            body: {
+              ...makePassedRun(),
+              runId: 'run_seeded_blocked',
+              testId: 't2',
+              status: 'blocked',
+            },
+          };
+        }
+        return { body: makePassedRun() };
+      });
+      const err = (await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => undefined,
+          stderr: () => undefined,
+          sleep: instantSleep,
+        },
+      ).catch(e => e)) as ApiError;
+      expect(urls.some(u => u.includes('run_seeded_blocked'))).toBe(false);
+      expect(err.code).toBe('CONFLICT');
+      expect(err.exitCode).toBe(6);
+      expect(err.message).toBe(message);
+      expect(err.nextAction).toBe(nextAction);
+    },
+  );
+
+  it('still polls the run id of a reason it has no label for (tunnel-required)', async () => {
+    const { credentialsPath } = makeCreds();
+    const resp: BatchRunFreshResponse = {
+      accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
+      conflicts: [
+        {
+          testId: 't2',
+          reason: 'tunnel-required' as unknown as ConflictReason,
+          currentRunId: 'run_seeded_tunnel',
+        },
+      ],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const urls: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      urls.push(url);
+      if ((init.method ?? 'GET') === 'POST') return { body: resp };
+      if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
+      if (url.endsWith('/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
+      if (url.includes('run_seeded_tunnel')) {
+        return {
+          body: { ...makePassedRun(), runId: 'run_seeded_tunnel', testId: 't2', status: 'blocked' },
+        };
+      }
+      return { body: makePassedRun() };
+    });
+    const err = (await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_fe',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(e => e)) as ApiError;
+    expect(urls.some(u => u.includes('run_seeded_tunnel'))).toBe(true);
+    expect(err.exitCode).toBe(1);
+  });
+
+  it.each([false, true])(
+    'nothing queued, only no_producer (wait=%s): says to add a producer, not to wait',
+    async wait => {
+      const { credentialsPath } = makeCreds();
+      const resp: BatchRunFreshResponse = {
+        accepted: [],
+        conflicts: [
+          { testId: 't1', reason: 'no_producer', currentRunId: 'run_seeded_1' },
+          { testId: 't2', reason: 'no_producer', currentRunId: 'run_seeded_2' },
+        ],
+        deferred: [],
+        skippedFrontend: [],
+        skippedIntegration: [],
+      };
+      const fetchImpl = makeFetch((url, init) => {
+        if ((init.method ?? 'GET') === 'POST') return { body: resp };
+        return { body: { items: [], nextToken: null } };
+      });
+      const err = (await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => undefined,
+          stderr: () => undefined,
+          sleep: instantSleep,
+        },
+      ).catch(e => e)) as ApiError;
+      expect(err.exitCode).toBe(6);
+      expect(err.message).toBe('Batch run: nothing was queued — 2 no producer for its variables.');
+      expect(err.nextAction).toBe(
+        'Add or accept a test case that captures the missing variable (or supply it from the environment), then retry: t1 t2',
+      );
+    },
+  );
+
+  it('a mixed hard-conflict batch names who waits and who needs a producer', async () => {
+    const { credentialsPath } = makeCreds();
+    const resp: BatchRunFreshResponse = {
+      accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
+      conflicts: [
+        { testId: 't2', reason: 'producer_in_flight', currentRunId: 'run_seeded_2' },
+        { testId: 't3', reason: 'no_producer', currentRunId: 'run_seeded_3' },
+      ],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: resp };
+      if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
+      return { body: makePassedRun() };
+    });
+    const err = (await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(e => e)) as ApiError;
+    expect(err.nextAction).toBe(
+      'Wait for the in-flight run(s) to finish, then retry: t2\n' +
+        'Add or accept a test case that captures the missing variable (or supply it from the environment), then retry: t3',
+    );
+  });
+});
+
 // ---------------------------------------------------------------------------
-// DEV-1305 — `--env <name>`: a named environment on the run surfaces
+// `--env <name>`: a named environment on the run surfaces
 // ---------------------------------------------------------------------------
 
-describe('test run --env (DEV-1305)', () => {
+describe('test run --env', () => {
   const ME_ON = { userId: 'u_1', keyId: 'k_1', scopes: [], env: 'development' };
 
   interface Seen {
@@ -6394,5 +7676,466 @@ describe('test run --env (DEV-1305)', () => {
     const text = out.join('\n');
     expect(text).toContain('environment local-dev');
     expect(text).toContain('targetUrl   http://127.0.0.1:55015');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `test run --all` on an EMPTY project (nothing skipped, no filter)
+// is a dead end for a new user: the exit-5 message itself names the generate
+// path so it prints in order after "Error:", and --allow-empty gets the same
+// pointer on stderr. Skipped-tests and filter-miss reasons are NOT an empty
+// project and must not claim it is.
+// ---------------------------------------------------------------------------
+describe('zero-dispatch on an EMPTY project points at test plan generate', () => {
+  const EMPTY_BATCH: BatchRunFreshResponse = {
+    accepted: [],
+    conflicts: [],
+    deferred: [],
+    skippedFrontend: [],
+    skippedIntegration: [],
+  };
+  const quiet = (stderr: string[] = []) => ({
+    stdout: () => undefined,
+    stderr: (l: string) => {
+      stderr.push(l);
+    },
+    sleep: () => Promise.resolve(),
+  });
+  function baseOpts(over: Record<string, unknown> = {}) {
+    return {
+      profile: 'default',
+      output: 'text' as const,
+      debug: false,
+      projectId: 'project_be',
+      wait: false,
+      timeoutSeconds: 600,
+      maxConcurrency: 5,
+      ...over,
+    };
+  }
+
+  it('empty project: the exit-5 message names test plan generate with the project id', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    await expect(
+      runTestRunAll(baseOpts() as never, { credentialsPath, fetchImpl, ...quiet() }),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.stringContaining('testsprite test plan generate --project project_be'),
+    });
+  });
+
+  it('empty project + --allow-empty: the pointer still reaches stderr', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    const stderr: string[] = [];
+    await runTestRunAll(baseOpts({ allowEmpty: true }) as never, {
+      credentialsPath,
+      fetchImpl,
+      ...quiet(stderr),
+    });
+    expect(stderr.join('\n')).toContain('testsprite test plan generate --project project_be');
+  });
+
+  it('empty project: the pointer names accept after generate, so the suggested path can run', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    const err = await runTestRunAll(baseOpts() as never, {
+      credentialsPath,
+      fetchImpl,
+      ...quiet(),
+    }).catch((e: unknown) => e as Error);
+    const message = (err as Error).message;
+    const generateAt = message.indexOf('testsprite test plan generate --project project_be');
+    const acceptAt = message.indexOf('testsprite test plan accept --project project_be');
+    expect(generateAt).toBeGreaterThanOrEqual(0);
+    expect(acceptAt).toBeGreaterThan(generateAt);
+    expect(message).toContain('testsprite project docs upload <spec> --project project_be');
+  });
+
+  it('project id from TESTSPRITE_PROJECT_ID (no --project): the exit-5 message still names it', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    await expect(
+      runTestRunAll(baseOpts({ projectId: undefined }) as never, {
+        credentialsPath,
+        fetchImpl,
+        env: { TESTSPRITE_PROJECT_ID: 'project_env' },
+        ...quiet(),
+      }),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.stringContaining('testsprite test plan generate --project project_env'),
+    });
+  });
+
+  it('project id from TESTSPRITE_PROJECT_ID + --allow-empty: the pointer still reaches stderr', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    const stderr: string[] = [];
+    await runTestRunAll(baseOpts({ projectId: undefined, allowEmpty: true }) as never, {
+      credentialsPath,
+      fetchImpl,
+      env: { TESTSPRITE_PROJECT_ID: 'project_env' },
+      ...quiet(stderr),
+    });
+    expect(stderr.join('\n')).toContain('[hint] This project has no tests yet.');
+    expect(stderr.join('\n')).toContain('testsprite test plan generate --project project_env');
+  });
+
+  it('--output json: the exit-5 message carries no pointer (the JSON envelope is unchanged)', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    const stderr: string[] = [];
+    await expect(
+      runTestRunAll(baseOpts({ output: 'json' }) as never, {
+        credentialsPath,
+        fetchImpl,
+        ...quiet(stderr),
+      }),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.not.stringContaining('plan generate'),
+    });
+    expect(stderr.join('\n')).not.toContain('[hint]');
+  });
+
+  it('--output json + --allow-empty: no pointer on stderr either', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: EMPTY_BATCH }));
+    const stderr: string[] = [];
+    await runTestRunAll(baseOpts({ output: 'json', allowEmpty: true }) as never, {
+      credentialsPath,
+      fetchImpl,
+      ...quiet(stderr),
+    });
+    expect(stderr.join('\n')).not.toContain('[hint]');
+    expect(stderr.join('\n')).not.toContain('plan generate');
+  });
+
+  it('all frontend tests skipped is NOT an empty project: no generate pointer', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: { ...EMPTY_BATCH, skippedFrontend: ['fe_1', 'fe_2'] },
+    }));
+    await expect(
+      runTestRunAll(baseOpts() as never, { credentialsPath, fetchImpl, ...quiet() }),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.not.stringContaining('plan generate'),
+    });
+  });
+
+  it('a --filter that matched nothing is NOT an empty project: no generate pointer', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch/run')) return { body: EMPTY_BATCH };
+      return {
+        body: {
+          items: [
+            {
+              id: 't1',
+              projectId: 'project_be',
+              name: 'Login flow',
+              type: 'backend',
+              status: 'passed',
+              createdFrom: 'cli',
+              createdAt: '2026-01-01T00:00:00.000Z',
+              updatedAt: '2026-01-01T00:00:00.000Z',
+            },
+          ],
+          nextToken: null,
+        },
+      };
+    });
+    await expect(
+      runTestRunAll(baseOpts({ nameFilter: 'checkout' }) as never, {
+        credentialsPath,
+        fetchImpl,
+        ...quiet(),
+      }),
+    ).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.not.stringContaining('plan generate'),
+    });
+  });
+});
+
+describe('run output regressions', () => {
+  afterEach(() => vi.restoreAllMocks());
+  it('shows a blocked scheduled local environment reason under --wait', async () => {
+    const reason =
+      'Environment local is on this machine (http://localhost:4900); scheduled runs execute in the cloud and cannot reach it.';
+    const { runId, testId, ...fields } = makePassedRun();
+    const run = {
+      runId,
+      testId,
+      testTitle: null,
+      ...fields,
+      status: 'blocked' as const,
+      failureKind: 'infra',
+      error: reason,
+    };
+    for (const output of ['text', 'json'] as const) {
+      const lines: string[] = [];
+      const err = await runTestRun(
+        {
+          profile: 'default',
+          output,
+          debug: false,
+          testId: 'test_xyz',
+          wait: true,
+          timeoutSeconds: 60,
+        },
+        {
+          ...makeCreds(),
+          fetchImpl: makeFetch((_url, init) => ({
+            body: init.method === 'POST' ? TRIGGER_RESP : run,
+          })),
+          stdout: line => lines.push(line),
+          stderr: () => {},
+          sleep: instantSleep,
+        },
+      ).catch((error: unknown) => error);
+      expect(err).toMatchObject({ exitCode: 1 });
+      if (output === 'json') expect(lines).toEqual([JSON.stringify(run, null, 2)]);
+      else expect(lines.join('\n')).toContain(`error       ${reason}`);
+    }
+  });
+
+  it.each([false, true])(
+    'uses a polled run createdAt for JUnit with final rescue poll=%s without changing JSON',
+    async rescue => {
+      let clock = 1_000;
+      const now = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+      const dir = mkdtempSync(join(tmpdir(), 'batch-junit-timing-'));
+      const reportFile = join(dir, 'report.xml');
+      const lines: string[] = [];
+      await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_1',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+          report: 'junit',
+          reportFile,
+        },
+        {
+          ...makeCreds(),
+          fetchImpl: makeFetch((url, init) => {
+            if (init.method === 'POST') {
+              return {
+                body: {
+                  accepted: [
+                    {
+                      testId: 'test_xyz',
+                      runId: 'run_abc',
+                      enqueuedAt: '2026-05-15T10:00:00.000Z',
+                    },
+                  ],
+                  conflicts: [],
+                  deferred: rescue ? [{ testId: 'later', reason: 'rate_limited' }] : [],
+                  skippedFrontend: [],
+                  skippedIntegration: [],
+                },
+              };
+            }
+            if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
+            return { body: { ...makePassedRun(), startedAt: null } };
+          }),
+          stdout: line => lines.push(line),
+          stderr: () => {},
+          sleep: async () => {
+            if (rescue) clock += 62_000;
+          },
+        },
+      ).catch(err => {
+        if (rescue) expect(err).toMatchObject({ exitCode: 7 });
+        else throw err;
+      });
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads the JUnit report this test wrote to its own temp dir, never user input
+      const xml = readFileSync(reportFile, 'utf8');
+      expect(xml).toContain(`skipped="${rescue ? 1 : 0}" time="30">`);
+      expect(xml).toContain('runId="run_abc" time="30">');
+      const json = JSON.parse(lines[0]!) as { accepted: Record<string, unknown>[] };
+      expect(json.accepted[0]).not.toHaveProperty('createdAt');
+      expect(json.accepted[0]).not.toHaveProperty('durationSeconds');
+      now.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// A deferral from an older backend is reported, never resent. Runs queue
+// inside their execution on the server now, so the client has no cap to wait
+// out: no 61 s sleep, no second dispatch, the accepted runs are still awaited.
+// ---------------------------------------------------------------------------
+
+describe('run --all: deferred[] from an older backend is reported, not resent', () => {
+  function deferredBatch(): BatchRunFreshResponse {
+    return {
+      accepted: [{ testId: 'test_ok', runId: 'run_ok', enqueuedAt: '2026-10-22T10:00:00.000Z' }],
+      deferred: [{ testId: 'test_later' }],
+      conflicts: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+  }
+
+  it('--wait sends one dispatch, never sleeps for the old resend, awaits the accepted run, exits 7', async () => {
+    const { credentialsPath } = makeCreds();
+    let posts = 0;
+    const sleeps: number[] = [];
+    const stderrLines: string[] = [];
+    const stdoutLines: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') {
+        posts++;
+        return { body: deferredBatch() };
+      }
+      if (url.includes('/runs/run_ok')) {
+        return { body: { ...makePassedRun(), runId: 'run_ok', testId: 'test_ok' } };
+      }
+      return { body: { items: [], nextToken: null } };
+    });
+    await expect(
+      runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 600,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: line => stdoutLines.push(line),
+          stderr: line => stderrLines.push(line),
+          sleep: async ms => {
+            sleeps.push(ms);
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 7 });
+    expect(posts).toBe(1);
+    expect(sleeps.filter(ms => ms >= 60_000)).toEqual([]);
+    expect(stderrLines.join('\n')).not.toContain('[deferred-retry]');
+    expect(stderrLines.join('\n')).toContain('Rate-deferred testIds');
+    expect(stderrLines.join('\n')).toContain('test_later');
+    const payload = JSON.parse(stdoutLines.find(l => l.includes('"summary"'))!) as {
+      deferred: Array<{ testId: string }>;
+      summary: { passed: number };
+    };
+    expect(payload.summary.passed).toBe(1);
+    expect(payload.deferred).toEqual([{ testId: 'test_later' }]);
+  });
+
+  it('--wait with every id deferred: one dispatch, no sleep, exit 7', async () => {
+    const { credentialsPath } = makeCreds();
+    let posts = 0;
+    const sleeps: number[] = [];
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'POST') {
+        posts++;
+        return { body: { ...deferredBatch(), accepted: [] } };
+      }
+      return { body: { items: [], nextToken: null } };
+    });
+    await expect(
+      runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 600,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => undefined,
+          stderr: () => undefined,
+          sleep: async ms => {
+            sleeps.push(ms);
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 7 });
+    expect(posts).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+});
+
+describe('run --all --wait: a queued run is waited through', () => {
+  it('queued → running → passed is polled to the verdict and the run is reported passed', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    const sequence = ['queued', 'queued', 'running', 'passed'] as const;
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') {
+        return {
+          body: {
+            accepted: [
+              { testId: 'test_q', runId: 'run_q', enqueuedAt: '2026-10-22T10:00:00.000Z' },
+            ],
+            deferred: [],
+            conflicts: [],
+            skippedFrontend: [],
+            skippedIntegration: [],
+          } satisfies BatchRunFreshResponse,
+        };
+      }
+      if (url.includes('/runs/run_q')) {
+        const status = sequence[Math.min(seen.length, sequence.length - 1)]!;
+        seen.push(status);
+        const base = { ...makePassedRun(), runId: 'run_q', testId: 'test_q' };
+        return status === 'passed'
+          ? { body: base }
+          : {
+              body: {
+                ...base,
+                status,
+                finishedAt: null,
+                startedAt: status === 'running' ? base.startedAt : null,
+                stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
+              },
+            };
+      }
+      return { body: { items: [], nextToken: null } };
+    });
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 600,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+    expect(seen).toEqual(['queued', 'queued', 'running', 'passed']);
+    const payload = JSON.parse(stdoutLines.find(l => l.includes('"summary"'))!) as {
+      summary: { passed: number; total: number };
+    };
+    expect(payload.summary).toMatchObject({ passed: 1, total: 1 });
   });
 });

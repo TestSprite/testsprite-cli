@@ -32,8 +32,8 @@
     },
     "priority": {
       "type": "string",
-      "enum": ["p0", "p1", "p2", "p3"],
-      "description": "Optional. p0 = must-pass, p1 = important paths, p2 = edge cases, p3 = cosmetic."
+      "pattern": "^([pP][0-3]|[hH][iI][gG][hH]|[mM][eE][dD][iI][uU][mM]|[lL][oO][wW])$",
+      "description": "Optional. p0/high = must-pass, p1/medium = important paths, p2/low = edge cases; p3 is treated as low."
     },
     "planSteps": {
       "type": "array",

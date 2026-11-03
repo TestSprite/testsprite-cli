@@ -127,6 +127,48 @@ describe('HttpClient.getTunnelStatus', () => {
   });
 });
 
+describe('HttpClient.listTunnels', () => {
+  it('GETs the collection with the API key and no idempotency key', async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({
+        tunnels: [
+          {
+            clientId: 'c1',
+            status: 'draining',
+            createdAt: null,
+            expiresAt: '2026-08-24T18:00:00.000Z',
+          },
+          { clientId: 'c2', status: 'online', expiresAt: '2026-08-24T19:00:00.000Z' },
+        ],
+      }),
+    );
+    const result = await makeClient(fetchImpl as unknown as typeof fetch).listTunnels();
+    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    expect(String(url)).toBe('https://api.example.com/api/cli/v1/tunnel');
+    expect(init.method).toBe('GET');
+    const headers = Object.fromEntries(
+      Object.entries(init.headers as Record<string, string>).map(([key, value]) => [
+        key.toLowerCase(),
+        value,
+      ]),
+    );
+    expect(headers['x-api-key']).toBe('sk-test');
+    expect(headers).not.toHaveProperty('idempotency-key');
+    expect(result.tunnels.map(t => t.status)).toEqual(['draining', 'online']);
+    expect(result.tunnels[0]?.createdAt).toBeNull();
+    expect(result.tunnels[1]).not.toHaveProperty('createdAt');
+  });
+
+  it('rejects a response without the tunnels array', async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({}));
+    await expect(
+      makeClient(fetchImpl as unknown as typeof fetch).listTunnels(),
+    ).rejects.toMatchObject({
+      code: 'INTERNAL',
+    });
+  });
+});
+
 describe('HttpClient.deleteTunnel', () => {
   it('accepts the documented 204 and DELETEs /tunnel/{clientId} with no request body', async () => {
     let url = '';

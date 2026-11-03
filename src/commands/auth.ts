@@ -1,4 +1,5 @@
 import { Command } from 'commander';
+import { formatWorkspaceStatus, type WorkspaceStatus } from '../lib/workspace-status.js';
 import {
   assertValidApiKey,
   assertValidEndpointUrl,
@@ -7,11 +8,11 @@ import {
   parseRequestTimeoutFlag,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
-import type { ErrorCode } from '../lib/errors.js';
-import { ApiError, CLIError } from '../lib/errors.js';
-import { facadeBaseUrl } from '../lib/facade.js';
+import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
+import { facadeBaseUrl, resolvePortalBase } from '../lib/facade.js';
 import type { FetchImpl } from '../lib/http.js';
 import { HttpClient } from '../lib/http.js';
+import { globalShutdown, type ShutdownHandle } from '../lib/interrupt.js';
 import {
   defaultCredentialsPath,
   deleteProfile,
@@ -19,7 +20,7 @@ import {
   readProfile,
   writeProfile,
 } from '../lib/credentials.js';
-import { loadConfig, normalizeEnvVar } from '../lib/config.js';
+import { loadConfig, normalizeEnvVar, resolveProfileName } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
 import type { OutputMode } from '../lib/output.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
@@ -68,6 +69,8 @@ export interface MeResponse {
     remaining: number;
     includedCredits: number;
     seats: number;
+    /** Billing standing (paused / pending / ok). Absent on an older backend. */
+    workspace?: WorkspaceStatus;
   };
   /**
    * Every organization the underlying user belongs to (account-wide
@@ -88,9 +91,13 @@ export interface AuthDeps {
   env?: NodeJS.ProcessEnv;
   credentialsPath?: string;
   fetchImpl?: FetchImpl;
+  shutdownSignal?: AbortSignal;
+  shutdown?: Pick<ShutdownHandle, 'runCriticalOperation'>;
   prompt?: {
     secret: (question: string) => Promise<string>;
   };
+  /** Setup passes a supplied --api-key through a synthetic prompt. */
+  suppliedApiKey?: boolean;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
   preludeWrite?: (chunk: string) => void;
@@ -126,6 +133,42 @@ interface ConfigureOptions extends CommonOptions {
 const DEFAULT_API_URL = 'https://api.testsprite.com';
 const FROM_ENV_MISSING_KEY =
   'TESTSPRITE_API_KEY is not set in the environment. Set it and re-run with --from-env, or omit --from-env to enter the key interactively.';
+
+const API_KEY_PAGE_PATH = '/dashboard/settings/apikey';
+
+/**
+ * Where a key comes from. Names the Portal origin that matches the API
+ * endpoint; for an endpoint the host map does not know, names the page by
+ * path only. `resolvePortalBase` returns undefined there on purpose — a
+ * confident link to the wrong environment's portal is worse than no origin.
+ */
+function apiKeyHint(apiUrl: string): string {
+  const portalBase = resolvePortalBase(apiUrl);
+  return portalBase === undefined
+    ? `Create or copy an API key on your TestSprite dashboard's API-keys page (${API_KEY_PAGE_PATH}).`
+    : `Create or copy an API key at ${portalBase}${API_KEY_PAGE_PATH}`;
+}
+
+/**
+ * Exit-5 error for "no key arrived" on any path: the interactive prompt,
+ * `--from-env`, and non-interactive setup. The hint is appended to the message
+ * and to `nextAction`; a path-specific `nextAction` lead-in and `details` are
+ * kept so callers lose nothing by routing through here.
+ */
+export function missingApiKeyError(
+  message: string,
+  apiUrl: string,
+  opts: { nextAction?: string; details?: Record<string, unknown> } = {},
+): ApiError {
+  const hint = apiKeyHint(apiUrl);
+  return new ApiError({
+    code: 'VALIDATION_ERROR',
+    message: `${message} ${hint}`,
+    nextAction: opts.nextAction === undefined ? hint : `${opts.nextAction} ${hint}`,
+    requestId: 'local',
+    details: opts.details ?? {},
+  });
+}
 
 export interface ConfigureResult {
   persisted: boolean;
@@ -187,7 +230,12 @@ export async function runConfigure(
 
   if (opts.fromEnv) {
     apiKey = env.TESTSPRITE_API_KEY?.trim();
-    if (!apiKey) throw validationError('TESTSPRITE_API_KEY', FROM_ENV_MISSING_KEY);
+    if (!apiKey) {
+      throw missingApiKeyError(FROM_ENV_MISSING_KEY, apiUrl, {
+        nextAction: 'Set TESTSPRITE_API_KEY and re-run.',
+        details: { field: 'TESTSPRITE_API_KEY', reason: 'missing' },
+      });
+    }
   } else {
     // --skip-if-configured: when a non-empty API key is already saved for
     // this profile, skip the interactive prompt and return early. The
@@ -206,8 +254,9 @@ export async function runConfigure(
     const promptApi = deps.prompt ?? { secret: (q: string) => promptSecret(q) };
     prelude(`Configuring profile "${opts.profile}".\n`);
     // Only the API key is prompted -- the endpoint defaults to prod (see above).
+    if (!deps.suppliedApiKey) stderr(apiKeyHint(apiUrl));
     apiKey = (await promptApi.secret('TestSprite API key: ')).trim();
-    if (!apiKey) throw new CLIError('No API key provided.', 5);
+    if (!apiKey) throw missingApiKeyError('No API key provided.', apiUrl);
   }
 
   // Advisory: when the endpoint was silently inherited from an existing profile
@@ -235,6 +284,8 @@ export async function runConfigure(
     apiKey,
     fetchImpl: deps.fetchImpl,
     requestTimeoutMs: opts.requestTimeoutMs,
+    shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
+    shutdown: deps.shutdown ?? globalShutdown,
   });
   try {
     // Tag the validation call with the originating command (when provided) so
@@ -246,6 +297,7 @@ export async function runConfigure(
       deps.commandTag ? { headers: { 'x-cli-command': deps.commandTag } } : {},
     );
   } catch (err) {
+    if (err instanceof InterruptError) throw err;
     const message = err instanceof Error ? err.message : String(err);
     stderr(`API key rejected by ${apiUrl}: ${message} — profile NOT updated`);
     // When the verification call returned a typed API error (AUTH_INVALID,
@@ -345,6 +397,11 @@ export async function runWhoami(opts: CommonOptions, deps: AuthDeps = {}): Promi
       ...(m.v3Enabled === true && m.activeOrg
         ? [`org:    ${m.activeOrg.name} (${m.activeOrg.plan}, ${m.activeOrg.role})`]
         : []),
+      // A paused (or payment-pending) workspace refuses every write, so say so
+      // next to the org it applies to instead of letting the next command find out.
+      ...(m.v3Enabled === true && formatWorkspaceStatus(m.activeOrg?.workspace)
+        ? [`workspace: ${formatWorkspaceStatus(m.activeOrg?.workspace)}`]
+        : []),
       // Authoritative routing mode, rendered only when the backend supplies it.
       ...(m.v3Enabled !== undefined ? [`routing: ${routingLabel(m.v3Enabled)}`] : []),
       // Org attribution — account-wide membership list, rendered only when
@@ -406,7 +463,9 @@ export async function runLogout(opts: CommonOptions, deps: AuthDeps = {}): Promi
 }
 
 export function createAuthCommand(deps: AuthDeps = {}): Command {
-  const auth = new Command('auth').description('Manage TestSprite credentials');
+  const auth = new Command('auth')
+    .description('Manage TestSprite credentials')
+    .addHelpText('after', '\nTo add credentials, run: testsprite setup');
 
   // `status` (primary; formerly `whoami`). Credential WRITES no longer live
   // here — `auth configure` is a hidden, deprecated alias for `setup` (attached
@@ -414,10 +473,13 @@ export function createAuthCommand(deps: AuthDeps = {}): Command {
 
   auth
     .command('status')
-    .description('Show the user, API key, env, and scopes bound to the active profile')
+    .summary('Show the active profile and its credentials')
+    .description(
+      'Show the active profile: user, API key id, endpoint, env, scopes and, when available, org, workspace and routing',
+    )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_cmdOpts, command: Command) => {
-      await runWhoami(resolveCommonOptions(command), deps);
+      await runWhoami(resolveCommonOptions(command, deps.env), deps);
     });
 
   // `whoami` — hidden, deprecated alias for `status` (kept so scripts/agents
@@ -427,15 +489,18 @@ export function createAuthCommand(deps: AuthDeps = {}): Command {
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_cmdOpts, command: Command) => {
       emitDeprecationNotice('auth whoami', 'auth status', deps.stderr);
-      await runWhoami(resolveCommonOptions(command), deps);
+      await runWhoami(resolveCommonOptions(command, deps.env), deps);
     });
 
   auth
     .command('remove')
-    .description('Remove credentials for the active profile')
+    .summary('Remove the stored API key for the active profile')
+    .description(
+      'Remove the stored API key for the active profile, on this machine only. The key is not revoked (do that in the dashboard); TESTSPRITE_API_KEY is unaffected',
+    )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_cmdOpts, command: Command) => {
-      await runLogout(resolveCommonOptions(command), deps);
+      await runLogout(resolveCommonOptions(command, deps.env), deps);
     });
 
   // `logout` — hidden, deprecated alias for `remove`.
@@ -444,18 +509,18 @@ export function createAuthCommand(deps: AuthDeps = {}): Command {
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (_cmdOpts, command: Command) => {
       emitDeprecationNotice('auth logout', 'auth remove', deps.stderr);
-      await runLogout(resolveCommonOptions(command), deps);
+      await runLogout(resolveCommonOptions(command, deps.env), deps);
     });
 
   return auth;
 }
 
-function resolveCommonOptions(command: Command): CommonOptions {
+function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const globals = command.optsWithGlobals() as Partial<CommonOptions> & {
     requestTimeout?: string;
   };
   return {
-    profile: globals.profile ?? 'default',
+    profile: resolveProfileName(globals.profile, env),
     output: resolveOutputMode(globals.output),
     endpointUrl: globals.endpointUrl,
     debug: globals.debug ?? false,
@@ -467,16 +532,4 @@ function resolveCommonOptions(command: Command): CommonOptions {
 
 function makeOutput(mode: OutputMode, deps: AuthDeps): Output {
   return new Output(mode, { stdout: deps.stdout, stderr: deps.stderr });
-}
-
-function validationError(field: string, message: string): ApiError {
-  return ApiError.fromEnvelope({
-    error: {
-      code: 'VALIDATION_ERROR' satisfies ErrorCode,
-      message,
-      nextAction: `Set ${field} and re-run.`,
-      requestId: 'local',
-      details: { field, reason: 'missing' },
-    },
-  });
 }

@@ -1,7 +1,7 @@
 /**
- * Wire types for the `/api/cli/v1/tunnel` facade (DEV-747 piece 1).
+ * Wire types for the `/api/cli/v1/tunnel` facade.
  *
- * Three routes and deliberately no fourth — there is no resume/adopt route to
+ * The list and status reads are secret-free. There is no resume/adopt route to
  * hand a `{clientId, secret}` back to, so the CLI mints fresh per invocation.
  */
 
@@ -56,4 +56,16 @@ export interface TunnelStatusResponse {
   clientId: string;
   status: 'online' | 'offline' | (string & {});
   expiresAt: string;
+}
+
+/** One secret-free binding returned by `GET /api/cli/v1/tunnel`. */
+export interface TunnelListItem {
+  clientId: string;
+  status: 'online' | 'offline' | 'unknown' | (string & {});
+  expiresAt: string;
+  createdAt?: string | null;
+}
+
+export interface TunnelListResponse {
+  tunnels: TunnelListItem[];
 }

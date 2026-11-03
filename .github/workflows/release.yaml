@@ -29,6 +29,19 @@ jobs:
       - run: npm run format:check
       - run: npm run test:coverage
       - run: npm run build
+      - name: Verify npm artifact contents
+        run: |
+          npm pack --dry-run --json > "$RUNNER_TEMP/npm-pack.json"
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          const pkg = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/npm-pack.json`, 'utf8'))[0];
+          const files = pkg.files.map(file => file.path);
+          const distCount = files.filter(path => path.startsWith('dist/')).length;
+          if (!files.includes('dist/index.js') || !files.includes('LICENSE') || distCount < 50) {
+            console.error(`Invalid npm artifact: dist files=${distCount}, index=${files.includes('dist/index.js')}, license=${files.includes('LICENSE')}`);
+            process.exit(1);
+          }
+          NODE
       # Auth via npm trusted publishing (OIDC) — no token needed; provenance is
       # implied. A prerelease tag (e.g. v0.3.0-rc.1, contains "-") must publish
       # under an explicit dist-tag: current npm already refuses an implicit

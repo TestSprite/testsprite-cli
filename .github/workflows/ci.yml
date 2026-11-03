@@ -4,7 +4,28 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [main, dev, stg]
+    branches: [main, dev, stg, 'backport/public-wave-**']
+  # backport/public-wave-** (added alongside main/dev/stg): auto-backport.yml
+  # pushes its wave branches here so a push-triggered run of this workflow
+  # actually cascades — see that file's header for why a push needs a
+  # non-GITHUB_TOKEN credential to do that, and why that's what makes these
+  # checks satisfy the dev branch ruleset (a workflow_dispatch run's checks
+  # never attach to a pull request or a required status check, no matter
+  # what triggered it — GitHub's own "Troubleshooting required status
+  # checks" docs — which is why this workflow no longer has that trigger).
+  # One exception: the gitleaks job's "Scan every PR commit for removed
+  # secrets" step already gates on github.event_name == 'pull_request' and
+  # simply doesn't run for a push, wave branch or otherwise (it diffs
+  # github.event.pull_request.base/head.sha, which don't exist on a push
+  # event) — no other job branches on event_name, reads
+  # github.event.pull_request.*, or reads github.ref, so every OTHER job
+  # runs identically for every branch this push trigger matches. Practical
+  # effect: the first push that opens a brand-new wave PR (a plain push,
+  # since GITHUB_TOKEN-authored PR creation fires no pull_request event of
+  # its own) gets no removed-secrets scan for that push; a later push to
+  # the same PR also fires pull_request: synchronize, which does cover it.
+  # Not closed here — the gitleaks job's other step, a working-tree scan,
+  # still runs unconditionally on every push regardless.
 
 # Least-privilege default for every job (OpenSSF Token-Permissions). No job here
 # needs write; checkout + npm only read. Any job needing more must opt in locally.
@@ -34,6 +55,28 @@ jobs:
       - name: Prettier
         run: npm run format:check
 
+  workflow-lint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          V=1.7.12
+          TARBALL="actionlint_${V}_linux_amd64.tar.gz"
+          BASE="https://github.com/rhysd/actionlint/releases/download/v${V}"
+          curl -fsSL -o "$TARBALL" "${BASE}/${TARBALL}"
+          curl -fsSL -o checksums.txt "${BASE}/actionlint_${V}_checksums.txt"
+          grep " ${TARBALL}\$" checksums.txt | sha256sum -c -
+          tar -xzf "$TARBALL" actionlint
+      - run: ./actionlint -color
+      # pull_request_target workflows run with this repository's secrets even
+      # for fork PRs, so they must stay checkout-free.
+      - run: node .github/scripts/check-pr-target-checkout.mjs
+
   typecheck:
     name: Typecheck
     runs-on: ubuntu-latest
@@ -51,12 +94,32 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
 
+  github-scripts:
+    name: GitHub script tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      # The workflow automation under .github/ ships with node:test suites that
+      # need no dependencies; the glob keeps new suites running without edits here.
+      # node --test exits 0 when a glob matches nothing, so fail loudly first.
+      - run: |
+          ls .github/scripts/*.test.mjs
+          node --test '.github/scripts/*.test.mjs'
+
   test:
     name: Unit Tests (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [20, 22]
+        node-version: [20, 22, 24]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -94,7 +157,7 @@ jobs:
       - run: npm test
         env:
           CI: true
-      # DEV-673: keep the exit-code contract checked on Windows, the OS where
+      # Keep the exit-code contract checked on Windows, the OS where
       # the underlying crash (libuv assert on forced process.exit during TLS
       # teardown) bites. This job cannot REPRODUCE that crash (it pins Node 22;
       # the crash needs Node >=23 + a real-network TLS socket) — the spec's
@@ -106,13 +169,32 @@ jobs:
       - run: npx vitest run -c vitest.e2e.config.ts test/e2e/exit-code.e2e.test.ts
         env:
           CI: true
+      # The ticket-ref guard shells out to git and joins paths, so its suite
+      # runs here as well as in the ubuntu "GitHub script tests" job.
+      - run: node --test .github/scripts/check-ticket-refs.test.mjs
+
+  macos-smoke:
+    name: CLI smoke (macOS, Node 22)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+      - run: node dist/index.js --version
+      - run: node dist/index.js --help
 
   build:
     name: Build (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [20, 22]
+        node-version: [20, 22, 24]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -131,6 +213,27 @@ jobs:
         run: |
           node dist/index.js --version
           node dist/index.js --help
+
+      - name: Verify and install npm artifact
+        if: matrix.node-version == 22
+        run: |
+          set -euo pipefail
+          npm pack --json > "$RUNNER_TEMP/npm-pack.json"
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          const pkg = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/npm-pack.json`, 'utf8'))[0];
+          const files = pkg.files.map(file => file.path);
+          const distCount = files.filter(path => path.startsWith('dist/')).length;
+          if (!files.includes('dist/index.js') || !files.includes('LICENSE') || distCount < 50) {
+            console.error(`Invalid npm artifact: dist files=${distCount}, index=${files.includes('dist/index.js')}, license=${files.includes('LICENSE')}`);
+            process.exit(1);
+          }
+          console.log(`npm artifact: ${files.length} files, ${distCount} dist files`);
+          NODE
+          TARBALL="$(node -p "JSON.parse(require('fs').readFileSync(process.env.RUNNER_TEMP + '/npm-pack.json', 'utf8'))[0].filename")"
+          npm install --prefix "$RUNNER_TEMP/cli-pack-smoke" --ignore-scripts --no-audit --no-fund "./$TARBALL"
+          "$RUNNER_TEMP/cli-pack-smoke/node_modules/.bin/testsprite" --version
+          "$RUNNER_TEMP/cli-pack-smoke/node_modules/.bin/testsprite" --help
 
   e2e:
     name: Local E2E Tests
@@ -158,6 +261,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       # Same pinned version + checksum-verified install as
       # divergence-sentinel.yml (the more recent/secure of the two gitleaks
@@ -183,3 +287,29 @@ jobs:
 
       - name: Scan working tree for secrets
         run: gitleaks detect --no-git --no-banner --redact --source .
+
+      - name: Scan every PR commit for removed secrets
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          gitleaks git --no-banner --redact \
+            --log-opts="--full-history --no-textconv --diff-filter=tuxdb ${BASE_SHA}..${HEAD_SHA}" .
+
+  backport-harness:
+    name: Backport harness
+    # The backport tooling and its harness are internal and are dropped from
+    # the public snapshot, so this job must not run on the public repo.
+    if: github.repository != 'TestSprite/testsprite-cli'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Offline: throwaway local repos plus a gh shim, no network or tokens.
+      - run: bash scripts/backport-harness.sh
