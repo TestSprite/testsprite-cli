@@ -13,39 +13,41 @@ import {
 describe('git-utils', () => {
   describe('isInsideGitRepo', () => {
     it('returns true if .git exists in the current directory', () => {
-      const mockExists = (p: string) => p === join('/foo/bar', '.git');
-      expect(isInsideGitRepo('/foo/bar', { existsSync: mockExists })).toBe(true);
+      const mockExists = (p: string) => p === join(resolve('/foo/bar'), '.git');
+      expect(isInsideGitRepo(resolve('/foo/bar'), { existsSync: mockExists })).toBe(true);
     });
 
     it('returns true if .git exists in a parent directory', () => {
-      const mockExists = (p: string) => p === join('/foo', '.git');
-      expect(isInsideGitRepo('/foo/bar/baz', { existsSync: mockExists })).toBe(true);
+      const mockExists = (p: string) => p === join(resolve('/foo'), '.git');
+      expect(isInsideGitRepo(resolve('/foo/bar/baz'), { existsSync: mockExists })).toBe(true);
     });
 
     it('returns false if .git is not found anywhere up the tree', () => {
       const mockExists = () => false;
-      expect(isInsideGitRepo('/foo/bar/baz', { existsSync: mockExists })).toBe(false);
+      expect(isInsideGitRepo(resolve('/foo/bar/baz'), { existsSync: mockExists })).toBe(false);
     });
   });
 
   describe('isInsideGitRepoAsync', () => {
     it('returns true if .git exists in the current directory (async)', async () => {
-      const mockExists = async (p: string) => p === join('/foo/bar', '.git');
-      await expect(isInsideGitRepoAsync('/foo/bar', { exists: mockExists })).resolves.toBe(true);
-    });
-
-    it('returns true if .git exists in a parent directory (async)', async () => {
-      const mockExists = async (p: string) => p === join('/foo', '.git');
-      await expect(isInsideGitRepoAsync('/foo/bar/baz', { exists: mockExists })).resolves.toBe(
+      const mockExists = async (p: string) => p === join(resolve('/foo/bar'), '.git');
+      await expect(isInsideGitRepoAsync(resolve('/foo/bar'), { exists: mockExists })).resolves.toBe(
         true,
       );
     });
 
+    it('returns true if .git exists in a parent directory (async)', async () => {
+      const mockExists = async (p: string) => p === join(resolve('/foo'), '.git');
+      await expect(
+        isInsideGitRepoAsync(resolve('/foo/bar/baz'), { exists: mockExists }),
+      ).resolves.toBe(true);
+    });
+
     it('returns false if .git is not found anywhere up the tree (async)', async () => {
       const mockExists = async () => false;
-      await expect(isInsideGitRepoAsync('/foo/bar/baz', { exists: mockExists })).resolves.toBe(
-        false,
-      );
+      await expect(
+        isInsideGitRepoAsync(resolve('/foo/bar/baz'), { exists: mockExists }),
+      ).resolves.toBe(false);
     });
   });
 
@@ -93,23 +95,23 @@ describe('git-utils', () => {
       const mockExists = () => false;
       const mockRead = async () => '';
       await expect(
-        checkTestspriteIgnored('/foo', { existsSync: mockExists, readFile: mockRead }),
+        checkTestspriteIgnored(resolve('/foo'), { existsSync: mockExists, readFile: mockRead }),
       ).resolves.toBe(false);
     });
 
     it('returns true if .gitignore exists and ignores .testsprite', async () => {
-      const mockExists = (p: string) => p === join('/foo', '.gitignore');
+      const mockExists = (p: string) => p === join(resolve('/foo'), '.gitignore');
       const mockRead = async () => 'dist/\n.testsprite/';
       await expect(
-        checkTestspriteIgnored('/foo', { existsSync: mockExists, readFile: mockRead }),
+        checkTestspriteIgnored(resolve('/foo'), { existsSync: mockExists, readFile: mockRead }),
       ).resolves.toBe(true);
     });
 
     it('returns false if .gitignore exists but does not ignore .testsprite', async () => {
-      const mockExists = (p: string) => p === join('/foo', '.gitignore');
+      const mockExists = (p: string) => p === join(resolve('/foo'), '.gitignore');
       const mockRead = async () => 'dist/';
       await expect(
-        checkTestspriteIgnored('/foo', { existsSync: mockExists, readFile: mockRead }),
+        checkTestspriteIgnored(resolve('/foo'), { existsSync: mockExists, readFile: mockRead }),
       ).resolves.toBe(false);
     });
   });
@@ -178,7 +180,7 @@ describe('git-utils', () => {
       return {
         appended,
         deps: {
-          existsSync: (p: string) => p === join('/foo', '.git'),
+          existsSync: (p: string) => p === join(resolve('/foo'), '.git'),
           lstat: async () => null,
           readFile: async () => '',
           appendFile: async (p: string, text: string) => {
@@ -191,7 +193,7 @@ describe('git-utils', () => {
 
     it('creates .gitignore by appending the entry inside a git repo', async () => {
       const { appended, deps } = repoDeps();
-      expect(await ensureTestspriteIgnored('/foo', deps)).toBe(true);
+      expect(await ensureTestspriteIgnored(resolve('/foo'), deps)).toBe(true);
       expect(appended).toEqual([
         {
           p: join(resolve('/foo'), '.gitignore'),
@@ -202,17 +204,18 @@ describe('git-utils', () => {
 
     it('does nothing outside a git repo', async () => {
       const { appended, deps } = repoDeps({ existsSync: () => false });
-      expect(await ensureTestspriteIgnored('/foo', deps)).toBe(false);
+      expect(await ensureTestspriteIgnored(resolve('/foo'), deps)).toBe(false);
       expect(appended).toEqual([]);
     });
 
     it('appends only the new chunk and keeps a leading newline when the file has no trailing newline', async () => {
       const { appended, deps } = repoDeps({
-        existsSync: (p: string) => p === join('/foo', '.git') || p === join('/foo', '.gitignore'),
+        existsSync: (p: string) =>
+          p === join(resolve('/foo'), '.git') || p === join(resolve('/foo'), '.gitignore'),
         lstat: async () => ({ isSymbolicLink: false }),
         readFile: async () => 'node_modules/\ndist/',
       });
-      expect(await ensureTestspriteIgnored('/foo', deps)).toBe(true);
+      expect(await ensureTestspriteIgnored(resolve('/foo'), deps)).toBe(true);
       expect(appended).toHaveLength(1);
       expect(appended[0]!.text).toBe('\n\n# TestSprite failure artifacts\n.testsprite/\n');
     });
@@ -222,7 +225,7 @@ describe('git-utils', () => {
         lstat: async () => ({ isSymbolicLink: false }),
         readFile: async () => 'dist/\r\n',
       });
-      expect(await ensureTestspriteIgnored('/foo', deps)).toBe(true);
+      expect(await ensureTestspriteIgnored(resolve('/foo'), deps)).toBe(true);
       expect(appended[0]!.text).toBe('\n# TestSprite failure artifacts\n.testsprite/\n');
     });
 
@@ -231,13 +234,13 @@ describe('git-utils', () => {
         lstat: async () => ({ isSymbolicLink: false }),
         readFile: async () => 'node_modules/\n.testsprite/',
       });
-      expect(await ensureTestspriteIgnored('/foo', deps)).toBe(false);
+      expect(await ensureTestspriteIgnored(resolve('/foo'), deps)).toBe(false);
       expect(appended).toEqual([]);
     });
 
     it('refuses to write through a symlinked .gitignore', async () => {
       const { appended, deps } = repoDeps({ lstat: async () => ({ isSymbolicLink: true }) });
-      await expect(ensureTestspriteIgnored('/foo', deps)).rejects.toThrow(/symlink/);
+      await expect(ensureTestspriteIgnored(resolve('/foo'), deps)).rejects.toThrow(/symlink/);
       expect(appended).toEqual([]);
     });
 

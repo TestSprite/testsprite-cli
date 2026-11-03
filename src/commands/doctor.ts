@@ -301,9 +301,8 @@ function checkGit(cwd: string, deps: DoctorDeps): [DoctorCheck, DoctorCheck] {
       return [
         {
           name: 'Git repository',
-          status: 'warn',
-          detail:
-            'not a Git repository; .testsprite/ failure artifacts are not tracked, nothing to ignore',
+          status: 'ok',
+          detail: 'not a Git repository; nothing to ignore',
         },
         {
           name: 'Gitignore safety',

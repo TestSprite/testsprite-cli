@@ -1323,7 +1323,7 @@ testsprite usage --dry-run --output json
 
 #### `testsprite doctor`
 
-One-shot environment diagnostic. Runs a fixed checklist — CLI version, Node.js runtime, active profile, API endpoint, credentials, live connectivity + key validity (`GET /me`), whether the verify skill is installed in the current project, whether the project is inside a Git repository (`Git repository`), and whether `.testsprite/` is ignored by a `.gitignore` between the project directory and the repository root (`Gitignore safety`) — and prints an OK/WARN/FAIL report. Exits non-zero only when a check **fails** (warnings, e.g. skill not installed or not a Git repository, don't fail the process), so it can gate a CI step or an agent preflight:
+One-shot environment diagnostic. Runs a fixed checklist — CLI version, Node.js runtime, active profile, API endpoint, credentials, live connectivity + key validity (`GET /me`), whether the verify skill is installed in the current project, whether the project is inside a Git repository (`Git repository`), and whether `.testsprite/` is ignored by a `.gitignore` between the project directory and the repository root (`Gitignore safety`) — and prints an OK/WARN/FAIL report. Exits non-zero only when a check **fails** (warnings, e.g. skill not installed or `.testsprite/` not ignored, don't fail the process; outside a Git repository both Git checks are informational), so it can gate a CI step or an agent preflight:
 
 ```bash
 testsprite doctor

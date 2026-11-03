@@ -2150,16 +2150,19 @@ describe('runInit -- skipIfConfigured', () => {
   });
 
   describe('.gitignore safety', () => {
+    // runInit resolves the project dir, so seed and assert the resolved path
+    // (on Windows path.resolve('/test-project') gains a drive letter).
+    const GIT_CWD = path.resolve(CWD);
     it('appends .testsprite/ to .gitignore when inside a git repo', async () => {
       const { deps } = makeCapture();
       const { fs: agentFs, store } = makeMemFs();
-      await agentFs.mkdir(path.join(CWD, '.git'));
+      await agentFs.mkdir(path.join(GIT_CWD, '.git'));
       writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
       const fetchMock = makeOkFetch();
 
       await runInit(
         makeBaseOpts({
-          dir: CWD,
+          dir: GIT_CWD,
           skipIfConfigured: true,
           noAgent: true,
           noGitignore: false,
@@ -2174,7 +2177,7 @@ describe('runInit -- skipIfConfigured', () => {
         },
       );
 
-      expect(store.get(path.join(CWD, '.gitignore'))).toContain('.testsprite/');
+      expect(store.get(path.join(GIT_CWD, '.gitignore'))).toContain('.testsprite/');
     });
 
     it('does not write .gitignore when outside a git repo', async () => {
@@ -2186,7 +2189,7 @@ describe('runInit -- skipIfConfigured', () => {
 
       await runInit(
         makeBaseOpts({
-          dir: CWD,
+          dir: GIT_CWD,
           skipIfConfigured: true,
           noAgent: true,
           noGitignore: false,
@@ -2201,19 +2204,19 @@ describe('runInit -- skipIfConfigured', () => {
         },
       );
 
-      expect(store.has(path.join(CWD, '.gitignore'))).toBe(false);
+      expect(store.has(path.join(GIT_CWD, '.gitignore'))).toBe(false);
     });
 
     it('does not write .gitignore when --no-gitignore is passed even inside a git repo', async () => {
       const { deps } = makeCapture();
       const { fs: agentFs, store } = makeMemFs();
-      await agentFs.mkdir(path.join(CWD, '.git'));
+      await agentFs.mkdir(path.join(GIT_CWD, '.git'));
       writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
       const fetchMock = makeOkFetch();
 
       await runInit(
         makeBaseOpts({
-          dir: CWD,
+          dir: GIT_CWD,
           skipIfConfigured: true,
           noAgent: true,
           noGitignore: true,
@@ -2228,7 +2231,7 @@ describe('runInit -- skipIfConfigured', () => {
         },
       );
 
-      expect(store.has(path.join(CWD, '.gitignore'))).toBe(false);
+      expect(store.has(path.join(GIT_CWD, '.gitignore'))).toBe(false);
     });
 
     async function runWithFs(
@@ -2239,7 +2242,7 @@ describe('runInit -- skipIfConfigured', () => {
       writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
       const run = runInit(
         makeBaseOpts({
-          dir: CWD,
+          dir: GIT_CWD,
           skipIfConfigured: true,
           noAgent: true,
           noGitignore: false,
@@ -2253,21 +2256,21 @@ describe('runInit -- skipIfConfigured', () => {
 
     it('appends without rewriting existing content (no trailing newline, CRLF)', async () => {
       const { fs: agentFs, store } = makeMemFs();
-      await agentFs.mkdir(path.join(CWD, '.git'));
-      await agentFs.writeFile(path.join(CWD, '.gitignore'), 'dist/\r\nnode_modules/');
+      await agentFs.mkdir(path.join(GIT_CWD, '.git'));
+      await agentFs.writeFile(path.join(GIT_CWD, '.gitignore'), 'dist/\r\nnode_modules/');
       const { run } = await runWithFs(agentFs);
       await run;
-      expect(store.get(path.join(CWD, '.gitignore'))).toBe(
+      expect(store.get(path.join(GIT_CWD, '.gitignore'))).toBe(
         'dist/\r\nnode_modules/\n\n# TestSprite failure artifacts\n.testsprite/\n',
       );
     });
 
     it('recognises .git as a file (worktree or submodule)', async () => {
       const { fs: agentFs, store } = makeMemFs();
-      await agentFs.writeFile(path.join(CWD, '.git'), 'gitdir: /elsewhere/.git/worktrees/x');
+      await agentFs.writeFile(path.join(GIT_CWD, '.git'), 'gitdir: /elsewhere/.git/worktrees/x');
       const { run } = await runWithFs(agentFs);
       await run;
-      expect(store.get(path.join(CWD, '.gitignore'))).toContain('.testsprite/');
+      expect(store.get(path.join(GIT_CWD, '.gitignore'))).toContain('.testsprite/');
     });
 
     it('resolves a relative --dir before walking up to the repo root', async () => {
@@ -2280,9 +2283,9 @@ describe('runInit -- skipIfConfigured', () => {
 
     it('refuses to write through a symlinked .gitignore and warns without failing setup', async () => {
       const { fs: memFs, store } = makeMemFs();
-      await memFs.mkdir(path.join(CWD, '.git'));
-      await memFs.writeFile(path.join(CWD, '.gitignore'), 'dist/\n');
-      const linkPath = path.join(CWD, '.gitignore');
+      await memFs.mkdir(path.join(GIT_CWD, '.git'));
+      await memFs.writeFile(path.join(GIT_CWD, '.gitignore'), 'dist/\n');
+      const linkPath = path.join(GIT_CWD, '.gitignore');
       const symlinkFs: AgentFs = {
         ...memFs,
         lstat: async p =>
@@ -2296,7 +2299,7 @@ describe('runInit -- skipIfConfigured', () => {
 
     it('still ignores .testsprite/ when the agent skill install fails after credentials were saved', async () => {
       const { fs: memFs, store } = makeMemFs();
-      await memFs.mkdir(path.join(CWD, '.git'));
+      await memFs.mkdir(path.join(GIT_CWD, '.git'));
       const failingFs: AgentFs = {
         ...memFs,
         writeFile: async (p, data, opts) => {
@@ -2306,7 +2309,7 @@ describe('runInit -- skipIfConfigured', () => {
       };
       const { run } = await runWithFs(failingFs, { noAgent: false, agent: 'claude' });
       await expect(run).rejects.toThrow();
-      expect(store.get(path.join(CWD, '.gitignore'))).toContain('.testsprite/');
+      expect(store.get(path.join(GIT_CWD, '.gitignore'))).toContain('.testsprite/');
     });
 
     it('registers --no-gitignore option in addSetupOptions', () => {

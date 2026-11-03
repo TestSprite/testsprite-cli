@@ -8,7 +8,7 @@
 
 import { chmodSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { Command } from 'commander';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, CLIError } from '../lib/errors.js';
@@ -430,7 +430,7 @@ describe('runDoctor — warnings do not fail', () => {
     expect(out).toContain('Verify skill');
   });
 
-  it('missing Git repository is a warning, not a failure', async () => {
+  it('outside a Git repository both Git checks are informational, with no warning', async () => {
     writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
     const { capture, deps } = makeCapture();
     const report = await runDoctor(
@@ -438,20 +438,9 @@ describe('runDoctor — warnings do not fail', () => {
       { ...healthyDeps(credentialsPath, { existsSync: p => !p.endsWith('.git') }), ...deps },
     );
     expect(report.failures).toBe(0);
+    expect(report.warnings).toBe(0);
     const out = capture.stdout.join('\n');
-    expect(out).toContain('[WARN] Git repository');
-  });
-
-  it('outside a Git repository emits one warning and no second gitignore warning', async () => {
-    writeProfile('default', { apiKey: 'sk-user-abc' }, { path: credentialsPath });
-    const { capture, deps } = makeCapture();
-    const report = await runDoctor(
-      { profile: 'default', output: 'text', debug: false },
-      { ...healthyDeps(credentialsPath, { existsSync: p => !p.endsWith('.git') }), ...deps },
-    );
-    expect(report.failures).toBe(0);
-    const out = capture.stdout.join('\n');
-    expect(out).toContain('[WARN] Git repository');
+    expect(out).toMatch(/\[OK\]\s+Git repository/);
     expect(out).not.toMatch(/\[WARN\]\s+Gitignore safety/);
     expect(out).not.toMatch(/require/i);
     expect(out).not.toContain('run setup');
@@ -464,9 +453,10 @@ describe('runDoctor — warnings do not fail', () => {
       { profile: 'default', output: 'text', debug: false },
       {
         ...healthyDeps(credentialsPath, {
-          cwd: '/repo/packages/app',
-          existsSync: p => p === '/repo/.git' || p === '/repo/.gitignore' || p.includes('skill'),
-          readFileSync: p => (p === '/repo/.gitignore' ? '.testsprite/\n' : ''),
+          cwd: resolve('/repo/packages/app'),
+          existsSync: p =>
+            p === resolve('/repo/.git') || p === resolve('/repo/.gitignore') || p.includes('skill'),
+          readFileSync: p => (p === resolve('/repo/.gitignore') ? '.testsprite/\n' : ''),
         }),
         ...deps,
       },
