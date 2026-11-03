@@ -7322,7 +7322,7 @@ function isTerminalPublicStatus(status: CliPublicStatus): boolean {
 
 /** Minimal client surface the backend-test wait fallback needs. */
 interface ResultReadClient {
-  get<T>(path: string, options?: { signal?: AbortSignal; retryOnRateLimit?: boolean }): Promise<T>;
+  get<T>(path: string, options?: { signal?: AbortSignal; retry?: boolean }): Promise<T>;
 }
 
 /**
@@ -7423,6 +7423,11 @@ export function makeBackendWaitFallback(args: {
   resolveTestId: (run: RunResponse) => string;
   resolveNotBefore: (run: RunResponse) => string | undefined;
   onResolved?: (testId: string, status: CliPublicStatus) => void;
+  /**
+   * Called once, when the one-time type probe succeeds. Lets the caller reuse
+   * the type (e.g. for the failure hint) instead of looking it up again.
+   */
+  onTypeDetected?: (type: CliTest['type']) => void;
 }): (run: RunResponse, elapsedMs: number, signal: AbortSignal) => Promise<RunResponse | null> {
   let detection: 'pending' | 'frontend' | 'backend' = 'pending';
   // Cached alongside `detection` from the same one-time type-probe: the human
@@ -7450,6 +7455,7 @@ export function makeBackendWaitFallback(args: {
         // row finalizes and `resolveAlternate` stops being called.
         detection = test.type === 'backend' ? 'backend' : 'frontend';
         testName = test.name?.trim() ? test.name : null;
+        args.onTypeDetected?.(test.type);
       } catch {
         return null; // transient — keep polling the run row, retry the probe next tick.
       }
@@ -7695,9 +7701,10 @@ export function renderRunResponseText(
  *
  * The lookup only picks wording, so it must never hold back the run envelope
  * or the exit code: it gets a {@link RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS} deadline
- * and `retryOnRateLimit: false` (a 429 with `Retry-After` would otherwise be
- * honoured for up to ~2 minutes — see `emitDupNameAdvisoryIfNeeded`), and
- * either outcome falls back like any other lookup error.
+ * and `retry: false` — one attempt, no retries of any kind (a 429 with
+ * `Retry-After` would otherwise be honoured for up to ~2 minutes, and 5xx /
+ * transport retry sleeps do not observe the deadline signal) — and either
+ * outcome falls back like any other lookup error.
  *
  * This closes the standalone-path gap: `test run <id>` / `test wait <run-id>`
  * never supply a type hint, and now that BE run rows finalize server-side
@@ -7721,7 +7728,7 @@ async function resolveRunCardIsBackend(
   try {
     const test = await client.get<CliTest>(`/tests/${encodeURIComponent(testId)}`, {
       signal: ac.signal,
-      retryOnRateLimit: false,
+      retry: false,
     });
     return test.type === 'backend';
   } catch (err) {
@@ -8485,10 +8492,14 @@ export async function runTestRun(
     // Backend-test fallback (dogfood L1888): BE run rows never finalize, so
     // resolve the verdict from the testId record once it's terminal.
     let beFallbackUsed = false;
+    let polledType: CliTest['type'] | undefined;
     const resolveBackendAlternate = makeBackendWaitFallback({
       client,
       resolveTestId: () => opts.testId,
       resolveNotBefore: () => triggerResponse.enqueuedAt,
+      onTypeDetected: type => {
+        polledType = type;
+      },
       onResolved: testId => {
         beFallbackUsed = true;
         stderrFn(
@@ -8808,6 +8819,7 @@ export async function runTestRun(
       opts.output,
       beFallbackUsed || opts.type === 'backend',
       finalRun.status,
+      polledType,
     );
 
     const finalRunWithUrl = withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps));
@@ -9452,10 +9464,14 @@ export async function runTestWait(
   // resolve the verdict from the testId record (discovered from the first
   // poll tick) once it's terminal for this run.
   let beFallbackUsed = false;
+  let polledType: CliTest['type'] | undefined;
   const resolveAlternate = makeBackendWaitFallback({
     client,
     resolveTestId: run => run.testId,
     resolveNotBefore: run => run.createdAt,
+    onTypeDetected: type => {
+      polledType = type;
+    },
     onResolved: testId => {
       beFallbackUsed = true;
       stderrFn(
@@ -9586,6 +9602,7 @@ export async function runTestWait(
     opts.output,
     beFallbackUsed,
     finalRun.status,
+    polledType,
   );
 
   out.print(withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)), data =>
@@ -13343,9 +13360,13 @@ async function runTestRerunCore(
       if (exitCodeForRunStatus(namedResult.status) !== 0) {
         // Only a backend rerun has a closure, and a backend failure bundle is
         // addressed by testId — there is no run-scoped bundle for namedRunId.
-        stderrFn(
-          `Run finished with status: ${namedResult.status}. Backend failure artifacts are addressed by testId — use 'testsprite test failure get ${testId}' to download the bundle.`,
-        );
+        // Failed/blocked only: `test failure get` returns the latest *failing*
+        // run, which for a cancelled rerun could be an older one.
+        if (isFailureHintStatus(namedResult.status)) {
+          stderrFn(
+            `Run finished with status: ${namedResult.status}. Backend failure artifacts are addressed by testId — use 'testsprite test failure get ${testId}' to download the bundle.`,
+          );
+        }
         throw new CLIError(`Run ${namedRunId} finished with status: ${namedResult.status}`, 1);
       }
 
@@ -13390,10 +13411,14 @@ async function runTestRerunCore(
 
     // Single FE rerun (or BE without closure) — poll the single runId
     let beFallbackUsed = false;
+    let polledType: CliTest['type'] | undefined;
     const resolveAlternate = makeBackendWaitFallback({
       client,
       resolveTestId: () => testId,
       resolveNotBefore: () => rerunResp.enqueuedAt,
+      onTypeDetected: type => {
+        polledType = type;
+      },
       onResolved: tid => {
         beFallbackUsed = true;
         stderrFn(
@@ -13539,7 +13564,7 @@ async function runTestRerunCore(
       opts.output,
       beFallbackUsed || isBERerun,
       finalRun.status,
-      opts.knownTests?.get(testId)?.type,
+      opts.knownTests?.get(testId)?.type ?? polledType,
     );
 
     out.print(withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)), data =>

@@ -94,7 +94,7 @@ function makeBeRerunResp(): RerunResponse {
 
 function makeTerminalRun(
   runId: string,
-  status: 'passed' | 'failed' | 'blocked' = 'passed',
+  status: 'passed' | 'failed' | 'blocked' | 'cancelled' = 'passed',
 ): RunResponse {
   return {
     runId,
@@ -274,7 +274,7 @@ describe('BE rerun --wait: failure recovery hint names test failure get <test-id
   async function rerun(args: {
     output: 'text' | 'json';
     rerunResp: RerunResponse;
-    namedStatus: 'passed' | 'failed' | 'blocked';
+    namedStatus: 'passed' | 'failed' | 'blocked' | 'cancelled';
     testType?: 'backend' | 'frontend';
   }) {
     const creds = makeCreds();
@@ -321,6 +321,16 @@ describe('BE rerun --wait: failure recovery hint names test failure get <test-id
       expect(typeLookups).toHaveLength(1);
     },
   );
+
+  it('multi-member closure (json): a cancelled named test exits 1 with no failure-bundle hint', async () => {
+    const { err, hint } = await rerun({
+      output: 'json',
+      rerunResp: makeBeRerunResp(),
+      namedStatus: 'cancelled',
+    });
+    expect(err.exitCode).toBe(1);
+    expect(hint).toBe('');
+  });
 
   it('single-member closure (json): known backend from the closure, so no extra type lookup', async () => {
     const resp = makeBeRerunResp();

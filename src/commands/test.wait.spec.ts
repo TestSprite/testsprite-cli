@@ -1891,6 +1891,95 @@ describe('runTestWait — failure recovery hint for a run that is terminal on th
     );
   });
 
+  it('JSON: a 5xx type lookup is tried once, not retried, and falls back', async () => {
+    const { credentialsPath } = makeCreds();
+    const router = beWaitRouter({ runStatus: 'failed', result: () => makeBeResult() });
+    let lookups = 0;
+    const stderr: string[] = [];
+    const err = await runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(url => {
+          if (/\/tests\/test_xyz(\?|$)/.test(url)) {
+            lookups += 1;
+            return errorBody('INTERNAL');
+          }
+          return router.handler(url);
+        }),
+        stdout: () => {},
+        stderr: line => stderr.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(lookups).toBe(1);
+    expect(err.exitCode).toBe(1);
+    expect(stderr.find(l => l.startsWith('Run finished'))).toContain(
+      "'testsprite test artifact get run_abc'",
+    );
+  });
+
+  it('reuses the backend type found while polling when the hint lookup later fails', async () => {
+    // Poll 1: run row still running → the BE fallback probes the type (backend)
+    // but the testId result is not ready. Poll 2: the run row is failed. The
+    // hint's own lookup then fails, yet the type is already known.
+    const { credentialsPath } = makeCreds();
+    let polls = 0;
+    let typeReads = 0;
+    const stderr: string[] = [];
+    const err = await runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(url => {
+          if (url.includes('/tests/test_xyz/result')) return errorBody('NOT_FOUND');
+          if (/\/tests\/test_xyz(\?|$)/.test(url)) {
+            typeReads += 1;
+            return typeReads === 1
+              ? {
+                  body: {
+                    id: 'test_xyz',
+                    projectId: 'p1',
+                    name: 'BE test',
+                    type: 'backend',
+                    createdFrom: 'mcp',
+                    status: 'running',
+                    createdAt: '2026-05-15T10:00:00.000Z',
+                    updatedAt: '2026-05-15T10:00:00.000Z',
+                  },
+                }
+              : errorBody('INTERNAL');
+          }
+          polls += 1;
+          return { body: makeRun(polls === 1 ? 'running' : 'failed') };
+        }),
+        stdout: () => {},
+        stderr: line => stderr.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err.exitCode).toBe(1);
+    expect(stderr.find(l => l.startsWith('Run finished'))).toContain(
+      "'testsprite test failure get test_xyz'",
+    );
+    // The polled type was reused: no second lookup for the hint.
+    expect(typeReads).toBe(1);
+  });
+
   it('JSON: a type lookup that never answers is abandoned at its deadline', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
