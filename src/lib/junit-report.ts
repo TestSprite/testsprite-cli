@@ -14,6 +14,8 @@ export interface JUnitTestResult {
   status: string;
   /** Observed on polled runs; used for classname when --project is omitted. */
   projectId?: string;
+  /** This row's own `classname`, when the batch spans several projects. */
+  classname?: string;
   error?: { code: string; message: string; exitCode?: number };
   /** Why a member was skipped before dispatch. */
   skipReason?: string;
@@ -122,12 +124,17 @@ export function assertJUnitReportOptions(opts: JUnitReportFlagOptions): void {
  * Prefer explicit `--project`, then ids observed on polled run rows.
  */
 export function resolveBatchReportProjectId(
-  opts: { projectId?: string },
+  opts: { projectId?: string; projectIdByTestId?: ReadonlyMap<string, string> },
   results: ReadonlyArray<{ projectId?: string }>,
 ): string {
   if (opts.projectId) return opts.projectId;
+  // Explicit ids that span several projects have no single `--project`; each
+  // row carries its own project as its classname and the suite gets this token.
+  const known = new Set(opts.projectIdByTestId?.values());
+  if (known.size > 1) return 'multiple-projects';
   const fromPoll = results.map(r => r.projectId).find((id): id is string => !!id);
   if (fromPoll) return fromPoll;
+  if (known.size === 1) return [...known][0]!;
   throw localValidationError(
     'project',
     '--report junit requires --project <id> when the project cannot be inferred from run results',
@@ -235,7 +242,7 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
   }
 
   const suiteName = escapeXml(opts.suiteName);
-  const testcases = results.map(r => renderTestcase(r, opts.classname)).join('\n');
+  const testcases = results.map(r => renderTestcase(r, r.classname ?? opts.classname)).join('\n');
 
   return [
     XML_DECL,
