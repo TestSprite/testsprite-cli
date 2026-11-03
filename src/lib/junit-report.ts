@@ -233,18 +233,30 @@ function resolveJUnitDisplayNames(
   results: ReadonlyArray<JUnitTestResult>,
   fallbackClassname: string,
 ): Array<string | undefined> {
-  const groups = new Map<string, number>();
-  const keys = results.map(result => {
-    const classname = result.classname ?? fallbackClassname;
-    const rawName = result.name?.trim() || result.testId;
-    const key = `${classname}\u0000${rawName}`;
-    groups.set(key, (groups.get(key) ?? 0) + 1);
-    return key;
-  });
-  return results.map((result, index) => {
-    if (groups.get(keys[index]!) === 1) return undefined;
-    return `${result.name?.trim() || result.testId} [${result.testId}]`;
-  });
+  const rawNames = results.map(result => result.name?.trim() || result.testId);
+  const names = [...rawNames];
+  // Suffixing can itself collide with a row whose human title already looks
+  // like a suffixed one ("Checkout [case-a]" as a literal name), so iterate
+  // until no (classname, name) pair collides. testIds are unique per row, so
+  // each round's colliding set ends pairwise distinct and the loop terminates;
+  // the round cap is a belt against adversarial duplicate ids.
+  for (let round = 0; round <= results.length; round++) {
+    const groups = new Map<string, number>();
+    results.forEach((result, index) => {
+      const key = `${result.classname ?? fallbackClassname}\u0000${names[index]}`;
+      groups.set(key, (groups.get(key) ?? 0) + 1);
+    });
+    let changed = false;
+    results.forEach((result, index) => {
+      const key = `${result.classname ?? fallbackClassname}\u0000${names[index]}`;
+      if ((groups.get(key) ?? 0) > 1) {
+        names[index] = `${names[index]} [${result.testId}]`;
+        changed = true;
+      }
+    });
+    if (!changed) break;
+  }
+  return names.map((name, index) => (name === rawNames[index] ? undefined : name));
 }
 
 /**

@@ -204,6 +204,23 @@ describe('buildJUnitReport', () => {
     expect(xml).toContain('name="Signup" testId="test_b"');
   });
 
+  it('#515: a literal title that matches a suffixed name does not re-collide', () => {
+    // "Checkout [case-a]" is also a human title on its own row: after the
+    // first suffixing round it must not share its (classname, name) with the
+    // suffixed row, or a consumer keyed on classname+name still collapses.
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'case_a', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'case_b', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'case_c', status: 'failed', name: 'Checkout [case_a]' }),
+      ],
+    });
+    const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]);
+    expect(new Set(names).size).toBe(3);
+  });
+
   it('#515: same name under different classnames stays unsuffixed', () => {
     // Distinct classnames are already distinct identities for standard
     // consumers; only rows sharing classname+name need the suffix.
