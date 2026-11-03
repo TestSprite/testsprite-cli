@@ -258,6 +258,24 @@ describe('run <id> <id>: project grouping', () => {
     expect(h.batchPosts()).toHaveLength(1);
     expect(h.calls.some(c => c.path === '/tunnel')).toBe(false);
   });
+
+  it('--allow-empty still decides the exit of a several-id batch that dispatches nothing', async () => {
+    // A single <test-id> refuses --allow-empty (#376); several ids are a batch,
+    // and the flag turns its zero-dispatch exit 5 into exit 0.
+    const skipAll = (_n: number, body: Record<string, unknown>) => ({
+      accepted: [],
+      skippedFrontend: body.testIds as string[],
+    });
+    const gated = harness({ batchExtra: skipAll });
+    await expect(gated.cli('run', 'a', 'b', '--skip-preflight')).rejects.toMatchObject({
+      exitCode: 5,
+      message: expect.stringContaining('pass --allow-empty to exit 0 intentionally'),
+    });
+    const allowed = harness({ batchExtra: skipAll });
+    await allowed.cli('run', 'a', 'b', '--skip-preflight', '--allow-empty');
+    expect(allowed.batchPosts()).toHaveLength(1);
+    expect(allowed.stderr.join('\n')).toContain('--allow-empty set — exiting 0');
+  });
 });
 
 describe('run <id> ...: 50-id chunking', () => {
