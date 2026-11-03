@@ -656,9 +656,11 @@ V2 runs keep their billing, and an in-flight Lambda finishes with its result dis
 
 Exit codes:
   0  cancelled (fresh or already-cancelled — naturally idempotent)
-  1  multi-id: a cancel request failed (auth/transport/server error; see summary.errors)
+  1  multi-id: a cancel request failed (transport/server error; see summary.errors)
+  3  auth error (multi-id: a rejected key on any id — outranks 1, 4, 6 and 14)
   4  run id not found (single id), or ANY id not found (multi-id; outranks conflict)
   6  run already terminal (passed/failed/blocked); multi-id: any conflict
+  14 client too old (multi-id: on any id — outranks 1, 4 and 6)
 
 Multi-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound, errors}.
 

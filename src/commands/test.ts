@@ -2593,6 +2593,21 @@ interface DeleteBatchOptions extends CommonOptions {
 }
 
 /**
+ * Track the member error a multi-id command exits with after its summary: one
+ * that fails EVERY id the same way — a rejected credential (exit 3) or a CLI too
+ * old for the backend (exit 14) — as the single-id form would, rather than
+ * folding it into the generic per-member failure (1). Auth outranks
+ * CLIENT_TOO_OLD, as in lib/wait-exit.ts; the first error of each kind is kept.
+ */
+function keepBatchWideError(current: ApiError | undefined, err: unknown): ApiError | undefined {
+  if (!(err instanceof ApiError)) return current;
+  const currentIsAuth = current !== undefined && isAuthCode(current.code);
+  if (isAuthCode(err.code)) return currentIsAuth ? current : err;
+  if (err.code === 'CLIENT_TOO_OLD') return current ?? err;
+  return current;
+}
+
+/**
  * `test delete-batch <test-ids...>` and `test delete --all --project <id>` — dogfood L1800.
  *
  * Deletes tests sequentially (to avoid hammering the server) and aggregates
@@ -2601,7 +2616,9 @@ interface DeleteBatchOptions extends CommonOptions {
  * object to stdout.
  *
  * Exit code: 0 if all targets were deleted (or `--dry-run`); 1 if any
- * deletion failed (server error); 5 if `--confirm` is missing.
+ * deletion failed (server error); 5 if `--confirm` is missing. A rejected key
+ * or a too-old CLI on any deletion exits with that error instead (3 / 14) —
+ * see {@link keepBatchWideError}.
  */
 export async function runDeleteBatch(
   opts: DeleteBatchOptions,
@@ -2732,6 +2749,7 @@ export async function runDeleteBatch(
   }
 
   const results: CliBulkDeleteResult[] = [];
+  let batchWide: ApiError | undefined;
 
   for (const testId of testIds) {
     const idempotencyKey = `cli-delete-${randomUUID()}`;
@@ -2752,6 +2770,7 @@ export async function runDeleteBatch(
       if (err instanceof ApiError && err.code === 'NOT_FOUND') {
         results.push({ testId, status: 'skipped', error: 'not found (already deleted?)' });
       } else {
+        batchWide = keepBatchWideError(batchWide, err);
         const msg = err instanceof Error ? err.message : String(err);
         results.push({ testId, status: 'error', error: msg });
       }
@@ -2770,6 +2789,7 @@ export async function runDeleteBatch(
 
   out.print(bulk, data => renderBulkDeleteText(data as CliBulkDeleteSummary));
 
+  if (batchWide !== undefined) throw batchWide;
   if (failed > 0) {
     throw new CLIError(
       `${failed} deletion${failed !== 1 ? 's' : ''} failed. See results for details.`,
@@ -9214,6 +9234,8 @@ export interface CliCancelSummary {
  * Multi-id: prints a `{cancelled, alreadyCancelled, conflicts, notFound}`
  * summary. Exit precedence (CXL-11): any `notFound` → 4 (outranks conflict —
  * it signals a caller bug, wrong id/tenant); else any `conflicts` → 6; else 0.
+ * Ahead of all of these, a rejected key or a too-old CLI on any id exits with
+ * that error (3 / 14), exactly as the single-id form does.
  */
 export async function runTestCancel(
   opts: RunTestCancelOptions,
@@ -9241,6 +9263,7 @@ export async function runTestCancel(
   }
 
   const rows: CliCancelResultRow[] = [];
+  let batchWide: ApiError | undefined;
   for (const runId of opts.runIds) {
     try {
       const result = await client.cancelRun(runId);
@@ -9260,6 +9283,7 @@ export async function runTestCancel(
         rows.push({ runId, status: 'conflict', conflictStatus });
         continue;
       }
+      batchWide = keepBatchWideError(batchWide, err);
       const message = err instanceof Error ? err.message : String(err);
       rows.push({ runId, status: 'error', error: message });
     }
@@ -9287,9 +9311,13 @@ export async function runTestCancel(
   if (errorRows.length > 0) parts.push(`${errorRows.length} error`);
   stderrFn(`Cancel summary: ${parts.join(', ')}.`);
 
+  // A rejected key / too-old CLI outranks every per-id outcome below: it is
+  // what the single-id form exits with, and the one thing the caller must fix.
+  if (batchWide !== undefined) throw batchWide;
+
   // Exit precedence (CXL-11): notFound outranks conflict — a caller-side bug
   // (wrong id / wrong tenant) is more actionable to surface than "it already
-  // finished". A bare transport/auth error on any member also fails loudly
+  // finished". Any other transport/server error on a member also fails loudly
   // rather than being silently absorbed into a 0 exit.
   if (summary.notFound.length > 0) {
     throw new CLIError(
@@ -9360,9 +9388,11 @@ export function createTestCancelCommand(deps: TestDeps): Command {
         'V2 runs keep their billing, and an in-flight Lambda finishes with its result discarded.\n' +
         '\nExit codes:\n' +
         '  0  cancelled (fresh or already-cancelled — naturally idempotent)\n' +
-        '  1  multi-id: a cancel request failed (auth/transport/server error; see summary.errors)\n' +
+        '  1  multi-id: a cancel request failed (transport/server error; see summary.errors)\n' +
+        '  3  auth error (multi-id: a rejected key on any id — outranks 1, 4, 6 and 14)\n' +
         '  4  run id not found (single id), or ANY id not found (multi-id; outranks conflict)\n' +
         '  6  run already terminal (passed/failed/blocked); multi-id: any conflict\n' +
+        '  14 client too old (multi-id: on any id — outranks 1, 4 and 6)\n' +
         '\nMulti-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound, errors}.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
@@ -15035,7 +15065,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '\nExit codes:\n' +
         '  0  all targeted tests deleted (or --dry-run)\n' +
         '  1  one or more deletions failed\n' +
-        '  5  validation error (e.g. missing --confirm, or --all without --project)',
+        '  3  auth error (a rejected key on any id — outranks 1 and 14)\n' +
+        '  5  validation error (e.g. missing --confirm, or --all without --project)\n' +
+        '  14 client too old (on any id — outranks 1)',
     )
     .option('--confirm', 'required: confirm the destructive operation', false)
     .option('--all', 'delete all tests in the resolved project (requires --project)', false)
