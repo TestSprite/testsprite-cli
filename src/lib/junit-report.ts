@@ -235,6 +235,14 @@ function resolveJUnitDisplayNames(
 ): Array<string | undefined> {
   const rawNames = results.map(result => result.name?.trim() || result.testId);
   const names = [...rawNames];
+  // XML consumers normalize attribute whitespace: line endings collapse first
+  // (CRLF/CR → LF), then tabs/newlines/carriage returns each become a space.
+  // Raw-distinct names can therefore share an identity downstream, so the
+  // collision keys use the normalized form; rendering keeps the original text.
+  const attributeKey = (value: string): string =>
+    value.replace(/\r\n?/g, '\n').replace(/[\n\t]/g, ' ');
+  const keyOf = (classname: string, name: string): string =>
+    `${attributeKey(classname)}\u0000${attributeKey(name)}`;
   // Suffixing can itself collide with a row whose human title already looks
   // like a suffixed one ("Checkout [case-a]" as a literal name), so iterate
   // until no (classname, name) pair collides. testIds are unique per row, so
@@ -243,12 +251,12 @@ function resolveJUnitDisplayNames(
   for (let round = 0; round <= results.length; round++) {
     const groups = new Map<string, number>();
     results.forEach((result, index) => {
-      const key = `${result.classname ?? fallbackClassname}\u0000${names[index]}`;
+      const key = keyOf(result.classname ?? fallbackClassname, names[index]!);
       groups.set(key, (groups.get(key) ?? 0) + 1);
     });
     let changed = false;
     results.forEach((result, index) => {
-      const key = `${result.classname ?? fallbackClassname}\u0000${names[index]}`;
+      const key = keyOf(result.classname ?? fallbackClassname, names[index]!);
       if ((groups.get(key) ?? 0) > 1) {
         names[index] = `${names[index]} [${result.testId}]`;
         changed = true;

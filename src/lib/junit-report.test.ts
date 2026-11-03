@@ -212,13 +212,35 @@ describe('buildJUnitReport', () => {
       suiteName: 'Batch',
       classname: 'proj_1',
       results: [
-        makeResult({ testId: 'case_a', status: 'failed', name: 'Checkout' }),
-        makeResult({ testId: 'case_b', status: 'failed', name: 'Checkout' }),
-        makeResult({ testId: 'case_c', status: 'failed', name: 'Checkout [case_a]' }),
+        makeResult({ testId: 'case_a', runId: 'run_a', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'case_b', runId: 'run_b', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'case_c', runId: 'run_c', status: 'failed', name: 'Checkout [case_a]' }),
       ],
     });
     const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]);
     expect(new Set(names).size).toBe(3);
+    // Each colliding row keeps its own run's diagnostics.
+    expect(xml).toContain('runId: run_a');
+    expect(xml).toContain('runId: run_b');
+    expect(xml).toContain('runId: run_c');
+  });
+
+  it('#515: names that XML attribute normalization folds together still get disambiguated', () => {
+    // XML consumers normalize attribute whitespace (CRLF, LF, tabs → spaces),
+    // so 'Checkout fix' and 'Checkout\tfix' are the same identity downstream
+    // even though the raw strings differ. The resolver must key on the
+    // normalized form; rendering keeps the original text.
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'test_a', runId: 'run_a', status: 'failed', name: 'Checkout fix' }),
+        makeResult({ testId: 'test_b', runId: 'run_b', status: 'failed', name: 'Checkout\tfix' }),
+      ],
+    });
+    expect(xml).toContain('name="Checkout fix [test_a]"');
+    expect(xml).toContain('name="Checkout\tfix [test_b]"');
+    expect((xml.match(/<failure /g) ?? []).length).toBe(2);
   });
 
   it('#515: same name under different classnames stays unsuffixed', () => {
