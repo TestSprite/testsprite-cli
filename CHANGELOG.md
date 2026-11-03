@@ -4,8 +4,13 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 
 ## [Unreleased]
 
+### Added
+
+- **`setup` keeps `.testsprite/` out of Git.** Inside a Git repository, `testsprite setup` appends `.testsprite/` (where failure artifacts are written) to the project's `.gitignore` when it is not already ignored; skip it with `--no-gitignore`, and `--dry-run` only reports it. The entry is appended rather than rewritten, a symlinked `.gitignore` is not written through, and a failure here is a warning that never fails setup (it also runs when the agent skill install fails after credentials were saved). `testsprite doctor` gains `Git repository` and `Gitignore safety` checks: inside a repository it warns (never fails) when no `.gitignore` between the project directory and the repository root ignores `.testsprite/`, and outside a repository both are informational. Thanks to @sandman-sh (#257, closes #258).
+
 ### Fixed
 
+- **`project credential` and `project auto-auth` no longer crash on an unreadable `--credential-file`, `--password-file`, `--client-secret-file` or `--refresh-token-file`.** A missing, unreadable or non-regular file now exits 5 (`VALIDATION_ERROR`) with the usual error envelope instead of an unhandled Node error (exit 1), and `--dry-run` no longer reads these files, matching `project create` and `project update`. Thanks @OkeyAmy (#283).
 - **`project get`/`project list` and `test code get`/`code put` validate the response shape.** A malformed response now exits 1 with an `INTERNAL` "Response shape mismatch" error (request id and the first mismatched paths, never the body) instead of a raw `TypeError`, a bad body printed as a success, or a bad `If-Match` header on `code put`. Additive server fields and new project type/language/framework values still pass through unchanged, an omitted project `nextToken` counts as the last page, and in text mode a null or empty `code` is reported as "no code generated yet" (with `--out`, no file is written and an existing one is left untouched). `test code get --output json` is unchanged for legacy rows. Thanks @jerrybate-sketch (#340).
 
 ## [0.16.0] - 2026-10-30
