@@ -284,3 +284,37 @@ describe('Output.writeChunk — backpressure', () => {
     expect(writeResolved).toBe(true);
   });
 });
+
+describe('Output deprecations option', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  const entry = { command: 'test rerun', replacement: 'test run', removedIn: '0.17.0' };
+
+  it('appends deprecations as the last key of a JSON object payload', () => {
+    new Output('json', {}, { deprecations: [entry] }).print({ a: 1, b: 2 });
+    const written = JSON.parse(logSpy.mock.calls[0]?.[0] as string);
+    expect(Object.keys(written)).toEqual(['a', 'b', 'deprecations']);
+    expect(written.deprecations).toEqual([entry]);
+  });
+
+  it('is absent without the option', () => {
+    new Output('json').print({ a: 1 });
+    expect(JSON.parse(logSpy.mock.calls[0]?.[0] as string)).toEqual({ a: 1 });
+  });
+
+  it('leaves array payloads untouched', () => {
+    new Output('json', {}, { deprecations: [entry] }).print([1, 2]);
+    expect(JSON.parse(logSpy.mock.calls[0]?.[0] as string)).toEqual([1, 2]);
+  });
+
+  it('does not touch text mode', () => {
+    new Output('text', {}, { deprecations: [entry] }).print({ a: 1 }, () => 'rendered');
+    expect(logSpy).toHaveBeenCalledWith('rendered');
+  });
+});

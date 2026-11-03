@@ -1290,8 +1290,18 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
 
   testlist
     .command('run <list-id>')
+    .summary('Run a test list')
     .description(
-      'Run a test list (dispatch its cases and return pollable run ids). Loopback environments open a tunnel automatically and wait.',
+      "Run a test list (dispatch its cases and return pollable run ids). Environments come from the list's --project-env mapping; loopback ones open one tunnel and wait (backend cases are skipped).\n" +
+        '\nExit codes:\n' +
+        '  0  dispatched (or all passed with --wait)\n' +
+        '  1  a run failed / blocked / cancelled\n' +
+        '  3  auth error\n' +
+        '  4  a --case id is not in the list\n' +
+        '  6  nothing dispatched: every case conflicted (already running, or cannot run here)\n' +
+        '  7  timeout, or some cases were rate-deferred (retry the printed ids)\n' +
+        ' 12  insufficient credits (non-retriable; top up)\n' +
+        ' 13  feature gated / workspace paused',
     )
     .option(
       '--case <test-id>',
@@ -1319,11 +1329,11 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
     )
     .option(
       '--gh-output',
-      'with --wait: emit GitHub-native output (::error:: annotations for failed/timed-out members, ::warning:: for never-dispatched ones; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
+      'with --wait: emit GitHub annotations (::error:: failed/timed-out, ::warning:: never dispatched) and a job-summary table when $GITHUB_STEP_SUMMARY is set; auto-enabled when GITHUB_ACTIONS=true',
     )
     .option(
       '--summary-file <path>',
-      'with --wait: also write the reduced machine summary JSON {total, passed, failed, skipped, timedOut, runs[]} to this file',
+      'with --wait: also write summary JSON {total, passed, failed, skipped, timedOut, runs[]} to this file',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(
