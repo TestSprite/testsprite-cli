@@ -11,6 +11,7 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 ### Fixed
 
 - **`project credential` and `project auto-auth` no longer crash on an unreadable `--credential-file`, `--password-file`, `--client-secret-file` or `--refresh-token-file`.** A missing, unreadable or non-regular file now exits 5 (`VALIDATION_ERROR`) with the usual error envelope instead of an unhandled Node error (exit 1), and `--dry-run` no longer reads these files, matching `project create` and `project update`. Thanks @OkeyAmy (#283).
+- **`project get`/`project list` and `test code get`/`code put` validate the response shape.** A malformed response now exits 1 with an `INTERNAL` "Response shape mismatch" error (request id and the first mismatched paths, never the body) instead of a raw `TypeError`, a bad body printed as a success, or a bad `If-Match` header on `code put`. Additive server fields and new project type/language/framework values still pass through unchanged, an omitted project `nextToken` counts as the last page, and in text mode a null or empty `code` is reported as "no code generated yet" (with `--out`, no file is written and an existing one is left untouched). `test code get --output json` is unchanged for legacy rows. Thanks @jerrybate-sketch (#340).
 
 ## [0.16.0] - 2026-10-30
 

@@ -24,6 +24,7 @@ import {
 } from '../lib/local-target.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { readSecretFileGuarded } from '../lib/secret-file.js';
+import { CLI_PROJECT_LIST_SCHEMA, CLI_PROJECT_SCHEMA } from '../lib/response-schemas.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
@@ -31,6 +32,7 @@ import {
   fetchSinglePage,
   paginate,
   validatePaginationFlags,
+  type FetchPageArgs,
   type Page,
   type PaginationFlags,
 } from '../lib/pagination.js';
@@ -172,6 +174,12 @@ export async function runList(
   // request — same shape AWS CLI ships. Otherwise auto-page.
   const useSinglePage = opts.pageSize !== undefined && opts.maxItems === undefined;
 
+  const fetchPage = async ({ pageSize, cursor }: FetchPageArgs) =>
+    client.get<Page<CliProject>>('/projects', {
+      query: { pageSize, cursor },
+      schema: CLI_PROJECT_LIST_SCHEMA,
+    });
+
   let page: Page<CliProject>;
   if (useSinglePage) {
     page = await fetchSinglePage<CliProject>(
@@ -179,15 +187,11 @@ export async function runList(
       '/projects',
       paginationFlags.pageSize!,
       opts.startingToken,
+      {},
+      CLI_PROJECT_LIST_SCHEMA,
     );
   } else {
-    page = await paginate<CliProject>(
-      async ({ pageSize, cursor }) =>
-        client.get<Page<CliProject>>('/projects', {
-          query: { pageSize, cursor },
-        }),
-      paginationFlags,
-    );
+    page = await paginate<CliProject>(fetchPage, paginationFlags);
   }
 
   out.print(page, data => {
@@ -205,7 +209,9 @@ export async function runGet(opts: GetOptions, deps: ProjectDeps = {}): Promise<
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
 
-  const project = await client.get<CliProject>(`/projects/${encodeURIComponent(opts.projectId)}`);
+  const project = await client.get<CliProject>(`/projects/${encodeURIComponent(opts.projectId)}`, {
+    schema: CLI_PROJECT_SCHEMA,
+  });
   out.print(project, data => renderProjectText(data as CliProject));
   return project;
 }
