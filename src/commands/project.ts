@@ -789,8 +789,9 @@ export async function runCredential(
   }
 
   // A credential (flag or file) is required for every type except `public`
-  // (which clears it). Presence only here: --credential-file is read after the
-  // dry-run early return so --dry-run never touches the filesystem.
+  // (which clears it). Presence only here: dry-run checks that the flag was
+  // given, not the file's contents; --credential-file is read after the dry-run
+  // early return so --dry-run never touches the filesystem.
   const missingCredential = (): ApiError =>
     localValidationError(
       '--credential (or --credential-file) is required unless --type is "public"',
