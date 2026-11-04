@@ -12,13 +12,12 @@
  * Broken pipe: when output is piped to a reader that closes early
  * (`testsprite ... | head`), the kernel raises `EPIPE` on the next stdout write.
  * Node turns an `'error'` with no listener into an uncaughtException and dumps a
- * raw `write EPIPE` stack (exit 1). Outside an armed lifetime the guard exits
- * 0 immediately, the conventional SIGPIPE-equivalent result. While armed it
- * first requests coordinated shutdown so tunnel cleanup can finish, then the
- * same synthetic interrupt reason preserves exit 0.
+ * raw `write EPIPE` stack (exit 1). The guard swallows only this broken-pipe
+ * error and lets the command finish normally, preserving its eventual verdict
+ * and exit code. EPIPE must not abort an armed wait or tunnel lifetime.
  *
- * `process` and the streams are injectable so the wiring is unit-testable
- * without spawning a subprocess or sending a real signal.
+ * The streams are injectable so the wiring is unit-testable without spawning a
+ * subprocess or sending a real signal.
  */
 
 import { setMaxListeners } from 'node:events';
@@ -52,7 +51,7 @@ export function armInterruptExitBackstop(
  * only these members, and tests can supply a lightweight fake.
  */
 export interface ShutdownHandle {
-  /** Aborts with the graceful-stop reason when a signal/EPIPE arrives while armed. */
+  /** Aborts with the graceful-stop reason when a termination signal arrives while armed. */
   readonly signal: AbortSignal;
   /** Enter a graceful-detach scope. Returns the disposer that leaves it. */
   arm(): () => void;
@@ -84,7 +83,7 @@ export class ShutdownController {
   private readonly controller = new AbortController();
   private readonly criticalOperations = new Set<Promise<unknown>>();
   private armedCount = 0;
-  private receivedCause: TerminationSignal | 'EPIPE' | null = null;
+  private receivedCause: TerminationSignal | null = null;
 
   constructor() {
     // Every fetch and every poll iteration composes this signal via
@@ -98,7 +97,7 @@ export class ShutdownController {
   }
 
   /** The first graceful-shutdown cause received, or null if none yet. */
-  get received(): TerminationSignal | 'EPIPE' | null {
+  get received(): TerminationSignal | null {
     return this.receivedCause;
   }
 
@@ -149,31 +148,6 @@ export class ShutdownController {
   interrupt(signal: TerminationSignal): void {
     this.receivedCause = signal;
     this.controller.abort(new InterruptError(signal));
-  }
-
-  /**
-   * Abort an armed lifetime after stdout's reader closes. The InterruptError
-   * subtype deliberately keeps the existing graceful-detach catch paths in
-   * play (including tunnel cancellation), while its exit code stays the
-   * SIGPIPE-equivalent success code 0.
-   */
-  brokenPipe(): void {
-    if (this.receivedCause !== null) return;
-    this.receivedCause = 'EPIPE';
-    this.controller.abort(new BrokenPipeInterruptError());
-  }
-}
-
-class BrokenPipeInterruptError extends InterruptError {
-  override readonly exitCode = 0;
-
-  constructor() {
-    // Existing graceful-detach consumers read `.signal` to render their
-    // partial status. The distinct name/message and exitCode carry the real
-    // cause without widening the OS-signal contract in errors.ts.
-    super('SIGINT');
-    this.name = 'BrokenPipeInterruptError';
-    this.message = 'Output pipe closed.';
   }
 }
 
@@ -335,38 +309,35 @@ export interface BrokenPipeDeps {
   stdout?: NodeJS.EventEmitter;
   /** stderr stream. Defaults to `process.stderr`. */
   stderr?: NodeJS.EventEmitter;
-  /** Process exit. Defaults to `process.exit`. */
+  /** @deprecated Retained for source compatibility; EPIPE no longer forces an exit. */
   exit?: (code: number) => void;
-  /** Shutdown coordinator. Defaults to {@link globalShutdown}. */
+  /** @deprecated Retained for source compatibility; EPIPE no longer aborts shutdown. */
   shutdown?: ShutdownController;
 }
 
 /**
  * Guard against `EPIPE` on stdout/stderr so piping to a reader that closes
- * early (`testsprite ... | head`) exits cleanly instead of crashing with an
- * unhandled `write EPIPE` stack. An armed stdout path requests graceful
- * shutdown before exiting 0; a disarmed one exits 0 immediately. Only `EPIPE`
- * is swallowed; any other stream error is left to surface normally.
+ * early (`testsprite ... | head`) does not produce an unhandled `write EPIPE`
+ * stack. A broken pipe only means output can no longer be delivered; it must
+ * not terminate or abort the command. The command must finish normally because
+ * its final exit code may not be known when EPIPE arrives (for example, a test
+ * run can still be resolving to failed). Only `EPIPE` is swallowed; any other
+ * stream error is left to surface normally.
  */
 export function installBrokenPipeGuard(deps: BrokenPipeDeps = {}): void {
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
-  const exit = deps.exit ?? ((code: number) => process.exit(code));
-  const shutdown = deps.shutdown ?? globalShutdown;
-
+  let stdoutBroken = false;
   stdout.on('error', (error: NodeJS.ErrnoException) => {
-    // Reader went away (`| head`, `| less` then q): exit cleanly like SIGPIPE
-    // rather than dumping an unhandled `write EPIPE` stack. Any other stdout
-    // error is a genuine, actionable failure, so re-throw it (Node's default).
+    // Reader went away (`| head`, `| less` then q). Once stdout has failed,
+    // later stream errors are consequences of the same closed pipe and cannot
+    // be reported to the reader either.
+    if (stdoutBroken) return;
     if (error.code === 'EPIPE') {
-      if (shutdown.isArmed) {
-        // A tunnel lifetime owns credential teardown in its `finally`. Abort
-        // through the same coordinator as the first signal and let that
-        // cleanup finish; the synthetic reason exits 0 once it propagates.
-        shutdown.brokenPipe();
-        return;
-      }
-      exit(0);
+      // Do not exit or abort the shutdown signal here. The command must
+      // continue through normal cleanup and verdict handling; process.exitCode
+      // may only be assigned after async work and telemetry complete.
+      stdoutBroken = true;
       return;
     }
     throw error;

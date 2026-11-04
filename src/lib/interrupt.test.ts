@@ -321,71 +321,70 @@ describe('installBrokenPipeGuard', () => {
     return Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
   }
 
-  it('exits 0 on stdout EPIPE (clean SIGPIPE-equivalent for `| head`)', () => {
-    const stdout = new EventEmitter();
-    const stderr = new EventEmitter();
-    const exit = vi.fn();
-    const shutdown = new ShutdownController();
-    installBrokenPipeGuard({ stdout, stderr, exit, shutdown });
+  it('does not assign an exit code when stdout EPIPE arrives before the verdict', () => {
+    const previousExitCode = process.exitCode;
+    try {
+      process.exitCode = undefined;
+      const stdout = new EventEmitter();
+      const stderr = new EventEmitter();
+      const exit = vi.fn();
+      installBrokenPipeGuard({ stdout, stderr, exit });
 
-    stdout.emit('error', makeEpipe());
-    expect(exit).toHaveBeenCalledWith(0);
-    expect(shutdown.signal.aborted).toBe(false);
+      stdout.emit('error', makeEpipe());
+
+      // The command is still responsible for determining its final status.
+      expect(exit).not.toHaveBeenCalled();
+      expect(process.exitCode).toBeUndefined();
+      process.exitCode = 1; // Simulate the async test verdict resolving later.
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
   });
 
-  it('armed scope: stdout EPIPE requests graceful cleanup instead of exiting immediately', async () => {
+  it('does not abort an armed command when stdout EPIPE arrives', () => {
     const stdout = new EventEmitter();
     const stderr = new EventEmitter();
-    const exit = vi.fn();
     const shutdown = new ShutdownController();
     const disarm = shutdown.arm();
-    const cleanup = vi.fn();
-    const lifetime = new Promise<void>(resolve => {
-      shutdown.signal.addEventListener(
-        'abort',
-        () => {
-          queueMicrotask(() => {
-            cleanup();
-            disarm();
-            resolve();
-          });
-        },
-        { once: true },
-      );
-    });
-    installBrokenPipeGuard({ stdout, stderr, exit, shutdown });
+    installBrokenPipeGuard({ stdout, stderr, shutdown });
 
     stdout.emit('error', makeEpipe());
 
-    expect(exit).not.toHaveBeenCalled();
-    expect(shutdown.signal.aborted).toBe(true);
-    const reason = shutdown.signal.reason as InterruptError;
-    expect(reason).toBeInstanceOf(InterruptError);
-    expect(reason.exitCode).toBe(0);
-    await lifetime;
-    expect(cleanup).toHaveBeenCalledOnce();
-    expect(shutdown.isArmed).toBe(false);
+    expect(shutdown.signal.aborted).toBe(false);
+    expect(shutdown.isArmed).toBe(true);
+    disarm();
   });
 
-  it('re-throws a non-EPIPE stdout error instead of silently swallowing it', () => {
+  it('swallows follow-up stream errors after stdout EPIPE', () => {
     const stdout = new EventEmitter();
     const stderr = new EventEmitter();
-    const exit = vi.fn();
-    installBrokenPipeGuard({ stdout, stderr, exit });
+    installBrokenPipeGuard({ stdout, stderr });
+
+    expect(() => {
+      stdout.emit('error', makeEpipe());
+      stdout.emit(
+        'error',
+        Object.assign(new Error('write after close'), { code: 'ERR_STREAM_DESTROYED' }),
+      );
+    }).not.toThrow();
+  });
+
+  it('re-throws a non-EPIPE stdout error before the pipe closes', () => {
+    const stdout = new EventEmitter();
+    const stderr = new EventEmitter();
+    installBrokenPipeGuard({ stdout, stderr });
 
     expect(() =>
       stdout.emit('error', Object.assign(new Error('boom'), { code: 'ENOSPC' })),
     ).toThrow('boom');
-    expect(exit).not.toHaveBeenCalled();
   });
 
-  it('swallows stderr EPIPE without exiting or throwing', () => {
+  it('swallows stderr EPIPE without throwing', () => {
     const stdout = new EventEmitter();
     const stderr = new EventEmitter();
-    const exit = vi.fn();
-    installBrokenPipeGuard({ stdout, stderr, exit });
+    installBrokenPipeGuard({ stdout, stderr });
 
     expect(() => stderr.emit('error', makeEpipe())).not.toThrow();
-    expect(exit).not.toHaveBeenCalled();
   });
 });
