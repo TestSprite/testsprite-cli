@@ -778,6 +778,216 @@ describe('HttpClient error mapping', () => {
   });
 });
 
+describe('HttpClient — TLS certificate failures', () => {
+  const TLS_CASES = [
+    { code: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', reason: 'tls_untrusted' },
+    { code: 'SELF_SIGNED_CERT_IN_CHAIN', reason: 'tls_untrusted' },
+    { code: 'DEPTH_ZERO_SELF_SIGNED_CERT', reason: 'tls_untrusted' },
+    { code: 'CERT_HAS_EXPIRED', reason: 'tls_expired' },
+    { code: 'ERR_TLS_CERT_ALTNAME_INVALID', reason: 'tls_hostname_mismatch' },
+  ] as const;
+
+  it.each(TLS_CASES)(
+    '$code fails once with exit 10 and names NODE_EXTRA_CA_CERTS',
+    async ({ code, reason }) => {
+      const fetchImpl = vi.fn(async () => {
+        const cause = Object.assign(new Error(`TLS failure: ${code}`), { code });
+        throw new TypeError('fetch failed', { cause });
+      });
+      const client = makeClient(fetchImpl as unknown as typeof fetch);
+      const err = (await client.get('/me').catch((e: unknown) => e)) as ApiError;
+
+      expect(err).toBeInstanceOf(TransportError);
+      expect(err.code).toBe('UNAVAILABLE');
+      expect(err.exitCode).toBe(10);
+      expect(err.message).toContain('NODE_EXTRA_CA_CERTS');
+      expect(err.getDetail('reason')).toBe(reason);
+      expect(err.getDetail('cause')).toBe(code);
+      // A certificate rejection cannot self-heal by retrying the same request.
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('keeps a named reason and cause for a closed port', async () => {
+    const fetchImpl = vi.fn(async () => {
+      const cause = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:9'), {
+        code: 'ECONNREFUSED',
+      });
+      throw new TypeError('fetch failed', { cause });
+    });
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    const err = (await client.get('/me').catch((e: unknown) => e)) as ApiError;
+
+    expect(err).toBeInstanceOf(TransportError);
+    expect(err.exitCode).toBe(10);
+    expect(err.message).toContain('Connection refused');
+    expect(err.getDetail('reason')).toBe('connection_refused');
+    expect(err.getDetail('cause')).toBe('ECONNREFUSED');
+    // Non-certificate causes can be transient and keep the existing budget.
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    { code: 'ENOTFOUND', reason: 'dns', messagePart: 'Could not resolve' },
+    { code: 'ETIMEDOUT', reason: 'timeout', messagePart: 'timed out' },
+    { code: 'ECONNRESET', reason: 'connection_reset', messagePart: 'was reset' },
+    { code: 'EHOSTUNREACH', reason: 'host_unreachable', messagePart: 'Could not reach' },
+    { code: 'ENETUNREACH', reason: 'host_unreachable', messagePart: 'Could not reach' },
+  ] as const)(
+    'names $code as $reason while keeping the retry budget',
+    async ({ code, reason, messagePart }) => {
+      const fetchImpl = vi.fn(async () => {
+        const cause = Object.assign(new Error(`network failure: ${code}`), { code });
+        throw new TypeError('fetch failed', { cause });
+      });
+      const client = makeClient(fetchImpl as unknown as typeof fetch);
+      const err = (await client.get('/me').catch((e: unknown) => e)) as ApiError;
+
+      expect(err).toBeInstanceOf(TransportError);
+      expect(err.exitCode).toBe(10);
+      expect(err.message).toContain(messagePart);
+      expect(err.getDetail('reason')).toBe(reason);
+      expect(err.getDetail('cause')).toBe(code);
+      expect(fetchImpl).toHaveBeenCalledTimes(4);
+    },
+  );
+
+  it('fails once when the proxy demands authentication (407)', async () => {
+    const fetchImpl = vi.fn(async () => {
+      const cause = Object.assign(new Error('Proxy Authentication Required (407)'), {
+        code: 'UND_ERR_INVALID_ARG',
+      });
+      throw new TypeError('fetch failed', { cause });
+    });
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    const err = (await client.get('/me').catch((e: unknown) => e)) as ApiError;
+
+    expect(err).toBeInstanceOf(TransportError);
+    expect(err.exitCode).toBe(10);
+    expect(err.message).toContain('407');
+    expect(err.getDetail('reason')).toBe('proxy_authentication');
+    expect(err.nextAction).toContain('HTTPS_PROXY');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('HttpClient — block pages that are not the API', () => {
+  const BLOCK_HTML =
+    '<!doctype html><html><head><title>Website blocked by your organization</title></head>' +
+    '<body><h1>Access Denied</h1></body></html>';
+
+  it.each([402, 403, 404, 426] as const)(
+    'a non-JSON HTTP %d is reported as not_testsprite, not an API verdict',
+    async status => {
+      const fetchImpl = vi.fn(
+        async () =>
+          new Response(BLOCK_HTML, {
+            status,
+            headers: { 'content-type': 'text/html; charset=utf-8' },
+          }),
+      );
+      const client = makeClient(fetchImpl as unknown as typeof fetch);
+      const err = (await client.get('/tests/test_abc').catch((e: unknown) => e)) as ApiError;
+
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err).not.toBeInstanceOf(TransportError);
+      expect(err.code).toBe('UNAVAILABLE');
+      expect(err.exitCode).toBe(10);
+      expect(err.message).toContain('Website blocked by your organization');
+      expect(err.nextAction).toContain('HTTPS_PROXY');
+      expect(err.details).toMatchObject({
+        reason: 'not_testsprite',
+        httpStatus: status,
+        contentType: 'text/html; charset=utf-8',
+        pageTitle: 'Website blocked by your organization',
+      });
+      // The page came from a proxy/firewall, not the API — no retry budget.
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('treats an empty 4xx body as not_testsprite too', async () => {
+    const fetchImpl = vi.fn(async () => new Response('', { status: 404 }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    const err = (await client.get('/tests/test_abc').catch((e: unknown) => e)) as ApiError;
+
+    expect(err.code).toBe('UNAVAILABLE');
+    expect(err.exitCode).toBe(10);
+    expect(err.details).toMatchObject({ reason: 'not_testsprite', httpStatus: 404 });
+    expect(err.getDetail('pageTitle')).toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the API status mapping for a valid JSON null body', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response('null', { status: 404, headers: { 'content-type': 'application/json' } }),
+    );
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.get('/tests/test_abc')).rejects.toMatchObject({
+      code: 'NOT_FOUND',
+      exitCode: 4,
+    });
+  });
+
+  it('decodes entities and strips terminal controls from the page title', async () => {
+    const html = '<html><head><title>Blocked &amp; logged &#27;]0;pwn&#7;</title></head></html>';
+    const fetchImpl = vi.fn(
+      async () => new Response(html, { status: 403, headers: { 'content-type': 'text/html' } }),
+    );
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    const err = (await client.get('/tests/test_abc').catch((e: unknown) => e)) as ApiError;
+
+    expect(err.getDetail('pageTitle')).toBe('Blocked & logged ]0;pwn');
+  });
+
+  it('keeps the API status mapping when the response echoes our x-request-id', async () => {
+    const fetchImpl = vi.fn(async (_input: unknown, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string> | undefined;
+      return new Response(BLOCK_HTML, {
+        status: 403,
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          'x-request-id': headers?.['x-request-id'] ?? '',
+        },
+      });
+    });
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    const err = (await client.get('/me', { requestId: 'cli_echoed' }).catch((e: unknown) => e)) as
+      ApiError | undefined;
+
+    expect(err?.code).toBe('AUTH_FORBIDDEN');
+    expect(err?.exitCode).toBe(3);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps JSON 403 (framework envelope) as AUTH_FORBIDDEN', async () => {
+    const fetchImpl = vi.fn(async () => errorEnvelopeResponse(403, 'AUTH_FORBIDDEN'));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.get('/me')).rejects.toMatchObject({
+      code: 'AUTH_FORBIDDEN',
+      exitCode: 3,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps HTML 429 as RATE_LIMITED and retries it', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response('too many requests', {
+          status: 429,
+          headers: { 'content-type': 'text/plain', 'retry-after': '1' },
+        }),
+    );
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.get('/me')).rejects.toMatchObject({
+      code: 'RATE_LIMITED',
+      exitCode: 11,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+});
+
 describe('HttpClient debug events', () => {
   it('emits request → response on success', async () => {
     const events: DebugEvent[] = [];
@@ -826,7 +1036,11 @@ describe('HttpClient transport-edge statuses', () => {
     async status => {
       const fetchImpl = vi.fn(async () => new Response('proxy gateway html', { status }));
       const client = makeClient(fetchImpl as unknown as typeof fetch);
-      await expect(client.get('/me')).rejects.toBeInstanceOf(TransportError);
+      const err = (await client.get('/me').catch((e: unknown) => e)) as TransportError;
+      expect(err).toBeInstanceOf(TransportError);
+      // The response did arrive, so doctor can still ask whether a tunnel is
+      // available on this endpoint instead of treating it as unreachable.
+      expect(err.httpStatus).toBe(status);
       expect(fetchImpl).toHaveBeenCalledTimes(4);
     },
   );

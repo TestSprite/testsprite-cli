@@ -3,6 +3,7 @@ import * as v from 'valibot';
 import type { ErrorCode } from './errors.js';
 import { ApiError, InterruptError, RequestTimeoutError, TransportError } from './errors.js';
 import { buildUserAgent } from './client-tag.js';
+import { classifyFetchFailure, transportFailureError } from './transport-failure.js';
 import {
   BATCH_RERUN_RESPONSE_SCHEMA,
   BATCH_RUN_FRESH_RESPONSE_SCHEMA,
@@ -902,7 +903,25 @@ export class HttpClient {
           // nested call or from a test-injected fetchImpl), pass it through unchanged
           // rather than re-wrapping it as a TransportError.
           if (err instanceof RequestTimeoutError) throw err;
-          const message = err instanceof Error ? err.message : String(err);
+          // Name the real network failure from the `fetch failed` cause chain.
+          // Certificate failures and an authenticating proxy are terminal: the
+          // same request cannot succeed on a retry, so fail on the first attempt
+          // instead of burning the backoff budget and reporting the misleading
+          // generic "Service is temporarily unavailable".
+          const failure = classifyFetchFailure(err, url);
+          if (failure?.fatal) {
+            this.debug({
+              kind: 'error',
+              method,
+              url,
+              attempt,
+              requestId,
+              errorCode: 'TRANSPORT',
+              durationMs: Date.now() - startedAt,
+            });
+            throw transportFailureError(failure, requestId);
+          }
+          const message = failure?.message ?? (err instanceof Error ? err.message : String(err));
           this.debug({
             kind: 'error',
             method,
@@ -915,9 +934,14 @@ export class HttpClient {
           const decision = allowTransportRetry
             ? transportRetryDecision(attempt, this.random)
             : { retry: false, delayMs: 0 };
-          if (!decision.retry) throw new TransportError(message, requestId);
+          if (!decision.retry) {
+            throw failure !== undefined
+              ? transportFailureError(failure, requestId)
+              : new TransportError(message, requestId);
+          }
+          const failureNote = failure !== undefined ? ` (${failure.reason})` : '';
           this.transition(
-            `Network error on ${shortPath(path)} — retrying in ${Math.round(decision.delayMs / 1000)}s (attempt ${attempt})`,
+            `Network error on ${shortPath(path)}${failureNote} — retrying in ${Math.round(decision.delayMs / 1000)}s (attempt ${attempt})`,
           );
           this.debug({
             kind: 'retry',
@@ -1008,16 +1032,43 @@ export class HttpClient {
           return { body: raw as T, requestId, status: response.status };
         }
 
-        let rawBody: unknown;
+        const nonApiCandidate = isNonApiCandidateStatus(response.status);
+        let errorBody: ReadErrorResponseBody;
         try {
-          rawBody = await safeReadJson(response);
+          errorBody = await readErrorResponseBody(response, nonApiCandidate);
         } catch (err) {
           // Interrupt passthrough (see the fetch catch above).
           if (err instanceof InterruptError) throw err;
-          // safeReadJson rethrows aborts/timeouts (it swallows only non-abort parse
-          // errors), so a timeout fired mid-body-read on a non-OK response lands here.
+          // readErrorResponseBody rethrows aborts/timeouts (it swallows only
+          // non-abort parse errors), so a timeout fired mid-body-read on a
+          // non-OK response lands here.
           this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
           throw err;
+        }
+        const rawBody = errorBody.json;
+
+        // A 4xx that is not a JSON API envelope and does not echo our request id
+        // did not come from TestSprite. A firewall, captive portal, WAF, or
+        // authenticating proxy answered instead. Reporting its status through the
+        // API's error catalog (403 -> AUTH_FORBIDDEN, 402 -> buy credits, ...)
+        // sends scripts and agents to rotate keys, top up, or upgrade for a
+        // request the API never received. Fail once, and name the page.
+        if (
+          !errorBody.jsonParsed &&
+          nonApiCandidate &&
+          !responseEchoesRequestId(response, requestId)
+        ) {
+          this.debug({
+            kind: 'error',
+            method,
+            url,
+            attempt,
+            status: response.status,
+            requestId,
+            errorCode: 'TRANSPORT',
+            durationMs,
+          });
+          throw nonApiResponseError(response, requestId, errorBody.text, this.baseUrl);
         }
 
         // Edge proxies / load balancers return 408/502/504 without our error
@@ -1039,7 +1090,9 @@ export class HttpClient {
             ? transportRetryDecision(attempt, this.random)
             : { retry: false, delayMs: 0 };
           if (!decision.retry) {
-            throw new TransportError(`HTTP ${response.status} from ${url}`, requestId);
+            throw new TransportError(`HTTP ${response.status} from ${url}`, requestId, {
+              httpStatus: response.status,
+            });
           }
           this.transition(
             `HTTP ${response.status} from ${shortPath(path)} — transport error, retrying in ${Math.round(decision.delayMs / 1000)}s (attempt ${attempt})`,
@@ -1330,15 +1383,166 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
   if (typeof unref === 'function') unref.call(timer);
 }
 
-async function safeReadJson(response: Response): Promise<unknown> {
+interface ReadErrorResponseBody {
+  /** Parsed JSON body, or `null` when the body was not valid JSON. */
+  json: unknown;
+  /** False when parsing failed, so a real JSON `null` is not mistaken for a page. */
+  jsonParsed: boolean;
+  /** Raw body text, captured only when the response could be a non-API page. */
+  text: string | undefined;
+}
+
+/**
+ * Read a non-OK response body.
+ *
+ * The CLI expects API errors to be JSON. When one is not, the raw text matters:
+ * a proxy/firewall block page usually carries a `<title>` that says exactly what
+ * happened ("Website blocked by your organization"), and that title is more
+ * useful than the status code. `captureText` is set only for the 4xx statuses
+ * that can be a non-API page, so ordinary JSON error bodies pay no extra copy.
+ *
+ * A `Response` can only be consumed once, so the text comes from a clone taken
+ * before `.json()`; the clone is best-effort (some runtimes/test doubles cannot
+ * clone), and a missing clone just means no title is reported.
+ */
+async function readErrorResponseBody(
+  response: Response,
+  captureText: boolean,
+): Promise<ReadErrorResponseBody> {
+  let clone: Response | undefined;
+  if (captureText) {
+    try {
+      clone = response.clone();
+    } catch {
+      clone = undefined;
+    }
+  }
+
   try {
-    return await response.json();
+    return { json: await response.json(), jsonParsed: true, text: undefined };
   } catch (err) {
     // Don't swallow interrupts, aborts, or timeouts as a null body — the caller
     // must preserve the interruption or classify a timeout correctly.
     if (err instanceof InterruptError) throw err;
     if (isAbortError(err) || isTimeoutError(err)) throw err;
-    return null;
+    let text: string | undefined;
+    if (clone !== undefined) {
+      try {
+        text = await clone.text();
+      } catch (readErr) {
+        if (readErr instanceof InterruptError) throw readErr;
+        if (isAbortError(readErr) || isTimeoutError(readErr)) throw readErr;
+        text = undefined;
+      }
+    }
+    return { json: null, jsonParsed: false, text };
+  }
+}
+
+/**
+ * 4xx statuses whose non-JSON body is treated as "something between this
+ * machine and the API answered". 408 and 429 keep their existing transport /
+ * rate-limit handling, and 5xx keeps today's retry behaviour.
+ */
+function isNonApiCandidateStatus(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
+/** True when the response carries back the exact `x-request-id` we sent. */
+function responseEchoesRequestId(response: Response, requestId: string): boolean {
+  const echoed = response.headers.get('x-request-id');
+  return echoed !== null && echoed.trim() === requestId;
+}
+
+/** Extract and lightly clean a page title, bounded so an error stays readable. */
+function extractPageTitle(text: string | undefined): string | undefined {
+  if (text === undefined || text.length === 0) return undefined;
+  const match = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(text);
+  if (match === null) return undefined;
+  const title = decodeHtmlEntities(match[1]!.replace(/<[^>]*>/g, ''))
+    // The page is untrusted input. Strip Unicode control characters so a
+    // malicious title cannot emit ANSI escapes to the terminal before the
+    // title is collapsed.
+    .replace(/\p{Cc}/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (title.length === 0) return undefined;
+  return title.length > 200 ? `${title.slice(0, 197)}...` : title;
+}
+
+/** Decode the common HTML entities a block-page title can contain. */
+function decodeHtmlEntities(value: string): string {
+  const named: Record<string, string> = {
+    amp: '&',
+    lt: '<',
+    gt: '>',
+    quot: '"',
+    apos: "'",
+    nbsp: ' ',
+  };
+  return value.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (entity, body: string) => {
+    if (body.startsWith('#x') || body.startsWith('#X')) {
+      const code = Number.parseInt(body.slice(2), 16);
+      return isSafeCodePoint(code) ? String.fromCodePoint(code) : entity;
+    }
+    if (body.startsWith('#')) {
+      const code = Number.parseInt(body.slice(1), 10);
+      return isSafeCodePoint(code) ? String.fromCodePoint(code) : entity;
+    }
+    return named[body.toLowerCase()] ?? entity;
+  });
+}
+
+function isSafeCodePoint(code: number): boolean {
+  return Number.isFinite(code) && code >= 0 && code <= 0x10ffff;
+}
+
+/**
+ * Typed (exit 10) error for a 4xx response that did not come from the API.
+ *
+ * Deliberately not routed through the status -> error-code table: a 403 block
+ * page must not look like an invalid API key, a 402 page must not look like an
+ * empty wallet, and a 426 page must not look like an obsolete CLI.
+ */
+function nonApiResponseError(
+  response: Response,
+  requestId: string,
+  text: string | undefined,
+  baseUrl: string,
+): ApiError {
+  const contentType = response.headers.get('content-type') ?? undefined;
+  const pageTitle = extractPageTitle(text);
+  const contentTypeNote = contentType !== undefined ? ` (content-type: ${contentType})` : '';
+  const titleNote = pageTitle !== undefined ? ` The page title is "${pageTitle}".` : '';
+  const host = safeHost(baseUrl);
+  return new ApiError(
+    {
+      code: 'UNAVAILABLE',
+      message:
+        `Something between this machine and the TestSprite API answered HTTP ${response.status}` +
+        `${contentTypeNote} instead of the API.${titleNote} A proxy, firewall, captive portal, or ` +
+        'WAF intercepted the request, so the API key was not rejected.',
+      nextAction:
+        `Open the same URL in a browser to see the page. Ask IT to allow ${host}, configure ` +
+        'HTTPS_PROXY (and NODE_EXTRA_CA_CERTS when TLS is inspected) if the network requires a ' +
+        'proxy, and check --endpoint-url / TESTSPRITE_API_URL. Do not rotate the API key for this response.',
+      requestId,
+      details: {
+        reason: 'not_testsprite',
+        httpStatus: response.status,
+        ...(contentType !== undefined ? { contentType } : {}),
+        ...(pageTitle !== undefined ? { pageTitle } : {}),
+      },
+    },
+    response.status,
+  );
+}
+
+function safeHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return 'the TestSprite API host';
   }
 }
 
