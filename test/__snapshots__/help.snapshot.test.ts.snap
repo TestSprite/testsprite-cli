@@ -184,7 +184,8 @@ Options:
                                   TESTSPRITE_PROJECT_ID)
   --all                           run all project tests (already the default)
   --filter <substr>               only run tests whose name contains this
-                                  substring
+                                  non-empty substring (case-insensitive); omit
+                                  to run every test
   --env <name>                    the environment whose sign-in the run uses
                                   (unknown names fail). In a pull request, with
                                   --target-url, the run happens in a temporary
@@ -1038,7 +1039,8 @@ Options:
                               accepted:
                               draft|ready|queued|running|passed|failed|blocked|cancelled|unknown)
   --filter <substr>           with --all: only rerun tests whose name contains
-                              this substring (case-insensitive)
+                              this non-empty substring (case-insensitive); omit
+                              to rerun every test
   --wait                      block until terminal status or --timeout elapses
                               (default: false)
   --no-wait                   detach without opening an automatic environment
@@ -1206,7 +1208,8 @@ Options:
   --project <id>              project id for --all (overrides
                               TESTSPRITE_PROJECT_ID)
   --filter <substr>           with --all: only run tests whose name contains
-                              this substring (case-insensitive)
+                              this non-empty substring (case-insensitive); omit
+                              to run every test
   --status <list>             with --all: only run tests whose latest status
                               matches one of these values (comma-separated;
                               accepted:
