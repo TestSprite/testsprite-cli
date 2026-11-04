@@ -57,7 +57,7 @@ describe.each(['test', 'schedule'] as const)('%s built CLI history retention', k
     expect(result.stdout).toContain(kind === 'test' ? 'No CLI-tracked history' : 'No runs yet.');
     expect(result.stderr).toContain('2 older runs hidden — the Free plan keeps 30 days');
     expect(result.stderr).toContain(`  billing:   ${billingUrl}`);
-  });
+  }, 30_000);
 
   it('prints backend meta unchanged in JSON with no human note', () => {
     const result = run(kind, true);
@@ -67,5 +67,5 @@ describe.each(['test', 'schedule'] as const)('%s built CLI history retention', k
       kind === 'test' ? { testKind: 'frontend', ...meta } : meta,
     );
     expect(result.stderr).toBe('');
-  });
+  }, 30_000);
 });

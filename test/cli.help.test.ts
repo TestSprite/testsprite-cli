@@ -32,28 +32,47 @@ function runCli(args: string[]): Promise<SpawnResult> {
 }
 
 describe('unknown command help handling', () => {
-  it('exits 5 without printing root help', async () => {
-    const result = await runCli(['config', '--help']);
-    expect(result.exitCode).toBe(5);
-    expect(result.stdout).toBe('');
-    expect(result.stderr).toContain("error: unknown command 'config'");
-    expect(result.stderr).not.toContain('Usage: testsprite');
-  });
+  // Each test spawns the built CLI as a child process. The child itself
+  // exits in milliseconds, but on a loaded machine the spawn can take
+  // several seconds, so the vitest default 5s timeout flakes even though
+  // the CLI is behaving correctly (same latent gap as the sibling
+  // subprocess suites, see BUG-FIXES.md). 30s matches their headroom.
+  const perTestTimeout = 30_000;
 
-  it('emits a JSON VALIDATION_ERROR envelope', async () => {
-    const result = await runCli(['config', '--help', '--output', 'json']);
-    expect(result.exitCode).toBe(5);
-    expect(result.stdout).toBe('');
-    const parsed = JSON.parse(result.stderr) as { error: { code: string; message: string } };
-    expect(parsed.error.code).toBe('VALIDATION_ERROR');
-    expect(parsed.error.message).toContain("unknown command 'config'");
-  });
+  it(
+    'exits 5 without printing root help',
+    async () => {
+      const result = await runCli(['config', '--help']);
+      expect(result.exitCode).toBe(5);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain("error: unknown command 'config'");
+      expect(result.stderr).not.toContain('Usage: testsprite');
+    },
+    perTestTimeout,
+  );
 
-  it('rejects the equivalent help subcommand form', async () => {
-    const result = await runCli(['help', 'config']);
-    expect(result.exitCode).toBe(5);
-    expect(result.stdout).toBe('');
-    expect(result.stderr).toContain("error: unknown command 'config'");
-    expect(result.stderr).not.toContain('Usage: testsprite');
-  });
+  it(
+    'emits a JSON VALIDATION_ERROR envelope',
+    async () => {
+      const result = await runCli(['config', '--help', '--output', 'json']);
+      expect(result.exitCode).toBe(5);
+      expect(result.stdout).toBe('');
+      const parsed = JSON.parse(result.stderr) as { error: { code: string; message: string } };
+      expect(parsed.error.code).toBe('VALIDATION_ERROR');
+      expect(parsed.error.message).toContain("unknown command 'config'");
+    },
+    perTestTimeout,
+  );
+
+  it(
+    'rejects the equivalent help subcommand form',
+    async () => {
+      const result = await runCli(['help', 'config']);
+      expect(result.exitCode).toBe(5);
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toContain("error: unknown command 'config'");
+      expect(result.stderr).not.toContain('Usage: testsprite');
+    },
+    perTestTimeout,
+  );
 });
