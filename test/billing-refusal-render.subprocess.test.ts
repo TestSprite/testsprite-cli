@@ -124,6 +124,10 @@ function run(shape: keyof typeof cases, args: string[]) {
 }
 
 describe('billing refusal rendering in the built CLI', () => {
+  // Each case spawns the built CLI twice (text + JSON), and every spawn may
+  // legitimately run up to its own 10s timeout, so a single case can take
+  // ~20s. The vitest default of 5s flaked under a loaded machine.
+  const perTestTimeout = 30_000;
   it.each(['plan_limit', 'plan', 'paused', 'credits', 'rollout', 'mcp_origin'] as const)(
     '%s text and JSON',
     shape => {
@@ -161,5 +165,6 @@ describe('billing refusal rendering in the built CLI', () => {
         expect(error.links).toEqual({ pricing: `${portal}/pricing`, billing });
       }
     },
+    perTestTimeout,
   );
 });

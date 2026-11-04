@@ -54,5 +54,5 @@ describe('tunnel limit error rendering in the built CLI', () => {
     };
     expect(envelope.error.details.clientIds).toHaveLength(2);
     expect(jsonResult.stderr).not.toContain('  tunnel:');
-  });
+  }, 30_000);
 });

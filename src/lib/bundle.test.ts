@@ -25,6 +25,7 @@ import {
   STREAM_URL_MAX_RETRIES,
   streamUrlToFile,
   stepFilenamePrefix,
+  stripTrailingSeparators,
   writeBundle,
   type AssertContextIntegrityOptions,
 } from './bundle.js';
@@ -632,24 +633,20 @@ describe('resolveBundleDir', () => {
     expect(out).toBe('/tmp/x');
   });
 
-  // `C:\...` is only recognized as absolute by node:path when the process
-  // itself is running on win32 (path.isAbsolute/resolve are platform-native,
-  // not path.win32.* explicitly) — these two assertions are only meaningful
-  // under an actual Windows runtime, hence gated rather than run everywhere.
-  it.runIf(process.platform === 'win32')(
-    'strips a trailing backslash (native Windows path)',
-    () => {
-      const out = resolveBundleDir('C:\\Users\\me\\bundle\\');
-      expect(out).toBe('C:\\Users\\me\\bundle');
-    },
-  );
+  // The Windows-specific behavior of `resolveBundleDir` decomposes into
+  // (a) `stripTrailingSeparators` — pure string logic that behaves
+  // identically on every platform — and (b) node's platform-native
+  // `isAbsolute` recognizing `C:\...`, which only holds under an actual
+  // Windows runtime. (a) is pinned here everywhere; (b) is node's own
+  // behavior, exercised by the win32 test run rather than re-asserted.
+  it('strips a trailing backslash from a Windows-style --out value', () => {
+    expect(stripTrailingSeparators('C:\\Users\\me\\bundle\\')).toBe('C:\\Users\\me\\bundle');
+    expect(stripTrailingSeparators('C:\\Users\\me\\bundle/')).toBe('C:\\Users\\me\\bundle');
+  });
 
-  it.runIf(process.platform === 'win32')(
-    'preserves a bare Windows drive root instead of truncating it to a drive-relative path',
-    () => {
-      expect(resolveBundleDir('C:\\')).toBe('C:\\');
-    },
-  );
+  it('preserves a bare Windows drive root instead of truncating it to a drive-relative path', () => {
+    expect(stripTrailingSeparators('C:\\')).toBe('C:\\');
+  });
 });
 
 describe('streamUrlToFile retry', () => {
