@@ -7385,7 +7385,8 @@ export function backendResultToRunResponse(
  * just-finished prior run could still be showing. Gate:
  *   - result names our runId         → accept (strongest signal);
  *   - result names a different runId → reject (a different run);
- *   - result has no runId (legacy)   → accept iff finishedAt >= notBefore.
+ *   - result has no runId (legacy)   → require a valid finishedAt, and when
+ *     notBefore is supplied, require a valid floor and finishedAt >= notBefore.
  */
 export function backendResultIsForThisRun(
   result: CliLatestResult,
@@ -7397,10 +7398,11 @@ export function backendResultIsForThisRun(
     return result.runIdIfAvailable === runId;
   }
   if (!result.finishedAt) return false;
-  if (!notBefore) return true;
   const finished = Date.parse(result.finishedAt);
+  if (Number.isNaN(finished)) return false;
+  if (notBefore === undefined) return true;
   const floor = Date.parse(notBefore);
-  if (Number.isNaN(finished) || Number.isNaN(floor)) return true;
+  if (Number.isNaN(floor)) return false;
   return finished >= floor;
 }
 
@@ -12152,6 +12154,7 @@ export async function runTestRunLocalBatch(
       )
         stderrFn(`idempotency-key: ${idempotencyBase}`);
 
+      /** Dispatch and poll one member within its own deadline, retaining per-run fallback state. */
       const runOne = async (index: number) => {
         const row = results[index]!;
         let triggerStartedAtMs: number;
@@ -12273,6 +12276,28 @@ export async function runTestRunLocalBatch(
           const startMs = triggerStartedAtMs;
           const remainingSeconds = (startMs + opts.timeoutSeconds * 1000 - Date.now()) / 1000;
           if (remainingSeconds <= 0) throw new TimeoutError(row.runId!, opts.timeoutSeconds);
+          // Public-environment backend members share this pool with local frontend
+          // runs, but their run rows may never finalize. Reuse the ordinary wait's
+          // correlated fallback without adding result probes to tunnel-bound runs.
+          const resolveBackendAlternate = targets.has(row.testId)
+            ? undefined
+            : makeBackendWaitFallback({
+                client,
+                resolveTestId: () => row.testId,
+                resolveNotBefore: () => response.enqueuedAt,
+              });
+          const resolveAlternate =
+            targets.has(row.testId) && checkBorrowedLiveness
+              ? /**
+                 * Check the borrowed frontend tunnel using the poller's abort signal.
+                 * Return null after a successful check so run polling continues;
+                 * throw when the tunnel owner is unavailable.
+                 */
+                async (_run: RunResponse, _elapsed: number, signal: AbortSignal) => {
+                  await checkBorrowedLiveness!(signal);
+                  return null;
+                }
+              : resolveBackendAlternate;
           const finalRun = await pollRunUntilTerminal(client, row.runId!, {
             timeoutSeconds: remainingSeconds,
             sleep: deps.sleep,
@@ -12286,14 +12311,7 @@ export async function runTestRunLocalBatch(
               }
               ticker.update(formatRunProgressLine(run, elapsedMs, `(${row.testId})`));
             },
-            ...(targets.has(row.testId) && checkBorrowedLiveness
-              ? {
-                  resolveAlternate: async (_run, _elapsed, signal) => {
-                    await checkBorrowedLiveness!(signal);
-                    return null;
-                  },
-                }
-              : {}),
+            resolveAlternate,
           });
           row.status = finalRun.status as LocalBatchResult['status'];
           unsettled.delete(row);
