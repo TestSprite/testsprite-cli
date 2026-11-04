@@ -2,6 +2,7 @@ import { promises as nodeFs } from 'node:fs';
 import { spawnSync as nodeSpawnSync, type SpawnSyncReturns } from 'node:child_process';
 import * as path from 'node:path';
 import { Command } from 'commander';
+import { equalIgnoringCrlf } from '../lib/text-equality.js';
 import {
   makeHttpClient,
   parseRequestTimeoutFlag,
@@ -725,8 +726,8 @@ async function runCiInitScaffold(
     if (code !== 'EEXIST') throw err;
     onExisted(true);
     const prior = await fs.readFile(absPath);
-    if (prior === workflow) {
-      // Already exactly what we'd write: no rewrite, and re-running (with or
+    if (equalIgnoringCrlf(prior, workflow)) {
+      // Equivalent apart from CRLF conversion: no rewrite, and re-running (with or
       // without --force) on identical content is a no-op rather than an error.
       wrote = false;
     } else if (!opts.force) {
