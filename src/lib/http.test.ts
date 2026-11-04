@@ -760,6 +760,73 @@ describe('HttpClient error mapping', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(4);
   });
 
+  it.each([
+    [500, 'INTERNAL', 1],
+    [503, 'UNAVAILABLE', 10],
+  ] as const)('does not retry a %d envelope for keyless writes', async (status, code, exitCode) => {
+    const fetchImpl = vi.fn(async () => errorEnvelopeResponse(status, code));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.post('/projects', { body: { name: 'Checkout' } })).rejects.toMatchObject({
+      code,
+      exitCode,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry an envelope-less 503 for keyless writes', async () => {
+    const fetchImpl = vi.fn(async () => new Response('', { status: 503 }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.post('/projects', { body: { name: 'Checkout' } })).rejects.toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not replay a tunnel mint on a 5xx', async () => {
+    const fetchImpl = vi.fn(async () => errorEnvelopeResponse(500, 'INTERNAL'));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.mintTunnel({})).rejects.toMatchObject({ code: 'INTERNAL' });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a 5xx for keyless writes marked replaySafe (cancel, tunnel delete)', async () => {
+    const fetchImpl = vi.fn(async () => errorEnvelopeResponse(503, 'UNAVAILABLE'));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.cancelRun('run_1')).rejects.toMatchObject({ code: 'UNAVAILABLE' });
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+    fetchImpl.mockClear();
+    await expect(client.deleteTunnel('c-1')).rejects.toMatchObject({ code: 'UNAVAILABLE' });
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    [500, 'INTERNAL', 2],
+    [503, 'UNAVAILABLE', 4],
+  ] as const)(
+    'retries a %d envelope for writes with an idempotency key',
+    async (status, code, calls) => {
+      const fetchImpl = vi.fn(async () => errorEnvelopeResponse(status, code));
+      const client = makeClient(fetchImpl as unknown as typeof fetch);
+      await expect(
+        client.post('/projects', {
+          body: { name: 'Checkout' },
+          headers: { 'Idempotency-Key': 'op_123' },
+        }),
+      ).rejects.toMatchObject({ code });
+      expect(fetchImpl).toHaveBeenCalledTimes(calls);
+    },
+  );
+
+  it('still retries a 429 for keyless writes', async () => {
+    const fetchImpl = vi.fn(async () => errorEnvelopeResponse(429, 'RATE_LIMITED'));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.post('/projects', { body: { name: 'Checkout' } })).rejects.toMatchObject({
+      code: 'RATE_LIMITED',
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
   it('does not retry AbortError', async () => {
     const fetchImpl = vi.fn(async () => {
       const err = new Error('aborted');
@@ -839,6 +906,21 @@ describe('HttpClient transport-edge statuses', () => {
     );
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
+
+  it.each(['GET', 'POST'] as const)(
+    '%s with a non-envelope JSON 504 takes the transport-edge path',
+    async method => {
+      const fetchImpl = vi.fn(async () =>
+        jsonResponse({ message: 'Endpoint request timed out' }, { status: 504 }),
+      );
+      const client = makeClient(fetchImpl as unknown as typeof fetch);
+      const call =
+        method === 'GET' ? client.get('/me') : client.post('/projects', { body: { name: 'x' } });
+      await expect(call).rejects.toBeInstanceOf(TransportError);
+      // GET keeps the transport budget; a keyless POST is sent once.
+      expect(fetchImpl).toHaveBeenCalledTimes(method === 'GET' ? 4 : 1);
+    },
+  );
 
   it('retries bare transport-edge responses for writes with an idempotency key', async () => {
     const fetchImpl = vi.fn(async () => new Response('proxy gateway html', { status: 502 }));

@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import * as v from 'valibot';
 import type { ErrorCode } from './errors.js';
-import { ApiError, InterruptError, RequestTimeoutError, TransportError } from './errors.js';
+import {
+  ApiError,
+  InterruptError,
+  isErrorCode,
+  RequestTimeoutError,
+  TransportError,
+} from './errors.js';
 import { buildUserAgent } from './client-tag.js';
 import {
   BATCH_RERUN_RESPONSE_SCHEMA,
@@ -224,6 +230,14 @@ export interface RequestOptions<T = unknown> {
    * other callers.
    */
   retryOnRateLimit?: boolean;
+  /**
+   * The endpoint absorbs a replay with no side effect even without an
+   * `Idempotency-Key` (a re-cancel is a 200 no-op, a binding is gone after
+   * any DELETE), so a keyless write may still retry a 5xx envelope. Without
+   * it, keyless POST/PUT/PATCH/DELETE are sent once on a 5xx: the server may
+   * have committed before failing.
+   */
+  replaySafe?: boolean;
   /**
    * Disable every automatic retry for a read whose caller owns its cadence.
    *
@@ -686,6 +700,7 @@ export class HttpClient {
       signal: options.signal,
       allowNoContent: true,
       retryOnConflict: false,
+      replaySafe: true,
     });
   }
 
@@ -705,6 +720,7 @@ export class HttpClient {
       signal: options?.signal,
       schema: CANCEL_RUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
+      replaySafe: true,
     });
   }
 
@@ -1023,8 +1039,11 @@ export class HttpClient {
         // Edge proxies / load balancers return 408/502/504 without our error
         // envelope on transient outages. These are transport-level retries,
         // not facade errors — fold them in here so we get the bounded backoff
-        // budget instead of a single INTERNAL bail.
-        if (rawBody === null && isTransportEdgeStatus(response.status)) {
+        // budget instead of a single INTERNAL bail. A JSON edge body (e.g. an
+        // API Gateway `{"message":"Endpoint request timed out"}`) is still not
+        // our envelope, so it takes this path too and the keyless-write gate
+        // below applies.
+        if (isTransportEdgeStatus(response.status) && !hasCatalogErrorCode(rawBody)) {
           this.debug({
             kind: 'error',
             method,
@@ -1090,16 +1109,22 @@ export class HttpClient {
         // frees the resource, not that the condition clears on its own.
         const retryOnRateLimit =
           options.retryOnRateLimit !== false && !isStandingRateLimit(apiError);
-        const decision = allowRetry
-          ? apiRetryDecision(
-              apiError.code,
-              attempt,
-              retryAfterSec,
-              this.random,
-              retryOnConflict,
-              retryOnRateLimit,
-            )
-          : { retry: false, delayMs: 0 };
+        // A 5xx can land after the server committed the write, so a keyless
+        // write is not replayed on one (the same rule #256 applies to
+        // transport failures). 429 / 409 are refusals and still retry.
+        const serverFault = apiError.code === 'INTERNAL' || apiError.code === 'UNAVAILABLE';
+        const replaySafe = allowTransportRetry || options.replaySafe === true;
+        const decision =
+          allowRetry && (replaySafe || !serverFault)
+            ? apiRetryDecision(
+                apiError.code,
+                attempt,
+                retryAfterSec,
+                this.random,
+                retryOnConflict,
+                retryOnRateLimit,
+              )
+            : { retry: false, delayMs: 0 };
         if (!decision.retry) throw apiError;
         const delaySec = Math.round(decision.delayMs / 1000);
         if (apiError.code === 'RATE_LIMITED') {
@@ -1507,6 +1532,20 @@ export function parseRetryAfter(headerValue: string | null): number | undefined 
  */
 function isTransportEdgeStatus(status: number): boolean {
   return status === 408 || status === 502 || status === 504;
+}
+
+/**
+ * True when the body carries a catalog error code (`{error:{code}}` or a bare
+ * `{code}`), i.e. the facade answered rather than an edge proxy.
+ */
+function hasCatalogErrorCode(body: unknown): boolean {
+  if (typeof body !== 'object' || body === null) return false;
+  const obj = body as Record<string, unknown>;
+  const errorObj =
+    typeof obj.error === 'object' && obj.error !== null
+      ? (obj.error as Record<string, unknown>)
+      : obj;
+  return isErrorCode(errorObj.code);
 }
 
 interface RetryDecision {
