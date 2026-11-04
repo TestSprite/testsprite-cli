@@ -186,3 +186,62 @@ describe('HttpClient.deleteTunnel', () => {
     expect(init?.body ?? null).toBeNull();
   });
 });
+
+describe('Transport retry regression', () => {
+  it('retries tunnel deletion after ECONNRESET', async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new Error('ECONNRESET'))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+    await expect(makeClient(fetchImpl).deleteTunnel('c1')).resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries tunnel deletion after bare HTTP 502', async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response('Bad Gateway', {
+          status: 502,
+          headers: { 'content-type': 'text/plain' },
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+    await expect(makeClient(fetchImpl).deleteTunnel('c1')).resolves.toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('Unsafe mutation transport retry protection', () => {
+  it('does not retry a generic keyless POST after ECONNRESET', async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new Error('ECONNRESET'))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    const client = makeClient(fetchImpl);
+
+    await expect(
+      client.post('/unsafe-operation', {
+        body: { value: 1 },
+      }),
+    ).rejects.toThrow();
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry tunnel minting after ECONNRESET', async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new Error('ECONNRESET'))
+      .mockResolvedValueOnce(jsonResponse(MINT_BODY, { status: 201 }));
+
+    const client = makeClient(fetchImpl);
+
+    await expect(client.mintTunnel({})).rejects.toThrow();
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});

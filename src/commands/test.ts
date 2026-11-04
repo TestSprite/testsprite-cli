@@ -16679,6 +16679,8 @@ async function deleteTunnelForCleanup(
   await withTeardownDeadline(opts, deps, client =>
     client.delete<unknown>(`/tunnel/${encodeURIComponent(clientId)}`, {
       allowNoContent: true,
+      retryOnConflict: false,
+      transportRetrySafe: true,
     }),
   );
 }

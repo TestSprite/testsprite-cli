@@ -964,6 +964,50 @@ describe('test run --local — happy path', () => {
 // ---------------------------------------------------------------------------
 
 describe('test run --local — teardown', () => {
+  it('retries tunnel DELETE after ECONNRESET during local teardown', async () => {
+    const calls: Call[] = [];
+    const target = 'http://127.0.0.1:5173';
+    let deleteAttempts = 0;
+
+    const fetchImpl = makeRecordingFetch({
+      calls,
+      targetUrl: target,
+      respond: call => {
+        if (call.method === 'DELETE' && call.url.includes('/tunnel/')) {
+          deleteAttempts++;
+          if (deleteAttempts === 1) {
+            throw new Error('ECONNRESET');
+          }
+        }
+        return undefined;
+      },
+    });
+
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        testId: 'test_xyz',
+        localPort: 5173,
+        localHost: '127.0.0.1',
+        wait: true,
+        timeoutSeconds: 30,
+        skipPreflight: true,
+      },
+      {
+        ...makeCreds(),
+        fetchImpl,
+        stdout: () => {},
+        stderr: () => {},
+        sleep: async () => {},
+        createTunnelClient: fakeTunnel().factory,
+      },
+    );
+
+    expect(deleteAttempts).toBe(2);
+  });
+
   it('deletes the binding when the run FAILS', async () => {
     const port = 5173;
     const calls: Call[] = [];

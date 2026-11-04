@@ -233,6 +233,13 @@ export interface RequestOptions<T = unknown> {
    * existing request paths retain their retry behaviour.
    */
   retry?: boolean;
+  /**
+   * Allow transport retries for operations whose endpoint contract
+   * explicitly guarantees safe replay without an Idempotency-Key.
+   *
+   * Defaults to false. Never enable for arbitrary keyless mutations.
+   */
+  transportRetrySafe?: boolean;
 }
 
 const RETRY_BASE_MS = 250;
@@ -686,6 +693,7 @@ export class HttpClient {
       signal: options.signal,
       allowNoContent: true,
       retryOnConflict: false,
+      transportRetrySafe: true,
     });
   }
 
@@ -705,6 +713,7 @@ export class HttpClient {
       signal: options?.signal,
       schema: CANCEL_RUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
+      transportRetrySafe: true,
     });
   }
 
@@ -1520,7 +1529,11 @@ function transportRetryDecision(attempt: number, random: () => number): RetryDec
 }
 
 function canRetryTransport(method: string, options: RequestOptions): boolean {
-  return isIdempotentMethod(method) || hasIdempotencyKey(options.headers);
+  return (
+    options.transportRetrySafe === true ||
+    isIdempotentMethod(method) ||
+    hasIdempotencyKey(options.headers)
+  );
 }
 
 function isIdempotentMethod(method: string): boolean {
