@@ -165,7 +165,7 @@ export class ShutdownController {
 }
 
 class BrokenPipeInterruptError extends InterruptError {
-  override readonly exitCode = 0;
+  override readonly exitCode = (process.exitCode as number | undefined) ?? 0;
 
   constructor() {
     // Existing graceful-detach consumers read `.signal` to render their
@@ -366,7 +366,7 @@ export function installBrokenPipeGuard(deps: BrokenPipeDeps = {}): void {
         shutdown.brokenPipe();
         return;
       }
-      exit(0);
+      exit((process.exitCode as number | undefined) ?? 0);
       return;
     }
     throw error;
