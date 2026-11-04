@@ -348,8 +348,9 @@ export async function runCreate(
   }
 
   if (opts.dryRun) {
-    // This path returns before makeClient() fires the banner, so emit it here
-    // — otherwise the canned sample can be mistaken for a live response.
+    // This path returns without making any dry-run request, so emit the
+    // banner here — otherwise the canned sample can be mistaken for a live
+    // response.
     emitDryRunBanner(stderr);
     const idempotencyKey = opts.idempotencyKey ?? `cli-proj-create-${randomUUID()}`;
     // P2-6: gate idempotency-key output behind --verbose/--debug/json (matches
