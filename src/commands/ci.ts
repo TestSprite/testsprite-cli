@@ -330,7 +330,8 @@ jobs:
     concurrency:
       group: testsprite-\${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
-    # pull_request: skip fork PRs (they get no repository secrets) and draft PRs.
+    # pull_request: skip fork PRs (they get no repository secrets), Dependabot PRs
+    # (Dependabot secrets are not Actions secrets), and draft PRs.
     # deployment_status: only successful, non-production deployments. Vercel leaves
     # production_environment false on production deployments, so the name is checked too
     # (GitHub compares strings case-insensitively).
@@ -347,6 +348,7 @@ jobs:
     if: >-
       (github.event_name == 'pull_request' &&
        github.event.pull_request.head.repo.full_name == github.repository &&
+       github.actor != 'dependabot[bot]' &&
        !github.event.pull_request.draft) ||
       (github.event_name == 'deployment_status' &&
        github.event.deployment_status.state == 'success' &&
