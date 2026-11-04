@@ -27,6 +27,7 @@ import { readSecretFileGuarded } from '../lib/secret-file.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
+import { requireNonEmpty } from '../lib/args.js';
 import {
   fetchSinglePage,
   paginate,
@@ -202,6 +203,7 @@ interface GetOptions extends CommonOptions {
 }
 
 export async function runGet(opts: GetOptions, deps: ProjectDeps = {}): Promise<CliProject> {
+  requireNonEmpty('project-id', opts.projectId);
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
 
@@ -717,9 +719,7 @@ export async function runDelete(
   deps: ProjectDeps = {},
 ): Promise<CliDeleteProjectResponse> {
   assertIdempotencyKey(opts.idempotencyKey);
-  if (opts.projectId === undefined || opts.projectId.trim().length === 0) {
-    throw localValidationError('<project-id> is required');
-  }
+  requireNonEmpty('project-id', opts.projectId);
 
   if (!opts.confirm && !opts.dryRun) {
     throw ApiError.fromEnvelope({

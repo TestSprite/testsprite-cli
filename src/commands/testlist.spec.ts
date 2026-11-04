@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   runTestlistAdd,
   runTestlistCreate,
@@ -329,6 +329,33 @@ describe('testlist commands', () => {
     ).catch(e => e)) as ApiError;
     expect(err.code).toBe('NOT_FOUND');
     expect(err.exitCode).toBe(4);
+  });
+
+  it('rejects empty and whitespace-only list id with VALIDATION_ERROR before network access', async () => {
+    const fetchImpl = vi.fn();
+    for (const invalidId of ['', '   ']) {
+      await expect(
+        runTestlistGet(
+          { ...base, listId: invalidId },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, stdout: () => {} },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'list-id', reason: 'is required' },
+      });
+      await expect(
+        runTestlistDelete(
+          { ...base, listId: invalidId, confirm: true },
+          { fetchImpl: fetchImpl as unknown as typeof fetch, stdout: () => {} },
+        ),
+      ).rejects.toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'list-id', reason: 'is required' },
+      });
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
 

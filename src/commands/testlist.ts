@@ -26,6 +26,7 @@ import {
   RequestTimeoutError,
   localValidationError,
 } from '../lib/errors.js';
+import { requireNonEmpty } from '../lib/args.js';
 import {
   REQUEST_TIMEOUT_DEFAULT_MS,
   REQUEST_TIMEOUT_MAX_MS,
@@ -192,6 +193,7 @@ export async function runTestlistGet(
   opts: CommonOptions & { listId: string },
   deps: TestListDeps = {},
 ): Promise<CliTestListDetail> {
+  requireNonEmpty('list-id', opts.listId);
   const out = makeOutput(opts.output, deps);
   if (opts.dryRun) {
     emitDryRunBanner(dryRunStderr(deps));
@@ -292,6 +294,7 @@ export async function runTestlistDelete(
   opts: CommonOptions & { listId: string; confirm?: boolean; idempotencyKey?: string },
   deps: TestListDeps = {},
 ): Promise<CliDeleteTestListResponse> {
+  requireNonEmpty('list-id', opts.listId);
   const out = makeOutput(opts.output, deps);
   // Destructive: deleting a list also deletes its schedules (and reaps their
   // EventBridge triggers). Require explicit --confirm — matches the CLI's
