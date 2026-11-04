@@ -6,6 +6,7 @@ import type { CommonOptions as FactoryCommonOptions } from '../lib/client-factor
 import { CLIError, localValidationError } from '../lib/errors.js';
 import type { OutputMode } from '../lib/output.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
+import { inspectTargetPath } from '../lib/target-path.js';
 import { promptText } from '../lib/prompt.js';
 import { FALLBACK_TARGET, resolveAgentTargets, type DetectAgentDeps } from '../lib/agent-detect.js';
 import {
@@ -80,52 +81,6 @@ const defaultAgentFs: AgentFs = {
 // ---------------------------------------------------------------------------
 // Path safety
 // ---------------------------------------------------------------------------
-
-/**
- * Walk each component of `relPath` beneath `root`, refusing to traverse or
- * write through a symlink. `fs.mkdir`/`writeFile` follow symlinks, so a planted
- * symlink at any existing path component (e.g. `.claude` -> /etc, or the final
- * `SKILL.md` -> ~/.bashrc) could place or clobber files outside `--dir`. The
- * lexical containment guard in `runInstall` is a string compare and cannot see
- * this; only an `lstat`-per-component walk can. Fail-closed: any symlink is
- * rejected (exit 5).
- *
- * Returns the target's `{ isFile }` when it already exists, or `null` when it
- * (or any ancestor) does not yet exist — in which case the missing tail is
- * created fresh and cannot be a pre-planted symlink. A small TOCTOU window
- * remains between this check and the write; that is acceptable for a local,
- * single-user CLI and avoids non-portable O_NOFOLLOW / rename gymnastics.
- */
-async function inspectTargetPath(
-  agentFs: AgentFs,
-  root: string,
-  relPath: string,
-): Promise<{ isFile: boolean } | null> {
-  const segments = relPath.split(/[/\\]+/).filter(Boolean);
-  let current = root;
-  let finalIsFile = false;
-  for (const [i, seg] of segments.entries()) {
-    current = path.join(current, seg);
-    const ls = await agentFs.lstat(current);
-    if (ls === null) {
-      // This component and everything below it does not exist yet.
-      return null;
-    }
-    if (ls.isSymbolicLink) {
-      const shown = segments.slice(0, i + 1).join('/');
-      throw new CLIError(
-        `refusing to write through a symlink: "${shown}" — installing here could place files outside --dir. Remove the symlink or choose a different --dir.`,
-        5,
-      );
-    }
-    if (i < segments.length - 1 && ls.isFile) {
-      const shown = segments.slice(0, i + 1).join('/');
-      throw new CLIError(`cannot create ${relPath}: "${shown}" exists and is not a directory.`, 5);
-    }
-    finalIsFile = ls.isFile;
-  }
-  return { isFile: finalIsFile };
-}
 
 /**
  * Back up the current bytes at `abs` next to it without clobbering any existing
