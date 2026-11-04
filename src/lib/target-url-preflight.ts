@@ -41,6 +41,13 @@
  *     string; the resolved-address check only covers *this* URL's host),
  *     so following it would hand an attacker-controlled Location header a
  *     live SSRF primitive running on the caller's machine or CI runner.
+ *
+ * One redirect is refused: Vercel Deployment Protection's login wall. Its
+ * Location is parsed as a string and never fetched, so the guarantee above
+ * holds. Unlike the app's own login page, no test credential gets past
+ * Vercel's wall. The honest limitation above (the probe runs here, not on
+ * the Lambda) does not apply either: Vercel sends every visitor without a
+ * Vercel session there, the Lambda included.
  */
 
 import * as dns from 'node:dns';
@@ -54,6 +61,14 @@ import { disallowedIpReason } from './target-url.js';
 const PREFLIGHT_TIMEOUT_MS = 8_000;
 
 const GATEWAY_ERROR_STATUSES = new Set([502, 503, 504]);
+
+/**
+ * Where Vercel Deployment Protection redirects a visitor with no Vercel
+ * session. A protected preview answers `302` with
+ * `location: https://vercel.com/sso-api?url=<preview>&nonce=<nonce>`.
+ */
+const VERCEL_LOGIN_WALL_HOST = 'vercel.com';
+const VERCEL_LOGIN_WALL_PATH = '/sso-api';
 
 export interface TargetUrlPreflightDeps {
   /** DNS resolution hook. Defaults to `dns.promises.lookup`. Injectable for tests. */
@@ -76,8 +91,11 @@ export interface TargetUrlPreflightDeps {
   proxyActive?: boolean;
 }
 
+/** A `refuse` verdict's `refusal` names why; it becomes `details.reason` on the thrown error. */
 export type TargetUrlPreflightOutcome =
-  { verdict: 'ok' } | { verdict: 'warn'; reason: string } | { verdict: 'refuse'; reason: string };
+  | { verdict: 'ok' }
+  | { verdict: 'warn'; reason: string }
+  | { verdict: 'refuse'; refusal: 'target-unreachable' | 'target-protected'; reason: string };
 
 /** Pulls the string addresses out of a `dns.lookup` result, whether it's a
  * single `{ address, family }` object (the no-options default) or an array
@@ -115,6 +133,23 @@ function errorHasCode(err: unknown, codes: readonly string[]): boolean {
 function isTimeoutError(err: unknown): boolean {
   const name = (err as { name?: unknown } | null)?.name;
   return name === 'AbortError' || name === 'TimeoutError';
+}
+
+/**
+ * True when a redirect's Location points at Vercel's login wall. The value
+ * is resolved against the probed URL as a string only; it is never fetched.
+ * A missing or unparseable Location is not the wall, and a relative one
+ * resolves to the probed host.
+ */
+function isVercelLoginWall(location: string | null, probedUrl: string): boolean {
+  if (location === null) return false;
+  let target: URL;
+  try {
+    target = new URL(location, probedUrl);
+  } catch {
+    return false;
+  }
+  return target.hostname === VERCEL_LOGIN_WALL_HOST && target.pathname === VERCEL_LOGIN_WALL_PATH;
 }
 
 /** Strips the `[...]` bracket notation the WHATWG `URL.hostname` getter uses for IPv6 literals. */
@@ -162,6 +197,7 @@ export async function probeTargetUrl(
         }
         return {
           verdict: 'refuse',
+          refusal: 'target-unreachable',
           reason: `--target-url host "${host}" does not resolve (${code})`,
         };
       }
@@ -188,6 +224,7 @@ export async function probeTargetUrl(
       if (blocked !== undefined) {
         return {
           verdict: 'refuse',
+          refusal: 'target-unreachable',
           reason: `--target-url host "${host}" resolves to ${address} (${blocked.reason})`,
         };
       }
@@ -218,7 +255,16 @@ export async function probeTargetUrl(
       if (resp.status >= 300 && resp.status < 400) {
         // A redirect is a live-server signal (e.g. a real app 302ing an
         // unauthenticated GET to a login page) — reachable, not refused. The
-        // Location header is deliberately never inspected or dereferenced.
+        // Location header is never dereferenced; it is only parsed to spot
+        // Vercel's login wall (see the module docstring). `headers?.` because
+        // an injected fetch may answer without headers.
+        if (isVercelLoginWall(resp.headers?.get('location') ?? null, rawUrl)) {
+          return {
+            verdict: 'refuse',
+            refusal: 'target-protected',
+            reason: `--target-url redirects to Vercel's login wall (${VERCEL_LOGIN_WALL_HOST}${VERCEL_LOGIN_WALL_PATH})`,
+          };
+        }
         return { verdict: 'ok' };
       }
       if (GATEWAY_ERROR_STATUSES.has(resp.status)) {
@@ -230,6 +276,7 @@ export async function probeTargetUrl(
         }
         return {
           verdict: 'refuse',
+          refusal: 'target-unreachable',
           reason: `--target-url responded HTTP ${resp.status} (gateway error — the target is unreachable)`,
         };
       }
@@ -250,6 +297,7 @@ export async function probeTargetUrl(
         }
         return {
           verdict: 'refuse',
+          refusal: 'target-unreachable',
           reason: 'connection to --target-url was refused (ECONNREFUSED)',
         };
       }
@@ -273,6 +321,18 @@ export async function probeTargetUrl(
 const SKIP_HINT = 'Skip this check entirely with --skip-preflight.';
 
 /**
+ * The two ways past Vercel Deployment Protection. The query parameters come
+ * from Vercel's "Protection Bypass for Automation" docs, which accept them as
+ * headers or query parameters (sourceRef:
+ * https://vercel.com/docs/deployment-protection/methods-to-bypass-deployment-protection/protection-bypass-automation).
+ */
+const VERCEL_PROTECTION_HINT =
+  "Turn off Vercel Authentication for preview deployments in the Vercel project's Deployment " +
+  'Protection settings, or create a Protection Bypass for Automation secret and pass it in the ' +
+  'URL: --target-url "<preview>?x-vercel-protection-bypass=<secret>&x-vercel-set-bypass-cookie=true" ' +
+  '(use "&" instead of "?" when the preview URL already has a query).';
+
+/**
  * Run the preflight and either throw (refuse), print an `[advisory]` line
  * (warn), or no-op (ok / skipped). This is the call-site integration point
  * — wired at all four `--target-url` trigger paths, after `assertNotLocal`
@@ -290,6 +350,19 @@ export async function assertTargetUrlReachable(
   if (opts.skipPreflight === true) return;
 
   const outcome = await probeTargetUrl(targetUrl, deps);
+  if (outcome.verdict === 'refuse' && outcome.refusal === 'target-protected') {
+    throw ApiError.fromEnvelope({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message:
+          `${outcome.reason}: the preview is behind Vercel Deployment Protection, so every test ` +
+          `would run against Vercel's login page instead of your app.`,
+        nextAction: `${VERCEL_PROTECTION_HINT} ${SKIP_HINT}`,
+        requestId: 'local',
+        details: { field: 'targetUrl', reason: 'target-protected', probeReason: outcome.reason },
+      },
+    });
+  }
   if (outcome.verdict === 'refuse') {
     throw ApiError.fromEnvelope({
       error: {
