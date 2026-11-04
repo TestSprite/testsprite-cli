@@ -7,10 +7,12 @@ import { writeProfile } from './credentials.js';
 
 let tmpRoot: string;
 let credentialsPath: string;
+let configPath: string;
 
 beforeEach(() => {
   tmpRoot = mkdtempSync(join(tmpdir(), 'testsprite-config-'));
   credentialsPath = join(tmpRoot, 'credentials');
+  configPath = join(tmpRoot, 'config');
 });
 
 describe('loadConfig', () => {
@@ -119,6 +121,73 @@ describe('loadConfig', () => {
       credentialsPath,
     });
     expect(config.apiKey).toBe('sk-file');
+  });
+
+  it('uses config-file apiUrl (api_url) when flag and env are absent', () => {
+    writeProfile('default', { apiUrl: 'https://from-config.example.com' }, { path: configPath });
+    const config = loadConfig({ env: {}, credentialsPath, configPath });
+    expect(config.apiUrl).toBe('https://from-config.example.com');
+  });
+
+  it('uses config-file endpoint_url as apiUrl', () => {
+    writeProfile('default', { apiUrl: 'https://from-config.example.com' }, { path: configPath });
+    const config = loadConfig({ env: {}, credentialsPath, configPath });
+    expect(config.apiUrl).toBe('https://from-config.example.com');
+  });
+
+  it('uses config-file output when no --output flag is set', () => {
+    writeProfile('default', { output: 'json' }, { path: configPath });
+    const config = loadConfig({ env: {}, credentialsPath, configPath });
+    expect(config.output).toBe('json');
+  });
+
+  it('uses config-file projectId when --project and TESTSPRITE_PROJECT_ID are absent', () => {
+    writeProfile('default', { projectId: 'proj_from_config' }, { path: configPath });
+    const config = loadConfig({ env: {}, credentialsPath, configPath });
+    expect(config.projectId).toBe('proj_from_config');
+  });
+
+  it('flag endpointUrl overrides the config file', () => {
+    writeProfile('default', { apiUrl: 'https://from-config.example.com' }, { path: configPath });
+    const config = loadConfig({
+      endpointUrl: 'https://from-flag.example.com',
+      env: {},
+      credentialsPath,
+      configPath,
+    });
+    expect(config.apiUrl).toBe('https://from-flag.example.com');
+  });
+
+  it('TESTSPRITE_API_URL overrides the config file', () => {
+    writeProfile('default', { apiUrl: 'https://from-config.example.com' }, { path: configPath });
+    const config = loadConfig({
+      env: { TESTSPRITE_API_URL: 'https://from-env.example.com' },
+      credentialsPath,
+      configPath,
+    });
+    expect(config.apiUrl).toBe('https://from-env.example.com');
+  });
+
+  it('config-file project loses to TESTSPRITE_PROJECT_ID env', () => {
+    writeProfile('default', { projectId: 'proj_from_config' }, { path: configPath });
+    const config = loadConfig({
+      env: { TESTSPRITE_PROJECT_ID: 'proj_from_env' },
+      credentialsPath,
+      configPath,
+    });
+    // projectId comes purely from the config file; env composes at the caller.
+    expect(config.projectId).toBe('proj_from_config');
+  });
+
+  it('resolves the config path from TESTSPRITE_CONFIG_FILE when configPath is omitted', () => {
+    const configRoot = mkdtempSync(join(tmpdir(), 'testsprite-config-env-'));
+    const envConfigPath = join(configRoot, 'config');
+    writeProfile('default', { projectId: 'proj_from_env_config' }, { path: envConfigPath });
+    const config = loadConfig({
+      env: { ...process.env, TESTSPRITE_CONFIG_FILE: envConfigPath },
+      credentialsPath,
+    });
+    expect(config.projectId).toBe('proj_from_env_config');
   });
 });
 
