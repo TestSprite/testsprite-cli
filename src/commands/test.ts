@@ -5014,8 +5014,15 @@ async function runBatchRun(
             codeVersion: '',
           },
       );
-      out.print({ results: partialResults }, () =>
-        partialResults.map(r => `${r.testId}  ${r.runId || '-'}  ${r.status}`).join('\n'),
+      out.print(
+        {
+          results: partialResults,
+          creation: {
+            results: createResponse.results,
+            summary: createResponse.summary,
+          },
+        },
+        () => partialResults.map(r => `${r.testId}  ${r.runId || '-'}  ${r.status}`).join('\n'),
       );
       const unfinished = partialResults
         .filter(r => r.status === 'running' && r.runId)
@@ -5057,7 +5064,13 @@ async function runBatchRun(
             return { ...r, dashboardUrl: state.dashboardUrl };
           })
         : batchRunResults;
-    out.print({ results: enrichedResults });
+    out.print({
+      results: enrichedResults,
+      creation: {
+        results: createResponse.results,
+        summary: createResponse.summary,
+      },
+    });
   } else if (!opts.wait) {
     // Text mode, no --wait: statuses are non-terminal by design ('queued'),
     // so a pass/fail summary would misread a successful dispatch as
