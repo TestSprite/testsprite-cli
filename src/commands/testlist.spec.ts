@@ -437,6 +437,46 @@ describe('testlist run', () => {
     expect(err.exitCode).toBe(6);
   });
 
+  it('#515: same-name members keep both failures in the JUnit report', async () => {
+    const { env } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-testlist-515-'));
+    const reportFile = join(dir, 'report.xml');
+    // Two distinct list members (case-a/case-b) whose server-side titles are
+    // both "Checkout" — the multi-project list case from #515. Standard
+    // consumers key on classname+name, so the report must disambiguate.
+    const fetchImpl = makeFetch((url, init) =>
+      (init.method ?? 'GET') === 'POST'
+        ? {
+            body: {
+              accepted: [
+                { testId: 'case-a', runId: 'run_a', enqueuedAt: '2026-08-01T00:00:00.000Z' },
+                { testId: 'case-b', runId: 'run_b', enqueuedAt: '2026-08-01T00:00:00.000Z' },
+              ],
+              conflicts: [],
+              deferred: [],
+            },
+          }
+        : {
+            body: String(url).includes('run_b')
+              ? { ...makeRun('failed'), runId: 'run_b', testId: 'case-b', testTitle: 'Checkout' }
+              : { ...makeRun('failed'), runId: 'run_a', testId: 'case-a', testTitle: 'Checkout' },
+          },
+    );
+    const err = (await runTestlistRun(
+      { ...runBase, listId: 'list-1', wait: true, report: 'junit', reportFile },
+      { env, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    ).catch(e => e)) as CLIError;
+    expect(err).toBeInstanceOf(CLIError);
+    expect(err.exitCode).toBe(1);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this test's own mkdtempSync temp file, never user input.
+    const xml = readFileSync(reportFile, 'utf8');
+    expect(xml).toContain('tests="2" failures="2" errors="0" skipped="0"');
+    const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]);
+    expect(new Set(names).size).toBe(2);
+    expect(names).toContain('Checkout [case-a]');
+    expect(names).toContain('Checkout [case-b]');
+  });
+
   it('nothing dispatched (empty list) returns without throwing', async () => {
     const { env } = makeCreds();
     const fetchImpl = makeFetch(() => ({
