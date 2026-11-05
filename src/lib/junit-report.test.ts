@@ -243,6 +243,29 @@ describe('buildJUnitReport', () => {
     expect((xml.match(/<failure /g) ?? []).length).toBe(2);
   });
 
+  it('#515: raw-distinct test ids folded by attribute normalization stay distinct after suffixing', () => {
+    // The suffix is written into an XML attribute, so the suffix itself must
+    // survive normalization: ids 'a\tb' and 'a b' are raw-distinct but fold
+    // to the same attribute identity. A raw suffix would re-collide the pair
+    // and the round cap would give up leaving duplicate (classname, name)s;
+    // the JSON-escaped suffix keeps the two rows distinct (PR #4652 review).
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'a\tb', runId: 'run_a', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'a b', runId: 'run_b', status: 'failed', name: 'Checkout' }),
+      ],
+    });
+    const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]);
+    // Attribute-normalized identities must be pairwise distinct.
+    const normalize = (value: string): string => value.replace(/\r\n?/g, '\n').replace(/[\n\t]/g, ' ');
+    expect(new Set(names.map(normalize)).size).toBe(2);
+    expect(names).toContain('Checkout [a\\tb]');
+    expect(names).toContain('Checkout [a b]');
+    expect((xml.match(/<failure /g) ?? []).length).toBe(2);
+  });
+
   it('#515: same name under different classnames stays unsuffixed', () => {
     // Distinct classnames are already distinct identities for standard
     // consumers; only rows sharing classname+name need the suffix.

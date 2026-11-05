@@ -243,11 +243,17 @@ function resolveJUnitDisplayNames(
     value.replace(/\r\n?/g, '\n').replace(/[\n\t]/g, ' ');
   const keyOf = (classname: string, name: string): string =>
     `${attributeKey(classname)}\u0000${attributeKey(name)}`;
+  // The suffix must stay injective under attributeKey normalization, or two raw-distinct
+  // ids ("a\tb" vs "a b") re-collide after suffixing and the round cap gives up leaving
+  // duplicate identities. JSON-escaping (minus the surrounding quotes) encodes control
+  // characters as visible two-char escapes, so distinct ids render distinct suffixes
+  // that normalization cannot fold; ids without escapes render unchanged.
+  const displayTestId = (testId: string): string => JSON.stringify(testId).slice(1, -1);
   // Suffixing can itself collide with a row whose human title already looks
   // like a suffixed one ("Checkout [case-a]" as a literal name), so iterate
-  // until no (classname, name) pair collides. testIds are unique per row, so
-  // each round's colliding set ends pairwise distinct and the loop terminates;
-  // the round cap is a belt against adversarial duplicate ids.
+  // until no (classname, name) pair collides. Each round's colliding set gets
+  // an injective encoded suffix, so the set ends pairwise distinct and the
+  // loop terminates; the round cap is a belt against adversarial duplicate ids.
   for (let round = 0; round <= results.length; round++) {
     const groups = new Map<string, number>();
     results.forEach((result, index) => {
@@ -258,7 +264,7 @@ function resolveJUnitDisplayNames(
     results.forEach((result, index) => {
       const key = keyOf(result.classname ?? fallbackClassname, names[index]!);
       if ((groups.get(key) ?? 0) > 1) {
-        names[index] = `${names[index]} [${result.testId}]`;
+        names[index] = `${names[index]} [${displayTestId(result.testId)}]`;
         changed = true;
       }
     });
