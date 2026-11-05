@@ -49,6 +49,7 @@ import { recordBatchOutcome } from '../lib/telemetry.js';
 import { formatRunProgressLine } from '../lib/run-progress.js';
 import { createTicker } from '../lib/ticker.js';
 import {
+  assertJUnitReportOptions,
   buildJUnitReport,
   durationSecondsBetween,
   parseJUnitReportFormat,
@@ -498,15 +499,10 @@ function validateTestlistRunOptions(opts: RunTestlistRunOptions): void {
       `must be an integer between 1 and ${MAX_TESTLIST_RUN_CONCURRENCY}`,
     );
   }
-  if (opts.report === 'junit' && opts.reportFile === undefined) {
-    throw localValidationError('report-file', 'required when --report junit is set');
-  }
-  if (opts.report === 'junit' && !opts.wait) {
-    throw localValidationError(
-      'report',
-      '--report junit requires --wait (verdicts come from the poll)',
-    );
-  }
+  // Same report-flag rules as `test run` / `test rerun` via the shared
+  // validator: orphan --report-file / --report-suite-name and --report junit
+  // without --wait are refused before anything is dispatched (#569).
+  assertJUnitReportOptions({ ...opts, wait: opts.wait === true, batchPath: true });
   // --gh-output / --summary-file reduce a --wait run's per-member results into the
   // CI summary. They require --wait (without it the command returns after dispatch,
   // before any terminal result exists) — reject loudly, same rule as --report junit

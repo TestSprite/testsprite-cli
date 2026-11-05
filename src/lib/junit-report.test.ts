@@ -108,6 +108,17 @@ describe('assertJUnitReportOptions', () => {
     ).toThrowError(ApiError);
   });
 
+  it('rejects empty-valued orphan report flags (#569 follow-up)', () => {
+    // Commander maps an explicit empty argument to '' — that still counts as
+    // a supplied orphan flag, not an absent one.
+    expect(() =>
+      assertJUnitReportOptions({ reportFile: '', wait: true, batchPath: true }),
+    ).toThrowError(ApiError);
+    expect(() =>
+      assertJUnitReportOptions({ reportSuiteName: '', wait: true, batchPath: true }),
+    ).toThrowError(ApiError);
+  });
+
   it('rejects report on non-batch paths', () => {
     expect(() =>
       assertJUnitReportOptions({
