@@ -253,17 +253,24 @@ function resolveJUnitDisplayNames(
   // like a suffixed one ("Checkout [case-a]" as a literal name), so iterate
   // until no (classname, name) pair collides. Each round's colliding set gets
   // an injective encoded suffix, so the set ends pairwise distinct and the
-  // loop terminates; the round cap is a belt against adversarial duplicate ids.
+  // loop terminates. A group whose rows all share one testId can never be
+  // separated by any suffix — the rows are exact duplicates — so it is left
+  // alone instead of spinning to the round cap (testlist run can pass the
+  // same id twice, billing each row).
   for (let round = 0; round <= results.length; round++) {
-    const groups = new Map<string, number>();
+    const groups = new Map<string, { count: number; testIds: Set<string> }>();
     results.forEach((result, index) => {
       const key = keyOf(result.classname ?? fallbackClassname, names[index]!);
-      groups.set(key, (groups.get(key) ?? 0) + 1);
+      const group = groups.get(key) ?? { count: 0, testIds: new Set<string>() };
+      group.count += 1;
+      group.testIds.add(result.testId);
+      groups.set(key, group);
     });
     let changed = false;
     results.forEach((result, index) => {
       const key = keyOf(result.classname ?? fallbackClassname, names[index]!);
-      if ((groups.get(key) ?? 0) > 1) {
+      const group = groups.get(key)!;
+      if (group.count > 1 && group.testIds.size > 1) {
         names[index] = `${names[index]} [${displayTestId(result.testId)}]`;
         changed = true;
       }

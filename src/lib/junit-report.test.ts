@@ -266,6 +266,42 @@ describe('buildJUnitReport', () => {
     expect((xml.match(/<failure /g) ?? []).length).toBe(2);
   });
 
+  it('#515: a group whose rows share one testId is left unsuffixed instead of spinning to the cap', () => {
+    // testlist run can pass the same id twice, billing each row. Duplicate
+    // rows are exact duplicates no suffix can separate, so the resolver must
+    // leave them alone rather than re-suffixing until the round cap.
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'dup', runId: 'run_a', status: 'failed', name: 'Checkout', durationSeconds: 1 }),
+        makeResult({ testId: 'dup', runId: 'run_b', status: 'failed', name: 'Checkout', durationSeconds: 2 }),
+        makeResult({ testId: 'dup', runId: 'run_c', status: 'failed', name: 'Checkout', durationSeconds: 3 }),
+      ],
+    });
+    expect((xml.match(/<failure /g) ?? []).length).toBe(3);
+    expect(xml).toContain('name="Checkout" testId="dup"');
+    expect(xml).not.toContain('Checkout [');
+  });
+
+  it('#515: a mixed duplicate group still disambiguates the distinct ids', () => {
+    // Duplicate-id rows keep the group distinct (2 testIds), so the whole
+    // group suffixes once; the duplicate pair then reads as a single-distinct
+    // group and the loop stops instead of re-suffixing to the cap.
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'dup', runId: 'run_a', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'dup', runId: 'run_b', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'test_b', runId: 'run_c', status: 'failed', name: 'Checkout' }),
+      ],
+    });
+    expect((xml.match(/<failure /g) ?? []).length).toBe(3);
+    expect(xml).toContain('name="Checkout [test_b]"');
+    expect((xml.match(/name="Checkout \[dup\]"/g) ?? []).length).toBe(2);
+  });
+
   it('#515: same name under different classnames stays unsuffixed', () => {
     // Distinct classnames are already distinct identities for standard
     // consumers; only rows sharing classname+name need the suffix.
