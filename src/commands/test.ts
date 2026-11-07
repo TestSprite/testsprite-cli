@@ -14261,6 +14261,7 @@ export async function assertOutDirParentExists(
     : parent;
   let parentStat;
   try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- this is the guard itself: `checked` is the parent of the user-supplied --out path after resolve() (inside <cwd>/.testsprite/, its closest existing ancestor); it is only stat()ed to validate it, nothing is read or written.
     parentStat = await stat(checked);
   } catch {
     throw localValidationError('out', `parent directory does not exist: ${parent}`);
@@ -14295,6 +14296,7 @@ async function closestExistingPath(target: string): Promise<string> {
   let current = target;
   for (;;) {
     try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- walks up from the --out parent, which isInsideProjectTestspriteDir() has confined to <cwd>/.testsprite/; stat() only, nothing is read or written.
       await stat(current);
       return current;
     } catch (err) {

@@ -239,6 +239,7 @@ describe('assertOutDirParentExists', () => {
     await expect(assertOutDirParentExists(target, cwd)).resolves.toBeUndefined();
     // Validation only: writeBundle creates the directories once the response
     // has passed its integrity checks, never this pre-check.
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- this test's own mkdtemp temp dir, never user input.
     expect(existsSync(join(cwd, '.testsprite'))).toBe(false);
   });
 
@@ -260,6 +261,7 @@ describe('assertOutDirParentExists', () => {
 
   it('reports a .testsprite file in the way as "not a directory"', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'cli-p4-tsdir-'));
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes into this test's own mkdtemp temp dir, never user input.
     await writeFile(join(cwd, '.testsprite'), 'not a directory');
     await expect(
       assertOutDirParentExists(join(cwd, '.testsprite', 'runs', 'run_x'), cwd),
@@ -385,6 +387,7 @@ describe('runArtifactGet', () => {
 
       const expectedDir = join(tmpDir, '.testsprite', 'runs', SAMPLE_RUN_ID);
       expect(result.bundle!.dir).toBe(expectedDir);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads back the bundle this test wrote into its own mkdtemp temp dir, never user input.
       expect(existsSync(join(expectedDir, 'meta.json'))).toBe(true);
     } finally {
       cwdSpy.mockRestore();
@@ -1016,6 +1019,7 @@ describe('runFailureGet M2 non-regression (requireRunId is opt-in)', () => {
 
       const expectedDir = join(tmpDir, '.testsprite', 'failure');
       expect(result.bundle!.dir).toBe(expectedDir);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads back the bundle this test wrote into its own mkdtemp temp dir, never user input.
       expect(existsSync(join(expectedDir, 'meta.json'))).toBe(true);
     } finally {
       cwdSpy.mockRestore();
