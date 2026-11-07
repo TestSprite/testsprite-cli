@@ -1516,7 +1516,12 @@ export function createCiCommand(deps: CiDeps = {}): Command {
     });
 
   ci.command('init <platform>')
-    .description('Write a CI workflow that runs your TestSprite tests (platform: github)')
+    .summary('Write a CI workflow that runs your test cases on pull requests (github)')
+    .description(
+      "Write a CI workflow (platform: github) that runs the project's TestSprite test cases against each\n" +
+        'pull request\'s preview deployment; each run spends credits. Replace the "REPLACE ME" step in the\n' +
+        `generated file with your preview URL. Needs the ${API_KEY_SECRET_NAME} repo secret (see --set-secret).`,
+    )
     .option('--project <id>', 'project id to run (auto-detected if you have exactly one)')
     .option(
       '--env <name>',
@@ -1569,7 +1574,8 @@ export function createCiCommand(deps: CiDeps = {}): Command {
   // Behaviour and exit codes are unchanged until the commands are removed.
   ci.command('doctor', { hidden: true })
     .description(
-      'Check that deployment events reach this repo — the precondition a deployment-gated workflow rests on',
+      'Check that deployment events reach this repo — the precondition for a deployment-gated workflow.\n' +
+        'Needs the GitHub CLI (`gh`), installed and authenticated.',
     )
     .option('--repo <owner/name>', 'repo to check (inferred from the `origin` remote if omitted)')
     .option(
@@ -1580,14 +1586,13 @@ export function createCiCommand(deps: CiDeps = {}): Command {
     .option('--timeout <s>', 'with --wait, how long to keep checking (1-3600, default 600)')
     .addHelpText(
       'after',
-      '\nWhy this exists:\n' +
-        '  A workflow triggered by deployments only fires if the repo actually receives\n' +
-        "  GitHub Deployment events. When the deploy platform isn't linked to the repo,\n" +
-        '  nothing is ever written and the gate stays silent — with no error anywhere.\n' +
-        '\n--wait succeeds when any new deployment record arrives, whatever its\n' +
-        'environment — a new record is the hard fact that events reach this repo.\n' +
+      '\nA deployment-triggered workflow only fires if the repo receives GitHub Deployment events;\n' +
+        'if the deploy platform is not linked, the gate stays silent with no error.\n' +
+        '--wait succeeds when any new deployment record arrives, whatever its environment.\n' +
         '\nExit codes:\n' +
-        '  0  events reach this repo (a gate will fire), or --wait saw a new record\n' +
+        '  0  events reach this repo (a gate will fire), or --wait saw a new record. With --wait and\n' +
+        '     no new record before --timeout it is still 0 if earlier events exist: check the output\n' +
+        '     (JSON: newDeployment)\n' +
         '  1  no usable events yet — see the printed next steps\n' +
         '  5  validation error (bad --repo, or no GitHub remote here)\n' +
         ' 10  could not read the history (gh missing / unauthenticated) — not a verdict',
@@ -1617,15 +1622,14 @@ export function createCiCommand(deps: CiDeps = {}): Command {
     )
     .addHelpText(
       'after',
-      "\nRuns the platform's own CLI (`npx vercel link` / `vercel git connect`) as a\n" +
-        'subprocess, always non-interactively: when a decision is needed (which project\n' +
-        'to link) it refuses and says so rather than creating anything you did not pick.\n' +
-        'Your Vercel credentials stay with the Vercel CLI — this command never asks for,\n' +
-        'stores, or transmits a platform token.\n' +
-        '\nNote: `vercel link` itself writes `.vercel/`, may add a VERCEL_OIDC_TOKEN line\n' +
-        'to `.env.local`, and may update `.gitignore` — the Vercel CLI’s own behavior.\n' +
-        '\nLinking only affects FUTURE pushes: push a commit afterwards, then confirm with\n' +
-        '`testsprite ci doctor --wait`.',
+      `\nRuns \`npx ${VERCEL_CLI_SPEC}\` (downloads the Vercel CLI) non-interactively to link this directory\n` +
+        'and connect the repo (`vercel link` / `vercel git connect`); if a decision is needed (which\n' +
+        'project to link) it refuses rather than create anything you did not pick. Your Vercel\n' +
+        'credentials stay with the Vercel CLI; this command never asks for or stores a platform token.\n' +
+        '`vercel link` itself writes `.vercel/`, may add VERCEL_OIDC_TOKEN to `.env.local` and may\n' +
+        'update `.gitignore`. --dry-run is not honored: the link is made.\n' +
+        '\nExit codes: 0 connected, 1 could not connect\n' +
+        '\nLinking only affects FUTURE pushes: push a commit, then confirm with `testsprite ci doctor --wait`.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts, command: Command) => {
