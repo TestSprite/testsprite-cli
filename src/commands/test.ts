@@ -24,10 +24,11 @@ import {
   readSync,
   readdirSync,
   statSync,
+  type Stats,
   type WriteStream,
 } from 'node:fs';
 import { rename, stat, unlink } from 'node:fs/promises';
-import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { Command } from 'commander';
 import { openInBrowser } from '../lib/browser.js';
@@ -7014,9 +7015,10 @@ export async function runFailureGet(
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
 
-  // Resolve and validate --out BEFORE the network call so a missing /
-  // empty path surfaces as VALIDATION_ERROR (exit 5) without spending
-  // an API call. Mirrors `runArtifactGet`; `writeBundle` re-validates
+  // Resolve and validate --out BEFORE the network call so an empty path,
+  // an existing file, or a file where a parent directory should be
+  // surfaces as VALIDATION_ERROR (exit 5) without spending an API call.
+  // Missing parent directories are created later by writeBundle. Mirrors `runArtifactGet`; `writeBundle` re-validates
   // internally as defense-in-depth.
   let resolvedDir: string | undefined;
   if (opts.out !== undefined) {
@@ -14239,35 +14241,20 @@ export function resolveDefaultArtifactDir(runId: string, cwd: string = process.c
  * `VALIDATION_ERROR` (exit 5) — matches the convention from `closeOutputFile`
  * for single-file `--out` flags (P4 D4 convention).
  *
- * The parent directory must already exist, so a mistyped `--out` fails here
- * instead of quietly creating a new directory tree somewhere else. The one
- * exception is a directory inside the project's own `.testsprite/` folder,
- * where `test artifact get` writes by default and where the docs and the
- * verify skill point `--out`: `writeBundle` creates the missing parents there,
- * as it does for the default, so `--out ./.testsprite/runs/<run-id>/` behaves
- * exactly like leaving `--out` off. Inside `.testsprite/`, the closest path
- * that already exists must still be a directory.
+ * Missing parent directories are fine: `writeBundle` creates the whole tree
+ * with `mkdir(dir, { recursive: true })` once the response has passed its
+ * integrity checks, as it does for the default `./.testsprite/runs/<run-id>/`,
+ * so a failed fetch still leaves nothing on disk. What is refused here is a
+ * path that can never become a directory: `--out` pointing at an existing
+ * file, or a file where one of its parent directories should be.
  *
  * The bundle directory itself (`resolvedDir`) may or may not exist;
  * `writeBundle` creates it if absent.
  */
-export async function assertOutDirParentExists(
-  resolvedDir: string,
-  cwd: string = process.cwd(),
-): Promise<void> {
-  const parent = dirname(resolvedDir);
-  const checked = isInsideProjectTestspriteDir(resolvedDir, cwd)
-    ? await closestExistingPath(parent)
-    : parent;
-  let parentStat;
-  try {
-    // eslint-disable-next-line security/detect-non-literal-fs-filename -- this is the guard itself: `checked` is the parent of the user-supplied --out path after resolve() (inside <cwd>/.testsprite/, its closest existing ancestor); it is only stat()ed to validate it, nothing is read or written.
-    parentStat = await stat(checked);
-  } catch {
-    throw localValidationError('out', `parent directory does not exist: ${parent}`);
-  }
-  if (!parentStat.isDirectory()) {
-    throw localValidationError('out', `parent path is not a directory: ${checked}`);
+export async function assertOutDirParentExists(resolvedDir: string): Promise<void> {
+  const closest = await closestExistingPath(dirname(resolvedDir));
+  if (!closest.stats.isDirectory()) {
+    throw localValidationError('out', `parent path is not a directory: ${closest.path}`);
   }
   // Also guard against --out pointing at an existing FILE (not a dir).
   let targetStat;
@@ -14283,28 +14270,23 @@ export async function assertOutDirParentExists(
 }
 
 /**
- * True when `dir` lies inside `<cwd>/.testsprite/` (not the folder itself):
- * the CLI's own per-project working directory.
+ * The nearest path at or above `target` that exists, with its stats. Missing
+ * components are skipped. So is a file in the middle of the path (ENOTDIR on
+ * POSIX, ENOENT on Windows): the walk stops at that file, and the caller
+ * reports it as "not a directory".
  */
-function isInsideProjectTestspriteDir(dir: string, cwd: string): boolean {
-  const rel = relative(join(cwd, '.testsprite'), dir);
-  return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
-}
-
-/** `target` itself when it exists, otherwise its closest existing ancestor. */
-async function closestExistingPath(target: string): Promise<string> {
+async function closestExistingPath(target: string): Promise<{ path: string; stats: Stats }> {
   let current = target;
   for (;;) {
     try {
-      // eslint-disable-next-line security/detect-non-literal-fs-filename -- walks up from the --out parent, which isInsideProjectTestspriteDir() has confined to <cwd>/.testsprite/; stat() only, nothing is read or written.
-      await stat(current);
-      return current;
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- this is the guard itself: walks up from the parent of the user-supplied --out path after resolve(); stat() only, nothing is read or written.
+      return { path: current, stats: await stat(current) };
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       const up = dirname(current);
-      // ENOTDIR means a path component is a file: keep climbing so the caller
-      // reports that file as "not a directory".
-      if ((code !== 'ENOENT' && code !== 'ENOTDIR') || up === current) return current;
+      if ((code !== 'ENOENT' && code !== 'ENOTDIR') || up === current) {
+        throw localValidationError('out', `cannot access parent path: ${current}`);
+      }
       current = up;
     }
   }
@@ -14371,8 +14353,9 @@ export async function runArtifactGet(
     return { context: cannedCtx };
   }
 
-  // Parent-dir validation for explicit --out only. The default path
-  // (.testsprite/runs/<runId>/) is always under cwd — mkdir will create it.
+  // Validate an explicit --out before the fetch (see assertOutDirParentExists).
+  // Missing parents are created by writeBundle, as for the default path
+  // (.testsprite/runs/<runId>/), which needs no check.
   if (opts.out !== undefined) {
     await assertOutDirParentExists(resolvedDir);
   }
@@ -18817,7 +18800,7 @@ export function createTestArtifactCommand(deps: TestDeps): Command {
     )
     .option(
       '--out <dir>',
-      'directory to write the bundle into (default: ./.testsprite/runs/<run-id>/); outside ./.testsprite/ the parent must exist',
+      'directory to write the bundle into (default: ./.testsprite/runs/<run-id>/); missing parent directories are created',
     )
     .option(
       '--failed-only',
@@ -18862,7 +18845,7 @@ function createTestFailureCommand(deps: TestDeps): Command {
     )
     .option(
       '--out <dir>',
-      'directory to write the bundle into (default: print the envelope to stdout); outside ./.testsprite/ the parent must exist',
+      'directory to write the bundle into (default: print the envelope to stdout); missing parent directories are created',
     )
     .option(
       '--failed-only',

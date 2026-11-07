@@ -835,8 +835,7 @@ Exit codes:
 
 Options:
   --out <dir>    directory to write the bundle into (default: print the
-                 envelope to stdout); outside ./.testsprite/ the parent must
-                 exist
+                 envelope to stdout); missing parent directories are created
   --failed-only  with --out: trim to the failed step ±1 (usually a no-op; \`test
                  steps <id>\` has the full trail)
   -h, --help     display help for command

@@ -11,6 +11,7 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 ### Fixed
 
 - **`project credential` and `project auto-auth` no longer crash on an unreadable `--credential-file`, `--password-file`, `--client-secret-file` or `--refresh-token-file`.** A missing, unreadable or non-regular file now exits 5 (`VALIDATION_ERROR`) with the usual error envelope instead of an unhandled Node error (exit 1), and `--dry-run` no longer reads these files, matching `project create` and `project update`. Thanks @OkeyAmy (#283).
+- **`test artifact get --out` and `test failure get --out` create missing parent directories.** An explicit `--out` needed an existing parent and exited 5 otherwise, so the `--out ./.testsprite/…` commands in the verify skill, the README and DOCUMENTATION.md failed in a fresh project. Missing parents are now created the way the default `./.testsprite/runs/<run-id>/` is, after the bundle passes its checks, so a failed fetch still leaves nothing on disk; an `--out` at an existing file, or one that runs through a file, still exits 5 (#729, closes #654).
 
 ## [0.16.0] - 2026-10-30
 
