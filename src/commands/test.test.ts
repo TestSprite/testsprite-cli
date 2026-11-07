@@ -5779,14 +5779,51 @@ describe('runFailureGet', () => {
     expect(fetchCalls).toBe(0);
   });
 
-  it('--out rejects a path under a missing parent dir with VALIDATION_ERROR (exit 5) before any network I/O', async () => {
+  it('--out two levels under a missing directory writes the bundle there', async () => {
+    const { credentialsPath } = makeCreds();
+    const ctx = makeFailureContext();
+    const fetchImpl = makeFetch(url => {
+      if (url.startsWith('https://signed.example.com')) {
+        return { body: '<html>snapshot</html>' };
+      }
+      if (url.startsWith('https://video.example.com')) {
+        return { body: 'fake-video-bytes' };
+      }
+      return { body: ctx };
+    });
+    const missingParentBase = mkdtempSync(join(tmpdir(), 'cli-p5-missing-parent-'));
+    const outDir = join(missingParentBase, 'no-such-dir', 'deeper', 'bundle');
+    try {
+      const result = await runFailureGet(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          testId: 'test_failed',
+          failedOnly: false,
+          out: outDir,
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined },
+      );
+      expect(result.bundle!.dir).toBe(outDir);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads back the bundle this test wrote into its own mkdtemp temp dir, never user input.
+      expect(existsSync(join(outDir, 'meta.json'))).toBe(true);
+    } finally {
+      rmSync(missingParentBase, { recursive: true, force: true });
+    }
+  });
+
+  it('--out at an existing file exits 5 before any network I/O', async () => {
     const { credentialsPath } = makeCreds();
     let fetchCalls = 0;
     const fetchImpl = makeFetch(() => {
       fetchCalls += 1;
       return { body: makeFailureContext() };
     });
-    const missingParentBase = mkdtempSync(join(tmpdir(), 'cli-p5-missing-parent-'));
+    const base = mkdtempSync(join(tmpdir(), 'cli-p5-out-file-'));
+    const existingFile = join(base, 'bundle.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes into this test's own mkdtemp temp dir, never user input.
+    writeFileSync(existingFile, 'content');
     try {
       await expect(
         runFailureGet(
@@ -5796,12 +5833,48 @@ describe('runFailureGet', () => {
             debug: false,
             testId: 'test_failed',
             failedOnly: false,
-            out: join(missingParentBase, 'no-such-dir', 'bundle'),
+            out: existingFile,
           },
           { credentialsPath, fetchImpl },
         ),
       ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
       expect(fetchCalls).toBe(0);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('a failed fetch with --out under a missing directory leaves no directory behind', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      status: 404,
+      body: {
+        error: {
+          code: 'NOT_FOUND',
+          message: 'Test has no failing run.',
+          nextAction: 'Test has no failing run. Use `testsprite test result <test-id>`.',
+          requestId: 'req_test',
+          details: { resource: 'test', id: 'test_passing', reason: 'no_failing_run' },
+        },
+      },
+    }));
+    const missingParentBase = mkdtempSync(join(tmpdir(), 'cli-p5-missing-parent-'));
+    try {
+      await expect(
+        runFailureGet(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            testId: 'test_passing',
+            failedOnly: false,
+            out: join(missingParentBase, 'no-such-dir', 'deeper', 'bundle'),
+          },
+          { credentialsPath, fetchImpl, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({ code: 'NOT_FOUND', exitCode: 4 });
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- this test's own mkdtemp temp dir, never user input.
+      expect(existsSync(join(missingParentBase, 'no-such-dir'))).toBe(false);
     } finally {
       rmSync(missingParentBase, { recursive: true, force: true });
     }
