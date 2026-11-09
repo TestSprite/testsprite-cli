@@ -601,6 +601,108 @@ describe('HttpClient — 200 response with a non-JSON body', () => {
   });
 });
 
+describe('HttpClient — connection reset while reading a 200 body', () => {
+  /**
+   * A 200 whose body stream fails part-way: headers arrived, a few bytes were
+   * read, then the socket closed. Node's fetch surfaces that from the body
+   * reader as `TypeError: terminated` — a network failure, not bad JSON.
+   */
+  function resetResponse(partial = '{"ok":'): Response {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(partial));
+        controller.error(
+          Object.assign(new TypeError('terminated'), {
+            cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }),
+          }),
+        );
+      },
+    });
+    return new Response(stream, { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+
+  it('retries a GET under the transport rules, then returns the healthy response', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(resetResponse())
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.get('/projects')).resolves.toEqual({ ok: true });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries a write that carries an Idempotency-Key', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(resetResponse())
+      .mockResolvedValueOnce(jsonResponse({ id: 'proj_1' }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(
+      client.post('/projects', { body: { name: 'x' }, headers: { 'Idempotency-Key': 'op_1' } }),
+    ).resolves.toEqual({ id: 'proj_1' });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not replay a keyless write: one attempt, UNAVAILABLE (exit 10) with a transport message', async () => {
+    const fetchImpl = vi.fn(async () => resetResponse());
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    const err = (await client
+      .post('/projects', { body: { name: 'x' } })
+      .catch((e: unknown) => e)) as TransportError;
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(err).toBeInstanceOf(TransportError);
+    expect(err).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
+    expect(err.message).toContain('connection closed while reading the response body');
+    expect(err.message).toContain('terminated');
+    expect(err.requestId).toMatch(/^cli_/);
+  });
+
+  it('does not retry when the caller disabled retries', async () => {
+    const fetchImpl = vi.fn(async () => resetResponse());
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.get('/projects', { retry: false })).rejects.toBeInstanceOf(TransportError);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up as UNAVAILABLE once the transport budget is spent', async () => {
+    const fetchImpl = vi.fn(async () => resetResponse());
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.get('/projects')).rejects.toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+
+  it('a body that is read in full but truncated is still malformed JSON (INTERNAL, no retry)', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response('{"ok":', { status: 200, headers: { 'content-type': 'application/json' } }),
+    );
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.get('/projects')).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('records the reset as a TRANSPORT error and a retry in the debug trace', async () => {
+    const events: DebugEvent[] = [];
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(resetResponse())
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch, {
+      onDebug: e => events.push(e),
+    });
+    await client.get('/projects');
+    expect(events.map(e => [e.kind, 'errorCode' in e ? e.errorCode : undefined])).toEqual(
+      expect.arrayContaining([
+        ['error', 'TRANSPORT'],
+        ['retry', 'TRANSPORT'],
+      ]),
+    );
+  });
+});
+
 describe('HttpClient error mapping', () => {
   it('does not retry AUTH_INVALID and exits 3', async () => {
     const fetchImpl = vi.fn(async () => errorEnvelopeResponse(401, 'AUTH_INVALID'));
@@ -1421,5 +1523,55 @@ describe('HttpClient retry-delay sleep bails on shutdown', () => {
     expect(err).toBeInstanceOf(InterruptError);
     expect((err as InterruptError).signal).toBe('SIGTERM');
     expect(calls).toBe(1);
+  });
+});
+
+describe('rerun deprecation advisories', () => {
+  const rerunBody = {
+    runId: 'run_1',
+    status: 'queued',
+    enqueuedAt: '2026-10-20T00:00:00Z',
+    codeVersion: 'v1',
+    autoHeal: true,
+  };
+  const batchBody = {
+    accepted: [],
+    conflicts: [],
+    deferred: [],
+    closure: { byProject: [] },
+  };
+  const heal = { feature: 'autoHeal', message: 'not honored yet' };
+  const dep = { feature: 'deprecation', message: 'use test run' };
+  const clientFor = (body: unknown): HttpClient =>
+    makeClient((async () => jsonResponse(body)) as unknown as typeof fetch);
+  const opts = { idempotencyKey: 'k1' };
+
+  it('drops a server deprecation advisory but keeps the autoHeal one', async () => {
+    const r = await clientFor({ ...rerunBody, advisories: [heal, dep] }).triggerRerun(
+      't1',
+      { source: 'cli' },
+      opts,
+    );
+    expect(r.advisories).toEqual([heal]);
+  });
+
+  it('removes the advisories key when only a deprecation advisory was sent', async () => {
+    const r = await clientFor({ ...rerunBody, advisories: [dep] }).triggerRerun(
+      't1',
+      { source: 'cli' },
+      opts,
+    );
+    expect('advisories' in r).toBe(false);
+  });
+
+  it('leaves a response without advisories untouched', async () => {
+    const r = await clientFor(rerunBody).triggerRerun('t1', { source: 'cli' }, opts);
+    expect(r).toEqual(rerunBody);
+  });
+
+  it('applies the same filter to the batch rerun response', async () => {
+    const client = clientFor({ ...batchBody, advisories: [dep, heal] });
+    const r = await client.triggerBatchRerun({ testIds: ['a'], source: 'cli' } as never, opts);
+    expect(r.advisories).toEqual([heal]);
   });
 });

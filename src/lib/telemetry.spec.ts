@@ -808,6 +808,13 @@ describe('sanitizeTelemetryExtras', () => {
     expect(sanitizeTelemetryExtras({ conflictReason: 'billing_hold' })).toEqual({
       conflictReason: 'billing_hold',
     });
+    // The two pre-dispatch blocks a backend consumer gets on the batch routes.
+    expect(sanitizeTelemetryExtras({ conflictReason: 'no_producer' })).toEqual({
+      conflictReason: 'no_producer',
+    });
+    expect(sanitizeTelemetryExtras({ conflictReason: 'producer_in_flight' })).toEqual({
+      conflictReason: 'producer_in_flight',
+    });
     expect(sanitizeTelemetryExtras({ platform: 'gitlab' })).toEqual({});
     expect(sanitizeTelemetryExtras({ projectResolved: 'guess' })).toEqual({});
     expect(sanitizeTelemetryExtras({ force: 'true' })).toEqual({});
