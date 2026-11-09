@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ConflictReason } from '../lib/conflict-reason.js';
 import { ApiError, CLIError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
@@ -3705,64 +3706,6 @@ describe('runTestRunAll — batch fresh run', () => {
     expect(e.code).toBe('NOT_FOUND');
   });
 
-  it('POLL_RESERVE_MS: the retry loop clamps sleep so it never eats the reserved poll window', async () => {
-    const { credentialsPath } = makeCreds();
-    const baseNow = new Date('2026-06-09T10:00:00.000Z').getTime();
-    let nowMs = baseNow;
-    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
-    const sleeps: number[] = [];
-    const advancingSleep = (ms: number) => {
-      sleeps.push(ms);
-      nowMs += ms; // the sleep really consumes the budget
-      return Promise.resolve();
-    };
-    // A test that stays rate-deferred across every retry, nothing accepted — so the
-    // only sleeps are the D3 retry loop's (no poll fan-out to muddy the count).
-    const fetchImpl = makeFetch(
-      () =>
-        ({
-          body: {
-            accepted: [],
-            conflicts: [],
-            deferred: [{ testId: 'test_be_02' }],
-            skippedFrontend: [],
-            skippedIntegration: [],
-          } as BatchRunFreshResponse,
-        }) as never,
-    );
-    try {
-      await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 180,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: () => undefined,
-          stderr: () => undefined,
-          env: {} as NodeJS.ProcessEnv,
-          sleep: advancingSleep,
-        },
-      );
-    } catch {
-      // the still-deferred test surfaces exit 7 — expected; we assert the sleep budget.
-    } finally {
-      nowSpy.mockRestore();
-    }
-    // POLL_RESERVE_MS = min(60000, 180000/3) = 60000. The retry loop must leave at
-    // least the reserve, so the total slept never exceeds budget - reserve.
-    // (Reverting POLL_RESERVE_MS to 0 lets the loop sleep to ~180000 and fails this.)
-    const totalSlept = sleeps.reduce((a, b) => a + b, 0);
-    expect(sleeps.length).toBeGreaterThan(0);
-    expect(totalSlept).toBeLessThanOrEqual(180_000 - 60_000);
-  });
-
   it('run --all --wait auto-resume: fetches the in-flight run for a createdAt floor and names its source', async () => {
     const { credentialsPath } = makeCreds();
     const stdoutLines: string[] = [];
@@ -4119,203 +4062,6 @@ describe('runTestRunAll — batch fresh run', () => {
     });
   });
 
-  it('carries every dispatch option into a deferred retry', async () => {
-    const { credentialsPath } = makeCreds();
-    const bodies: Record<string, unknown>[] = [];
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
-        return {
-          body: {
-            accepted: [],
-            deferred: bodies.length === 1 ? [{ testId: 'test_deferred' }] : [],
-            conflicts: [],
-            skippedFrontend: [],
-            skippedIntegration: [],
-            targetUrl: 'https://preview.example.com/path',
-          },
-        };
-      }
-      return errorBody('NOT_FOUND');
-    });
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 300,
-        maxConcurrency: 5,
-        targetUrl: 'https://preview.example.com/path',
-        skipPreflight: true,
-        environment: 'preview',
-        autoHeal: false,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        env: {} as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(() => undefined);
-    expect(bodies).toHaveLength(2);
-    expect(bodies[0]).toMatchObject({
-      projectId: 'project_be',
-      source: 'cli',
-      targetUrl: 'https://preview.example.com/path',
-      environment: 'preview',
-      autoHeal: false,
-    });
-    expect(bodies[1]).toMatchObject({
-      projectId: 'project_be',
-      source: 'cli',
-      testIds: ['test_deferred'],
-      targetUrl: 'https://preview.example.com/path',
-      environment: 'preview',
-      autoHeal: false,
-    });
-  });
-
-  it('rejects a mismatched URL echo on a deferred retry and cancels its accepted run', async () => {
-    const { credentialsPath } = makeCreds();
-    const calls: string[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      if (url.endsWith('/cancel')) {
-        calls.push(url);
-        return {
-          body: {
-            ...makePassedRun('run_retry', 'test_deferred'),
-            status: 'cancelled',
-            alreadyCancelled: false,
-            refund: { status: 'not_charged' },
-          },
-        };
-      }
-      if ((init.method ?? 'GET') === 'POST') {
-        calls.push('dispatch');
-        return {
-          body: {
-            accepted:
-              calls.filter(c => c === 'dispatch').length === 1
-                ? []
-                : [
-                    {
-                      testId: 'test_deferred',
-                      runId: 'run_retry',
-                      enqueuedAt: '2026-09-25T00:00:00Z',
-                    },
-                  ],
-            deferred:
-              calls.filter(c => c === 'dispatch').length === 1 ? [{ testId: 'test_deferred' }] : [],
-            conflicts: [],
-            skippedFrontend: [],
-            skippedIntegration: [],
-            targetUrl:
-              calls.filter(c => c === 'dispatch').length === 1
-                ? 'https://preview.example.com/path'
-                : 'https://other.example.com/path',
-          },
-        };
-      }
-      return errorBody('NOT_FOUND');
-    });
-    const err = await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 300,
-        maxConcurrency: 5,
-        targetUrl: 'https://preview.example.com/path',
-        skipPreflight: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        env: {} as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toMatchObject({ code: 'UNSUPPORTED', exitCode: 7 });
-    expect(calls).toEqual([
-      'dispatch',
-      'dispatch',
-      'http://localhost:13502/api/cli/v1/runs/run_retry/cancel',
-    ]);
-  });
-
-  it('a mismatched retry echo cancels only that leg, never a run an earlier leg confirmed', async () => {
-    const { credentialsPath } = makeCreds();
-    const cancels: string[] = [];
-    let dispatches = 0;
-    const fetchImpl = makeFetch((url, init) => {
-      if (url.endsWith('/cancel')) {
-        cancels.push(url);
-        return {
-          body: {
-            ...makePassedRun('run_b', 'test_b'),
-            status: 'cancelled',
-            alreadyCancelled: false,
-            refund: { status: 'not_charged' },
-          },
-        };
-      }
-      if ((init.method ?? 'GET') === 'POST') {
-        dispatches += 1;
-        const first = dispatches === 1;
-        return {
-          body: {
-            accepted: [
-              first
-                ? { testId: 'test_a', runId: 'run_a', enqueuedAt: '2026-09-25T00:00:00Z' }
-                : { testId: 'test_b', runId: 'run_b', enqueuedAt: '2026-09-25T00:00:01Z' },
-            ],
-            deferred: first ? [{ testId: 'test_b' }] : [],
-            conflicts: [],
-            skippedFrontend: [],
-            skippedIntegration: [],
-            targetUrl: first
-              ? 'https://preview.example.com/path'
-              : 'https://other.example.com/path',
-          },
-        };
-      }
-      if (url.includes('/runs/run_a')) return { body: makePassedRun('run_a', 'test_a') };
-      return errorBody('NOT_FOUND');
-    });
-    const err = await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 300,
-        maxConcurrency: 5,
-        targetUrl: 'https://preview.example.com/path',
-        skipPreflight: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        env: {} as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(err).toMatchObject({ code: 'UNSUPPORTED', exitCode: 7 });
-    expect(dispatches).toBe(2);
-    expect(cancels).toEqual(['http://localhost:13502/api/cli/v1/runs/run_b/cancel']);
-  });
-
   it('writes every CI artifact and reports server refund status when the echo is wrong', async () => {
     const { credentialsPath } = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-wrong-target-'));
@@ -4412,65 +4158,6 @@ describe('runTestRunAll — batch fresh run', () => {
       { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
     ).catch(e => e);
     expect(err).toMatchObject({ code, exitCode, message });
-  });
-
-  it('surfaces a precondition refusal from a deferred retry', async () => {
-    const { credentialsPath } = makeCreds();
-    let dispatches = 0;
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        dispatches++;
-        return dispatches === 1
-          ? {
-              body: {
-                accepted: [],
-                deferred: [{ testId: 'test_deferred' }],
-                conflicts: [],
-                skippedFrontend: [],
-                skippedIntegration: [],
-                targetUrl: 'https://preview.example.com',
-              },
-            }
-          : {
-              status: 412,
-              body: {
-                error: {
-                  code: 'PRECONDITION_FAILED',
-                  message: 'Login-once environment has a different origin',
-                  requestId: 'req_retry',
-                },
-              },
-            };
-      }
-      return errorBody('NOT_FOUND');
-    });
-    const err = await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 300,
-        maxConcurrency: 5,
-        targetUrl: 'https://preview.example.com',
-        skipPreflight: true,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        env: {} as NodeJS.ProcessEnv,
-        sleep: instantSleep,
-      },
-    ).catch(e => e);
-    expect(dispatches).toBe(2);
-    expect(err).toMatchObject({
-      code: 'PRECONDITION_FAILED',
-      exitCode: 6,
-      message: 'Login-once environment has a different origin',
-    });
   });
 
   it('keeps dry-run offline and previews the URL in its request body', async () => {
@@ -4961,399 +4648,6 @@ describe('runTestRunAll — batch fresh run', () => {
 });
 
 // ---------------------------------------------------------------------------
-// [P1] D3 deferred-retry: conflicts discovered during retries must be merged
-// into the running conflicts collection and appear in the final summary/JSON.
-// Without the fix the code only logged them; the final accounting still showed
-// only initial conflicts → everything-deferred→retried→conflicted would exit 0
-// with zero accepted/deferred/conflicts reported.
-// ---------------------------------------------------------------------------
-
-// The deferred-retry leg re-sends `--no-auto-heal`, so it has to read the echo
-// back too. Without this the tests a rate limit pushed into the retry are the
-// only ones that run unwarned — and during a rollout they are also the likeliest
-// to land on a differently-configured instance than the first attempt did.
-describe('run --all --no-auto-heal: the deferred-retry leg also checks the echo', () => {
-  const baseOpts = {
-    profile: 'default' as const,
-    output: 'json' as const,
-    debug: false,
-    projectId: 'project_be',
-    // The deferred-retry loop only runs under --wait; the non-wait path
-    // dispatches once and returns, so there would be no second leg to test.
-    wait: true,
-    timeoutSeconds: 300,
-    maxConcurrency: 5,
-    autoHeal: false as const,
-  };
-
-  function twoDispatches(
-    first: Partial<BatchRunFreshResponse>,
-    second: Partial<BatchRunFreshResponse>,
-  ) {
-    const initial: BatchRunFreshResponse = {
-      accepted: [],
-      deferred: [{ testId: 'test_deferred' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-      ...first,
-    };
-    const retry: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_deferred', runId: 'run_retry', enqueuedAt: '2026-09-18T00:00:00.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-      ...second,
-    };
-    let n = 0;
-    const stderr: string[] = [];
-    const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        n++;
-        return { body: n === 1 ? initial : retry };
-      }
-      return errorBody('NOT_FOUND');
-    });
-    return runTestRunAll(baseOpts, {
-      credentialsPath,
-      fetchImpl,
-      stdout: () => undefined,
-      stderr: line => stderr.push(line),
-      env: {} as NodeJS.ProcessEnv,
-      sleep: instantSleep,
-    })
-      .catch(() => undefined)
-      .then(() => stderr.join('\n'));
-  }
-
-  // The gap this covers: first attempt honoured the opt-out, the retry did not.
-  it('warns when only the RETRY dispatch reports the opt-out dropped', async () => {
-    const err = await twoDispatches({ autoHeal: false }, { autoHeal: true });
-    expect(err).toContain('[advisory]');
-    expect(err).toContain('not applied by the server');
-  });
-
-  // Deduped on OUTCOME, not fired once: the same story twice is noise.
-  it('does not repeat the same advisory for both dispatches', async () => {
-    const err = await twoDispatches({}, {});
-    const hits = err.split('\n').filter(l => l.includes('does not support it yet'));
-    expect(hits).toHaveLength(1);
-  });
-
-  // ...but a retry that tells a DIFFERENT story is new information.
-  it('warns again when the retry reports a different outcome than the first attempt', async () => {
-    const err = await twoDispatches({}, { autoHeal: true });
-    expect(err).toContain('does not support it yet');
-    expect(err).toContain('not applied by the server');
-  });
-});
-
-describe('[codex-P1] run --all deferred-retry: retry-conflicts merged into final accounting', () => {
-  it('deferred→conflict on retry: summary.conflicts reflects retry-returned conflicts; exits 6 when all paths resolve to conflict', async () => {
-    const { credentialsPath } = makeCreds();
-
-    // Initial dispatch: 1 deferred, 0 accepted, 0 initial conflicts.
-    const initialResp: BatchRunFreshResponse = {
-      accepted: [],
-      deferred: [{ testId: 'test_deferred' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    // Retry response: the deferred test is now in-flight (conflict).
-    const retryResp: BatchRunFreshResponse = {
-      accepted: [],
-      deferred: [],
-      conflicts: [{ testId: 'test_deferred' }],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-
-    let batchCallCount = 0;
-    const printed: Array<Record<string, unknown>> = [];
-    const stderrLines: string[] = [];
-
-    const fetchImpl = makeFetch((_url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCallCount++;
-        return { body: batchCallCount === 1 ? initialResp : retryResp };
-      }
-      return errorBody('NOT_FOUND');
-    });
-
-    try {
-      await runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 300,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-          stderr: line => stderrLines.push(line),
-          sleep: instantSleep,
-        },
-      );
-      // Should not reach here: exit 6 because accepted=0 and conflicts>0 after retry
-      throw new Error('Expected runTestRunAll to throw');
-    } catch (err) {
-      // After D3 retries drain deferred→conflict: accepted=0, conflicts=[test_deferred]
-      // The code should throw CONFLICT (exit 6) because accepted=0 and conflicts>0.
-      expect((err as ApiError).exitCode).toBe(6);
-    }
-
-    // The retry must have fired (initial + 1 retry = 2 calls, since deferred drains)
-    expect(batchCallCount).toBeGreaterThanOrEqual(2);
-
-    // The final JSON payload must include the retry-discovered conflict, not just the initial []
-    const withConflicts = printed.find(
-      p => Array.isArray(p.conflicts) && (p.conflicts as unknown[]).length > 0,
-    );
-    expect(withConflicts).toBeDefined();
-    expect(
-      (withConflicts?.conflicts as Array<{ testId: string }>).some(
-        c => c.testId === 'test_deferred',
-      ),
-    ).toBe(true);
-  });
-
-  it('deferred→partially-conflict on retry: retry-conflicts appear in JSON summary; hard conflict exits 6', async () => {
-    const { credentialsPath } = makeCreds();
-
-    // Initial dispatch: 2 deferred, 1 accepted.
-    const initialResp: BatchRunFreshResponse = {
-      accepted: [{ testId: 'test_ok', runId: 'run_ok', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
-      deferred: [{ testId: 'test_deferred_a' }, { testId: 'test_deferred_b' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    // Retry: one accepted, one becomes conflict.
-    const retryResp: BatchRunFreshResponse = {
-      accepted: [
-        {
-          testId: 'test_deferred_a',
-          runId: 'run_deferred_a',
-          enqueuedAt: '2026-06-09T10:00:01.000Z',
-        },
-      ],
-      deferred: [],
-      conflicts: [{ testId: 'test_deferred_b' }],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-
-    let batchCallCount = 0;
-    const printed: Array<Record<string, unknown>> = [];
-
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCallCount++;
-        return { body: batchCallCount === 1 ? initialResp : retryResp };
-      }
-      // Poll: both accepted runs return passed
-      if (url.includes('/runs/run_ok')) {
-        return {
-          body: {
-            runId: 'run_ok',
-            testId: 'test_ok',
-            projectId: 'project_be',
-            userId: 'u1',
-            status: 'passed',
-            source: 'cli',
-            createdAt: '2026-06-09T10:00:00.000Z',
-            startedAt: '2026-06-09T10:00:01.000Z',
-            finishedAt: '2026-06-09T10:00:30.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://api.example.com',
-            createdFrom: 'cli',
-            failedStepIndex: null,
-            failureKind: null,
-            error: null,
-            videoUrl: null,
-            stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-          } satisfies RunResponse,
-        };
-      }
-      if (url.includes('/runs/run_deferred_a')) {
-        return {
-          body: {
-            runId: 'run_deferred_a',
-            testId: 'test_deferred_a',
-            projectId: 'project_be',
-            userId: 'u1',
-            status: 'passed',
-            source: 'cli',
-            createdAt: '2026-06-09T10:00:00.000Z',
-            startedAt: '2026-06-09T10:00:01.000Z',
-            finishedAt: '2026-06-09T10:00:30.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://api.example.com',
-            createdFrom: 'cli',
-            failedStepIndex: null,
-            failureKind: null,
-            error: null,
-            videoUrl: null,
-            stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-          } satisfies RunResponse,
-        };
-      }
-      return errorBody('NOT_FOUND');
-    });
-
-    // test_deferred_b is a HARD conflict (no currentRunId) → not runnable, not
-    // resumable → the batch exits 6 even though the two accepted runs passed.
-    // The JSON payload is still printed BEFORE the exit-6 gate, so the merge
-    // assertions below hold.
-    await expect(
-      runTestRunAll(
-        {
-          profile: 'default',
-          output: 'json',
-          debug: false,
-          projectId: 'project_be',
-          wait: true,
-          timeoutSeconds: 300,
-          maxConcurrency: 5,
-        },
-        {
-          credentialsPath,
-          fetchImpl,
-          stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-          stderr: () => undefined,
-          sleep: instantSleep,
-        },
-      ),
-    ).rejects.toMatchObject({ exitCode: 6 });
-
-    // summary must include the retry-discovered conflict in the conflicts count
-    const withSummary = printed.find(p => p.summary);
-    expect(withSummary).toBeDefined();
-    expect((withSummary?.summary as Record<string, number>).conflicts).toBe(1);
-    expect((withSummary?.summary as Record<string, number>).passed).toBe(2); // both accepted runs passed
-    expect(
-      (withSummary?.conflicts as Array<{ testId: string }>).some(
-        c => c.testId === 'test_deferred_b',
-      ),
-    ).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// D3 deferred-retry is BUDGET-DRIVEN, not capped at a fixed attempt count:
-// a busy pool that keeps deferring for more than 3 tries still drains as long
-// as the --timeout budget remains. Before this fix the loop stopped after
-// MAX_DEFERRED_RETRIES (3) attempts and failed the run (exit 7) even with
-// budget left. instantSleep does not advance the clock, so the deadline never
-// trips here — the run resolves purely because the loop keeps retrying beyond 3.
-// ---------------------------------------------------------------------------
-
-describe('run --all deferred-retry: budget-driven (retries beyond the old fixed cap)', () => {
-  it('a pool that defers for 4 retries still accepts and passes when the timeout budget allows', async () => {
-    const { credentialsPath } = makeCreds();
-
-    const deferredResp: BatchRunFreshResponse = {
-      accepted: [],
-      deferred: [{ testId: 'test_busy' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const acceptedResp: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_busy', runId: 'run_busy', enqueuedAt: '2026-06-09T10:00:05.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-
-    let batchCallCount = 0;
-    const printed: Array<Record<string, unknown>> = [];
-
-    // Calls 1-4 (initial dispatch + 3 retries) defer; call 5 (the 4th retry —
-    // one past the old MAX_DEFERRED_RETRIES=3 cap) finally accepts.
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCallCount++;
-        return { body: batchCallCount >= 5 ? acceptedResp : deferredResp };
-      }
-      if (url.includes('/runs/run_busy')) {
-        return {
-          body: {
-            runId: 'run_busy',
-            testId: 'test_busy',
-            projectId: 'project_be',
-            userId: 'u1',
-            status: 'passed',
-            source: 'cli',
-            createdAt: '2026-06-09T10:00:00.000Z',
-            startedAt: '2026-06-09T10:00:05.000Z',
-            finishedAt: '2026-06-09T10:00:30.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://api.example.com',
-            createdFrom: 'cli',
-            failedStepIndex: null,
-            failureKind: null,
-            error: null,
-            videoUrl: null,
-            stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-          } satisfies RunResponse,
-        };
-      }
-      return errorBody('NOT_FOUND');
-    });
-
-    // Large budget → maxDeferredAttempts = max(3, ceil(600/60)+2) = 12, well
-    // past the 5 calls this test needs. Under the old fixed cap of 3 the loop
-    // would stop after call 4 with test_busy still deferred → exit 7.
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 600,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => printed.push(JSON.parse(line) as Record<string, unknown>),
-        stderr: () => {},
-        sleep: instantSleep,
-      },
-    );
-
-    // The 5th POST (4th retry) is what accepts — proof the loop retried past 3.
-    expect(batchCallCount).toBe(5);
-    const payload = printed.find(p => p.summary && typeof p.summary === 'object');
-    expect(payload).toBeDefined();
-    expect((payload?.summary as { passed: number }).passed).toBe(1);
-  });
-
-  // NOTE: the deferred-retry dispatch POST is deliberately NOT bound to the
-  // batch deadline via an AbortSignal (aborting a state-creating dispatch
-  // mid-flight leaves the outcome indeterminate and can duplicate runs on the
-  // next invocation — see the comment at the call site). This isn't unit-tested
-  // by signal inspection because the HttpClient's own `--request-timeout` always
-  // attaches a request-scoped AbortSignal, so presence alone can't distinguish
-  // the (removed) deadline signal from the (kept) request-timeout one.
-});
-
-// ---------------------------------------------------------------------------
 // Gap B: `run --all --wait` auto-resumes an already-running case (a conflict
 // carrying `currentRunId`) by polling the existing run to a verdict, instead
 // of failing the batch on the conflict.
@@ -5677,101 +4971,6 @@ describe('run --all --wait: auto-resume already-running conflicts (Gap B)', () =
         },
       ),
     ).rejects.toMatchObject({ exitCode: 6 });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// [P2] D3 idempotency key truncation: derived retry keys stay ≤ 256 chars
-// ---------------------------------------------------------------------------
-
-describe('[codex-P2] run --all deferred-retry: idempotency key truncation', () => {
-  it('retry idempotency key does not exceed 256 chars when base key is at the 256-char limit', async () => {
-    const { credentialsPath } = makeCreds();
-
-    // A caller-supplied key exactly at the 256-char limit
-    const longKey = 'k'.repeat(256);
-
-    const initialResp: BatchRunFreshResponse = {
-      accepted: [],
-      deferred: [{ testId: 'test_deferred' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const retryResp: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_deferred', runId: 'run_d', enqueuedAt: '2026-06-09T10:00:00.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-
-    const capturedIdempotencyKeys: string[] = [];
-    let batchCallCount = 0;
-
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        const key = (init.headers as Record<string, string>)?.['idempotency-key'] ?? '';
-        capturedIdempotencyKeys.push(key);
-        batchCallCount++;
-        return { body: batchCallCount === 1 ? initialResp : retryResp };
-      }
-      if (url.includes('/runs/run_d')) {
-        return {
-          body: {
-            runId: 'run_d',
-            testId: 'test_deferred',
-            projectId: 'project_be',
-            userId: 'u1',
-            status: 'passed',
-            source: 'cli',
-            createdAt: '2026-06-09T10:00:00.000Z',
-            startedAt: '2026-06-09T10:00:01.000Z',
-            finishedAt: '2026-06-09T10:00:30.000Z',
-            codeVersion: 'v1',
-            targetUrl: 'https://api.example.com',
-            createdFrom: 'cli',
-            failedStepIndex: null,
-            failureKind: null,
-            error: null,
-            videoUrl: null,
-            stepSummary: { total: 1, completed: 1, passedCount: 1, failedCount: 0 },
-          } satisfies RunResponse,
-        };
-      }
-      return errorBody('NOT_FOUND');
-    });
-
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 300,
-        maxConcurrency: 5,
-        idempotencyKey: longKey,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: () => undefined,
-        stderr: () => undefined,
-        sleep: instantSleep,
-      },
-    );
-
-    // All captured keys must be ≤ 256 chars
-    for (const key of capturedIdempotencyKeys) {
-      expect(key.length).toBeLessThanOrEqual(256);
-    }
-    // The retry key must differ from the base key (suffix was appended)
-    expect(capturedIdempotencyKeys.length).toBeGreaterThanOrEqual(2);
-    expect(capturedIdempotencyKeys[1]).not.toBe(longKey);
-    expect(capturedIdempotencyKeys[1]).toContain('deferred-retry');
   });
 });
 
@@ -7518,324 +6717,6 @@ describe('early run receipt', () => {
 });
 
 // ---------------------------------------------------------------------------
-// A deferred retry asks only for the still-deferred ids but can come back with
-// a test the first dispatch already ran. Keeping both entries polled the same
-// test twice and made `summary.total` exceed the number of tests.
-// ---------------------------------------------------------------------------
-
-describe('run --all deferred-retry: accepted[] is deduped by testId', () => {
-  function makeBatchPassedRun(runId: string, testId: string): RunResponse {
-    return {
-      runId,
-      testId,
-      projectId: 'project_be',
-      userId: 'user_1',
-      status: 'passed',
-      source: 'cli',
-      createdAt: '2026-08-27T10:00:00.000Z',
-      startedAt: '2026-08-27T10:00:01.000Z',
-      finishedAt: '2026-08-27T10:00:30.000Z',
-      codeVersion: 'v1',
-      targetUrl: 'https://api.example.com',
-      createdFrom: 'cli',
-      failedStepIndex: null,
-      failureKind: null,
-      error: null,
-      videoUrl: null,
-      stepSummary: { total: 3, completed: 3, passedCount: 3, failedCount: 0 },
-    };
-  }
-
-  it('a retry that re-returns an already-dispatched test keeps the first run and warns', async () => {
-    const { credentialsPath } = makeCreds();
-
-    // Initial: consumer deferred, producer dispatched.
-    const initialResp: BatchRunFreshResponse = {
-      accepted: [
-        {
-          testId: 'test_producer',
-          runId: 'run_producer_1',
-          enqueuedAt: '2026-08-27T10:00:00.000Z',
-        },
-      ],
-      deferred: [{ testId: 'test_consumer' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    // Retry names only test_consumer, but comes back with the producer too.
-    const retryResp: BatchRunFreshResponse = {
-      accepted: [
-        {
-          testId: 'test_consumer',
-          runId: 'run_consumer_1',
-          enqueuedAt: '2026-08-27T10:01:00.000Z',
-        },
-        {
-          testId: 'test_producer',
-          runId: 'run_producer_2',
-          enqueuedAt: '2026-08-27T10:01:00.000Z',
-        },
-      ],
-      deferred: [],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-
-    let batchCalls = 0;
-    const polled: string[] = [];
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCalls++;
-        return { body: batchCalls === 1 ? initialResp : retryResp };
-      }
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? '';
-      polled.push(runId);
-      const testId = runId.startsWith('run_producer') ? 'test_producer' : 'test_consumer';
-      return { body: { ...makeBatchPassedRun(runId, testId) } };
-    });
-
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 300,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-
-    expect(batchCalls).toBe(2);
-
-    const payload = JSON.parse(stdoutLines.join('\n')) as {
-      accepted: Array<{ testId: string; runId: string }>;
-      summary: { total: number };
-    };
-
-    // Two tests were requested, so two runs are reported — not three.
-    expect(payload.accepted).toHaveLength(2);
-    expect(payload.summary.total).toBe(2);
-    expect(payload.accepted.map(a => a.testId).sort()).toEqual(['test_consumer', 'test_producer']);
-
-    // The first run of the duplicated test is the one kept.
-    expect(payload.accepted.find(a => a.testId === 'test_producer')?.runId).toBe('run_producer_1');
-
-    // The superseded runId is never polled.
-    expect(polled).not.toContain('run_producer_2');
-
-    // The operator is told which run is unpolled, by id, and how to stop it.
-    const warned = stderrLines.join('\n');
-    expect(warned).toContain('duplicate dispatch');
-    expect(warned).toContain('polling run_producer_1, not polling run_producer_2');
-    expect(warned).toContain('testsprite test cancel <run-id>');
-  });
-
-  it('a retry echoing the same runId is the same run, so nothing is reported', async () => {
-    const { credentialsPath } = makeCreds();
-
-    const initialResp: BatchRunFreshResponse = {
-      accepted: [{ testId: 'test_a', runId: 'run_a', enqueuedAt: '2026-08-27T10:00:00.000Z' }],
-      deferred: [{ testId: 'test_b' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    // The retry re-reports test_a with the run it already has — an echo, not a
-    // second dispatch. Nothing extra is executing, so nothing is unpolled.
-    const retryResp: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_a', runId: 'run_a', enqueuedAt: '2026-08-27T10:00:00.000Z' },
-        { testId: 'test_b', runId: 'run_b', enqueuedAt: '2026-08-27T10:01:00.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-
-    let batchCalls = 0;
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCalls++;
-        return { body: batchCalls === 1 ? initialResp : retryResp };
-      }
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? '';
-      return { body: makeBatchPassedRun(runId, runId === 'run_a' ? 'test_a' : 'test_b') };
-    });
-
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 300,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-
-    const payload = JSON.parse(stdoutLines.join('\n')) as {
-      accepted: Array<{ testId: string; runId: string }>;
-      summary: { total: number };
-    };
-    expect(payload.accepted).toHaveLength(2);
-    expect(payload.summary.total).toBe(2);
-    expect(stderrLines.some(l => l.includes('duplicate dispatch'))).toBe(false);
-  });
-
-  it('two extra runs are reported in the plural, each named', async () => {
-    const { credentialsPath } = makeCreds();
-
-    const initialResp: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_a', runId: 'run_a1', enqueuedAt: '2026-08-27T10:00:00.000Z' },
-        { testId: 'test_b', runId: 'run_b1', enqueuedAt: '2026-08-27T10:00:00.000Z' },
-      ],
-      deferred: [{ testId: 'test_c' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    // The retry re-dispatches both already-running tests with NEW run ids.
-    const retryResp: BatchRunFreshResponse = {
-      accepted: [
-        { testId: 'test_c', runId: 'run_c1', enqueuedAt: '2026-08-27T10:01:00.000Z' },
-        { testId: 'test_a', runId: 'run_a2', enqueuedAt: '2026-08-27T10:01:00.000Z' },
-        { testId: 'test_b', runId: 'run_b2', enqueuedAt: '2026-08-27T10:01:00.000Z' },
-      ],
-      deferred: [],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-
-    let batchCalls = 0;
-    const polled: string[] = [];
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCalls++;
-        return { body: batchCalls === 1 ? initialResp : retryResp };
-      }
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? '';
-      polled.push(runId);
-      return { body: makeBatchPassedRun(runId, `test_${runId.charAt(4)}`) };
-    });
-
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 300,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-
-    const payload = JSON.parse(stdoutLines.join('\n')) as { summary: { total: number } };
-    expect(payload.summary.total).toBe(3);
-
-    const warned = stderrLines.join('\n');
-    expect(warned).toContain('2 duplicate dispatches');
-    expect(warned).toContain('polling run_a1, not polling run_a2');
-    expect(warned).toContain('polling run_b1, not polling run_b2');
-    expect(polled).not.toContain('run_a2');
-    expect(polled).not.toContain('run_b2');
-  });
-
-  it('a retry with no overlap keeps every accepted entry and emits no warning', async () => {
-    const { credentialsPath } = makeCreds();
-
-    const initialResp: BatchRunFreshResponse = {
-      accepted: [{ testId: 'test_a', runId: 'run_a', enqueuedAt: '2026-08-27T10:00:00.000Z' }],
-      deferred: [{ testId: 'test_b' }],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-    const retryResp: BatchRunFreshResponse = {
-      accepted: [{ testId: 'test_b', runId: 'run_b', enqueuedAt: '2026-08-27T10:01:00.000Z' }],
-      deferred: [],
-      conflicts: [],
-      skippedFrontend: [],
-      skippedIntegration: [],
-    };
-
-    let batchCalls = 0;
-    const stdoutLines: string[] = [];
-    const stderrLines: string[] = [];
-    const fetchImpl = makeFetch((url, init) => {
-      if ((init.method ?? 'GET') === 'POST') {
-        batchCalls++;
-        return { body: batchCalls === 1 ? initialResp : retryResp };
-      }
-      const runId = url.split('/runs/')[1]?.split('?')[0] ?? '';
-      return { body: makeBatchPassedRun(runId, runId === 'run_a' ? 'test_a' : 'test_b') };
-    });
-
-    await runTestRunAll(
-      {
-        profile: 'default',
-        output: 'json',
-        debug: false,
-        projectId: 'project_be',
-        wait: true,
-        timeoutSeconds: 300,
-        maxConcurrency: 5,
-      },
-      {
-        credentialsPath,
-        fetchImpl,
-        stdout: line => stdoutLines.push(line),
-        stderr: line => stderrLines.push(line),
-        sleep: instantSleep,
-      },
-    );
-
-    const payload = JSON.parse(stdoutLines.join('\n')) as {
-      accepted: Array<{ testId: string }>;
-      summary: { total: number };
-    };
-    expect(payload.accepted).toHaveLength(2);
-    expect(payload.summary.total).toBe(2);
-    expect(stderrLines.some(l => l.includes('duplicate dispatch'))).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
 // Billing refusals on the batch surface + per-command telemetry facts
 // ---------------------------------------------------------------------------
 
@@ -8356,6 +7237,253 @@ describe('runTestRunAll — pure in-flight conflict wording is restored to origi
   });
 });
 
+describe('test run --all: dependency refusals in the batch advisory', () => {
+  it('names no_producer and producer_in_flight instead of repeating "not dispatched"', async () => {
+    const { credentialsPath } = makeCreds();
+    const resp: BatchRunFreshResponse = {
+      accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
+      conflicts: [
+        { testId: 't2', reason: 'no_producer', message: 'Missing "x"' },
+        { testId: 't3', reason: 'producer_in_flight', currentRunId: 'run_other' },
+      ],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: resp };
+      return { body: { items: [], nextToken: null } };
+    });
+    const stderr: string[] = [];
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: false,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderr.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(() => undefined);
+    const advisory = stderr.find(l => l.includes('not dispatched')) ?? '';
+    expect(advisory).toContain(
+      '2 tests not dispatched (1 no producer for its variables, 1 producer running in another run), skipped: t2 t3',
+    );
+  });
+});
+
+describe('test run --all --wait: a consumer seeded blocked is not auto-resumed', () => {
+  // The server answers no_producer / producer_in_flight with the id of the
+  // result it seeded BLOCKED for this request, before dispatch.
+  it.each([
+    [
+      'producer_in_flight',
+      '1 producer running in another run — blocked before dispatch.',
+      'Wait for the in-flight run(s) to finish, then retry: t2',
+    ],
+    [
+      'no_producer',
+      '1 no producer for its variables — blocked before dispatch.',
+      'Add or accept a test case that captures the missing variable (or supply it from the environment), then retry: t2',
+    ],
+  ] as const)(
+    '%s: reports the refusal with exit 6, never polls its seeded result',
+    async (reason, message, nextAction) => {
+      const { credentialsPath } = makeCreds();
+      const resp: BatchRunFreshResponse = {
+        accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
+        conflicts: [{ testId: 't2', reason, currentRunId: 'run_seeded_blocked' }],
+        deferred: [],
+        skippedFrontend: [],
+        skippedIntegration: [],
+      };
+      const urls: string[] = [];
+      const fetchImpl = makeFetch((url, init) => {
+        urls.push(url);
+        if ((init.method ?? 'GET') === 'POST') return { body: resp };
+        if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
+        if (url.includes('run_seeded_blocked')) {
+          return {
+            body: {
+              ...makePassedRun(),
+              runId: 'run_seeded_blocked',
+              testId: 't2',
+              status: 'blocked',
+            },
+          };
+        }
+        return { body: makePassedRun() };
+      });
+      const err = (await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => undefined,
+          stderr: () => undefined,
+          sleep: instantSleep,
+        },
+      ).catch(e => e)) as ApiError;
+      expect(urls.some(u => u.includes('run_seeded_blocked'))).toBe(false);
+      expect(err.code).toBe('CONFLICT');
+      expect(err.exitCode).toBe(6);
+      expect(err.message).toBe(message);
+      expect(err.nextAction).toBe(nextAction);
+    },
+  );
+
+  it('still polls the run id of a reason it has no label for (tunnel-required)', async () => {
+    const { credentialsPath } = makeCreds();
+    const resp: BatchRunFreshResponse = {
+      accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
+      conflicts: [
+        {
+          testId: 't2',
+          reason: 'tunnel-required' as unknown as ConflictReason,
+          currentRunId: 'run_seeded_tunnel',
+        },
+      ],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const urls: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      urls.push(url);
+      if ((init.method ?? 'GET') === 'POST') return { body: resp };
+      if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
+      if (url.endsWith('/env')) return { body: CURRENT_DEFAULT_ENVIRONMENTS };
+      if (url.includes('run_seeded_tunnel')) {
+        return {
+          body: { ...makePassedRun(), runId: 'run_seeded_tunnel', testId: 't2', status: 'blocked' },
+        };
+      }
+      return { body: makePassedRun() };
+    });
+    const err = (await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_fe',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(e => e)) as ApiError;
+    expect(urls.some(u => u.includes('run_seeded_tunnel'))).toBe(true);
+    expect(err.exitCode).toBe(1);
+  });
+
+  it.each([false, true])(
+    'nothing queued, only no_producer (wait=%s): says to add a producer, not to wait',
+    async wait => {
+      const { credentialsPath } = makeCreds();
+      const resp: BatchRunFreshResponse = {
+        accepted: [],
+        conflicts: [
+          { testId: 't1', reason: 'no_producer', currentRunId: 'run_seeded_1' },
+          { testId: 't2', reason: 'no_producer', currentRunId: 'run_seeded_2' },
+        ],
+        deferred: [],
+        skippedFrontend: [],
+        skippedIntegration: [],
+      };
+      const fetchImpl = makeFetch((url, init) => {
+        if ((init.method ?? 'GET') === 'POST') return { body: resp };
+        return { body: { items: [], nextToken: null } };
+      });
+      const err = (await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => undefined,
+          stderr: () => undefined,
+          sleep: instantSleep,
+        },
+      ).catch(e => e)) as ApiError;
+      expect(err.exitCode).toBe(6);
+      expect(err.message).toBe('Batch run: nothing was queued — 2 no producer for its variables.');
+      expect(err.nextAction).toBe(
+        'Add or accept a test case that captures the missing variable (or supply it from the environment), then retry: t1 t2',
+      );
+    },
+  );
+
+  it('a mixed hard-conflict batch names who waits and who needs a producer', async () => {
+    const { credentialsPath } = makeCreds();
+    const resp: BatchRunFreshResponse = {
+      accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-06-09T10:00:00.000Z' }],
+      conflicts: [
+        { testId: 't2', reason: 'producer_in_flight', currentRunId: 'run_seeded_2' },
+        { testId: 't3', reason: 'no_producer', currentRunId: 'run_seeded_3' },
+      ],
+      deferred: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') return { body: resp };
+      if (url.includes('/tests?')) return { body: { items: [], nextToken: null } };
+      return { body: makePassedRun() };
+    });
+    const err = (await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 60,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    ).catch(e => e)) as ApiError;
+    expect(err.nextAction).toBe(
+      'Wait for the in-flight run(s) to finish, then retry: t2\n' +
+        'Add or accept a test case that captures the missing variable (or supply it from the environment), then retry: t3',
+    );
+  });
+});
+
 // ---------------------------------------------------------------------------
 // `--env <name>`: a named environment on the run surfaces
 // ---------------------------------------------------------------------------
@@ -8839,4 +7967,175 @@ describe('run output regressions', () => {
       rmSync(dir, { recursive: true, force: true });
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// A deferral from an older backend is reported, never resent. Runs queue
+// inside their execution on the server now, so the client has no cap to wait
+// out: no 61 s sleep, no second dispatch, the accepted runs are still awaited.
+// ---------------------------------------------------------------------------
+
+describe('run --all: deferred[] from an older backend is reported, not resent', () => {
+  function deferredBatch(): BatchRunFreshResponse {
+    return {
+      accepted: [{ testId: 'test_ok', runId: 'run_ok', enqueuedAt: '2026-10-22T10:00:00.000Z' }],
+      deferred: [{ testId: 'test_later' }],
+      conflicts: [],
+      skippedFrontend: [],
+      skippedIntegration: [],
+    };
+  }
+
+  it('--wait sends one dispatch, never sleeps for the old resend, awaits the accepted run, exits 7', async () => {
+    const { credentialsPath } = makeCreds();
+    let posts = 0;
+    const sleeps: number[] = [];
+    const stderrLines: string[] = [];
+    const stdoutLines: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') {
+        posts++;
+        return { body: deferredBatch() };
+      }
+      if (url.includes('/runs/run_ok')) {
+        return { body: { ...makePassedRun(), runId: 'run_ok', testId: 'test_ok' } };
+      }
+      return { body: { items: [], nextToken: null } };
+    });
+    await expect(
+      runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 600,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: line => stdoutLines.push(line),
+          stderr: line => stderrLines.push(line),
+          sleep: async ms => {
+            sleeps.push(ms);
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 7 });
+    expect(posts).toBe(1);
+    expect(sleeps.filter(ms => ms >= 60_000)).toEqual([]);
+    expect(stderrLines.join('\n')).not.toContain('[deferred-retry]');
+    expect(stderrLines.join('\n')).toContain('Rate-deferred testIds');
+    expect(stderrLines.join('\n')).toContain('test_later');
+    const payload = JSON.parse(stdoutLines.find(l => l.includes('"summary"'))!) as {
+      deferred: Array<{ testId: string }>;
+      summary: { passed: number };
+    };
+    expect(payload.summary.passed).toBe(1);
+    expect(payload.deferred).toEqual([{ testId: 'test_later' }]);
+  });
+
+  it('--wait with every id deferred: one dispatch, no sleep, exit 7', async () => {
+    const { credentialsPath } = makeCreds();
+    let posts = 0;
+    const sleeps: number[] = [];
+    const fetchImpl = makeFetch((_url, init) => {
+      if ((init.method ?? 'GET') === 'POST') {
+        posts++;
+        return { body: { ...deferredBatch(), accepted: [] } };
+      }
+      return { body: { items: [], nextToken: null } };
+    });
+    await expect(
+      runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 600,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => undefined,
+          stderr: () => undefined,
+          sleep: async ms => {
+            sleeps.push(ms);
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 7 });
+    expect(posts).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+});
+
+describe('run --all --wait: a queued run is waited through', () => {
+  it('queued → running → passed is polled to the verdict and the run is reported passed', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+    const sequence = ['queued', 'queued', 'running', 'passed'] as const;
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'POST') {
+        return {
+          body: {
+            accepted: [
+              { testId: 'test_q', runId: 'run_q', enqueuedAt: '2026-10-22T10:00:00.000Z' },
+            ],
+            deferred: [],
+            conflicts: [],
+            skippedFrontend: [],
+            skippedIntegration: [],
+          } satisfies BatchRunFreshResponse,
+        };
+      }
+      if (url.includes('/runs/run_q')) {
+        const status = sequence[Math.min(seen.length, sequence.length - 1)]!;
+        seen.push(status);
+        const base = { ...makePassedRun(), runId: 'run_q', testId: 'test_q' };
+        return status === 'passed'
+          ? { body: base }
+          : {
+              body: {
+                ...base,
+                status,
+                finishedAt: null,
+                startedAt: status === 'running' ? base.startedAt : null,
+                stepSummary: { total: 0, completed: 0, passedCount: 0, failedCount: 0 },
+              },
+            };
+      }
+      return { body: { items: [], nextToken: null } };
+    });
+    await runTestRunAll(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_be',
+        wait: true,
+        timeoutSeconds: 600,
+        maxConcurrency: 5,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+        sleep: instantSleep,
+      },
+    );
+    expect(seen).toEqual(['queued', 'queued', 'running', 'passed']);
+    const payload = JSON.parse(stdoutLines.find(l => l.includes('"summary"'))!) as {
+      summary: { passed: number; total: number };
+    };
+    expect(payload.summary).toMatchObject({ passed: 1, total: 1 });
+  });
 });
