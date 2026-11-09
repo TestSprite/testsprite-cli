@@ -6,12 +6,14 @@
  *      targets are settled here, before anything is written
  *   1. runConfigure  — writes the API-key profile (validates via GET /me first)
  *   2. runWhoami     — fetches identity for the post-configure banner
+ *   2.5 ensureTestspriteIgnored — appends .testsprite/ to .gitignore inside a Git repo (unless --no-gitignore)
  *   3. runInstall    — installs the TestSprite verification-loop skill (unless --no-agent)
  *   4. Summary print — JSON object or human text block
  *
  * Hard constraint: orchestrate existing exported primitives; never fork them.
  */
 
+import path from 'node:path';
 import { Command } from 'commander';
 import {
   parseRequestTimeoutFlag,
@@ -36,6 +38,12 @@ import {
 import { promptText } from '../lib/prompt.js';
 import type { FetchImpl } from '../lib/http.js';
 import { readProfile } from '../lib/credentials.js';
+import {
+  ensureTestspriteIgnored,
+  checkTestspriteIgnored,
+  isInsideGitRepoAsync,
+  type GitUtilsDeps,
+} from '../lib/git-utils.js';
 
 /** Mirrors auth.ts's DEFAULT_API_URL (kept in sync; auth.ts owns the canonical value). */
 const DEFAULT_API_URL = 'https://api.testsprite.com';
@@ -105,6 +113,7 @@ interface InitOptions extends CommonOptions {
    */
   agent?: AgentTarget;
   noAgent: boolean;
+  noGitignore?: boolean;
   force: boolean;
   dir?: string;
   yes: boolean;
@@ -292,6 +301,29 @@ function shouldConfirmTargets(
 }
 
 const CONFIRM_TARGETS_MAX_ATTEMPTS = 3;
+
+/** Resolve the project root used for the .git walk and .gitignore (relative --dir is resolved against cwd). */
+function resolveProjectDir(opts: InitOptions, deps: InitDeps): string {
+  return path.resolve(opts.dir ?? deps.cwd ?? process.cwd());
+}
+
+/** Route .gitignore access through the injected agent fs when present (tests); real fs otherwise. */
+function buildGitignoreDeps(deps: InitDeps): GitUtilsDeps {
+  const agentFs = deps.fs;
+  if (!agentFs) return {};
+  return {
+    exists: async p => (await agentFs.lstat(p)) !== null,
+    lstat: async p => {
+      const st = await agentFs.lstat(p);
+      return st === null ? null : { isSymbolicLink: st.isSymbolicLink };
+    },
+    readFile: p => agentFs.readFile(p),
+    appendFile: async (p, text) => {
+      const current = (await agentFs.lstat(p)) === null ? '' : await agentFs.readFile(p);
+      await agentFs.writeFile(p, current + text);
+    },
+  };
+}
 
 /**
  * Let an operator see and edit the detected set before anything is written.
@@ -497,6 +529,17 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
       );
     }
 
+    if (!opts.noGitignore) {
+      const projectDir = resolveProjectDir(opts, deps);
+      const gitignoreDeps = buildGitignoreDeps(deps);
+      if (await isInsideGitRepoAsync(projectDir, gitignoreDeps)) {
+        const isIgnored = await checkTestspriteIgnored(projectDir, gitignoreDeps);
+        if (!isIgnored) {
+          stderrFn('[dry-run] would ignore .testsprite/ in .gitignore');
+        }
+      }
+    }
+
     const summary: InitSummary = {
       profile: opts.profile,
       apiUrl: resolveReportedEndpoint(opts, deps),
@@ -565,6 +608,29 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
       stderrFn(`[debug] setup identity lookup failed after configure: ${reason}`);
     }
     me = { userId: '', keyId: '', scopes: [], env: 'production' };
+  }
+
+  // -------------------------------------------------------------------------
+  // Step 2.5: Ensure .testsprite/ is ignored in .gitignore
+  // -------------------------------------------------------------------------
+  // Runs before the agent install so a failing skill install (which re-throws)
+  // cannot skip it after credentials were already saved. Never blocks setup.
+  if (!opts.noGitignore) {
+    try {
+      const appended = await ensureTestspriteIgnored(
+        resolveProjectDir(opts, deps),
+        buildGitignoreDeps(deps),
+      );
+      if (appended) {
+        stderrFn(
+          '[info] Added .testsprite/ to .gitignore (failure artifacts stay local; pass --no-gitignore to skip)',
+        );
+      }
+    } catch (err) {
+      stderrFn(
+        `[warn] Failed to update .gitignore: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -786,6 +852,8 @@ export interface SetupCmdOpts {
    */
   agent: string | false;
   noAgent?: boolean;
+  gitignore?: boolean;
+  noGitignore?: boolean;
   force?: boolean;
   dir?: string;
   yes?: boolean;
@@ -816,9 +884,13 @@ export function addSetupOptions(
         `(default: every agent detected in this project, or ${defaultAgent} if none)`,
     )
     .option('--no-agent', 'Skip the agent skill install (configure credentials only)')
+    .option('--no-gitignore', 'Skip adding .testsprite/ to .gitignore')
     .option('--force', 'Overwrite an existing skill file (a .bak backup is kept)')
     .option('--dir <path>', 'Project root for the skill install (default: current directory)')
-    .option('-y, --yes', 'Non-interactive: accept all defaults, never prompt')
+    .option(
+      '-y, --yes',
+      'Non-interactive: accept defaults, never prompt (needs --from-env or --api-key)',
+    )
     .option(
       '--skip-if-configured',
       'Skip the API key prompt when credentials already exist for this profile (CI-safe idempotent re-run)',
@@ -836,6 +908,7 @@ function buildSetupOptions(
   // Commander sets `agent: false` (boolean) when `--no-agent` is passed,
   // because `--no-agent` is the negation of `--agent <target>`.
   const isNoAgent = cmdOpts.noAgent === true || cmdOpts.agent === false;
+  const isNoGitignore = cmdOpts.noGitignore === true || cmdOpts.gitignore === false;
 
   // Detect conflict when both --no-agent and --agent <target> appear in the raw
   // args. Commander only populates `rawArgs` on the ROOT command passed to
@@ -861,6 +934,7 @@ function buildSetupOptions(
     fromEnv: Boolean(cmdOpts.fromEnv),
     agent: chosenAgent,
     noAgent: isNoAgent,
+    noGitignore: isNoGitignore,
     force: Boolean(cmdOpts.force),
     dir: cmdOpts.dir,
     yes: Boolean(cmdOpts.yes),
@@ -893,8 +967,17 @@ export function createSetupCommand(deps: InitDeps = {}): Command {
   const defaultAgent: AgentTarget = 'claude';
 
   return addSetupOptions(new Command('setup'), validTargets, defaultAgent)
+    .summary('Configure your API key and install the agent skills')
     .description(SETUP_DESCRIPTION)
-    .addHelpText('after', GLOBAL_OPTS_HINT)
+    .addHelpText(
+      'after',
+      '\nValidates the key (GET /me), saves it to your profile and writes the skills into the project\n' +
+        'directory. With --yes or no terminal (CI) the key must come from --from-env or --api-key\n' +
+        '(or --skip-if-configured with a saved key); otherwise setup exits 5.\n' +
+        '\nExample:\n' +
+        '  TESTSPRITE_API_KEY=sk-... testsprite setup --from-env --yes --agent claude\n' +
+        GLOBAL_OPTS_HINT,
+    )
     .action(async (cmdOpts: SetupCmdOpts, command: Command) => {
       await runSetupAction(cmdOpts, command, deps);
     });
