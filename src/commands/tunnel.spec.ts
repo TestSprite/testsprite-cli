@@ -48,8 +48,7 @@ const PLAINTEXT_MINT_BODY = {
   expiresAt: MINT_BODY.expiresAt,
 };
 const VALID_CLIENT_ID = 'cf6e0843-9166-4eaa-918e-f085407eaca5';
-const INVALID_CLIENT_ID_MESSAGE =
-  "Tunnel client id must be a UUID (see 'testsprite tunnel status'/'tunnel start' output).";
+const INVALID_CLIENT_ID_MESSAGE = "Tunnel client id must be a UUID (see 'testsprite tunnel list').";
 const SECOND_CLIENT_ID = 'f8606d66-2140-49c5-9c45-8e4e36b587c9';
 const LIST_BODY = {
   tunnels: [
@@ -80,7 +79,7 @@ describe('tunnel help', () => {
   it('describes automatic environment tunnels and adopting an existing tunnel', () => {
     const text = helpFor();
     expect(text).toContain('automatically');
-    expect(text).toContain('test run <id> --env <name> --tunnel-client <id>');
+    expect(text).toContain('test run <test-id> --env <name> --tunnel-client <client-id>');
   });
 
   it('start help suggests a built server for a heavy development server', () => {
