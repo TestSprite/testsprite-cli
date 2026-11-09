@@ -12,6 +12,7 @@ import { recordTelemetryTunnelOpened } from './telemetry.js';
 import type { HttpClient } from './http.js';
 import type { RunResponse } from './runs.types.js';
 import { Output } from './output.js';
+import type { DeprecationEntry } from './deprecate.js';
 import { emitCiArtifacts, summarizeAcceptedPayload } from './gh-output.js';
 import { buildJUnitReport, writeJUnitReportFile } from './junit-report.js';
 import { pollRunUntilTerminal, TimeoutError, isTerminalStatus } from './poll.js';
@@ -70,13 +71,6 @@ export function assertNoTunnelOptions(args: {
         'cancelled when this command stops waiting — Ctrl-C detaches, and `testsprite test ' +
         'cancel <run-id>` is the way to stop one',
     );
-}
-
-export function severalIdsWithoutTunnel(): never {
-  throw localValidationError(
-    'test-id',
-    'several test ids run through one tunnel with --local <port>. For tests the runner can already reach, use `testsprite test run --all --project <id> [--filter <text>]`, or run them one at a time.',
-  );
 }
 
 const announcedEnvironments = new WeakMap<Map<string, Environment[] | undefined>, Set<string>>();
@@ -570,7 +564,10 @@ export async function emitEnvironmentDispatchPartial(
     ghOutput?: boolean;
     summaryFile?: string;
   },
-  deps: ClientFactoryDeps & { stdout?: (line: string) => void },
+  deps: ClientFactoryDeps & {
+    stdout?: (line: string) => void;
+    deprecations?: readonly DeprecationEntry[];
+  },
   label: string,
   error: unknown,
   context: EnvironmentTunnelContext,
@@ -603,9 +600,11 @@ export async function emitEnvironmentDispatchPartial(
     ...(responses.some(response => response.notFound) ? { notFound } : {}),
   };
   const stderr = deps.stderr ?? (line => process.stderr.write(`${line}\n`));
-  new Output(opts.output, { stdout: deps.stdout, stderr: deps.stderr }).print(partial, () =>
-    accepted.map(row => `${row.runId}  ${row.status}`).join('\n'),
-  );
+  new Output(
+    opts.output,
+    { stdout: deps.stdout, stderr: deps.stderr },
+    { deprecations: deps.deprecations },
+  ).print(partial, () => accepted.map(row => `${row.runId}  ${row.status}`).join('\n'));
   const summary = summarizeAcceptedPayload(JSON.stringify(partial));
   summary.runs.push(
     ...notRunTestIds.map(testId => ({
