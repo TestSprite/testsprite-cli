@@ -819,7 +819,9 @@ async function cancelDoomedTunnelRun(args: {
   if (!args.enabled) return { outcome: 'skipped' };
   try {
     await withTeardownDeadline(args.opts, args.deps, client =>
-      client.post<CancelRunResponse>(`/runs/${encodeURIComponent(args.runId)}/cancel`),
+      client.post<CancelRunResponse>(`/runs/${encodeURIComponent(args.runId)}/cancel`, {
+        replaySafe: true,
+      }),
     );
     return { outcome: 'cancelled' };
   } catch (err) {
@@ -16679,6 +16681,7 @@ async function deleteTunnelForCleanup(
   await withTeardownDeadline(opts, deps, client =>
     client.delete<unknown>(`/tunnel/${encodeURIComponent(clientId)}`, {
       allowNoContent: true,
+      replaySafe: true,
     }),
   );
 }
