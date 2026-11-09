@@ -242,6 +242,8 @@ export const TRIGGER_RUN_RESPONSE_SCHEMA: v.GenericSchema<unknown, TriggerRunRes
     // `dashboard` line only when the key is present.
     dashboardUrl: v.optional(v.string()),
     executionUrl: v.optional(v.string()),
+    // Present-or-omitted echo of the request's `skipDependencies: true`; no default.
+    skipDependencies: v.optional(v.boolean()),
   });
 
 // ---------------------------------------------------------------------------
@@ -390,6 +392,7 @@ export const BATCH_RUN_FRESH_RESPONSE_SCHEMA: v.GenericSchema<unknown, BatchRunF
     // echo was served by a backend that cut the batch / ran a plain override.
     admission: v.optional(v.picklist(['budget', 'all'])),
     previewName: v.optional(v.string()),
+    skipDependencies: v.optional(v.boolean()),
   });
 
 /**
