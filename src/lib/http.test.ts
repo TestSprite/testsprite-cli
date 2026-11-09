@@ -635,6 +635,108 @@ describe('HttpClient — 200 response with a non-JSON body', () => {
   });
 });
 
+describe('HttpClient — connection reset while reading a 200 body', () => {
+  /**
+   * A 200 whose body stream fails part-way: headers arrived, a few bytes were
+   * read, then the socket closed. Node's fetch surfaces that from the body
+   * reader as `TypeError: terminated` — a network failure, not bad JSON.
+   */
+  function resetResponse(partial = '{"ok":'): Response {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(partial));
+        controller.error(
+          Object.assign(new TypeError('terminated'), {
+            cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }),
+          }),
+        );
+      },
+    });
+    return new Response(stream, { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+
+  it('retries a GET under the transport rules, then returns the healthy response', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(resetResponse())
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.get('/projects')).resolves.toEqual({ ok: true });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries a write that carries an Idempotency-Key', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(resetResponse())
+      .mockResolvedValueOnce(jsonResponse({ id: 'proj_1' }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(
+      client.post('/projects', { body: { name: 'x' }, headers: { 'Idempotency-Key': 'op_1' } }),
+    ).resolves.toEqual({ id: 'proj_1' });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not replay a keyless write: one attempt, UNAVAILABLE (exit 10) with a transport message', async () => {
+    const fetchImpl = vi.fn(async () => resetResponse());
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    const err = (await client
+      .post('/projects', { body: { name: 'x' } })
+      .catch((e: unknown) => e)) as TransportError;
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(err).toBeInstanceOf(TransportError);
+    expect(err).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
+    expect(err.message).toContain('connection closed while reading the response body');
+    expect(err.message).toContain('terminated');
+    expect(err.requestId).toMatch(/^cli_/);
+  });
+
+  it('does not retry when the caller disabled retries', async () => {
+    const fetchImpl = vi.fn(async () => resetResponse());
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.get('/projects', { retry: false })).rejects.toBeInstanceOf(TransportError);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up as UNAVAILABLE once the transport budget is spent', async () => {
+    const fetchImpl = vi.fn(async () => resetResponse());
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.get('/projects')).rejects.toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+
+  it('a body that is read in full but truncated is still malformed JSON (INTERNAL, no retry)', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response('{"ok":', { status: 200, headers: { 'content-type': 'application/json' } }),
+    );
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.get('/projects')).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('records the reset as a TRANSPORT error and a retry in the debug trace', async () => {
+    const events: DebugEvent[] = [];
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(resetResponse())
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch, {
+      onDebug: e => events.push(e),
+    });
+    await client.get('/projects');
+    expect(events.map(e => [e.kind, 'errorCode' in e ? e.errorCode : undefined])).toEqual(
+      expect.arrayContaining([
+        ['error', 'TRANSPORT'],
+        ['retry', 'TRANSPORT'],
+      ]),
+    );
+  });
+});
+
 describe('HttpClient error mapping', () => {
   it('does not retry AUTH_INVALID and exits 3', async () => {
     const fetchImpl = vi.fn(async () => errorEnvelopeResponse(401, 'AUTH_INVALID'));
@@ -794,6 +896,73 @@ describe('HttpClient error mapping', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(4);
   });
 
+  it.each([
+    [500, 'INTERNAL', 1],
+    [503, 'UNAVAILABLE', 10],
+  ] as const)('does not retry a %d envelope for keyless writes', async (status, code, exitCode) => {
+    const fetchImpl = vi.fn(async () => errorEnvelopeResponse(status, code));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.post('/projects', { body: { name: 'Checkout' } })).rejects.toMatchObject({
+      code,
+      exitCode,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry an envelope-less 503 for keyless writes', async () => {
+    const fetchImpl = vi.fn(async () => new Response('', { status: 503 }));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.post('/projects', { body: { name: 'Checkout' } })).rejects.toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not replay a tunnel mint on a 5xx', async () => {
+    const fetchImpl = vi.fn(async () => errorEnvelopeResponse(500, 'INTERNAL'));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.mintTunnel({})).rejects.toMatchObject({ code: 'INTERNAL' });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a 5xx for keyless writes marked replaySafe (cancel, tunnel delete)', async () => {
+    const fetchImpl = vi.fn(async () => errorEnvelopeResponse(503, 'UNAVAILABLE'));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.cancelRun('run_1')).rejects.toMatchObject({ code: 'UNAVAILABLE' });
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+    fetchImpl.mockClear();
+    await expect(client.deleteTunnel('c-1')).rejects.toMatchObject({ code: 'UNAVAILABLE' });
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    [500, 'INTERNAL', 2],
+    [503, 'UNAVAILABLE', 4],
+  ] as const)(
+    'retries a %d envelope for writes with an idempotency key',
+    async (status, code, calls) => {
+      const fetchImpl = vi.fn(async () => errorEnvelopeResponse(status, code));
+      const client = makeClient(fetchImpl as unknown as typeof fetch);
+      await expect(
+        client.post('/projects', {
+          body: { name: 'Checkout' },
+          headers: { 'Idempotency-Key': 'op_123' },
+        }),
+      ).rejects.toMatchObject({ code });
+      expect(fetchImpl).toHaveBeenCalledTimes(calls);
+    },
+  );
+
+  it('still retries a 429 for keyless writes', async () => {
+    const fetchImpl = vi.fn(async () => errorEnvelopeResponse(429, 'RATE_LIMITED'));
+    const client = makeClient(fetchImpl as unknown as typeof fetch);
+    await expect(client.post('/projects', { body: { name: 'Checkout' } })).rejects.toMatchObject({
+      code: 'RATE_LIMITED',
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
   it('does not retry AbortError', async () => {
     const fetchImpl = vi.fn(async () => {
       const err = new Error('aborted');
@@ -873,6 +1042,21 @@ describe('HttpClient transport-edge statuses', () => {
     );
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
+
+  it.each(['GET', 'POST'] as const)(
+    '%s with a non-envelope JSON 504 takes the transport-edge path',
+    async method => {
+      const fetchImpl = vi.fn(async () =>
+        jsonResponse({ message: 'Endpoint request timed out' }, { status: 504 }),
+      );
+      const client = makeClient(fetchImpl as unknown as typeof fetch);
+      const call =
+        method === 'GET' ? client.get('/me') : client.post('/projects', { body: { name: 'x' } });
+      await expect(call).rejects.toBeInstanceOf(TransportError);
+      // GET keeps the transport budget; a keyless POST is sent once.
+      expect(fetchImpl).toHaveBeenCalledTimes(method === 'GET' ? 4 : 1);
+    },
+  );
 
   it('retries bare transport-edge responses for writes with an idempotency key', async () => {
     const fetchImpl = vi.fn(async () => new Response('proxy gateway html', { status: 502 }));
