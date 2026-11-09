@@ -1264,6 +1264,76 @@ describe('createTestCommand list — required flag', () => {
     expect(seen[0]).toMatch(/[?&]status=failed%2Cblocked/);
   });
 
+  it('--status not_run asks the server for the test cases that never ran (draft, ready)', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      seen.push(url);
+      return { body: { items: [], nextToken: null } };
+    });
+    for (const status of ['not_run', 'failed,not_run']) {
+      await runList(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_alice',
+          status,
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined },
+      );
+    }
+    expect(new URL(seen[0]!).searchParams.get('status')).toBe('draft,ready');
+    expect(new URL(seen[1]!).searchParams.get('status')).toBe('failed,draft,ready');
+  });
+
+  it('--status still accepts the older values (draft, ready, queued, running, unknown)', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      seen.push(url);
+      return { body: { items: [], nextToken: null } };
+    });
+    await runList(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        status: 'draft,ready,queued,running,unknown',
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(new URL(seen[0]!).searchParams.get('status')).toBe('draft,ready,queued,running,unknown');
+  });
+
+  it('--status rejects an unknown token naming the latest-status values', async () => {
+    const { credentialsPath } = makeCreds();
+    const err = (await runList(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        status: 'fail',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: { items: [], nextToken: null } })),
+        stdout: () => undefined,
+      },
+    ).catch((e: unknown) => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.nextAction).toContain('passed, failed, blocked, cancelled, not_run');
+    expect(err.getDetail('accepted')).toEqual([
+      'passed',
+      'failed',
+      'blocked',
+      'cancelled',
+      'not_run',
+    ]);
+  });
+
   it('M2.1 piece 2: --status rejects unknown tokens locally (exit 5, no fetch)', async () => {
     // Defense: a typo like `--status fail` shouldn't silently filter
     // to nothing. Fail fast client-side with the accepted set in
