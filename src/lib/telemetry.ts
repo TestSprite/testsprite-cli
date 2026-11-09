@@ -212,6 +212,8 @@ export type TelemetryConflictReason =
   | 'mcp_view_only'
   | 'local_address'
   | 'tunnel-required'
+  | 'no_producer'
+  | 'producer_in_flight'
   | 'error';
 
 /**
@@ -318,6 +320,8 @@ const ENUM_KEYS: {
     'mcp_view_only',
     'local_address',
     'tunnel-required',
+    'no_producer',
+    'producer_in_flight',
     'error',
   ]),
   platform: new Set(['github']),
