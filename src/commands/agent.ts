@@ -1149,15 +1149,18 @@ function collect(v: string, prev: string[]): string[] {
 }
 
 export function createAgentCommand(deps: AgentDeps = {}): Command {
-  const agent = new Command('agent').description(
-    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Kiro, Windsurf, Copilot, Codex)',
-  );
+  const agent = new Command('agent')
+    .summary('Install TestSprite guidance into coding-agent config')
+    .description(
+      'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Kiro, Windsurf, Copilot, Codex)',
+    );
 
   agent
     .command('install [targets...]')
+    .summary('Write the TestSprite agent skills into a project')
     .description(
       'Write the TestSprite agent skills (verification loop + first-run onboarding) into a project for a coding agent. ' +
-        'Target(s) may be given positionally (e.g. `agent install cursor codex`) and/or via --target; the two are merged.',
+        'Targets may be positional (`agent install cursor codex`) and/or via --target; they are merged.',
     )
     .option(
       '--target <t>',
@@ -1208,6 +1211,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
 
   agent
     .command('list')
+    .summary('List installable agent targets and skills')
     .description(
       'List the agent targets and skills this CLI can install and where each lands (run `testsprite agent status` to see what is installed here)',
     )
@@ -1218,6 +1222,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
 
   agent
     .command('status')
+    .summary('Check installed skill files against this CLI version')
     .description(
       'Check installed TestSprite skill files against this CLI version: ok, stale, modified, unmarked, absent, or corrupt (exits 1 when anything needs attention, so it can gate CI)',
     )
