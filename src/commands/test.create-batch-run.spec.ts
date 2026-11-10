@@ -1094,6 +1094,89 @@ describe('runCreateBatch --run --wait: CONFLICT auto-resume', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Partial creation success — the receipt must survive normal completion with
+// and without --wait, independently of the run-result status.
+// ---------------------------------------------------------------------------
+
+describe('runCreateBatch --run: partial creation receipt', () => {
+  it.each([true, false])(
+    'preserves created and validation_error rows on normal completion (wait=%s)',
+    async wait => {
+      const { credentialsPath } = makeCreds();
+      const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC]);
+      const creationResponse = {
+        results: [
+          { specIndex: 0, testId: 'test_partial_created', status: 'created' },
+          {
+            specIndex: 1,
+            status: 'validation_error',
+            error: { code: 'VALIDATION_ERROR', message: 'invalid plan', field: 'planSteps' },
+          },
+        ],
+        summary: { total: 2, created: 1, failed: 1 },
+      };
+
+      const fetchImpl = makeFetch(url => {
+        if (url.includes('/tests/batch')) return { body: creationResponse };
+        if (url.endsWith('/tests/test_partial_created/runs')) {
+          return { body: makeTriggerResponse('test_partial_created', 'run_partial_created') };
+        }
+        if (url.includes('/runs/run_partial_created')) {
+          return { body: makePassedRun('test_partial_created', 'run_partial_created') };
+        }
+        return {
+          status: 404,
+          body: {
+            error: { code: 'NOT_FOUND', message: 'not found', nextAction: '', requestId: 'r1' },
+          },
+        };
+      });
+
+      const stdout: string[] = [];
+      await runCreateBatch(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: false,
+          plans: plansFile,
+          run: true,
+          wait,
+          maxConcurrency: 1,
+          timeoutSeconds: 60,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: line => stdout.push(line),
+          stderr: () => {},
+          sleep: instantSleep,
+        },
+      );
+
+      const printed = JSON.parse(stdout.join('')) as {
+        results: Array<{ testId: string; status: string }>;
+        creation: {
+          results: Array<{ specIndex: number; testId?: string; status: string; error?: unknown }>;
+          summary: { total: number; created: number; failed: number };
+        };
+      };
+      expect(printed.results).toHaveLength(1);
+      expect(printed.results[0]?.status).toBe(wait ? 'passed' : 'queued');
+      expect(printed.creation.summary).toEqual({ total: 2, created: 1, failed: 1 });
+      expect(printed.creation.results).toMatchObject([
+        { specIndex: 0, testId: 'test_partial_created', status: 'created' },
+        {
+          specIndex: 1,
+          status: 'validation_error',
+          error: { code: 'VALIDATION_ERROR', field: 'planSteps' },
+        },
+      ]);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
 // --dry-run mode
 // ---------------------------------------------------------------------------
 
