@@ -692,6 +692,24 @@ describe('RequestTimeoutError', () => {
     const err = new RequestTimeoutError(1_500);
     expect(err.message).toContain('2s');
   });
+
+  it('leaves nextAction unset by default so renderers use the generic advice', () => {
+    const err = new RequestTimeoutError(5_000);
+    expect(err.nextAction).toBeUndefined();
+  });
+
+  it('honors caller-specific message and nextAction overrides', () => {
+    const err = new RequestTimeoutError(5_000, 'local', {
+      message: 'Environment preflight read timed out after 5s (client-side).',
+      nextAction: 'The environment preflight read timed out. Check the backend, then retry.',
+    });
+    expect(err.message).toBe('Environment preflight read timed out after 5s (client-side).');
+    expect(err.message).not.toContain('--request-timeout');
+    expect(err.nextAction).toContain('environment preflight read');
+    expect(err.code).toBe('REQUEST_TIMEOUT');
+    expect(err.exitCode).toBe(7);
+    expect(err.timeoutMs).toBe(5_000);
+  });
 });
 
 describe('INSUFFICIENT_CREDITS detection', () => {
