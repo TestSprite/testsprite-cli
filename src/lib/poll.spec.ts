@@ -1047,7 +1047,9 @@ describe('pollRunUntilTerminal — shutdown (SIGINT/SIGTERM graceful detach)', (
 describe('pollRunUntilTerminal: outage once the endpoint has answered', () => {
   beforeEach(() => {
     // Fake clock and the real default (setTimeout) sleep, so every read time
-    // below is the time the loop actually waited.
+    // below is the time the loop actually waited. A `running` answer that comes
+    // back at once is paced by LONG_POLL_MIN_INTERVAL_MS, so the read after it
+    // lands at 2s.
     vi.useFakeTimers();
     // No jitter: the schedule is exactly 2s, 4s, 8s, then 15s.
     vi.spyOn(Math, 'random').mockReturnValue(0.5);
@@ -1110,7 +1112,7 @@ describe('pollRunUntilTerminal: outage once the endpoint has answered', () => {
     await vi.advanceTimersByTimeAsync(60_000);
 
     expect(await outcome).toMatchObject({ run: { status: 'passed' } });
-    expect(client.readTimesMs).toEqual([0, 0, 2000, 6000, 14000]);
+    expect(client.readTimesMs).toEqual([0, 2000, 4000, 8000, 16000]);
   });
 
   it('re-reads after 2s, 4s, 8s, then every 15s, and exits 10 with the runId when the outage outlasts --timeout', async () => {
@@ -1119,7 +1121,7 @@ describe('pollRunUntilTerminal: outage once the endpoint has answered', () => {
     await vi.advanceTimersByTimeAsync(70_000);
 
     const result = await outcome;
-    expect(client.readTimesMs).toEqual([0, 0, 2000, 6000, 14000, 29000, 44000, 59000]);
+    expect(client.readTimesMs).toEqual([0, 2000, 4000, 8000, 16000, 31000, 46000]);
     expect(result).toHaveProperty('error');
     const err = (result as { error: unknown }).error;
     expect(err).toBeInstanceOf(UnreachableAtDeadlineError);
@@ -1146,7 +1148,7 @@ describe('pollRunUntilTerminal: outage once the endpoint has answered', () => {
     await vi.advanceTimersByTimeAsync(30_000);
 
     expect(await outcome).toMatchObject({ run: { status: 'passed' } });
-    expect(client.readTimesMs).toEqual([0, 0, 7000]);
+    expect(client.readTimesMs).toEqual([0, 2000, 9000]);
   });
 
   it("honours the envelope's retryAfterSec when a 503 sends no Retry-After header", async () => {
@@ -1159,7 +1161,7 @@ describe('pollRunUntilTerminal: outage once the endpoint has answered', () => {
     await vi.advanceTimersByTimeAsync(30_000);
 
     expect(await outcome).toMatchObject({ run: { status: 'passed' } });
-    expect(client.readTimesMs).toEqual([0, 0, 5000]);
+    expect(client.readTimesMs).toEqual([0, 2000, 7000]);
   });
 
   it('waits out an outage on the first read after a trigger (the trigger reached the endpoint)', async () => {
@@ -1224,7 +1226,7 @@ describe('pollRunUntilTerminal: outage once the endpoint has answered', () => {
 
     const result = (await outcome) as { error: unknown };
     expect(result.error).toMatchObject({ code: 'RATE_LIMITED' });
-    expect(client.readTimesMs).toEqual([0, 0, 2000]);
+    expect(client.readTimesMs).toEqual([0, 2000, 4000]);
   });
 
   it('keeps the INTERNAL single retry during an outage: a second 500 still ends the wait', async () => {
@@ -1238,20 +1240,21 @@ describe('pollRunUntilTerminal: outage once the endpoint has answered', () => {
 
     const result = (await outcome) as { error: unknown };
     expect(result.error).toMatchObject({ code: 'INTERNAL' });
-    expect(client.readTimesMs).toEqual([0, 0, 2000, 3000]);
+    expect(client.readTimesMs).toEqual([0, 2000, 4000, 5000]);
   });
 
   it('Ctrl-C during the outage backoff wins at once', async () => {
     const shutdown = new ShutdownController();
     const client = makeScriptedClient([makeRun('running'), networkDown]);
     const outcome = settle(pollRunUntilTerminal(client, RUN_ID, { timeoutSeconds: 600, shutdown }));
-    await vi.advanceTimersByTimeAsync(1000);
+    // 3s in: the read at 2s failed and the loop sits in its 2s outage backoff.
+    await vi.advanceTimersByTimeAsync(3000);
     shutdown.interrupt('SIGINT');
     await vi.advanceTimersByTimeAsync(0);
 
     const result = (await outcome) as { error: unknown };
     expect(result.error).toBeInstanceOf(InterruptError);
-    expect(client.readTimesMs).toEqual([0, 0]);
+    expect(client.readTimesMs).toEqual([0, 2000]);
   });
 
   it('reports the outage and the reconnection through onTransition', async () => {
