@@ -1360,6 +1360,7 @@ async function emitDupNameAdvisoryIfNeeded(
   projectId: string | undefined,
   name: string | undefined,
   stderrFn: (line: string) => void,
+  debug?: boolean,
 ): Promise<void> {
   if (!projectId || !name) return;
   // B: ordinary advisory failures must not block the create critical path.
@@ -1397,6 +1398,10 @@ async function emitDupNameAdvisoryIfNeeded(
     }
   } catch (err) {
     if (err instanceof InterruptError) throw err;
+    if (debug) {
+      const reason = err instanceof Error ? err.message : String(err);
+      stderrFn(`[debug] duplicate-name advisory lookup failed: ${reason}`);
+    }
     // Other lookup failures are best-effort and must not block the create.
   } finally {
     clearTimeout(timer);
@@ -1690,7 +1695,7 @@ export async function runCreate(
   // B3: best-effort duplicate-name advisory. Skip under --dry-run.
   if (!opts.dryRun) {
     const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-    await emitDupNameAdvisoryIfNeeded(client, projectId, opts.name, stderrFn);
+    await emitDupNameAdvisoryIfNeeded(client, projectId, opts.name, stderrFn, opts.debug);
   }
 
   const response = await client.post<CliCreateTestResponse>('/tests', {
@@ -3735,7 +3740,7 @@ export async function runCreateFromPlan(
   // The plan's projectId + name are available after validation above. Skip
   // under dry-run (no network calls); swallow all errors (advisory only).
   if (!opts.dryRun) {
-    await emitDupNameAdvisoryIfNeeded(client, plan.projectId, plan.name, stderrFn);
+    await emitDupNameAdvisoryIfNeeded(client, plan.projectId, plan.name, stderrFn, opts.debug);
   }
 
   const response = await client.post<CliCreateFromPlanResponse>('/tests', {
