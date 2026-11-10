@@ -1,3 +1,4 @@
+import type * as v from 'valibot';
 import type { HttpClient } from './http.js';
 import { ApiError, localValidationError } from './errors.js';
 
@@ -153,8 +154,10 @@ export async function fetchSinglePage<T>(
   pageSize: number,
   cursor: string | undefined,
   extraQuery: Record<string, string | number | boolean | undefined> = {},
+  schema?: v.GenericSchema<unknown, Page<T>>,
 ): Promise<Page<T>> {
   return client.get<Page<T>>(path, {
     query: { ...extraQuery, pageSize, cursor },
+    ...(schema !== undefined ? { schema } : {}),
   });
 }
