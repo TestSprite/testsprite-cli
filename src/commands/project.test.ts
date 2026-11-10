@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../lib/errors.js';
+import { terminalWidth } from '../lib/ticker.js';
 import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import {
   type CliProject,
@@ -10,6 +11,7 @@ import {
   type CliDeleteProjectResponse,
   type CliUpdateProjectResponse,
   createProjectCommand,
+  renderProjectListText,
   runAutoAuth,
   runCreate,
   runCredential,
@@ -2768,6 +2770,182 @@ describe('runUpdate — --local <port>', () => {
   });
 });
 
+describe('#282 — secret --*-file flags are guarded (structured error, exit 5, no raw ENOENT)', () => {
+  const noNetwork = () => {
+    throw new Error('network should not be hit');
+  };
+  const deps = (credentialsPath: string) => ({
+    credentialsPath,
+    fetchImpl: makeFetch(noNetwork),
+    stdout: () => {},
+    stderr: () => {},
+  });
+  const missingPath = () => join(mkdtempSync(join(tmpdir(), 'cli-missing-')), 'no-such-secret.txt');
+
+  it('runCredential --credential-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runCredential(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          authType: 'API key',
+          credentialFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runCredential --credential-file pointing at a directory → VALIDATION_ERROR (exit 5)', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-cred-dir-'));
+    await expect(
+      runCredential(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          authType: 'API key',
+          credentialFile: dir,
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runCredential reads a valid --credential-file (trimmed) and sends it', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-cred-ok-'));
+    const credFile = join(dir, 'cred.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (dir), not user input.
+    writeFileSync(credFile, '  tok-from-file\n');
+    let sentBody: { credential?: string } | undefined;
+    const fetchImpl = makeFetch((_url, init) => {
+      sentBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { status: 200, body: { projectId: 'p1', authType: 'API key', rewroteCount: 1 } };
+    });
+    await runCredential(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'p1',
+        authType: 'API key',
+        credentialFile: credFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    // The on-disk fixture is "  tok-from-file\n"; the shared guard trims it.
+    expect(sentBody?.credential).toBe('tok-from-file');
+  });
+
+  it('runAutoAuth --password-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'password',
+          inject: 'bearer',
+          passwordFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runAutoAuth --client-secret-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'refresh_token',
+          inject: 'bearer',
+          clientSecretFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runAutoAuth --refresh-token-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'refresh_token',
+          inject: 'bearer',
+          refreshTokenFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runAutoAuth --dry-run with missing --password-file skips filesystem (returns sample)', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    const result = await runAutoAuth(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'p1',
+        method: 'password',
+        inject: 'bearer',
+        passwordFile: missingPath(),
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(fetched).toBe(false);
+    // Dry-run skips file reads; the sample carries the projectId we passed in.
+    expect(result.projectId).toBe('p1');
+  });
+
+  it('runCredential --dry-run with missing --credential-file skips filesystem (returns sample)', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    const result = await runCredential(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'p1',
+        authType: 'API key',
+        credentialFile: missingPath(),
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(fetched).toBe(false);
+    expect(result).toEqual({ projectId: 'p1', authType: 'API key', rewroteCount: 0 });
+  });
+});
+
 describe('project compatibility contracts', () => {
   it('appends environment columns after the legacy created column', async () => {
     const { credentialsPath } = makeCreds();
@@ -3046,4 +3224,35 @@ describe('first-suite signpost for a `--local` project', () => {
       expect(stderr).not.toContain('[hint]');
     },
   );
+});
+
+describe('renderProjectListText — CJK display-width regression (#369)', () => {
+  const cjkProject: CliProject = {
+    ...PROJECT_FIXTURE,
+    id: 'project_cjk',
+    name: '登录支付验证系统',
+  };
+  const page = { items: [PROJECT_FIXTURE, cjkProject], nextToken: null };
+
+  // String indexes can't assert alignment (a CJK row carries fewer UTF-16
+  // units for the same terminal cells); compare the DISPLAY width of the
+  // prefix before the column instead.
+  const offsetOf = (line: string, needle: string): number => {
+    const idx = line.indexOf(needle);
+    expect(idx).toBeGreaterThan(-1);
+    return terminalWidth(line.slice(0, idx));
+  };
+
+  it('keeps later columns aligned when a project name is full-width', () => {
+    const lines = renderProjectListText(page).split('\n');
+    expect(lines.length).toBe(3);
+    expect(offsetOf(lines[1]!, 'frontend')).toBe(offsetOf(lines[2]!, 'frontend'));
+    expect(offsetOf(lines[0]!, 'TYPE')).toBe(offsetOf(lines[1]!, 'frontend'));
+  });
+
+  it('keeps alignment with --columns reordering and CJK names', () => {
+    const lines = renderProjectListText(page, { columns: 'type,name', noHeader: true }).split('\n');
+    expect(lines.length).toBe(2);
+    expect(offsetOf(lines[0]!, PROJECT_FIXTURE.name)).toBe(offsetOf(lines[1]!, cjkProject.name));
+  });
 });

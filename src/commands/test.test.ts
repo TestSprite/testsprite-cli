@@ -1264,6 +1264,76 @@ describe('createTestCommand list — required flag', () => {
     expect(seen[0]).toMatch(/[?&]status=failed%2Cblocked/);
   });
 
+  it('--status not_run asks the server for the test cases that never ran (draft, ready)', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      seen.push(url);
+      return { body: { items: [], nextToken: null } };
+    });
+    for (const status of ['not_run', 'failed,not_run']) {
+      await runList(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_alice',
+          status,
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined },
+      );
+    }
+    expect(new URL(seen[0]!).searchParams.get('status')).toBe('draft,ready');
+    expect(new URL(seen[1]!).searchParams.get('status')).toBe('failed,draft,ready');
+  });
+
+  it('--status still accepts the older values (draft, ready, queued, running, unknown)', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      seen.push(url);
+      return { body: { items: [], nextToken: null } };
+    });
+    await runList(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        status: 'draft,ready,queued,running,unknown',
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(new URL(seen[0]!).searchParams.get('status')).toBe('draft,ready,queued,running,unknown');
+  });
+
+  it('--status rejects an unknown token naming the latest-status values', async () => {
+    const { credentialsPath } = makeCreds();
+    const err = (await runList(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        status: 'fail',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: { items: [], nextToken: null } })),
+        stdout: () => undefined,
+      },
+    ).catch((e: unknown) => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.nextAction).toContain('passed, failed, blocked, cancelled, not_run');
+    expect(err.getDetail('accepted')).toEqual([
+      'passed',
+      'failed',
+      'blocked',
+      'cancelled',
+      'not_run',
+    ]);
+  });
+
   it('M2.1 piece 2: --status rejects unknown tokens locally (exit 5, no fetch)', async () => {
     // Defense: a typo like `--status fail` shouldn't silently filter
     // to nothing. Fail fast client-side with the accepted set in
@@ -3633,6 +3703,34 @@ describe('runSteps', () => {
     // Shared run metadata renders once at the bottom.
     expect(block).toContain('runId:       run_abc');
     expect(block).toContain('codeVersion: v3');
+  });
+
+  it('text mode puts every header over its column, failure marker included', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: {
+        items: [STEP_PASSED, { ...STEP_FAILED, outcomeContributesToFailure: true }],
+        nextToken: null,
+      },
+    }));
+    const out: string[] = [];
+    await runSteps(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    const [header, passedRow, failedRow] = out.join('\n').split('\n');
+    expect(failedRow!.startsWith('* ')).toBe(true);
+    for (const row of [passedRow!, failedRow!]) {
+      for (const [heading, value] of [
+        ['INDEX', /\d/],
+        ['ACTION', /click/],
+        ['STATUS', /passed|failed/],
+        ['DESCRIPTION', /Click the/],
+        ['UPDATED', /2026-/],
+      ] as const) {
+        expect(row.search(value), `${heading} in: ${row}`).toBe(header!.indexOf(heading));
+      }
+    }
   });
 
   it('text mode reads "No steps." on an empty list', async () => {
