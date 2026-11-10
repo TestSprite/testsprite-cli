@@ -191,7 +191,19 @@ describe('runCreateBatch --run --wait: happy path', () => {
     const fetchImpl = makeFetch(url => {
       // Batch create
       if (url.includes('/tests/batch')) {
-        return { body: makeBatchCreateResponse(testIds) };
+        return {
+          body: {
+            results: testIds.map((testId, specIndex) => ({
+              specIndex,
+              testId,
+              status: 'created' as const,
+              ...(specIndex === 0
+                ? { dashboardUrl: 'https://portal.testsprite.com/tests/test_a1' }
+                : {}),
+            })),
+            summary: { total: testIds.length, created: testIds.length, failed: 0 },
+          },
+        };
       }
       // Trigger POST /tests/{id}/runs
       const triggerMatch = /\/tests\/(test_[a-z0-9]+)\/runs$/.exec(url);
@@ -239,8 +251,21 @@ describe('runCreateBatch --run --wait: happy path', () => {
     );
 
     // JSON output is the batch-run envelope
-    const printed = JSON.parse(stdout.join('')) as { results: unknown[] };
+    const printed = JSON.parse(stdout.join('')) as {
+      results: unknown[];
+      creation: {
+        results: Array<{ testId?: string; status: string; dashboardUrl?: string }>;
+        summary: { total: number; created: number; failed: number };
+      };
+    };
     expect(printed.results).toHaveLength(3);
+    expect(printed.creation.summary).toEqual({ total: 3, created: 3, failed: 0 });
+    expect(printed.creation.results).toHaveLength(3);
+    expect(printed.creation.results[0]).toMatchObject({
+      testId: 'test_a1',
+      status: 'created',
+      dashboardUrl: 'https://portal.testsprite.com/tests/test_a1',
+    });
     const results = printed.results as Array<{ testId: string; status: string; runId: string }>;
     expect(results.every(r => r.status === 'passed')).toBe(true);
     expect(results.map(r => r.testId).sort()).toEqual(['test_a1', 'test_a2', 'test_a3'].sort());
@@ -418,10 +443,16 @@ describe('runCreateBatch --run (no --wait): exit-code contract', () => {
 
     const printed = JSON.parse(stdout.join('')) as {
       results: Array<{ testId: string; status: string; error?: unknown }>;
+      creation: {
+        results: Array<{ specIndex: number; testId?: string; status: string }>;
+        summary: { total: number; created: number; failed: number };
+      };
     };
     expect(printed.results).toHaveLength(3);
     expect(printed.results.every(r => r.status === 'queued')).toBe(true);
     expect(printed.results.every(r => r.error === undefined)).toBe(true);
+    expect(printed.creation.results).toHaveLength(3);
+    expect(printed.creation.summary).toEqual({ total: 3, created: 3, failed: 0 });
   });
 
   it('all triggers succeed (queued) → text summary reports "3/3 triggered", exit 0 (no "0/N passed")', async () => {
@@ -1098,6 +1129,89 @@ describe('runCreateBatch --run --wait: CONFLICT auto-resume', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Partial creation success — the receipt must survive normal completion with
+// and without --wait, independently of the run-result status.
+// ---------------------------------------------------------------------------
+
+describe('runCreateBatch --run: partial creation receipt', () => {
+  it.each([true, false])(
+    'preserves created and validation_error rows on normal completion (wait=%s)',
+    async wait => {
+      const { credentialsPath } = makeCreds();
+      const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC]);
+      const creationResponse = {
+        results: [
+          { specIndex: 0, testId: 'test_partial_created', status: 'created' },
+          {
+            specIndex: 1,
+            status: 'validation_error',
+            error: { code: 'VALIDATION_ERROR', message: 'invalid plan', field: 'planSteps' },
+          },
+        ],
+        summary: { total: 2, created: 1, failed: 1 },
+      };
+
+      const fetchImpl = makeFetch(url => {
+        if (url.includes('/tests/batch')) return { body: creationResponse };
+        if (url.endsWith('/tests/test_partial_created/runs')) {
+          return { body: makeTriggerResponse('test_partial_created', 'run_partial_created') };
+        }
+        if (url.includes('/runs/run_partial_created')) {
+          return { body: makePassedRun('test_partial_created', 'run_partial_created') };
+        }
+        return {
+          status: 404,
+          body: {
+            error: { code: 'NOT_FOUND', message: 'not found', nextAction: '', requestId: 'r1' },
+          },
+        };
+      });
+
+      const stdout: string[] = [];
+      await runCreateBatch(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: false,
+          plans: plansFile,
+          run: true,
+          wait,
+          maxConcurrency: 1,
+          timeoutSeconds: 60,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: line => stdout.push(line),
+          stderr: () => {},
+          sleep: instantSleep,
+        },
+      );
+
+      const printed = JSON.parse(stdout.join('')) as {
+        results: Array<{ testId: string; status: string }>;
+        creation: {
+          results: Array<{ specIndex: number; testId?: string; status: string; error?: unknown }>;
+          summary: { total: number; created: number; failed: number };
+        };
+      };
+      expect(printed.results).toHaveLength(1);
+      expect(printed.results[0]?.status).toBe(wait ? 'passed' : 'queued');
+      expect(printed.creation.summary).toEqual({ total: 2, created: 1, failed: 1 });
+      expect(printed.creation.results).toMatchObject([
+        { specIndex: 0, testId: 'test_partial_created', status: 'created' },
+        {
+          specIndex: 1,
+          status: 'validation_error',
+          error: { code: 'VALIDATION_ERROR', field: 'planSteps' },
+        },
+      ]);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
 // --dry-run mode
 // ---------------------------------------------------------------------------
 
@@ -1165,9 +1279,51 @@ describe('runCreateBatch --run --dry-run', () => {
     expect(envelope.dryRun).toBe(true);
     expect(Array.isArray(envelope.testIds)).toBe(true);
     expect((envelope.testIds as string[]).sort()).toEqual(testIds.sort());
-    // results array is present
+    // Both run descriptors and the original create receipt are present.
     expect(Array.isArray(envelope.results)).toBe(true);
     expect((envelope.results as unknown[]).length).toBe(testIds.length);
+    expect(envelope.creation).toMatchObject({
+      results: testIds.map((testId, specIndex) => ({
+        specIndex,
+        testId,
+        status: 'created',
+      })),
+      summary: { total: 2, created: 2, failed: 0 },
+    });
+  });
+
+  it('text dry-run keeps the existing descriptor shape without a creation field', async () => {
+    const { credentialsPath } = makeCreds();
+    const plansFile = writePlansJsonl([FE_SPEC]);
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch')) return { body: makeBatchCreateResponse(['test_text_dry']) };
+      return { status: 404, body: {} };
+    });
+    const stdout: string[] = [];
+
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: true,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdout.push(line),
+        stderr: () => {},
+      },
+    );
+
+    const output = stdout.join('');
+    // Text mode uses the human-readable formatter, not the JSON envelope.
+    expect(() => JSON.parse(output)).toThrow();
+    expect(output).not.toContain('creation');
   });
 });
 
@@ -1772,14 +1928,25 @@ it('a paused workspace outranks a mixed-in credits refusal from create-batch --r
 
 it('marks a dispatched batch run for recovery guidance on fan-out interruption', async () => {
   const { credentialsPath } = makeCreds();
-  const plansFile = writePlansJsonl([FE_SPEC]);
+  const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC]);
   const interruption = new InterruptError('SIGINT');
   const stdout: string[] = [];
   const stderr: string[] = [];
+  const creationResponse = {
+    results: [
+      { specIndex: 0, testId: 'test_one', status: 'created' },
+      {
+        specIndex: 1,
+        status: 'validation_error',
+        error: { code: 'VALIDATION_ERROR', message: 'invalid spec' },
+      },
+    ],
+    summary: { total: 2, created: 1, failed: 1 },
+  };
   const fetchImpl = (async (input: FetchInput) => {
     const url = String(input);
     if (url.includes('/tests/batch')) {
-      return new Response(JSON.stringify(makeBatchCreateResponse(['test_one'])));
+      return new Response(JSON.stringify(creationResponse));
     }
     if (url.includes('/tests/test_one/runs')) {
       return new Response(JSON.stringify(makeTriggerResponse('test_one', 'run_one')));
@@ -1814,6 +1981,17 @@ it('marks a dispatched batch run for recovery guidance on fan-out interruption',
   expect((error as InterruptError).runWaitContext).toBe(true);
   expect(JSON.parse(stdout.at(-1)!) as unknown).toMatchObject({
     results: [{ testId: 'test_one', runId: 'run_one', status: 'running' }],
+    creation: {
+      results: [
+        { specIndex: 0, testId: 'test_one', status: 'created' },
+        {
+          specIndex: 1,
+          status: 'validation_error',
+          error: { code: 'VALIDATION_ERROR', message: 'invalid spec' },
+        },
+      ],
+      summary: { total: 2, created: 1, failed: 1 },
+    },
   });
   expect(stderr.join('\n')).toContain('testsprite test wait run_one');
 });

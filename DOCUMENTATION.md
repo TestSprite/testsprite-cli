@@ -424,6 +424,45 @@ Bulk-create frontend tests from a JSONL plan-steps file (or a directory of plan 
 
 With `--run`, each trigger's idempotency key is derived from the batch key (`<key>:run:<testId>`), so retrying the command with the same `--idempotency-key` — or the auto-minted one printed to stderr under `--output json`, `--verbose` or `--debug` — returns the runs the first attempt already started instead of starting new, billed ones. An all-public several-id `test run` is one batch request that uses the key as is; a tunnel-pool run (several ids or `--all` through `--local` or a tunneled environment) triggers each test separately with `<key>:<testId>`. A trigger routed through the tunnel also carries the tunnel's client id before the test id (`<key>:run:<clientId>:<testId>` for `create-batch`, `<key>:<clientId>:<testId>` for `test run`): a retry through the same tunnel (adopted with `--tunnel-client`) gets its runs back, while a retry through a new tunnel starts new runs, since the old ones cannot reach the app without their tunnel. A key too long to fit its suffix within 256 characters is shortened, with a digest of the full key kept so it stays unique.
 
+**JSON output with `--run`.** The top-level `results` array remains the per-test run results. A separate additive `creation` object preserves the original batch-create receipt, including failures for individual specs that were not created:
+
+```json
+{
+  "results": [
+    {
+      "testId": "test_xxxxxxxx",
+      "runId": "run_xxxxxxxx",
+      "status": "passed"
+    }
+  ],
+  "creation": {
+    "results": [
+      {
+        "specIndex": 0,
+        "testId": "test_xxxxxxxx",
+        "status": "created",
+        "dashboardUrl": "https://..."
+      },
+      {
+        "specIndex": 1,
+        "status": "validation_error",
+        "error": {
+          "code": "VALIDATION_ERROR",
+          "message": "Invalid plan"
+        }
+      }
+    ],
+    "summary": {
+      "total": 2,
+      "created": 1,
+      "failed": 1
+    }
+  }
+}
+```
+
+The `creation` object has the same `{ results, summary }` shape as create-only JSON output. Each creation result retains its `specIndex`, status, optional error and optional `dashboardUrl`; the dashboard URL is omitted when unavailable or explicitly suppressed. This receipt is also included in interrupted/partial output and `--dry-run` JSON envelopes. Existing run-result rows, text output and exit codes are unchanged.
+
 ```bash
 testsprite test create-batch --plans ./plans.jsonl --run --max-concurrency 4 --output json
 testsprite test create-batch --plan-from-dir ./plans/ --dry-run --output json

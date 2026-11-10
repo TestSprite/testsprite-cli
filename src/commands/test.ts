@@ -3068,7 +3068,22 @@ export interface CliBatchRunResult {
 
 /** Envelope emitted by `test create-batch --run` in JSON mode. */
 export interface CliCreateBatchRunResponse {
+  /** Per-test run results; remains unchanged for existing consumers. */
   results: CliBatchRunResult[];
+  /** Original per-spec creation receipt, matching create-only JSON output. */
+  creation: CliCreateBatchResponse;
+}
+
+/** Dry-run variant of the `test create-batch --run` JSON envelope. */
+export interface CliCreateBatchDryRunResponse extends CliCreateBatchRunResponse {
+  dryRun: true;
+  method: 'POST';
+  pathTemplate: '/api/cli/v1/tests/{testId}/runs';
+  maxConcurrency: number | null;
+  wait: boolean;
+  timeoutSeconds: number;
+  testIds: string[];
+  thenPoll?: string;
 }
 
 /**
@@ -4483,6 +4498,17 @@ async function runBatchRun(
     .filter(r => r.status === 'created' && r.testId !== undefined)
     .map(r => r.testId as string);
 
+  // Match the create-only JSON receipt: preserve server links, normalize
+  // explicitly suppressed links, and use the same create-time fallback map.
+  const creationResults: CliBatchSpecResult[] =
+    !opts.dryRun && testIdToDashboardState !== undefined
+      ? createResponse.results.map(r => {
+          if (r.status !== 'created' || r.testId === undefined) return r;
+          const state = testIdToDashboardState.get(r.testId);
+          return state ? { ...r, dashboardUrl: state.dashboardUrl } : r;
+        })
+      : createResponse.results;
+
   if (testIds.length === 0) {
     // All specs failed at create time — already threw above; unreachable.
     return;
@@ -4497,9 +4523,9 @@ async function runBatchRun(
       codeVersion: 'v1',
     }));
     const envelope = {
-      dryRun: true,
-      method: 'POST',
-      pathTemplate: '/api/cli/v1/tests/{testId}/runs',
+      dryRun: true as const,
+      method: 'POST' as const,
+      pathTemplate: '/api/cli/v1/tests/{testId}/runs' as const,
       maxConcurrency: opts.maxConcurrency ?? null,
       wait: opts.wait ?? false,
       timeoutSeconds,
@@ -4507,7 +4533,19 @@ async function runBatchRun(
       ...(opts.wait ? { thenPoll: `/api/cli/v1/runs/<run-id>?waitSeconds=25` } : {}),
       results: dryRunResults,
     };
-    out.print(envelope);
+    if (opts.output === 'json') {
+      const jsonEnvelope: CliCreateBatchDryRunResponse = {
+        ...envelope,
+        creation: {
+          results: creationResults,
+          summary: createResponse.summary,
+        },
+      };
+      out.print(jsonEnvelope);
+    } else {
+      // Keep the pre-existing text-mode dry-run descriptor unchanged.
+      out.print(envelope);
+    }
     return;
   }
 
@@ -5169,8 +5207,15 @@ async function runBatchRun(
             codeVersion: '',
           },
       );
-      out.print({ results: partialResults }, () =>
-        partialResults.map(r => `${r.testId}  ${r.runId || '-'}  ${r.status}`).join('\n'),
+      out.print(
+        {
+          results: partialResults,
+          creation: {
+            results: creationResults,
+            summary: createResponse.summary,
+          },
+        },
+        () => partialResults.map(r => `${r.testId}  ${r.runId || '-'}  ${r.status}`).join('\n'),
       );
       const unfinished = partialResults
         .filter(r => r.status === 'running' && r.runId)
@@ -5212,7 +5257,13 @@ async function runBatchRun(
             return { ...r, dashboardUrl: state.dashboardUrl };
           })
         : batchRunResults;
-    out.print({ results: enrichedResults });
+    out.print({
+      results: enrichedResults,
+      creation: {
+        results: creationResults,
+        summary: createResponse.summary,
+      },
+    });
   } else if (!opts.wait) {
     // Text mode, no --wait: statuses are non-terminal by design ('queued'),
     // so a pass/fail summary would misread a successful dispatch as
