@@ -812,7 +812,8 @@ Options:
                              the cloud, so it can be wrong, e.g. behind an IP
                              allowlist) (default: false)
   --idempotency-key <token>  idempotency token for the batch (1-256 ASCII
-                             chars; default: random UUID, pin one for safe
+                             chars; with --run, each trigger key is derived
+                             from it; default: random UUID, pin one for safe
                              retries)
   -h, --help                 display help for command
 

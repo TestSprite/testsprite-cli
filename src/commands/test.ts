@@ -4413,7 +4413,7 @@ export async function runCreateBatch(
   if (opts.run === true) {
     await withCreatedReceipt(opts, deps, response, runDeps =>
       runBatchRun(
-        opts,
+        { ...opts, idempotencyKey },
         response,
         runDeps.environmentTunnel?.client ?? client,
         makeOutput(opts.output, runDeps),
@@ -4451,7 +4451,7 @@ export async function runCreateBatch(
  *     that code only when ALL runs share the same code; otherwise 1.
  */
 async function runBatchRun(
-  opts: CreateBatchOptions,
+  opts: CreateBatchOptions & { idempotencyKey: string },
   createResponse: CliCreateBatchResponse,
   client: HttpClient,
   out: Output,
@@ -4639,8 +4639,21 @@ async function runBatchRun(
   const pendingTriggers = new Set<Promise<unknown>>();
 
   async function triggerOne(testId: string): Promise<CliBatchRunResult> {
-    // Mint a fresh idempotency key per run — MUST NOT reuse the create key.
-    const runIdempotencyKey = `cli-batch-run-${randomUUID()}`;
+    // Derived from the create key, never the create key itself (that would
+    // replay the create response), so a retry with the same key gets back the
+    // runs the first attempt started. A trigger routed through a tunnel names
+    // the tunnel's client id in its body, and the server refuses a reused key
+    // whose body changed (IDEMPOTENCY_BODY_MISMATCH), so that client id goes in
+    // the key too: a retry through the same tunnel (adopted with
+    // --tunnel-client) gets its runs back, and a retry through a new tunnel
+    // starts new runs, since the old ones cannot reach the app without theirs.
+    const tunnelScope = deps.environmentTunnel?.targets?.has(testId)
+      ? `:${deps.environmentTunnel.clientId}`
+      : '';
+    const runIdempotencyKey = suffixedIdempotencyKey(
+      opts.idempotencyKey,
+      `:run${tunnelScope}:${testId}`,
+    );
     if (opts.debug) {
       stderrFn(`[batch-run] ${testId} idempotency-key: ${runIdempotencyKey}`);
     }
@@ -12436,12 +12449,11 @@ export async function runTestRunLocalBatch(
       const runOne = async (index: number) => {
         const row = results[index]!;
         let triggerStartedAtMs: number;
-        const suffix = `:${row.testId}`;
-        const key = opts.idempotencyKey
-          ? `${idempotencyBase.slice(0, Math.max(0, 256 - suffix.length))}${suffix}`.slice(-256)
-          : index === 0
-            ? idempotencyBase
-            : `cli-run-${randomUUID()}`;
+        // Derived for every test, auto-minted base included, so a retry with
+        // the printed key re-sends the same keys; scoped to the tunnel when
+        // routed through one (see triggerOne in runBatchRun for why).
+        const tunnelScope = targets.has(row.testId) ? `:${liveSession.clientId}` : '';
+        const key = suffixedIdempotencyKey(idempotencyBase, `${tunnelScope}:${row.testId}`);
         let response: TriggerRunResponse;
         try {
           if (shutdown.signal.aborted) throw shutdown.signal.reason;
@@ -15050,7 +15062,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .option('--skip-preflight', `with --run: ${SKIP_PREFLIGHT_HELP}`, false)
     .option(
       '--idempotency-key <token>',
-      'idempotency token for the batch (1-256 ASCII chars; default: random UUID, pin one for safe retries)',
+      'idempotency token for the batch (1-256 ASCII chars; with --run, each trigger key is derived from it; default: random UUID, pin one for safe retries)',
     )
     .addHelpText(
       'after',
