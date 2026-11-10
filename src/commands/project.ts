@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { createReadStream, readFileSync, statSync, type Stats } from 'node:fs';
+import { createReadStream, statSync, type Stats } from 'node:fs';
 import { basename, extname } from 'node:path';
 import { Readable } from 'node:stream';
 import { Command, Option } from 'commander';
@@ -788,20 +788,19 @@ export async function runCredential(
     throw localValidationError(`--type must be one of: ${CLI_AUTH_TYPES.join(', ')}`);
   }
 
-  // Resolve the credential value (flag or file). Required for every type
-  // except `public` (which clears it).
-  let credential = opts.credential;
-  if (credential === undefined && opts.credentialFile !== undefined) {
-    credential = readFileSync(opts.credentialFile, 'utf8').trim();
-  }
-  if (opts.authType !== 'public' && (credential === undefined || credential === '')) {
-    throw localValidationError(
+  // A credential (flag or file) is required for every type except `public`
+  // (which clears it). Presence only here: dry-run checks that the flag was
+  // given, not the file's contents; --credential-file is read after the dry-run
+  // early return so --dry-run never touches the filesystem.
+  const missingCredential = (): ApiError =>
+    localValidationError(
       '--credential (or --credential-file) is required unless --type is "public"',
     );
+  const credentialSupplied =
+    opts.credential !== undefined ? opts.credential !== '' : opts.credentialFile !== undefined;
+  if (opts.authType !== 'public' && !credentialSupplied) {
+    throw missingCredential();
   }
-
-  const body: Record<string, string> = { authType: opts.authType };
-  if (opts.authType !== 'public' && credential !== undefined) body.credential = credential;
 
   const idempotencyKey = opts.idempotencyKey ?? `cli-proj-cred-${randomUUID()}`;
   if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
@@ -817,6 +816,17 @@ export async function runCredential(
     out.print(sample, data => renderCredentialText(data as CliProjectCredentialResponse));
     return sample;
   }
+
+  let credential = opts.credential;
+  if (credential === undefined && opts.credentialFile !== undefined) {
+    credential = readSecretFileGuarded('credential-file', opts.credentialFile);
+  }
+  if (opts.authType !== 'public' && (credential === undefined || credential === '')) {
+    throw missingCredential();
+  }
+
+  const body: Record<string, string> = { authType: opts.authType };
+  if (opts.authType !== 'public' && credential !== undefined) body.credential = credential;
 
   const client = makeClient(opts, deps);
   const res = await client.put<CliProjectCredentialResponse>(
@@ -898,22 +908,42 @@ export async function runAutoAuth(
     throw localValidationError(`--inject must be one of: ${AUTO_AUTH_INJECTS.join(', ')}`);
   }
 
+  const enabled = opts.disable !== true;
+
+  const idempotencyKey = opts.idempotencyKey ?? `cli-proj-autoauth-${randomUUID()}`;
+  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
+    stderr(`idempotency-key: ${idempotencyKey}`);
+  }
+
+  if (opts.dryRun) {
+    const sample: CliProjectAutoAuthResponse = {
+      projectId: opts.projectId,
+      enabled,
+      method: opts.method,
+      inject: opts.inject,
+    };
+    out.print(sample, data => renderAutoAuthText(data as CliProjectAutoAuthResponse));
+    return sample;
+  }
+
   // Resolve secrets from --*-file variants so they stay out of shell history.
+  // Placed after the dry-run early return so --dry-run never touches the filesystem.
   const password =
     opts.password ??
-    (opts.passwordFile !== undefined ? readFileSync(opts.passwordFile, 'utf8').trim() : undefined);
+    (opts.passwordFile !== undefined
+      ? readSecretFileGuarded('password-file', opts.passwordFile)
+      : undefined);
   const clientSecret =
     opts.clientSecret ??
     (opts.clientSecretFile !== undefined
-      ? readFileSync(opts.clientSecretFile, 'utf8').trim()
+      ? readSecretFileGuarded('client-secret-file', opts.clientSecretFile)
       : undefined);
   const refreshToken =
     opts.refreshToken ??
     (opts.refreshTokenFile !== undefined
-      ? readFileSync(opts.refreshTokenFile, 'utf8').trim()
+      ? readSecretFileGuarded('refresh-token-file', opts.refreshTokenFile)
       : undefined);
 
-  const enabled = opts.disable !== true;
   const body: Record<string, unknown> = { enabled, method: opts.method, inject: opts.inject };
   const maybe = (k: string, v: string | undefined): void => {
     if (v !== undefined) body[k] = v;
@@ -932,22 +962,6 @@ export async function runAutoAuth(
   maybe('refreshToken', refreshToken);
   maybe('scope', opts.scope);
   maybe('region', opts.region);
-
-  const idempotencyKey = opts.idempotencyKey ?? `cli-proj-autoauth-${randomUUID()}`;
-  if (opts.idempotencyKey === undefined && (opts.output === 'json' || opts.verbose || opts.debug)) {
-    stderr(`idempotency-key: ${idempotencyKey}`);
-  }
-
-  if (opts.dryRun) {
-    const sample: CliProjectAutoAuthResponse = {
-      projectId: opts.projectId,
-      enabled,
-      method: opts.method,
-      inject: opts.inject,
-    };
-    out.print(sample, data => renderAutoAuthText(data as CliProjectAutoAuthResponse));
-    return sample;
-  }
 
   const client = makeClient(opts, deps);
   const res = await client.put<CliProjectAutoAuthResponse>(
@@ -1194,16 +1208,17 @@ export async function runDocsUpload(
   // Compose the shutdown signal into the PUT abort (manual listeners, house
   // style — no AbortSignal.any) and arm the graceful scope for the upload's
   // duration, so Ctrl-C during a long PUT takes the honest detach path
-  // instead of being unabortable.
+  // instead of being unabortable. The timer and listener stay armed through the
+  // failed-response body read below, not just through fetch's header
+  // resolution — a non-OK response can still stall its body.
   const shutdown = deps.shutdown ?? globalShutdown;
   const shutdownSignal = shutdown.signal;
   const onShutdownAbort = (): void => controller.abort(shutdownSignal.reason);
   const disarm = shutdown.arm();
   if (shutdownSignal.aborted) onShutdownAbort();
   else shutdownSignal.addEventListener('abort', onShutdownAbort, { once: true });
-  let putResponse: Response;
   try {
-    putResponse = await fetchImpl(minted.uploadUrl, {
+    const putResponse = await fetchImpl(minted.uploadUrl, {
       method: 'PUT',
       headers: { 'content-type': contentType, 'content-length': String(stat.size) },
       body: Readable.toWeb(createReadStream(opts.file)) as unknown as RequestInit['body'],
@@ -1217,14 +1232,26 @@ export async function runDocsUpload(
       redirect: 'error',
       signal: controller.signal,
     } as RequestInit);
+    if (!putResponse.ok) {
+      // The deadline stays armed while this reads: a storage/proxy response can
+      // send non-OK headers and then stall its body indefinitely.
+      const snippet = await readFailedPutSnippet(putResponse, controller.signal);
+      throw presignedPutError(
+        `S3 returned HTTP ${putResponse.status}${snippet ? ` — ${snippet}` : ''}`,
+        minted.expiresInSeconds,
+      );
+    }
   } catch (cause) {
-    // Interrupt outranks the timeout mapping: a Ctrl-C-aborted fetch must
-    // surface as InterruptError (exit 130/143), never as a timeout.
+    // Interrupt outranks the timeout mapping: a Ctrl-C-aborted fetch or body
+    // read must surface as InterruptError (exit 130/143), never as a timeout.
     if (cause instanceof InterruptError) throw cause;
     if (shutdownSignal.aborted) throw shutdownSignal.reason;
+    // The presigned error thrown above already carries the HTTP status and
+    // step-2 guidance — don't remap it as a network failure.
+    if (cause instanceof ApiError) throw cause;
     // Any other abort here is ours (the per-request timer): map to the CLI's
     // typed exit-7 timeout, same contract as HttpClient's per-request timeout.
-    if (isAbortError(cause)) {
+    if (controller.signal.aborted || isAbortError(cause)) {
       throw new RequestTimeoutError(requestTimeoutMs);
     }
     throw presignedPutError(
@@ -1235,13 +1262,6 @@ export async function runDocsUpload(
     clearTimeout(timer);
     shutdownSignal.removeEventListener('abort', onShutdownAbort);
     disarm();
-  }
-  if (!putResponse.ok) {
-    const snippet = (await putResponse.text().catch(() => '')).slice(0, 300);
-    throw presignedPutError(
-      `S3 returned HTTP ${putResponse.status}${snippet ? ` — ${snippet}` : ''}`,
-      minted.expiresInSeconds,
-    );
   }
 
   // ── Step 3 of 3: register the uploaded object ─────────────────────────────
@@ -1276,6 +1296,84 @@ export async function runDocsUpload(
   };
   out.print(result, data => renderDocsUploadText(data as CliDocsUploadResult));
   return result;
+}
+
+const PUT_ERROR_BODY_MAX_BYTES = 1_200;
+const PUT_ERROR_SNIPPET_MAX_CHARS = 300;
+
+/**
+ * Read a bounded diagnostic prefix from a failed presigned PUT response.
+ *
+ * The caller keeps the PUT timeout/shutdown signal armed while this runs, but a
+ * body that ignores the abort must not extend the request past its deadline:
+ * every read races the abort signal, and the stream is cancelled without
+ * waiting for the peer. At most 1,200 bytes are read — enough for 300 four-byte
+ * UTF-8 code points — and at most 300 characters are displayed.
+ *
+ * A non-abort body error returns an empty snippet so the caller still reports
+ * the already-known HTTP status. Aborts and interrupts propagate so the upload
+ * maps them to the typed timeout/interrupt errors instead of swallowing them.
+ */
+async function readFailedPutSnippet(response: Response, signal: AbortSignal): Promise<string> {
+  if (response.body === null) return '';
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let bytes = 0;
+  let complete = false;
+  let removeAbortListener: (() => void) | undefined;
+
+  const aborted = new Promise<never>((_resolve, reject) => {
+    let notified = false;
+    const onAbort = (): void => {
+      if (notified) return;
+      notified = true;
+      // Don't await cleanup: a peer that never ends its body must not hold up
+      // the already-known upload failure.
+      void reader.cancel().catch(() => undefined);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    removeAbortListener = () => signal.removeEventListener('abort', onAbort);
+    // Covers an abort racing the listener registration above.
+    if (signal.aborted) onAbort();
+  });
+
+  try {
+    while (bytes < PUT_ERROR_BODY_MAX_BYTES && text.length < PUT_ERROR_SNIPPET_MAX_CHARS) {
+      const result = await Promise.race([reader.read(), aborted]);
+      // Cancelling the reader in `onAbort` can settle the pending read as
+      // `{ done: true }` before the abort rejection wins the race. Re-check the
+      // signal so a stalled body still surfaces the timeout/interrupt.
+      if (signal.aborted) throw signal.reason;
+      const { done, value } = result;
+      if (done) {
+        complete = true;
+        text += decoder.decode();
+        break;
+      }
+      if (value === undefined) continue;
+      const prefix = value.subarray(0, PUT_ERROR_BODY_MAX_BYTES - bytes);
+      bytes += prefix.byteLength;
+      text += decoder.decode(prefix, { stream: true });
+    }
+    return text.slice(0, PUT_ERROR_SNIPPET_MAX_CHARS);
+  } catch (cause) {
+    if (signal.aborted) throw signal.reason;
+    if (cause instanceof InterruptError || isAbortError(cause)) throw cause;
+    return '';
+  } finally {
+    removeAbortListener?.();
+    // Do not let remote stream cleanup delay the already-known error.
+    if (!complete) void reader.cancel().catch(() => undefined);
+    try {
+      reader.releaseLock();
+    } catch {
+      // A pending read can hold the lock after an abort; the stream is already
+      // being cancelled and the caller must not wait on that cleanup.
+    }
+  }
 }
 
 function isAbortError(cause: unknown): boolean {
