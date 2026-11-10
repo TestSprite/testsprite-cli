@@ -1291,10 +1291,10 @@ describe('runCreateBatch --run --dry-run', () => {
       },
     );
 
-    const envelope = JSON.parse(stdout.join('')) as Record<string, unknown>;
-    expect(envelope.dryRun).toBe(true);
-    expect(envelope.results).toBeDefined();
-    expect(envelope).not.toHaveProperty('creation');
+    const output = stdout.join('');
+    // Text mode uses the human-readable formatter, not the JSON envelope.
+    expect(() => JSON.parse(output)).toThrow();
+    expect(output).not.toContain('creation');
   });
 });
 
