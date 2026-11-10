@@ -350,6 +350,7 @@ describe('buildGithubWorkflow', () => {
     const generated = new Set(
       [...buildGithubWorkflow(WF_BASE).matchAll(/uses: (actions\/[\w-]+@v\d+)/g)].map(m => m[1]),
     );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this repository's own DOCUMENTATION.md, never user input.
     const docs = readFileSync(new URL('../../DOCUMENTATION.md', import.meta.url), 'utf8');
     const documented = [...docs.matchAll(/uses: (actions\/[\w-]+@v\d+)/g)].map(m => m[1]);
     expect(documented.length).toBeGreaterThan(0);
