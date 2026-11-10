@@ -116,6 +116,134 @@ describe('readGithubRunContext', () => {
       },
     );
     expect(closed.kind).toBe('no_pull_request');
+    // Nor is a merged/closed pull request whose head IS the deployed commit (a redeploy after merge).
+    for (const state of ['closed', 'merged']) {
+      const done = await readGithubRunContext(
+        actionsEnv({ GITHUB_EVENT_NAME: 'deployment_status', GITHUB_TOKEN: 't' }),
+        {
+          ...eventFile({ deployment: { sha: SHA } }),
+          fetchImpl: githubApi([{ number: 7, state, head: { sha: SHA, ref: 'feat/done' } }]),
+        },
+      );
+      expect(done).toMatchObject({ kind: 'no_pull_request', event: 'deployment_status' });
+    }
+    // Nor an open PR that only contains the commit (branched off it): its head is another commit.
+    const containing = await readGithubRunContext(
+      actionsEnv({ GITHUB_EVENT_NAME: 'deployment_status', GITHUB_TOKEN: 't' }),
+      {
+        ...eventFile({ deployment: { sha: SHA } }),
+        fetchImpl: githubApi([
+          { number: 7, state: 'closed', head: { sha: SHA, ref: 'feat/done' } },
+          { number: 8, state: 'open', head: { sha: OTHER, ref: 'feat/next' } },
+        ]),
+      },
+    );
+    expect(containing).toMatchObject({ kind: 'no_pull_request', event: 'deployment_status' });
+  });
+
+  it('deployment_status: an open PR wins over a closed one with the same head commit', async () => {
+    const ctx = await readGithubRunContext(
+      actionsEnv({ GITHUB_EVENT_NAME: 'deployment_status', GITHUB_TOKEN: 't' }),
+      {
+        ...eventFile({ deployment: { sha: SHA } }),
+        fetchImpl: githubApi([
+          { number: 7, state: 'closed', head: { sha: SHA, ref: 'feat/old' } },
+          { number: 9, state: 'open', head: { sha: SHA, ref: 'feat/new' } },
+        ]),
+      },
+    );
+    expect(ctx).toMatchObject({ kind: 'pull_request', trigger: { prNumber: 9 } });
+  });
+
+  it('deployment_status: a lookup that never answers times out with exit 10 instead of hanging', async () => {
+    const hang = vi.fn(
+      (_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+        }),
+    ) as unknown as typeof globalThis.fetch;
+    const started = Date.now();
+    await expect(
+      readGithubRunContext(
+        actionsEnv({ GITHUB_EVENT_NAME: 'deployment_status', GITHUB_TOKEN: 't' }),
+        {
+          ...eventFile({ deployment: { sha: SHA } }),
+          fetchImpl: hang,
+          requestTimeoutMs: 50,
+        },
+      ),
+    ).rejects.toMatchObject({
+      exitCode: 10,
+      message: expect.stringContaining('did not answer within'),
+    });
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  it('deployment_status: a 200 whose body stalls past the timeout is reported as a timeout, exit 10', async () => {
+    const stall = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      const body = new ReadableStream({
+        start(controller) {
+          init?.signal?.addEventListener('abort', () => controller.error(init.signal?.reason));
+        },
+      });
+      return Promise.resolve(
+        new Response(body, { status: 200, headers: { 'content-type': 'application/json' } }),
+      );
+    }) as unknown as typeof globalThis.fetch;
+    await expect(
+      readGithubRunContext(
+        actionsEnv({ GITHUB_EVENT_NAME: 'deployment_status', GITHUB_TOKEN: 't' }),
+        { ...eventFile({ deployment: { sha: SHA } }), fetchImpl: stall, requestTimeoutMs: 50 },
+      ),
+    ).rejects.toMatchObject({
+      exitCode: 10,
+      message: expect.stringContaining('did not finish answering within'),
+    });
+  });
+
+  it('deployment_status: a 200 that is not JSON (proxy, captive portal) is exit 10, not an uncaught crash', async () => {
+    const html = vi.fn(
+      async () =>
+        new Response('<html>sign in to the proxy</html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        }),
+    ) as unknown as typeof globalThis.fetch;
+    await expect(
+      readGithubRunContext(
+        actionsEnv({ GITHUB_EVENT_NAME: 'deployment_status', GITHUB_TOKEN: 't' }),
+        {
+          ...eventFile({ deployment: { sha: SHA } }),
+          fetchImpl: html,
+        },
+      ),
+    ).rejects.toMatchObject({ exitCode: 10, message: expect.stringContaining('not JSON') });
+  });
+
+  it('deployment_status: a body that breaks off mid-stream is exit 10 with its cause, not "not JSON"', async () => {
+    const broken = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('[{"number":'));
+              controller.error(new Error('socket hang up'));
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+    ) as unknown as typeof globalThis.fetch;
+    const failure = readGithubRunContext(
+      actionsEnv({ GITHUB_EVENT_NAME: 'deployment_status', GITHUB_TOKEN: 't' }),
+      { ...eventFile({ deployment: { sha: SHA } }), fetchImpl: broken },
+    );
+    await expect(failure).rejects.toMatchObject({
+      exitCode: 10,
+      message: expect.stringContaining('could not be read: socket hang up'),
+    });
+    await expect(failure).rejects.not.toMatchObject({
+      message: expect.stringContaining('not JSON'),
+    });
   });
 
   it('deployment_status: needs GITHUB_TOKEN, and a failed lookup never falls back to a guess', async () => {

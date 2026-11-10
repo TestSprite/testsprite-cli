@@ -50,7 +50,7 @@ import { globalShutdown, type ShutdownHandle } from './interrupt.js';
 import { isProxyAgentActive } from './proxy.js';
 import { disallowedIpReason } from './target-url.js';
 
-/** ~8s, matching the MCP plugin's `checkPortListening` TCP-probe budget. */
+/** Shared DNS + HTTP budget, matching the MCP plugin's ~8s probe budget. */
 const PREFLIGHT_TIMEOUT_MS = 8_000;
 
 const GATEWAY_ERROR_STATUSES = new Set([502, 503, 504]);
@@ -122,6 +122,27 @@ function bareHost(hostname: string): string {
   return hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
 }
 
+/** Stop waiting even though the system resolver itself cannot be cancelled. */
+async function lookupWithSignal(
+  hostname: string,
+  lookup: (hostname: string) => Promise<unknown>,
+  signal: AbortSignal,
+): Promise<unknown> {
+  signal.throwIfAborted();
+  let onAbort!: () => void;
+  try {
+    return await new Promise<unknown>((resolve, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener('abort', onAbort, { once: true });
+      // Both handlers remain attached after an abort: a late DNS result cannot
+      // resume the probe, and a late rejection must not become unhandled.
+      lookup(hostname).then(resolve, reject);
+    });
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
 /**
  * Probe `rawUrl` for the narrow refusal set described in the module
  * docstring. Network failures classify to `warn` or `refuse`, while a process
@@ -141,130 +162,151 @@ export async function probeTargetUrl(
     return { verdict: 'warn', reason: 'could not parse --target-url for the reachability probe' };
   }
 
-  const host = bareHost(parsed.hostname);
-
-  // Step 1 — DNS. Skipped for a literal IP host (nothing to resolve, and
-  // dns.lookup on a literal is a needless round trip through the resolver).
-  if (isIP(host) === 0) {
-    const dnsLookup =
-      deps.dnsLookup ?? ((hostname: string) => dns.promises.lookup(hostname, { all: true }));
-    let lookupResult: unknown;
-    try {
-      lookupResult = await dnsLookup(host);
-    } catch (err) {
-      const code = (err as { code?: unknown } | null)?.code;
-      if (code === 'ENOTFOUND' || code === 'EAI_NONAME') {
-        if (proxied) {
-          return {
-            verdict: 'warn',
-            reason: `DNS lookup for "${host}" failed locally (${code}) — not conclusive behind a configured proxy`,
-          };
-        }
-        return {
-          verdict: 'refuse',
-          reason: `--target-url host "${host}" does not resolve (${code})`,
-        };
-      }
-      // Anything else (e.g. EAI_AGAIN — a transient resolver hiccup) is
-      // ambiguous, not a confirmed dead target — warn, never refuse.
-      return {
-        verdict: 'warn',
-        reason: `DNS lookup for "${host}" failed (${typeof code === 'string' ? code : 'unknown error'})`,
-      };
-    }
-
-    // DNS rebinding: a public-looking hostname (e.g. an attacker-controlled
-    // domain, or a tunnel host with attacker-influenced DNS) whose A/AAAA
-    // record actually points at a private, loopback, link-local, or
-    // metadata-service address. `assertNotLocal` never catches this — it
-    // only ever inspected the literal `--target-url` *string*, and this
-    // hostname passed that check honestly (it doesn't LOOK private). Unlike
-    // the DNS-failure branch above, there is no proxy carve-out: resolving
-    // locally to a private address is a security signal, not an ambiguous
-    // "can't tell from here" result, and a false positive has a documented
-    // escape hatch (`--skip-preflight`) rather than a broken workflow.
-    for (const address of resolvedAddresses(lookupResult)) {
-      const blocked = disallowedIpReason(address);
-      if (blocked !== undefined) {
-        return {
-          verdict: 'refuse',
-          reason: `--target-url host "${host}" resolves to ${address} (${blocked.reason})`,
-        };
-      }
-    }
-  }
-
-  // Step 2 — HTTP probe. Runs through the global `fetch`, which picks up
-  // the proxy dispatcher `proxy.ts` installs at startup when one is
-  // configured — so this step (unlike the DNS step above) is proxy-aware
-  // by construction, not just proxy-tolerant.
-  const fetchImpl = deps.fetchImpl ?? fetch;
   const shutdownSignal = deps.shutdownSignal ?? globalShutdown.signal;
   const shutdown = deps.shutdown ?? globalShutdown;
   return shutdown.runCriticalOperation(async () => {
+    shutdownSignal.throwIfAborted();
+    const deadline = new AbortController();
+    const timer = setTimeout(() => {
+      deadline.abort(new DOMException('Target URL preflight timed out', 'TimeoutError'));
+    }, PREFLIGHT_TIMEOUT_MS);
+    timer.unref?.();
+    const signal = AbortSignal.any([deadline.signal, shutdownSignal]);
     try {
-      const resp = await fetchImpl(rawUrl, {
-        method: 'GET',
-        // Never follow — see the module docstring. A 3xx is reachability
-        // proof on its own (handled immediately below); the redirect target
-        // is unvalidated and must not be dereferenced.
-        redirect: 'manual',
-        signal: AbortSignal.any([AbortSignal.timeout(PREFLIGHT_TIMEOUT_MS), shutdownSignal]),
-      });
-      // Never read the body — only the status matters here. Cancel it so the
-      // connection is released promptly instead of buffering a full page.
-      await resp.body?.cancel().catch(() => undefined);
-      if (shutdownSignal.aborted) throw shutdownSignal.reason;
-      if (resp.status >= 300 && resp.status < 400) {
-        // A redirect is a live-server signal (e.g. a real app 302ing an
-        // unauthenticated GET to a login page) — reachable, not refused. The
-        // Location header is deliberately never inspected or dereferenced.
+      const host = bareHost(parsed.hostname);
+
+      // Step 1 — DNS. Skipped for a literal IP host (nothing to resolve, and
+      // dns.lookup on a literal is a needless round trip through the resolver).
+      if (isIP(host) === 0) {
+        const dnsLookup =
+          deps.dnsLookup ?? ((hostname: string) => dns.promises.lookup(hostname, { all: true }));
+        let lookupResult: unknown;
+        try {
+          lookupResult = await lookupWithSignal(host, dnsLookup, signal);
+          signal.throwIfAborted();
+        } catch (err) {
+          if (shutdownSignal.aborted) throw shutdownSignal.reason;
+          if (err instanceof InterruptError) throw err;
+          if (signal.aborted) {
+            return {
+              verdict: 'warn',
+              reason: `DNS lookup for "${host}" did not finish within ${PREFLIGHT_TIMEOUT_MS / 1000}s`,
+            };
+          }
+          const code = (err as { code?: unknown } | null)?.code;
+          if (code === 'ENOTFOUND' || code === 'EAI_NONAME') {
+            if (proxied) {
+              return {
+                verdict: 'warn',
+                reason: `DNS lookup for "${host}" failed locally (${code}) — not conclusive behind a configured proxy`,
+              };
+            }
+            return {
+              verdict: 'refuse',
+              reason: `--target-url host "${host}" does not resolve (${code})`,
+            };
+          }
+          // Anything else (e.g. EAI_AGAIN — a transient resolver hiccup) is
+          // ambiguous, not a confirmed dead target — warn, never refuse.
+          return {
+            verdict: 'warn',
+            reason: `DNS lookup for "${host}" failed (${typeof code === 'string' ? code : 'unknown error'})`,
+          };
+        }
+
+        // DNS rebinding: a public-looking hostname (e.g. an attacker-controlled
+        // domain, or a tunnel host with attacker-influenced DNS) whose A/AAAA
+        // record actually points at a private, loopback, link-local, or
+        // metadata-service address. `assertNotLocal` never catches this — it
+        // only ever inspected the literal `--target-url` *string*, and this
+        // hostname passed that check honestly (it doesn't LOOK private). Unlike
+        // the DNS-failure branch above, there is no proxy carve-out: resolving
+        // locally to a private address is a security signal, not an ambiguous
+        // "can't tell from here" result, and a false positive has a documented
+        // escape hatch (`--skip-preflight`) rather than a broken workflow.
+        for (const address of resolvedAddresses(lookupResult)) {
+          const blocked = disallowedIpReason(address);
+          if (blocked !== undefined) {
+            return {
+              verdict: 'refuse',
+              reason: `--target-url host "${host}" resolves to ${address} (${blocked.reason})`,
+            };
+          }
+        }
+      }
+
+      // Step 2 — HTTP probe. Runs through the global `fetch`, which picks up
+      // the proxy dispatcher `proxy.ts` installs at startup when one is
+      // configured — so this step (unlike the DNS step above) is proxy-aware
+      // by construction, not just proxy-tolerant.
+      const fetchImpl = deps.fetchImpl ?? fetch;
+      try {
+        signal.throwIfAborted();
+        const resp = await fetchImpl(rawUrl, {
+          method: 'GET',
+          // Never follow — see the module docstring. A 3xx is reachability
+          // proof on its own (handled immediately below); the redirect target
+          // is unvalidated and must not be dereferenced.
+          redirect: 'manual',
+          signal,
+        });
+        // Never read the body — only the status matters here. Cancel it so the
+        // connection is released promptly instead of buffering a full page.
+        await resp.body?.cancel().catch(() => undefined);
+        if (shutdownSignal.aborted) throw shutdownSignal.reason;
+        if (resp.status >= 300 && resp.status < 400) {
+          // A redirect is a live-server signal (e.g. a real app 302ing an
+          // unauthenticated GET to a login page) — reachable, not refused. The
+          // Location header is deliberately never inspected or dereferenced.
+          return { verdict: 'ok' };
+        }
+        if (GATEWAY_ERROR_STATUSES.has(resp.status)) {
+          if (proxied) {
+            return {
+              verdict: 'warn',
+              reason: `--target-url responded HTTP ${resp.status} — not conclusive behind a configured proxy`,
+            };
+          }
+          return {
+            verdict: 'refuse',
+            reason: `--target-url responded HTTP ${resp.status} (gateway error — the target is unreachable)`,
+          };
+        }
+        if (resp.status >= 400) {
+          return { verdict: 'warn', reason: `--target-url responded HTTP ${resp.status}` };
+        }
         return { verdict: 'ok' };
-      }
-      if (GATEWAY_ERROR_STATUSES.has(resp.status)) {
-        if (proxied) {
+      } catch (err) {
+        if (shutdownSignal.aborted) throw shutdownSignal.reason;
+        if (err instanceof InterruptError) throw err;
+        if (errorHasCode(err, ['ECONNREFUSED'])) {
+          if (proxied) {
+            return {
+              verdict: 'warn',
+              reason:
+                'connection to --target-url was refused — not conclusive behind a configured proxy',
+            };
+          }
           return {
-            verdict: 'warn',
-            reason: `--target-url responded HTTP ${resp.status} — not conclusive behind a configured proxy`,
+            verdict: 'refuse',
+            reason: 'connection to --target-url was refused (ECONNREFUSED)',
           };
         }
-        return {
-          verdict: 'refuse',
-          reason: `--target-url responded HTTP ${resp.status} (gateway error — the target is unreachable)`,
-        };
-      }
-      if (resp.status >= 400) {
-        return { verdict: 'warn', reason: `--target-url responded HTTP ${resp.status}` };
-      }
-      return { verdict: 'ok' };
-    } catch (err) {
-      if (shutdownSignal.aborted) throw shutdownSignal.reason;
-      if (err instanceof InterruptError) throw err;
-      if (errorHasCode(err, ['ECONNREFUSED'])) {
-        if (proxied) {
+        if (isTimeoutError(err)) {
           return {
             verdict: 'warn',
-            reason:
-              'connection to --target-url was refused — not conclusive behind a configured proxy',
+            reason: `--target-url did not respond within ${PREFLIGHT_TIMEOUT_MS / 1000}s`,
           };
         }
-        return {
-          verdict: 'refuse',
-          reason: 'connection to --target-url was refused (ECONNREFUSED)',
-        };
-      }
-      if (isTimeoutError(err)) {
+        // TLS errors and anything else unclassified: warn only — the refusal
+        // set stays narrow to exactly what that analysis measured.
         return {
           verdict: 'warn',
-          reason: `--target-url did not respond within ${PREFLIGHT_TIMEOUT_MS / 1000}s`,
+          reason: `could not reach --target-url (${err instanceof Error ? err.message : String(err)})`,
         };
       }
-      // TLS errors and anything else unclassified: warn only — the refusal
-      // set stays narrow to exactly what that analysis measured.
-      return {
-        verdict: 'warn',
-        reason: `could not reach --target-url (${err instanceof Error ? err.message : String(err)})`,
-      };
+    } finally {
+      clearTimeout(timer);
     }
   });
 }
