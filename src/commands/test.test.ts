@@ -10231,6 +10231,7 @@ describe('runCreateBatch', () => {
           output: 'json',
           debug: false,
           plans: plansFile,
+          run: true,
           maxConcurrency: 0,
         },
         { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
@@ -10252,6 +10253,7 @@ describe('runCreateBatch', () => {
           output: 'json',
           debug: false,
           plans: plansFile,
+          run: true,
           maxConcurrency: 101,
         },
         { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
@@ -10266,14 +10268,17 @@ describe('runCreateBatch', () => {
     const { credentialsPath } = makeCreds();
     const plansFile = writePlansJsonl([FE_SPEC]);
     const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
-    // Should NOT throw VALIDATION_ERROR for exactly 100
+    // Should NOT throw VALIDATION_ERROR for exactly 100 (with --run, the only
+    // mode that reads it; --dry-run previews the triggers without a server).
     await expect(
       runCreateBatch(
         {
           profile: 'default',
           output: 'json',
           debug: false,
+          dryRun: true,
           plans: plansFile,
+          run: true,
           maxConcurrency: 100,
         },
         { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
