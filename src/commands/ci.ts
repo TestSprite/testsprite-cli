@@ -2,9 +2,11 @@ import { promises as nodeFs } from 'node:fs';
 import { spawnSync as nodeSpawnSync, type SpawnSyncReturns } from 'node:child_process';
 import * as path from 'node:path';
 import { Command } from 'commander';
+import { equalIgnoringCrlf } from '../lib/text-equality.js';
 import {
   makeHttpClient,
   parseRequestTimeoutFlag,
+  resolveRequestTimeoutMs,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { ApiError, CLIError, localValidationError } from '../lib/errors.js';
@@ -12,6 +14,7 @@ import { loadConfig, resolveProfileName } from '../lib/config.js';
 import { type FetchImpl, type HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import type { Page } from '../lib/pagination.js';
+import { inspectTargetPath, type TargetPathFs } from '../lib/target-path.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import {
   classifyLinkage,
@@ -24,7 +27,12 @@ import {
 } from '../lib/ci-linkage.js';
 import { ciRefusalOutcome, recordTelemetryExtras } from '../lib/telemetry.js';
 import type { CliProject } from './project.js';
-import { runTestRunAll, type RunTestRunAllOptions, type TestDeps } from './test.js';
+import {
+  parseNameFilter,
+  runTestRunAll,
+  type RunTestRunAllOptions,
+  type TestDeps,
+} from './test.js';
 import { emitCiStepOutputs, type CiSummary } from '../lib/gh-output.js';
 import { previewEnvironmentName, readGithubRunContext } from '../lib/github-context.js';
 import type { CiGithubTrigger } from '../lib/runs.types.js';
@@ -67,10 +75,11 @@ const DEFAULT_API_URL = 'https://api.testsprite.com';
 
 /**
  * Minimal fs seam (mirrors `agent.ts`'s `AgentFs` semantics: exclusive writes to
- * refuse clobbering, recursive mkdir to create parent dirs). Kept local so `ci`
- * doesn't couple to the agent-install internals.
+ * refuse clobbering, recursive mkdir to create parent dirs). Path inspection
+ * shares the agent installer's component walk.
  */
-export interface CiFs {
+export interface CiFs extends TargetPathFs {
+  realpath(target: string): Promise<string>;
   writeFile(target: string, data: string, opts?: { exclusive?: boolean }): Promise<void>;
   mkdir(dir: string): Promise<void>;
   readFile(target: string): Promise<string>;
@@ -79,6 +88,18 @@ export interface CiFs {
 }
 
 const defaultCiFs: CiFs = {
+  async lstat(target) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- inspect each component before writing the caller-selected workflow path.
+      const stat = await nodeFs.lstat(target);
+      return { isFile: stat.isFile(), isSymbolicLink: stat.isSymbolicLink() };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  },
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- resolve the repository and workflow symlink for containment validation.
+  realpath: target => nodeFs.realpath(target),
   // `target`/`dir` are the workflow output path (default `.github/workflows/testsprite.yml`,
   // or the caller's `--path`), resolved from cwd — a scaffold target the user is writing into
   // their own repo, never external/network input. Same risk profile as agent-install scaffolding.
@@ -278,6 +299,16 @@ export function buildGithubWorkflow(input: {
   assertSafeWorkflowValue('project', input.projectId);
   assertSafeWorkflowValue('env', input.environment);
   if (input.endpointUrl) assertSafeWorkflowValue('endpoint-url', input.endpointUrl);
+  // All generated workflows live directly under .github/workflows/. Keep the
+  // readable filename, including its extension; escape rather than discard
+  // punctuation so distinct filenames cannot collapse to the same slug.
+  // GitHub compares concurrency group names case-insensitively, so uppercase
+  // letters are escaped too (keeping existing %XX escapes intact): otherwise
+  // TestSprite.yml and testsprite.yml would share a group.
+  const workflowSlug = encodeURIComponent(path.posix.basename(input.workflowPath)).replace(
+    /%[0-9A-F]{2}|[A-Z]/g,
+    match => (match.startsWith('%') ? match : `%${match.charCodeAt(0).toString(16).toUpperCase()}`),
+  );
 
   const envLines = [
     `      ${API_KEY_SECRET_NAME}: \${{ secrets.${API_KEY_SECRET_NAME} }}`,
@@ -320,6 +351,8 @@ permissions:
 
 jobs:
   testsprite-tests:
+    # Include this workflow's filename: concurrency groups are repository-wide,
+    # so another project's workflow must not cancel this gate.
     # B (pull_request): a new push to the pull request cancels the previous job.
     # A (deployment_status): one group per COMMIT — Vercel sets deployment.ref to
     # the commit sha, so a new push does not cancel the previous commit's job.
@@ -328,9 +361,10 @@ jobs:
     # Cancelling only stops this job's CLI: the TestSprite run it started keeps
     # executing and reports in the Portal; the new push starts its own run.
     concurrency:
-      group: testsprite-\${{ github.event.pull_request.number || github.event.deployment.sha }}
+      group: testsprite-${workflowSlug}-\${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
-    # pull_request: skip fork PRs (they get no repository secrets) and draft PRs.
+    # pull_request: skip fork PRs (they get no repository secrets), Dependabot PRs
+    # (Dependabot secrets are not Actions secrets), and draft PRs.
     # deployment_status: only successful, non-production deployments. Vercel leaves
     # production_environment false on production deployments, so the name is checked too
     # (GitHub compares strings case-insensitively).
@@ -347,6 +381,7 @@ jobs:
     if: >-
       (github.event_name == 'pull_request' &&
        github.event.pull_request.head.repo.full_name == github.repository &&
+       github.actor != 'dependabot[bot]' &&
        !github.event.pull_request.draft) ||
       (github.event_name == 'deployment_status' &&
        github.event.deployment_status.state == 'success' &&
@@ -357,11 +392,14 @@ jobs:
     env:
 ${envLines.join('\n')}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
+          # Only the CLI is installed below. Without this, an npm repo
+          # (package.json "packageManager": "npm@…") with no lockfile fails here.
+          package-manager-cache: false
 
       - run: npm i -g ${CLI_PACKAGE_SPEC}
 
@@ -384,7 +422,7 @@ ${runLines.join('\n')}
 
       - name: Upload TestSprite report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: testsprite-results
           path: ${SUMMARY_FILE}
@@ -628,6 +666,29 @@ async function runCiInitScaffold(
   if (opts.project) assertSafeWorkflowValue('project', opts.project);
   if (opts.env) assertSafeWorkflowValue('env', opts.env);
   const { relPath, absPath } = resolveWorkflowPath(opts.workflowPath, cwd);
+  const allowInternalSymlink = async (target: string): Promise<void> => {
+    let resolved: string;
+    let root: string;
+    try {
+      [root, resolved] = await Promise.all([fs.realpath(cwd), fs.realpath(target)]);
+    } catch {
+      throw new CLIError(
+        `cannot resolve symlink at "${target}"; refusing to write the workflow.`,
+        5,
+      );
+    }
+    const relative = path.relative(root, resolved);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new CLIError(
+        `refusing to write through symlink "${target}": "${resolved}" is outside the repository.`,
+        5,
+      );
+    }
+  };
+  await inspectTargetPath(fs, cwd, relPath, allowInternalSymlink);
+  if (opts.force) {
+    await inspectTargetPath(fs, cwd, `${relPath}.bak`, allowInternalSymlink);
+  }
 
   const projectId = await resolveProjectId(opts, deps);
   const resolvedEnv = await resolveEnvironment(opts, deps, projectId);
@@ -725,8 +786,8 @@ async function runCiInitScaffold(
     if (code !== 'EEXIST') throw err;
     onExisted(true);
     const prior = await fs.readFile(absPath);
-    if (prior === workflow) {
-      // Already exactly what we'd write: no rewrite, and re-running (with or
+    if (equalIgnoringCrlf(prior, workflow)) {
+      // Equivalent apart from CRLF conversion: no rewrite, and re-running (with or
       // without --force) on identical content is a no-op rather than an error.
       wrote = false;
     } else if (!opts.force) {
@@ -1327,7 +1388,10 @@ export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise
     throw err;
   }
 
-  const github = await readGithubRunContext(env, { fetchImpl: deps.fetchImpl });
+  const github = await readGithubRunContext(env, {
+    fetchImpl: deps.fetchImpl,
+    requestTimeoutMs: resolveRequestTimeoutMs(opts, env),
+  });
   let previewName: string | undefined;
   let githubTrigger: CiGithubTrigger | undefined;
   if (github.kind === 'pull_request') {
@@ -1427,6 +1491,7 @@ async function assertCiEnvironmentExists(opts: CiRunOptions, deps: TestDeps): Pr
   );
 }
 
+/** Build CI run and workflow scaffolding commands with injectable runtime dependencies. */
 export function createCiCommand(deps: CiDeps = {}): Command {
   const ci = new Command('ci').description('Run tests in CI and scaffold CI integration');
 
@@ -1435,7 +1500,10 @@ export function createCiCommand(deps: CiDeps = {}): Command {
     .allowExcessArguments(false)
     .option('--project <id>', 'project id (defaults to TESTSPRITE_PROJECT_ID)')
     .option('--all', 'run all project tests (already the default)')
-    .option('--filter <substr>', 'only run tests whose name contains this substring')
+    .option(
+      '--filter <substr>',
+      'only run tests whose name contains this non-empty substring (case-insensitive); omit to run every test',
+    )
     .option(
       '--env <name>',
       'the environment whose sign-in the run uses (unknown names fail). In a pull request, with --target-url, the run happens in a temporary clone of it at the preview address, named github-pr-<N> like a GitHub App run',
@@ -1490,7 +1558,7 @@ export function createCiCommand(deps: CiDeps = {}): Command {
         {
           ...resolveCommonOptions(command),
           projectId: cmdOpts.project,
-          nameFilter: cmdOpts.filter,
+          nameFilter: parseNameFilter(cmdOpts.filter),
           environment: cmdOpts.env,
           targetUrl: cmdOpts.targetUrl,
           skipPreflight: cmdOpts.skipPreflight === true,
