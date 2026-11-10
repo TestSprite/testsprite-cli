@@ -16,13 +16,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import { readProfile, writeProfile } from '../lib/credentials.js';
 import type { MeResponse } from './auth.js';
 import type { AgentFs } from './agent.js';
+import { Command } from 'commander';
 import type { InitDeps } from './init.js';
-import { runInit } from './init.js';
+import { runInit, addSetupOptions } from './init.js';
 import {
   TARGETS,
   DEFAULT_SKILLS,
@@ -65,6 +66,18 @@ function makeOkFetch(): InitDeps['fetchImpl'] {
         headers: { 'content-type': 'application/json' },
       }),
   ) as unknown as InitDeps['fetchImpl'];
+}
+
+/** Mock fetch that never answers; it rejects only when the request is aborted. */
+function makeHangingFetch(): InitDeps['fetchImpl'] {
+  return vi.fn(
+    (_input: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+          once: true,
+        });
+      }),
+  );
 }
 
 /** Mock fetch that returns 401 for any request (simulates bad key). */
@@ -176,6 +189,8 @@ function makeBaseOpts(overrides: Partial<Parameters<typeof runInit>[0]> = {}) {
     fromEnv: false,
     agent: 'claude' as AgentTarget,
     noAgent: false,
+    // Never touch the real repository .gitignore; the .gitignore tests opt in explicitly.
+    noGitignore: true,
     force: false,
     yes: false,
     ...overrides,
@@ -503,6 +518,53 @@ describe('runInit — session-only environment credentials', () => {
     ).rejects.toBe(error);
     expect(captured.stderr).toEqual([]);
     expect(captured.stdout).toEqual([]);
+  });
+});
+
+describe('runInit: the key check against /me does not answer', () => {
+  const options = () =>
+    makeBaseOpts({ fromEnv: true, noAgent: true, output: 'json', requestTimeoutMs: 20 });
+
+  it('setup --from-env exits 7 with REQUEST_TIMEOUT, keeps the request id and saves nothing', async () => {
+    const { captured, deps } = makeCapture();
+    const err = await runInit(options(), {
+      ...deps,
+      env: { TESTSPRITE_API_KEY: 'sk-user-valid-key' },
+      credentialsPath,
+      fetchImpl: makeHangingFetch(),
+      isTTY: false,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RequestTimeoutError);
+    expect(err).toMatchObject({
+      code: 'REQUEST_TIMEOUT',
+      exitCode: 7,
+      requestId: expect.stringMatching(/^cli_/),
+    });
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    const stderr = captured.stderr.join('\n');
+    expect(stderr).toContain('timed out, profile NOT updated');
+    expect(stderr).not.toContain('API key rejected');
+    expect(captured.stdout).toEqual([]);
+  });
+
+  it('a 401 from /me still exits 3 with the typed envelope', async () => {
+    const { captured, deps } = makeCapture();
+    await expect(
+      runInit(options(), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: 'sk-user-revoked-key' },
+        credentialsPath,
+        fetchImpl: makeAuthFailFetch(),
+        isTTY: false,
+      }),
+    ).rejects.toMatchObject({
+      code: 'AUTH_INVALID',
+      exitCode: 3,
+      nextAction: 'Provide a valid key.',
+      requestId: 'r-1',
+    });
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(captured.stderr.join('\n')).toContain('API key rejected');
   });
 });
 
@@ -2185,5 +2247,176 @@ describe('runInit -- skipIfConfigured', () => {
 
     // Explicit --api-key must overwrite regardless of skipIfConfigured.
     expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-new');
+  });
+
+  describe('.gitignore safety', () => {
+    // runInit resolves the project dir, so seed and assert the resolved path
+    // (on Windows path.resolve('/test-project') gains a drive letter).
+    const GIT_CWD = path.resolve(CWD);
+    it('appends .testsprite/ to .gitignore when inside a git repo', async () => {
+      const { deps } = makeCapture();
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.mkdir(path.join(GIT_CWD, '.git'));
+      writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+      const fetchMock = makeOkFetch();
+
+      await runInit(
+        makeBaseOpts({
+          dir: GIT_CWD,
+          skipIfConfigured: true,
+          noAgent: true,
+          noGitignore: false,
+          output: 'json',
+        }),
+        {
+          ...deps,
+          credentialsPath,
+          fetchImpl: fetchMock,
+          fs: agentFs,
+          isTTY: false,
+        },
+      );
+
+      expect(store.get(path.join(GIT_CWD, '.gitignore'))).toContain('.testsprite/');
+    });
+
+    it('does not write .gitignore when outside a git repo', async () => {
+      const { deps } = makeCapture();
+      const { fs: agentFs, store } = makeMemFs();
+      // No .git directory created
+      writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+      const fetchMock = makeOkFetch();
+
+      await runInit(
+        makeBaseOpts({
+          dir: GIT_CWD,
+          skipIfConfigured: true,
+          noAgent: true,
+          noGitignore: false,
+          output: 'json',
+        }),
+        {
+          ...deps,
+          credentialsPath,
+          fetchImpl: fetchMock,
+          fs: agentFs,
+          isTTY: false,
+        },
+      );
+
+      expect(store.has(path.join(GIT_CWD, '.gitignore'))).toBe(false);
+    });
+
+    it('does not write .gitignore when --no-gitignore is passed even inside a git repo', async () => {
+      const { deps } = makeCapture();
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.mkdir(path.join(GIT_CWD, '.git'));
+      writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+      const fetchMock = makeOkFetch();
+
+      await runInit(
+        makeBaseOpts({
+          dir: GIT_CWD,
+          skipIfConfigured: true,
+          noAgent: true,
+          noGitignore: true,
+          output: 'json',
+        }),
+        {
+          ...deps,
+          credentialsPath,
+          fetchImpl: fetchMock,
+          fs: agentFs,
+          isTTY: false,
+        },
+      );
+
+      expect(store.has(path.join(GIT_CWD, '.gitignore'))).toBe(false);
+    });
+
+    async function runWithFs(
+      agentFs: AgentFs,
+      overrides: Partial<Parameters<typeof makeBaseOpts>[0]> = {},
+    ) {
+      const { captured, deps } = makeCapture();
+      writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+      const run = runInit(
+        makeBaseOpts({
+          dir: GIT_CWD,
+          skipIfConfigured: true,
+          noAgent: true,
+          noGitignore: false,
+          output: 'json',
+          ...overrides,
+        }),
+        { ...deps, credentialsPath, fetchImpl: makeOkFetch(), fs: agentFs, isTTY: false },
+      );
+      return { captured, run };
+    }
+
+    it('appends without rewriting existing content (no trailing newline, CRLF)', async () => {
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.mkdir(path.join(GIT_CWD, '.git'));
+      await agentFs.writeFile(path.join(GIT_CWD, '.gitignore'), 'dist/\r\nnode_modules/');
+      const { run } = await runWithFs(agentFs);
+      await run;
+      expect(store.get(path.join(GIT_CWD, '.gitignore'))).toBe(
+        'dist/\r\nnode_modules/\n\n# TestSprite failure artifacts\n.testsprite/\n',
+      );
+    });
+
+    it('recognises .git as a file (worktree or submodule)', async () => {
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.writeFile(path.join(GIT_CWD, '.git'), 'gitdir: /elsewhere/.git/worktrees/x');
+      const { run } = await runWithFs(agentFs);
+      await run;
+      expect(store.get(path.join(GIT_CWD, '.gitignore'))).toContain('.testsprite/');
+    });
+
+    it('resolves a relative --dir before walking up to the repo root', async () => {
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.mkdir(path.join(process.cwd(), '.git'));
+      const { run } = await runWithFs(agentFs, { dir: path.join('rel', 'sub') });
+      await run;
+      expect(store.get(path.resolve('rel', 'sub', '.gitignore'))).toContain('.testsprite/');
+    });
+
+    it('refuses to write through a symlinked .gitignore and warns without failing setup', async () => {
+      const { fs: memFs, store } = makeMemFs();
+      await memFs.mkdir(path.join(GIT_CWD, '.git'));
+      await memFs.writeFile(path.join(GIT_CWD, '.gitignore'), 'dist/\n');
+      const linkPath = path.join(GIT_CWD, '.gitignore');
+      const symlinkFs: AgentFs = {
+        ...memFs,
+        lstat: async p =>
+          p === linkPath ? { isFile: false, isSymbolicLink: true } : memFs.lstat(p),
+      };
+      const { captured, run } = await runWithFs(symlinkFs);
+      await run;
+      expect(store.get(linkPath)).toBe('dist/\n');
+      expect(captured.stderr.join('\n')).toMatch(/\[warn\] Failed to update \.gitignore:.*symlink/);
+    });
+
+    it('still ignores .testsprite/ when the agent skill install fails after credentials were saved', async () => {
+      const { fs: memFs, store } = makeMemFs();
+      await memFs.mkdir(path.join(GIT_CWD, '.git'));
+      const failingFs: AgentFs = {
+        ...memFs,
+        writeFile: async (p, data, opts) => {
+          if (p.endsWith('SKILL.md') || p.includes('skills')) throw new Error('disk full');
+          return memFs.writeFile(p, data, opts);
+        },
+      };
+      const { run } = await runWithFs(failingFs, { noAgent: false, agent: 'claude' });
+      await expect(run).rejects.toThrow();
+      expect(store.get(path.join(GIT_CWD, '.gitignore'))).toContain('.testsprite/');
+    });
+
+    it('registers --no-gitignore option in addSetupOptions', () => {
+      const cmd = new Command();
+      addSetupOptions(cmd, [], 'claude' as AgentTarget);
+      const opt = cmd.options.find(o => o.long === '--no-gitignore');
+      expect(opt).toBeDefined();
+    });
   });
 });

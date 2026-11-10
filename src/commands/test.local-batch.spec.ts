@@ -32,6 +32,8 @@ function fixture(
     };
     sleep?: (ms: number) => Promise<void>;
     onStderr?: (line: string) => void;
+    /** Answer like a backend that predates `skipDependencies`: the key is never echoed. */
+    noSkipDependenciesEcho?: boolean;
   } = {},
 ) {
   const credentialsPath = join(mkdtempSync(join(tmpdir(), 'local-batch-')), 'credentials');
@@ -95,6 +97,9 @@ function fixture(
         enqueuedAt: '2026-09-22T00:00:00.000Z',
         codeVersion: 'v1',
         targetUrl,
+        ...(body?.skipDependencies === true && !options.noSkipDependenciesEcho
+          ? { skipDependencies: true }
+          : {}),
       });
     const poll = /\/runs\/run_([^/?]+)/.exec(url);
     if (method === 'GET' && poll) {
@@ -452,6 +457,36 @@ describe('test run local batch', () => {
     });
   });
 
+  it('forwards --skip-dependencies to every local run and shows it in the dry-run', async () => {
+    const f = fixture(['a', 'b']);
+    await f.run('a', 'b', '--local', '5173', '--skip-dependencies', '--skip-preflight');
+    expect(
+      f.calls.filter(c => c.method === 'POST' && c.url.endsWith('/runs')).map(c => c.body),
+    ).toEqual([
+      expect.objectContaining({ skipDependencies: true }),
+      expect.objectContaining({ skipDependencies: true }),
+    ]);
+    const dry = fixture(['a', 'b']);
+    await dry.run('a', 'b', '--local', '5173', '--skip-dependencies', '--dry-run');
+    expect(JSON.parse(dry.stdout.join('')).runs.map((r: { body: unknown }) => r.body)).toEqual([
+      expect.objectContaining({ skipDependencies: true }),
+      expect.objectContaining({ skipDependencies: true }),
+    ]);
+  });
+
+  it('says once when the backend does not confirm --skip-dependencies on the local runs', async () => {
+    const unconfirmed = fixture(['a', 'b'], { noSkipDependenciesEcho: true });
+    await unconfirmed.run('a', 'b', '--local', '5173', '--skip-dependencies', '--skip-preflight');
+    expect(
+      unconfirmed.stderr.filter(l => l.includes('did not confirm --skip-dependencies')),
+    ).toEqual([
+      '[advisory] This backend did not confirm --skip-dependencies, so the runs may also include the test cases they depend on, as a Portal run does.',
+    ]);
+    const confirmed = fixture(['a', 'b']);
+    await confirmed.run('a', 'b', '--local', '5173', '--skip-dependencies', '--skip-preflight');
+    expect(confirmed.stderr.join('\n')).not.toContain('did not confirm');
+  });
+
   it('describes all-local borrowed dry-run without mint or project reads', async () => {
     const f = fixture([]);
     await f.run(
@@ -514,6 +549,39 @@ describe('test run local batch', () => {
     expect(payload.skipped).toEqual([{ testId: 'backend', reason: 'backend-test' }]);
     expect(f.stderr.join('\n')).toContain('1 backend test(s) skipped');
     expect(f.calls.filter(c => c.method === 'GET' && c.url.includes('/tests?'))).toHaveLength(2);
+  });
+
+  it('filters --all by --status before resolving the tunnel and skips backend tests', async () => {
+    const f = fixture(['a', 'b'], {
+      onCall: call =>
+        call.method === 'GET' && call.url.includes('/tests?')
+          ? new Response(
+              JSON.stringify({
+                items: [
+                  { id: 'a', name: 'a', type: 'frontend', projectId: 'P', status: 'failed' },
+                  { id: 'b', name: 'b', type: 'frontend', projectId: 'P', status: 'passed' },
+                  { id: 'backend', name: 'API', type: 'backend', projectId: 'P', status: 'failed' },
+                ],
+                nextToken: null,
+              }),
+              { headers: { 'content-type': 'application/json' } },
+            )
+          : undefined,
+    });
+    await f.run(
+      '--all',
+      '--project',
+      'P',
+      '--local',
+      '5173',
+      '--status',
+      'failed',
+      '--skip-preflight',
+    );
+    const payload = JSON.parse(f.stdout.join(''));
+    expect(payload.results.map((r: { testId: string }) => r.testId)).toEqual(['a']);
+    expect(payload.skipped).toEqual([{ testId: 'backend', reason: 'backend-test' }]);
+    expect(f.stderr.join('\n')).toContain('--status filter: skipped 1 test');
   });
 
   it('does not mint when every project test is backend', async () => {
@@ -1437,16 +1505,17 @@ describe('test run local batch', () => {
     expect(f.stderr.filter(line => line.startsWith('idempotency-key:'))).toEqual([]);
   });
 
-  it('prints the first automatic trigger key once', async () => {
+  it('prints the automatic key once and derives every trigger key from it', async () => {
     const f = fixture(['a', 'b']);
     await f.run('a', 'b', '--local', '5173', '--skip-preflight');
     const keys = f.calls
       .filter(c => c.method === 'POST' && /\/tests\/[^/]+\/runs/.test(c.url))
       .map(c => c.idempotencyKey);
-    expect(keys[0]).not.toBe(keys[1]);
-    expect(f.stderr.filter(line => line.startsWith('idempotency-key:'))).toEqual([
-      `idempotency-key: ${keys[0]}`,
-    ]);
+    const printed = f.stderr.filter(line => line.startsWith('idempotency-key:'));
+    expect(printed).toHaveLength(1);
+    const base = printed[0]!.slice('idempotency-key: '.length);
+    // Passing the printed key back with --idempotency-key reproduces these keys.
+    expect(keys).toEqual([`${base}:${f.clientId}:a`, `${base}:${f.clientId}:b`]);
   });
 
   it('prints the text table without inventing a project dashboard link', async () => {
