@@ -819,7 +819,9 @@ async function cancelDoomedTunnelRun(args: {
   if (!args.enabled) return { outcome: 'skipped' };
   try {
     await withTeardownDeadline(args.opts, args.deps, client =>
-      client.post<CancelRunResponse>(`/runs/${encodeURIComponent(args.runId)}/cancel`),
+      client.post<CancelRunResponse>(`/runs/${encodeURIComponent(args.runId)}/cancel`, {
+        replaySafe: true,
+      }),
     );
     return { outcome: 'cancelled' };
   } catch (err) {
@@ -2593,6 +2595,21 @@ interface DeleteBatchOptions extends CommonOptions {
 }
 
 /**
+ * Track the member error a multi-id command exits with after its summary: one
+ * that fails EVERY id the same way — a rejected credential (exit 3) or a CLI too
+ * old for the backend (exit 14) — as the single-id form would, rather than
+ * folding it into the generic per-member failure (1). Auth outranks
+ * CLIENT_TOO_OLD, as in lib/wait-exit.ts; the first error of each kind is kept.
+ */
+function keepBatchWideError(current: ApiError | undefined, err: unknown): ApiError | undefined {
+  if (!(err instanceof ApiError)) return current;
+  const currentIsAuth = current !== undefined && isAuthCode(current.code);
+  if (isAuthCode(err.code)) return currentIsAuth ? current : err;
+  if (err.code === 'CLIENT_TOO_OLD') return current ?? err;
+  return current;
+}
+
+/**
  * `test delete-batch <test-ids...>` and `test delete --all --project <id>` — dogfood L1800.
  *
  * Deletes tests sequentially (to avoid hammering the server) and aggregates
@@ -2601,7 +2618,9 @@ interface DeleteBatchOptions extends CommonOptions {
  * object to stdout.
  *
  * Exit code: 0 if all targets were deleted (or `--dry-run`); 1 if any
- * deletion failed (server error); 5 if `--confirm` is missing.
+ * deletion failed (server error); 5 if `--confirm` is missing. A rejected key
+ * or a too-old CLI on any deletion exits with that error instead (3 / 14) —
+ * see {@link keepBatchWideError}.
  */
 export async function runDeleteBatch(
   opts: DeleteBatchOptions,
@@ -2732,6 +2751,7 @@ export async function runDeleteBatch(
   }
 
   const results: CliBulkDeleteResult[] = [];
+  let batchWide: ApiError | undefined;
 
   for (const testId of testIds) {
     const idempotencyKey = `cli-delete-${randomUUID()}`;
@@ -2752,6 +2772,7 @@ export async function runDeleteBatch(
       if (err instanceof ApiError && err.code === 'NOT_FOUND') {
         results.push({ testId, status: 'skipped', error: 'not found (already deleted?)' });
       } else {
+        batchWide = keepBatchWideError(batchWide, err);
         const msg = err instanceof Error ? err.message : String(err);
         results.push({ testId, status: 'error', error: msg });
       }
@@ -2770,6 +2791,7 @@ export async function runDeleteBatch(
 
   out.print(bulk, data => renderBulkDeleteText(data as CliBulkDeleteSummary));
 
+  if (batchWide !== undefined) throw batchWide;
   if (failed > 0) {
     throw new CLIError(
       `${failed} deletion${failed !== 1 ? 's' : ''} failed. See results for details.`,
@@ -4508,6 +4530,18 @@ async function runBatchRun(
   const billingRunErrors: ApiError[] = [];
   const sleepFn = deps.sleep ?? defaultSleep;
   const shutdown = shutdownOf(deps);
+  const envListings = new Map<string, Promise<CliProjectEnvListResponse>>();
+  const listEnvironments = (projectId: string): Promise<CliProjectEnvListResponse> => {
+    let listing = envListings.get(projectId);
+    if (!listing) {
+      listing = client.get<CliProjectEnvListResponse>(
+        `/projects/${encodeURIComponent(projectId)}/env`,
+        { signal: shutdown.signal },
+      );
+      envListings.set(projectId, listing);
+    }
+    return listing;
+  };
   // Response-driven --target-url advisory, fired at most ONCE for the whole
   // batch (Finding 2's contract) the first time any member's trigger
   // response reports a target different from what was requested — see the
@@ -4771,6 +4805,50 @@ async function runBatchRun(
             (v): v is string => typeof v === 'string' && v.length > 0,
           );
           if (conflictReason === 'run_in_flight' && currentRunId !== undefined) {
+            const incompatibleRun = (reason: string): ApiError =>
+              new ApiError({
+                code: 'CONFLICT',
+                message: `Conflict: run ${currentRunId} is already in flight; ${reason}. This invocation cannot attach to it.`,
+                nextAction: `testsprite test wait ${currentRunId}`,
+                requestId: '',
+                details: { reason: 'run_in_flight', currentRunId },
+              });
+            let inFlight: RunResponse | undefined;
+            try {
+              try {
+                inFlight = await client.getRun(currentRunId, { signal: shutdown.signal });
+              } catch (readErr) {
+                if (readErr instanceof InterruptError) throw readErr;
+              }
+              if (inFlight) {
+                await verifyInFlightRunEnvironment(
+                  inFlight,
+                  normalizeEnvironmentName(opts.environment),
+                  listEnvironments,
+                  incompatibleRun,
+                );
+                if (opts.targetUrl !== undefined && inFlight.targetUrl !== opts.targetUrl) {
+                  throw incompatibleRun('its target URL does not match the requested target URL');
+                }
+              } else if (opts.environment !== undefined || opts.targetUrl !== undefined) {
+                throw incompatibleRun('its environment could not be verified');
+              }
+            } catch (attachErr) {
+              if (attachErr instanceof InterruptError) throw attachErr;
+              if (!(attachErr instanceof ApiError) || attachErr.code !== 'CONFLICT')
+                throw attachErr;
+              return {
+                testId,
+                runId: '',
+                status: 'error',
+                codeVersion: '',
+                error: {
+                  code: attachErr.code,
+                  message: `${attachErr.message} ${attachErr.nextAction}`,
+                  exitCode: attachErr.exitCode,
+                },
+              };
+            }
             stderrFn(
               `[batch-run] ${testId} — run already in flight (runId: ${currentRunId}). Auto-resuming wait.`,
             );
@@ -4779,7 +4857,7 @@ async function runBatchRun(
               status: 'queued',
               enqueuedAt: new Date().toISOString(),
               codeVersion: '',
-              targetUrl: opts.targetUrl ?? '',
+              targetUrl: inFlight?.targetUrl ?? '',
             };
             break; // exit the outer retry loop with a conflict-resumed response
           } else {
@@ -7322,7 +7400,7 @@ function isTerminalPublicStatus(status: CliPublicStatus): boolean {
 
 /** Minimal client surface the backend-test wait fallback needs. */
 interface ResultReadClient {
-  get<T>(path: string, options?: { signal?: AbortSignal }): Promise<T>;
+  get<T>(path: string, options?: { signal?: AbortSignal; retry?: boolean }): Promise<T>;
 }
 
 /**
@@ -7423,6 +7501,11 @@ export function makeBackendWaitFallback(args: {
   resolveTestId: (run: RunResponse) => string;
   resolveNotBefore: (run: RunResponse) => string | undefined;
   onResolved?: (testId: string, status: CliPublicStatus) => void;
+  /**
+   * Called once, when the one-time type probe succeeds. Lets the caller reuse
+   * the type (e.g. for the failure hint) instead of looking it up again.
+   */
+  onTypeDetected?: (type: CliTest['type']) => void;
 }): (run: RunResponse, elapsedMs: number, signal: AbortSignal) => Promise<RunResponse | null> {
   let detection: 'pending' | 'frontend' | 'backend' = 'pending';
   // Cached alongside `detection` from the same one-time type-probe: the human
@@ -7450,6 +7533,7 @@ export function makeBackendWaitFallback(args: {
         // row finalizes and `resolveAlternate` stops being called.
         detection = test.type === 'backend' ? 'backend' : 'frontend';
         testName = test.name?.trim() ? test.name : null;
+        args.onTypeDetected?.(test.type);
       } catch {
         return null; // transient — keep polling the run row, retry the probe next tick.
       }
@@ -7678,13 +7762,27 @@ export function renderRunResponseText(
 
 /**
  * Best-effort resolve whether a finished run's test is a backend test, for the
- * text run-card's step line + failure hint only. Returns true with no
- * network call when already known (create-chain `--type`, or the BE wait
- * fallback fired). Otherwise, in TEXT mode only, issues one `GET /tests/{id}`;
- * ordinary lookup errors → false (render the numeric step summary as before).
- * Interrupts propagate. JSON mode
- * never probes — its envelope carries `stepSummary` verbatim and has no
- * "n/a (backend)" concept, so it is already correct.
+ * text run-card's step line and the stderr recovery hint after a failed or
+ * blocked run. Returns true with no network call when already known
+ * (create-chain `--type`, a backend rerun's closure, or the BE wait fallback
+ * fired), and returns `knownType === 'backend'` with no call when an earlier
+ * read already fetched the test. Otherwise issues one `GET /tests/{id}`; ordinary lookup errors →
+ * false (numeric step summary and the run-scoped `test artifact get` hint, as
+ * before). Interrupts propagate.
+ *
+ * Text mode always probes, for the card. JSON mode probes only when the run
+ * failed or was blocked: its envelope carries `stepSummary` verbatim and has no
+ * "n/a (backend)" concept, so the card needs no type there — but the recovery
+ * hint on stderr does. A backend failure bundle is addressed by testId
+ * (`test failure get`), so a JSON caller that skipped the probe was pointed at
+ * `test artifact get <run-id>`, which has no bundle for a backend run.
+ *
+ * The lookup only picks wording, so it must never hold back the run envelope
+ * or the exit code: it gets a {@link RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS} deadline
+ * and `retry: false` — one attempt, no retries of any kind (a 429 with
+ * `Retry-After` would otherwise be honoured for up to ~2 minutes, and 5xx /
+ * transport retry sleeps do not observe the deadline signal) — and either
+ * outcome falls back like any other lookup error.
  *
  * This closes the standalone-path gap: `test run <id>` / `test wait <run-id>`
  * never supply a type hint, and now that BE run rows finalize server-side
@@ -7696,16 +7794,35 @@ async function resolveRunCardIsBackend(
   testId: string | undefined,
   output: string,
   alreadyKnown: boolean,
+  status: string,
+  knownType?: CliTest['type'],
 ): Promise<boolean> {
   if (alreadyKnown) return true;
-  if (output === 'json' || !testId) return false;
+  if (knownType !== undefined) return knownType === 'backend';
+  if (!testId) return false;
+  if (output === 'json' && !isFailureHintStatus(status)) return false;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS);
   try {
-    const test = await client.get<CliTest>(`/tests/${encodeURIComponent(testId)}`);
+    const test = await client.get<CliTest>(`/tests/${encodeURIComponent(testId)}`, {
+      signal: ac.signal,
+      retry: false,
+    });
     return test.type === 'backend';
   } catch (err) {
     if (err instanceof InterruptError) throw err;
     return false; // best-effort — fall back to the numeric step summary.
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+/** Deadline for {@link resolveRunCardIsBackend}'s best-effort type lookup. */
+export const RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS = 5_000;
+
+/** Statuses that print a failure-bundle recovery hint on stderr. */
+function isFailureHintStatus(status: string): boolean {
+  return status === 'failed' || status === 'blocked';
 }
 
 /**
@@ -8464,10 +8581,14 @@ export async function runTestRun(
     // Backend-test fallback (dogfood L1888): BE run rows never finalize, so
     // resolve the verdict from the testId record once it's terminal.
     let beFallbackUsed = false;
+    let polledType: CliTest['type'] | undefined;
     const resolveBackendAlternate = makeBackendWaitFallback({
       client,
       resolveTestId: () => opts.testId,
       resolveNotBefore: () => triggerResponse.enqueuedAt,
+      onTypeDetected: type => {
+        polledType = type;
+      },
       onResolved: testId => {
         beFallbackUsed = true;
         stderrFn(
@@ -8780,12 +8901,14 @@ export async function runTestRun(
 
     // BE detection: type hint (create-chain) OR beFallbackUsed (slow runs); on
     // the standalone `test run <id>` path neither is set, so probe the test type
-    // once (text mode only, best-effort).
+    // once (best-effort; JSON mode only when the run failed or was blocked).
     const isBackend = await resolveRunCardIsBackend(
       client,
       opts.testId,
       opts.output,
       beFallbackUsed || opts.type === 'backend',
+      finalRun.status,
+      polledType,
     );
 
     const finalRunWithUrl = withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps));
@@ -9225,6 +9348,8 @@ export interface CliCancelSummary {
  * Multi-id: prints a `{cancelled, alreadyCancelled, conflicts, notFound}`
  * summary. Exit precedence (CXL-11): any `notFound` → 4 (outranks conflict —
  * it signals a caller bug, wrong id/tenant); else any `conflicts` → 6; else 0.
+ * Ahead of all of these, a rejected key or a too-old CLI on any id exits with
+ * that error (3 / 14), exactly as the single-id form does.
  */
 export async function runTestCancel(
   opts: RunTestCancelOptions,
@@ -9252,6 +9377,7 @@ export async function runTestCancel(
   }
 
   const rows: CliCancelResultRow[] = [];
+  let batchWide: ApiError | undefined;
   for (const runId of opts.runIds) {
     try {
       const result = await client.cancelRun(runId);
@@ -9271,6 +9397,7 @@ export async function runTestCancel(
         rows.push({ runId, status: 'conflict', conflictStatus });
         continue;
       }
+      batchWide = keepBatchWideError(batchWide, err);
       const message = err instanceof Error ? err.message : String(err);
       rows.push({ runId, status: 'error', error: message });
     }
@@ -9298,9 +9425,13 @@ export async function runTestCancel(
   if (errorRows.length > 0) parts.push(`${errorRows.length} error`);
   stderrFn(`Cancel summary: ${parts.join(', ')}.`);
 
+  // A rejected key / too-old CLI outranks every per-id outcome below: it is
+  // what the single-id form exits with, and the one thing the caller must fix.
+  if (batchWide !== undefined) throw batchWide;
+
   // Exit precedence (CXL-11): notFound outranks conflict — a caller-side bug
   // (wrong id / wrong tenant) is more actionable to surface than "it already
-  // finished". A bare transport/auth error on any member also fails loudly
+  // finished". Any other transport/server error on a member also fails loudly
   // rather than being silently absorbed into a 0 exit.
   if (summary.notFound.length > 0) {
     throw new CLIError(
@@ -9371,9 +9502,11 @@ export function createTestCancelCommand(deps: TestDeps): Command {
         'V2 runs keep their billing, and an in-flight Lambda finishes with its result discarded.\n' +
         '\nExit codes:\n' +
         '  0  cancelled (fresh or already-cancelled — naturally idempotent)\n' +
-        '  1  multi-id: a cancel request failed (auth/transport/server error; see summary.errors)\n' +
+        '  1  multi-id: a cancel request failed (transport/server error; see summary.errors)\n' +
+        '  3  auth error (multi-id: a rejected key on any id — outranks 1, 4, 6 and 14)\n' +
         '  4  run id not found (single id), or ANY id not found (multi-id; outranks conflict)\n' +
         '  6  run already terminal (passed/failed/blocked); multi-id: any conflict\n' +
+        '  14 client too old (multi-id: on any id — outranks 1, 4 and 6)\n' +
         '\nMulti-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound, errors}.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
@@ -9430,10 +9563,14 @@ export async function runTestWait(
   // resolve the verdict from the testId record (discovered from the first
   // poll tick) once it's terminal for this run.
   let beFallbackUsed = false;
+  let polledType: CliTest['type'] | undefined;
   const resolveAlternate = makeBackendWaitFallback({
     client,
     resolveTestId: run => run.testId,
     resolveNotBefore: run => run.createdAt,
+    onTypeDetected: type => {
+      polledType = type;
+    },
     onResolved: testId => {
       beFallbackUsed = true;
       stderrFn(
@@ -9555,13 +9692,16 @@ export async function runTestWait(
 
   ticker.finalize(formatRunProgressLine(finalRun, Date.now() - startMs));
 
-  // `test wait` has no type hint; probe the test type once (text mode only,
-  // best-effort) so a backend run's card reads `n/a (backend)`.
+  // `test wait` has no type hint; probe the test type once (best-effort) so a
+  // backend run's card reads `n/a (backend)` and its failure hint names
+  // `test failure get` (JSON mode probes only for a failed/blocked run).
   const isBackend = await resolveRunCardIsBackend(
     client,
     finalRun.testId,
     opts.output,
     beFallbackUsed,
+    finalRun.status,
+    polledType,
   );
 
   out.print(withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)), data =>
@@ -10997,6 +11137,7 @@ export async function runTestRunAll(
   // resolvable in-flight run stay hard (nothing to wait on).
   // An in-flight run may belong to another deployment/environment. CI can
   // only use runs accepted by this invocation to judge its own change.
+  const metadataConflicts = conflicts;
   // A `no_producer` / `producer_in_flight` conflict's `currentRunId` is the
   // result the server seeded BLOCKED before dispatch. It is reported with the
   // server's reason and exit 6, as a single `test run` reports it, not polled.
@@ -11036,6 +11177,8 @@ export async function runTestRunAll(
     }
     return listing;
   };
+  // Keep the metadata stage graceful even between tracked HTTP requests.
+  const disarmResolve = shutdownOf(deps).arm();
   const resumedOrRefused = await Promise.all(
     resumableConflicts.map(
       async (c): Promise<{ entry: BatchRunFreshAccepted } | { refused: RunConflict }> => {
@@ -11102,7 +11245,43 @@ export async function runTestRunAll(
         return { entry: { testId: c.testId, runId: inFlightRunId, enqueuedAt: notBefore } };
       },
     ),
-  );
+  )
+    .catch((err: unknown) => {
+      if (err instanceof InterruptError) {
+        const partialResults: CliBatchRunFreshResult[] = accepted.map(e => ({
+          testId: e.testId,
+          runId: e.runId,
+          status: 'running',
+        }));
+        out.print(
+          {
+            accepted: partialResults,
+            conflicts: metadataConflicts,
+            deferred,
+            skippedFrontend,
+            skippedIntegration,
+            ...(notRunTestIds.length > 0 ? { notRunTestIds } : {}),
+          },
+          () =>
+            partialResults.length > 0
+              ? partialResults.map(r => `${r.runId}  ${r.status}`).join('\n')
+              : resumableConflicts
+                  .map(c => `${c.currentRunId}  unverified (not attached)`)
+                  .join('\n'),
+        );
+        if (accepted.length > 0) {
+          err.runWaitContext = true;
+          stderrFn(
+            interruptDetachMessage(
+              err,
+              accepted.map(e => e.runId),
+            ),
+          );
+        }
+      }
+      throw err;
+    })
+    .finally(disarmResolve);
   const resumableEntries: BatchRunFreshAccepted[] = [];
   for (const outcome of resumedOrRefused) {
     if ('entry' in outcome) {
@@ -12694,6 +12873,7 @@ export async function runTestRerun(
   const targets = new Map<string, ResolvedRunTarget>();
   const backend: string[] = [];
   const cache = new Map();
+  const readTests = new Map(opts.knownTests ?? []);
   for (const testId of opts.testIds) {
     let knownTest = opts.knownTests?.get(testId);
     try {
@@ -12705,6 +12885,7 @@ export async function runTestRerun(
     } catch (err) {
       if (err instanceof InterruptError) throw err;
     }
+    if (knownTest) readTests.set(testId, knownTest);
     const target = await resolveEnvironmentRunTarget({
       client,
       testId,
@@ -12720,7 +12901,13 @@ export async function runTestRerun(
     if (target && knownTest?.type === 'backend') backend.push(testId);
     else if (target) targets.set(testId, target);
   }
-  if (!targets.size) return runTestRerunCore(opts, deps);
+  // A single rerun hands the type it just read to the core, so the run card and
+  // failure hint after --wait don't fetch the same test a second time.
+  if (!targets.size)
+    return runTestRerunCore(
+      opts.testIds.length === 1 && readTests.size > 0 ? { ...opts, knownTests: readTests } : opts,
+      deps,
+    );
   const maxConcurrency = opts.concurrencyIsDefault ? 5 : opts.maxConcurrency;
   if (maxConcurrency > 10)
     throw localValidationError(
@@ -13309,9 +13496,15 @@ async function runTestRerunCore(
       }
 
       if (exitCodeForRunStatus(namedResult.status) !== 0) {
-        stderrFn(
-          `Run finished with status: ${namedResult.status}. Use 'testsprite test artifact get ${namedRunId}' to download the failure bundle.`,
-        );
+        // Only a backend rerun has a closure, and a backend failure bundle is
+        // addressed by testId — there is no run-scoped bundle for namedRunId.
+        // Failed/blocked only: `test failure get` returns the latest *failing*
+        // run, which for a cancelled rerun could be an older one.
+        if (isFailureHintStatus(namedResult.status)) {
+          stderrFn(
+            `Run finished with status: ${namedResult.status}. Backend failure artifacts are addressed by testId — use 'testsprite test failure get ${testId}' to download the bundle.`,
+          );
+        }
         throw new CLIError(`Run ${namedRunId} finished with status: ${namedResult.status}`, 1);
       }
 
@@ -13356,10 +13549,14 @@ async function runTestRerunCore(
 
     // Single FE rerun (or BE without closure) — poll the single runId
     let beFallbackUsed = false;
+    let polledType: CliTest['type'] | undefined;
     const resolveAlternate = makeBackendWaitFallback({
       client,
       resolveTestId: () => testId,
       resolveNotBefore: () => rerunResp.enqueuedAt,
+      onTypeDetected: type => {
+        polledType = type;
+      },
       onResolved: tid => {
         beFallbackUsed = true;
         stderrFn(
@@ -13494,10 +13691,19 @@ async function runTestRerunCore(
 
     ticker.finalize(formatRunProgressLine(finalRun, Date.now() - replayStartMs, '(replay)'));
 
-    // Probe the test type once (text mode only, best-effort) so a backend
-    // rerun's card reads `n/a (backend)` even when the fallback never fired
-    // (BE run rows finalize server-side now).
-    const isBackend = await resolveRunCardIsBackend(client, testId, opts.output, beFallbackUsed);
+    // A closure in the rerun response already marks a backend rerun; otherwise
+    // probe the test type once (best-effort; JSON mode only for a failed/blocked
+    // run) so a backend rerun's card reads `n/a (backend)` and its failure hint
+    // names `test failure get`, even when the fallback never fired (BE run rows
+    // finalize server-side now).
+    const isBackend = await resolveRunCardIsBackend(
+      client,
+      testId,
+      opts.output,
+      beFallbackUsed || isBERerun,
+      finalRun.status,
+      opts.knownTests?.get(testId)?.type ?? polledType,
+    );
 
     out.print(withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)), data =>
       renderRunResponseText(data as RunResponse, { isBackend }),
@@ -15046,7 +15252,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '\nExit codes:\n' +
         '  0  all targeted tests deleted (or --dry-run)\n' +
         '  1  one or more deletions failed\n' +
-        '  5  validation error (e.g. missing --confirm, or --all without --project)',
+        '  3  auth error (a rejected key on any id — outranks 1 and 14)\n' +
+        '  5  validation error (e.g. missing --confirm, or --all without --project)\n' +
+        '  14 client too old (on any id — outranks 1)',
     )
     .option('--confirm', 'required: confirm the destructive operation', false)
     .option('--all', 'delete all tests in the resolved project (requires --project)', false)
@@ -16692,6 +16900,7 @@ async function deleteTunnelForCleanup(
   await withTeardownDeadline(opts, deps, client =>
     client.delete<unknown>(`/tunnel/${encodeURIComponent(clientId)}`, {
       allowNoContent: true,
+      replaySafe: true,
     }),
   );
 }
