@@ -690,6 +690,21 @@ describe('testlist run', () => {
     },
   );
 
+  it('refuses --report-file reports/ before dispatch', async () => {
+    const { env } = makeCreds();
+    const fetchImpl = vi.fn(makeFetch(() => ({ body: { accepted: [] } })));
+    const err = (await runTestlistRun(
+      { ...runBase, listId: 'list-1', wait: true, report: 'junit', reportFile: 'reports/' },
+      { env, fetchImpl, stdout: () => {}, stderr: () => {}, sleep: instantSleep },
+    ).catch(e => e)) as ApiError;
+    expect(err.exitCode).toBe(5);
+    expect(err.details).toMatchObject({
+      field: 'report-file',
+      reason: 'must point to a file, not a directory',
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('gh-output: an all-conflict --wait run emits annotations + summary before exiting 6', async () => {
     const { env } = makeCreds();
     const dir = mkdtempSync(join(tmpdir(), 'cli-testlist-conflict-'));

@@ -721,7 +721,9 @@ describe('assertArtifactPath', () => {
   it('reports an unreadable target instead of treating it as absent', () => {
     const dir = mkdtempSync(join(tmpdir(), 'cli-artifact-'));
     // a <-> b symlink loop: stat fails with ELOOP, which must not pass as "file not created yet"
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- create a symlink only inside this test's fresh temporary directory.
     symlinkSync(join(dir, 'b'), join(dir, 'a'));
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- complete the loop inside the same isolated temporary directory.
     symlinkSync(join(dir, 'a'), join(dir, 'b'));
     expect(() => assertArtifactPath('report-file', join(dir, 'a'))).toThrow(
       expect.objectContaining({
@@ -738,7 +740,9 @@ describe('assertArtifactPath', () => {
     'reports a permission error on the parent instead of "does not exist"',
     () => {
       const dir = mkdtempSync(join(tmpdir(), 'cli-artifact-'));
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- create the permission fixture inside this test's fresh temporary directory.
       mkdirSync(join(dir, 'locked', 'out'), { recursive: true });
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- restrict only the temporary fixture directory and restore it in finally.
       chmodSync(join(dir, 'locked'), 0o000);
       try {
         expect(() =>
@@ -752,6 +756,7 @@ describe('assertArtifactPath', () => {
           }),
         );
       } finally {
+        // eslint-disable-next-line security/detect-non-literal-fs-filename -- restore permissions on the temporary fixture before cleanup.
         chmodSync(join(dir, 'locked'), 0o755);
         rmSync(dir, { recursive: true, force: true });
       }
@@ -760,6 +765,7 @@ describe('assertArtifactPath', () => {
 
   it('refuses an existing directory as the target', () => {
     const dir = mkdtempSync(join(tmpdir(), 'cli-artifact-'));
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- make a target-directory fixture inside this test's fresh temporary directory.
     mkdirSync(join(dir, 'sub'));
     expect(() => assertArtifactPath('report-file', join(dir, 'sub'))).toThrow(ApiError);
     rmSync(dir, { recursive: true, force: true });
@@ -768,4 +774,18 @@ describe('assertArtifactPath', () => {
   it('refuses an empty path', () => {
     expect(() => assertArtifactPath('summary-file', '')).toThrow(ApiError);
   });
+
+  it.each(['reports/', 'reports\\'])(
+    'refuses a raw trailing separator before resolving %s',
+    path => {
+      expect(() => assertArtifactPath('report-file', path)).toThrow(
+        expect.objectContaining({
+          details: expect.objectContaining({
+            field: 'report-file',
+            reason: 'must point to a file, not a directory',
+          }),
+        }),
+      );
+    },
+  );
 });

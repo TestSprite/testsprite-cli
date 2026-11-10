@@ -350,6 +350,15 @@ export function skippedJUnitResultsFromSummary(
     .map(row => ({ testId: row.testId, status: 'skipped', skipReason: row.error ?? row.status }));
 }
 
+function errorCode(err: unknown): string {
+  return (err as NodeJS.ErrnoException | undefined)?.code ?? 'unknown error';
+}
+
+function isAbsentPathError(err: unknown): boolean {
+  const code = errorCode(err);
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
 /**
  * Check that an output artifact path (`--report-file`, `--summary-file`) can be
  * written: non-empty, not a directory, and inside an existing directory.
@@ -360,27 +369,19 @@ export function skippedJUnitResultsFromSummary(
  * a full batch has run. The write itself re-checks (the directory can vanish in
  * between).
  */
-function errorCode(err: unknown): string {
-  return (err as NodeJS.ErrnoException | undefined)?.code ?? 'unknown error';
-}
-
-function isAbsentPathError(err: unknown): boolean {
-  const code = errorCode(err);
-  return code === 'ENOENT' || code === 'ENOTDIR';
-}
-
 export function assertArtifactPath(field: 'report-file' | 'summary-file', rawPath: string): string {
   if (typeof rawPath !== 'string' || rawPath.length === 0) {
     throw localValidationError(field, 'must be a non-empty file path');
   }
-  const resolved = isAbsolute(rawPath) ? rawPath : resolve(process.cwd(), rawPath);
-  if (resolved.endsWith('/') || resolved.endsWith('\\')) {
+  if (/[\\/]$/.test(rawPath)) {
     throw localValidationError(field, 'must point to a file, not a directory');
   }
+  const resolved = isAbsolute(rawPath) ? rawPath : resolve(process.cwd(), rawPath);
 
   const parent = dirname(resolved);
   let parentStat;
   try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- inspect the user-selected artifact parent before dispatch; no file content is read.
     parentStat = statSync(parent);
   } catch (err) {
     if (isAbsentPathError(err))
@@ -396,6 +397,7 @@ export function assertArtifactPath(field: 'report-file' | 'summary-file', rawPat
 
   let targetStat;
   try {
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- inspect the user-selected artifact target to reject directories and inaccessible paths before dispatch.
     targetStat = statSync(resolved);
   } catch (err) {
     // Only a missing target is fine (it will be created); anything else (EACCES, ELOOP...) would fail the
