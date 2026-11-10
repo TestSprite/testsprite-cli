@@ -1,11 +1,17 @@
-import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, RequestTimeoutError } from './errors.js';
 import { HttpClient } from './http.js';
+import { ShutdownController } from './interrupt.js';
 import { assertLocalPortListening, parseLoopbackTargetUrl } from './local-target.js';
+import { UnreachableAtDeadlineError } from './poll.js';
 import {
   ENVIRONMENT_PREFLIGHT_TIMEOUT_MS,
   readEnvironmentPreflight,
   resolveEnvironmentRunTarget,
+  withEnvironmentTunnel,
 } from './environment-tunnel.js';
 
 function resolver(environments: unknown) {
@@ -179,5 +185,108 @@ describe('environment preflight and diagnostics', () => {
     expect((error as ApiError).nextAction).toContain('http://localhost:<port>');
     expect((error as ApiError).nextAction).toContain('http://127.0.0.1:<port>');
     expect((error as ApiError).nextAction).toContain('http://[::1]:<port>');
+  });
+});
+
+describe('withEnvironmentTunnel: waiting for batch capacity', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('exits 10 with the owned-tunnel hint when the API stays unreachable until the deadline', async () => {
+    vi.useFakeTimers();
+    const tunnelClientId = '11111111-2222-3333-4444-555555555555';
+    const credentialsPath = join(
+      mkdtempSync(join(tmpdir(), 'env-tunnel-capacity-')),
+      'credentials',
+    );
+    writeFileSync(
+      credentialsPath,
+      '[default]\napi_url = https://api.example.com\napi_key = sk-user-test\n',
+    );
+    const json = (body: unknown, status = 200) =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { 'content-type': 'application/json' },
+      });
+    const requests: string[] = [];
+    const fetchImpl = vi.fn(async (input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      const parsed = new URL(
+        typeof input === 'string' ? input : input instanceof URL ? input.href : input.url,
+      );
+      const path = parsed.pathname.replace('/api/cli/v1', '');
+      const method = init.method ?? 'GET';
+      requests.push(`${method} ${path}`);
+      if (method === 'POST' && path === '/tunnel')
+        return json(
+          {
+            clientId: tunnelClientId,
+            secret: 'fixture-secret',
+            controlUrl: 'ws://tunnel.example/ws',
+            tunnelAddr: 'tunnel.example:7400',
+            expiresAt: '2026-10-02T00:00:00Z',
+          },
+          201,
+        );
+      if (method === 'DELETE' && path === `/tunnel/${tunnelClientId}`)
+        return new Response(null, { status: 204 });
+      if (method === 'POST' && path === '/runs/run_a/cancel')
+        return json({ runId: 'run_a', status: 'cancelled', alreadyCancelled: false });
+      // Every read of the run that holds the slot fails: the API is unreachable.
+      if (method === 'GET' && path === '/runs/run_a')
+        return json(
+          {
+            error: {
+              code: 'UNAVAILABLE',
+              message: 'poll backend unavailable',
+              nextAction: 'retry',
+              requestId: 'r-unavailable',
+              details: {},
+            },
+          },
+          503,
+        );
+      throw new Error(`unexpected request: ${method} ${path}`);
+    });
+
+    const pending = withEnvironmentTunnel(
+      { profile: 'default', output: 'json', debug: false, maxConcurrency: 1, timeoutSeconds: 30 },
+      {
+        credentialsPath,
+        fetchImpl,
+        stderr: () => {},
+        shutdown: new ShutdownController(),
+        createTunnelClient: () => ({ start: async () => {}, stop: async () => {} }),
+      },
+      [],
+      'test run',
+      async context => {
+        await context.confirm({ tunnelClientId: context.clientId }, ['run_a']);
+        // One slot, held by run_a: the next dispatch waits for it to finish.
+        await context.waitForCapacity(1);
+      },
+    ).then(
+      () => ({ error: undefined }),
+      (error: unknown) => ({ error }),
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    const { error } = await pending;
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).not.toBeInstanceOf(UnreachableAtDeadlineError);
+    expect(error).toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+      requestId: 'r-unavailable',
+      details: { runId: 'run_a' },
+    });
+    const thrown = error as ApiError;
+    expect(thrown.message).toContain('poll backend unavailable');
+    // The tunnel closes with this process, so the hint is the owned-tunnel one,
+    // never a re-attach with `test wait`.
+    expect(thrown.nextAction).toBe(
+      'The owned tunnel is closing; inspect cancellation with testsprite test cancel run_a.',
+    );
+    expect(requests).toContain('POST /runs/run_a/cancel');
   });
 });
