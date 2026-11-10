@@ -1753,7 +1753,7 @@ it('marks a dispatched batch run for recovery guidance on fan-out interruption',
       {
         specIndex: 1,
         testId: null,
-        status: 'error',
+        status: 'validation_error',
         error: { code: 'VALIDATION_ERROR', message: 'invalid spec' },
       },
     ],
