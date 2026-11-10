@@ -3016,7 +3016,22 @@ export interface CliBatchRunResult {
 
 /** Envelope emitted by `test create-batch --run` in JSON mode. */
 export interface CliCreateBatchRunResponse {
+  /** Per-test run results; remains unchanged for existing consumers. */
   results: CliBatchRunResult[];
+  /** Original per-spec creation receipt, matching create-only JSON output. */
+  creation: CliCreateBatchResponse;
+}
+
+/** Dry-run variant of the `test create-batch --run` JSON envelope. */
+export interface CliCreateBatchDryRunResponse extends CliCreateBatchRunResponse {
+  dryRun: true;
+  method: 'POST';
+  pathTemplate: '/api/cli/v1/tests/{testId}/runs';
+  maxConcurrency: number | null;
+  wait: boolean;
+  timeoutSeconds: number;
+  testIds: string[];
+  thenPoll?: string;
 }
 
 /**
