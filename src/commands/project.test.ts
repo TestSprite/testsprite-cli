@@ -2770,6 +2770,182 @@ describe('runUpdate — --local <port>', () => {
   });
 });
 
+describe('#282 — secret --*-file flags are guarded (structured error, exit 5, no raw ENOENT)', () => {
+  const noNetwork = () => {
+    throw new Error('network should not be hit');
+  };
+  const deps = (credentialsPath: string) => ({
+    credentialsPath,
+    fetchImpl: makeFetch(noNetwork),
+    stdout: () => {},
+    stderr: () => {},
+  });
+  const missingPath = () => join(mkdtempSync(join(tmpdir(), 'cli-missing-')), 'no-such-secret.txt');
+
+  it('runCredential --credential-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runCredential(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          authType: 'API key',
+          credentialFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runCredential --credential-file pointing at a directory → VALIDATION_ERROR (exit 5)', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-cred-dir-'));
+    await expect(
+      runCredential(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          authType: 'API key',
+          credentialFile: dir,
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runCredential reads a valid --credential-file (trimmed) and sends it', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-cred-ok-'));
+    const credFile = join(dir, 'cred.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (dir), not user input.
+    writeFileSync(credFile, '  tok-from-file\n');
+    let sentBody: { credential?: string } | undefined;
+    const fetchImpl = makeFetch((_url, init) => {
+      sentBody = init.body ? JSON.parse(init.body as string) : undefined;
+      return { status: 200, body: { projectId: 'p1', authType: 'API key', rewroteCount: 1 } };
+    });
+    await runCredential(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'p1',
+        authType: 'API key',
+        credentialFile: credFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    // The on-disk fixture is "  tok-from-file\n"; the shared guard trims it.
+    expect(sentBody?.credential).toBe('tok-from-file');
+  });
+
+  it('runAutoAuth --password-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'password',
+          inject: 'bearer',
+          passwordFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runAutoAuth --client-secret-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'refresh_token',
+          inject: 'bearer',
+          clientSecretFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runAutoAuth --refresh-token-file missing → VALIDATION_ERROR (exit 5), no network', async () => {
+    const { credentialsPath } = makeCreds();
+    await expect(
+      runAutoAuth(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'p1',
+          method: 'refresh_token',
+          inject: 'bearer',
+          refreshTokenFile: missingPath(),
+        },
+        deps(credentialsPath),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+  });
+
+  it('runAutoAuth --dry-run with missing --password-file skips filesystem (returns sample)', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    const result = await runAutoAuth(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'p1',
+        method: 'password',
+        inject: 'bearer',
+        passwordFile: missingPath(),
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(fetched).toBe(false);
+    // Dry-run skips file reads; the sample carries the projectId we passed in.
+    expect(result.projectId).toBe('p1');
+  });
+
+  it('runCredential --dry-run with missing --credential-file skips filesystem (returns sample)', async () => {
+    const { credentialsPath } = makeCreds();
+    let fetched = false;
+    const fetchImpl = makeFetch(() => {
+      fetched = true;
+      return { body: {} };
+    });
+    const result = await runCredential(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'p1',
+        authType: 'API key',
+        credentialFile: missingPath(),
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: () => {} },
+    );
+    expect(fetched).toBe(false);
+    expect(result).toEqual({ projectId: 'p1', authType: 'API key', rewroteCount: 0 });
+  });
+});
+
 describe('project compatibility contracts', () => {
   it('appends environment columns after the legacy created column', async () => {
     const { credentialsPath } = makeCreds();
