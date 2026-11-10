@@ -190,7 +190,19 @@ describe('runCreateBatch --run --wait: happy path', () => {
     const fetchImpl = makeFetch(url => {
       // Batch create
       if (url.includes('/tests/batch')) {
-        return { body: makeBatchCreateResponse(testIds) };
+        return {
+          body: {
+            results: testIds.map((testId, specIndex) => ({
+              specIndex,
+              testId,
+              status: 'created' as const,
+              ...(specIndex === 0
+                ? { dashboardUrl: 'https://portal.testsprite.com/tests/test_a1' }
+                : {}),
+            })),
+            summary: { total: testIds.length, created: testIds.length, failed: 0 },
+          },
+        };
       }
       // Trigger POST /tests/{id}/runs
       const triggerMatch = /\/tests\/(test_[a-z0-9]+)\/runs$/.exec(url);
@@ -238,8 +250,21 @@ describe('runCreateBatch --run --wait: happy path', () => {
     );
 
     // JSON output is the batch-run envelope
-    const printed = JSON.parse(stdout.join('')) as { results: unknown[] };
+    const printed = JSON.parse(stdout.join('')) as {
+      results: unknown[];
+      creation: {
+        results: Array<{ testId?: string; status: string; dashboardUrl?: string }>;
+        summary: { total: number; created: number; failed: number };
+      };
+    };
     expect(printed.results).toHaveLength(3);
+    expect(printed.creation.summary).toEqual({ total: 3, created: 3, failed: 0 });
+    expect(printed.creation.results).toHaveLength(3);
+    expect(printed.creation.results[0]).toMatchObject({
+      testId: 'test_a1',
+      status: 'created',
+      dashboardUrl: 'https://portal.testsprite.com/tests/test_a1',
+    });
     const results = printed.results as Array<{ testId: string; status: string; runId: string }>;
     expect(results.every(r => r.status === 'passed')).toBe(true);
     expect(results.map(r => r.testId).sort()).toEqual(['test_a1', 'test_a2', 'test_a3'].sort());
@@ -1136,9 +1161,17 @@ describe('runCreateBatch --run --dry-run', () => {
     expect(envelope.dryRun).toBe(true);
     expect(Array.isArray(envelope.testIds)).toBe(true);
     expect((envelope.testIds as string[]).sort()).toEqual(testIds.sort());
-    // results array is present
+    // Both run descriptors and the original create receipt are present.
     expect(Array.isArray(envelope.results)).toBe(true);
     expect((envelope.results as unknown[]).length).toBe(testIds.length);
+    expect(envelope.creation).toMatchObject({
+      results: testIds.map((testId, specIndex) => ({
+        specIndex,
+        testId,
+        status: 'created',
+      })),
+      summary: { total: 2, created: 2, failed: 0 },
+    });
   });
 });
 
