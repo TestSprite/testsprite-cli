@@ -77,15 +77,18 @@ function truthy(value: string | undefined): boolean {
 /**
  * Every relative path this CLI writes for a target, across all default skills.
  *
- * Includes the `.bak` sibling `agent install --force` leaves behind. Without
- * it one forced reinstall makes that target permanently "detected" from its
- * own backup — the self-reinforcement `hasForeignContent` exists to prevent,
- * just one file over.
+ * Includes the backup siblings `agent install --force` leaves behind —
+ * `writeBackup` walks `.bak`, `.bak.1`, … `.bak.99` before giving up. Without
+ * them a repeated forced reinstall makes that target permanently "detected"
+ * from its own backups — the self-reinforcement `hasForeignContent` exists to
+ * prevent, just one file over.
  */
 function ownPaths(target: AgentTarget): string[] {
   return DEFAULT_SKILLS.flatMap(skill => {
     const p = pathFor(target, skill).replace(/\\/g, '/');
-    return [p, `${p}.bak`];
+    const backups = [`${p}.bak`];
+    for (let n = 1; n <= 99; n++) backups.push(`${p}.bak.${n}`);
+    return [p, ...backups];
   });
 }
 
