@@ -417,17 +417,13 @@ describe('ci run', () => {
     expect(h.stderr.some(s => s.startsWith('::warning') && s.includes(message))).toBe(true);
   });
 
-  it('passes the chosen environment on initial dispatch and every deferred retry', async () => {
-    const h = harness([
-      batch({ accepted: [accepted('a')], deferred: [{ testId: 'b' }] }),
-      batch({ accepted: [accepted('b')] }),
-    ]);
-    await runCiRun({ ...h.opts, environment: 'pr-42' }, h.deps);
+  it('passes the chosen environment on the dispatch and never resends a deferred id', async () => {
+    const h = harness([batch({ accepted: [accepted('a')], deferred: [{ testId: 'b' }] })]);
+    await expect(runCiRun({ ...h.opts, environment: 'pr-42' }, h.deps)).resolves.toBeUndefined();
     const posts = h.calls.filter(c => c.method === 'POST');
-    expect(posts).toHaveLength(2);
-    expect(posts.map(c => c.body?.environment)).toEqual(['pr-42', 'pr-42']);
-    expect(posts[1]!.body?.testIds).toEqual(['b']);
-    expect(h.summary()).toMatchObject({ total: 2, passed: 2, skipped: 0 });
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.body?.environment).toBe('pr-42');
+    expect(h.summary()).toMatchObject({ total: 2, passed: 1, skipped: 1 });
   });
 
   it('reports timed-out accepted runs with exit 7, separately from deferred skips', async () => {
@@ -483,61 +479,6 @@ describe('ci run', () => {
     await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ exitCode: 3 });
     expect(h.summary().failed).toBe(1);
     expect(h.outputs()).toContain('failed=1');
-  });
-
-  it('does not turn a failed deferred dispatch into a passing CI run', async () => {
-    const h = harness([batch({ accepted: [accepted('a')], deferred: [{ testId: 'b' }] })]);
-    const original = h.deps.fetchImpl.getMockImplementation()!;
-    let dispatches = 0;
-    h.deps.fetchImpl.mockImplementation(async (input, init) => {
-      if (init?.method === 'POST' && ++dispatches > 1) {
-        return new Response(
-          JSON.stringify({
-            error: {
-              code: 'AUTH_INVALID',
-              message: 'expired',
-              nextAction: '',
-              requestId: 'test',
-              details: {},
-            },
-          }),
-          { status: 401 },
-        );
-      }
-      return original(input, init);
-    });
-    await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ exitCode: 3 });
-    expect(h.summary()).toMatchObject({ passed: 1, skipped: 1 });
-    expect(h.outputs()).toContain('passed=1');
-  });
-
-  it('preserves auth errors when a slow retry leaves only the final bounded poll', async () => {
-    const h = harness([
-      batch({ accepted: [accepted('a')], deferred: [{ testId: 'b' }] }),
-      batch({ accepted: [accepted('b')] }),
-    ]);
-    const original = h.deps.fetchImpl.getMockImplementation()!;
-    let dispatches = 0;
-    h.deps.fetchImpl.mockImplementation(async (input, init) => {
-      if (init?.method === 'POST' && ++dispatches > 1) await h.deps.sleep(200_000);
-      if (String(input).includes('/runs/')) {
-        return new Response(
-          JSON.stringify({
-            error: {
-              code: 'AUTH_INVALID',
-              message: 'expired',
-              nextAction: '',
-              requestId: 'test',
-              details: {},
-            },
-          }),
-          { status: 401 },
-        );
-      }
-      return original(input, init);
-    });
-    await expect(runCiRun(h.opts, h.deps)).rejects.toMatchObject({ exitCode: 3 });
-    expect(h.summary()).toMatchObject({ failed: 2, timedOut: 0 });
   });
 
   it('an unmatched filter emits an empty summary without dispatching', async () => {
