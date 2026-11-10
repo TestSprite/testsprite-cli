@@ -4325,6 +4325,17 @@ async function runBatchRun(
     .filter(r => r.status === 'created' && r.testId !== undefined)
     .map(r => r.testId as string);
 
+  // Match the create-only JSON receipt: preserve server links, normalize
+  // explicitly suppressed links, and use the same create-time fallback map.
+  const creationResults: CliBatchSpecResult[] =
+    !opts.dryRun && testIdToDashboardState !== undefined
+      ? createResponse.results.map(r => {
+          if (r.status !== 'created' || r.testId === undefined) return r;
+          const state = testIdToDashboardState.get(r.testId);
+          return state ? { ...r, dashboardUrl: state.dashboardUrl } : r;
+        })
+      : createResponse.results;
+
   if (testIds.length === 0) {
     // All specs failed at create time — already threw above; unreachable.
     return;
@@ -4348,6 +4359,10 @@ async function runBatchRun(
       testIds,
       ...(opts.wait ? { thenPoll: `/api/cli/v1/runs/<run-id>?waitSeconds=25` } : {}),
       results: dryRunResults,
+      creation: {
+        results: creationResults,
+        summary: createResponse.summary,
+      },
     };
     out.print(envelope);
     return;
@@ -4946,7 +4961,7 @@ async function runBatchRun(
         {
           results: partialResults,
           creation: {
-            results: createResponse.results,
+            results: creationResults,
             summary: createResponse.summary,
           },
         },
@@ -4995,7 +5010,7 @@ async function runBatchRun(
     out.print({
       results: enrichedResults,
       creation: {
-        results: createResponse.results,
+        results: creationResults,
         summary: createResponse.summary,
       },
     });
