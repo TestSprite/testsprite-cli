@@ -49,11 +49,13 @@ import { recordBatchOutcome } from '../lib/telemetry.js';
 import { formatRunProgressLine } from '../lib/run-progress.js';
 import { createTicker } from '../lib/ticker.js';
 import {
+  assertJUnitReportOptions,
   buildJUnitReport,
   durationSecondsBetween,
   parseJUnitReportFormat,
   skippedJUnitResultsFromSummary,
   writeJUnitReportFile,
+  assertArtifactPath,
   type JUnitReportFormat,
   type JUnitTestResult,
 } from '../lib/junit-report.js';
@@ -86,6 +88,22 @@ export interface TestListDeps {
 type CommonOptions = FactoryCommonOptions;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Explain that interrupting a remote wait leaves unfinished runs executing and
+ * billing, and name the commands to re-attach or cancel those specific runs.
+ */
+function interruptDetachMessage(err: InterruptError, runIds: string[]): string {
+  const subject =
+    runIds.length === 1
+      ? `Run ${runIds[0]} is still executing on the server and will keep running (and billing) until it finishes.`
+      : `${runIds.length} runs are still executing on the server and will keep running (and billing) until they finish.`;
+  return (
+    `Interrupted (${err.signal}). ${subject}\n` +
+    `  Re-attach with: testsprite test wait ${runIds.join(' ')}\n` +
+    `  Cancel with:    testsprite test cancel ${runIds.join(' ')}`
+  );
+}
 
 function resolveCommonOptions(command: Command, env?: NodeJS.ProcessEnv): CommonOptions {
   const g = command.optsWithGlobals() as Partial<CommonOptions> & { requestTimeout?: string };
@@ -498,15 +516,10 @@ function validateTestlistRunOptions(opts: RunTestlistRunOptions): void {
       `must be an integer between 1 and ${MAX_TESTLIST_RUN_CONCURRENCY}`,
     );
   }
-  if (opts.report === 'junit' && opts.reportFile === undefined) {
-    throw localValidationError('report-file', 'required when --report junit is set');
-  }
-  if (opts.report === 'junit' && !opts.wait) {
-    throw localValidationError(
-      'report',
-      '--report junit requires --wait (verdicts come from the poll)',
-    );
-  }
+  // Same report-flag rules as `test run` / `test rerun` via the shared
+  // validator: orphan --report-file / --report-suite-name and --report junit
+  // without --wait are refused before anything is dispatched (#569).
+  assertJUnitReportOptions({ ...opts, wait: opts.wait === true, batchPath: true });
   // --gh-output / --summary-file reduce a --wait run's per-member results into the
   // CI summary. They require --wait (without it the command returns after dispatch,
   // before any terminal result exists) — reject loudly, same rule as --report junit
@@ -524,6 +537,10 @@ function validateTestlistRunOptions(opts: RunTestlistRunOptions): void {
       '--summary-file requires --wait (it reduces the terminal run result). Add --wait.',
     );
   }
+  if (opts.report === 'junit' && opts.reportFile !== undefined) {
+    assertArtifactPath('report-file', opts.reportFile);
+  }
+  if (opts.summaryFile !== undefined) assertArtifactPath('summary-file', opts.summaryFile);
 }
 
 export async function runTestlistRun(
@@ -608,6 +625,11 @@ export async function runTestlistRun(
   );
 }
 
+/**
+ * Dispatch selected list members and optionally collect their terminal results.
+ * On interruption, emit acknowledged runs and settled outcomes before rethrowing;
+ * tunnel execution retains its separate cancellation and partial-output handling.
+ */
 async function runTestlistRunCore(
   opts: RunTestlistRunOptions,
   deps: TestListDeps = {},
@@ -949,6 +971,46 @@ async function runTestlistRunCore(
         err,
         deps.environmentTunnel,
       );
+    else if (err instanceof InterruptError) {
+      // Keep settled outcomes intact and retain every dispatched run ID,
+      // including members that had not acquired a polling slot yet.
+      const settled = new Map(results.map(result => [result.runId, result] as const));
+      const partialResults = resp.accepted.map(
+        (entry): TestlistRunMemberResult =>
+          settled.get(entry.runId) ?? {
+            testId: entry.testId,
+            runId: entry.runId,
+            status: 'running',
+          },
+      );
+      out.print(
+        {
+          accepted: partialResults,
+          conflicts: resp.conflicts,
+          deferred: resp.deferred,
+          ...(resp.notFound && resp.notFound.length > 0 ? { notFound: resp.notFound } : {}),
+          ...(resp.reason ? { reason: resp.reason } : {}),
+          summary: {
+            passed: results.filter(result => result.status === 'passed').length,
+            failed: results.filter(
+              result => result.status !== 'passed' && result.status !== 'timeout',
+            ).length,
+            timedOut: results.filter(result => result.status === 'timeout').length,
+            deferred: resp.deferred.length,
+            conflicts: resp.conflicts.length,
+            total: resp.accepted.length,
+          },
+        },
+        () => partialResults.map(result => `${result.runId}  ${result.status}`).join('\n'),
+      );
+      const unfinished = resp.accepted
+        .filter(entry => !settled.has(entry.runId))
+        .map(entry => entry.runId);
+      if (unfinished.length > 0) {
+        err.runWaitContext = true;
+        stderrFn(interruptDetachMessage(err, unfinished));
+      }
+    }
     throw err;
   }
 
@@ -1290,8 +1352,18 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
 
   testlist
     .command('run <list-id>')
+    .summary('Run a test list')
     .description(
-      'Run a test list (dispatch its cases and return pollable run ids). Loopback environments open a tunnel automatically and wait.',
+      "Run a test list (dispatch its cases and return pollable run ids). Environments come from the list's --project-env mapping; loopback ones open one tunnel and wait (backend cases are skipped).\n" +
+        '\nExit codes:\n' +
+        '  0  dispatched (or all passed with --wait)\n' +
+        '  1  a run failed / blocked / cancelled\n' +
+        '  3  auth error\n' +
+        '  4  a --case id is not in the list\n' +
+        '  6  nothing dispatched: every case conflicted (already running, or cannot run here)\n' +
+        '  7  timeout, or some cases were rate-deferred (retry the printed ids)\n' +
+        ' 12  insufficient credits (non-retriable; top up)\n' +
+        ' 13  feature gated / workspace paused',
     )
     .option(
       '--case <test-id>',
@@ -1319,11 +1391,11 @@ export function createTestListCommand(deps: TestListDeps = {}): Command {
     )
     .option(
       '--gh-output',
-      'with --wait: emit GitHub-native output (::error:: annotations for failed/timed-out members, ::warning:: for never-dispatched ones; job-summary table when $GITHUB_STEP_SUMMARY is set). Auto-enabled when GITHUB_ACTIONS=true',
+      'with --wait: emit GitHub annotations (::error:: failed/timed-out, ::warning:: never dispatched) and a job-summary table when $GITHUB_STEP_SUMMARY is set; auto-enabled when GITHUB_ACTIONS=true',
     )
     .option(
       '--summary-file <path>',
-      'with --wait: also write the reduced machine summary JSON {total, passed, failed, skipped, timedOut, runs[]} to this file',
+      'with --wait: also write summary JSON {total, passed, failed, skipped, timedOut, runs[]} to this file',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(

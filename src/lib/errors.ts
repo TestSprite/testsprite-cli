@@ -440,22 +440,35 @@ export class TransportError extends ApiError {
  * as `TimeoutError` from the polling path. Use `--request-timeout <s>` or
  * `TESTSPRITE_REQUEST_TIMEOUT_MS` to extend the deadline when targeting a
  * slow backend.
+ *
+ * A caller working against a fixed internal deadline the `--request-timeout`
+ * flag does not govern (e.g. the environment preflight read) passes
+ * `message` / `nextAction` overrides so the rendered guidance names that
+ * deadline instead of pointing at the flag.
  */
 export class RequestTimeoutError extends CLIError {
   readonly requestId: string;
   readonly timeoutMs: number;
+  /** Caller-specific envelope guidance; unset keeps the generic advice. */
+  readonly nextAction?: string;
 
-  constructor(timeoutMs: number, requestId = 'local') {
+  constructor(
+    timeoutMs: number,
+    requestId = 'local',
+    options: { message?: string; nextAction?: string } = {},
+  ) {
     const timeoutSec = Math.round(timeoutMs / 1000);
     super(
-      `Request timed out after ${timeoutSec}s (client-side). ` +
-        `Use --request-timeout <seconds> or TESTSPRITE_REQUEST_TIMEOUT_MS to extend the deadline.`,
+      options.message ??
+        `Request timed out after ${timeoutSec}s (client-side). ` +
+          `Use --request-timeout <seconds> or TESTSPRITE_REQUEST_TIMEOUT_MS to extend the deadline.`,
       7,
       'REQUEST_TIMEOUT',
     );
     this.name = 'RequestTimeoutError';
     this.requestId = requestId;
     this.timeoutMs = timeoutMs;
+    if (options.nextAction !== undefined) this.nextAction = options.nextAction;
   }
 }
 

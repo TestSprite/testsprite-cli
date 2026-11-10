@@ -16,13 +16,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import { readProfile, writeProfile } from '../lib/credentials.js';
 import type { MeResponse } from './auth.js';
 import type { AgentFs } from './agent.js';
+import type * as AgentModule from './agent.js';
+import { runInstall } from './agent.js';
+import { Command } from 'commander';
 import type { InitDeps } from './init.js';
-import { runInit } from './init.js';
+import { runInit, addSetupOptions } from './init.js';
 import {
   TARGETS,
   DEFAULT_SKILLS,
@@ -41,6 +44,13 @@ vi.mock('node:fs', async importOriginal => {
     unlinkSync: vi.fn(actual.unlinkSync),
     writeFileSync: vi.fn(actual.writeFileSync),
   };
+});
+
+// runInstall gets the same pass-through double as the node:fs functions above,
+// so a test can make the agent install step write a stray stdout line.
+vi.mock('./agent.js', async importOriginal => {
+  const actual = await importOriginal<typeof AgentModule>();
+  return { ...actual, runInstall: vi.fn(actual.runInstall) };
 });
 
 // ---------------------------------------------------------------------------
@@ -65,6 +75,18 @@ function makeOkFetch(): InitDeps['fetchImpl'] {
         headers: { 'content-type': 'application/json' },
       }),
   ) as unknown as InitDeps['fetchImpl'];
+}
+
+/** Mock fetch that never answers; it rejects only when the request is aborted. */
+function makeHangingFetch(): InitDeps['fetchImpl'] {
+  return vi.fn(
+    (_input: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+          once: true,
+        });
+      }),
+  );
 }
 
 /** Mock fetch that returns 401 for any request (simulates bad key). */
@@ -176,6 +198,8 @@ function makeBaseOpts(overrides: Partial<Parameters<typeof runInit>[0]> = {}) {
     fromEnv: false,
     agent: 'claude' as AgentTarget,
     noAgent: false,
+    // Never touch the real repository .gitignore; the .gitignore tests opt in explicitly.
+    noGitignore: true,
     force: false,
     yes: false,
     ...overrides,
@@ -201,6 +225,7 @@ afterEach(() => {
   for (const fn of [mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync]) {
     vi.mocked(fn).mockReset();
   }
+  vi.mocked(runInstall).mockReset();
 });
 
 describe('runInit — session-only environment credentials', () => {
@@ -506,6 +531,53 @@ describe('runInit — session-only environment credentials', () => {
   });
 });
 
+describe('runInit: the key check against /me does not answer', () => {
+  const options = () =>
+    makeBaseOpts({ fromEnv: true, noAgent: true, output: 'json', requestTimeoutMs: 20 });
+
+  it('setup --from-env exits 7 with REQUEST_TIMEOUT, keeps the request id and saves nothing', async () => {
+    const { captured, deps } = makeCapture();
+    const err = await runInit(options(), {
+      ...deps,
+      env: { TESTSPRITE_API_KEY: 'sk-user-valid-key' },
+      credentialsPath,
+      fetchImpl: makeHangingFetch(),
+      isTTY: false,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RequestTimeoutError);
+    expect(err).toMatchObject({
+      code: 'REQUEST_TIMEOUT',
+      exitCode: 7,
+      requestId: expect.stringMatching(/^cli_/),
+    });
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    const stderr = captured.stderr.join('\n');
+    expect(stderr).toContain('timed out, profile NOT updated');
+    expect(stderr).not.toContain('API key rejected');
+    expect(captured.stdout).toEqual([]);
+  });
+
+  it('a 401 from /me still exits 3 with the typed envelope', async () => {
+    const { captured, deps } = makeCapture();
+    await expect(
+      runInit(options(), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: 'sk-user-revoked-key' },
+        credentialsPath,
+        fetchImpl: makeAuthFailFetch(),
+        isTTY: false,
+      }),
+    ).rejects.toMatchObject({
+      code: 'AUTH_INVALID',
+      exitCode: 3,
+      nextAction: 'Provide a valid key.',
+      requestId: 'r-1',
+    });
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(captured.stderr.join('\n')).toContain('API key rejected');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 1. Happy path — interactive (text + json output)
 // ---------------------------------------------------------------------------
@@ -621,6 +693,130 @@ describe('runInit — happy path (interactive)', () => {
     const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
     expect(parsed.status).toBe('initialized');
     expect(captured.stderr.some(line => line.includes('setup identity lookup failed'))).toBe(true);
+  });
+
+  /**
+   * Runs setup with the profile read in resolveReportedEndpoint failing: once
+   * the configure and whoami fetches are done, reading the credentials file throws.
+   */
+  async function runInitWithFailingProfileRead(
+    debug: boolean,
+  ): Promise<{ captured: Captured; failedReads: number }> {
+    const { captured, deps } = makeCapture();
+    const fetchMock = makeOkFetch()!;
+    const actual = await vi.importActual<typeof NodeFs>('node:fs');
+    let fetchCount = 0;
+    let failedReads = 0;
+    const trackingFetch = vi.fn(
+      async (input: Parameters<typeof fetchMock>[0], init?: Parameters<typeof fetchMock>[1]) => {
+        fetchCount++;
+        return fetchMock(input, init);
+      },
+    );
+
+    vi.mocked(readFileSync).mockImplementation((...args) => {
+      if (fetchCount >= 2 && args[0] === credentialsPath) {
+        failedReads++;
+        throw new Error('simulated credentials read error');
+      }
+      return actual.readFileSync(...args);
+    });
+
+    await runInit(
+      makeBaseOpts({ apiKey: 'sk-user-json-test', debug, noAgent: true, output: 'json' }),
+      {
+        ...deps,
+        fetchImpl: trackingFetch,
+        credentialsPath,
+        isTTY: false,
+      },
+    );
+
+    return { captured, failedReads };
+  }
+
+  it('debug mode reports resolve endpoint profile read failure without failing the command', async () => {
+    const { captured, failedReads } = await runInitWithFailingProfileRead(true);
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
+    expect(parsed.status).toBe('initialized');
+    expect(failedReads).toBeGreaterThan(0);
+    expect(
+      captured.stderr.some(line =>
+        line.includes(
+          '[debug] resolve endpoint profile read failed: simulated credentials read error',
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps stderr free of [debug] lines when the profile read fails without --debug', async () => {
+    const { captured, failedReads } = await runInitWithFailingProfileRead(false);
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
+    expect(parsed.status).toBe('initialized');
+    // The read did fail; it just must not be reported.
+    expect(failedReads).toBeGreaterThan(0);
+    expect(captured.stderr.filter(line => line.includes('[debug]'))).toEqual([]);
+  });
+
+  /**
+   * Runs setup with the agent install step writing one stray non-JSON stdout
+   * line before its real result. runInstall prints a single JSON document in
+   * json mode, so the parse fallback is only reachable by faking that output.
+   */
+  async function runInitWithStrayInstallOutput(debug: boolean): Promise<Captured> {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    const actual = await vi.importActual<typeof AgentModule>('./agent.js');
+    vi.mocked(runInstall).mockImplementationOnce(async (installOpts, installDeps) => {
+      installDeps?.stdout?.('not json');
+      await actual.runInstall(installOpts, installDeps);
+    });
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-json-test', debug, output: 'json' }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    return captured;
+  }
+
+  it('debug mode reports a non-JSON line from the agent install step and keeps the summary', async () => {
+    const captured = await runInitWithStrayInstallOutput(true);
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as {
+      status: string;
+      agent: { action: string; skills?: string[] } | null;
+    };
+    expect(parsed.status).toBe('initialized');
+    // The real install result after the stray line is still picked up.
+    expect(parsed.agent?.action).toBe('installed');
+    expect(parsed.agent?.skills).toContain('testsprite-verify');
+    expect(vi.mocked(runInstall)).toHaveBeenCalledTimes(1);
+    expect(
+      captured.stderr.filter(line =>
+        line.includes('[debug] setup agent install output parse non-JSON:'),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('keeps stderr free of [debug] lines when the agent install step writes a non-JSON line without --debug', async () => {
+    const captured = await runInitWithStrayInstallOutput(false);
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as {
+      status: string;
+      agent: { action: string } | null;
+    };
+    expect(parsed.status).toBe('initialized');
+    expect(parsed.agent?.action).toBe('installed');
+    // The stray line was written; it just must not be reported.
+    expect(vi.mocked(runInstall)).toHaveBeenCalledTimes(1);
+    expect(captured.stderr.filter(line => line.includes('[debug]'))).toEqual([]);
   });
 
   it('stops before skill installation when the identity request is interrupted', async () => {
@@ -2144,5 +2340,176 @@ describe('runInit -- skipIfConfigured', () => {
 
     // Explicit --api-key must overwrite regardless of skipIfConfigured.
     expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-new');
+  });
+
+  describe('.gitignore safety', () => {
+    // runInit resolves the project dir, so seed and assert the resolved path
+    // (on Windows path.resolve('/test-project') gains a drive letter).
+    const GIT_CWD = path.resolve(CWD);
+    it('appends .testsprite/ to .gitignore when inside a git repo', async () => {
+      const { deps } = makeCapture();
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.mkdir(path.join(GIT_CWD, '.git'));
+      writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+      const fetchMock = makeOkFetch();
+
+      await runInit(
+        makeBaseOpts({
+          dir: GIT_CWD,
+          skipIfConfigured: true,
+          noAgent: true,
+          noGitignore: false,
+          output: 'json',
+        }),
+        {
+          ...deps,
+          credentialsPath,
+          fetchImpl: fetchMock,
+          fs: agentFs,
+          isTTY: false,
+        },
+      );
+
+      expect(store.get(path.join(GIT_CWD, '.gitignore'))).toContain('.testsprite/');
+    });
+
+    it('does not write .gitignore when outside a git repo', async () => {
+      const { deps } = makeCapture();
+      const { fs: agentFs, store } = makeMemFs();
+      // No .git directory created
+      writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+      const fetchMock = makeOkFetch();
+
+      await runInit(
+        makeBaseOpts({
+          dir: GIT_CWD,
+          skipIfConfigured: true,
+          noAgent: true,
+          noGitignore: false,
+          output: 'json',
+        }),
+        {
+          ...deps,
+          credentialsPath,
+          fetchImpl: fetchMock,
+          fs: agentFs,
+          isTTY: false,
+        },
+      );
+
+      expect(store.has(path.join(GIT_CWD, '.gitignore'))).toBe(false);
+    });
+
+    it('does not write .gitignore when --no-gitignore is passed even inside a git repo', async () => {
+      const { deps } = makeCapture();
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.mkdir(path.join(GIT_CWD, '.git'));
+      writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+      const fetchMock = makeOkFetch();
+
+      await runInit(
+        makeBaseOpts({
+          dir: GIT_CWD,
+          skipIfConfigured: true,
+          noAgent: true,
+          noGitignore: true,
+          output: 'json',
+        }),
+        {
+          ...deps,
+          credentialsPath,
+          fetchImpl: fetchMock,
+          fs: agentFs,
+          isTTY: false,
+        },
+      );
+
+      expect(store.has(path.join(GIT_CWD, '.gitignore'))).toBe(false);
+    });
+
+    async function runWithFs(
+      agentFs: AgentFs,
+      overrides: Partial<Parameters<typeof makeBaseOpts>[0]> = {},
+    ) {
+      const { captured, deps } = makeCapture();
+      writeProfile('default', { apiKey: 'sk-user-existing' }, { path: credentialsPath });
+      const run = runInit(
+        makeBaseOpts({
+          dir: GIT_CWD,
+          skipIfConfigured: true,
+          noAgent: true,
+          noGitignore: false,
+          output: 'json',
+          ...overrides,
+        }),
+        { ...deps, credentialsPath, fetchImpl: makeOkFetch(), fs: agentFs, isTTY: false },
+      );
+      return { captured, run };
+    }
+
+    it('appends without rewriting existing content (no trailing newline, CRLF)', async () => {
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.mkdir(path.join(GIT_CWD, '.git'));
+      await agentFs.writeFile(path.join(GIT_CWD, '.gitignore'), 'dist/\r\nnode_modules/');
+      const { run } = await runWithFs(agentFs);
+      await run;
+      expect(store.get(path.join(GIT_CWD, '.gitignore'))).toBe(
+        'dist/\r\nnode_modules/\n\n# TestSprite failure artifacts\n.testsprite/\n',
+      );
+    });
+
+    it('recognises .git as a file (worktree or submodule)', async () => {
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.writeFile(path.join(GIT_CWD, '.git'), 'gitdir: /elsewhere/.git/worktrees/x');
+      const { run } = await runWithFs(agentFs);
+      await run;
+      expect(store.get(path.join(GIT_CWD, '.gitignore'))).toContain('.testsprite/');
+    });
+
+    it('resolves a relative --dir before walking up to the repo root', async () => {
+      const { fs: agentFs, store } = makeMemFs();
+      await agentFs.mkdir(path.join(process.cwd(), '.git'));
+      const { run } = await runWithFs(agentFs, { dir: path.join('rel', 'sub') });
+      await run;
+      expect(store.get(path.resolve('rel', 'sub', '.gitignore'))).toContain('.testsprite/');
+    });
+
+    it('refuses to write through a symlinked .gitignore and warns without failing setup', async () => {
+      const { fs: memFs, store } = makeMemFs();
+      await memFs.mkdir(path.join(GIT_CWD, '.git'));
+      await memFs.writeFile(path.join(GIT_CWD, '.gitignore'), 'dist/\n');
+      const linkPath = path.join(GIT_CWD, '.gitignore');
+      const symlinkFs: AgentFs = {
+        ...memFs,
+        lstat: async p =>
+          p === linkPath ? { isFile: false, isSymbolicLink: true } : memFs.lstat(p),
+      };
+      const { captured, run } = await runWithFs(symlinkFs);
+      await run;
+      expect(store.get(linkPath)).toBe('dist/\n');
+      expect(captured.stderr.join('\n')).toMatch(/\[warn\] Failed to update \.gitignore:.*symlink/);
+    });
+
+    it('still ignores .testsprite/ when the agent skill install fails after credentials were saved', async () => {
+      const { fs: memFs, store } = makeMemFs();
+      await memFs.mkdir(path.join(GIT_CWD, '.git'));
+      const failingFs: AgentFs = {
+        ...memFs,
+        writeFile: async (p, data, opts) => {
+          if (p.endsWith('SKILL.md') || p.includes('skills')) throw new Error('disk full');
+          return memFs.writeFile(p, data, opts);
+        },
+      };
+      const { run } = await runWithFs(failingFs, { noAgent: false, agent: 'claude' });
+      await expect(run).rejects.toThrow();
+      expect(store.get(path.join(GIT_CWD, '.gitignore'))).toContain('.testsprite/');
+    });
+
+    it('registers --no-gitignore option in addSetupOptions', () => {
+      const cmd = new Command();
+      addSetupOptions(cmd, [], 'claude' as AgentTarget);
+      const opt = cmd.options.find(o => o.long === '--no-gitignore');
+      expect(opt).toBeDefined();
+    });
   });
 });
