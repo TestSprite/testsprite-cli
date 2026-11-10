@@ -2,6 +2,7 @@ import { promises as nodeFs } from 'node:fs';
 import { spawnSync as nodeSpawnSync, type SpawnSyncReturns } from 'node:child_process';
 import * as path from 'node:path';
 import { Command } from 'commander';
+import { equalIgnoringCrlf } from '../lib/text-equality.js';
 import {
   makeHttpClient,
   parseRequestTimeoutFlag,
@@ -12,6 +13,7 @@ import { loadConfig, resolveProfileName } from '../lib/config.js';
 import { type FetchImpl, type HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import type { Page } from '../lib/pagination.js';
+import { inspectTargetPath, type TargetPathFs } from '../lib/target-path.js';
 import { assertNotLocal } from '../lib/target-url.js';
 import {
   classifyLinkage,
@@ -67,10 +69,11 @@ const DEFAULT_API_URL = 'https://api.testsprite.com';
 
 /**
  * Minimal fs seam (mirrors `agent.ts`'s `AgentFs` semantics: exclusive writes to
- * refuse clobbering, recursive mkdir to create parent dirs). Kept local so `ci`
- * doesn't couple to the agent-install internals.
+ * refuse clobbering, recursive mkdir to create parent dirs). Path inspection
+ * shares the agent installer's component walk.
  */
-export interface CiFs {
+export interface CiFs extends TargetPathFs {
+  realpath(target: string): Promise<string>;
   writeFile(target: string, data: string, opts?: { exclusive?: boolean }): Promise<void>;
   mkdir(dir: string): Promise<void>;
   readFile(target: string): Promise<string>;
@@ -79,6 +82,18 @@ export interface CiFs {
 }
 
 const defaultCiFs: CiFs = {
+  async lstat(target) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- inspect each component before writing the caller-selected workflow path.
+      const stat = await nodeFs.lstat(target);
+      return { isFile: stat.isFile(), isSymbolicLink: stat.isSymbolicLink() };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  },
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- resolve the repository and workflow symlink for containment validation.
+  realpath: target => nodeFs.realpath(target),
   // `target`/`dir` are the workflow output path (default `.github/workflows/testsprite.yml`,
   // or the caller's `--path`), resolved from cwd — a scaffold target the user is writing into
   // their own repo, never external/network input. Same risk profile as agent-install scaffolding.
@@ -278,6 +293,16 @@ export function buildGithubWorkflow(input: {
   assertSafeWorkflowValue('project', input.projectId);
   assertSafeWorkflowValue('env', input.environment);
   if (input.endpointUrl) assertSafeWorkflowValue('endpoint-url', input.endpointUrl);
+  // All generated workflows live directly under .github/workflows/. Keep the
+  // readable filename, including its extension; escape rather than discard
+  // punctuation so distinct filenames cannot collapse to the same slug.
+  // GitHub compares concurrency group names case-insensitively, so uppercase
+  // letters are escaped too (keeping existing %XX escapes intact): otherwise
+  // TestSprite.yml and testsprite.yml would share a group.
+  const workflowSlug = encodeURIComponent(path.posix.basename(input.workflowPath)).replace(
+    /%[0-9A-F]{2}|[A-Z]/g,
+    match => (match.startsWith('%') ? match : `%${match.charCodeAt(0).toString(16).toUpperCase()}`),
+  );
 
   const envLines = [
     `      ${API_KEY_SECRET_NAME}: \${{ secrets.${API_KEY_SECRET_NAME} }}`,
@@ -320,6 +345,8 @@ permissions:
 
 jobs:
   testsprite-tests:
+    # Include this workflow's filename: concurrency groups are repository-wide,
+    # so another project's workflow must not cancel this gate.
     # B (pull_request): a new push to the pull request cancels the previous job.
     # A (deployment_status): one group per COMMIT — Vercel sets deployment.ref to
     # the commit sha, so a new push does not cancel the previous commit's job.
@@ -328,9 +355,10 @@ jobs:
     # Cancelling only stops this job's CLI: the TestSprite run it started keeps
     # executing and reports in the Portal; the new push starts its own run.
     concurrency:
-      group: testsprite-\${{ github.event.pull_request.number || github.event.deployment.sha }}
+      group: testsprite-${workflowSlug}-\${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
-    # pull_request: skip fork PRs (they get no repository secrets) and draft PRs.
+    # pull_request: skip fork PRs (they get no repository secrets), Dependabot PRs
+    # (Dependabot secrets are not Actions secrets), and draft PRs.
     # deployment_status: only successful, non-production deployments. Vercel leaves
     # production_environment false on production deployments, so the name is checked too
     # (GitHub compares strings case-insensitively).
@@ -347,6 +375,7 @@ jobs:
     if: >-
       (github.event_name == 'pull_request' &&
        github.event.pull_request.head.repo.full_name == github.repository &&
+       github.actor != 'dependabot[bot]' &&
        !github.event.pull_request.draft) ||
       (github.event_name == 'deployment_status' &&
        github.event.deployment_status.state == 'success' &&
@@ -628,6 +657,29 @@ async function runCiInitScaffold(
   if (opts.project) assertSafeWorkflowValue('project', opts.project);
   if (opts.env) assertSafeWorkflowValue('env', opts.env);
   const { relPath, absPath } = resolveWorkflowPath(opts.workflowPath, cwd);
+  const allowInternalSymlink = async (target: string): Promise<void> => {
+    let resolved: string;
+    let root: string;
+    try {
+      [root, resolved] = await Promise.all([fs.realpath(cwd), fs.realpath(target)]);
+    } catch {
+      throw new CLIError(
+        `cannot resolve symlink at "${target}"; refusing to write the workflow.`,
+        5,
+      );
+    }
+    const relative = path.relative(root, resolved);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new CLIError(
+        `refusing to write through symlink "${target}": "${resolved}" is outside the repository.`,
+        5,
+      );
+    }
+  };
+  await inspectTargetPath(fs, cwd, relPath, allowInternalSymlink);
+  if (opts.force) {
+    await inspectTargetPath(fs, cwd, `${relPath}.bak`, allowInternalSymlink);
+  }
 
   const projectId = await resolveProjectId(opts, deps);
   const resolvedEnv = await resolveEnvironment(opts, deps, projectId);
@@ -725,8 +777,8 @@ async function runCiInitScaffold(
     if (code !== 'EEXIST') throw err;
     onExisted(true);
     const prior = await fs.readFile(absPath);
-    if (prior === workflow) {
-      // Already exactly what we'd write: no rewrite, and re-running (with or
+    if (equalIgnoringCrlf(prior, workflow)) {
+      // Equivalent apart from CRLF conversion: no rewrite, and re-running (with or
       // without --force) on identical content is a no-op rather than an error.
       wrote = false;
     } else if (!opts.force) {
@@ -1516,7 +1568,12 @@ export function createCiCommand(deps: CiDeps = {}): Command {
     });
 
   ci.command('init <platform>')
-    .description('Write a CI workflow that runs your TestSprite tests (platform: github)')
+    .summary('Write a CI workflow that runs your test cases on pull requests (github)')
+    .description(
+      "Write a CI workflow (platform: github) that runs the project's TestSprite test cases against each\n" +
+        'pull request\'s preview deployment; each run spends credits. Replace the "REPLACE ME" step in the\n' +
+        `generated file with your preview URL. Needs the ${API_KEY_SECRET_NAME} repo secret (see --set-secret).`,
+    )
     .option('--project <id>', 'project id to run (auto-detected if you have exactly one)')
     .option(
       '--env <name>',
@@ -1569,7 +1626,8 @@ export function createCiCommand(deps: CiDeps = {}): Command {
   // Behaviour and exit codes are unchanged until the commands are removed.
   ci.command('doctor', { hidden: true })
     .description(
-      'Check that deployment events reach this repo — the precondition a deployment-gated workflow rests on',
+      'Check that deployment events reach this repo — the precondition for a deployment-gated workflow.\n' +
+        'Needs the GitHub CLI (`gh`), installed and authenticated.',
     )
     .option('--repo <owner/name>', 'repo to check (inferred from the `origin` remote if omitted)')
     .option(
@@ -1580,14 +1638,13 @@ export function createCiCommand(deps: CiDeps = {}): Command {
     .option('--timeout <s>', 'with --wait, how long to keep checking (1-3600, default 600)')
     .addHelpText(
       'after',
-      '\nWhy this exists:\n' +
-        '  A workflow triggered by deployments only fires if the repo actually receives\n' +
-        "  GitHub Deployment events. When the deploy platform isn't linked to the repo,\n" +
-        '  nothing is ever written and the gate stays silent — with no error anywhere.\n' +
-        '\n--wait succeeds when any new deployment record arrives, whatever its\n' +
-        'environment — a new record is the hard fact that events reach this repo.\n' +
+      '\nA deployment-triggered workflow only fires if the repo receives GitHub Deployment events;\n' +
+        'if the deploy platform is not linked, the gate stays silent with no error.\n' +
+        '--wait succeeds when any new deployment record arrives, whatever its environment.\n' +
         '\nExit codes:\n' +
-        '  0  events reach this repo (a gate will fire), or --wait saw a new record\n' +
+        '  0  events reach this repo (a gate will fire), or --wait saw a new record. With --wait and\n' +
+        '     no new record before --timeout it is still 0 if earlier events exist: check the output\n' +
+        '     (JSON: newDeployment)\n' +
         '  1  no usable events yet — see the printed next steps\n' +
         '  5  validation error (bad --repo, or no GitHub remote here)\n' +
         ' 10  could not read the history (gh missing / unauthenticated) — not a verdict',
@@ -1617,15 +1674,14 @@ export function createCiCommand(deps: CiDeps = {}): Command {
     )
     .addHelpText(
       'after',
-      "\nRuns the platform's own CLI (`npx vercel link` / `vercel git connect`) as a\n" +
-        'subprocess, always non-interactively: when a decision is needed (which project\n' +
-        'to link) it refuses and says so rather than creating anything you did not pick.\n' +
-        'Your Vercel credentials stay with the Vercel CLI — this command never asks for,\n' +
-        'stores, or transmits a platform token.\n' +
-        '\nNote: `vercel link` itself writes `.vercel/`, may add a VERCEL_OIDC_TOKEN line\n' +
-        'to `.env.local`, and may update `.gitignore` — the Vercel CLI’s own behavior.\n' +
-        '\nLinking only affects FUTURE pushes: push a commit afterwards, then confirm with\n' +
-        '`testsprite ci doctor --wait`.',
+      `\nRuns \`npx ${VERCEL_CLI_SPEC}\` (downloads the Vercel CLI) non-interactively to link this directory\n` +
+        'and connect the repo (`vercel link` / `vercel git connect`); if a decision is needed (which\n' +
+        'project to link) it refuses rather than create anything you did not pick. Your Vercel\n' +
+        'credentials stay with the Vercel CLI; this command never asks for or stores a platform token.\n' +
+        '`vercel link` itself writes `.vercel/`, may add VERCEL_OIDC_TOKEN to `.env.local` and may\n' +
+        'update `.gitignore`. --dry-run is not honored: the link is made.\n' +
+        '\nExit codes: 0 connected, 1 could not connect\n' +
+        '\nLinking only affects FUTURE pushes: push a commit, then confirm with `testsprite ci doctor --wait`.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (cmdOpts, command: Command) => {

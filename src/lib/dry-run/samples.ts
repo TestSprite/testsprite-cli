@@ -1021,13 +1021,14 @@ const ENTRIES: DryRunSampleEntry[] = [
   // **MUST appear before `/tests` and `/tests/{testId}` generic matchers**
   // so the more-specific runs path wins. Canned response shape per the
   // runs-trigger design spec.
-  entry('triggerRun', 'POST', '/tests/{testId}/runs', {
+  entry('triggerRun', 'POST', '/tests/{testId}/runs', (req?: unknown): TriggerRunResponse => ({
     runId: SAMPLE_RUN_ID,
     status: 'queued',
     enqueuedAt: '2026-05-15T19:32:00.000Z',
     codeVersion: 'v1',
     targetUrl: SAMPLE_TARGET_URL,
-  } satisfies TriggerRunResponse),
+    ...echoSkipDependencies(req),
+  })),
   // M3.4 piece-3 — POST /tests/{testId}/runs/rerun (single rerun).
   // **MUST appear before `/tests/{testId}/runs` and `/tests/{testId}`** so the
   // more-specific `/runs/rerun` path wins over the generic runs trigger.
@@ -1058,24 +1059,31 @@ const ENTRIES: DryRunSampleEntry[] = [
   // **MUST appear before `/tests/batch/rerun` and `/tests/batch` (create)**
   // so the more-specific `/batch/run` path wins. Shows `accepted[]` with
   // per-test runIds + `skippedFrontend[]` so dry-run learners see both shapes.
-  entry('triggerBatchRunFresh', 'POST', '/tests/batch/run', {
-    accepted: [
-      {
-        testId: SAMPLE_TEST_ID_FRESH_1,
-        runId: SAMPLE_BATCH_FRESH_RUN_ID_1,
-        enqueuedAt: '2026-06-09T10:00:00.000Z',
-      },
-      {
-        testId: SAMPLE_TEST_ID_FRESH_2,
-        runId: SAMPLE_BATCH_FRESH_RUN_ID_2,
-        enqueuedAt: '2026-06-09T10:00:00.000Z',
-      },
-    ],
-    conflicts: [],
-    deferred: [],
-    skippedFrontend: [],
-    skippedIntegration: [],
-  } satisfies BatchRunFreshResponse),
+  entry(
+    'triggerBatchRunFresh',
+    'POST',
+    '/tests/batch/run',
+    (req?: unknown) =>
+      ({
+        accepted: [
+          {
+            testId: SAMPLE_TEST_ID_FRESH_1,
+            runId: SAMPLE_BATCH_FRESH_RUN_ID_1,
+            enqueuedAt: '2026-06-09T10:00:00.000Z',
+          },
+          {
+            testId: SAMPLE_TEST_ID_FRESH_2,
+            runId: SAMPLE_BATCH_FRESH_RUN_ID_2,
+            enqueuedAt: '2026-06-09T10:00:00.000Z',
+          },
+        ],
+        conflicts: [],
+        deferred: [],
+        skippedFrontend: [],
+        skippedIntegration: [],
+        ...echoSkipDependencies(req),
+      }) satisfies BatchRunFreshResponse,
+  ),
   // M3.4 piece-3 — POST /tests/batch/rerun (batch rerun).
   // **MUST appear before `/tests/batch` (create)** so the more-specific
   // `/batch/rerun` path wins. Shows `accepted[]` with per-test runIds (C2)
@@ -1196,6 +1204,15 @@ const ENTRIES: DryRunSampleEntry[] = [
     expiresAt: '2026-01-01T01:00:00.000Z',
   } satisfies TunnelStatusResponse),
 ];
+
+/** What a backend that handles the field answers: `true` when asked, otherwise the key is omitted. */
+function echoSkipDependencies(req: unknown): { skipDependencies?: true } {
+  return req != null &&
+    typeof req === 'object' &&
+    (req as Record<string, unknown>).skipDependencies === true
+    ? { skipDependencies: true }
+    : {};
+}
 
 function entry(
   operationId: string,

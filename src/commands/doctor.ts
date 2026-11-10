@@ -28,6 +28,7 @@ import {
   normalizeEnvVar,
   type Config,
 } from '../lib/config.js';
+import { readCredentialsFile } from '../lib/credentials.js';
 import {
   ApiError,
   CLIError,
@@ -46,6 +47,7 @@ import { isVerifySkillInstalled } from '../lib/skill-nudge.js';
 import { emitV3RoutingAdvisory, routingLabel } from '../lib/v3-advisory.js';
 import { VERSION } from '../version.js';
 import { SUPPORTED_NODE_RANGE, shouldRejectNodeVersion } from '../version-guard.js';
+import { inspectTestspriteIgnore } from '../lib/git-utils.js';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -86,6 +88,8 @@ export interface DoctorDeps {
   nodeVersion?: string;
   existsSync?: (p: string) => boolean;
   readFileSync?: (p: string) => string;
+  /** lstat for the Git checks (tests); a symlinked .gitignore is not trusted. */
+  lstatSync?: (p: string) => { isSymbolicLink: boolean } | null;
   /** Config resolver. Defaults to `loadConfig`; injectable for tests. */
   loadConfigFn?: typeof loadConfig;
 }
@@ -119,6 +123,19 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
       apiKey: normalizeEnvVar(env.TESTSPRITE_API_KEY),
     };
   }
+  // Complete overrides let loadConfig skip the store. Doctor still diagnoses
+  // the file itself, without making its permissions block those overrides.
+  if (!credentialsReadError) {
+    try {
+      readCredentialsFile({ path: deps.credentialsPath });
+    } catch (error) {
+      if (!isFsPermissionError(error)) throw error;
+      credentialsReadError = error.code;
+    }
+  }
+  const hasCompleteOverrides =
+    normalizeEnvVar(env.TESTSPRITE_API_KEY) !== undefined &&
+    (opts.endpointUrl ?? normalizeEnvVar(env.TESTSPRITE_API_URL)) !== undefined;
   const endpointCheck = checkEndpoint(config.apiUrl);
   const hasKey = Boolean(config.apiKey);
   const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
@@ -132,12 +149,20 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
     config,
   });
 
+  const gitChecks = checkGit(cwd, deps);
   const checks: DoctorCheck[] = [
     { name: 'CLI version', status: 'ok', detail: VERSION },
     checkNodeVersion(nodeVersion),
+    gitChecks[0],
     { name: 'Profile', status: 'ok', detail: config.profile },
     endpointCheck,
-    checkCredentials(hasKey, config.profile, opts.dryRun ?? false, credentialsReadError),
+    checkCredentials(
+      hasKey,
+      config.profile,
+      opts.dryRun ?? false,
+      credentialsReadError,
+      hasCompleteOverrides,
+    ),
     connectivity.check,
   ];
 
@@ -179,6 +204,7 @@ export async function runDoctor(opts: CommonOptions, deps: DoctorDeps = {}): Pro
   );
 
   checks.push(checkSkill(cwd, deps));
+  checks.push(gitChecks[1]);
 
   const failures = checks.filter(check => check.status === 'fail').length;
   const warnings = checks.filter(check => check.status === 'warn').length;
@@ -240,15 +266,16 @@ function checkCredentials(
   profile: string,
   dryRun: boolean,
   readError?: string,
+  hasCompleteOverrides = false,
 ): DoctorCheck {
   if (readError) {
     return {
       name: 'Credentials',
-      status: hasKey ? 'warn' : 'fail',
+      status: hasCompleteOverrides ? 'warn' : 'fail',
       detail:
         `credentials file exists but cannot be read (${readError}); its ACL may be locked out ` +
         'by an earlier CLI version — delete the file and re-run `testsprite setup`' +
-        (hasKey ? ' (TESTSPRITE_API_KEY is set, so commands still work)' : ''),
+        (hasCompleteOverrides ? ' (TESTSPRITE_API_KEY is set, so commands still work)' : ''),
     };
   }
   if (hasKey) {
@@ -281,6 +308,50 @@ function checkSkill(cwd: string, deps: DoctorDeps): DoctorCheck {
       ? 'installed in this project'
       : 'not installed here; run `testsprite setup` so your agent verifies its changes',
   };
+}
+
+/**
+ * Git repository + .gitignore safety, computed together from one pass over the
+ * project dir up to the repository root. Informational only: never fails doctor.
+ */
+function checkGit(cwd: string, deps: DoctorDeps): [DoctorCheck, DoctorCheck] {
+  try {
+    const { inRepo, ignored } = inspectTestspriteIgnore(cwd, {
+      existsSync: deps.existsSync,
+      readFileSync: deps.readFileSync,
+      lstatSync: deps.lstatSync,
+    });
+    if (!inRepo) {
+      return [
+        {
+          name: 'Git repository',
+          status: 'ok',
+          detail: 'not a Git repository; nothing to ignore',
+        },
+        {
+          name: 'Gitignore safety',
+          status: 'ok',
+          detail: 'not applicable outside a Git repository',
+        },
+      ];
+    }
+    return [
+      { name: 'Git repository', status: 'ok', detail: 'inside a Git repository' },
+      {
+        name: 'Gitignore safety',
+        status: ignored ? 'ok' : 'warn',
+        detail: ignored
+          ? '.testsprite/ is ignored'
+          : '.testsprite/ is not ignored; run `testsprite setup` or add `.testsprite/` to .gitignore to avoid committing artifacts',
+      },
+    ];
+  } catch (err) {
+    const detail = `could not inspect Git state: ${err instanceof Error ? err.message : String(err)}`;
+    return [
+      { name: 'Git repository', status: 'warn', detail },
+      { name: 'Gitignore safety', status: 'ok', detail: 'skipped' },
+    ];
+  }
 }
 
 async function checkConnectivity(
@@ -471,8 +542,9 @@ function renderDoctor(report: DoctorReport): string {
 
 export function createDoctorCommand(deps: DoctorDeps = {}): Command {
   const cmd = new Command('doctor')
+    .summary('Diagnose CLI setup: credentials, connectivity, skill')
     .description(
-      'Diagnose CLI setup: version, Node, profile, endpoint, credentials, connectivity, skill',
+      'Diagnose CLI setup: version, Node, profile, endpoint, credentials, API connectivity, workspace routing, tunnel permission (run:tunnel) and the verify skill in this directory. Exit 1 if any check fails; warnings do not.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .addHelpText(
