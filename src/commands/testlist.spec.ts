@@ -516,7 +516,12 @@ describe('testlist run', () => {
       return { body: RUN_ACCEPTED };
     });
     const err = (await runTestlistRun(
-      { ...runBase, output: 'json' as const, listId: 'list-1', reportFile: join('out', 'results.xml') },
+      {
+        ...runBase,
+        output: 'json' as const,
+        listId: 'list-1',
+        reportFile: join('out', 'results.xml'),
+      },
       { env, fetchImpl, stdout: () => {} },
     ).catch(e => e)) as ApiError;
     expect(err).toBeInstanceOf(ApiError);
