@@ -724,9 +724,6 @@ export async function runDelete(
   deps: ProjectDeps = {},
 ): Promise<CliDeleteProjectResponse> {
   assertIdempotencyKey(opts.idempotencyKey);
-  if (opts.projectId === undefined || opts.projectId.trim().length === 0) {
-    throw localValidationError('<project-id> is required');
-  }
 
   if (!opts.confirm && !opts.dryRun) {
     throw ApiError.fromEnvelope({

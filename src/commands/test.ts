@@ -2018,7 +2018,6 @@ export async function runPlanPut(
   deps: TestDeps = {},
 ): Promise<CliPutPlanStepsResponse> {
   assertIdempotencyKey(opts.idempotencyKey);
-  requireNonEmpty('test-id', opts.testId);
   requireNonEmpty('steps', opts.stepsFile);
 
   if (
@@ -2431,7 +2430,6 @@ export async function runUpdate(
   deps: TestDeps = {},
 ): Promise<CliUpdateTestResponse> {
   assertIdempotencyKey(opts.idempotencyKey);
-  requireNonEmpty('test-id', opts.testId);
   // P1-3: client-side length checks matching server limits.
   if (opts.name !== undefined && opts.name.trim().length === 0) {
     throw localValidationError(
@@ -2574,7 +2572,6 @@ export async function runDelete(
   deps: TestDeps = {},
 ): Promise<CliDeleteTestResponse> {
   assertIdempotencyKey(opts.idempotencyKey);
-  requireNonEmpty('test-id', opts.testId);
 
   if (!opts.confirm && !opts.dryRun) {
     throw ApiError.fromEnvelope({
@@ -5858,7 +5855,6 @@ export async function runCodePut(
   deps: TestDeps = {},
 ): Promise<CliPutTestCodeResponse> {
   assertIdempotencyKey(opts.idempotencyKey);
-  requireNonEmpty('test-id', opts.testId);
   requireNonEmpty('code-file', opts.codeFile);
   assertPythonCodeFile(opts.codeFile);
 
@@ -16300,9 +16296,6 @@ export async function runFlaky(
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const out = makeOutput(opts.output, deps);
 
-  if (typeof opts.testId !== 'string' || opts.testId.length === 0) {
-    throw localValidationError('test-id', 'is required');
-  }
   if (!Number.isInteger(opts.runs) || opts.runs < 1 || opts.runs > MAX_FLAKY_RUNS) {
     throw localValidationError('runs', `must be an integer between 1 and ${MAX_FLAKY_RUNS}`);
   }
