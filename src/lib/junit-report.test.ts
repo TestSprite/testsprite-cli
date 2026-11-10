@@ -257,9 +257,10 @@ describe('buildJUnitReport', () => {
         makeResult({ testId: 'a b', runId: 'run_b', status: 'failed', name: 'Checkout' }),
       ],
     });
-    const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]);
+    const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]!);
     // Attribute-normalized identities must be pairwise distinct.
-    const normalize = (value: string): string => value.replace(/\r\n?/g, '\n').replace(/[\n\t]/g, ' ');
+    const normalize = (value: string): string =>
+      value.replace(/\r\n?/g, '\n').replace(/[\n\t]/g, ' ');
     expect(new Set(names.map(normalize)).size).toBe(2);
     expect(names).toContain('Checkout [a\\tb]');
     expect(names).toContain('Checkout [a b]');
