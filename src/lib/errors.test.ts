@@ -602,6 +602,52 @@ describe('localValidationError', () => {
     expect(err.nextAction).toBe('Flag `--page-size` is invalid: must be a positive integer.');
     expect(err.nextAction.endsWith('..')).toBe(false);
   });
+
+  it('kind=argument formats bare positional name wrapped in angle brackets', () => {
+    const err = localValidationError(
+      'projectId',
+      'cannot be empty or whitespace-only',
+      undefined,
+      'argument',
+    );
+    expect(err.code).toBe('VALIDATION_ERROR');
+    expect(err.exitCode).toBe(5);
+    expect(err.nextAction).toBe(
+      'Argument `<project-id>` is invalid: cannot be empty or whitespace-only.',
+    );
+  });
+
+  it('kind=argument preserves existing bracketed argument names', () => {
+    const required = localValidationError(
+      '<project-id>',
+      'cannot be empty or whitespace-only',
+      undefined,
+      'argument',
+    );
+    expect(required.nextAction).toBe(
+      'Argument `<project-id>` is invalid: cannot be empty or whitespace-only.',
+    );
+
+    const optional = localValidationError(
+      '[output-path]',
+      'cannot be empty or whitespace-only',
+      undefined,
+      'argument',
+    );
+    expect(optional.nextAction).toBe(
+      'Argument `[output-path]` is invalid: cannot be empty or whitespace-only.',
+    );
+
+    const variadic = localValidationError(
+      '<run-id...>',
+      'cannot be empty or whitespace-only',
+      undefined,
+      'argument',
+    );
+    expect(variadic.nextAction).toBe(
+      'Argument `<run-id...>` is invalid: cannot be empty or whitespace-only.',
+    );
+  });
 });
 
 describe('ApiError.getDetail', () => {

@@ -22,6 +22,7 @@ import { createUsageCommand } from './commands/usage.js';
 import { resolveProfileName } from './lib/config.js';
 import { classifyBillingRefusal } from './lib/billing-refusal.js';
 import { TARGETS, type AgentTarget } from './lib/agent-targets.js';
+import { validatePositionalArgs } from './lib/args.js';
 import {
   ApiError,
   CLIError,
@@ -285,6 +286,13 @@ function telemetryGlobals(): {
 // action; the helper self-gates (text-only, non-dry-run, a small command
 // allowlist, opt-out via TESTSPRITE_NO_SKILL_WARNING) and never throws.
 program.hook('preAction', (_thisCommand, actionCommand) => {
+  const commandPath = commandPathOf(actionCommand);
+  // Record which leaf command ran, for the telemetry emit around parseAsync.
+  ranCommandPath = commandPath;
+
+  // Validate positional arguments across all commands before executing their actions.
+  validatePositionalArgs(actionCommand);
+
   const globals = actionCommand.optsWithGlobals() as {
     output?: string;
     profile?: string;
@@ -295,9 +303,6 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     local?: string;
     localHost?: string;
   };
-  const commandPath = commandPathOf(actionCommand);
-  // Record which leaf command ran, for the telemetry emit around parseAsync.
-  ranCommandPath = commandPath;
   // Preserve explicit --local attempts, including refusals and borrowed tunnels;
   // only flag presence is recorded. Automatic tunnel paths record the same fact.
   if (globals.local !== undefined) recordTelemetryExtras({ local: true });

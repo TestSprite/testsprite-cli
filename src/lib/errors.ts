@@ -396,12 +396,18 @@ export function localValidationError(
   field: string,
   reason: string,
   accepted?: unknown,
-  kind: 'flag' | 'field' = 'flag',
+  kind: 'flag' | 'field' | 'argument' = 'flag',
 ): ApiError {
+  let argName = field;
+  if (kind === 'argument' && !field.startsWith('<') && !field.startsWith('[')) {
+    argName = `<${field.replace(/[A-Z]/g, ch => `-${ch.toLowerCase()}`)}>`;
+  }
   const subject =
     kind === 'flag'
       ? `Flag \`--${field.replace(/[A-Z]/g, ch => `-${ch.toLowerCase()}`)}\``
-      : `Field \`${field}\``;
+      : kind === 'argument'
+        ? `Argument \`${argName}\``
+        : `Field \`${field}\``;
   const punctuatedReason = reason.endsWith('.') ? reason : `${reason}.`;
   return ApiError.fromEnvelope({
     error: {
