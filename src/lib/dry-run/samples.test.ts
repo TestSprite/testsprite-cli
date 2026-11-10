@@ -26,6 +26,23 @@ describe('sampleJUnitReportXml', () => {
   });
 });
 
+describe('findSample skipDependencies echo', () => {
+  it.each(['/tests/test_a/runs', '/tests/batch/run'])(
+    'POST %s echoes skipDependencies only when the request carried it',
+    path => {
+      const echoed = findSample('POST', path, { skipDependencies: true })!.body() as Record<
+        string,
+        unknown
+      >;
+      expect(echoed.skipDependencies).toBe(true);
+      const plain = findSample('POST', path, { source: 'cli' })!.body() as Record<string, unknown>;
+      expect('skipDependencies' in plain).toBe(false);
+      const none = findSample('POST', path)!.body() as Record<string, unknown>;
+      expect('skipDependencies' in none).toBe(false);
+    },
+  );
+});
+
 describe('findSample', () => {
   it('provides password-free project sign-in get and set samples', () => {
     const get = findSample('GET', '/projects/p_x/sign-in?environment=default');

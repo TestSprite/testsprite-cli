@@ -172,6 +172,20 @@ describe('a trace this CLI wrote itself is not evidence', () => {
     expect(detectedTargets('.', repo(withBackup))).toEqual([]);
   });
 
+  it('ignores numbered .bak.N backups from repeated --force runs', () => {
+    // `writeBackup` rotates to .bak.1, .bak.2, … once .bak exists; those slots
+    // are ours too, or a second --force re-poisons detection the same way.
+    const ours = DEFAULT_SKILLS.map(s => pathFor('windsurf', s));
+    const withBackups = [
+      ...ours,
+      `${ours[0]!}.bak`,
+      `${ours[0]!}.bak.1`,
+      `${ours[0]!}.bak.2`,
+      `${ours[0]!}.bak.99`, // writeBackup's last slot before it gives up
+    ];
+    expect(detectedTargets('.', repo(withBackups))).toEqual([]);
+  });
+
   it('still detects a target whose dir holds our skills AND real config', () => {
     const paths = [
       ...DEFAULT_SKILLS.map(s => pathFor('cursor', s)),

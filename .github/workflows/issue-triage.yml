@@ -27,6 +27,8 @@ env:
   SLOT_CAP: '3'
   # D2: the three-issue cap is enforced for new claims.
   ENFORCE_CAP: 'true'
+  # How long after an issue is accepted only its opener can claim it.
+  OPENER_RESERVE_HOURS: '48'
 
 jobs:
   triage:
@@ -232,6 +234,49 @@ jobs:
                       + `see the triage comment (a maintainer will label it \`accepted\` once it is). `
                       + `Feel free to check back, or ping us on Discord if it's been quiet.` });
                 return;
+              }
+
+              // One claimant at a time: a second claim on a claimed issue would
+              // otherwise just add a co-assignee.
+              const holders = (context.payload.issue.assignees || [])
+                .map(a => a.login).filter(login => login !== user);
+              if (holders.length > 0 && !isMaintainer) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue,
+                  body: `Thanks for the interest, @${user}! This issue is already claimed by @${holders.join(', @')}. `
+                      + `If the claim is released, you can comment \`/assign\` again.` });
+                return;
+              }
+
+              // The opener's head start: for OPENER_RESERVE_HOURS after the issue
+              // is accepted, only the person who opened it can claim it. Issues
+              // opened by maintainers or bots are not reserved.
+              const opener = context.payload.issue.user;
+              if (opener && opener.login !== user && opener.type !== 'Bot' && !isMaintainer) {
+                let openerIsMaintainer;
+                try {
+                  const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: opener.login });
+                  openerIsMaintainer = ['admin', 'maintain', 'write'].includes(data.permission);
+                } catch {
+                  openerIsMaintainer = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(context.payload.issue.author_association);
+                }
+                if (!openerIsMaintainer) {
+                  const events = await github.paginate(github.rest.issues.listEvents,
+                    { owner, repo, issue_number: issue, per_page: 100 });
+                  const acceptedAt = events
+                    .filter(e => e.event === 'labeled' && ACCEPT_LABELS.includes(e.label?.name))
+                    .map(e => Date.parse(e.created_at))
+                    .filter(t => !Number.isNaN(t))
+                    .reduce((latest, t) => Math.max(latest, t), 0);
+                  const reservedUntil = acceptedAt + parseInt(process.env.OPENER_RESERVE_HOURS, 10) * 3600 * 1000;
+                  if (acceptedAt && Date.now() < reservedUntil) {
+                    const until = new Date(reservedUntil).toISOString().replace(/\.\d{3}Z$/, 'Z');
+                    await github.rest.issues.createComment({ owner, repo, issue_number: issue,
+                      body: `Thanks for the interest, @${user}! @${opener.login} opened this issue, so it's reserved for them `
+                          + `until ${until} (${process.env.OPENER_RESERVE_HOURS} hours after it was accepted). `
+                          + `If they haven't claimed it by then, comment \`/assign\` again.` });
+                    return;
+                  }
+                }
               }
             }
 
