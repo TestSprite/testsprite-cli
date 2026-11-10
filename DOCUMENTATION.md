@@ -414,13 +414,35 @@ Bulk-create frontend tests from a JSONL plan-steps file (or a directory of plan 
 
 ```json
 {
-  "results": [{ "testId": "test_xxxxxxxx", "runId": "run_xxxxxxxx", "status": "passed" }],
+  "results": [
+    {
+      "testId": "test_xxxxxxxx",
+      "runId": "run_xxxxxxxx",
+      "status": "passed"
+    }
+  ],
   "creation": {
     "results": [
-      { "specIndex": 0, "testId": "test_xxxxxxxx", "status": "created", "dashboardUrl": "https://..." },
-      { "specIndex": 1, "status": "validation_error", "error": { "code": "VALIDATION_ERROR", "message": "Invalid plan" } }
+      {
+        "specIndex": 0,
+        "testId": "test_xxxxxxxx",
+        "status": "created",
+        "dashboardUrl": "https://..."
+      },
+      {
+        "specIndex": 1,
+        "status": "validation_error",
+        "error": {
+          "code": "VALIDATION_ERROR",
+          "message": "Invalid plan"
+        }
+      }
     ],
-    "summary": { "total": 2, "created": 1, "failed": 1 }
+    "summary": {
+      "total": 2,
+      "created": 1,
+      "failed": 1
+    }
   }
 }
 ```
