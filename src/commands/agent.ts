@@ -1,6 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { Command } from 'commander';
+import { equalIgnoringCrlf } from '../lib/text-equality.js';
 import { resolveProfileName } from '../lib/config.js';
 import type { CommonOptions as FactoryCommonOptions } from '../lib/client-factory.js';
 import { CLIError, localValidationError } from '../lib/errors.js';
@@ -271,7 +272,7 @@ function classifySection(existing: string, section: string): SectionState {
   const after = existing.slice(endOfEndByte + trailingNewline);
   const currentSection = existing.slice(beginByteIdx, endOfEndByte + trailingNewline);
 
-  if (currentSection === section) {
+  if (equalIgnoringCrlf(currentSection, section)) {
     return { kind: 'unchanged' };
   }
 
@@ -770,7 +771,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
         results.push({ target: t, path: relPath, action: 'written', skills: [skill] });
       } else {
         const existing = await agentFs.readFile(abs);
-        if (existing === content) {
+        if (equalIgnoringCrlf(existing, content)) {
           // Byte-identical — skip
           results.push({ target: t, path: relPath, action: 'skipped', skills: [skill] });
         } else if (!opts.force) {
@@ -988,7 +989,7 @@ async function classifyOwnFileState(
   // render carrying its own marker line, so a marker whose version string lags
   // behind an unchanged body still reads ok.
   const reRender = renderOwnFileWithMarker(target, skill, marker.line, body);
-  return existing === reRender ? 'ok' : 'modified';
+  return equalIgnoringCrlf(existing, reRender) ? 'ok' : 'modified';
 }
 
 /**
