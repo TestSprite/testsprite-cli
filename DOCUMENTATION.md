@@ -1168,6 +1168,8 @@ testsprite ci init github --set-secret --repo owner/name
 - **A — your platform deploys every PR** (for example the Vercel or Netlify git integration): change the trigger to `on: deployment_status`, delete the placeholder step, and keep the rest. A repository that deploys **several** projects gets one deployment per project for the same commit (Vercel names them `Preview – <project>`); pin the one to gate with `&& github.event.deployment.environment == 'Preview – <project>'` in the `if:`, or the gate tests whichever project's URL arrives. The run step reads the URL from `github.event.deployment_status.environment_url`, and `ci run` finds the pull request behind the deployment's commit with `GITHUB_TOKEN`; a deployment that belongs to no open pull request is skipped with a notice. The job only runs for successful, non-production deployments (it checks both `production_environment` and the environment name, because Vercel reports `production_environment: false` on its production deployments). This shape needs the repository to actually receive deployment events from your platform; confirm it with one real pull request.
 - **B — you deploy in the workflow**: keep `on: pull_request`, replace the placeholder's commands with your deploy, and end it with `echo "url=<preview address>" >> "$GITHUB_OUTPUT"`. Your platform token goes in its own repo secret.
 
+Concurrency groups include the workflow filename from `--path` so separate generated workflows do not cancel each other. The filename keeps its extension and URI-escapes special characters rather than discarding them; because GitHub compares group names case-insensitively, uppercase letters are escaped too, so `TestSprite.yml` and `testsprite.yml` stay separate. Regenerating the same file keeps its group; the PR number or deployment SHA still identifies runs within that workflow. Both examples below use `.github/workflows/testsprite.yml`.
+
 The two finished shapes, with the template's comments left out (the generated file carries them):
 
 ```yaml
@@ -1181,7 +1183,7 @@ permissions:
 jobs:
   gate:
     concurrency:
-      group: testsprite-${{ github.event.pull_request.number || github.event.deployment.sha }}
+      group: testsprite-testsprite.yml-${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
     if: >-
       github.event_name == 'deployment_status' &&
@@ -1230,11 +1232,12 @@ permissions:
 jobs:
   gate:
     concurrency:
-      group: testsprite-${{ github.event.pull_request.number || github.event.deployment.sha }}
+      group: testsprite-testsprite.yml-${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]' &&
       !github.event.pull_request.draft
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -1277,7 +1280,7 @@ jobs:
 
 The last step runs `testsprite ci run --project <id> --env <name> --target-url <preview>`. In a pull request, the run uses a temporary copy of that environment pointed at the preview (named `github-pr-<N>`, like GitHub App runs, and released when the run finishes), so the Portal shows which pull request it tested.
 
-What the generated workflow fixes in place: it installs `@testsprite/testsprite-cli@latest` (results are decided by the backend, which is not versioned with the CLI, so a pinned client would only freeze old behaviour); it requests `contents: read` and `pull-requests: read`; it skips fork pull requests (they run without repository secrets) and draft pull requests (it runs again on `ready_for_review`); it passes `--fail-on-skipped`, so a test that never ran fails the gate instead of warning; under shape B a new push to the pull request cancels the previous job; under shape A the concurrency group is **per commit** (Vercel sets the deployment's `ref` to the commit SHA, so there is no branch to key on) and a new push does not cancel the previous commit's job — either way, cancelling only stops that job's CLI; the TestSprite run it started keeps executing and reports in the Portal, and the new push starts its own run. The group is declared on the job, so deployment events the `if:` drops (`pending`, `inactive`, another project's deployment of the same commit) never cancel a running gate; and it uploads `ci run`'s summary file even when the job fails.
+What the generated workflow fixes in place: it installs `@testsprite/testsprite-cli@latest` (results are decided by the backend, which is not versioned with the CLI, so a pinned client would only freeze old behaviour); it requests `contents: read` and `pull-requests: read`; it skips fork pull requests (they run without repository secrets), Dependabot pull requests (Dependabot secrets are not Actions secrets) and draft pull requests (it runs again on `ready_for_review`); it passes `--fail-on-skipped`, so a test that never ran fails the gate instead of warning; under shape B a new push to the pull request cancels the previous job; under shape A the concurrency group is **per commit** (Vercel sets the deployment's `ref` to the commit SHA, so there is no branch to key on) and a new push does not cancel the previous commit's job — either way, cancelling only stops that job's CLI; the TestSprite run it started keeps executing and reports in the Portal, and the new push starts its own run. The group is declared on the job, so deployment events the `if:` drops (`pending`, `inactive`, another project's deployment of the same commit) never cancel a running gate; and it uploads `ci run`'s summary file even when the job fails.
 
 > **Forks and shape A.** A `deployment_status` event runs the workflow file **at the deployed commit**, with the repository's secrets, and the event does not say whether that commit came from a fork. The `if:` can skip fork pull requests on `pull_request` events, not on deployments. If your hosting platform deploys pull requests from forks, turn that off on the platform (Vercel: fork protection / require authorization for fork deployments), or a fork's edit of the workflow runs with your `TESTSPRITE_API_KEY`.
 
