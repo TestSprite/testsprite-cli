@@ -994,13 +994,31 @@ interface EnvIdempotencyFlagOpts {
 
 const IDEMPOTENCY_HELP = 'opaque idempotency token. Defaults to a UUIDv4 minted per invocation.';
 
-const EXIT_CODE_NOTE =
+const LIST_EXIT_CODE_NOTE =
   '\nExit codes:\n' +
   '  0  success\n' +
   '  3  auth error\n' +
-  '  4  project (or environment) not found\n' +
-  '  5  validation error\n' +
-  '  6  conflict (name already exists / deleting the default)';
+  '  4  project not found\n' +
+  '  5  validation error';
+const GET_EXIT_CODE_NOTE =
+  '\nExit codes:\n' +
+  '  0  success\n' +
+  '  3  auth error\n' +
+  '  4  project or environment not found\n' +
+  '  5  validation error';
+const DELETE_EXIT_CODE_NOTE =
+  '\nExit codes:\n' +
+  '  0  success\n' +
+  '  3  auth error\n' +
+  '  4  project or environment not found\n' +
+  '  5  validation error (e.g., missing --confirm)\n' +
+  '  6  conflict (the default environment cannot be deleted)';
+const SET_DEFAULT_EXIT_CODE_NOTE =
+  '\nExit codes:\n' +
+  '  0  success\n' +
+  '  3  auth error\n' +
+  '  4  project or environment not found\n' +
+  '  5  validation error';
 const UPDATE_EXIT_CODE_NOTE =
   '\nExit codes:\n' +
   '  0  success\n' +
@@ -1023,6 +1041,7 @@ const CREATE_EXIT_CODE_NOTE =
 
 export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
   const env = new Command('env')
+    .summary("Manage a project's environments")
     .description(
       "Manage a project's environments — named URL + test-account bundles that `test run --env <name>` selects",
     )
@@ -1034,7 +1053,8 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
 
   env
     .command('list <project-id>')
-    .description("List a project's environments (name, default, URL, auth)." + EXIT_CODE_NOTE)
+    .summary("List a project's environments")
+    .description("List a project's environments (name, default, URL, auth)." + LIST_EXIT_CODE_NOTE)
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (projectId: string, _cmdOpts: unknown, command: Command) => {
       await runEnvList({ ...resolveCommonOptions(command, deps.env), projectId }, deps);
@@ -1042,7 +1062,8 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
 
   env
     .command('get <project-id> <name>')
-    .description('Get one environment by name, including its login settings.' + EXIT_CODE_NOTE)
+    .summary('Get one environment by name')
+    .description('Get one environment by name, including its login settings.' + GET_EXIT_CODE_NOTE)
     .addHelpText('after', GLOBAL_OPTS_HINT)
     .action(async (projectId: string, name: string, _cmdOpts: unknown, command: Command) => {
       await runEnvGet({ ...resolveCommonOptions(command, deps.env), projectId, name }, deps);
@@ -1050,6 +1071,7 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
 
   env
     .command('create <project-id>')
+    .summary('Create an environment')
     .description(
       'Create an environment (--name and one of --url / --local are required).' +
         CREATE_EXIT_CODE_NOTE,
@@ -1071,18 +1093,21 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
     )
     .option('--skip-preflight', 'skip the local TCP listener check before creating')
     .option('--username <user>', 'test-account username the browser logs in with')
-    .option('--password <pw>', 'test-account password (prefer --password-file)')
+    .option('--password <pw>', 'test-account password (prefer --password-file, exclusive)')
     .option('--password-file <path>', 'read the password from a file instead of the command line')
     .option(
       '--var <KEY=VALUE>',
-      'set a custom variable (repeatable); shown in plain text by `env get` — not for secrets, use --username/--password',
+      'set a custom variable (repeatable; max 50, 4096 bytes each, key [A-Za-z_][A-Za-z0-9_]*, reserved names like url/username/password rejected); shown in plain text by `env get`, not for secrets',
       collectVar,
       [],
     )
-    .option('--sign-in <mode>', 'public, account, otp, or manual (aliases: none, credentials, sso)')
+    .option(
+      '--sign-in <mode>',
+      'public, account, otp, or manual (aliases: none, credentials, sso). manual: log in once in the Portal, runs reuse that session (not signed in until then). otp and manual: not for local environments',
+    )
     .option(
       '--otp-channel <email,sms>',
-      'OTP channels: email and/or sms; repeat or comma-separate',
+      'OTP channels: email and/or sms; repeat or comma-separate (default: email)',
       (value: string, previous: string[] = []) => [...previous, value],
     )
     .option(
@@ -1118,7 +1143,11 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
 
   env
     .command('update <project-id> <name>')
-    .description("Change an environment's URL, credentials or name." + UPDATE_EXIT_CODE_NOTE)
+    .summary('Change an environment')
+    .description(
+      "Change an environment's URL, credentials, custom variables or name (sign-in mode: `project sign-in set`)." +
+        UPDATE_EXIT_CODE_NOTE,
+    )
     .option(
       '--url <url>',
       'new address runs open (public http/https, or a loopback http origin with an explicit port)',
@@ -1135,12 +1164,12 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
     )
     .option('--skip-preflight', 'skip the local TCP listener check before the update')
     .option('--username <user>', 'new test-account username')
-    .option('--password <pw>', 'new test-account password (prefer --password-file)')
+    .option('--password <pw>', 'new test-account password (prefer --password-file, exclusive)')
     .option('--password-file <path>', 'read the new password from a file')
     .option('--clear-credentials', 'remove stored username and password; disable account login')
     .option(
       '--var <KEY=VALUE>',
-      'merge a custom variable (repeatable); shown in plain text by `env get` — not for secrets, use --username/--password',
+      'merge a custom variable (repeatable; max 50, 4096 bytes each, key [A-Za-z_][A-Za-z0-9_]*, reserved names like url/username/password rejected); shown in plain text by `env get`, not for secrets',
       collectVar,
       [],
     )
@@ -1176,10 +1205,11 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
 
   env
     .command('delete <project-id> <name>')
+    .summary('Delete an environment (requires --confirm)')
     .description(
       'Delete an environment and its stored credentials. Requires --confirm; the default\n' +
         'environment cannot be deleted (set another default first).' +
-        EXIT_CODE_NOTE,
+        DELETE_EXIT_CODE_NOTE,
     )
     .option('--confirm', 'required: explicit confirmation for the destructive operation', false)
     .option('--idempotency-key <token>', IDEMPOTENCY_HELP)
@@ -1201,10 +1231,10 @@ export function createProjectEnvCommand(deps: ProjectDeps = {}): Command {
 
   env
     .command('set-default <project-id> <name>')
+    .summary('Make an environment the project default')
     .description(
-      'Make an environment the project default — what every run without --env uses.\n' +
-        'The environment needs a URL.' +
-        EXIT_CODE_NOTE,
+      'Make an environment the project default — what every run without --env uses.' +
+        SET_DEFAULT_EXIT_CODE_NOTE,
     )
     .option('--idempotency-key <token>', IDEMPOTENCY_HELP)
     .addHelpText('after', GLOBAL_OPTS_HINT)

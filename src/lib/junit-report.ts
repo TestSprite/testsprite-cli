@@ -14,6 +14,8 @@ export interface JUnitTestResult {
   status: string;
   /** Observed on polled runs; used for classname when --project is omitted. */
   projectId?: string;
+  /** This row's own `classname`, when the batch spans several projects. */
+  classname?: string;
   error?: { code: string; message: string; exitCode?: number };
   /** Why a member was skipped before dispatch. */
   skipReason?: string;
@@ -122,12 +124,17 @@ export function assertJUnitReportOptions(opts: JUnitReportFlagOptions): void {
  * Prefer explicit `--project`, then ids observed on polled run rows.
  */
 export function resolveBatchReportProjectId(
-  opts: { projectId?: string },
+  opts: { projectId?: string; projectIdByTestId?: ReadonlyMap<string, string> },
   results: ReadonlyArray<{ projectId?: string }>,
 ): string {
   if (opts.projectId) return opts.projectId;
+  // Explicit ids that span several projects have no single `--project`; each
+  // row carries its own project as its classname and the suite gets this token.
+  const known = new Set(opts.projectIdByTestId?.values());
+  if (known.size > 1) return 'multiple-projects';
   const fromPoll = results.map(r => r.projectId).find((id): id is string => !!id);
   if (fromPoll) return fromPoll;
+  if (known.size === 1) return [...known][0]!;
   throw localValidationError(
     'project',
     '--report junit requires --project <id> when the project cannot be inferred from run results',
@@ -135,10 +142,22 @@ export function resolveBatchReportProjectId(
 }
 
 /**
+ * Characters XML 1.0 forbids anywhere in a document: the `Char` production
+ * allows only #x9, #xA, #xD, [#x20-#xD7FF], [#xE000-#xFFFD] and
+ * [#x10000-#x10FFFF]. No entity can represent the excluded characters, so
+ * they are stripped rather than escaped — a single one in a free-text run
+ * message (LLM / server supplied) makes strict parsers reject the whole
+ * report. Tab, newline and carriage return are legal and preserved.
+ */
+// eslint-disable-next-line no-control-regex
+const XML_1_0_ILLEGAL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g;
+
+/**
  * Escape text for inclusion in XML element bodies and double-quoted attributes.
  */
 export function escapeXml(text: string): string {
   return text
+    .replace(XML_1_0_ILLEGAL_CHARS, '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -235,7 +254,7 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
   }
 
   const suiteName = escapeXml(opts.suiteName);
-  const testcases = results.map(r => renderTestcase(r, opts.classname)).join('\n');
+  const testcases = results.map(r => renderTestcase(r, r.classname ?? opts.classname)).join('\n');
 
   return [
     XML_DECL,
