@@ -7703,6 +7703,49 @@ describe('runCreate', () => {
       stderrLines.some(l => l.includes('[debug] duplicate-name advisory lookup failed: Forbidden')),
     ).toBe(true);
   });
+
+  it('Fix 4 — keeps stderr free of [debug] lines when the lookup fails without --debug', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('// test code');
+    let listCalled = false;
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'GET' && url.includes('/tests')) {
+        listCalled = true;
+        return {
+          status: 403,
+          body: {
+            error: {
+              code: 'AUTH_FORBIDDEN',
+              message: 'Forbidden',
+              nextAction: '',
+              requestId: 'r1',
+              details: {},
+            },
+          },
+        };
+      }
+      return { body: SAMPLE_RESPONSE };
+    });
+
+    const stderrLines: string[] = [];
+    const result = await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'another test',
+        codeFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+    );
+
+    // The lookup did fail and the create still went through; nothing is reported.
+    expect(listCalled).toBe(true);
+    expect(result.testId).toBe('test_new');
+    expect(stderrLines.filter(l => l.includes('[debug]'))).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -10236,6 +10279,62 @@ describe('runCreateFromPlan', () => {
     expect(listAttempted).toBe(true);
     expect(postCalled).toBe(true);
     expect(result.testId).toBe(SAMPLE_RESPONSE.testId);
+  });
+
+  /** Creates from FE_PLAN while the dup-name listing (GET /tests) fails with 403. */
+  async function createFromPlanWithFailingLookup(debug: boolean) {
+    const { credentialsPath } = makeCreds();
+    let listAttempted = false;
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'GET' && url.includes('/tests')) {
+        listAttempted = true;
+        return {
+          status: 403,
+          body: {
+            error: {
+              code: 'AUTH_FORBIDDEN',
+              message: 'Forbidden',
+              nextAction: '',
+              requestId: 'r',
+              details: {},
+            },
+          },
+        };
+      }
+      return { body: SAMPLE_RESPONSE };
+    });
+    const stderrLines: string[] = [];
+
+    const result = await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug, planFrom: writePlanFile(FE_PLAN) },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+
+    return { result, stderrLines, listAttempted };
+  }
+
+  it('[finding-4] reports a failed dup-name lookup on the plan-from path under --debug', async () => {
+    const { result, stderrLines, listAttempted } = await createFromPlanWithFailingLookup(true);
+
+    expect(listAttempted).toBe(true);
+    expect(result.testId).toBe(SAMPLE_RESPONSE.testId);
+    expect(
+      stderrLines.some(l => l.includes('[debug] duplicate-name advisory lookup failed: Forbidden')),
+    ).toBe(true);
+  });
+
+  it('[finding-4] keeps stderr free of [debug] lines when the plan-from lookup fails without --debug', async () => {
+    const { result, stderrLines, listAttempted } = await createFromPlanWithFailingLookup(false);
+
+    // The lookup did fail and the create still went through; nothing is reported.
+    expect(listAttempted).toBe(true);
+    expect(result.testId).toBe(SAMPLE_RESPONSE.testId);
+    expect(stderrLines.filter(l => l.includes('[debug]'))).toEqual([]);
   });
 
   it('[finding-4] skips dup-name lookup when dry-run is true', async () => {
