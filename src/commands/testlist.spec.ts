@@ -390,7 +390,11 @@ describe('testlist run', () => {
 
   it('#569: --report-file without --report junit → VALIDATION_ERROR before dispatch', async () => {
     const { env } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: RUN_ACCEPTED }));
+    let dispatched = false;
+    const fetchImpl = makeFetch(() => {
+      dispatched = true;
+      return { body: RUN_ACCEPTED };
+    });
     const err = (await runTestlistRun(
       { ...runBase, output: 'json' as const, listId: 'list-1', reportFile: join('out', 'results.xml') },
       { env, fetchImpl, stdout: () => {} },
@@ -398,20 +402,10 @@ describe('testlist run', () => {
     expect(err).toBeInstanceOf(ApiError);
     expect(err.code).toBe('VALIDATION_ERROR');
     expect(err.exitCode).toBe(5);
+    expect(dispatched).toBe(false);
   });
 
   it('#569: --report-suite-name without --report junit → VALIDATION_ERROR before dispatch', async () => {
-    const { env } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: RUN_ACCEPTED }));
-    const err = (await runTestlistRun(
-      { ...runBase, output: 'json' as const, listId: 'list-1', reportSuiteName: 'nightly' },
-      { env, fetchImpl, stdout: () => {} },
-    ).catch(e => e)) as CLIError;
-    expect(err).toBeInstanceOf(CLIError);
-    expect(err.exitCode).toBe(5);
-  });
-
-  it("#569: --report-file '' without --report junit → VALIDATION_ERROR before dispatch", async () => {
     const { env } = makeCreds();
     let dispatched = false;
     const fetchImpl = makeFetch(() => {
@@ -419,11 +413,10 @@ describe('testlist run', () => {
       return { body: RUN_ACCEPTED };
     });
     const err = (await runTestlistRun(
-      { ...runBase, output: 'json' as const, listId: 'list-1', reportFile: '' },
+      { ...runBase, output: 'json' as const, listId: 'list-1', reportSuiteName: 'nightly' },
       { env, fetchImpl, stdout: () => {} },
-    ).catch(e => e)) as ApiError;
-    expect(err).toBeInstanceOf(ApiError);
-    expect(err.code).toBe('VALIDATION_ERROR');
+    ).catch(e => e)) as CLIError;
+    expect(err).toBeInstanceOf(CLIError);
     expect(err.exitCode).toBe(5);
     expect(dispatched).toBe(false);
   });

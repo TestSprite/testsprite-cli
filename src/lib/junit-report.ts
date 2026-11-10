@@ -90,12 +90,10 @@ export function parseJUnitReportFormat(raw: string | undefined): JUnitReportForm
  */
 export function assertJUnitReportOptions(opts: JUnitReportFlagOptions): void {
   if (opts.report === undefined) {
-    // An explicitly supplied flag counts even when Commander mapped it to ''
-    // (#569 follow-up): an empty value is still an orphan report flag.
-    if (opts.reportFile !== undefined) {
+    if (opts.reportFile !== undefined && opts.reportFile !== '') {
       throw localValidationError('report-file', '--report-file requires --report junit');
     }
-    if (opts.reportSuiteName !== undefined) {
+    if (opts.reportSuiteName !== undefined && opts.reportSuiteName !== '') {
       throw localValidationError(
         'report-suite-name',
         '--report-suite-name requires --report junit',

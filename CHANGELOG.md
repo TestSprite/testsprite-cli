@@ -11,7 +11,7 @@ All notable changes to `@testsprite/testsprite-cli` are documented here. The for
 ### Fixed
 
 - **`project credential` and `project auto-auth` no longer crash on an unreadable `--credential-file`, `--password-file`, `--client-secret-file` or `--refresh-token-file`.** A missing, unreadable or non-regular file now exits 5 (`VALIDATION_ERROR`) with the usual error envelope instead of an unhandled Node error (exit 1), and `--dry-run` no longer reads these files, matching `project create` and `project update`. Thanks @OkeyAmy (#283).
-- **`testlist run` now enforces the same report-flag rules as `test run`.** Orphan `--report-file` and `--report-suite-name` flags (including explicitly empty values) could dispatch every member of the list (billed), poll, and exit 0 without writing any JUnit report — the CI upload step then found no file or uploaded a stale one while the gate was green. On the non-tunnel path, `--report junit` without `--wait` already failed with exit 5 before dispatch. These combinations are now rejected with exit 5 before anything is dispatched, through the shared validator. (#569)
+- **`testlist run` now enforces the same report-flag rules as `test run`.** Orphan `--report-file` and `--report-suite-name` flags could dispatch every member of the list (billed), poll, and exit 0 without writing any JUnit report — the CI upload step then found no file or uploaded a stale one while the gate was green. These combinations are now rejected with exit 5 before anything is dispatched, through the shared validator. (#569)
 
 ## [0.16.0] - 2026-10-30
 
