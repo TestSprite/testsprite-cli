@@ -4364,22 +4364,30 @@ async function runBatchRun(
       status: 'queued',
       codeVersion: 'v1',
     }));
-    const envelope: CliCreateBatchDryRunResponse = {
-      dryRun: true,
-      method: 'POST',
-      pathTemplate: '/api/cli/v1/tests/{testId}/runs',
+    const envelope = {
+      dryRun: true as const,
+      method: 'POST' as const,
+      pathTemplate: '/api/cli/v1/tests/{testId}/runs' as const,
       maxConcurrency: opts.maxConcurrency ?? null,
       wait: opts.wait ?? false,
       timeoutSeconds,
       testIds,
       ...(opts.wait ? { thenPoll: `/api/cli/v1/runs/<run-id>?waitSeconds=25` } : {}),
       results: dryRunResults,
-      creation: {
-        results: creationResults,
-        summary: createResponse.summary,
-      },
     };
-    out.print(envelope);
+    if (opts.output === 'json') {
+      const jsonEnvelope: CliCreateBatchDryRunResponse = {
+        ...envelope,
+        creation: {
+          results: creationResults,
+          summary: createResponse.summary,
+        },
+      };
+      out.print(jsonEnvelope);
+    } else {
+      // Keep the pre-existing text-mode dry-run descriptor unchanged.
+      out.print(envelope);
+    }
     return;
   }
 
