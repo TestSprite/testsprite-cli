@@ -31,7 +31,8 @@ jobs:
     concurrency:
       group: testsprite-testsprite.yml-\${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
-    # pull_request: skip fork PRs (they get no repository secrets) and draft PRs.
+    # pull_request: skip fork PRs (they get no repository secrets), Dependabot PRs
+    # (Dependabot secrets are not Actions secrets), and draft PRs.
     # deployment_status: only successful, non-production deployments. Vercel leaves
     # production_environment false on production deployments, so the name is checked too
     # (GitHub compares strings case-insensitively).
@@ -48,6 +49,7 @@ jobs:
     if: >-
       (github.event_name == 'pull_request' &&
        github.event.pull_request.head.repo.full_name == github.repository &&
+       github.actor != 'dependabot[bot]' &&
        !github.event.pull_request.draft) ||
       (github.event_name == 'deployment_status' &&
        github.event.deployment_status.state == 'success' &&
@@ -60,11 +62,14 @@ jobs:
       # ci run looks up the PR behind a deployment_status event with this token.
       GITHUB_TOKEN: \${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
+          # Only the CLI is installed below. Without this, an npm repo
+          # (package.json "packageManager": "npm@…") with no lockfile fails here.
+          package-manager-cache: false
 
       - run: npm i -g @testsprite/testsprite-cli@latest
 
@@ -92,7 +97,7 @@ jobs:
 
       - name: Upload TestSprite report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: testsprite-results
           path: testsprite-summary.json
@@ -131,7 +136,8 @@ jobs:
     concurrency:
       group: testsprite-testsprite.yml-\${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
-    # pull_request: skip fork PRs (they get no repository secrets) and draft PRs.
+    # pull_request: skip fork PRs (they get no repository secrets), Dependabot PRs
+    # (Dependabot secrets are not Actions secrets), and draft PRs.
     # deployment_status: only successful, non-production deployments. Vercel leaves
     # production_environment false on production deployments, so the name is checked too
     # (GitHub compares strings case-insensitively).
@@ -148,6 +154,7 @@ jobs:
     if: >-
       (github.event_name == 'pull_request' &&
        github.event.pull_request.head.repo.full_name == github.repository &&
+       github.actor != 'dependabot[bot]' &&
        !github.event.pull_request.draft) ||
       (github.event_name == 'deployment_status' &&
        github.event.deployment_status.state == 'success' &&
@@ -161,11 +168,14 @@ jobs:
       GITHUB_TOKEN: \${{ github.token }}
       TESTSPRITE_API_URL: "https://selfhosted.example:8443"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
+          # Only the CLI is installed below. Without this, an npm repo
+          # (package.json "packageManager": "npm@…") with no lockfile fails here.
+          package-manager-cache: false
 
       - run: npm i -g @testsprite/testsprite-cli@latest
 
@@ -194,7 +204,7 @@ jobs:
 
       - name: Upload TestSprite report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: testsprite-results
           path: testsprite-summary.json

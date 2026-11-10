@@ -52,6 +52,16 @@ function makeFakeFs(seed: Record<string, string> = {}): CiFs & { files: Map<stri
   const files = new Map<string, string>(Object.entries(seed));
   return {
     files,
+    async lstat(target) {
+      if (files.has(target)) return { isFile: true, isSymbolicLink: false };
+      if ([...files.keys()].some(file => file.startsWith(`${target}${sep}`))) {
+        return { isFile: false, isSymbolicLink: false };
+      }
+      return null;
+    },
+    async realpath(target) {
+      return target;
+    },
     async writeFile(target, data, opts) {
       if (opts?.exclusive && files.has(target)) {
         const err = new Error('EEXIST') as NodeJS.ErrnoException;
@@ -300,10 +310,13 @@ describe('buildGithubWorkflow', () => {
     expect(yaml).toContain('exit 1');
   });
 
-  it('guards both events: no fork or draft PRs, only successful non-production deployments', () => {
+  it('guards both events: no fork, Dependabot or draft PRs, only successful non-production deployments', () => {
     const yaml = buildGithubWorkflow(WF_BASE);
     expect(yaml).toContain('types: [opened, synchronize, reopened, ready_for_review]');
     expect(yaml).toContain('github.event.pull_request.head.repo.full_name == github.repository');
+    // Dependabot branches live in the base repo, so the fork guard passes, but
+    // Dependabot events get no Actions secrets.
+    expect(yaml).toContain("github.actor != 'dependabot[bot]'");
     expect(yaml).toContain('!github.event.pull_request.draft');
     expect(yaml).toContain("github.event.deployment_status.state == 'success'");
     expect(yaml).toContain('!github.event.deployment.production_environment');
@@ -319,8 +332,42 @@ describe('buildGithubWorkflow', () => {
     expect(yaml).toMatch(/permissions:\n {2}contents: read\n {2}pull-requests: read\n/);
     expect(yaml).toContain('TESTSPRITE_API_KEY: ${{ secrets.TESTSPRITE_API_KEY }}');
     expect(yaml).toContain('GITHUB_TOKEN: ${{ github.token }}');
-    expect(yaml).toMatch(/if: always\(\)\n\s+uses: actions\/upload-artifact@v4/);
+    expect(yaml).toMatch(/if: always\(\)\n\s+uses: actions\/upload-artifact@v7/);
     expect(yaml).toContain('--summary-file testsprite-summary.json');
+  });
+
+  it('only uses action majors that run on Node 24', () => {
+    // GitHub removed Node 20 from hosted runners on 2026-09-23; an action that
+    // still declares `runs.using: node20` is forced onto Node 24 with a
+    // deprecation warning on every job. These are the first majors of each
+    // action that declare node24.
+    const firstNode24Major: Record<string, number> = {
+      'actions/checkout': 5,
+      'actions/setup-node': 5,
+      'actions/upload-artifact': 6,
+    };
+    const yaml = buildGithubWorkflow(WF_BASE);
+    const used = [...yaml.matchAll(/uses: ([\w-]+\/[\w-]+)@v(\d+)/g)];
+    expect(used.map(([, action]) => action).sort()).toEqual(Object.keys(firstNode24Major).sort());
+    for (const [, action, major] of used) {
+      expect(Number(major), action).toBeGreaterThanOrEqual(firstNode24Major[action!]!);
+    }
+    // setup-node v5+ caches dependencies on its own when package.json names a
+    // package manager; the job installs only the CLI, so that cache stays off.
+    expect(yaml).toMatch(
+      /uses: actions\/setup-node@v\d+\n\s+with:\n(?:\s+.+\n)*?\s+package-manager-cache: false\n/,
+    );
+  });
+
+  it('documents the same action versions it generates', () => {
+    const generated = new Set(
+      [...buildGithubWorkflow(WF_BASE).matchAll(/uses: (actions\/[\w-]+@v\d+)/g)].map(m => m[1]),
+    );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads this repository's own DOCUMENTATION.md, never user input.
+    const docs = readFileSync(new URL('../../DOCUMENTATION.md', import.meta.url), 'utf8');
+    const documented = [...docs.matchAll(/uses: (actions\/[\w-]+@v\d+)/g)].map(m => m[1]);
+    expect(documented.length).toBeGreaterThan(0);
+    for (const ref of documented) expect(generated, ref).toContain(ref);
   });
 
   it('writes --timeout and the endpoint only when given, and sizes the job to fit', () => {
@@ -541,15 +588,32 @@ describe('runCiInit', () => {
     });
   });
 
-  it('a byte-identical workflow is left alone and gets no .bak, with or without --force', async () => {
+  it.each([false, true])('CRLF-equivalent workflow stays untouched (force=%s)', async force => {
     const io = collect();
     const fresh = makeFakeFs();
     await runCiInit(opts({ project: 'p' }), deps({ fs: fresh, ...collect() }));
-    const fs = makeFakeFs({ [WF]: fresh.files.get(WF)! });
-    await runCiInit(opts({ project: 'p', force: true }), deps({ fs, ...io }));
+    const existing = fresh.files.get(WF)!.replace(/\n/g, '\r\n');
+    const fs = makeFakeFs({ [WF]: existing });
+    await runCiInit(opts({ project: 'p', force }), deps({ fs, ...io }));
+    expect(fs.files.get(WF)).toBe(existing);
     expect(fs.files.has(`${WF}.bak`)).toBe(false);
     expect(io.json()).toMatchObject({ wrote: false, status: 'unchanged' });
     expect(io.json()).not.toHaveProperty('backupPath');
+  });
+
+  it('CRLF workflow with a real edit still needs force and keeps its original backup', async () => {
+    const fresh = makeFakeFs();
+    await runCiInit(opts({ project: 'p' }), deps({ fs: fresh, ...collect() }));
+    const canonical = fresh.files.get(WF)!;
+    const existing = canonical.replace(/\n/g, '\r\n') + '# local edit\r\n';
+    const fs = makeFakeFs({ [WF]: existing });
+    await expect(runCiInit(opts({ project: 'p' }), deps({ fs }))).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+    });
+    expect(fs.files.get(WF)).toBe(existing);
+    await runCiInit(opts({ project: 'p', force: true }), deps({ fs }));
+    expect(fs.files.get(WF)).toBe(canonical);
+    expect(fs.files.get(`${WF}.bak`)).toBe(existing);
   });
 
   it('honors a custom --path under .github/workflows/ (.yaml too)', async () => {
