@@ -1,6 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { Command } from 'commander';
+import { equalIgnoringCrlf } from '../lib/text-equality.js';
 import { resolveProfileName } from '../lib/config.js';
 import type { CommonOptions as FactoryCommonOptions } from '../lib/client-factory.js';
 import { CLIError, localValidationError } from '../lib/errors.js';
@@ -226,7 +227,7 @@ function classifySection(existing: string, section: string): SectionState {
   const after = existing.slice(endOfEndByte + trailingNewline);
   const currentSection = existing.slice(beginByteIdx, endOfEndByte + trailingNewline);
 
-  if (currentSection === section) {
+  if (equalIgnoringCrlf(currentSection, section)) {
     return { kind: 'unchanged' };
   }
 
@@ -725,7 +726,7 @@ export async function runInstall(opts: InstallOptions, deps: AgentDeps = {}): Pr
         results.push({ target: t, path: relPath, action: 'written', skills: [skill] });
       } else {
         const existing = await agentFs.readFile(abs);
-        if (existing === content) {
+        if (equalIgnoringCrlf(existing, content)) {
           // Byte-identical — skip
           results.push({ target: t, path: relPath, action: 'skipped', skills: [skill] });
         } else if (!opts.force) {
@@ -943,7 +944,7 @@ async function classifyOwnFileState(
   // render carrying its own marker line, so a marker whose version string lags
   // behind an unchanged body still reads ok.
   const reRender = renderOwnFileWithMarker(target, skill, marker.line, body);
-  return existing === reRender ? 'ok' : 'modified';
+  return equalIgnoringCrlf(existing, reRender) ? 'ok' : 'modified';
 }
 
 /**
@@ -1104,15 +1105,18 @@ function collect(v: string, prev: string[]): string[] {
 }
 
 export function createAgentCommand(deps: AgentDeps = {}): Command {
-  const agent = new Command('agent').description(
-    'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Kiro, Windsurf, Copilot, Codex)',
-  );
+  const agent = new Command('agent')
+    .summary('Install TestSprite guidance into coding-agent config')
+    .description(
+      'Install TestSprite guidance into coding-agent config (Claude Code, Cursor, Cline, Antigravity, Kiro, Windsurf, Copilot, Codex)',
+    );
 
   agent
     .command('install [targets...]')
+    .summary('Write the TestSprite agent skills into a project')
     .description(
       'Write the TestSprite agent skills (verification loop + first-run onboarding) into a project for a coding agent. ' +
-        'Target(s) may be given positionally (e.g. `agent install cursor codex`) and/or via --target; the two are merged.',
+        'Targets may be positional (`agent install cursor codex`) and/or via --target; they are merged.',
     )
     .option(
       '--target <t>',
@@ -1163,6 +1167,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
 
   agent
     .command('list')
+    .summary('List installable agent targets and skills')
     .description(
       'List the agent targets and skills this CLI can install and where each lands (run `testsprite agent status` to see what is installed here)',
     )
@@ -1173,6 +1178,7 @@ export function createAgentCommand(deps: AgentDeps = {}): Command {
 
   agent
     .command('status')
+    .summary('Check installed skill files against this CLI version')
     .description(
       'Check installed TestSprite skill files against this CLI version: ok, stale, modified, unmarked, absent, or corrupt (exits 1 when anything needs attention, so it can gate CI)',
     )

@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import * as v from 'valibot';
 import type { ErrorCode } from './errors.js';
-import { ApiError, InterruptError, RequestTimeoutError, TransportError } from './errors.js';
+import {
+  ApiError,
+  InterruptError,
+  isErrorCode,
+  RequestTimeoutError,
+  TransportError,
+} from './errors.js';
 import { buildUserAgent } from './client-tag.js';
 import {
   BATCH_RERUN_RESPONSE_SCHEMA,
@@ -224,6 +230,14 @@ export interface RequestOptions<T = unknown> {
    * other callers.
    */
   retryOnRateLimit?: boolean;
+  /**
+   * The endpoint absorbs a replay with no side effect even without an
+   * `Idempotency-Key` (a re-cancel is a 200 no-op, a binding is gone after
+   * any DELETE), so a keyless write may still retry a 5xx envelope. Without
+   * it, keyless POST/PUT/PATCH/DELETE are sent once on a 5xx: the server may
+   * have committed before failing.
+   */
+  replaySafe?: boolean;
   /**
    * Disable every automatic retry for a read whose caller owns its cadence.
    *
@@ -474,7 +488,7 @@ export class HttpClient {
       signal: options.signal,
       schema: RERUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
-    }).then(r => r.body);
+    }).then(r => withoutDeprecationAdvisories(r.body));
   }
 
   /**
@@ -494,7 +508,7 @@ export class HttpClient {
       signal: options.signal,
       schema: BATCH_RERUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
-    }).then(r => r.body);
+    }).then(r => withoutDeprecationAdvisories(r.body));
   }
 
   /**
@@ -686,6 +700,7 @@ export class HttpClient {
       signal: options.signal,
       allowNoContent: true,
       retryOnConflict: false,
+      replaySafe: true,
     });
   }
 
@@ -705,6 +720,7 @@ export class HttpClient {
       signal: options?.signal,
       schema: CANCEL_RUN_RESPONSE_SCHEMA,
       retryOnConflict: false,
+      replaySafe: true,
     });
   }
 
@@ -902,34 +918,19 @@ export class HttpClient {
           // nested call or from a test-injected fetchImpl), pass it through unchanged
           // rather than re-wrapping it as a TransportError.
           if (err instanceof RequestTimeoutError) throw err;
-          const message = err instanceof Error ? err.message : String(err);
-          this.debug({
-            kind: 'error',
+          const delayMs = this.transportRetryDelayOrThrow({
+            message: err instanceof Error ? err.message : String(err),
+            transition: 'Network error',
             method,
             url,
+            path,
             attempt,
             requestId,
-            errorCode: 'TRANSPORT',
-            durationMs: Date.now() - startedAt,
-          });
-          const decision = allowTransportRetry
-            ? transportRetryDecision(attempt, this.random)
-            : { retry: false, delayMs: 0 };
-          if (!decision.retry) throw new TransportError(message, requestId);
-          this.transition(
-            `Network error on ${shortPath(path)} — retrying in ${Math.round(decision.delayMs / 1000)}s (attempt ${attempt})`,
-          );
-          this.debug({
-            kind: 'retry',
-            method,
-            url,
-            attempt,
-            requestId,
-            errorCode: 'TRANSPORT',
-            delayMs: decision.delayMs,
+            startedAt,
+            allowTransportRetry,
           });
           requestTimeout.clear();
-          await this.sleepBeforeRetry(decision.delayMs);
+          await this.sleepBeforeRetry(delayMs);
           continue;
         }
 
@@ -949,34 +950,56 @@ export class HttpClient {
             durationMs,
           });
           let raw: unknown;
-          try {
-            if (response.status === 204 && options.allowNoContent === true) {
-              // Only explicitly bodyless endpoints may bypass the historical
-              // JSON-envelope contract. Every other 204 still falls through
-              // to JSON.parse('') and becomes a typed malformed-response error.
-              raw = undefined;
-            } else {
-              // Bounded read, then parse — assigning to `raw` rather than returning
-              // here keeps the schema validation below on the success path.
-              const text = await readBoundedText(response, this.maxResponseBytes, requestId);
-              raw = JSON.parse(text);
+          // Only explicitly bodyless endpoints may bypass the historical
+          // JSON-envelope contract. Every other 204 still falls through to
+          // JSON.parse('') and becomes a typed malformed-response error.
+          if (response.status !== 204 || options.allowNoContent !== true) {
+            // Read and parse are separate steps with separate failure classes.
+            // Reading can fail after the headers arrived — the connection is
+            // reset or closed mid-body (`TypeError: terminated` from undici) —
+            // which is a network failure, retried under the same transport
+            // rules as a failed fetch. Only a body that was read in full and
+            // still is not JSON is a malformed response.
+            let text: string;
+            try {
+              text = await readBoundedText(response, this.maxResponseBytes, requestId);
+            } catch (err) {
+              // Interrupt passthrough (see the fetch catch above).
+              if (err instanceof InterruptError) throw err;
+              // A bounded-read rejection (PAYLOAD_TOO_LARGE) — or any typed
+              // ApiError — is a real, actionable outcome; surface it unchanged.
+              if (err instanceof ApiError) throw err;
+              // A timeout/abort can fire mid-body-read (headers received, stream stalls).
+              this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
+              if (err instanceof RequestTimeoutError) throw err;
+              const delayMs = this.transportRetryDelayOrThrow({
+                message: `connection closed while reading the response body: ${err instanceof Error ? err.message : String(err)}`,
+                transition: 'Connection dropped mid-response',
+                method,
+                url,
+                path,
+                attempt,
+                requestId,
+                startedAt,
+                allowTransportRetry,
+              });
+              requestTimeout.clear();
+              await this.sleepBeforeRetry(delayMs);
+              continue;
             }
-          } catch (err) {
-            // Interrupt passthrough (see the fetch catch above).
-            if (err instanceof InterruptError) throw err;
-            // A bounded-read rejection (PAYLOAD_TOO_LARGE) — or any typed ApiError —
-            // is a real, actionable outcome; surface it unchanged rather than
-            // masking it as a malformed-body error below.
-            if (err instanceof ApiError) throw err;
-            // A timeout/abort can fire mid-body-read (headers received, stream stalls).
-            this.rethrowIfAbort(err, timeoutSignal, options.signal, requestId, effectiveSignal);
-            // Otherwise the successful response body was not valid JSON — a
-            // misconfigured endpoint, a proxy / captive-portal / login page that
-            // returns HTML with a 200 status, or an empty body. Surface a typed
-            // error carrying the requestId instead of letting the raw SyntaxError
-            // escape to index.ts, where it would print a bare `{"error":"..."}`
-            // and break the --output json envelope contract.
-            throw malformedResponseError(response, requestId, err);
+            try {
+              // Assigning to `raw` rather than returning here keeps the schema
+              // validation below on the success path.
+              raw = JSON.parse(text);
+            } catch (err) {
+              // The successful response body was not valid JSON — a
+              // misconfigured endpoint, a proxy / captive-portal / login page
+              // that returns HTML with a 200 status, or an empty body. Surface a
+              // typed error carrying the requestId instead of letting the raw
+              // SyntaxError escape to index.ts, where it would print a bare
+              // `{"error":"..."}` and break the --output json envelope contract.
+              throw malformedResponseError(response, requestId, err);
+            }
           }
           if (options.schema !== undefined) {
             const parsed = v.safeParse(options.schema, raw);
@@ -1023,8 +1046,11 @@ export class HttpClient {
         // Edge proxies / load balancers return 408/502/504 without our error
         // envelope on transient outages. These are transport-level retries,
         // not facade errors — fold them in here so we get the bounded backoff
-        // budget instead of a single INTERNAL bail.
-        if (rawBody === null && isTransportEdgeStatus(response.status)) {
+        // budget instead of a single INTERNAL bail. A JSON edge body (e.g. an
+        // API Gateway `{"message":"Endpoint request timed out"}`) is still not
+        // our envelope, so it takes this path too and the keyless-write gate
+        // below applies.
+        if (isTransportEdgeStatus(response.status) && !hasCatalogErrorCode(rawBody)) {
           this.debug({
             kind: 'error',
             method,
@@ -1090,16 +1116,22 @@ export class HttpClient {
         // frees the resource, not that the condition clears on its own.
         const retryOnRateLimit =
           options.retryOnRateLimit !== false && !isStandingRateLimit(apiError);
-        const decision = allowRetry
-          ? apiRetryDecision(
-              apiError.code,
-              attempt,
-              retryAfterSec,
-              this.random,
-              retryOnConflict,
-              retryOnRateLimit,
-            )
-          : { retry: false, delayMs: 0 };
+        // A 5xx can land after the server committed the write, so a keyless
+        // write is not replayed on one (the same rule #256 applies to
+        // transport failures). 429 / 409 are refusals and still retry.
+        const serverFault = apiError.code === 'INTERNAL' || apiError.code === 'UNAVAILABLE';
+        const replaySafe = allowTransportRetry || options.replaySafe === true;
+        const decision =
+          allowRetry && (replaySafe || !serverFault)
+            ? apiRetryDecision(
+                apiError.code,
+                attempt,
+                retryAfterSec,
+                this.random,
+                retryOnConflict,
+                retryOnRateLimit,
+              )
+            : { retry: false, delayMs: 0 };
         if (!decision.retry) throw apiError;
         const delaySec = Math.round(decision.delayMs / 1000);
         if (apiError.code === 'RATE_LIMITED') {
@@ -1186,6 +1218,53 @@ export class HttpClient {
 
   private debug(event: DebugEvent): void {
     if (this.onDebug) this.onDebug(event);
+  }
+
+  /**
+   * Shared handling for a transport failure — the fetch itself rejected, or
+   * the connection dropped while the body was being read. Records the failure,
+   * then either throws {@link TransportError} (retries not allowed for this
+   * request, or the transport budget is spent) or announces the retry and
+   * returns the backoff delay for the caller to sleep before `continue`.
+   */
+  private transportRetryDelayOrThrow(args: {
+    message: string;
+    transition: string;
+    method: string;
+    url: string;
+    path: string;
+    attempt: number;
+    requestId: string;
+    startedAt: number;
+    allowTransportRetry: boolean;
+  }): number {
+    const { method, url, attempt, requestId } = args;
+    this.debug({
+      kind: 'error',
+      method,
+      url,
+      attempt,
+      requestId,
+      errorCode: 'TRANSPORT',
+      durationMs: Date.now() - args.startedAt,
+    });
+    const decision = args.allowTransportRetry
+      ? transportRetryDecision(attempt, this.random)
+      : { retry: false, delayMs: 0 };
+    if (!decision.retry) throw new TransportError(args.message, requestId);
+    this.transition(
+      `${args.transition} on ${shortPath(args.path)} — retrying in ${Math.round(decision.delayMs / 1000)}s (attempt ${attempt})`,
+    );
+    this.debug({
+      kind: 'retry',
+      method,
+      url,
+      attempt,
+      requestId,
+      errorCode: 'TRANSPORT',
+      delayMs: decision.delayMs,
+    });
+    return decision.delayMs;
   }
 
   private transition(msg: string): void {
@@ -1509,6 +1588,20 @@ function isTransportEdgeStatus(status: number): boolean {
   return status === 408 || status === 502 || status === 504;
 }
 
+/**
+ * True when the body carries a catalog error code (`{error:{code}}` or a bare
+ * `{code}`), i.e. the facade answered rather than an edge proxy.
+ */
+function hasCatalogErrorCode(body: unknown): boolean {
+  if (typeof body !== 'object' || body === null) return false;
+  const obj = body as Record<string, unknown>;
+  const errorObj =
+    typeof obj.error === 'object' && obj.error !== null
+      ? (obj.error as Record<string, unknown>)
+      : obj;
+  return isErrorCode(errorObj.code);
+}
+
 interface RetryDecision {
   retry: boolean;
   delayMs: number;
@@ -1635,4 +1728,22 @@ function isTimeoutError(err: unknown): boolean {
     return (err as { name?: string }).name === 'TimeoutError';
   }
   return false;
+}
+
+/**
+ * Drop server-sent `feature: 'deprecation'` advisories from a rerun response.
+ * The CLI owns the deprecation signal itself (one stderr line plus the JSON
+ * `deprecations` key), so passing the server's through would announce the same
+ * thing twice. Matched on the machine-readable `feature`, never on message
+ * text; other advisories (autoHeal) are kept and an emptied list is removed.
+ */
+function withoutDeprecationAdvisories<T extends { advisories?: { feature: string }[] }>(
+  body: T,
+): T {
+  if (!body.advisories) return body;
+  const kept = body.advisories.filter(a => a.feature !== 'deprecation');
+  if (kept.length === body.advisories.length) return body;
+  const next: { advisories?: { feature: string }[] } = { ...body, advisories: kept };
+  if (kept.length === 0) delete next.advisories;
+  return next as T;
 }

@@ -88,7 +88,9 @@ describe('createScheduleCommand', () => {
       const command = schedule.commands.find(c => c.name() === name)!;
       const env = command.options.find(o => o.long === '--env');
       expect(env?.description).toContain('Pin this project schedule to an environment');
-      expect(env?.description).toContain("project's default environment");
+      expect(env?.description).toContain(
+        name === 'create' ? "project's default environment" : 'leave the current pin unchanged',
+      );
     }
   });
 
