@@ -6,6 +6,7 @@ import { equalIgnoringCrlf } from '../lib/text-equality.js';
 import {
   makeHttpClient,
   parseRequestTimeoutFlag,
+  resolveRequestTimeoutMs,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { ApiError, CLIError, localValidationError } from '../lib/errors.js';
@@ -1387,7 +1388,10 @@ export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise
     throw err;
   }
 
-  const github = await readGithubRunContext(env, { fetchImpl: deps.fetchImpl });
+  const github = await readGithubRunContext(env, {
+    fetchImpl: deps.fetchImpl,
+    requestTimeoutMs: resolveRequestTimeoutMs(opts, env),
+  });
   let previewName: string | undefined;
   let githubTrigger: CiGithubTrigger | undefined;
   if (github.kind === 'pull_request') {
