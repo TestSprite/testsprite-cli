@@ -442,10 +442,16 @@ describe('runCreateBatch --run (no --wait): exit-code contract', () => {
 
     const printed = JSON.parse(stdout.join('')) as {
       results: Array<{ testId: string; status: string; error?: unknown }>;
+      creation: {
+        results: Array<{ specIndex: number; testId?: string; status: string }>;
+        summary: { total: number; created: number; failed: number };
+      };
     };
     expect(printed.results).toHaveLength(3);
     expect(printed.results.every(r => r.status === 'queued')).toBe(true);
     expect(printed.results.every(r => r.error === undefined)).toBe(true);
+    expect(printed.creation.results).toHaveLength(3);
+    expect(printed.creation.summary).toEqual({ total: 3, created: 3, failed: 0 });
   });
 
   it('all triggers succeed (queued) → text summary reports "3/3 triggered", exit 0 (no "0/N passed")', async () => {
