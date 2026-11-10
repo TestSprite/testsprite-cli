@@ -1800,7 +1800,7 @@ it('marks a dispatched batch run for recovery guidance on fan-out interruption',
     creation: {
       results: [
         { specIndex: 0, testId: 'test_one', status: 'created' },
-        { specIndex: 1, testId: null, status: 'error' },
+        { specIndex: 1, testId: null, status: 'validation_error' },
       ],
       summary: { total: 2, created: 1, failed: 1 },
     },
