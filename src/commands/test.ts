@@ -86,6 +86,7 @@ import {
 } from '../lib/http.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
+import { CLI_TEST_CODE_SCHEMA } from '../lib/response-schemas.js';
 import { VERSION } from '../version.js';
 import {
   emitDeprecationEntry,
@@ -330,6 +331,18 @@ export interface CliTestCode {
   codeVersion: string | null;
   etag?: string | null;
 }
+
+/** The standalone code endpoint also serves draft, legacy, and newer server values. */
+export type CliTestCodeRead = Omit<
+  CliTestCode,
+  'language' | 'framework' | 'code' | 'codeVersion'
+> & {
+  language: string;
+  framework?: string;
+  code: string | null;
+  /** Legacy rows may omit it or send null; both mean "no version stamped yet". */
+  codeVersion?: string | null;
+};
 
 /** §6.4 TestStep wire shape. `null` is "not known", not "absent". */
 export interface CliTestStep {
@@ -5584,7 +5597,10 @@ interface CodeGetOptions extends CommonOptions {
  * temp file is discarded and the user's pre-existing `--out` file, if
  * any, is left untouched.
  */
-export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Promise<CliTestCode> {
+export async function runCodeGet(
+  opts: CodeGetOptions,
+  deps: TestDeps = {},
+): Promise<CliTestCodeRead> {
   // Dry-run: no fetch, no fs. Print the canned shape to stdout and, if
   // the user passed `--out`, log on stderr what would have been written.
   // We deliberately do NOT validate the `--out` path here in dry-run —
@@ -5594,15 +5610,26 @@ export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Pro
     const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
     const out = makeOutput(opts.output, deps);
     const client = makeClient(opts, deps);
-    const code = await client.get<CliTestCode>(`/tests/${encodeURIComponent(opts.testId)}/code`);
+    const code = await client.get<CliTestCodeRead>(
+      `/tests/${encodeURIComponent(opts.testId)}/code`,
+      {
+        schema: CLI_TEST_CODE_SCHEMA,
+      },
+    );
     if (opts.out !== undefined) {
-      const bytes = isPresignedCodeUrl(code.code) ? '<presigned-stream>' : `${code.code.length}`;
+      // Null/empty first: isPresignedCodeUrl dereferences its argument.
+      const bytes =
+        code.code === null || code.code === ''
+          ? '0'
+          : isPresignedCodeUrl(code.code)
+            ? '<presigned-stream>'
+            : `${code.code.length}`;
       stderr(`[dry-run] would write code body (${bytes} bytes) to ${opts.out}`);
     }
     if (opts.output === 'json') {
       out.print(code);
     } else {
-      await out.writeChunk(code.code);
+      await out.writeChunk(code.code ?? '');
     }
     return code;
   }
@@ -5612,24 +5639,19 @@ export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Pro
   const client = makeClient(opts, deps);
 
   try {
-    const code = await client.get<CliTestCode>(`/tests/${encodeURIComponent(opts.testId)}/code`);
+    const code = await client.get<CliTestCodeRead>(
+      `/tests/${encodeURIComponent(opts.testId)}/code`,
+      {
+        schema: CLI_TEST_CODE_SCHEMA,
+      },
+    );
     let wroteContent = false;
 
     if (opts.output === 'json') {
       out.print(code);
       wroteContent = true;
-    } else if (isPresignedCodeUrl(code.code)) {
-      // Text mode: dump the source body. JSON consumers want the wire
-      // shape; humans (and agents shelling out via `> file.ts`) want
-      // ready-to-edit code. Stream chunk-wise so a multi-MB generated
-      // suite doesn't sit in memory waiting for the full download.
-      // `writeChunk` awaits the rawStdout drain promise so a slow
-      // downstream consumer (a file on a slow disk, an NFS mount,
-      // or a piped `gzip`) pauses the upstream reader rather than
-      // letting chunks accumulate in V8's heap.
-      await streamPresignedBody(code.code, out, deps);
-      wroteContent = true;
     } else if (code.code === '' || code.code === null) {
+      // Checked before isPresignedCodeUrl, which dereferences its argument.
       // P2-10: draft test with no code yet — empty body would produce
       // silent empty stdout. Print a friendly hint to stderr instead so
       // the operator knows what happened, and keep exit 0 when no `--out`.
@@ -5648,6 +5670,17 @@ export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Pro
       }
       const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
       stderrFn('(no code generated yet — run the test first)');
+    } else if (isPresignedCodeUrl(code.code)) {
+      // Text mode: dump the source body. JSON consumers want the wire
+      // shape; humans (and agents shelling out via `> file.ts`) want
+      // ready-to-edit code. Stream chunk-wise so a multi-MB generated
+      // suite doesn't sit in memory waiting for the full download.
+      // `writeChunk` awaits the rawStdout drain promise so a slow
+      // downstream consumer (a file on a slow disk, an NFS mount,
+      // or a piped `gzip`) pauses the upstream reader rather than
+      // letting chunks accumulate in V8's heap.
+      await streamPresignedBody(code.code, out, deps);
+      wroteContent = true;
     } else {
       await out.writeChunk(code.code);
       wroteContent = true;
@@ -5794,7 +5827,12 @@ export async function runCodePut(
     requireNonEmpty('expected-version', opts.expectedVersion);
     ifMatch = opts.expectedVersion;
   } else {
-    const fetched = await client.get<CliTestCode>(`/tests/${encodeURIComponent(opts.testId)}/code`);
+    const fetched = await client.get<CliTestCodeRead>(
+      `/tests/${encodeURIComponent(opts.testId)}/code`,
+      {
+        schema: CLI_TEST_CODE_SCHEMA,
+      },
+    );
     const cv = fetched.codeVersion;
     if (cv === null || cv === undefined) {
       // Server hasn't stamped a codeVersion yet (legacy row). Send `*`
