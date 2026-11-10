@@ -180,12 +180,14 @@ function failureMessage(result: JUnitTestResult): string {
   return result.status;
 }
 
-function renderTestcase(result: JUnitTestResult, classname: string): string {
+function renderTestcase(result: JUnitTestResult, classname: string, displayName?: string): string {
   const outcome = classifyJUnitOutcome(result.status, result.error);
   // A readable CI test tab keys on `name`: prefer the human test name, fall back
   // to the id. The UUID is preserved as a `testId` attribute (ignored by
   // renderers, read by machine consumers) so the switch loses no information.
-  const name = escapeXml(result.name?.trim() || result.testId);
+  // `displayName` carries the precomputed disambiguated name for colliding
+  // groups (see resolveJUnitDisplayNames).
+  const name = escapeXml(displayName ?? (result.name?.trim() || result.testId));
   const cls = escapeXml(classname);
   const time = formatTime(result.durationSeconds);
   const idAttr = ` testId="${escapeXml(result.testId)}"`;
@@ -232,6 +234,65 @@ function renderTestcase(result: JUnitTestResult, classname: string): string {
 }
 
 /**
+ * Standard JUnit consumers (GitLab, Jenkins) key a testcase on classname+name
+ * and ignore extra attributes, so rows sharing both collapse into one — a
+ * same-name pair from a multi-project list then loses one verdict and one
+ * run's diagnostics (#515). The stable logical testId — not the ephemeral
+ * runId, which would break cross-run comparison — joins the standard identity
+ * for colliding groups only: unique names render exactly as before.
+ */
+function resolveJUnitDisplayNames(
+  results: ReadonlyArray<JUnitTestResult>,
+  fallbackClassname: string,
+): Array<string | undefined> {
+  const rawNames = results.map(result => result.name?.trim() || result.testId);
+  const names = [...rawNames];
+  // XML consumers normalize attribute whitespace: line endings collapse first
+  // (CRLF/CR → LF), then tabs/newlines/carriage returns each become a space.
+  // Raw-distinct names can therefore share an identity downstream, so the
+  // collision keys use the normalized form; rendering keeps the original text.
+  const attributeKey = (value: string): string =>
+    value.replace(/\r\n?/g, '\n').replace(/[\n\t]/g, ' ');
+  const keyOf = (classname: string, name: string): string =>
+    `${attributeKey(classname)}\u0000${attributeKey(name)}`;
+  // The suffix must stay injective under attributeKey normalization, or two raw-distinct
+  // ids ("a\tb" vs "a b") re-collide after suffixing and the round cap gives up leaving
+  // duplicate identities. JSON-escaping (minus the surrounding quotes) encodes control
+  // characters as visible two-char escapes, so distinct ids render distinct suffixes
+  // that normalization cannot fold; ids without escapes render unchanged.
+  const displayTestId = (testId: string): string => JSON.stringify(testId).slice(1, -1);
+  // Suffixing can itself collide with a row whose human title already looks
+  // like a suffixed one ("Checkout [case-a]" as a literal name), so iterate
+  // until no (classname, name) pair collides. Each round's colliding set gets
+  // an injective encoded suffix, so the set ends pairwise distinct and the
+  // loop terminates. A group whose rows all share one testId can never be
+  // separated by any suffix — the rows are exact duplicates — so it is left
+  // alone instead of spinning to the round cap (testlist run can pass the
+  // same id twice, billing each row).
+  for (let round = 0; round <= results.length; round++) {
+    const groups = new Map<string, { count: number; testIds: Set<string> }>();
+    results.forEach((result, index) => {
+      const key = keyOf(result.classname ?? fallbackClassname, names[index]!);
+      const group = groups.get(key) ?? { count: 0, testIds: new Set<string>() };
+      group.count += 1;
+      group.testIds.add(result.testId);
+      groups.set(key, group);
+    });
+    let changed = false;
+    results.forEach((result, index) => {
+      const key = keyOf(result.classname ?? fallbackClassname, names[index]!);
+      const group = groups.get(key)!;
+      if (group.count > 1 && group.testIds.size > 1) {
+        names[index] = `${names[index]} [${displayTestId(result.testId)}]`;
+        changed = true;
+      }
+    });
+    if (!changed) break;
+  }
+  return names.map((name, index) => (name === rawNames[index] ? undefined : name));
+}
+
+/**
  * Build a JUnit XML document from batch results, including skipped members. Per-`testcase` `time` is
  * the run's wall-clock duration (from `startedAt`/`finishedAt`); the `testsuite`
  * `time` is their sum. `time` falls back to `0` for a run with no timing.
@@ -254,7 +315,10 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
   }
 
   const suiteName = escapeXml(opts.suiteName);
-  const testcases = results.map(r => renderTestcase(r, r.classname ?? opts.classname)).join('\n');
+  const displayNames = resolveJUnitDisplayNames(results, opts.classname);
+  const testcases = results
+    .map((r, index) => renderTestcase(r, r.classname ?? opts.classname, displayNames[index]))
+    .join('\n');
 
   return [
     XML_DECL,

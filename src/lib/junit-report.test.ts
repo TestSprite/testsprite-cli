@@ -180,6 +180,189 @@ describe('buildJUnitReport', () => {
     expect(xml).toContain('</testsuites>');
   });
 
+  it('#515: disambiguates same-name tests so standard consumers keep both failures', () => {
+    // GitLab hashes suite/class/name: two rows sharing classname+name collapse
+    // into one row (one failure, one diagnostic). The stable logical testId —
+    // not the ephemeral runId — joins the standard identity, for the colliding
+    // group only.
+    const xml = buildJUnitReport({
+      suiteName: 'testsprite:testlist:list-1',
+      classname: 'testlist:list-1',
+      results: [
+        makeResult({
+          testId: 'test_a',
+          runId: 'run_a',
+          status: 'failed',
+          name: 'Checkout',
+          durationSeconds: 2.5,
+        }),
+        makeResult({
+          testId: 'test_b',
+          runId: 'run_b',
+          status: 'failed',
+          name: 'Checkout',
+          durationSeconds: 2.5,
+        }),
+      ],
+    });
+    const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]);
+    expect(new Set(names).size).toBe(2);
+    expect(names).toContain('Checkout [test_a]');
+    expect(names).toContain('Checkout [test_b]');
+    expect(xml).toContain('<failure message="failed" type="failed">');
+    expect((xml.match(/<failure /g) ?? []).length).toBe(2);
+  });
+
+  it('#515: keeps unique display names untouched (no suffix noise)', () => {
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'test_a', status: 'passed', name: 'Checkout' }),
+        makeResult({ testId: 'test_b', status: 'passed', name: 'Signup' }),
+      ],
+    });
+    expect(xml).toContain('name="Checkout" testId="test_a"');
+    expect(xml).toContain('name="Signup" testId="test_b"');
+  });
+
+  it('#515: a literal title that matches a suffixed name does not re-collide', () => {
+    // "Checkout [case-a]" is also a human title on its own row: after the
+    // first suffixing round it must not share its (classname, name) with the
+    // suffixed row, or a consumer keyed on classname+name still collapses.
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'case_a', runId: 'run_a', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'case_b', runId: 'run_b', status: 'failed', name: 'Checkout' }),
+        makeResult({
+          testId: 'case_c',
+          runId: 'run_c',
+          status: 'failed',
+          name: 'Checkout [case_a]',
+        }),
+      ],
+    });
+    const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]);
+    expect(new Set(names).size).toBe(3);
+    // Each colliding row keeps its own run's diagnostics.
+    expect(xml).toContain('runId: run_a');
+    expect(xml).toContain('runId: run_b');
+    expect(xml).toContain('runId: run_c');
+  });
+
+  it('#515: names that XML attribute normalization folds together still get disambiguated', () => {
+    // XML consumers normalize attribute whitespace (CRLF, LF, tabs → spaces),
+    // so 'Checkout fix' and 'Checkout\tfix' are the same identity downstream
+    // even though the raw strings differ. The resolver must key on the
+    // normalized form; rendering keeps the original text.
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'test_a', runId: 'run_a', status: 'failed', name: 'Checkout fix' }),
+        makeResult({ testId: 'test_b', runId: 'run_b', status: 'failed', name: 'Checkout\tfix' }),
+      ],
+    });
+    expect(xml).toContain('name="Checkout fix [test_a]"');
+    expect(xml).toContain('name="Checkout\tfix [test_b]"');
+    expect((xml.match(/<failure /g) ?? []).length).toBe(2);
+  });
+
+  it('#515: raw-distinct test ids folded by attribute normalization stay distinct after suffixing', () => {
+    // The suffix is written into an XML attribute, so the suffix itself must
+    // survive normalization: ids 'a\tb' and 'a b' are raw-distinct but fold
+    // to the same attribute identity. A raw suffix would re-collide the pair
+    // and the round cap would give up leaving duplicate (classname, name)s;
+    // the JSON-escaped suffix keeps the two rows distinct (PR #4652 review).
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'a\tb', runId: 'run_a', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'a b', runId: 'run_b', status: 'failed', name: 'Checkout' }),
+      ],
+    });
+    const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]!);
+    // Attribute-normalized identities must be pairwise distinct.
+    const normalize = (value: string): string =>
+      value.replace(/\r\n?/g, '\n').replace(/[\n\t]/g, ' ');
+    expect(new Set(names.map(normalize)).size).toBe(2);
+    expect(names).toContain('Checkout [a\\tb]');
+    expect(names).toContain('Checkout [a b]');
+    expect((xml.match(/<failure /g) ?? []).length).toBe(2);
+  });
+
+  it('#515: a group whose rows share one testId is left unsuffixed instead of spinning to the cap', () => {
+    // testlist run can pass the same id twice, billing each row. Duplicate
+    // rows are exact duplicates no suffix can separate, so the resolver must
+    // leave them alone rather than re-suffixing until the round cap.
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({
+          testId: 'dup',
+          runId: 'run_a',
+          status: 'failed',
+          name: 'Checkout',
+          durationSeconds: 1,
+        }),
+        makeResult({
+          testId: 'dup',
+          runId: 'run_b',
+          status: 'failed',
+          name: 'Checkout',
+          durationSeconds: 2,
+        }),
+        makeResult({
+          testId: 'dup',
+          runId: 'run_c',
+          status: 'failed',
+          name: 'Checkout',
+          durationSeconds: 3,
+        }),
+      ],
+    });
+    expect((xml.match(/<failure /g) ?? []).length).toBe(3);
+    expect(xml).toContain('name="Checkout" testId="dup"');
+    expect(xml).not.toContain('Checkout [');
+  });
+
+  it('#515: a mixed duplicate group still disambiguates the distinct ids', () => {
+    // Duplicate-id rows keep the group distinct (2 testIds), so the whole
+    // group suffixes once; the duplicate pair then reads as a single-distinct
+    // group and the loop stops instead of re-suffixing to the cap.
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_1',
+      results: [
+        makeResult({ testId: 'dup', runId: 'run_a', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'dup', runId: 'run_b', status: 'failed', name: 'Checkout' }),
+        makeResult({ testId: 'test_b', runId: 'run_c', status: 'failed', name: 'Checkout' }),
+      ],
+    });
+    expect((xml.match(/<failure /g) ?? []).length).toBe(3);
+    expect(xml).toContain('name="Checkout [test_b]"');
+    expect((xml.match(/name="Checkout \[dup\]"/g) ?? []).length).toBe(2);
+  });
+
+  it('#515: same name under different classnames stays unsuffixed', () => {
+    // Distinct classnames are already distinct identities for standard
+    // consumers; only rows sharing classname+name need the suffix.
+    const xml = buildJUnitReport({
+      suiteName: 'Batch',
+      classname: 'proj_default',
+      results: [
+        makeResult({ testId: 'test_a', status: 'failed', name: 'Checkout', classname: 'proj_one' }),
+        makeResult({ testId: 'test_b', status: 'failed', name: 'Checkout', classname: 'proj_two' }),
+      ],
+    });
+    expect(xml).toContain('classname="proj_one" name="Checkout"');
+    expect(xml).toContain('classname="proj_two" name="Checkout"');
+  });
+
   it('counts passed tests without child elements', () => {
     const xml = buildJUnitReport({
       suiteName: 'Batch',
