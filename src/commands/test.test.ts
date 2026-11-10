@@ -3705,6 +3705,34 @@ describe('runSteps', () => {
     expect(block).toContain('codeVersion: v3');
   });
 
+  it('text mode puts every header over its column, failure marker included', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: {
+        items: [STEP_PASSED, { ...STEP_FAILED, outcomeContributesToFailure: true }],
+        nextToken: null,
+      },
+    }));
+    const out: string[] = [];
+    await runSteps(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    const [header, passedRow, failedRow] = out.join('\n').split('\n');
+    expect(failedRow!.startsWith('* ')).toBe(true);
+    for (const row of [passedRow!, failedRow!]) {
+      for (const [heading, value] of [
+        ['INDEX', /\d/],
+        ['ACTION', /click/],
+        ['STATUS', /passed|failed/],
+        ['DESCRIPTION', /Click the/],
+        ['UPDATED', /2026-/],
+      ] as const) {
+        expect(row.search(value), `${heading} in: ${row}`).toBe(header!.indexOf(heading));
+      }
+    }
+  });
+
   it('text mode reads "No steps." on an empty list', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch(() => ({ body: { items: [], nextToken: null } }));
@@ -10203,6 +10231,7 @@ describe('runCreateBatch', () => {
           output: 'json',
           debug: false,
           plans: plansFile,
+          run: true,
           maxConcurrency: 0,
         },
         { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
@@ -10224,6 +10253,7 @@ describe('runCreateBatch', () => {
           output: 'json',
           debug: false,
           plans: plansFile,
+          run: true,
           maxConcurrency: 101,
         },
         { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
@@ -10238,14 +10268,17 @@ describe('runCreateBatch', () => {
     const { credentialsPath } = makeCreds();
     const plansFile = writePlansJsonl([FE_SPEC]);
     const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
-    // Should NOT throw VALIDATION_ERROR for exactly 100
+    // Should NOT throw VALIDATION_ERROR for exactly 100 (with --run, the only
+    // mode that reads it; --dry-run previews the triggers without a server).
     await expect(
       runCreateBatch(
         {
           profile: 'default',
           output: 'json',
           debug: false,
+          dryRun: true,
           plans: plansFile,
+          run: true,
           maxConcurrency: 100,
         },
         { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },

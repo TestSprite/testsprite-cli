@@ -6,6 +6,7 @@ import { equalIgnoringCrlf } from '../lib/text-equality.js';
 import {
   makeHttpClient,
   parseRequestTimeoutFlag,
+  resolveRequestTimeoutMs,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
 import { ApiError, CLIError, localValidationError } from '../lib/errors.js';
@@ -26,7 +27,12 @@ import {
 } from '../lib/ci-linkage.js';
 import { ciRefusalOutcome, recordTelemetryExtras } from '../lib/telemetry.js';
 import type { CliProject } from './project.js';
-import { runTestRunAll, type RunTestRunAllOptions, type TestDeps } from './test.js';
+import {
+  parseNameFilter,
+  runTestRunAll,
+  type RunTestRunAllOptions,
+  type TestDeps,
+} from './test.js';
 import { emitCiStepOutputs, type CiSummary } from '../lib/gh-output.js';
 import { previewEnvironmentName, readGithubRunContext } from '../lib/github-context.js';
 import type { CiGithubTrigger } from '../lib/runs.types.js';
@@ -386,11 +392,14 @@ jobs:
     env:
 ${envLines.join('\n')}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
+          # Only the CLI is installed below. Without this, an npm repo
+          # (package.json "packageManager": "npm@…") with no lockfile fails here.
+          package-manager-cache: false
 
       - run: npm i -g ${CLI_PACKAGE_SPEC}
 
@@ -413,7 +422,7 @@ ${runLines.join('\n')}
 
       - name: Upload TestSprite report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: testsprite-results
           path: ${SUMMARY_FILE}
@@ -1379,7 +1388,10 @@ export async function runCiRun(opts: CiRunOptions, deps: TestDeps = {}): Promise
     throw err;
   }
 
-  const github = await readGithubRunContext(env, { fetchImpl: deps.fetchImpl });
+  const github = await readGithubRunContext(env, {
+    fetchImpl: deps.fetchImpl,
+    requestTimeoutMs: resolveRequestTimeoutMs(opts, env),
+  });
   let previewName: string | undefined;
   let githubTrigger: CiGithubTrigger | undefined;
   if (github.kind === 'pull_request') {
@@ -1479,6 +1491,7 @@ async function assertCiEnvironmentExists(opts: CiRunOptions, deps: TestDeps): Pr
   );
 }
 
+/** Build CI run and workflow scaffolding commands with injectable runtime dependencies. */
 export function createCiCommand(deps: CiDeps = {}): Command {
   const ci = new Command('ci').description('Run tests in CI and scaffold CI integration');
 
@@ -1487,7 +1500,10 @@ export function createCiCommand(deps: CiDeps = {}): Command {
     .allowExcessArguments(false)
     .option('--project <id>', 'project id (defaults to TESTSPRITE_PROJECT_ID)')
     .option('--all', 'run all project tests (already the default)')
-    .option('--filter <substr>', 'only run tests whose name contains this substring')
+    .option(
+      '--filter <substr>',
+      'only run tests whose name contains this non-empty substring (case-insensitive); omit to run every test',
+    )
     .option(
       '--env <name>',
       'the environment whose sign-in the run uses (unknown names fail). In a pull request, with --target-url, the run happens in a temporary clone of it at the preview address, named github-pr-<N> like a GitHub App run',
@@ -1542,7 +1558,7 @@ export function createCiCommand(deps: CiDeps = {}): Command {
         {
           ...resolveCommonOptions(command),
           projectId: cmdOpts.project,
-          nameFilter: cmdOpts.filter,
+          nameFilter: parseNameFilter(cmdOpts.filter),
           environment: cmdOpts.env,
           targetUrl: cmdOpts.targetUrl,
           skipPreflight: cmdOpts.skipPreflight === true,
