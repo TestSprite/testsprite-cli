@@ -57,6 +57,7 @@ import {
   resolveBatchReportProjectId,
   skippedJUnitResultsFromSummary,
   writeJUnitReportFile,
+  assertArtifactPath,
   type JUnitReportFormat,
   parseJUnitReportFormat,
   type JUnitTestResult,
@@ -1360,6 +1361,7 @@ async function emitDupNameAdvisoryIfNeeded(
   projectId: string | undefined,
   name: string | undefined,
   stderrFn: (line: string) => void,
+  debug?: boolean,
 ): Promise<void> {
   if (!projectId || !name) return;
   // B: ordinary advisory failures must not block the create critical path.
@@ -1397,6 +1399,10 @@ async function emitDupNameAdvisoryIfNeeded(
     }
   } catch (err) {
     if (err instanceof InterruptError) throw err;
+    if (debug) {
+      const reason = err instanceof Error ? err.message : String(err);
+      stderrFn(`[debug] duplicate-name advisory lookup failed: ${reason}`);
+    }
     // Other lookup failures are best-effort and must not block the create.
   } finally {
     clearTimeout(timer);
@@ -1690,7 +1696,7 @@ export async function runCreate(
   // B3: best-effort duplicate-name advisory. Skip under --dry-run.
   if (!opts.dryRun) {
     const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-    await emitDupNameAdvisoryIfNeeded(client, projectId, opts.name, stderrFn);
+    await emitDupNameAdvisoryIfNeeded(client, projectId, opts.name, stderrFn, opts.debug);
   }
 
   const response = await client.post<CliCreateTestResponse>('/tests', {
@@ -3059,7 +3065,22 @@ export interface CliBatchRunResult {
 
 /** Envelope emitted by `test create-batch --run` in JSON mode. */
 export interface CliCreateBatchRunResponse {
+  /** Per-test run results; remains unchanged for existing consumers. */
   results: CliBatchRunResult[];
+  /** Original per-spec creation receipt, matching create-only JSON output. */
+  creation: CliCreateBatchResponse;
+}
+
+/** Dry-run variant of the `test create-batch --run` JSON envelope. */
+export interface CliCreateBatchDryRunResponse extends CliCreateBatchRunResponse {
+  dryRun: true;
+  method: 'POST';
+  pathTemplate: '/api/cli/v1/tests/{testId}/runs';
+  maxConcurrency: number | null;
+  wait: boolean;
+  timeoutSeconds: number;
+  testIds: string[];
+  thenPoll?: string;
 }
 
 /**
@@ -3732,7 +3753,7 @@ export async function runCreateFromPlan(
   // The plan's projectId + name are available after validation above. Skip
   // under dry-run (no network calls); swallow all errors (advisory only).
   if (!opts.dryRun) {
-    await emitDupNameAdvisoryIfNeeded(client, plan.projectId, plan.name, stderrFn);
+    await emitDupNameAdvisoryIfNeeded(client, plan.projectId, plan.name, stderrFn, opts.debug);
   }
 
   const response = await client.post<CliCreateFromPlanResponse>('/tests', {
@@ -4474,6 +4495,17 @@ async function runBatchRun(
     .filter(r => r.status === 'created' && r.testId !== undefined)
     .map(r => r.testId as string);
 
+  // Match the create-only JSON receipt: preserve server links, normalize
+  // explicitly suppressed links, and use the same create-time fallback map.
+  const creationResults: CliBatchSpecResult[] =
+    !opts.dryRun && testIdToDashboardState !== undefined
+      ? createResponse.results.map(r => {
+          if (r.status !== 'created' || r.testId === undefined) return r;
+          const state = testIdToDashboardState.get(r.testId);
+          return state ? { ...r, dashboardUrl: state.dashboardUrl } : r;
+        })
+      : createResponse.results;
+
   if (testIds.length === 0) {
     // All specs failed at create time — already threw above; unreachable.
     return;
@@ -4488,9 +4520,9 @@ async function runBatchRun(
       codeVersion: 'v1',
     }));
     const envelope = {
-      dryRun: true,
-      method: 'POST',
-      pathTemplate: '/api/cli/v1/tests/{testId}/runs',
+      dryRun: true as const,
+      method: 'POST' as const,
+      pathTemplate: '/api/cli/v1/tests/{testId}/runs' as const,
       maxConcurrency: opts.maxConcurrency ?? null,
       wait: opts.wait ?? false,
       timeoutSeconds,
@@ -4498,7 +4530,19 @@ async function runBatchRun(
       ...(opts.wait ? { thenPoll: `/api/cli/v1/runs/<run-id>?waitSeconds=25` } : {}),
       results: dryRunResults,
     };
-    out.print(envelope);
+    if (opts.output === 'json') {
+      const jsonEnvelope: CliCreateBatchDryRunResponse = {
+        ...envelope,
+        creation: {
+          results: creationResults,
+          summary: createResponse.summary,
+        },
+      };
+      out.print(jsonEnvelope);
+    } else {
+      // Keep the pre-existing text-mode dry-run descriptor unchanged.
+      out.print(envelope);
+    }
     return;
   }
 
@@ -5160,8 +5204,15 @@ async function runBatchRun(
             codeVersion: '',
           },
       );
-      out.print({ results: partialResults }, () =>
-        partialResults.map(r => `${r.testId}  ${r.runId || '-'}  ${r.status}`).join('\n'),
+      out.print(
+        {
+          results: partialResults,
+          creation: {
+            results: creationResults,
+            summary: createResponse.summary,
+          },
+        },
+        () => partialResults.map(r => `${r.testId}  ${r.runId || '-'}  ${r.status}`).join('\n'),
       );
       const unfinished = partialResults
         .filter(r => r.status === 'running' && r.runId)
@@ -5203,7 +5254,13 @@ async function runBatchRun(
             return { ...r, dashboardUrl: state.dashboardUrl };
           })
         : batchRunResults;
-    out.print({ results: enrichedResults });
+    out.print({
+      results: enrichedResults,
+      creation: {
+        results: creationResults,
+        summary: createResponse.summary,
+      },
+    });
   } else if (!opts.wait) {
     // Text mode, no --wait: statuses are non-terminal by design ('queued'),
     // so a pass/fail summary would misread a successful dispatch as
@@ -8090,6 +8147,17 @@ function assertFreshRunWaitOptions(
     );
 }
 
+/** Pre-dispatch: refuse unwritable --report-file / --summary-file before anything is triggered. */
+function assertRunArtifactPaths(opts: {
+  report?: JUnitReportFormat;
+  reportFile?: string;
+  summaryFile?: string;
+}): void {
+  if (opts.report === 'junit' && opts.reportFile !== undefined)
+    assertArtifactPath('report-file', opts.reportFile);
+  if (opts.summaryFile !== undefined) assertArtifactPath('summary-file', opts.summaryFile);
+}
+
 function isSameLoopbackPort(url: string, port: number): boolean {
   try {
     return parseLoopbackTargetUrl(url)?.port === port;
@@ -8326,6 +8394,7 @@ export async function runTestRun(
     client = makeClient(clientOpts, deps);
   }
   assertFreshRunWaitOptions(opts, false);
+  assertRunArtifactPaths(opts);
   const tunnelRequestTimeoutMs = isTunnelRun
     ? resolveRequestTimeoutMs(clientOpts, deps.env ?? process.env)
     : undefined;
@@ -15706,6 +15775,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           '--summary-file requires --wait (it reduces the terminal run result). Add --wait.',
         );
       }
+      assertRunArtifactPaths({
+        report,
+        reportFile: cmdOpts.reportFile,
+        summaryFile: cmdOpts.summaryFile,
+      });
 
       if (isAll && !usingLocal && cmdOpts.tunnelClient === undefined) {
         // --all path: wave-ordered fresh batch run.
