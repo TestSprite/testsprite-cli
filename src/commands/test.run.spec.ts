@@ -5,6 +5,7 @@
  * sleep injection is wired through `TestDeps.sleep` to avoid real delays.
  */
 
+import * as dns from 'node:dns';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -3666,6 +3667,187 @@ describe('runTestRunAll — batch fresh run', () => {
     };
   }
 
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'names unverified conflicts in text when no runs were accepted on %s',
+    async signal => {
+      const { credentialsPath } = makeCreds();
+      const shutdown = new ShutdownController();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const methods: string[] = [];
+      const error: unknown = await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          shutdown,
+          fetchImpl: makeFetch((url, init) => {
+            methods.push(init.method ?? 'GET');
+            if (init.method === 'POST') {
+              return {
+                body: {
+                  ...BATCH_FRESH_RESP,
+                  accepted: [],
+                  conflicts: [
+                    { testId: 'test_busy', currentRunId: 'run_busy' },
+                    { testId: 'test_busy_2', currentRunId: 'run_busy_2' },
+                    { testId: 'test_unknown', reason: 'in_flight' },
+                  ],
+                },
+              };
+            }
+            if (url.includes('/runs/')) {
+              shutdown.interrupt(signal);
+              throw shutdown.signal.reason;
+            }
+            return { body: { environments: [] } };
+          }),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+        },
+      ).catch((caught: unknown) => caught);
+      expect(error).toBe(shutdown.signal.reason);
+      expect(shutdown.isArmed).toBe(false);
+      expect(stdout.join('\n')).toBe(
+        'run_busy  unverified (not attached)\nrun_busy_2  unverified (not attached)',
+      );
+      expect(stderr.join('\n')).not.toContain('[auto-resume]');
+      expect(methods.filter(method => method !== 'GET')).toEqual(['POST']);
+    },
+  );
+
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'keeps unsent filtered test IDs when dispatch stops before metadata interruption on %s',
+    async signal => {
+      const { credentialsPath } = makeCreds();
+      const shutdown = new ShutdownController();
+      const stdout: string[] = [];
+      const methods: string[] = [];
+      const tests = Array.from({ length: 51 }, (_, i) => ({
+        id: `test_${i}`,
+        name: `selected ${i}`,
+        projectId: 'project_be',
+        type: i >= 2 && i < 50 ? 'frontend' : 'backend',
+      }));
+      let dispatches = 0;
+      const error: unknown = await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          nameFilter: 'selected',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          shutdown,
+          fetchImpl: makeFetch((url, init) => {
+            methods.push(init.method ?? 'GET');
+            if (url.includes('/tests?')) return { body: { items: tests, nextToken: null } };
+            if (init.method === 'POST') {
+              dispatches++;
+              if (dispatches > 1) return errorBody('PRECONDITION_FAILED');
+              return {
+                body: {
+                  ...BATCH_FRESH_RESP,
+                  accepted: [
+                    { testId: 'test_0', runId: 'run_new', enqueuedAt: '2026-06-09T10:00:00Z' },
+                  ],
+                  conflicts: [{ testId: 'test_1', currentRunId: 'run_busy' }],
+                  skippedFrontend: tests.slice(2, 50).map(test => test.id),
+                },
+              };
+            }
+            if (url.includes('/runs/run_busy')) {
+              shutdown.interrupt(signal);
+              throw shutdown.signal.reason;
+            }
+            return { body: { environments: [] } };
+          }),
+          stdout: line => stdout.push(line),
+          stderr: () => {},
+        },
+      ).catch((caught: unknown) => caught);
+      expect(error).toBe(shutdown.signal.reason);
+      expect(shutdown.isArmed).toBe(false);
+      expect(JSON.parse(stdout.join('\n'))).toMatchObject({
+        accepted: [{ testId: 'test_0', runId: 'run_new', status: 'running' }],
+        conflicts: [{ testId: 'test_1', currentRunId: 'run_busy' }],
+        notRunTestIds: ['test_50'],
+        skippedFrontend: tests.slice(2, 50).map(test => test.id),
+      });
+      expect(methods.filter(method => method !== 'GET')).toEqual(['POST', 'POST']);
+    },
+  );
+
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'preserves batch receipts and disarms the conflict metadata scope on %s',
+    async signal => {
+      const { credentialsPath } = makeCreds();
+      const shutdown = new ShutdownController();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      let armedAtRead = false;
+      const response: BatchRunFreshResponse = {
+        ...BATCH_FRESH_RESP,
+        conflicts: [{ testId: 'test_busy', currentRunId: 'run_busy', reason: 'in_flight' }],
+        skippedFrontend: ['test_frontend'],
+        skippedIntegration: [{ testId: 'test_integration' }],
+      };
+      const error: unknown = await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          shutdown,
+          fetchImpl: makeFetch((url, init) => {
+            if (init.method === 'POST') return { body: response };
+            if (url.includes('/runs/run_busy')) {
+              armedAtRead = shutdown.isArmed;
+              shutdown.interrupt(signal);
+              throw shutdown.signal.reason;
+            }
+            return { body: { environments: [] } };
+          }),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+        },
+      ).catch((caught: unknown) => caught);
+      expect(error).toBe(shutdown.signal.reason);
+      expect(armedAtRead).toBe(true);
+      expect(shutdown.isArmed).toBe(false);
+      expect(JSON.parse(stdout.join('\n'))).toEqual({
+        accepted: response.accepted.map(e => ({
+          testId: e.testId,
+          runId: e.runId,
+          status: 'running',
+        })),
+        conflicts: response.conflicts,
+        deferred: [],
+        skippedFrontend: response.skippedFrontend,
+        skippedIntegration: response.skippedIntegration,
+      });
+      expect(stderr.join('\n')).toContain('testsprite test wait run_fresh_01 run_fresh_02');
+    },
+  );
+
   it('run --all --wait: a NOT_FOUND member poll → exit 4 with error.code (was folded to exit 1 before this PR)', async () => {
     const { credentialsPath } = makeCreds();
     let caughtError: unknown;
@@ -6301,6 +6483,82 @@ describe('runTestRun — --target-url reachability preflight wiring', () => {
   // tests are governed purely by the injected `fetchImpl` mock — no real
   // DNS lookups, no network flakiness.
   const LITERAL_IP_TARGET = 'http://203.0.113.10';
+
+  it('interrupting stalled DNS rejects before any probe HTTP request or trigger POST', async () => {
+    const { credentialsPath } = makeCreds();
+    const shutdown = new ShutdownController();
+    const fetchImpl = vi.fn();
+    const stderr = vi.fn();
+    const rejected = vi.fn();
+    vi.useFakeTimers();
+    const lookup = vi.spyOn(dns.promises, 'lookup').mockImplementation(() => new Promise(() => {}));
+    try {
+      const pending = runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: false,
+          testId: 'test_xyz',
+          wait: false,
+          timeoutSeconds: 60,
+          targetUrl: 'https://preview.example.test',
+        },
+        { credentialsPath, fetchImpl, shutdown, stdout: () => {}, stderr },
+      ).catch(rejected);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lookup).toHaveBeenCalledWith('preview.example.test', { all: true });
+      shutdown.interrupt('SIGINT');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(rejected).toHaveBeenCalledWith(shutdown.signal.reason);
+      await pending;
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(stderr.mock.calls.some(([line]) => line.includes('[advisory]'))).toBe(false);
+      expect(shutdown.hasCriticalOperations).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      lookup.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('a stalled DNS timeout advises and still dispatches the run', async () => {
+    const { credentialsPath } = makeCreds();
+    const targetUrl = 'https://preview.example.test';
+    const fetchImpl = vi.fn(makeFetch(() => ({ body: { ...TRIGGER_RESP, targetUrl } })));
+    const stderr = vi.fn();
+    const settled = vi.fn();
+    vi.useFakeTimers();
+    const lookup = vi.spyOn(dns.promises, 'lookup').mockImplementation(() => new Promise(() => {}));
+    try {
+      const pending = runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_xyz',
+          wait: false,
+          timeoutSeconds: 60,
+          targetUrl,
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr },
+      ).then(settled);
+      await vi.advanceTimersByTimeAsync(7_999);
+      expect(fetchImpl).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run_abc' }));
+      await pending;
+      expect(fetchImpl).toHaveBeenCalledOnce();
+      expect(fetchImpl).toHaveBeenCalledWith(
+        expect.stringContaining('/tests/test_xyz/runs'),
+        expect.objectContaining({ method: 'POST' }),
+      );
+      expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/\[advisory\].*DNS.*8s/));
+    } finally {
+      lookup.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 
   it('a gateway-error response (502) refuses before the trigger POST — exit 5, no run row', async () => {
     const { credentialsPath } = makeCreds();

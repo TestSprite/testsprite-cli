@@ -819,7 +819,9 @@ async function cancelDoomedTunnelRun(args: {
   if (!args.enabled) return { outcome: 'skipped' };
   try {
     await withTeardownDeadline(args.opts, args.deps, client =>
-      client.post<CancelRunResponse>(`/runs/${encodeURIComponent(args.runId)}/cancel`),
+      client.post<CancelRunResponse>(`/runs/${encodeURIComponent(args.runId)}/cancel`, {
+        replaySafe: true,
+      }),
     );
     return { outcome: 'cancelled' };
   } catch (err) {
@@ -4508,6 +4510,18 @@ async function runBatchRun(
   const billingRunErrors: ApiError[] = [];
   const sleepFn = deps.sleep ?? defaultSleep;
   const shutdown = shutdownOf(deps);
+  const envListings = new Map<string, Promise<CliProjectEnvListResponse>>();
+  const listEnvironments = (projectId: string): Promise<CliProjectEnvListResponse> => {
+    let listing = envListings.get(projectId);
+    if (!listing) {
+      listing = client.get<CliProjectEnvListResponse>(
+        `/projects/${encodeURIComponent(projectId)}/env`,
+        { signal: shutdown.signal },
+      );
+      envListings.set(projectId, listing);
+    }
+    return listing;
+  };
   // Response-driven --target-url advisory, fired at most ONCE for the whole
   // batch (Finding 2's contract) the first time any member's trigger
   // response reports a target different from what was requested — see the
@@ -4771,6 +4785,50 @@ async function runBatchRun(
             (v): v is string => typeof v === 'string' && v.length > 0,
           );
           if (conflictReason === 'run_in_flight' && currentRunId !== undefined) {
+            const incompatibleRun = (reason: string): ApiError =>
+              new ApiError({
+                code: 'CONFLICT',
+                message: `Conflict: run ${currentRunId} is already in flight; ${reason}. This invocation cannot attach to it.`,
+                nextAction: `testsprite test wait ${currentRunId}`,
+                requestId: '',
+                details: { reason: 'run_in_flight', currentRunId },
+              });
+            let inFlight: RunResponse | undefined;
+            try {
+              try {
+                inFlight = await client.getRun(currentRunId, { signal: shutdown.signal });
+              } catch (readErr) {
+                if (readErr instanceof InterruptError) throw readErr;
+              }
+              if (inFlight) {
+                await verifyInFlightRunEnvironment(
+                  inFlight,
+                  normalizeEnvironmentName(opts.environment),
+                  listEnvironments,
+                  incompatibleRun,
+                );
+                if (opts.targetUrl !== undefined && inFlight.targetUrl !== opts.targetUrl) {
+                  throw incompatibleRun('its target URL does not match the requested target URL');
+                }
+              } else if (opts.environment !== undefined || opts.targetUrl !== undefined) {
+                throw incompatibleRun('its environment could not be verified');
+              }
+            } catch (attachErr) {
+              if (attachErr instanceof InterruptError) throw attachErr;
+              if (!(attachErr instanceof ApiError) || attachErr.code !== 'CONFLICT')
+                throw attachErr;
+              return {
+                testId,
+                runId: '',
+                status: 'error',
+                codeVersion: '',
+                error: {
+                  code: attachErr.code,
+                  message: `${attachErr.message} ${attachErr.nextAction}`,
+                  exitCode: attachErr.exitCode,
+                },
+              };
+            }
             stderrFn(
               `[batch-run] ${testId} — run already in flight (runId: ${currentRunId}). Auto-resuming wait.`,
             );
@@ -4779,7 +4837,7 @@ async function runBatchRun(
               status: 'queued',
               enqueuedAt: new Date().toISOString(),
               codeVersion: '',
-              targetUrl: opts.targetUrl ?? '',
+              targetUrl: inFlight?.targetUrl ?? '',
             };
             break; // exit the outer retry loop with a conflict-resumed response
           } else {
@@ -11038,6 +11096,7 @@ export async function runTestRunAll(
   // resolvable in-flight run stay hard (nothing to wait on).
   // An in-flight run may belong to another deployment/environment. CI can
   // only use runs accepted by this invocation to judge its own change.
+  const metadataConflicts = conflicts;
   // A `no_producer` / `producer_in_flight` conflict's `currentRunId` is the
   // result the server seeded BLOCKED before dispatch. It is reported with the
   // server's reason and exit 6, as a single `test run` reports it, not polled.
@@ -11077,6 +11136,8 @@ export async function runTestRunAll(
     }
     return listing;
   };
+  // Keep the metadata stage graceful even between tracked HTTP requests.
+  const disarmResolve = shutdownOf(deps).arm();
   const resumedOrRefused = await Promise.all(
     resumableConflicts.map(
       async (c): Promise<{ entry: BatchRunFreshAccepted } | { refused: RunConflict }> => {
@@ -11143,7 +11204,43 @@ export async function runTestRunAll(
         return { entry: { testId: c.testId, runId: inFlightRunId, enqueuedAt: notBefore } };
       },
     ),
-  );
+  )
+    .catch((err: unknown) => {
+      if (err instanceof InterruptError) {
+        const partialResults: CliBatchRunFreshResult[] = accepted.map(e => ({
+          testId: e.testId,
+          runId: e.runId,
+          status: 'running',
+        }));
+        out.print(
+          {
+            accepted: partialResults,
+            conflicts: metadataConflicts,
+            deferred,
+            skippedFrontend,
+            skippedIntegration,
+            ...(notRunTestIds.length > 0 ? { notRunTestIds } : {}),
+          },
+          () =>
+            partialResults.length > 0
+              ? partialResults.map(r => `${r.runId}  ${r.status}`).join('\n')
+              : resumableConflicts
+                  .map(c => `${c.currentRunId}  unverified (not attached)`)
+                  .join('\n'),
+        );
+        if (accepted.length > 0) {
+          err.runWaitContext = true;
+          stderrFn(
+            interruptDetachMessage(
+              err,
+              accepted.map(e => e.runId),
+            ),
+          );
+        }
+      }
+      throw err;
+    })
+    .finally(disarmResolve);
   const resumableEntries: BatchRunFreshAccepted[] = [];
   for (const outcome of resumedOrRefused) {
     if ('entry' in outcome) {
@@ -16758,6 +16855,7 @@ async function deleteTunnelForCleanup(
   await withTeardownDeadline(opts, deps, client =>
     client.delete<unknown>(`/tunnel/${encodeURIComponent(clientId)}`, {
       allowNoContent: true,
+      replaySafe: true,
     }),
   );
 }
