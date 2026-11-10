@@ -735,6 +735,119 @@ describe('runDeleteBatch (dogfood L1796)', () => {
     expect(skipped?.status).toBe('skipped');
   });
 
+  function errorResp(status: number, code: string) {
+    return {
+      status,
+      body: { error: { code, message: code, nextAction: '', requestId: 'r1', details: {} } },
+    };
+  }
+
+  it('a rejected key exits 3 with the typed AUTH_INVALID error, not the generic 1', async () => {
+    const creds = makeCreds();
+    const fetchImpl = makeFetch((_url, init) =>
+      init.method === 'DELETE' ? errorResp(401, 'AUTH_INVALID') : { body: {} },
+    );
+    const stdout: string[] = [];
+
+    const err = await runDeleteBatch(
+      {
+        testIds: ['test_a', 'test_b'],
+        all: false,
+        confirm: true,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, fetchImpl, stdout: (l: string) => stdout.push(l), stderr: () => {} },
+    ).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ exitCode: 3, code: 'AUTH_INVALID' });
+    // The per-test summary still lands on stdout before the error.
+    const summary = JSON.parse(stdout.join('\n')) as CliBulkDeleteSummary;
+    expect(summary.summary).toEqual({ total: 2, deleted: 0, skipped: 0, failed: 2 });
+  });
+
+  it('a too-old CLI (426 CLIENT_TOO_OLD) exits 14', async () => {
+    const creds = makeCreds();
+    const fetchImpl = makeFetch((_url, init) =>
+      init.method === 'DELETE' ? errorResp(426, 'CLIENT_TOO_OLD') : { body: {} },
+    );
+
+    const err = await runDeleteBatch(
+      {
+        testIds: ['test_a', 'test_b'],
+        all: false,
+        confirm: true,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, fetchImpl, stdout: () => {}, stderr: () => {} },
+    ).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ exitCode: 14, code: 'CLIENT_TOO_OLD' });
+  });
+
+  it('auth outranks a too-old CLI: deleted + 426 + 401 exits 3', async () => {
+    const creds = makeCreds();
+    const fetchImpl = makeFetch((url, init) => {
+      if (init.method !== 'DELETE') return { body: {} };
+      if (url.includes('test_old')) return errorResp(426, 'CLIENT_TOO_OLD');
+      if (url.includes('test_denied')) return errorResp(401, 'AUTH_INVALID');
+      const testId = url.split('/tests/')[1]!.split('?')[0]!;
+      return { body: deleteResp(testId) };
+    });
+    const stdout: string[] = [];
+
+    const err = await runDeleteBatch(
+      {
+        testIds: ['test_ok', 'test_old', 'test_denied'],
+        all: false,
+        confirm: true,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, fetchImpl, stdout: (l: string) => stdout.push(l), stderr: () => {} },
+    ).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ exitCode: 3, code: 'AUTH_INVALID' });
+    const summary = JSON.parse(stdout.join('\n')) as CliBulkDeleteSummary;
+    expect(summary.summary).toEqual({ total: 3, deleted: 1, skipped: 0, failed: 2 });
+  });
+
+  it('a non-batch-wide deletion failure keeps the generic exit 1', async () => {
+    const creds = makeCreds();
+    const fetchImpl = makeFetch((url, init) => {
+      if (init.method !== 'DELETE') return { body: {} };
+      if (url.includes('test_bad')) return errorResp(400, 'VALIDATION_ERROR');
+      const testId = url.split('/tests/')[1]!.split('?')[0]!;
+      return { body: deleteResp(testId) };
+    });
+
+    const err = await runDeleteBatch(
+      {
+        testIds: ['test_ok', 'test_bad'],
+        all: false,
+        confirm: true,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, fetchImpl, stdout: () => {}, stderr: () => {} },
+    ).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ exitCode: 1 });
+  });
+
   it('--dry-run skips all HTTP calls and returns full synthetic summary', async () => {
     const creds = makeCreds();
     const callCount = { n: 0 };
@@ -847,6 +960,55 @@ describe('runDeleteBatch (dogfood L1796)', () => {
     expect(deletedIds).toEqual(['test_failed']);
   });
 
+  it('--all --status not_run deletes only the tests that never ran (draft, ready)', async () => {
+    const creds = makeCreds();
+    const deletedIds: string[] = [];
+
+    const allTests = [
+      { id: 'test_draft', status: 'draft' },
+      { id: 'test_ready', status: 'ready' },
+      { id: 'test_failed', status: 'failed' },
+      { id: 'test_running', status: 'running' },
+      { id: 'test_unknown', status: 'unknown' },
+    ];
+
+    const fetchImpl = makeFetch((url, init) => {
+      if (url.includes('/tests') && (!init.method || init.method === 'GET')) {
+        return { body: { items: allTests, nextToken: null } };
+      }
+      if (init.method === 'DELETE') {
+        const testId = url.split('/tests/')[1]!.split('?')[0]!;
+        deletedIds.push(decodeURIComponent(testId));
+        return { body: deleteResp(decodeURIComponent(testId)) };
+      }
+      return { body: {} };
+    });
+
+    for (const statusFilter of ['not_run', 'failed,not_run']) {
+      deletedIds.length = 0;
+      await runDeleteBatch(
+        {
+          testIds: [],
+          all: true,
+          projectId: 'project_abc',
+          statusFilter,
+          confirm: true,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug: false,
+          verbose: false,
+        },
+        { ...creds, fetchImpl, stderr: () => {} },
+      );
+      expect(deletedIds.sort()).toEqual(
+        statusFilter === 'not_run'
+          ? ['test_draft', 'test_ready']
+          : ['test_draft', 'test_failed', 'test_ready'],
+      );
+    }
+  });
+
   it('exit 5 when --status contains an invalid token', async () => {
     const creds = makeCreds();
     const fetchImpl = makeFetch((url, init) => {
@@ -872,6 +1034,48 @@ describe('runDeleteBatch (dogfood L1796)', () => {
         { ...creds, fetchImpl },
       ),
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+  });
+
+  it('exit 5 before any request when --all --status is empty, whitespace or commas only', async () => {
+    const creds = makeCreds();
+    // An empty --status used to be read as "no filter", so `--status ''`
+    // deleted every test in the project.
+    const requests: string[] = [];
+    const fetchImpl = makeFetch((url, init) => {
+      requests.push(`${init.method ?? 'GET'} ${url}`);
+      if (url.includes('/tests') && (!init.method || init.method === 'GET')) {
+        return { body: { items: [{ id: 'test_a', status: 'passed' }], nextToken: null } };
+      }
+      if (init.method === 'DELETE') return { body: deleteResp('test_a') };
+      return { body: {} };
+    });
+    for (const statusFilter of ['', '  ', ',', ' , ']) {
+      for (const dryRun of [false, true]) {
+        await expect(
+          runDeleteBatch(
+            {
+              testIds: [],
+              all: true,
+              projectId: 'project_abc',
+              statusFilter,
+              confirm: true,
+              output: 'json',
+              profile: 'default',
+              dryRun,
+              debug: false,
+              verbose: false,
+            },
+            { ...creds, fetchImpl, stdout: () => {}, stderr: () => {} },
+          ),
+        ).rejects.toMatchObject({
+          code: 'VALIDATION_ERROR',
+          nextAction: expect.stringContaining(
+            '--status needs at least one status (accepted: passed, failed, blocked, cancelled, not_run)',
+          ),
+        });
+      }
+    }
+    expect(requests).toEqual([]);
   });
 
   // ---- correctness-fix tests (code-review 2026-06-04) ----------------------
