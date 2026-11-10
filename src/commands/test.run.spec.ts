@@ -5,6 +5,7 @@
  * sleep injection is wired through `TestDeps.sleep` to avoid real delays.
  */
 
+import * as dns from 'node:dns';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,7 +18,7 @@ import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-facto
 import type { FetchImpl } from '../lib/http.js';
 import type { RunResponse, TriggerRunResponse, BatchRunFreshResponse } from '../lib/runs.types.js';
 import { takeTelemetryExtras } from '../lib/telemetry.js';
-import { runTestRun, runTestRunAll } from './test.js';
+import { renderRunResponseText, runTestRun, runTestRunAll } from './test.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -3666,6 +3667,187 @@ describe('runTestRunAll — batch fresh run', () => {
     };
   }
 
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'names unverified conflicts in text when no runs were accepted on %s',
+    async signal => {
+      const { credentialsPath } = makeCreds();
+      const shutdown = new ShutdownController();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const methods: string[] = [];
+      const error: unknown = await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          shutdown,
+          fetchImpl: makeFetch((url, init) => {
+            methods.push(init.method ?? 'GET');
+            if (init.method === 'POST') {
+              return {
+                body: {
+                  ...BATCH_FRESH_RESP,
+                  accepted: [],
+                  conflicts: [
+                    { testId: 'test_busy', currentRunId: 'run_busy' },
+                    { testId: 'test_busy_2', currentRunId: 'run_busy_2' },
+                    { testId: 'test_unknown', reason: 'in_flight' },
+                  ],
+                },
+              };
+            }
+            if (url.includes('/runs/')) {
+              shutdown.interrupt(signal);
+              throw shutdown.signal.reason;
+            }
+            return { body: { environments: [] } };
+          }),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+        },
+      ).catch((caught: unknown) => caught);
+      expect(error).toBe(shutdown.signal.reason);
+      expect(shutdown.isArmed).toBe(false);
+      expect(stdout.join('\n')).toBe(
+        'run_busy  unverified (not attached)\nrun_busy_2  unverified (not attached)',
+      );
+      expect(stderr.join('\n')).not.toContain('[auto-resume]');
+      expect(methods.filter(method => method !== 'GET')).toEqual(['POST']);
+    },
+  );
+
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'keeps unsent filtered test IDs when dispatch stops before metadata interruption on %s',
+    async signal => {
+      const { credentialsPath } = makeCreds();
+      const shutdown = new ShutdownController();
+      const stdout: string[] = [];
+      const methods: string[] = [];
+      const tests = Array.from({ length: 51 }, (_, i) => ({
+        id: `test_${i}`,
+        name: `selected ${i}`,
+        projectId: 'project_be',
+        type: i >= 2 && i < 50 ? 'frontend' : 'backend',
+      }));
+      let dispatches = 0;
+      const error: unknown = await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          nameFilter: 'selected',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          shutdown,
+          fetchImpl: makeFetch((url, init) => {
+            methods.push(init.method ?? 'GET');
+            if (url.includes('/tests?')) return { body: { items: tests, nextToken: null } };
+            if (init.method === 'POST') {
+              dispatches++;
+              if (dispatches > 1) return errorBody('PRECONDITION_FAILED');
+              return {
+                body: {
+                  ...BATCH_FRESH_RESP,
+                  accepted: [
+                    { testId: 'test_0', runId: 'run_new', enqueuedAt: '2026-06-09T10:00:00Z' },
+                  ],
+                  conflicts: [{ testId: 'test_1', currentRunId: 'run_busy' }],
+                  skippedFrontend: tests.slice(2, 50).map(test => test.id),
+                },
+              };
+            }
+            if (url.includes('/runs/run_busy')) {
+              shutdown.interrupt(signal);
+              throw shutdown.signal.reason;
+            }
+            return { body: { environments: [] } };
+          }),
+          stdout: line => stdout.push(line),
+          stderr: () => {},
+        },
+      ).catch((caught: unknown) => caught);
+      expect(error).toBe(shutdown.signal.reason);
+      expect(shutdown.isArmed).toBe(false);
+      expect(JSON.parse(stdout.join('\n'))).toMatchObject({
+        accepted: [{ testId: 'test_0', runId: 'run_new', status: 'running' }],
+        conflicts: [{ testId: 'test_1', currentRunId: 'run_busy' }],
+        notRunTestIds: ['test_50'],
+        skippedFrontend: tests.slice(2, 50).map(test => test.id),
+      });
+      expect(methods.filter(method => method !== 'GET')).toEqual(['POST', 'POST']);
+    },
+  );
+
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'preserves batch receipts and disarms the conflict metadata scope on %s',
+    async signal => {
+      const { credentialsPath } = makeCreds();
+      const shutdown = new ShutdownController();
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      let armedAtRead = false;
+      const response: BatchRunFreshResponse = {
+        ...BATCH_FRESH_RESP,
+        conflicts: [{ testId: 'test_busy', currentRunId: 'run_busy', reason: 'in_flight' }],
+        skippedFrontend: ['test_frontend'],
+        skippedIntegration: [{ testId: 'test_integration' }],
+      };
+      const error: unknown = await runTestRunAll(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_be',
+          wait: true,
+          timeoutSeconds: 60,
+          maxConcurrency: 5,
+        },
+        {
+          credentialsPath,
+          shutdown,
+          fetchImpl: makeFetch((url, init) => {
+            if (init.method === 'POST') return { body: response };
+            if (url.includes('/runs/run_busy')) {
+              armedAtRead = shutdown.isArmed;
+              shutdown.interrupt(signal);
+              throw shutdown.signal.reason;
+            }
+            return { body: { environments: [] } };
+          }),
+          stdout: line => stdout.push(line),
+          stderr: line => stderr.push(line),
+        },
+      ).catch((caught: unknown) => caught);
+      expect(error).toBe(shutdown.signal.reason);
+      expect(armedAtRead).toBe(true);
+      expect(shutdown.isArmed).toBe(false);
+      expect(JSON.parse(stdout.join('\n'))).toEqual({
+        accepted: response.accepted.map(e => ({
+          testId: e.testId,
+          runId: e.runId,
+          status: 'running',
+        })),
+        conflicts: response.conflicts,
+        deferred: [],
+        skippedFrontend: response.skippedFrontend,
+        skippedIntegration: response.skippedIntegration,
+      });
+      expect(stderr.join('\n')).toContain('testsprite test wait run_fresh_01 run_fresh_02');
+    },
+  );
+
   it('run --all --wait: a NOT_FOUND member poll → exit 4 with error.code (was folded to exit 1 before this PR)', async () => {
     const { credentialsPath } = makeCreds();
     let caughtError: unknown;
@@ -6302,6 +6484,82 @@ describe('runTestRun — --target-url reachability preflight wiring', () => {
   // DNS lookups, no network flakiness.
   const LITERAL_IP_TARGET = 'http://203.0.113.10';
 
+  it('interrupting stalled DNS rejects before any probe HTTP request or trigger POST', async () => {
+    const { credentialsPath } = makeCreds();
+    const shutdown = new ShutdownController();
+    const fetchImpl = vi.fn();
+    const stderr = vi.fn();
+    const rejected = vi.fn();
+    vi.useFakeTimers();
+    const lookup = vi.spyOn(dns.promises, 'lookup').mockImplementation(() => new Promise(() => {}));
+    try {
+      const pending = runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: false,
+          testId: 'test_xyz',
+          wait: false,
+          timeoutSeconds: 60,
+          targetUrl: 'https://preview.example.test',
+        },
+        { credentialsPath, fetchImpl, shutdown, stdout: () => {}, stderr },
+      ).catch(rejected);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lookup).toHaveBeenCalledWith('preview.example.test', { all: true });
+      shutdown.interrupt('SIGINT');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(rejected).toHaveBeenCalledWith(shutdown.signal.reason);
+      await pending;
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(stderr.mock.calls.some(([line]) => line.includes('[advisory]'))).toBe(false);
+      expect(shutdown.hasCriticalOperations).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      lookup.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('a stalled DNS timeout advises and still dispatches the run', async () => {
+    const { credentialsPath } = makeCreds();
+    const targetUrl = 'https://preview.example.test';
+    const fetchImpl = vi.fn(makeFetch(() => ({ body: { ...TRIGGER_RESP, targetUrl } })));
+    const stderr = vi.fn();
+    const settled = vi.fn();
+    vi.useFakeTimers();
+    const lookup = vi.spyOn(dns.promises, 'lookup').mockImplementation(() => new Promise(() => {}));
+    try {
+      const pending = runTestRun(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_xyz',
+          wait: false,
+          timeoutSeconds: 60,
+          targetUrl,
+        },
+        { credentialsPath, fetchImpl, stdout: () => {}, stderr },
+      ).then(settled);
+      await vi.advanceTimersByTimeAsync(7_999);
+      expect(fetchImpl).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run_abc' }));
+      await pending;
+      expect(fetchImpl).toHaveBeenCalledOnce();
+      expect(fetchImpl).toHaveBeenCalledWith(
+        expect.stringContaining('/tests/test_xyz/runs'),
+        expect.objectContaining({ method: 'POST' }),
+      );
+      expect(stderr).toHaveBeenCalledWith(expect.stringMatching(/\[advisory\].*DNS.*8s/));
+    } finally {
+      lookup.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it('a gateway-error response (502) refuses before the trigger POST — exit 5, no run row', async () => {
     const { credentialsPath } = makeCreds();
     const postedUrls: string[] = [];
@@ -6680,14 +6938,33 @@ describe('early run receipt', () => {
   );
 
   it.each([
-    { links: {}, expected: undefined },
+    { links: {}, dashboard: undefined, execution: undefined },
+    {
+      links: { dashboardUrl: 'https://www.testsprite.com/dashboard/tests/test_xyz' },
+      dashboard: 'https://www.testsprite.com/dashboard/tests/test_xyz',
+      execution: undefined,
+    },
     {
       links: { executionUrl: 'https://www.testsprite.com/executions/run_abc' },
-      expected: 'https://www.testsprite.com/executions/run_abc',
+      dashboard: undefined,
+      execution: 'https://www.testsprite.com/executions/run_abc',
+    },
+    {
+      links: {
+        dashboardUrl: 'https://www.testsprite.com/dashboard/tests/test_xyz',
+        executionUrl: 'https://www.testsprite.com/executions/run_abc',
+      },
+      dashboard: 'https://www.testsprite.com/dashboard/tests/test_xyz',
+      execution: 'https://www.testsprite.com/executions/run_abc',
+    },
+    {
+      links: { executionUrl: '' },
+      dashboard: undefined,
+      execution: undefined,
     },
   ])(
-    'prints a no-wait receipt using only available server links ($expected)',
-    async ({ links, expected }) => {
+    'prints a no-wait receipt using only available server links (dashboard=$dashboard execution=$execution)',
+    async ({ links, dashboard, execution }) => {
       const stderr: string[] = [];
       const stdout: string[] = [];
       const response = { ...TRIGGER_RESP, ...links };
@@ -6709,11 +6986,108 @@ describe('early run receipt', () => {
       );
       expect(stderr).toContain('Run run_abc');
       expect(stderr.filter(line => line.startsWith('Dashboard:'))).toEqual(
-        expected ? [`Dashboard: ${expected}`] : [],
+        dashboard ? [`Dashboard: ${dashboard}`] : [],
+      );
+      expect(stderr.filter(line => line.startsWith('Execution:'))).toEqual(
+        execution ? [`Execution: ${execution}`] : [],
       );
       expect(stdout).toEqual([JSON.stringify(response, null, 2)]);
     },
   );
+});
+
+const DASHBOARD_LINK = 'https://www.testsprite.com/dashboard/tests/test_xyz';
+const EXECUTION_LINK = 'https://www.testsprite.com/executions/run_abc';
+
+describe('run text links keep the execution page off the dashboard label', () => {
+  it.each([
+    {
+      name: 'both urls',
+      links: { dashboardUrl: DASHBOARD_LINK, executionUrl: EXECUTION_LINK },
+      dashboard: DASHBOARD_LINK,
+      execution: EXECUTION_LINK,
+    },
+    {
+      name: 'dashboard only',
+      links: { dashboardUrl: DASHBOARD_LINK },
+      dashboard: DASHBOARD_LINK,
+      execution: undefined,
+    },
+    {
+      name: 'execution only',
+      links: { executionUrl: EXECUTION_LINK },
+      dashboard: undefined,
+      execution: EXECUTION_LINK,
+    },
+    {
+      name: 'execution empty',
+      links: { executionUrl: '' },
+      dashboard: undefined,
+      execution: undefined,
+    },
+  ])('no-wait text card and receipt ($name)', async ({ links, dashboard, execution }) => {
+    const stderr: string[] = [];
+    const stdout: string[] = [];
+    await runTestRun(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        testId: 'test_xyz',
+        wait: false,
+        timeoutSeconds: 600,
+      },
+      {
+        ...makeCreds(),
+        stdout: line => stdout.push(line),
+        stderr: line => stderr.push(line),
+        fetchImpl: makeFetch(() => ({ body: { ...TRIGGER_RESP, ...links } })),
+      },
+    );
+    const card = stdout.join('\n');
+    expect(card.includes(`dashboard   ${DASHBOARD_LINK}`)).toBe(dashboard !== undefined);
+    expect(card.includes(`execution   ${EXECUTION_LINK}`)).toBe(execution !== undefined);
+    expect(card).not.toContain('Dashboard:');
+    expect(card).not.toContain('Execution:');
+    expect(stderr.filter(line => line.startsWith('Dashboard:'))).toEqual(
+      dashboard ? [`Dashboard: ${dashboard}`] : [],
+    );
+    expect(stderr.filter(line => line.startsWith('Execution:'))).toEqual(
+      execution ? [`Execution: ${execution}`] : [],
+    );
+  });
+
+  it.each([
+    {
+      name: 'both urls',
+      run: { dashboardUrl: DASHBOARD_LINK, executionUrl: EXECUTION_LINK },
+      dashboard: true,
+      execution: true,
+    },
+    {
+      name: 'dashboard only',
+      run: { dashboardUrl: DASHBOARD_LINK },
+      dashboard: true,
+      execution: false,
+    },
+    {
+      name: 'execution only',
+      run: { executionUrl: EXECUTION_LINK },
+      dashboard: false,
+      execution: true,
+    },
+    {
+      name: 'execution null',
+      run: { executionUrl: null },
+      dashboard: false,
+      execution: false,
+    },
+  ])('finished run card ($name)', ({ run, dashboard, execution }) => {
+    const text = renderRunResponseText({ ...makePassedRun(), ...run });
+    expect(text.includes(`dashboard   ${DASHBOARD_LINK}`)).toBe(dashboard);
+    expect(text.includes(`execution   ${EXECUTION_LINK}`)).toBe(execution);
+    if (execution) expect(text).not.toContain(`dashboard   ${EXECUTION_LINK}`);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -8137,5 +8511,66 @@ describe('run --all --wait: a queued run is waited through', () => {
       summary: { passed: number; total: number };
     };
     expect(payload.summary).toMatchObject({ passed: 1, total: 1 });
+  });
+});
+
+describe('runTestRun --wait — failure recovery hint for a run that is terminal on the first poll', () => {
+  async function runTerminal(
+    output: 'text' | 'json',
+    runStatus: RunResponse['status'],
+    type?: string,
+  ) {
+    const { credentialsPath } = makeCreds();
+    const router = beRunRouter({ type, runStatus, result: () => makeBeResult() });
+    const stderr: string[] = [];
+    const err = await runTestRun(
+      {
+        profile: 'default',
+        output,
+        debug: false,
+        dryRun: false,
+        testId: 'test_be',
+        wait: true,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(router.handler),
+        stdout: () => {},
+        stderr: l => stderr.push(l),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    return {
+      err,
+      hint: stderr.find(l => l.startsWith('Run finished')) ?? '',
+      counts: router.counts,
+    };
+  }
+
+  it.each(['failed', 'blocked'] as const)(
+    'JSON: a %s backend run points at test failure get <test-id>',
+    async runStatus => {
+      const { err, hint, counts } = await runTerminal('json', runStatus);
+      expect(err.exitCode).toBe(1);
+      expect(hint).toContain("'testsprite test failure get test_be'");
+      expect(hint).not.toContain('artifact get');
+      expect(counts.result).toBe(0);
+    },
+  );
+
+  it('JSON: a failed frontend run keeps the run-scoped artifact hint', async () => {
+    const { hint } = await runTerminal('json', 'failed', 'frontend');
+    expect(hint).toContain("'testsprite test artifact get run_abc'");
+  });
+
+  it('JSON: the hint costs one extra type lookup, and only for a failed run', async () => {
+    // `test run` already reads the test once before triggering; the hint adds
+    // at most one GET on top of that, and none when the run passed.
+    const passed = await runTerminal('json', 'passed');
+    const failed = await runTerminal('json', 'failed');
+    expect(passed.err.status).toBe('passed');
+    expect(passed.hint).toBe('');
+    expect(failed.counts.type - passed.counts.type).toBe(1);
   });
 });

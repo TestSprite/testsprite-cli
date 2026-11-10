@@ -52,6 +52,16 @@ function makeFakeFs(seed: Record<string, string> = {}): CiFs & { files: Map<stri
   const files = new Map<string, string>(Object.entries(seed));
   return {
     files,
+    async lstat(target) {
+      if (files.has(target)) return { isFile: true, isSymbolicLink: false };
+      if ([...files.keys()].some(file => file.startsWith(`${target}${sep}`))) {
+        return { isFile: false, isSymbolicLink: false };
+      }
+      return null;
+    },
+    async realpath(target) {
+      return target;
+    },
     async writeFile(target, data, opts) {
       if (opts?.exclusive && files.has(target)) {
         const err = new Error('EEXIST') as NodeJS.ErrnoException;
@@ -300,10 +310,13 @@ describe('buildGithubWorkflow', () => {
     expect(yaml).toContain('exit 1');
   });
 
-  it('guards both events: no fork or draft PRs, only successful non-production deployments', () => {
+  it('guards both events: no fork, Dependabot or draft PRs, only successful non-production deployments', () => {
     const yaml = buildGithubWorkflow(WF_BASE);
     expect(yaml).toContain('types: [opened, synchronize, reopened, ready_for_review]');
     expect(yaml).toContain('github.event.pull_request.head.repo.full_name == github.repository');
+    // Dependabot branches live in the base repo, so the fork guard passes, but
+    // Dependabot events get no Actions secrets.
+    expect(yaml).toContain("github.actor != 'dependabot[bot]'");
     expect(yaml).toContain('!github.event.pull_request.draft');
     expect(yaml).toContain("github.event.deployment_status.state == 'success'");
     expect(yaml).toContain('!github.event.deployment.production_environment');
@@ -575,15 +588,32 @@ describe('runCiInit', () => {
     });
   });
 
-  it('a byte-identical workflow is left alone and gets no .bak, with or without --force', async () => {
+  it.each([false, true])('CRLF-equivalent workflow stays untouched (force=%s)', async force => {
     const io = collect();
     const fresh = makeFakeFs();
     await runCiInit(opts({ project: 'p' }), deps({ fs: fresh, ...collect() }));
-    const fs = makeFakeFs({ [WF]: fresh.files.get(WF)! });
-    await runCiInit(opts({ project: 'p', force: true }), deps({ fs, ...io }));
+    const existing = fresh.files.get(WF)!.replace(/\n/g, '\r\n');
+    const fs = makeFakeFs({ [WF]: existing });
+    await runCiInit(opts({ project: 'p', force }), deps({ fs, ...io }));
+    expect(fs.files.get(WF)).toBe(existing);
     expect(fs.files.has(`${WF}.bak`)).toBe(false);
     expect(io.json()).toMatchObject({ wrote: false, status: 'unchanged' });
     expect(io.json()).not.toHaveProperty('backupPath');
+  });
+
+  it('CRLF workflow with a real edit still needs force and keeps its original backup', async () => {
+    const fresh = makeFakeFs();
+    await runCiInit(opts({ project: 'p' }), deps({ fs: fresh, ...collect() }));
+    const canonical = fresh.files.get(WF)!;
+    const existing = canonical.replace(/\n/g, '\r\n') + '# local edit\r\n';
+    const fs = makeFakeFs({ [WF]: existing });
+    await expect(runCiInit(opts({ project: 'p' }), deps({ fs }))).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+    });
+    expect(fs.files.get(WF)).toBe(existing);
+    await runCiInit(opts({ project: 'p', force: true }), deps({ fs }));
+    expect(fs.files.get(WF)).toBe(canonical);
+    expect(fs.files.get(`${WF}.bak`)).toBe(existing);
   });
 
   it('honors a custom --path under .github/workflows/ (.yaml too)', async () => {
