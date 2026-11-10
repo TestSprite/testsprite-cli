@@ -189,8 +189,20 @@ describe('buildJUnitReport', () => {
       suiteName: 'testsprite:testlist:list-1',
       classname: 'testlist:list-1',
       results: [
-        makeResult({ testId: 'test_a', runId: 'run_a', status: 'failed', name: 'Checkout', durationSeconds: 2.5 }),
-        makeResult({ testId: 'test_b', runId: 'run_b', status: 'failed', name: 'Checkout', durationSeconds: 2.5 }),
+        makeResult({
+          testId: 'test_a',
+          runId: 'run_a',
+          status: 'failed',
+          name: 'Checkout',
+          durationSeconds: 2.5,
+        }),
+        makeResult({
+          testId: 'test_b',
+          runId: 'run_b',
+          status: 'failed',
+          name: 'Checkout',
+          durationSeconds: 2.5,
+        }),
       ],
     });
     const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]);
@@ -224,7 +236,12 @@ describe('buildJUnitReport', () => {
       results: [
         makeResult({ testId: 'case_a', runId: 'run_a', status: 'failed', name: 'Checkout' }),
         makeResult({ testId: 'case_b', runId: 'run_b', status: 'failed', name: 'Checkout' }),
-        makeResult({ testId: 'case_c', runId: 'run_c', status: 'failed', name: 'Checkout [case_a]' }),
+        makeResult({
+          testId: 'case_c',
+          runId: 'run_c',
+          status: 'failed',
+          name: 'Checkout [case_a]',
+        }),
       ],
     });
     const names = [...xml.matchAll(/<testcase [^>]*? name="([^"]+)"/g)].map(match => match[1]);
@@ -285,9 +302,27 @@ describe('buildJUnitReport', () => {
       suiteName: 'Batch',
       classname: 'proj_1',
       results: [
-        makeResult({ testId: 'dup', runId: 'run_a', status: 'failed', name: 'Checkout', durationSeconds: 1 }),
-        makeResult({ testId: 'dup', runId: 'run_b', status: 'failed', name: 'Checkout', durationSeconds: 2 }),
-        makeResult({ testId: 'dup', runId: 'run_c', status: 'failed', name: 'Checkout', durationSeconds: 3 }),
+        makeResult({
+          testId: 'dup',
+          runId: 'run_a',
+          status: 'failed',
+          name: 'Checkout',
+          durationSeconds: 1,
+        }),
+        makeResult({
+          testId: 'dup',
+          runId: 'run_b',
+          status: 'failed',
+          name: 'Checkout',
+          durationSeconds: 2,
+        }),
+        makeResult({
+          testId: 'dup',
+          runId: 'run_c',
+          status: 'failed',
+          name: 'Checkout',
+          durationSeconds: 3,
+        }),
       ],
     });
     expect((xml.match(/<failure /g) ?? []).length).toBe(3);
