@@ -22,6 +22,10 @@ git('config', 'commit.gpgsign', 'false');
 mkdirSync(join(repo, 'src'));
 const baseLines = Array.from({ length: 10 }, (_, i) => `const line${i + 1} = ${i + 1};`);
 writeFileSync(join(repo, 'src/a.ts'), `${baseLines.join('\n')}\n`);
+// A second changed file marked `-diff`: Git would emit a binary marker with no
+// hunk headers unless the filter asks for a textual diff.
+writeFileSync(join(repo, '.gitattributes'), 'src/attr.ts -diff\n');
+writeFileSync(join(repo, 'src/attr.ts'), `${baseLines.join('\n')}\n`);
 git('add', '.');
 git('commit', '-q', '-m', 'base');
 const BASE = git('rev-parse', 'HEAD');
@@ -29,12 +33,13 @@ const headLines = [...baseLines];
 headLines[2] = 'const line3 = readFileSync(userPath);';
 headLines.push('const line11 = 11;', 'const line12 = readFileSync(otherPath);');
 writeFileSync(join(repo, 'src/a.ts'), `${headLines.join('\n')}\n`);
+writeFileSync(join(repo, 'src/attr.ts'), `${headLines.join('\n')}\n`);
 git('commit', '-q', '-am', 'head');
 const HEAD = git('rev-parse', 'HEAD');
 
-function runFilter(messages, { base = BASE } = {}) {
+function runFilter(messages, { base = BASE, file = 'src/a.ts' } = {}) {
   const reportPath = join(repo, `report-${Math.random().toString(36).slice(2)}.json`);
-  writeFileSync(reportPath, JSON.stringify([{ filePath: join(repo, 'src/a.ts'), messages }]));
+  writeFileSync(reportPath, JSON.stringify([{ filePath: join(repo, file), messages }]));
   const result = spawnSync(process.execPath, [filterScript, reportPath], {
     cwd: repo,
     encoding: 'utf8',
@@ -83,4 +88,17 @@ test('warnings on added lines do not fail the gate', () => {
 
 test('without a base every error is kept', () => {
   assert.equal(runFilter([finding(5)], { base: '' }).status, 1);
+});
+
+// Regression: a `.gitattributes` `-diff` marker made `git diff` print a binary
+// marker instead of hunks, so the filter dropped every finding in that file and
+// the gate passed green.
+test('a -diff attribute does not hide a finding on a changed line', () => {
+  const { status, output } = runFilter([finding(3)], { file: 'src/attr.ts' });
+  assert.equal(status, 1);
+  assert.match(output, /src\/attr\.ts:3:1/);
+});
+
+test('a -diff file still scopes findings to its changed lines', () => {
+  assert.equal(runFilter([finding(5)], { file: 'src/attr.ts' }).status, 0);
 });
