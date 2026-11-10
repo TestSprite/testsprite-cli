@@ -1262,6 +1262,40 @@ describe('runCreateBatch --run --dry-run', () => {
       summary: { total: 2, created: 2, failed: 0 },
     });
   });
+
+  it('text dry-run keeps the existing descriptor shape without a creation field', async () => {
+    const { credentialsPath } = makeCreds();
+    const plansFile = writePlansJsonl([FE_SPEC]);
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch')) return { body: makeBatchCreateResponse(['test_text_dry']) };
+      return { status: 404, body: {} };
+    });
+    const stdout: string[] = [];
+
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: true,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdout.push(line),
+        stderr: () => {},
+      },
+    );
+
+    const envelope = JSON.parse(stdout.join('')) as Record<string, unknown>;
+    expect(envelope.dryRun).toBe(true);
+    expect(envelope.results).toBeDefined();
+    expect(envelope).not.toHaveProperty('creation');
+  });
 });
 
 // ---------------------------------------------------------------------------
