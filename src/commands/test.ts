@@ -4364,7 +4364,7 @@ async function runBatchRun(
       status: 'queued',
       codeVersion: 'v1',
     }));
-    const envelope = {
+    const envelope: CliCreateBatchDryRunResponse = {
       dryRun: true,
       method: 'POST',
       pathTemplate: '/api/cli/v1/tests/{testId}/runs',
