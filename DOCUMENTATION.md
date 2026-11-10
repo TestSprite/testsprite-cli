@@ -410,6 +410,23 @@ testsprite test create --plan-from ./checkout.plan.json --dry-run --output json
 
 Bulk-create frontend tests from a JSONL plan-steps file (or a directory of plan files with `--plan-from-dir`). Optional `--run --max-concurrency <N>` fans out triggers. Without `--wait`, each run is dispatched (`status: "queued"`) and the command exits 0 when every trigger is accepted — mirroring single `test run` without `--wait`; a trigger error still exits non-zero. With `--wait`, it polls every run to terminal and exits non-zero if any run does not pass.
 
+**JSON output with `--run`.** The top-level `results` array remains the per-test run results. A separate additive `creation` object preserves the original batch-create receipt, including failures for individual specs that were not created:
+
+```json
+{
+  "results": [{ "testId": "test_xxxxxxxx", "runId": "run_xxxxxxxx", "status": "passed" }],
+  "creation": {
+    "results": [
+      { "specIndex": 0, "testId": "test_xxxxxxxx", "status": "created", "dashboardUrl": "https://..." },
+      { "specIndex": 1, "status": "validation_error", "error": { "code": "VALIDATION_ERROR", "message": "Invalid plan" } }
+    ],
+    "summary": { "total": 2, "created": 1, "failed": 1 }
+  }
+}
+```
+
+The `creation` object has the same `{ results, summary }` shape as create-only JSON output. Each creation result retains its `specIndex`, status, optional error and optional `dashboardUrl`; the dashboard URL is omitted when unavailable or explicitly suppressed. This receipt is also included in interrupted/partial output and `--dry-run` JSON envelopes. Existing run-result rows, text output and exit codes are unchanged.
+
 ```bash
 testsprite test create-batch --plans ./plans.jsonl --run --max-concurrency 4 --output json
 testsprite test create-batch --plan-from-dir ./plans/ --dry-run --output json
