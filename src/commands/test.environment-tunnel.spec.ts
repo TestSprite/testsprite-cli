@@ -30,6 +30,10 @@ vi.mock('../lib/local-target.js', async importOriginal => ({
 const clientId = '11111111-2222-3333-4444-555555555555';
 const savedUrl = 'http://127.0.0.1:5173/';
 const common = { profile: 'default', output: 'json' as const, debug: false };
+/**
+ * Build an offline environment/tunnel fixture with configurable API responses.
+ * Capture requests and output, and inject shutdown events for interruption tests.
+ */
 function fixture(
   options: {
     url?: string;
@@ -354,6 +358,36 @@ describe('environment tunnel resolution', () => {
         .filter(c => c.method === 'POST' && c.path.endsWith('/runs'))
         .map(c => c.body.tunnelClientId),
     ).toEqual([clientId, clientId]);
+  });
+  it('forwards --skip-dependencies on every tunnel run', async () => {
+    const f = fixture();
+    await f.run('run', 'a', 'b', '--skip-dependencies', '--skip-preflight');
+    expect(
+      f.calls.filter(c => c.method === 'POST' && c.path.endsWith('/runs')).map(c => c.body),
+    ).toEqual([
+      expect.objectContaining({ skipDependencies: true }),
+      expect.objectContaining({ skipDependencies: true }),
+    ]);
+  });
+  it('sends a backend-only id set through batch/run even when the default environment is loopback', async () => {
+    const f = fixture({ type: 'backend' });
+    await f.run('run', 'a', 'b', '--skip-preflight');
+    expect(f.calls.filter(c => c.path === '/tunnel')).toEqual([]);
+    const posts = f.calls.filter(c => c.method === 'POST');
+    expect(posts.map(c => c.path)).toEqual(['/tests/batch/run']);
+    expect(posts[0]!.body).toMatchObject({ projectId: 'P', testIds: ['a', 'b'] });
+  });
+  it('keeps a mix of loopback and public ids inside the tunnel pool', async () => {
+    const f = fixture({
+      tests: [
+        { id: 'a', type: 'frontend', projectId: 'P' },
+        { id: 'b', type: 'frontend', projectId: 'Q' },
+      ],
+      envsByProject: { Q: [{ name: 'public', url: 'https://example.com', isDefault: true }] },
+    });
+    await f.run('run', 'a', 'b', '--skip-preflight');
+    expect(f.calls.some(c => c.path === '/tests/batch/run')).toBe(false);
+    expect(f.calls.filter(c => c.method === 'POST' && c.path.endsWith('/runs'))).toHaveLength(2);
   });
   it('--all automatically uses the tunnel batch pool', async () => {
     const f = fixture();
@@ -828,14 +862,12 @@ describe('environment tunnel resolution', () => {
     expect(JSON.parse(f.stdout[0]!)).toHaveProperty('run');
   });
 
-  it('ordinary several-id text output preserves the legacy refusal', async () => {
+  it('ordinary several-id text output dispatches via POST /tests/batch/run grouped by project', async () => {
     const f = fixture({ url: 'https://example.com' });
-    await expect(f.run('run', 'a', 'b', '--skip-preflight')).rejects.toMatchObject({
-      exitCode: 5,
-      details: { field: 'test-id' },
-    });
-    expect(f.calls.every(c => c.method === 'GET')).toBe(true);
-    expect(f.stdout).toEqual([]);
+    await f.run('run', 'a', 'b', '--skip-preflight');
+    const posts = f.calls.filter(c => c.method === 'POST');
+    expect(posts.map(c => c.path)).toEqual(['/tests/batch/run']);
+    expect(posts[0]!.body).toMatchObject({ projectId: 'P', testIds: ['a', 'b'], source: 'cli' });
   });
   it('an ad-hoc explicit loopback retry preserves the overriding port and host', () => {
     expect(
@@ -1023,16 +1055,21 @@ describe('environment tunnel resolution', () => {
   });
 
   it.each(['summary-file', 'report'])(
-    'ordinary several-id %s refuses before dispatch rather than losing batch artifacts',
+    'ordinary several-id %s is written by the batch run path',
     async flag => {
       const f = fixture({ url: 'https://example.com' });
       const path = join(mkdtempSync(join(tmpdir(), 'env-artifact-')), 'artifact');
       const args =
         flag === 'report' ? ['--report', 'junit', '--report-file', path] : ['--summary-file', path];
-      await expect(
-        f.run('run', 'a', 'b', '--wait', '--skip-preflight', ...args),
-      ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
-      expect(f.calls.some(c => c.method === 'POST')).toBe(false);
+      await f.run('run', 'a', 'b', '--wait', '--skip-preflight', ...args);
+      expect(f.calls.filter(c => c.method === 'POST').map(c => c.path)).toEqual([
+        '/tests/batch/run',
+      ]);
+
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- this test's own mkdtempSync temp path, never user input.
+      const written = readFileSync(path, 'utf8');
+      if (flag === 'report') expect(written).toContain('testId="a"');
+      else expect(JSON.parse(written)).toMatchObject({ total: 2, passed: 2 });
     },
   );
 
@@ -1234,95 +1271,6 @@ describe('environment tunnel resolution', () => {
       notRunTestIds: ['b'],
     });
   });
-  it('reports an old-server tunnel refusal when a deferred retry first accepts runs', async () => {
-    let dispatches = 0;
-    const f = fixture({
-      echo: false,
-      batchResponse: body => {
-        if (++dispatches > 1) return {};
-        return {
-          accepted: [],
-          deferred: (body.testIds as string[]).map(testId => ({ testId, reason: 'rate_limited' })),
-        };
-      },
-    });
-    const error = await runTestRerun(
-      {
-        ...common,
-        testIds: ['a', 'b'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 600,
-        maxConcurrency: 5,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-      },
-      f.deps,
-    ).catch(err => err);
-    expect(error).toMatchObject({
-      code: 'UNSUPPORTED',
-      message: expect.stringContaining('server did not confirm tunnel use'),
-    });
-    expect(f.calls.filter(call => call.path.endsWith('/cancel')).map(call => call.path)).toEqual([
-      '/runs/run_a/cancel',
-      '/runs/run_b/cancel',
-    ]);
-    expect(f.stdout).toHaveLength(1);
-    expect(JSON.parse(f.stdout[0]!)).toMatchObject({
-      accepted: [
-        { testId: 'a', runId: 'run_a' },
-        { testId: 'b', runId: 'run_b' },
-      ],
-      deferred: [],
-    });
-    expect(f.calls.at(-1)?.method).toBe('DELETE');
-  });
-
-  it('keeps accepted retry run IDs when the following retry dispatch is interrupted', async () => {
-    const interrupt = new InterruptError('SIGINT');
-    let dispatches = 0;
-    const f = fixture({
-      tests: [
-        { id: 'a', type: 'frontend', projectId: 'P' },
-        { id: 'b', type: 'frontend', projectId: 'Q' },
-      ],
-      envsByProject: {
-        P: [{ name: 'saved', url: savedUrl, isDefault: true }],
-        Q: [{ name: 'saved', url: 'http://localhost:3000', isDefault: true }],
-      },
-      batchResponse: body => {
-        dispatches++;
-        if (dispatches === 4) throw interrupt;
-        if (dispatches > 2) return {};
-        return {
-          accepted: [],
-          deferred: (body.testIds as string[]).map(testId => ({ testId, reason: 'rate_limited' })),
-        };
-      },
-    });
-    const error = await runTestRerun(
-      {
-        ...common,
-        testIds: ['a', 'b'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 600,
-        maxConcurrency: 5,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-      },
-      f.deps,
-    ).catch(err => err);
-    expect(error).toBe(interrupt);
-    expect(f.stdout).toHaveLength(1);
-    expect(JSON.parse(f.stdout[0]!)).toMatchObject({
-      accepted: [{ testId: 'a', runId: 'run_a' }],
-      deferred: [{ testId: 'b' }],
-    });
-    expect(f.calls.some(call => call.path === '/runs/run_a/cancel')).toBe(true);
-  });
 
   it('stops queued create-batch tunnel runs when polling fails without a terminal verdict', async () => {
     const f = fixture({ pollStatus: 404 });
@@ -1358,6 +1306,39 @@ describe('environment tunnel resolution', () => {
       ],
     });
   });
+
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'keeps one owned test-list partial envelope on %s during polling',
+    async signal => {
+      const shutdown = new ShutdownController();
+      const f = fixture({
+        shutdown,
+        poll: () => {
+          shutdown.interrupt(signal);
+          throw shutdown.signal.reason;
+        },
+      });
+      const error = await runTestlistRun(
+        { ...common, listId: 'L', wait: true, timeoutSeconds: 10, maxConcurrency: 5 },
+        f.deps,
+      ).catch((err: unknown) => err);
+
+      expect(error).toBe(shutdown.signal.reason);
+      expect(error).toMatchObject({ exitCode: signal === 'SIGINT' ? 130 : 143 });
+      expect(f.stdout).toHaveLength(1);
+      expect(JSON.parse(f.stdout[0]!)).toMatchObject({
+        accepted: [{ testId: 'a', runId: 'run_a', status: 'running' }],
+        conflicts: [],
+        deferred: [],
+        notRunTestIds: [],
+      });
+      // Owned tunnels retain their existing cleanup behavior; only the remote
+      // non-tunnel path detaches without cancelling runs.
+      expect(f.calls.filter(call => call.path.endsWith('/cancel')).map(call => call.path)).toEqual([
+        '/runs/run_a/cancel',
+      ]);
+    },
+  );
 
   it('uses distinct bounded idempotency keys for loopback test-list groups', async () => {
     const f = fixture({
@@ -1499,40 +1480,6 @@ describe('environment tunnel resolution', () => {
     });
   });
 
-  it('keeps run receipts when an owned rerun is interrupted during deferred backoff', async () => {
-    const interrupt = new InterruptError('SIGINT');
-    const f = fixture({
-      batchResponse: () => ({
-        accepted: [{ testId: 'a', runId: 'run_a', enqueuedAt: '2026-10-01T00:00:00Z' }],
-        deferred: [{ testId: 'b', reason: 'rate_limited' }],
-      }),
-    });
-    f.deps.sleep = async () => {
-      throw interrupt;
-    };
-    const error = await runTestRerun(
-      {
-        ...common,
-        testIds: ['a', 'b'],
-        all: false,
-        wait: true,
-        timeoutSeconds: 600,
-        maxConcurrency: 5,
-        autoHeal: false,
-        autoHealExplicit: false,
-        skipDependencies: false,
-      },
-      f.deps,
-    ).catch(err => err);
-    expect(error).toBe(interrupt);
-    expect(f.stdout).toHaveLength(1);
-    expect(JSON.parse(f.stdout[0]!)).toMatchObject({
-      accepted: [{ testId: 'a', runId: 'run_a' }],
-      deferred: [{ testId: 'b' }],
-    });
-    expect(f.calls.some(call => call.path === '/runs/run_a/cancel')).toBe(true);
-  });
-
   it('drains concurrent create-batch triggers before printing receipts and closing the tunnel', async () => {
     const f = fixture({ pollStatus: 404 });
     const original = f.deps.fetchImpl;
@@ -1636,28 +1583,27 @@ describe('environment tunnel resolution', () => {
 });
 
 describe('environment tunnel compatibility regressions', () => {
-  it('refuses several public-target ids before any request with the legacy reason', async () => {
-    const f = fixture({ url: 'https://example.com' });
-    await expect(
-      f.run('run', 'a', 'b', '--target-url', 'https://preview.example.com', '--skip-preflight'),
-    ).rejects.toMatchObject({
-      exitCode: 5,
-      details: {
-        field: 'test-id',
-        reason:
-          'several test ids run through one tunnel with --local <port>. For tests the runner can already reach, use `testsprite test run --all --project <id> [--filter <text>]`, or run them one at a time.',
-      },
+  it('dispatches several public-target ids as one batch run without a tunnel', async () => {
+    const f = fixture({
+      url: 'https://example.com',
+      batchResponse: body => ({ targetUrl: body.targetUrl }),
     });
-    expect(f.calls).toEqual([]);
+    await f.run('run', 'a', 'b', '--target-url', 'https://preview.example.com', '--skip-preflight');
+    const posts = f.calls.filter(c => c.method === 'POST');
+    expect(posts.map(c => c.path)).toEqual(['/tests/batch/run']);
+    expect(posts[0]!.body).toMatchObject({
+      projectId: 'P',
+      testIds: ['a', 'b'],
+      targetUrl: 'https://preview.example.com',
+    });
   });
-  it('refuses several ids after public environment resolution without dispatch', async () => {
+  it('dispatches several ids after public environment resolution as one batch run', async () => {
     const f = fixture({ url: 'https://example.com' });
-    await expect(f.run('run', 'a', 'b', '--skip-preflight')).rejects.toMatchObject({
-      exitCode: 5,
-      details: { field: 'test-id' },
+    await f.run('run', 'a', 'b', '--skip-preflight');
+    expect(f.calls.filter(c => c.method === 'POST').map(c => c.path)).toEqual(['/tests/batch/run']);
+    expect(JSON.parse(f.stdout[0]!)).toMatchObject({
+      accepted: [{ testId: 'a' }, { testId: 'b' }],
     });
-    expect(f.calls.every(c => c.method === 'GET')).toBe(true);
-    expect(f.stdout).toEqual([]);
   });
   it.each(['--tunnel-client', '--no-cancel-on-interrupt'])(
     'refuses inert %s before a public-target request',
@@ -1772,6 +1718,7 @@ describe('environment tunnel compatibility regressions', () => {
 });
 
 describe('creation tunnel preflight receipts', () => {
+  /** Write fixture plans with the requested test types for batch tunnel scenarios. */
   function plansFile(types: Array<'frontend' | 'backend'> = ['frontend', 'frontend']) {
     const plans = join(mkdtempSync(join(tmpdir(), 'creation-preflight-')), 'plans.jsonl');
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture-owned temporary directory.
