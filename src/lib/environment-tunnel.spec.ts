@@ -200,6 +200,7 @@ describe('withEnvironmentTunnel: waiting for batch capacity', () => {
       mkdtempSync(join(tmpdir(), 'env-tunnel-capacity-')),
       'credentials',
     );
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture-owned temporary file.
     writeFileSync(
       credentialsPath,
       '[default]\napi_url = https://api.example.com\napi_key = sk-user-test\n',
