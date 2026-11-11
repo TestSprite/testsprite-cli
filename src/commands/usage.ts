@@ -360,6 +360,7 @@ function renderUsage(u: UsageResponse, portalBase?: string): string {
 export function createUsageCommand(deps: UsageDeps = {}): Command {
   const cmd = new Command('usage')
     .alias('credits')
+    .summary('Show credit balance and plan info')
     .description(
       'Show credit balance and plan/entitlement info (proactive pre-flight before a large test run)',
     )
