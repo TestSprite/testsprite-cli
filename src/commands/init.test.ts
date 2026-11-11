@@ -90,20 +90,30 @@ function makeHangingFetch(): InitDeps['fetchImpl'] {
 }
 
 /** Mock fetch that returns 401 for any request (simulates bad key). */
-function makeAuthFailFetch(): InitDeps['fetchImpl'] {
+function makeAuthFailFetch(
+  overrides: {
+    status?: number;
+    code?: string;
+    message?: string;
+    nextAction?: string;
+    requestId?: string;
+  } = {},
+): InitDeps['fetchImpl'] {
+  const {
+    status = 401,
+    code = 'AUTH_INVALID',
+    message = 'Invalid API key',
+    nextAction = 'Provide a valid key.',
+    requestId = 'r-1',
+  } = overrides;
   return vi.fn(
     async () =>
       new Response(
         JSON.stringify({
-          error: {
-            code: 'AUTH_INVALID',
-            message: 'Invalid API key',
-            nextAction: 'Provide a valid key.',
-            requestId: 'r-1',
-          },
+          error: { code, message, nextAction, requestId },
         }),
         {
-          status: 401,
+          status,
           headers: { 'content-type': 'application/json' },
         },
       ),
@@ -2250,10 +2260,18 @@ describe('runInit -- skipIfConfigured', () => {
   it('skips the API key prompt and reuses saved credentials when the profile exists', async () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs } = makeMemFs();
-    // Write a saved key before running setup.
-    writeProfile('default', { apiKey: 'sk-saved' }, { path: credentialsPath });
-    // Provide a mock fetch that accepts /me so runWhoami (identity banner) succeeds.
-    const fetchMock = makeOkFetch();
+    // Write a saved key before running setup. Valid format, so the identity
+    // lookup reaches the server instead of failing the local format check.
+    writeProfile('default', { apiKey: 'sk-user-saved-key' }, { path: credentialsPath });
+    // Mock fetch that accepts /me and records every request it receives.
+    const requests: string[] = [];
+    const fetchMock = vi.fn(async (url: string, init: { method?: string }) => {
+      requests.push(`${init.method ?? 'GET'} ${new URL(url).pathname}`);
+      return new Response(JSON.stringify(ME), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as InitDeps['fetchImpl'];
     const prompt = { secret: vi.fn(async () => 'sk-should-never-be-asked') };
 
     await runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
@@ -2268,10 +2286,77 @@ describe('runInit -- skipIfConfigured', () => {
     // The prompt must never have fired.
     expect(prompt.secret).not.toHaveBeenCalled();
     // The saved key must be untouched.
-    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-saved');
-    // The summary must still be emitted.
-    const parsed = JSON.parse(captured.stdout.join('')) as { status: string };
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-saved-key');
+    // The saved key is checked against the server exactly once.
+    expect(requests).toEqual([expect.stringMatching(/^GET \S*\/me$/)]);
+    // The summary must still be emitted, with the identity the server returned
+    // rather than the placeholder used when the lookup fails.
+    const parsed = JSON.parse(captured.stdout.join('')) as {
+      status: string;
+      env: string;
+      scopes: string[];
+    };
     expect(parsed.status).toBe('initialized');
+    expect(parsed.env).toBe(ME.env);
+    expect(parsed.scopes).toEqual(ME.scopes);
+  });
+
+  it('fails with AUTH_INVALID instead of reporting success when the saved key is rejected', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    // A key that is still on disk but no longer accepted by the server.
+    // Valid format so the failure comes from the server, not the local format check.
+    writeProfile('default', { apiKey: 'sk-user-revoked-key' }, { path: credentialsPath });
+
+    // `--skip-if-configured` skips the configure-time GET /me, so whoami is the
+    // only call that reaches the server. Before this fix its 401 was swallowed
+    // and the run still printed an `initialized` summary with exit 0.
+    await expect(
+      runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
+        ...deps,
+        credentialsPath,
+        fetchImpl: makeAuthFailFetch(),
+        fs: agentFs,
+        isTTY: false,
+      }),
+    ).rejects.toMatchObject({ code: 'AUTH_INVALID', exitCode: 3 });
+
+    // No success summary may reach stdout.
+    expect(captured.stdout.join('')).not.toContain('initialized');
+  });
+
+  it('preserves the server error detail when the saved key is forbidden', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    writeProfile('default', { apiKey: 'sk-user-revoked-key' }, { path: credentialsPath });
+
+    // 403 rather than 401: a key the server still recognises but no longer
+    // authorises must fail the same way. The failure also has to carry the
+    // server's own remediation text and requestId through, because that is what
+    // an operator needs to open a support ticket -- a generic "setup failed"
+    // would lose both.
+    await expect(
+      runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
+        ...deps,
+        credentialsPath,
+        fetchImpl: makeAuthFailFetch({
+          status: 403,
+          code: 'AUTH_FORBIDDEN',
+          message: 'API key is not permitted for this organization',
+          nextAction: 'Ask an organization admin to grant access.',
+          requestId: 'r-403',
+        }),
+        fs: agentFs,
+        isTTY: false,
+      }),
+    ).rejects.toMatchObject({
+      code: 'AUTH_FORBIDDEN',
+      exitCode: 3,
+      requestId: 'r-403',
+      nextAction: 'Ask an organization admin to grant access.',
+    });
+
+    expect(captured.stdout.join('')).not.toContain('initialized');
   });
 
   it('proceeds to prompt when skipIfConfigured is true but no credentials exist', async () => {
