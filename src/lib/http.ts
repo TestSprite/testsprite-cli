@@ -248,6 +248,13 @@ export interface RequestOptions<T = unknown> {
    * existing request paths retain their retry behaviour.
    */
   retry?: boolean;
+  /**
+   * Called with the delay of each automatic retry wait (a transport backoff, a
+   * 429's `Retry-After`, a 5xx backoff) just before the wait starts. The run
+   * poll's stall guard uses it to restart its budget after the wait, so a
+   * retry inside one read is never mistaken for a silent connection.
+   */
+  onRetryWait?: (delayMs: number) => void;
 }
 
 const RETRY_BASE_MS = 250;
@@ -603,7 +610,12 @@ export class HttpClient {
    */
   async getRun(
     runId: string,
-    options?: { waitSeconds?: number; includeSteps?: boolean; signal?: AbortSignal },
+    options?: {
+      waitSeconds?: number;
+      includeSteps?: boolean;
+      signal?: AbortSignal;
+      onRetryWait?: (delayMs: number) => void;
+    },
   ): Promise<RunResponse> {
     const query: Record<string, number | boolean | undefined> = {};
     if (options?.waitSeconds !== undefined) {
@@ -616,6 +628,7 @@ export class HttpClient {
       query: Object.keys(query).length > 0 ? query : undefined,
       signal: options?.signal,
       schema: RUN_RESPONSE_SCHEMA,
+      onRetryWait: options?.onRetryWait,
     });
   }
 
@@ -939,6 +952,7 @@ export class HttpClient {
             allowTransportRetry,
           });
           requestTimeout.clear();
+          options.onRetryWait?.(delayMs);
           await this.sleepBeforeRetry(delayMs);
           continue;
         }
@@ -993,6 +1007,7 @@ export class HttpClient {
                 allowTransportRetry,
               });
               requestTimeout.clear();
+              options.onRetryWait?.(delayMs);
               await this.sleepBeforeRetry(delayMs);
               continue;
             }
@@ -1089,6 +1104,7 @@ export class HttpClient {
             delayMs: decision.delayMs,
           });
           requestTimeout.clear();
+          options.onRetryWait?.(decision.delayMs);
           await this.sleepBeforeRetry(decision.delayMs);
           continue;
         }
@@ -1166,6 +1182,7 @@ export class HttpClient {
           delayMs: decision.delayMs,
         });
         requestTimeout.clear();
+        options.onRetryWait?.(decision.delayMs);
         await this.sleepBeforeRetry(decision.delayMs);
       } finally {
         requestTimeout.clear();
@@ -1421,7 +1438,7 @@ interface RequestTimeoutHandle {
   clear: () => void;
 }
 
-interface AbortComposition {
+export interface AbortComposition {
   signal: AbortSignal;
   cleanup: () => void;
 }
@@ -1455,8 +1472,11 @@ interface AbortComposition {
  * `cleanup()` once the request settles (success, error, or retry) so the
  * listeners are removed immediately rather than left for a cleanup pass that,
  * for this composition, no longer exists.
+ *
+ * Exported for the run poll's per-read stall guard (`poll.ts`), which composes
+ * its stall signal with the poll session signal on every read.
  */
-function composeAbortSignals(signals: readonly AbortSignal[]): AbortComposition {
+export function composeAbortSignals(signals: readonly AbortSignal[]): AbortComposition {
   if (signals.length <= 1) {
     return { signal: signals[0]!, cleanup: () => {} };
   }
