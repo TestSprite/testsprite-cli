@@ -22,7 +22,13 @@ const JSON_HEADERS = {
   'x-request-id': SAMPLE_DRY_RUN_REQUEST_ID,
 };
 
-export function createDryRunFetch(): FetchImpl {
+export interface DryRunFetchOptions {
+  debug?: boolean;
+  stderr?: (line: string) => void;
+}
+
+export function createDryRunFetch(options?: DryRunFetchOptions): FetchImpl {
+  const stderrFn = options?.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   return async (input, init) => {
     const url = resolveUrl(input);
     const method = (init?.method ?? 'GET').toUpperCase();
@@ -38,7 +44,11 @@ export function createDryRunFetch(): FetchImpl {
         // practice fetch bodies are always JSON strings here).
         const raw = typeof init.body === 'string' ? init.body : String(init.body);
         requestBody = JSON.parse(raw);
-      } catch {
+      } catch (err) {
+        if (options?.debug) {
+          const reason = err instanceof Error ? err.message : String(err);
+          stderrFn(`[debug] dry-run request body parse failed: ${reason}`);
+        }
         // Unparseable body — leave requestBody undefined; samples fall
         // back to their no-input defaults.
       }

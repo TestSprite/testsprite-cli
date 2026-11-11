@@ -607,6 +607,63 @@ describe('R-FE1: FE rerun — queued (no --wait)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Debug diagnostics for best-effort lookups
+// ---------------------------------------------------------------------------
+
+describe('runTestRerun — debug diagnostics for best-effort lookups', () => {
+  it('reports a failed test type lookup on stderr only in debug mode without altering output', async () => {
+    const runOnce = async (debug: boolean): Promise<{ stdout: string; stderr: string[] }> => {
+      const rerunResp = makeFeRerunResp();
+      const fetchImpl = makeFetch(url => {
+        if (url.includes('/tests/test_fe_01/runs/rerun')) return { body: rerunResp };
+        if (/\/tests\/test_fe_01(\?|$)/.test(url)) return errorBody('NOT_FOUND');
+        return errorBody('NOT_FOUND');
+      });
+      const creds = makeCreds();
+      const printed: string[] = [];
+      const stderr: string[] = [];
+      await runTestRerun(
+        {
+          testIds: ['test_fe_01'],
+          all: false,
+          wait: false,
+          timeoutSeconds: 600,
+          autoHeal: true,
+          autoHealExplicit: false,
+          skipDependencies: false,
+          maxConcurrency: 10,
+          output: 'json',
+          profile: 'default',
+          dryRun: false,
+          debug,
+          verbose: false,
+          idempotencyKey: 'cli-rerun-debug-test',
+        },
+        {
+          ...creds,
+          sleep: instantSleep,
+          fetchImpl,
+          stdout: line => printed.push(line),
+          stderr: line => stderr.push(line),
+        },
+      );
+      return { stdout: printed.join('\n'), stderr };
+    };
+
+    const debugRun = await runOnce(true);
+    const normalRun = await runOnce(false);
+
+    expect(debugRun.stdout).toBe(normalRun.stdout);
+    expect(
+      debugRun.stderr.some(line =>
+        line.includes('[debug] rerun auto-heal test type lookup failed:'),
+      ),
+    ).toBe(true);
+    expect(normalRun.stderr.filter(line => line.includes('[debug]'))).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // R-FE1: Single FE rerun with --wait
 // ---------------------------------------------------------------------------
 

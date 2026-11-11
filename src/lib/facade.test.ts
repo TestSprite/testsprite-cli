@@ -146,4 +146,51 @@ describe('TESTSPRITE_PORTAL_URL override', () => {
     vi.stubEnv('TESTSPRITE_PORTAL_URL', '   ');
     expect(resolvePortalBase('https://api.testsprite.com')).toBe('https://www.testsprite.com');
   });
+
+  it('reports invalid override url on stderr only in debug mode without altering output', () => {
+    vi.stubEnv('TESTSPRITE_PORTAL_URL', 'not-a-url');
+    const stderrDebug: string[] = [];
+    const stderrNormal: string[] = [];
+
+    const resultDebug = resolvePortalBase('https://api.testsprite.com', {
+      debug: true,
+      stderr: line => stderrDebug.push(line),
+    });
+    const resultNormal = resolvePortalBase('https://api.testsprite.com', {
+      debug: false,
+      stderr: line => stderrNormal.push(line),
+    });
+    const resultDefault = resolvePortalBase('https://api.testsprite.com');
+
+    expect(resultDebug).toBeUndefined();
+    expect(resultNormal).toBeUndefined();
+    expect(resultDefault).toBeUndefined();
+    expect(resultNormal).toEqual(resultDefault);
+    expect(stderrDebug.some(l => l.includes('[debug] portal override url parse failed:'))).toBe(
+      true,
+    );
+    expect(stderrNormal).toEqual([]);
+  });
+
+  it('reports invalid api url on stderr only in debug mode without altering output', () => {
+    const stderrDebug: string[] = [];
+    const stderrNormal: string[] = [];
+
+    const resultDebug = resolvePortalBase('not a valid url', {
+      debug: true,
+      stderr: line => stderrDebug.push(line),
+    });
+    const resultNormal = resolvePortalBase('not a valid url', {
+      debug: false,
+      stderr: line => stderrNormal.push(line),
+    });
+    const resultDefault = resolvePortalBase('not a valid url');
+
+    expect(resultDebug).toBeUndefined();
+    expect(resultNormal).toBeUndefined();
+    expect(resultDefault).toBeUndefined();
+    expect(resultNormal).toEqual(resultDefault);
+    expect(stderrDebug.some(l => l.includes('[debug] portal api url parse failed:'))).toBe(true);
+    expect(stderrNormal).toEqual([]);
+  });
 });

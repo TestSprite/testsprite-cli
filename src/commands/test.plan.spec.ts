@@ -453,6 +453,56 @@ describe('runPlanGenerate — happy path', () => {
     expect(printed).toEqual(result);
   });
 
+  it('reports a failed baseline read on stderr only in debug mode without altering output', async () => {
+    const runOnce = async (debug: boolean): Promise<{ stdout: string; stderr: string[] }> => {
+      let reads = 0;
+      const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+        const url = typeof input === 'string' ? input : (input as { url: string }).url;
+        const method = (init.method ?? 'GET').toUpperCase();
+        if (method === 'POST' && url.includes('/plans/generate')) {
+          return new Response(JSON.stringify(accepted('proposals', [])), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        reads += 1;
+        if (reads === 1) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                code: 'NOT_FOUND',
+                message: 'boom',
+                nextAction: '',
+                requestId: 'req_x',
+                details: {},
+              },
+            }),
+            { status: 404, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response(JSON.stringify(stagedPlans()), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }) as FetchImpl;
+      const capture: Capture = { stdout: [], stderr: [] };
+      await runPlanGenerate(
+        baseOpts({ debug, idempotencyKey: 'cli-plan-debug-test' }),
+        makeDeps(fetchImpl, capture) as never,
+      );
+      return { stdout: capture.stdout.join('\n'), stderr: capture.stderr };
+    };
+
+    const debugRun = await runOnce(true);
+    const normalRun = await runOnce(false);
+
+    expect(debugRun.stdout).toBe(normalRun.stdout);
+    expect(
+      debugRun.stderr.some(line => line.includes('[debug] plan baseline lookup failed:')),
+    ).toBe(true);
+    expect(normalRun.stderr.filter(line => line.includes('[debug]'))).toEqual([]);
+  });
+
   // A facade-side billing failure degrades the wire block to
   // `{charged: [], balance: null}` — charged is DEFINED there, so the
   // undefined-guard alone would diff the settled lifetime totals against an

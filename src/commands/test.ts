@@ -1505,6 +1505,7 @@ export async function runCreate(
   opts: CreateOptions,
   deps: TestDeps = {},
 ): Promise<CliCreateTestResponse> {
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   if (opts.environment !== undefined && opts.run !== true) {
     throw localValidationError('env', '--env requires --run');
   }
@@ -1736,7 +1737,10 @@ export async function runCreate(
       () =>
         opts.dryRun
           ? undefined
-          : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId),
+          : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId, {
+              debug: opts.debug,
+              stderr: stderrFn,
+            }),
     );
     const runDashboardStderrFn =
       deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
@@ -1800,7 +1804,10 @@ export async function runCreate(
     () =>
       opts.dryRun
         ? undefined
-        : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId),
+        : resolvePortalUrl(resolveApiUrl(opts, deps), projectId, response.testId, {
+            debug: opts.debug,
+            stderr: stderrFn,
+          }),
   );
   const dashboardUrl = responseWithDashboardUrl.dashboardUrl ?? undefined;
   if (opts.output === 'json') {
@@ -3777,7 +3784,10 @@ export async function runCreateFromPlan(
     withDashboardUrl(response, () =>
       opts.dryRun
         ? undefined
-        : resolvePortalUrl(resolveApiUrl(opts, deps), plan.projectId, response.testId),
+        : resolvePortalUrl(resolveApiUrl(opts, deps), plan.projectId, response.testId, {
+            debug: opts.debug,
+            stderr: stderrFn,
+          }),
     );
   const planDashboardUrl = responseWithDashboardUrl.dashboardUrl ?? undefined;
 
@@ -7245,6 +7255,7 @@ export async function runFailureGet(
 ): Promise<FailureGetResult> {
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
   // Resolve and validate --out BEFORE the network call so an empty path,
   // an existing file, or a file where a parent directory should be
@@ -7302,6 +7313,8 @@ export async function runFailureGet(
       fetchImpl: deps.fetchImpl,
       shutdownSignal: shutdownOf(deps).signal,
       shutdown: shutdownOf(deps),
+      debug: opts.debug,
+      stderr: stderrFn,
     });
     if (opts.output === 'json') {
       out.print({ ok: true, dir: bundle.dir, meta: bundle.meta, files: bundle.files });
@@ -7947,13 +7960,15 @@ export function renderRunResponseText(
  * (backend-v2.0 #551/#555) the wait fallback rarely fires — so a backend run
  * card would otherwise show a misleading `steps 0/0 (passed=0, failed=0)`.
  */
-async function resolveRunCardIsBackend(
+export async function resolveRunCardIsBackend(
   client: ResultReadClient,
   testId: string | undefined,
   output: string,
   alreadyKnown: boolean,
   status: string,
   knownType?: CliTest['type'],
+  stderrFn?: (line: string) => void,
+  debug?: boolean,
 ): Promise<boolean> {
   if (alreadyKnown) return true;
   if (knownType !== undefined) return knownType === 'backend';
@@ -7969,6 +7984,10 @@ async function resolveRunCardIsBackend(
     return test.type === 'backend';
   } catch (err) {
     if (err instanceof InterruptError) throw err;
+    if (debug && stderrFn) {
+      const reason = err instanceof Error ? err.message : String(err);
+      stderrFn(`[debug] run card backend type lookup failed: ${reason}`);
+    }
     return false; // best-effort — fall back to the numeric step summary.
   } finally {
     clearTimeout(timer);
@@ -9123,6 +9142,8 @@ export async function runTestRun(
       beFallbackUsed || opts.type === 'backend',
       finalRun.status,
       polledType,
+      stderrFn,
+      opts.debug,
     );
 
     const finalRunWithUrl = withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps));
@@ -9937,6 +9958,8 @@ export async function runTestWait(
     beFallbackUsed,
     finalRun.status,
     polledType,
+    stderrFn,
+    opts.debug,
   );
 
   out.print(withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)), data =>
@@ -10052,9 +10075,11 @@ export interface RunTestRunAllOptions extends CommonOptions {
  * bounded by a 5 s deadline. Ordinary lookup errors leave a missing/partial
  * map that falls back to ids; interrupts propagate.
  */
-async function buildTestNameMap(
+export async function buildTestNameMap(
   client: HttpClient,
   projectId: string | undefined,
+  stderrFn?: (line: string) => void,
+  debug?: boolean,
 ): Promise<Map<string, string>> {
   const map = new Map<string, string>();
   if (!projectId) return map;
@@ -10074,6 +10099,10 @@ async function buildTestNameMap(
     }
   } catch (err) {
     if (err instanceof InterruptError) throw err;
+    if (debug && stderrFn) {
+      const reason = err instanceof Error ? err.message : String(err);
+      stderrFn(`[debug] junit test name lookup failed: ${reason}`);
+    }
     // best-effort — a partial/empty map simply falls back to ids in the report.
   } finally {
     clearTimeout(timer);
@@ -10125,10 +10154,14 @@ export async function writeBatchJUnitReportIfRequested(
 async function buildTestNameMapForProjects(
   client: HttpClient,
   projectIds: readonly string[],
+  stderrFn?: (line: string) => void,
+  debug?: boolean,
 ): Promise<Map<string, string>> {
   const merged = new Map<string, string>();
   for (const projectId of projectIds) {
-    for (const [id, name] of await buildTestNameMap(client, projectId)) merged.set(id, name);
+    for (const [id, name] of await buildTestNameMap(client, projectId, stderrFn, debug)) {
+      merged.set(id, name);
+    }
   }
   return merged;
 }
@@ -11934,8 +11967,13 @@ export async function runTestRunAll(
   const freshNameMap =
     opts.report === 'junit' && opts.reportFile !== undefined
       ? explicitIds
-        ? await buildTestNameMapForProjects(client, [...new Set(projectOf.values())])
-        : await buildTestNameMap(client, opts.projectId)
+        ? await buildTestNameMapForProjects(
+            client,
+            [...new Set(projectOf.values())],
+            stderrFn,
+            opts.debug,
+          )
+        : await buildTestNameMap(client, opts.projectId, stderrFn, opts.debug)
       : undefined;
   const ciSummary = summarizeAcceptedPayload(
     JSON.stringify({
@@ -13320,6 +13358,10 @@ async function runTestRerunCore(
         }
       } catch (err) {
         if (err instanceof InterruptError) throw err;
+        if (opts.debug) {
+          const reason = err instanceof Error ? err.message : String(err);
+          stderrFn(`[debug] rerun auto-heal test type lookup failed: ${reason}`);
+        }
         // Best-effort: don't fail on a lookup error; server will gate anyway.
       }
     }
@@ -14005,6 +14047,8 @@ async function runTestRerunCore(
       beFallbackUsed || isBERerun,
       finalRun.status,
       opts.knownTests?.get(testId)?.type ?? polledType,
+      stderrFn,
+      opts.debug,
     );
 
     out.print(withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)), data =>
@@ -14632,7 +14676,7 @@ async function runTestRerunCore(
   };
   const rerunNameMap =
     opts.report === 'junit' && opts.reportFile !== undefined
-      ? await buildTestNameMap(client, opts.projectId)
+      ? await buildTestNameMap(client, opts.projectId, stderrFn, opts.debug)
       : undefined;
   await writeBatchJUnitReportIfRequested(
     opts,
@@ -14826,6 +14870,7 @@ export async function runArtifactGet(
   deps: TestDeps = {},
 ): Promise<ArtifactGetResult> {
   const out = makeOutput(opts.output, deps);
+  const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const { runId } = opts;
 
   // Resolve output dir: explicit --out or the default .testsprite/runs/<runId>/
@@ -14915,6 +14960,8 @@ export async function runArtifactGet(
     fetchImpl: deps.fetchImpl,
     shutdownSignal: shutdownOf(deps).signal,
     shutdown: shutdownOf(deps),
+    debug: opts.debug,
+    stderr: stderrFn,
   });
 
   if (opts.output === 'json') {
@@ -16469,6 +16516,10 @@ export async function runFlaky(
     isBackend = test.type === 'backend';
   } catch (err) {
     if (err instanceof InterruptError) throw err;
+    if (opts.debug) {
+      const reason = err instanceof Error ? err.message : String(err);
+      stderrFn(`[debug] replay credit advisory test type lookup failed: ${reason}`);
+    }
     // best-effort — proceed without the advisory.
   }
   if (isBackend) {
@@ -18759,6 +18810,10 @@ export async function runPlanGenerate(
       });
     } catch (err) {
       if (err instanceof InterruptError) throw err;
+      if (opts.debug) {
+        const reason = err instanceof Error ? err.message : String(err);
+        stderrFn(`[debug] plan baseline lookup failed: ${reason}`);
+      }
       baselinePlans = null;
     }
 

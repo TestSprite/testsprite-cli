@@ -49,4 +49,47 @@ describe('createDryRunFetch', () => {
     const res = await fetch('https://api.testsprite.com/api/cli/v1/projects?pageSize=2');
     expect(res.status).toBe(200);
   });
+
+  it('reports unparseable body on stderr only in debug mode without altering output', async () => {
+    const stderrDebug: string[] = [];
+    const stderrNormal: string[] = [];
+
+    const fetchDebug = createDryRunFetch({
+      debug: true,
+      stderr: line => stderrDebug.push(line),
+    });
+    const fetchNormal = createDryRunFetch({
+      debug: false,
+      stderr: line => stderrNormal.push(line),
+    });
+    const fetchDefault = createDryRunFetch();
+
+    const invalidBody = '{ invalid json';
+    const resDebug = await fetchDebug('https://api.testsprite.com/api/cli/v1/projects', {
+      method: 'POST',
+      body: invalidBody,
+    });
+    const resNormal = await fetchNormal('https://api.testsprite.com/api/cli/v1/projects', {
+      method: 'POST',
+      body: invalidBody,
+    });
+    const resDefault = await fetchDefault('https://api.testsprite.com/api/cli/v1/projects', {
+      method: 'POST',
+      body: invalidBody,
+    });
+
+    const bodyDebug = await resDebug.text();
+    const bodyNormal = await resNormal.text();
+    const bodyDefault = await resDefault.text();
+
+    expect(resDebug.status).toBe(200);
+    expect(resNormal.status).toBe(200);
+    expect(resDefault.status).toBe(200);
+    expect(bodyNormal).toBe(bodyDefault);
+    expect(bodyDebug).toBe(bodyDefault);
+    expect(stderrDebug.some(l => l.includes('[debug] dry-run request body parse failed:'))).toBe(
+      true,
+    );
+    expect(stderrNormal).toEqual([]);
+  });
 });
