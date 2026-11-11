@@ -51,6 +51,8 @@ function makeFlakyFetch(opts: {
   triggerAuthError?: TriggerAuthErrorCode;
   /** Advisories echoed on every `POST /runs/rerun` response. */
   advisories?: RerunAdvisory[];
+  /** Make the best-effort `GET /tests/{id}` type probe fail. */
+  failTestLookup?: boolean;
 }): {
   fetchImpl: FetchImpl;
   triggerCount: () => number;
@@ -65,6 +67,16 @@ function makeFlakyFetch(opts: {
     const method = (init.method ?? 'GET').toUpperCase();
 
     if (method === 'GET' && /\/tests\/[^/]+$/.test(url.split('?')[0]!)) {
+      if (opts.failTestLookup) {
+        return jsonResponse(404, {
+          error: {
+            code: 'NOT_FOUND',
+            message: 'lookup failed',
+            requestId: 'req_lookup',
+            details: {},
+          },
+        });
+      }
       return jsonResponse(200, {
         id: 'test_x',
         projectId: 'project_abc',
@@ -381,6 +393,42 @@ describe('runFlaky', () => {
       deps,
     );
     expect(stderr.some(l => l.includes('backend test') && l.includes('credits'))).toBe(true);
+  });
+
+  it('reports a failed type lookup on stderr only in debug mode without altering output', async () => {
+    const runOnce = async (debug: boolean): Promise<{ stdout: string; stderr: string[] }> => {
+      const { fetchImpl } = makeFlakyFetch({
+        statuses: ['passed'],
+        failTestLookup: true,
+      });
+      const { deps, stdout, stderr } = makeDeps(fetchImpl);
+      await runFlaky(
+        {
+          profile: 'default',
+          output: 'json',
+          dryRun: false,
+          debug,
+          verbose: false,
+          testId: 'test_x',
+          runs: 1,
+          untilFail: false,
+          timeoutSeconds: 600,
+        },
+        deps,
+      );
+      return { stdout: stdout.join('\n'), stderr };
+    };
+
+    const debugRun = await runOnce(true);
+    const normalRun = await runOnce(false);
+
+    expect(debugRun.stdout).toBe(normalRun.stdout);
+    expect(
+      debugRun.stderr.some(line =>
+        line.includes('[debug] replay credit advisory test type lookup failed:'),
+      ),
+    ).toBe(true);
+    expect(normalRun.stderr.filter(line => line.includes('[debug]'))).toEqual([]);
   });
 
   it('emits a machine-readable JSON stability report', async () => {

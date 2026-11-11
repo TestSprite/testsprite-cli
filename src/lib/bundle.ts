@@ -119,6 +119,8 @@ export interface WriteBundleOptions {
   shutdown?: Pick<ShutdownHandle, 'runCriticalOperation'>;
   /** Server requestId to embed in `.partial` on failure. */
   requestId?: string;
+  debug?: boolean;
+  stderr?: (line: string) => void;
 }
 
 export interface WriteBundleResult {
@@ -379,12 +381,22 @@ const KNOWN_VIDEO_EXTENSIONS = new Set(['mp4', 'webm', 'mov', 'mkv', 'avi']);
  * URL is malformed or its extension isn't a recognized container, so a
  * response-controlled field can never smuggle an arbitrary suffix onto disk.
  */
-export function pickVideoExtension(url: string): string {
+export interface PickVideoExtensionOptions {
+  debug?: boolean;
+  stderr?: (line: string) => void;
+}
+
+export function pickVideoExtension(url: string, opts?: PickVideoExtensionOptions): string {
   try {
     const match = /\.([A-Za-z0-9]+)$/.exec(new URL(url).pathname);
     const ext = match?.[1]?.toLowerCase();
     if (ext !== undefined && KNOWN_VIDEO_EXTENSIONS.has(ext)) return ext;
-  } catch {
+  } catch (err) {
+    if (opts?.debug) {
+      const reason = err instanceof Error ? err.message : String(err);
+      const stderr = opts.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+      stderr(`[debug] video extension parse failed: ${reason}`);
+    }
     // Malformed URL — fall through to the default below.
   }
   return 'mp4';
@@ -523,7 +535,10 @@ export async function writeBundle(
     // it on the wire. Extension matches the actual recording container
     // (some runs ship `.webm`, not `.mp4`).
     if (filtered.result.videoUrl) {
-      const videoFile = `video.${pickVideoExtension(filtered.result.videoUrl)}`;
+      const videoFile = `video.${pickVideoExtension(filtered.result.videoUrl, {
+        debug: options.debug,
+        stderr: options.stderr,
+      })}`;
       await streamUrlToFile(
         filtered.result.videoUrl,
         join(tmpDir, videoFile),

@@ -567,6 +567,29 @@ describe('pickVideoExtension', () => {
   it('falls back to mp4 on a malformed URL rather than throwing', () => {
     expect(pickVideoExtension('not a url')).toBe('mp4');
   });
+
+  it('reports malformed video url on stderr only in debug mode without altering output', () => {
+    const stderrDebug: string[] = [];
+    const stderrNormal: string[] = [];
+
+    const resultDebug = pickVideoExtension('not a valid url', {
+      debug: true,
+      stderr: line => stderrDebug.push(line),
+    });
+    const resultNormal = pickVideoExtension('not a valid url', {
+      debug: false,
+      stderr: line => stderrNormal.push(line),
+    });
+    const resultDefault = pickVideoExtension('not a valid url');
+
+    expect(resultDebug).toBe('mp4');
+    expect(resultNormal).toBe('mp4');
+    expect(resultDefault).toBe('mp4');
+    expect(resultNormal).toBe(resultDefault);
+    expect(resultDebug).toBe(resultDefault);
+    expect(stderrDebug.some(l => l.includes('[debug] video extension parse failed:'))).toBe(true);
+    expect(stderrNormal).toEqual([]);
+  });
 });
 
 describe('stepFilenamePrefix', () => {

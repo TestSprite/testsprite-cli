@@ -43,12 +43,18 @@ export function facadeBaseUrl(endpointUrl: string): string {
  *
  * Deep-link path: {portalBase}/dashboard/tests/{projectId}/test/{testId}
  */
+export interface ResolvePortalOptions {
+  debug?: boolean;
+  stderr?: (line: string) => void;
+}
+
 export function resolvePortalUrl(
   apiUrl: string,
   projectId: string,
   testId: string,
+  opts?: ResolvePortalOptions,
 ): string | undefined {
-  const portalBase = resolvePortalBase(apiUrl);
+  const portalBase = resolvePortalBase(apiUrl, opts);
   if (portalBase === undefined) return undefined;
 
   // R4: encode path segments so future opaque ids (e.g. containing '#' or '?')
@@ -63,7 +69,8 @@ export function resolvePortalUrl(
  * here); returns undefined for unknown hosts so callers emit nothing rather
  * than a wrong-environment link.
  */
-export function resolvePortalBase(apiUrl: string): string | undefined {
+export function resolvePortalBase(apiUrl: string, opts?: ResolvePortalOptions): string | undefined {
+  const stderrFn = opts?.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   // Operator override: lets any non-prod environment point dashboard links at
   // its own Portal without a code mapping. Set-but-invalid → undefined: when
   // the caller explicitly chose an origin, falling back to the host mapping
@@ -75,7 +82,11 @@ export function resolvePortalBase(apiUrl: string): string | undefined {
       if (parsedOverride.protocol === 'https:' || parsedOverride.protocol === 'http:') {
         return override.endsWith('/') ? override.slice(0, -1) : override;
       }
-    } catch {
+    } catch (err) {
+      if (opts?.debug) {
+        const reason = err instanceof Error ? err.message : String(err);
+        stderrFn(`[debug] portal override url parse failed: ${reason}`);
+      }
       // fall through to undefined below
     }
     return undefined;
@@ -92,7 +103,11 @@ export function resolvePortalBase(apiUrl: string): string | undefined {
   let parsed: URL;
   try {
     parsed = new URL(raw);
-  } catch {
+  } catch (err) {
+    if (opts?.debug) {
+      const reason = err instanceof Error ? err.message : String(err);
+      stderrFn(`[debug] portal api url parse failed: ${reason}`);
+    }
     return undefined;
   }
 

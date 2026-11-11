@@ -343,7 +343,7 @@ function resolveHttpClientOptions(opts: CommonOptions, deps: ClientFactoryDeps):
     return {
       baseUrl: facadeBaseUrl(dryRunEndpoint),
       apiKey: DRY_RUN_API_KEY,
-      fetchImpl: deps.fetchImpl ?? createDryRunFetch(),
+      fetchImpl: deps.fetchImpl ?? createDryRunFetch({ debug: opts.debug, stderr }),
       onDebug: opts.debug ? (event: DebugEvent) => stderr(formatDryRunDebug(event)) : undefined,
       onTransition: opts.verbose ? (msg: string) => stderr(`[verbose] ${msg}`) : undefined,
       env,
