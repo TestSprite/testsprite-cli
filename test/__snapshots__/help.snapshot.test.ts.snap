@@ -184,7 +184,8 @@ Options:
                                   TESTSPRITE_PROJECT_ID)
   --all                           run all project tests (already the default)
   --filter <substr>               only run tests whose name contains this
-                                  substring
+                                  non-empty substring (case-insensitive); omit
+                                  to run every test
   --env <name>                    the environment whose sign-in the run uses
                                   (unknown names fail). In a pull request, with
                                   --target-url, the run happens in a temporary
@@ -656,9 +657,11 @@ V2 runs keep their billing, and an in-flight Lambda finishes with its result dis
 
 Exit codes:
   0  cancelled (fresh or already-cancelled — naturally idempotent)
-  1  multi-id: a cancel request failed (auth/transport/server error; see summary.errors)
+  1  multi-id: a cancel request failed (transport/server error; see summary.errors)
+  3  auth error (multi-id: a rejected key on any id — outranks 1, 4, 6 and 14)
   4  run id not found (single id), or ANY id not found (multi-id; outranks conflict)
   6  run already terminal (passed/failed/blocked); multi-id: any conflict
+  14 client too old (multi-id: on any id — outranks 1, 4 and 6)
 
 Multi-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound, errors}.
 
@@ -809,7 +812,8 @@ Options:
                              the cloud, so it can be wrong, e.g. behind an IP
                              allowlist) (default: false)
   --idempotency-key <token>  idempotency token for the batch (1-256 ASCII
-                             chars; default: random UUID, pin one for safe
+                             chars; with --run, each trigger key is derived
+                             from it; default: random UUID, pin one for safe
                              retries)
   -h, --help                 display help for command
 
@@ -835,7 +839,7 @@ Exit codes:
 
 Options:
   --out <dir>    directory to write the bundle into (default: print the
-                 envelope to stdout)
+                 envelope to stdout); missing parent directories are created
   --failed-only  with --out: trim to the failed step ±1 (usually a no-op; \`test
                  steps <id>\` has the full trail)
   -h, --help     display help for command
@@ -1038,7 +1042,8 @@ Options:
                               accepted:
                               draft|ready|queued|running|passed|failed|blocked|cancelled|unknown)
   --filter <substr>           with --all: only rerun tests whose name contains
-                              this substring (case-insensitive)
+                              this non-empty substring (case-insensitive); omit
+                              to rerun every test
   --wait                      block until terminal status or --timeout elapses
                               (default: false)
   --no-wait                   detach without opening an automatic environment
@@ -1206,7 +1211,8 @@ Options:
   --project <id>              project id for --all (overrides
                               TESTSPRITE_PROJECT_ID)
   --filter <substr>           with --all: only run tests whose name contains
-                              this substring (case-insensitive)
+                              this non-empty substring (case-insensitive); omit
+                              to run every test
   --status <list>             with --all: only run tests whose latest status
                               matches one of these values (comma-separated;
                               accepted:

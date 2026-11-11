@@ -24,6 +24,7 @@ import {
   readSync,
   readdirSync,
   statSync,
+  type Stats,
   type WriteStream,
 } from 'node:fs';
 import { rename, stat, unlink } from 'node:fs/promises';
@@ -56,6 +57,7 @@ import {
   resolveBatchReportProjectId,
   skippedJUnitResultsFromSummary,
   writeJUnitReportFile,
+  assertArtifactPath,
   type JUnitReportFormat,
   parseJUnitReportFormat,
   type JUnitTestResult,
@@ -85,6 +87,7 @@ import {
 } from '../lib/http.js';
 import type { FetchImpl } from '../lib/http.js';
 import type { HttpClient } from '../lib/http.js';
+import { CLI_TEST_CODE_SCHEMA } from '../lib/response-schemas.js';
 import { VERSION } from '../version.js';
 import {
   emitDeprecationEntry,
@@ -184,7 +187,7 @@ import {
   type TextTableColumn,
 } from '../lib/text-table.js';
 import { createLiveRunProgress, formatRunProgressLine } from '../lib/run-progress.js';
-import { createTicker } from '../lib/ticker.js';
+import { createTicker, terminalWidth } from '../lib/ticker.js';
 import { RateThrottle } from '../lib/rate-throttle.js';
 import { resolvePortalBase, resolvePortalUrl } from '../lib/facade.js';
 import { emitTargetUrlMismatchAdvisory } from '../lib/v3-advisory.js';
@@ -329,6 +332,18 @@ export interface CliTestCode {
   codeVersion: string | null;
   etag?: string | null;
 }
+
+/** The standalone code endpoint also serves draft, legacy, and newer server values. */
+export type CliTestCodeRead = Omit<
+  CliTestCode,
+  'language' | 'framework' | 'code' | 'codeVersion'
+> & {
+  language: string;
+  framework?: string;
+  code: string | null;
+  /** Legacy rows may omit it or send null; both mean "no version stamped yet". */
+  codeVersion?: string | null;
+};
 
 /** §6.4 TestStep wire shape. `null` is "not known", not "absent". */
 export interface CliTestStep {
@@ -819,7 +834,9 @@ async function cancelDoomedTunnelRun(args: {
   if (!args.enabled) return { outcome: 'skipped' };
   try {
     await withTeardownDeadline(args.opts, args.deps, client =>
-      client.post<CancelRunResponse>(`/runs/${encodeURIComponent(args.runId)}/cancel`),
+      client.post<CancelRunResponse>(`/runs/${encodeURIComponent(args.runId)}/cancel`, {
+        replaySafe: true,
+      }),
     );
     return { outcome: 'cancelled' };
   } catch (err) {
@@ -1270,6 +1287,37 @@ interface CreateOptions extends CommonOptions {
 }
 
 /**
+ * `test create` / `test create-batch`: `--wait`, `--timeout` and (batch only)
+ * `--max-concurrency` act on the runs `--run` triggers. Without `--run`
+ * nothing is triggered, so they are refused like `--env` instead of exiting 0
+ * with no run at all (#376). Each flag is passed as "given on the command line".
+ */
+function assertRunChainFlagsNeedRun(
+  run: boolean | undefined,
+  given: { wait?: boolean; timeout?: boolean; maxConcurrency?: boolean },
+): void {
+  if (run === true) return;
+  if (given.wait === true) {
+    throw localValidationError(
+      'wait',
+      '--wait requires --run (it polls the run that --run triggers). Add --run, or remove --wait',
+    );
+  }
+  if (given.timeout === true) {
+    throw localValidationError(
+      'timeout',
+      '--timeout requires --run (it bounds the wait for the run that --run triggers). Add --run, or remove --timeout',
+    );
+  }
+  if (given.maxConcurrency === true) {
+    throw localValidationError(
+      'max-concurrency',
+      '--max-concurrency requires --run (it caps the triggers --run keeps in flight). Add --run, or remove --max-concurrency',
+    );
+  }
+}
+
+/**
  * Chained `test create --run` / `test create --plan-from --run` derive the
  * trigger idempotency key as `<createKey>:run`. Validate that derived key
  * BEFORE the create POST so a near-limit user-supplied base key fails fast
@@ -1313,6 +1361,7 @@ async function emitDupNameAdvisoryIfNeeded(
   projectId: string | undefined,
   name: string | undefined,
   stderrFn: (line: string) => void,
+  debug?: boolean,
 ): Promise<void> {
   if (!projectId || !name) return;
   // B: ordinary advisory failures must not block the create critical path.
@@ -1350,6 +1399,10 @@ async function emitDupNameAdvisoryIfNeeded(
     }
   } catch (err) {
     if (err instanceof InterruptError) throw err;
+    if (debug) {
+      const reason = err instanceof Error ? err.message : String(err);
+      stderrFn(`[debug] duplicate-name advisory lookup failed: ${reason}`);
+    }
     // Other lookup failures are best-effort and must not block the create.
   } finally {
     clearTimeout(timer);
@@ -1450,6 +1503,10 @@ export async function runCreate(
   if (opts.environment !== undefined && opts.run !== true) {
     throw localValidationError('env', '--env requires --run');
   }
+  assertRunChainFlagsNeedRun(opts.run, {
+    wait: opts.wait,
+    timeout: opts.timeout !== undefined && opts.timeoutIsDefault !== true,
+  });
   normalizeEnvironmentName(opts.environment);
   // P1-2: validate idempotency key before any I/O — non-ASCII chars cause a
   // ByteString TypeError at the HTTP transport layer (exit 10 UNAVAILABLE).
@@ -1639,7 +1696,7 @@ export async function runCreate(
   // B3: best-effort duplicate-name advisory. Skip under --dry-run.
   if (!opts.dryRun) {
     const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
-    await emitDupNameAdvisoryIfNeeded(client, projectId, opts.name, stderrFn);
+    await emitDupNameAdvisoryIfNeeded(client, projectId, opts.name, stderrFn, opts.debug);
   }
 
   const response = await client.post<CliCreateTestResponse>('/tests', {
@@ -1961,7 +2018,6 @@ export async function runPlanPut(
   deps: TestDeps = {},
 ): Promise<CliPutPlanStepsResponse> {
   assertIdempotencyKey(opts.idempotencyKey);
-  requireNonEmpty('test-id', opts.testId);
   requireNonEmpty('steps', opts.stepsFile);
 
   if (
@@ -2374,7 +2430,6 @@ export async function runUpdate(
   deps: TestDeps = {},
 ): Promise<CliUpdateTestResponse> {
   assertIdempotencyKey(opts.idempotencyKey);
-  requireNonEmpty('test-id', opts.testId);
   // P1-3: client-side length checks matching server limits.
   if (opts.name !== undefined && opts.name.trim().length === 0) {
     throw localValidationError(
@@ -2517,7 +2572,6 @@ export async function runDelete(
   deps: TestDeps = {},
 ): Promise<CliDeleteTestResponse> {
   assertIdempotencyKey(opts.idempotencyKey);
-  requireNonEmpty('test-id', opts.testId);
 
   if (!opts.confirm && !opts.dryRun) {
     throw ApiError.fromEnvelope({
@@ -2593,6 +2647,21 @@ interface DeleteBatchOptions extends CommonOptions {
 }
 
 /**
+ * Track the member error a multi-id command exits with after its summary: one
+ * that fails EVERY id the same way — a rejected credential (exit 3) or a CLI too
+ * old for the backend (exit 14) — as the single-id form would, rather than
+ * folding it into the generic per-member failure (1). Auth outranks
+ * CLIENT_TOO_OLD, as in lib/wait-exit.ts; the first error of each kind is kept.
+ */
+function keepBatchWideError(current: ApiError | undefined, err: unknown): ApiError | undefined {
+  if (!(err instanceof ApiError)) return current;
+  const currentIsAuth = current !== undefined && isAuthCode(current.code);
+  if (isAuthCode(err.code)) return currentIsAuth ? current : err;
+  if (err.code === 'CLIENT_TOO_OLD') return current ?? err;
+  return current;
+}
+
+/**
  * `test delete-batch <test-ids...>` and `test delete --all --project <id>` — dogfood L1800.
  *
  * Deletes tests sequentially (to avoid hammering the server) and aggregates
@@ -2601,7 +2670,9 @@ interface DeleteBatchOptions extends CommonOptions {
  * object to stdout.
  *
  * Exit code: 0 if all targets were deleted (or `--dry-run`); 1 if any
- * deletion failed (server error); 5 if `--confirm` is missing.
+ * deletion failed (server error); 5 if `--confirm` is missing. A rejected key
+ * or a too-old CLI on any deletion exits with that error instead (3 / 14) —
+ * see {@link keepBatchWideError}.
  */
 export async function runDeleteBatch(
   opts: DeleteBatchOptions,
@@ -2732,6 +2803,7 @@ export async function runDeleteBatch(
   }
 
   const results: CliBulkDeleteResult[] = [];
+  let batchWide: ApiError | undefined;
 
   for (const testId of testIds) {
     const idempotencyKey = `cli-delete-${randomUUID()}`;
@@ -2752,6 +2824,7 @@ export async function runDeleteBatch(
       if (err instanceof ApiError && err.code === 'NOT_FOUND') {
         results.push({ testId, status: 'skipped', error: 'not found (already deleted?)' });
       } else {
+        batchWide = keepBatchWideError(batchWide, err);
         const msg = err instanceof Error ? err.message : String(err);
         results.push({ testId, status: 'error', error: msg });
       }
@@ -2770,6 +2843,7 @@ export async function runDeleteBatch(
 
   out.print(bulk, data => renderBulkDeleteText(data as CliBulkDeleteSummary));
 
+  if (batchWide !== undefined) throw batchWide;
   if (failed > 0) {
     throw new CLIError(
       `${failed} deletion${failed !== 1 ? 's' : ''} failed. See results for details.`,
@@ -2991,7 +3065,22 @@ export interface CliBatchRunResult {
 
 /** Envelope emitted by `test create-batch --run` in JSON mode. */
 export interface CliCreateBatchRunResponse {
+  /** Per-test run results; remains unchanged for existing consumers. */
   results: CliBatchRunResult[];
+  /** Original per-spec creation receipt, matching create-only JSON output. */
+  creation: CliCreateBatchResponse;
+}
+
+/** Dry-run variant of the `test create-batch --run` JSON envelope. */
+export interface CliCreateBatchDryRunResponse extends CliCreateBatchRunResponse {
+  dryRun: true;
+  method: 'POST';
+  pathTemplate: '/api/cli/v1/tests/{testId}/runs';
+  maxConcurrency: number | null;
+  wait: boolean;
+  timeoutSeconds: number;
+  testIds: string[];
+  thenPoll?: string;
 }
 
 /**
@@ -3540,6 +3629,10 @@ export async function runCreateFromPlan(
   if (opts.environment !== undefined && opts.run !== true) {
     throw localValidationError('env', '--env requires --run');
   }
+  assertRunChainFlagsNeedRun(opts.run, {
+    wait: opts.wait,
+    timeout: opts.timeout !== undefined && opts.timeoutIsDefault !== true,
+  });
   normalizeEnvironmentName(opts.environment);
   assertIdempotencyKey(opts.idempotencyKey);
   // codex #128 P2: validate the derived `<key>:run` chain key before the
@@ -3660,7 +3753,7 @@ export async function runCreateFromPlan(
   // The plan's projectId + name are available after validation above. Skip
   // under dry-run (no network calls); swallow all errors (advisory only).
   if (!opts.dryRun) {
-    await emitDupNameAdvisoryIfNeeded(client, plan.projectId, plan.name, stderrFn);
+    await emitDupNameAdvisoryIfNeeded(client, plan.projectId, plan.name, stderrFn, opts.debug);
   }
 
   const response = await client.post<CliCreateFromPlanResponse>('/tests', {
@@ -4063,6 +4156,11 @@ export async function runCreateBatch(
   if (opts.environment !== undefined && opts.run !== true) {
     throw localValidationError('env', '--env requires --run');
   }
+  assertRunChainFlagsNeedRun(opts.run, {
+    wait: opts.wait,
+    timeout: opts.timeoutSeconds !== undefined,
+    maxConcurrency: opts.maxConcurrency !== undefined,
+  });
   normalizeEnvironmentName(opts.environment);
   assertIdempotencyKey(opts.idempotencyKey);
   // Exactly one of --plans or --plan-from-dir is required.
@@ -4333,7 +4431,7 @@ export async function runCreateBatch(
   if (opts.run === true) {
     await withCreatedReceipt(opts, deps, response, runDeps =>
       runBatchRun(
-        opts,
+        { ...opts, idempotencyKey },
         response,
         runDeps.environmentTunnel?.client ?? client,
         makeOutput(opts.output, runDeps),
@@ -4371,7 +4469,7 @@ export async function runCreateBatch(
  *     that code only when ALL runs share the same code; otherwise 1.
  */
 async function runBatchRun(
-  opts: CreateBatchOptions,
+  opts: CreateBatchOptions & { idempotencyKey: string },
   createResponse: CliCreateBatchResponse,
   client: HttpClient,
   out: Output,
@@ -4397,6 +4495,17 @@ async function runBatchRun(
     .filter(r => r.status === 'created' && r.testId !== undefined)
     .map(r => r.testId as string);
 
+  // Match the create-only JSON receipt: preserve server links, normalize
+  // explicitly suppressed links, and use the same create-time fallback map.
+  const creationResults: CliBatchSpecResult[] =
+    !opts.dryRun && testIdToDashboardState !== undefined
+      ? createResponse.results.map(r => {
+          if (r.status !== 'created' || r.testId === undefined) return r;
+          const state = testIdToDashboardState.get(r.testId);
+          return state ? { ...r, dashboardUrl: state.dashboardUrl } : r;
+        })
+      : createResponse.results;
+
   if (testIds.length === 0) {
     // All specs failed at create time — already threw above; unreachable.
     return;
@@ -4411,9 +4520,9 @@ async function runBatchRun(
       codeVersion: 'v1',
     }));
     const envelope = {
-      dryRun: true,
-      method: 'POST',
-      pathTemplate: '/api/cli/v1/tests/{testId}/runs',
+      dryRun: true as const,
+      method: 'POST' as const,
+      pathTemplate: '/api/cli/v1/tests/{testId}/runs' as const,
       maxConcurrency: opts.maxConcurrency ?? null,
       wait: opts.wait ?? false,
       timeoutSeconds,
@@ -4421,7 +4530,19 @@ async function runBatchRun(
       ...(opts.wait ? { thenPoll: `/api/cli/v1/runs/<run-id>?waitSeconds=25` } : {}),
       results: dryRunResults,
     };
-    out.print(envelope);
+    if (opts.output === 'json') {
+      const jsonEnvelope: CliCreateBatchDryRunResponse = {
+        ...envelope,
+        creation: {
+          results: creationResults,
+          summary: createResponse.summary,
+        },
+      };
+      out.print(jsonEnvelope);
+    } else {
+      // Keep the pre-existing text-mode dry-run descriptor unchanged.
+      out.print(envelope);
+    }
     return;
   }
 
@@ -4508,6 +4629,18 @@ async function runBatchRun(
   const billingRunErrors: ApiError[] = [];
   const sleepFn = deps.sleep ?? defaultSleep;
   const shutdown = shutdownOf(deps);
+  const envListings = new Map<string, Promise<CliProjectEnvListResponse>>();
+  const listEnvironments = (projectId: string): Promise<CliProjectEnvListResponse> => {
+    let listing = envListings.get(projectId);
+    if (!listing) {
+      listing = client.get<CliProjectEnvListResponse>(
+        `/projects/${encodeURIComponent(projectId)}/env`,
+        { signal: shutdown.signal },
+      );
+      envListings.set(projectId, listing);
+    }
+    return listing;
+  };
   // Response-driven --target-url advisory, fired at most ONCE for the whole
   // batch (Finding 2's contract) the first time any member's trigger
   // response reports a target different from what was requested — see the
@@ -4547,8 +4680,21 @@ async function runBatchRun(
   const pendingTriggers = new Set<Promise<unknown>>();
 
   async function triggerOne(testId: string): Promise<CliBatchRunResult> {
-    // Mint a fresh idempotency key per run — MUST NOT reuse the create key.
-    const runIdempotencyKey = `cli-batch-run-${randomUUID()}`;
+    // Derived from the create key, never the create key itself (that would
+    // replay the create response), so a retry with the same key gets back the
+    // runs the first attempt started. A trigger routed through a tunnel names
+    // the tunnel's client id in its body, and the server refuses a reused key
+    // whose body changed (IDEMPOTENCY_BODY_MISMATCH), so that client id goes in
+    // the key too: a retry through the same tunnel (adopted with
+    // --tunnel-client) gets its runs back, and a retry through a new tunnel
+    // starts new runs, since the old ones cannot reach the app without theirs.
+    const tunnelScope = deps.environmentTunnel?.targets?.has(testId)
+      ? `:${deps.environmentTunnel.clientId}`
+      : '';
+    const runIdempotencyKey = suffixedIdempotencyKey(
+      opts.idempotencyKey,
+      `:run${tunnelScope}:${testId}`,
+    );
     if (opts.debug) {
       stderrFn(`[batch-run] ${testId} idempotency-key: ${runIdempotencyKey}`);
     }
@@ -4771,6 +4917,50 @@ async function runBatchRun(
             (v): v is string => typeof v === 'string' && v.length > 0,
           );
           if (conflictReason === 'run_in_flight' && currentRunId !== undefined) {
+            const incompatibleRun = (reason: string): ApiError =>
+              new ApiError({
+                code: 'CONFLICT',
+                message: `Conflict: run ${currentRunId} is already in flight; ${reason}. This invocation cannot attach to it.`,
+                nextAction: `testsprite test wait ${currentRunId}`,
+                requestId: '',
+                details: { reason: 'run_in_flight', currentRunId },
+              });
+            let inFlight: RunResponse | undefined;
+            try {
+              try {
+                inFlight = await client.getRun(currentRunId, { signal: shutdown.signal });
+              } catch (readErr) {
+                if (readErr instanceof InterruptError) throw readErr;
+              }
+              if (inFlight) {
+                await verifyInFlightRunEnvironment(
+                  inFlight,
+                  normalizeEnvironmentName(opts.environment),
+                  listEnvironments,
+                  incompatibleRun,
+                );
+                if (opts.targetUrl !== undefined && inFlight.targetUrl !== opts.targetUrl) {
+                  throw incompatibleRun('its target URL does not match the requested target URL');
+                }
+              } else if (opts.environment !== undefined || opts.targetUrl !== undefined) {
+                throw incompatibleRun('its environment could not be verified');
+              }
+            } catch (attachErr) {
+              if (attachErr instanceof InterruptError) throw attachErr;
+              if (!(attachErr instanceof ApiError) || attachErr.code !== 'CONFLICT')
+                throw attachErr;
+              return {
+                testId,
+                runId: '',
+                status: 'error',
+                codeVersion: '',
+                error: {
+                  code: attachErr.code,
+                  message: `${attachErr.message} ${attachErr.nextAction}`,
+                  exitCode: attachErr.exitCode,
+                },
+              };
+            }
             stderrFn(
               `[batch-run] ${testId} — run already in flight (runId: ${currentRunId}). Auto-resuming wait.`,
             );
@@ -4779,7 +4969,7 @@ async function runBatchRun(
               status: 'queued',
               enqueuedAt: new Date().toISOString(),
               codeVersion: '',
-              targetUrl: opts.targetUrl ?? '',
+              targetUrl: inFlight?.targetUrl ?? '',
             };
             break; // exit the outer retry loop with a conflict-resumed response
           } else {
@@ -5014,8 +5204,15 @@ async function runBatchRun(
             codeVersion: '',
           },
       );
-      out.print({ results: partialResults }, () =>
-        partialResults.map(r => `${r.testId}  ${r.runId || '-'}  ${r.status}`).join('\n'),
+      out.print(
+        {
+          results: partialResults,
+          creation: {
+            results: creationResults,
+            summary: createResponse.summary,
+          },
+        },
+        () => partialResults.map(r => `${r.testId}  ${r.runId || '-'}  ${r.status}`).join('\n'),
       );
       const unfinished = partialResults
         .filter(r => r.status === 'running' && r.runId)
@@ -5057,7 +5254,13 @@ async function runBatchRun(
             return { ...r, dashboardUrl: state.dashboardUrl };
           })
         : batchRunResults;
-    out.print({ results: enrichedResults });
+    out.print({
+      results: enrichedResults,
+      creation: {
+        results: creationResults,
+        summary: createResponse.summary,
+      },
+    });
   } else if (!opts.wait) {
     // Text mode, no --wait: statuses are non-terminal by design ('queued'),
     // so a pass/fail summary would misread a successful dispatch as
@@ -5461,7 +5664,10 @@ interface CodeGetOptions extends CommonOptions {
  * temp file is discarded and the user's pre-existing `--out` file, if
  * any, is left untouched.
  */
-export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Promise<CliTestCode> {
+export async function runCodeGet(
+  opts: CodeGetOptions,
+  deps: TestDeps = {},
+): Promise<CliTestCodeRead> {
   // Dry-run: no fetch, no fs. Print the canned shape to stdout and, if
   // the user passed `--out`, log on stderr what would have been written.
   // We deliberately do NOT validate the `--out` path here in dry-run —
@@ -5471,15 +5677,26 @@ export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Pro
     const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
     const out = makeOutput(opts.output, deps);
     const client = makeClient(opts, deps);
-    const code = await client.get<CliTestCode>(`/tests/${encodeURIComponent(opts.testId)}/code`);
+    const code = await client.get<CliTestCodeRead>(
+      `/tests/${encodeURIComponent(opts.testId)}/code`,
+      {
+        schema: CLI_TEST_CODE_SCHEMA,
+      },
+    );
     if (opts.out !== undefined) {
-      const bytes = isPresignedCodeUrl(code.code) ? '<presigned-stream>' : `${code.code.length}`;
+      // Null/empty first: isPresignedCodeUrl dereferences its argument.
+      const bytes =
+        code.code === null || code.code === ''
+          ? '0'
+          : isPresignedCodeUrl(code.code)
+            ? '<presigned-stream>'
+            : `${code.code.length}`;
       stderr(`[dry-run] would write code body (${bytes} bytes) to ${opts.out}`);
     }
     if (opts.output === 'json') {
       out.print(code);
     } else {
-      await out.writeChunk(code.code);
+      await out.writeChunk(code.code ?? '');
     }
     return code;
   }
@@ -5489,24 +5706,19 @@ export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Pro
   const client = makeClient(opts, deps);
 
   try {
-    const code = await client.get<CliTestCode>(`/tests/${encodeURIComponent(opts.testId)}/code`);
+    const code = await client.get<CliTestCodeRead>(
+      `/tests/${encodeURIComponent(opts.testId)}/code`,
+      {
+        schema: CLI_TEST_CODE_SCHEMA,
+      },
+    );
     let wroteContent = false;
 
     if (opts.output === 'json') {
       out.print(code);
       wroteContent = true;
-    } else if (isPresignedCodeUrl(code.code)) {
-      // Text mode: dump the source body. JSON consumers want the wire
-      // shape; humans (and agents shelling out via `> file.ts`) want
-      // ready-to-edit code. Stream chunk-wise so a multi-MB generated
-      // suite doesn't sit in memory waiting for the full download.
-      // `writeChunk` awaits the rawStdout drain promise so a slow
-      // downstream consumer (a file on a slow disk, an NFS mount,
-      // or a piped `gzip`) pauses the upstream reader rather than
-      // letting chunks accumulate in V8's heap.
-      await streamPresignedBody(code.code, out, deps);
-      wroteContent = true;
     } else if (code.code === '' || code.code === null) {
+      // Checked before isPresignedCodeUrl, which dereferences its argument.
       // P2-10: draft test with no code yet — empty body would produce
       // silent empty stdout. Print a friendly hint to stderr instead so
       // the operator knows what happened, and keep exit 0 when no `--out`.
@@ -5525,6 +5737,17 @@ export async function runCodeGet(opts: CodeGetOptions, deps: TestDeps = {}): Pro
       }
       const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
       stderrFn('(no code generated yet — run the test first)');
+    } else if (isPresignedCodeUrl(code.code)) {
+      // Text mode: dump the source body. JSON consumers want the wire
+      // shape; humans (and agents shelling out via `> file.ts`) want
+      // ready-to-edit code. Stream chunk-wise so a multi-MB generated
+      // suite doesn't sit in memory waiting for the full download.
+      // `writeChunk` awaits the rawStdout drain promise so a slow
+      // downstream consumer (a file on a slow disk, an NFS mount,
+      // or a piped `gzip`) pauses the upstream reader rather than
+      // letting chunks accumulate in V8's heap.
+      await streamPresignedBody(code.code, out, deps);
+      wroteContent = true;
     } else {
       await out.writeChunk(code.code);
       wroteContent = true;
@@ -5632,7 +5855,6 @@ export async function runCodePut(
   deps: TestDeps = {},
 ): Promise<CliPutTestCodeResponse> {
   assertIdempotencyKey(opts.idempotencyKey);
-  requireNonEmpty('test-id', opts.testId);
   requireNonEmpty('code-file', opts.codeFile);
   assertPythonCodeFile(opts.codeFile);
 
@@ -5671,7 +5893,12 @@ export async function runCodePut(
     requireNonEmpty('expected-version', opts.expectedVersion);
     ifMatch = opts.expectedVersion;
   } else {
-    const fetched = await client.get<CliTestCode>(`/tests/${encodeURIComponent(opts.testId)}/code`);
+    const fetched = await client.get<CliTestCodeRead>(
+      `/tests/${encodeURIComponent(opts.testId)}/code`,
+      {
+        schema: CLI_TEST_CODE_SCHEMA,
+      },
+    );
     const cv = fetched.codeVersion;
     if (cv === null || cv === undefined) {
       // Server hasn't stamped a codeVersion yet (legacy row). Send `*`
@@ -6836,7 +7063,7 @@ const RUN_HISTORY_TABLE_COLUMNS: ReadonlyArray<TextTableColumn<RunHistoryItem>> 
   { header: 'SOURCE', width: 18, render: run => run.source },
   {
     header: 'ENV',
-    width: rows => Math.max(3, ...rows.map(run => describeRunEnv(run).length)),
+    width: rows => Math.max(3, ...rows.map(run => terminalWidth(describeRunEnv(run)))),
     render: describeRunEnv,
   },
   { header: 'RERUN?', width: 6, render: run => (run.isRerun ? 'yes' : 'no') },
@@ -7014,9 +7241,10 @@ export async function runFailureGet(
   const out = makeOutput(opts.output, deps);
   const client = makeClient(opts, deps);
 
-  // Resolve and validate --out BEFORE the network call so a missing /
-  // empty path surfaces as VALIDATION_ERROR (exit 5) without spending
-  // an API call. Mirrors `runArtifactGet`; `writeBundle` re-validates
+  // Resolve and validate --out BEFORE the network call so an empty path,
+  // an existing file, or a file where a parent directory should be
+  // surfaces as VALIDATION_ERROR (exit 5) without spending an API call.
+  // Missing parent directories are created later by writeBundle. Mirrors `runArtifactGet`; `writeBundle` re-validates
   // internally as defense-in-depth.
   let resolvedDir: string | undefined;
   if (opts.out !== undefined) {
@@ -7322,7 +7550,7 @@ function isTerminalPublicStatus(status: CliPublicStatus): boolean {
 
 /** Minimal client surface the backend-test wait fallback needs. */
 interface ResultReadClient {
-  get<T>(path: string, options?: { signal?: AbortSignal }): Promise<T>;
+  get<T>(path: string, options?: { signal?: AbortSignal; retry?: boolean }): Promise<T>;
 }
 
 /**
@@ -7423,6 +7651,11 @@ export function makeBackendWaitFallback(args: {
   resolveTestId: (run: RunResponse) => string;
   resolveNotBefore: (run: RunResponse) => string | undefined;
   onResolved?: (testId: string, status: CliPublicStatus) => void;
+  /**
+   * Called once, when the one-time type probe succeeds. Lets the caller reuse
+   * the type (e.g. for the failure hint) instead of looking it up again.
+   */
+  onTypeDetected?: (type: CliTest['type']) => void;
 }): (run: RunResponse, elapsedMs: number, signal: AbortSignal) => Promise<RunResponse | null> {
   let detection: 'pending' | 'frontend' | 'backend' = 'pending';
   // Cached alongside `detection` from the same one-time type-probe: the human
@@ -7450,6 +7683,7 @@ export function makeBackendWaitFallback(args: {
         // row finalizes and `resolveAlternate` stops being called.
         detection = test.type === 'backend' ? 'backend' : 'frontend';
         testName = test.name?.trim() ? test.name : null;
+        args.onTypeDetected?.(test.type);
       } catch {
         return null; // transient — keep polling the run row, retry the probe next tick.
       }
@@ -7670,21 +7904,38 @@ export function renderRunResponseText(
   if (run.replay?.path === 'refused') {
     lines.push(`replay      refused${run.replay.reason ? ` (${run.replay.reason})` : ''}`);
   }
-  // Closing pointer: where to inspect this run in the Portal (video, steps,
-  // screenshots). Present only when withRunDashboardUrl could resolve it.
+  // The test-case page (`dashboard`) and this run's result page (`execution`)
+  // are different links. Print each only when the server sent a non-empty
+  // string. A null or absent `executionUrl` means this run has no execution
+  // page — do not invent one, and never label an execution URL as the dashboard.
   if (run.dashboardUrl) lines.push(`dashboard   ${run.dashboardUrl}`);
+  if (run.executionUrl) lines.push(`execution   ${run.executionUrl}`);
   return lines.join('\n');
 }
 
 /**
  * Best-effort resolve whether a finished run's test is a backend test, for the
- * text run-card's step line + failure hint only. Returns true with no
- * network call when already known (create-chain `--type`, or the BE wait
- * fallback fired). Otherwise, in TEXT mode only, issues one `GET /tests/{id}`;
- * ordinary lookup errors → false (render the numeric step summary as before).
- * Interrupts propagate. JSON mode
- * never probes — its envelope carries `stepSummary` verbatim and has no
- * "n/a (backend)" concept, so it is already correct.
+ * text run-card's step line and the stderr recovery hint after a failed or
+ * blocked run. Returns true with no network call when already known
+ * (create-chain `--type`, a backend rerun's closure, or the BE wait fallback
+ * fired), and returns `knownType === 'backend'` with no call when an earlier
+ * read already fetched the test. Otherwise issues one `GET /tests/{id}`; ordinary lookup errors →
+ * false (numeric step summary and the run-scoped `test artifact get` hint, as
+ * before). Interrupts propagate.
+ *
+ * Text mode always probes, for the card. JSON mode probes only when the run
+ * failed or was blocked: its envelope carries `stepSummary` verbatim and has no
+ * "n/a (backend)" concept, so the card needs no type there — but the recovery
+ * hint on stderr does. A backend failure bundle is addressed by testId
+ * (`test failure get`), so a JSON caller that skipped the probe was pointed at
+ * `test artifact get <run-id>`, which has no bundle for a backend run.
+ *
+ * The lookup only picks wording, so it must never hold back the run envelope
+ * or the exit code: it gets a {@link RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS} deadline
+ * and `retry: false` — one attempt, no retries of any kind (a 429 with
+ * `Retry-After` would otherwise be honoured for up to ~2 minutes, and 5xx /
+ * transport retry sleeps do not observe the deadline signal) — and either
+ * outcome falls back like any other lookup error.
  *
  * This closes the standalone-path gap: `test run <id>` / `test wait <run-id>`
  * never supply a type hint, and now that BE run rows finalize server-side
@@ -7696,16 +7947,35 @@ async function resolveRunCardIsBackend(
   testId: string | undefined,
   output: string,
   alreadyKnown: boolean,
+  status: string,
+  knownType?: CliTest['type'],
 ): Promise<boolean> {
   if (alreadyKnown) return true;
-  if (output === 'json' || !testId) return false;
+  if (knownType !== undefined) return knownType === 'backend';
+  if (!testId) return false;
+  if (output === 'json' && !isFailureHintStatus(status)) return false;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS);
   try {
-    const test = await client.get<CliTest>(`/tests/${encodeURIComponent(testId)}`);
+    const test = await client.get<CliTest>(`/tests/${encodeURIComponent(testId)}`, {
+      signal: ac.signal,
+      retry: false,
+    });
     return test.type === 'backend';
   } catch (err) {
     if (err instanceof InterruptError) throw err;
     return false; // best-effort — fall back to the numeric step summary.
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+/** Deadline for {@link resolveRunCardIsBackend}'s best-effort type lookup. */
+export const RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS = 5_000;
+
+/** Statuses that print a failure-bundle recovery hint on stderr. */
+function isFailureHintStatus(status: string): boolean {
+  return status === 'failed' || status === 'blocked';
 }
 
 /**
@@ -7721,10 +7991,12 @@ function renderTriggerRunText(r: TriggerRunResponse): string {
   if (r.codeVersion !== null) lines.push(`codeVersion ${r.codeVersion}`);
   if (r.environment) lines.push(`environment ${describeEnvironmentLine(r)}`);
   if (r.targetUrl !== null) lines.push(`targetUrl   ${r.targetUrl}`);
-  // Same line the run card prints after `--wait` (`renderRunResponseText`), so a
+  // Same lines the run card prints after `--wait` (`renderRunResponseText`), so a
   // bare `test run <id>` shows where to look without a second command. Only
-  // when the server sent one — absent means it had no correct link to give.
+  // when the server sent one — absent or empty means it had no correct link
+  // to give, and an execution URL is never labeled as the dashboard.
   if (r.dashboardUrl) lines.push(`dashboard   ${r.dashboardUrl}`);
+  if (r.executionUrl) lines.push(`execution   ${r.executionUrl}`);
   return lines.join('\n');
 }
 
@@ -7755,6 +8027,17 @@ function normalizeEnvironmentName(raw: string | undefined): string | undefined {
     );
   }
   return name;
+}
+
+/** Reject an explicitly empty name filter; omission alone selects every test. */
+export function parseNameFilter(raw: string | undefined): string | undefined {
+  if (raw === '') {
+    throw localValidationError(
+      'filter',
+      'must not be empty; omit --filter to run every project test, or pass a non-empty substring',
+    );
+  }
+  return raw;
 }
 
 /**
@@ -7864,6 +8147,17 @@ function assertFreshRunWaitOptions(
     );
 }
 
+/** Pre-dispatch: refuse unwritable --report-file / --summary-file before anything is triggered. */
+function assertRunArtifactPaths(opts: {
+  report?: JUnitReportFormat;
+  reportFile?: string;
+  summaryFile?: string;
+}): void {
+  if (opts.report === 'junit' && opts.reportFile !== undefined)
+    assertArtifactPath('report-file', opts.reportFile);
+  if (opts.summaryFile !== undefined) assertArtifactPath('summary-file', opts.summaryFile);
+}
+
 function isSameLoopbackPort(url: string, port: number): boolean {
   try {
     return parseLoopbackTargetUrl(url)?.port === port;
@@ -7927,7 +8221,7 @@ async function verifyInFlightRunEnvironment(
   if (currentEnvironment.id !== inFlightEnvironment.id) {
     throw incompatibleRun('its environment does not match the requested environment');
   }
-  return `--env ${currentEnvironment.name}`;
+  return `--env ${quoteEnvironmentName(currentEnvironment.name)}`;
 }
 
 export async function runTestRun(
@@ -8100,6 +8394,7 @@ export async function runTestRun(
     client = makeClient(clientOpts, deps);
   }
   assertFreshRunWaitOptions(opts, false);
+  assertRunArtifactPaths(opts);
   const tunnelRequestTimeoutMs = isTunnelRun
     ? resolveRequestTimeoutMs(clientOpts, deps.env ?? process.env)
     : undefined;
@@ -8379,8 +8674,10 @@ export async function runTestRun(
     }
 
     stderrFn(`Run ${triggerResponse.runId}`);
-    const receiptUrl = triggerResponse.dashboardUrl ?? triggerResponse.executionUrl;
-    if (receiptUrl) stderrFn(`Dashboard: ${receiptUrl}`);
+    // The test-case link and this run's result page are different URLs.
+    // Never fold a missing dashboard link onto the execution URL.
+    if (triggerResponse.dashboardUrl) stderrFn(`Dashboard: ${triggerResponse.dashboardUrl}`);
+    if (triggerResponse.executionUrl) stderrFn(`Execution: ${triggerResponse.executionUrl}`);
 
     // Response-driven, not assumption-driven: the backend is the ground
     // truth for whether --target-url was actually applied — V3
@@ -8453,10 +8750,14 @@ export async function runTestRun(
     // Backend-test fallback (dogfood L1888): BE run rows never finalize, so
     // resolve the verdict from the testId record once it's terminal.
     let beFallbackUsed = false;
+    let polledType: CliTest['type'] | undefined;
     const resolveBackendAlternate = makeBackendWaitFallback({
       client,
       resolveTestId: () => opts.testId,
       resolveNotBefore: () => triggerResponse.enqueuedAt,
+      onTypeDetected: type => {
+        polledType = type;
+      },
       onResolved: testId => {
         beFallbackUsed = true;
         stderrFn(
@@ -8769,12 +9070,14 @@ export async function runTestRun(
 
     // BE detection: type hint (create-chain) OR beFallbackUsed (slow runs); on
     // the standalone `test run <id>` path neither is set, so probe the test type
-    // once (text mode only, best-effort).
+    // once (best-effort; JSON mode only when the run failed or was blocked).
     const isBackend = await resolveRunCardIsBackend(
       client,
       opts.testId,
       opts.output,
       beFallbackUsed || opts.type === 'backend',
+      finalRun.status,
+      polledType,
     );
 
     const finalRunWithUrl = withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps));
@@ -9214,6 +9517,8 @@ export interface CliCancelSummary {
  * Multi-id: prints a `{cancelled, alreadyCancelled, conflicts, notFound}`
  * summary. Exit precedence (CXL-11): any `notFound` → 4 (outranks conflict —
  * it signals a caller bug, wrong id/tenant); else any `conflicts` → 6; else 0.
+ * Ahead of all of these, a rejected key or a too-old CLI on any id exits with
+ * that error (3 / 14), exactly as the single-id form does.
  */
 export async function runTestCancel(
   opts: RunTestCancelOptions,
@@ -9241,6 +9546,7 @@ export async function runTestCancel(
   }
 
   const rows: CliCancelResultRow[] = [];
+  let batchWide: ApiError | undefined;
   for (const runId of opts.runIds) {
     try {
       const result = await client.cancelRun(runId);
@@ -9260,6 +9566,7 @@ export async function runTestCancel(
         rows.push({ runId, status: 'conflict', conflictStatus });
         continue;
       }
+      batchWide = keepBatchWideError(batchWide, err);
       const message = err instanceof Error ? err.message : String(err);
       rows.push({ runId, status: 'error', error: message });
     }
@@ -9287,9 +9594,13 @@ export async function runTestCancel(
   if (errorRows.length > 0) parts.push(`${errorRows.length} error`);
   stderrFn(`Cancel summary: ${parts.join(', ')}.`);
 
+  // A rejected key / too-old CLI outranks every per-id outcome below: it is
+  // what the single-id form exits with, and the one thing the caller must fix.
+  if (batchWide !== undefined) throw batchWide;
+
   // Exit precedence (CXL-11): notFound outranks conflict — a caller-side bug
   // (wrong id / wrong tenant) is more actionable to surface than "it already
-  // finished". A bare transport/auth error on any member also fails loudly
+  // finished". Any other transport/server error on a member also fails loudly
   // rather than being silently absorbed into a 0 exit.
   if (summary.notFound.length > 0) {
     throw new CLIError(
@@ -9360,9 +9671,11 @@ export function createTestCancelCommand(deps: TestDeps): Command {
         'V2 runs keep their billing, and an in-flight Lambda finishes with its result discarded.\n' +
         '\nExit codes:\n' +
         '  0  cancelled (fresh or already-cancelled — naturally idempotent)\n' +
-        '  1  multi-id: a cancel request failed (auth/transport/server error; see summary.errors)\n' +
+        '  1  multi-id: a cancel request failed (transport/server error; see summary.errors)\n' +
+        '  3  auth error (multi-id: a rejected key on any id — outranks 1, 4, 6 and 14)\n' +
         '  4  run id not found (single id), or ANY id not found (multi-id; outranks conflict)\n' +
         '  6  run already terminal (passed/failed/blocked); multi-id: any conflict\n' +
+        '  14 client too old (multi-id: on any id — outranks 1, 4 and 6)\n' +
         '\nMulti-id output is a summary: {cancelled, alreadyCancelled, conflicts, notFound, errors}.',
     )
     .addHelpText('after', GLOBAL_OPTS_HINT)
@@ -9419,10 +9732,14 @@ export async function runTestWait(
   // resolve the verdict from the testId record (discovered from the first
   // poll tick) once it's terminal for this run.
   let beFallbackUsed = false;
+  let polledType: CliTest['type'] | undefined;
   const resolveAlternate = makeBackendWaitFallback({
     client,
     resolveTestId: run => run.testId,
     resolveNotBefore: run => run.createdAt,
+    onTypeDetected: type => {
+      polledType = type;
+    },
     onResolved: testId => {
       beFallbackUsed = true;
       stderrFn(
@@ -9544,13 +9861,16 @@ export async function runTestWait(
 
   ticker.finalize(formatRunProgressLine(finalRun, Date.now() - startMs));
 
-  // `test wait` has no type hint; probe the test type once (text mode only,
-  // best-effort) so a backend run's card reads `n/a (backend)`.
+  // `test wait` has no type hint; probe the test type once (best-effort) so a
+  // backend run's card reads `n/a (backend)` and its failure hint names
+  // `test failure get` (JSON mode probes only for a failed/blocked run).
   const isBackend = await resolveRunCardIsBackend(
     client,
     finalRun.testId,
     opts.output,
     beFallbackUsed,
+    finalRun.status,
+    polledType,
   );
 
   out.print(withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)), data =>
@@ -10986,6 +11306,7 @@ export async function runTestRunAll(
   // resolvable in-flight run stay hard (nothing to wait on).
   // An in-flight run may belong to another deployment/environment. CI can
   // only use runs accepted by this invocation to judge its own change.
+  const metadataConflicts = conflicts;
   // A `no_producer` / `producer_in_flight` conflict's `currentRunId` is the
   // result the server seeded BLOCKED before dispatch. It is reported with the
   // server's reason and exit 6, as a single `test run` reports it, not polled.
@@ -11025,6 +11346,8 @@ export async function runTestRunAll(
     }
     return listing;
   };
+  // Keep the metadata stage graceful even between tracked HTTP requests.
+  const disarmResolve = shutdownOf(deps).arm();
   const resumedOrRefused = await Promise.all(
     resumableConflicts.map(
       async (c): Promise<{ entry: BatchRunFreshAccepted } | { refused: RunConflict }> => {
@@ -11091,7 +11414,43 @@ export async function runTestRunAll(
         return { entry: { testId: c.testId, runId: inFlightRunId, enqueuedAt: notBefore } };
       },
     ),
-  );
+  )
+    .catch((err: unknown) => {
+      if (err instanceof InterruptError) {
+        const partialResults: CliBatchRunFreshResult[] = accepted.map(e => ({
+          testId: e.testId,
+          runId: e.runId,
+          status: 'running',
+        }));
+        out.print(
+          {
+            accepted: partialResults,
+            conflicts: metadataConflicts,
+            deferred,
+            skippedFrontend,
+            skippedIntegration,
+            ...(notRunTestIds.length > 0 ? { notRunTestIds } : {}),
+          },
+          () =>
+            partialResults.length > 0
+              ? partialResults.map(r => `${r.runId}  ${r.status}`).join('\n')
+              : resumableConflicts
+                  .map(c => `${c.currentRunId}  unverified (not attached)`)
+                  .join('\n'),
+        );
+        if (accepted.length > 0) {
+          err.runWaitContext = true;
+          stderrFn(
+            interruptDetachMessage(
+              err,
+              accepted.map(e => e.runId),
+            ),
+          );
+        }
+      }
+      throw err;
+    })
+    .finally(disarmResolve);
   const resumableEntries: BatchRunFreshAccepted[] = [];
   for (const outcome of resumedOrRefused) {
     if ('entry' in outcome) {
@@ -12155,12 +12514,11 @@ export async function runTestRunLocalBatch(
       const runOne = async (index: number) => {
         const row = results[index]!;
         let triggerStartedAtMs: number;
-        const suffix = `:${row.testId}`;
-        const key = opts.idempotencyKey
-          ? `${idempotencyBase.slice(0, Math.max(0, 256 - suffix.length))}${suffix}`.slice(-256)
-          : index === 0
-            ? idempotencyBase
-            : `cli-run-${randomUUID()}`;
+        // Derived for every test, auto-minted base included, so a retry with
+        // the printed key re-sends the same keys; scoped to the tunnel when
+        // routed through one (see triggerOne in runBatchRun for why).
+        const tunnelScope = targets.has(row.testId) ? `:${liveSession.clientId}` : '';
+        const key = suffixedIdempotencyKey(idempotencyBase, `${tunnelScope}:${row.testId}`);
         let response: TriggerRunResponse;
         try {
           if (shutdown.signal.aborted) throw shutdown.signal.reason;
@@ -12683,6 +13041,7 @@ export async function runTestRerun(
   const targets = new Map<string, ResolvedRunTarget>();
   const backend: string[] = [];
   const cache = new Map();
+  const readTests = new Map(opts.knownTests ?? []);
   for (const testId of opts.testIds) {
     let knownTest = opts.knownTests?.get(testId);
     try {
@@ -12694,6 +13053,7 @@ export async function runTestRerun(
     } catch (err) {
       if (err instanceof InterruptError) throw err;
     }
+    if (knownTest) readTests.set(testId, knownTest);
     const target = await resolveEnvironmentRunTarget({
       client,
       testId,
@@ -12709,7 +13069,13 @@ export async function runTestRerun(
     if (target && knownTest?.type === 'backend') backend.push(testId);
     else if (target) targets.set(testId, target);
   }
-  if (!targets.size) return runTestRerunCore(opts, deps);
+  // A single rerun hands the type it just read to the core, so the run card and
+  // failure hint after --wait don't fetch the same test a second time.
+  if (!targets.size)
+    return runTestRerunCore(
+      opts.testIds.length === 1 && readTests.size > 0 ? { ...opts, knownTests: readTests } : opts,
+      deps,
+    );
   const maxConcurrency = opts.concurrencyIsDefault ? 5 : opts.maxConcurrency;
   if (maxConcurrency > 10)
     throw localValidationError(
@@ -13298,9 +13664,15 @@ async function runTestRerunCore(
       }
 
       if (exitCodeForRunStatus(namedResult.status) !== 0) {
-        stderrFn(
-          `Run finished with status: ${namedResult.status}. Use 'testsprite test artifact get ${namedRunId}' to download the failure bundle.`,
-        );
+        // Only a backend rerun has a closure, and a backend failure bundle is
+        // addressed by testId — there is no run-scoped bundle for namedRunId.
+        // Failed/blocked only: `test failure get` returns the latest *failing*
+        // run, which for a cancelled rerun could be an older one.
+        if (isFailureHintStatus(namedResult.status)) {
+          stderrFn(
+            `Run finished with status: ${namedResult.status}. Backend failure artifacts are addressed by testId — use 'testsprite test failure get ${testId}' to download the bundle.`,
+          );
+        }
         throw new CLIError(`Run ${namedRunId} finished with status: ${namedResult.status}`, 1);
       }
 
@@ -13345,10 +13717,14 @@ async function runTestRerunCore(
 
     // Single FE rerun (or BE without closure) — poll the single runId
     let beFallbackUsed = false;
+    let polledType: CliTest['type'] | undefined;
     const resolveAlternate = makeBackendWaitFallback({
       client,
       resolveTestId: () => testId,
       resolveNotBefore: () => rerunResp.enqueuedAt,
+      onTypeDetected: type => {
+        polledType = type;
+      },
       onResolved: tid => {
         beFallbackUsed = true;
         stderrFn(
@@ -13483,10 +13859,19 @@ async function runTestRerunCore(
 
     ticker.finalize(formatRunProgressLine(finalRun, Date.now() - replayStartMs, '(replay)'));
 
-    // Probe the test type once (text mode only, best-effort) so a backend
-    // rerun's card reads `n/a (backend)` even when the fallback never fired
-    // (BE run rows finalize server-side now).
-    const isBackend = await resolveRunCardIsBackend(client, testId, opts.output, beFallbackUsed);
+    // A closure in the rerun response already marks a backend rerun; otherwise
+    // probe the test type once (best-effort; JSON mode only for a failed/blocked
+    // run) so a backend rerun's card reads `n/a (backend)` and its failure hint
+    // names `test failure get`, even when the fallback never fired (BE run rows
+    // finalize server-side now).
+    const isBackend = await resolveRunCardIsBackend(
+      client,
+      testId,
+      opts.output,
+      beFallbackUsed || isBERerun,
+      finalRun.status,
+      opts.knownTests?.get(testId)?.type ?? polledType,
+    );
 
     out.print(withRunDashboardUrl(finalRun, resolveApiUrl(opts, deps)), data =>
       renderRunResponseText(data as RunResponse, { isBackend }),
@@ -14235,23 +14620,24 @@ export function resolveDefaultArtifactDir(runId: string, cwd: string = process.c
 }
 
 /**
- * Validate that the parent directory of `resolvedDir` exists and is a
- * directory. Surfaces `VALIDATION_ERROR` (exit 5) — matches the convention
- * from `closeOutputFile` for single-file `--out` flags (P4 D4 convention).
+ * Validate the `--out` bundle directory before any request goes out. Surfaces
+ * `VALIDATION_ERROR` (exit 5) — matches the convention from `closeOutputFile`
+ * for single-file `--out` flags (P4 D4 convention).
+ *
+ * Missing parent directories are fine: `writeBundle` creates the whole tree
+ * with `mkdir(dir, { recursive: true })` once the response has passed its
+ * integrity checks, as it does for the default `./.testsprite/runs/<run-id>/`,
+ * so a failed fetch still leaves nothing on disk. What is refused here is a
+ * path that can never become a directory: `--out` pointing at an existing
+ * file, or a file where one of its parent directories should be.
  *
  * The bundle directory itself (`resolvedDir`) may or may not exist;
  * `writeBundle` creates it if absent.
  */
 export async function assertOutDirParentExists(resolvedDir: string): Promise<void> {
-  const parent = dirname(resolvedDir);
-  let parentStat;
-  try {
-    parentStat = await stat(parent);
-  } catch {
-    throw localValidationError('out', `parent directory does not exist: ${parent}`);
-  }
-  if (!parentStat.isDirectory()) {
-    throw localValidationError('out', `parent path is not a directory: ${parent}`);
+  const closest = await closestExistingPath(dirname(resolvedDir));
+  if (!closest.stats.isDirectory()) {
+    throw localValidationError('out', `parent path is not a directory: ${closest.path}`);
   }
   // Also guard against --out pointing at an existing FILE (not a dir).
   let targetStat;
@@ -14263,6 +14649,29 @@ export async function assertOutDirParentExists(resolvedDir: string): Promise<voi
   }
   if (!targetStat.isDirectory()) {
     throw localValidationError('out', `must point to a directory, not a file: ${resolvedDir}`);
+  }
+}
+
+/**
+ * The nearest path at or above `target` that exists, with its stats. Missing
+ * components are skipped. So is a file in the middle of the path (ENOTDIR on
+ * POSIX, ENOENT on Windows): the walk stops at that file, and the caller
+ * reports it as "not a directory".
+ */
+async function closestExistingPath(target: string): Promise<{ path: string; stats: Stats }> {
+  let current = target;
+  for (;;) {
+    try {
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- this is the guard itself: walks up from the parent of the user-supplied --out path after resolve(); stat() only, nothing is read or written.
+      return { path: current, stats: await stat(current) };
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      const up = dirname(current);
+      if ((code !== 'ENOENT' && code !== 'ENOTDIR') || up === current) {
+        throw localValidationError('out', `cannot access parent path: ${current}`);
+      }
+      current = up;
+    }
   }
 }
 
@@ -14327,8 +14736,9 @@ export async function runArtifactGet(
     return { context: cannedCtx };
   }
 
-  // Parent-dir validation for explicit --out only. The default path
-  // (.testsprite/runs/<runId>/) is always under cwd — mkdir will create it.
+  // Validate an explicit --out before the fetch (see assertOutDirParentExists).
+  // Missing parents are created by writeBundle, as for the default path
+  // (.testsprite/runs/<runId>/), which needs no check.
   if (opts.out !== undefined) {
     await assertOutDirParentExists(resolvedDir);
   }
@@ -14590,6 +15000,10 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         runPlanTemplate(resolveCommonOptions(command, deps.env), deps);
         return;
       }
+      assertRunChainFlagsNeedRun(cmdOpts.run, {
+        wait: cmdOpts.wait === true,
+        timeout: cmdOpts.timeout !== undefined,
+      });
       // --plan-from and --code-file are mutually exclusive. Dispatch
       // here so each `run*` function stays single-purpose. If neither
       // is set, the existing runCreate path enforces --code-file.
@@ -14713,7 +15127,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .option('--skip-preflight', `with --run: ${SKIP_PREFLIGHT_HELP}`, false)
     .option(
       '--idempotency-key <token>',
-      'idempotency token for the batch (1-256 ASCII chars; default: random UUID, pin one for safe retries)',
+      'idempotency token for the batch (1-256 ASCII chars; with --run, each trigger key is derived from it; default: random UUID, pin one for safe retries)',
     )
     .addHelpText(
       'after',
@@ -14730,7 +15144,12 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           maxConcurrency: parseNumericFlag(cmdOpts.maxConcurrency, 'max-concurrency'),
           wait: cmdOpts.wait === true,
           noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
-          timeoutSeconds: parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
+          // undefined = flag not given (runCreateBatch defaults it, and refuses
+          // an explicit --timeout without --run).
+          timeoutSeconds:
+            cmdOpts.timeout === undefined
+              ? undefined
+              : parseTimeoutFlag(cmdOpts.timeout, 'timeout'),
           targetUrl: cmdOpts.targetUrl,
           environment: cmdOpts.env,
           skipPreflight: cmdOpts.skipPreflight === true,
@@ -15035,7 +15454,9 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         '\nExit codes:\n' +
         '  0  all targeted tests deleted (or --dry-run)\n' +
         '  1  one or more deletions failed\n' +
-        '  5  validation error (e.g. missing --confirm, or --all without --project)',
+        '  3  auth error (a rejected key on any id — outranks 1 and 14)\n' +
+        '  5  validation error (e.g. missing --confirm, or --all without --project)\n' +
+        '  14 client too old (on any id — outranks 1)',
     )
     .option('--confirm', 'required: confirm the destructive operation', false)
     .option('--all', 'delete all tests in the resolved project (requires --project)', false)
@@ -15140,7 +15561,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     .option('--project <id>', 'project id for --all (overrides TESTSPRITE_PROJECT_ID)')
     .option(
       '--filter <substr>',
-      'with --all: only run tests whose name contains this substring (case-insensitive)',
+      'with --all: only run tests whose name contains this non-empty substring (case-insensitive); omit to run every test',
     )
     .option(
       '--status <list>',
@@ -15221,6 +15642,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
         );
       }
       const isAll = cmdOpts.all === true;
+      const nameFilter = parseNameFilter(cmdOpts.filter);
       const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
 
       // Mutual-exclusion: exactly one of positional <test-id> vs --all must be set.
@@ -15239,7 +15661,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
       // --filter is an --all-only narrowing flag (mirrors `test rerun --filter`).
       // Without --all it would be SILENTLY ignored while the explicit <test-id>
       // still runs — defeating the caller's narrowing intent. Reject early.
-      if (cmdOpts.filter !== undefined && cmdOpts.filter !== '' && !isAll) {
+      if (nameFilter !== undefined && !isAll) {
         throw localValidationError(
           'filter',
           '--filter only applies with --all (it narrows which project tests run). Remove --filter, or add --all with --project <id> or TESTSPRITE_PROJECT_ID.',
@@ -15353,6 +15775,11 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           '--summary-file requires --wait (it reduces the terminal run result). Add --wait.',
         );
       }
+      assertRunArtifactPaths({
+        report,
+        reportFile: cmdOpts.reportFile,
+        summaryFile: cmdOpts.summaryFile,
+      });
 
       if (isAll && !usingLocal && cmdOpts.tunnelClient === undefined) {
         // --all path: wave-ordered fresh batch run.
@@ -15377,7 +15804,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           {
             ...resolveCommonOptions(command, deps.env),
             projectId,
-            nameFilter: cmdOpts.filter,
+            nameFilter,
             statusFilter: cmdOpts.status,
             wait: effectiveWait,
             noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
@@ -15444,7 +15871,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
             wait: effectiveWait,
             all: isAll,
             projectId: cmdOpts.project,
-            nameFilter: cmdOpts.filter,
+            nameFilter,
             statusFilter: cmdOpts.status,
             localPort,
             localHost,
@@ -15601,7 +16028,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
     )
     .option(
       '--filter <substr>',
-      'with --all: only rerun tests whose name contains this substring (case-insensitive)',
+      'with --all: only rerun tests whose name contains this non-empty substring (case-insensitive); omit to rerun every test',
     )
     .option('--wait', 'block until terminal status or --timeout elapses', false)
     .option('--no-wait', 'detach without opening an automatic environment tunnel')
@@ -15673,6 +16100,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           `${RUN_STATUS_VALUES.join(', ')}.`,
       );
       const rerunDeps: TestDeps = { ...deps, deprecations: [rerunDeprecation] };
+      const nameFilter = parseNameFilter(cmdOpts.filter);
       // Commander's `--no-auto-heal` pattern makes `cmdOpts.autoHeal` default
       // `true` (unchanged by the user) and `false` when the user passes
       // `--no-auto-heal`. There is no explicit `--auto-heal` flag, so
@@ -15717,7 +16145,7 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           projectId: cmdOpts.project,
           skipTerminal: cmdOpts.skipTerminal === true,
           statusFilter: cmdOpts.status,
-          nameFilter: cmdOpts.filter,
+          nameFilter,
           wait: cmdOpts.wait === true,
           noWait: command.getOptionValueSource('wait') === 'cli' && cmdOpts.wait === false,
           skipPreflight: cmdOpts.skipPreflight === true,
@@ -15868,9 +16296,6 @@ export async function runFlaky(
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const out = makeOutput(opts.output, deps);
 
-  if (typeof opts.testId !== 'string' || opts.testId.length === 0) {
-    throw localValidationError('test-id', 'is required');
-  }
   if (!Number.isInteger(opts.runs) || opts.runs < 1 || opts.runs > MAX_FLAKY_RUNS) {
     throw localValidationError('runs', `must be an integer between 1 and ${MAX_FLAKY_RUNS}`);
   }
@@ -16679,6 +17104,7 @@ async function deleteTunnelForCleanup(
   await withTeardownDeadline(opts, deps, client =>
     client.delete<unknown>(`/tunnel/${encodeURIComponent(clientId)}`, {
       allowNoContent: true,
+      replaySafe: true,
     }),
   );
 }
@@ -16959,7 +17385,7 @@ const TEST_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliTest>> = [
   },
   {
     header: 'NAME',
-    width: rows => Math.max(4, ...rows.map(test => test.name.length)),
+    width: rows => Math.max(4, ...rows.map(test => terminalWidth(test.name))),
     render: test => test.name,
   },
   {
@@ -16976,7 +17402,8 @@ const TEST_LIST_COLUMNS: ReadonlyArray<TextTableColumn<CliTest>> = [
   },
   {
     header: 'ENV',
-    width: rows => Math.max(3, ...rows.map(test => (test.headlineEnvironment?.name ?? '-').length)),
+    width: rows =>
+      Math.max(3, ...rows.map(test => terminalWidth(test.headlineEnvironment?.name ?? '-'))),
     render: test => test.headlineEnvironment?.name ?? '-',
   },
 ];
@@ -17107,22 +17534,24 @@ function renderStepsText(page: Page<CliTestStep>): string {
     return isSynthetic ? `${clamped} (synthetic assertion failure)` : clamped;
   };
 
+  // action/description are free text (CJK, emoji, ZWJ clusters): measure their
+  // floors in terminal display columns, matching how `pad` measures values —
+  // a UTF-16 `.length` undercounts and shifts later columns between rows.
   const indexWidth = Math.max(5, ...page.items.map(s => String(s.stepIndex).length));
-  const actionWidth = Math.max(6, ...page.items.map(s => s.action.length));
+  const actionWidth = Math.max(6, ...page.items.map(s => terminalWidth(s.action)));
   const statusWidth = 6; // "passed" / "failed" / "—"
-  const descWidth = Math.max(11, ...page.items.map(s => descOf(s).length));
+  const descWidth = Math.max(11, ...page.items.map(s => terminalWidth(descOf(s))));
 
-  const header =
-    pad('  ', 2) +
-    pad('INDEX', indexWidth) +
-    '  ' +
-    pad('ACTION', actionWidth) +
-    '  ' +
-    pad('STATUS', statusWidth) +
-    '  ' +
-    pad('DESCRIPTION', descWidth) +
-    '  ' +
-    'UPDATED';
+  // Joined exactly like the rows below (marker column included), so every
+  // header lines up over its values.
+  const header = [
+    '  ',
+    pad('INDEX', indexWidth),
+    pad('ACTION', actionWidth),
+    pad('STATUS', statusWidth),
+    pad('DESCRIPTION', descWidth),
+    'UPDATED',
+  ].join('  ');
 
   const rows = page.items.flatMap(s => {
     const marker = s.outcomeContributesToFailure === true ? '* ' : '  ';
@@ -17448,9 +17877,16 @@ function uniqueNonNull(values: Array<string | null>): string | undefined {
   return filtered.every(v => v === first) ? first : undefined;
 }
 
+/**
+ * Right-pad `s` with spaces up to `width` terminal display columns. Measures
+ * display width (CJK/full-width = 2 cells), not UTF-16 length, matching the
+ * shared `text-table` renderer; a value already at or beyond `width` is
+ * returned unchanged.
+ */
 function pad(s: string, width: number): string {
-  if (s.length >= width) return s;
-  return s + ' '.repeat(width - s.length);
+  const display = terminalWidth(s);
+  if (display >= width) return s;
+  return s + ' '.repeat(width - display);
 }
 
 function createTestCodeCommand(deps: TestDeps): Command {
@@ -18773,7 +19209,7 @@ export function createTestArtifactCommand(deps: TestDeps): Command {
     )
     .option(
       '--out <dir>',
-      'directory to write the bundle into (default: ./.testsprite/runs/<run-id>/); the parent must exist',
+      'directory to write the bundle into (default: ./.testsprite/runs/<run-id>/); missing parent directories are created',
     )
     .option(
       '--failed-only',
@@ -18818,7 +19254,7 @@ function createTestFailureCommand(deps: TestDeps): Command {
     )
     .option(
       '--out <dir>',
-      'directory to write the bundle into (default: print the envelope to stdout)',
+      'directory to write the bundle into (default: print the envelope to stdout); missing parent directories are created',
     )
     .option(
       '--failed-only',
