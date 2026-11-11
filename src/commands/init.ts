@@ -21,7 +21,7 @@ import {
 } from '../lib/client-factory.js';
 import { normalizeEnvVar, resolveProfileName } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
-import { CLIError, InterruptError, localValidationError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError, localValidationError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import type { AuthDeps, ConfigureResult, MeResponse } from './auth.js';
 import { missingApiKeyError, runConfigure, runWhoami } from './auth.js';
@@ -609,6 +609,23 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     me = await runWhoami(opts, whoamiDeps);
   } catch (err) {
     if (err instanceof InterruptError) throw err;
+    // `--skip-if-configured` skipped the configure-time validation, so whoami is
+    // the only call that ever reaches the server on this path. Swallowing its
+    // auth failure made `setup --skip-if-configured` print an "initialized"
+    // summary with exit 0 for a key that had since been revoked, and the first
+    // real command failed afterwards with a much less obvious error. Let the
+    // typed envelop through instead (AUTH_INVALID / AUTH_FORBIDDEN, exit 3).
+    // Scoped to the two auth codes on purpose: a malformed saved key reports
+    // VALIDATION_ERROR from the client factory, and that stays display-only so
+    // a cosmetic format complaint cannot fail an otherwise valid setup.
+    // Every other path still treats whoami as display-only.
+    if (
+      skipWillApply &&
+      err instanceof ApiError &&
+      (err.code === 'AUTH_INVALID' || err.code === 'AUTH_FORBIDDEN')
+    ) {
+      throw err;
+    }
     // Whoami is display-only. If it fails after a successful configure,
     // continue with a minimal placeholder so the summary still prints.
     if (opts.debug) {
