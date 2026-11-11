@@ -115,8 +115,9 @@ This is the loop a coding agent runs on its own once you've onboarded it with `t
 testsprite setup
 
 # 1 — describe the behavior you want to guarantee, run it, wait
-testsprite test create --project proj_8f0f6 --type frontend \
-  --plan-from ./checkout-flow.plan.json --run --wait --output json
+# Set projectId in checkout-flow.plan.json to your project ID.
+testsprite test create --plan-from ./checkout-flow.plan.json \
+  --run --wait --output json
 #   → exits 1: the run failed
 
 # 2 — pull ONE self-consistent failure bundle to ./.testsprite/failure/
@@ -295,7 +296,7 @@ Common flags: `--page-size`, `--starting-token`, `--max-items` — same shape as
 
 #### `testsprite test result <test-id>`
 
-Get the latest result for a test — status, started / finished timestamps, video and failure-analysis URLs, summary counts (`passed / failed / skipped`), and correlation fields (`snapshotId`, `runId`, `codeVersion`). With `--include-analysis`, the response also carries an inline `analysis` block (root-cause hypothesis, recommended fix target, failure kind). Backend tests additionally surface the run's captured stdout (`apiOutput`) and Python traceback (`trace`): full content under `--output json` (and in `result.json` / `failure.json` inside failure bundles); text mode prints a bounded 20-line tail of each with a byte count.
+Get the latest result for a test — `status`, `verdict`, `executionStatus`, started / finished timestamps, video and failure-analysis URLs, a `summary` string, and correlation fields (`snapshotId`, `runIdIfAvailable`, `codeVersion`). With `--include-analysis`, the response also carries an inline `analysis` block (root-cause hypothesis, recommended fix target, failure kind). Backend tests additionally surface the run's captured stdout (`apiOutput`) and Python traceback (`trace`): full content under `--output json` (and in `result.json` / `failure.json` inside failure bundles); text mode prints a bounded 20-line tail of each with a byte count.
 
 With `--history`, each row also carries the environment the run used: an **ENV** column shows the environment name, or `—` for rows that predate environments. A run-time `--target-url` can reuse an existing same-origin environment or use a temporary one; `--env` can supply settings while the browser visits the override URL. The `targetUrl:` detail line reports the run's target. `--env <name>` filters the history to runs on that environment (server-side; only with `--history`). The latest-result view prints an `environment:` line for the same reason. JSON consumers get `environment: { id, name } | null` on every run/result payload and `targetUrl`; `targetUrlSource` is `null` on a V3 row.
 
@@ -406,7 +407,7 @@ testsprite test create --project proj_xxxxxxxx --type frontend --name "Checkout"
   --code-file ./checkout.py --step-timeout 45000
 
 # Frontend test from an agent-supplied plan-steps document; trigger + wait inline
-testsprite test create --plan-from ./checkout.plan.json --type frontend \
+testsprite test create --plan-from ./checkout.plan.json \
   --run --wait --timeout 600 --output json
 
 # Print the plan-file skeleton, edit it, then create from it
@@ -535,13 +536,14 @@ testsprite project update proj_xxxxxxxx --test-id-attributes data-element,data-t
 
 ```bash
 testsprite project create --type frontend --name <name> --local <port> [--skip-preflight]
-testsprite test create --plan-from ./checkout.plan.json --project <project-id>
+# Set projectId in checkout.plan.json to the project ID returned above.
+testsprite test create --plan-from ./checkout.plan.json
 testsprite test run <test-id>
 ```
 
 `project create --local` stores `http://localhost:<port>`. Alternatively, pass `--url http://localhost:<port>`, `--url http://127.0.0.1:<port>` or `--url http://[::1]:<port>` (an optional trailing `/` is preserved). Loopback stored URLs must use HTTP, an explicit port and no path; HTTPS, missing ports, other `127.x` hosts, unspecified addresses, LAN/RFC1918, link-local and metadata addresses remain refused. `--local-host` still overrides the shorthand host, but is deprecated and hidden from project/environment help; prefer an explicit URL. Existing rows retain their host spelling. `project get` and `project list` expose `originMode: 'local'` in JSON, while text output shows `(Local)`. Loopback creation is frontend-only; `--local` and `--url` remain mutually exclusive. The port is probed before creation unless `--skip-preflight` is given. V2-only accounts receive exit 7 (`local-origin-requires-v3`).
 
-Creation performs **no exploration or plan generation**. `test plan generate --project <project-id>` on a local project is refused **before charge**, with exit 6 and guidance to use `test create --plan-from … --project <id>` followed by `test run <test-id>`. Author a plan using the [plan file format](#plan-file-format), capture the created test id, and run it through the tunnel.
+Creation performs **no exploration or plan generation**. `test plan generate --project <project-id>` on a local project is refused **before charge**, with exit 6 and guidance to set `projectId` in the plan and use `test create --plan-from …` followed by `test run <test-id>`. Author a plan using the [plan file format](#plan-file-format), capture the created test id, and run it through the tunnel.
 
 Portal runs of a local project are **BLOCKED for free** until you set a public URL:
 
@@ -850,7 +852,7 @@ Batch `--report` flags apply only to `test run --wait` with `--all` or several i
 
 `--target-url` and `--local` can supply an ad-hoc origin while `--env` supplies its sign-in configuration and run attribution. When no saved origin matches and no `--env` is selected, a supporting backend clones the project default's sign-in configuration into a temporary environment. Explicit `--local` can use a public environment's sign-in configuration on a new backend; an older backend's refusal is rendered verbatim and the tunnel is closed. Unknown environment names remain validation errors with the available names. `--env` is also accepted by `--all` and several ids.
 
-**Reachability preflight (refuse before charge).** For a public `--target-url`, the CLI probes **before dispatching** (and before anything is billed): a DNS resolve plus a lightweight HTTP request, sharing an 8-second budget. A stalled DNS lookup produces an advisory when that budget expires; interruption stops waiting immediately without dispatching a run. Loopback tunnel targets use a TCP probe of the stored host and port instead. A confirmed-dead target — DNS `NXDOMAIN`, connection refused, or a `502`/`503`/`504` gateway error (the signature of a tunnel that has gone away) — is refused with a validation error (exit 5) instead of dispatching a run that can only fail against a URL nobody is serving. A resolved address that lands in private/loopback/link-local space is always refused (the hostname passed the literal check but actually points somewhere unreachable from the runner). Ambiguous signals — a timeout, a TLS error, an odd status — only produce a stderr warning and never block; behind a configured HTTP(S) proxy, a local DNS failure is also downgraded to a warning, since resolution really happens at the proxy. `--skip-preflight` (on `test run`, `test create`, and `test create-batch`) skips these probes; metadata reads needed to resolve an environment still occur. Note: for a backend test the probe is a heuristic (the test's own base URL is baked into its code) — reach for `--skip-preflight` if a refusal surprises you there.
+**Reachability preflight (refuse before charge).** For a public `--target-url`, the CLI probes **before dispatching** (and before anything is billed): a DNS resolve plus a lightweight HTTP request, sharing an 8-second budget. A stalled DNS lookup produces an advisory when that budget expires; interruption stops waiting immediately without dispatching a run. Loopback tunnel targets use a TCP probe of the stored host and port instead. A confirmed-dead target — DNS `NXDOMAIN`, connection refused, or a `502`/`503`/`504` gateway error (the signature of a tunnel that has gone away) — is refused with a validation error (exit 5) instead of dispatching a run that can only fail against a URL nobody is serving. A resolved address that lands in private/loopback/link-local space is always refused (the hostname passed the literal check but actually points somewhere unreachable from the runner). A redirect to Vercel's login wall (`vercel.com/sso-api`, a preview behind Vercel Deployment Protection) is refused too (exit 5, `details.reason: 'target-protected'`), since every test would run against the login page: turn off Vercel Authentication for previews, or pass a Protection Bypass for Automation secret as `--target-url "<preview>?x-vercel-protection-bypass=<secret>&x-vercel-set-bypass-cookie=true"` (with `&` instead of `?` when the URL already has a query). Ambiguous signals — a timeout, a TLS error, an odd status — only produce a stderr warning and never block; behind a configured HTTP(S) proxy, a local DNS failure is also downgraded to a warning, since resolution really happens at the proxy. `--skip-preflight` (on `test run`, `test create`, and `test create-batch`) skips these probes; metadata reads needed to resolve an environment still occur. Note: for a backend test the probe is a heuristic (the test's own base URL is baked into its code) — reach for `--skip-preflight` if a refusal surprises you there.
 
 The `[advisory]` about `--target-url` on V3-routed accounts is now **response-driven**: the CLI reads the run's actual trigger response rather than guessing from account flags, so it fires only when the override genuinely did not take effect (newer backends apply `--target-url` to fresh frontend runs on V3; older ones ignore it and the advisory says so). The CLI auto-mints an idempotency key (printed to stderr under `--output json`, `--verbose`, or `--debug`); pass `--idempotency-key <uuid>` to control it explicitly.
 
@@ -1160,7 +1162,7 @@ testsprite ci run --project proj_xxxxxxxx --filter checkout --fail-on-skipped
 testsprite ci run --project proj_xxxxxxxx --summary-file testsprite-summary.json
 ```
 
-`--project` defaults to `TESTSPRITE_PROJECT_ID`. All project tests are selected unless `--filter <substr>` narrows them (case-insensitive, non-empty substring); `--all` is optional. An explicitly empty `--filter` fails with `VALIDATION_ERROR` / exit **5** before any request, including with `--dry-run`; omit the flag to select every test. Whitespace is preserved. `--env <name>` names the environment whose sign-in the run uses; the name must be one of the project's environments (`testsprite project env list <id>`), and an unknown name is refused **before** anything dispatches or charges, even with `--allow-empty`. That check fails closed: an environment list that cannot be read is that error (a bad key exits **3**, a backend that is down **10**), never a run that goes on to dispatch unchecked; only a backend answering that the project has no environment surface (a V2 project, or an older backend without the route) leaves the name to the batch's own validation. `--target-url <url>` is the address to test — a pull request's preview deployment, or a local app through an automatic tunnel (see [`test run`](#testsprite-test-run-test-id)); `--skip-preflight` skips its reachability probe when the preview is still warming up. Backend tests use the URL in their own code, not `--target-url`.
+`--project` defaults to `TESTSPRITE_PROJECT_ID`. All project tests are selected unless `--filter <substr>` narrows them (case-insensitive, non-empty substring); `--all` is optional. An explicitly empty `--filter` fails with `VALIDATION_ERROR` / exit **5** before any request, including with `--dry-run`; omit the flag to select every test. Whitespace is preserved. `--env <name>` names the environment whose sign-in the run uses; the name must be one of the project's environments (`testsprite project env list <id>`), and an unknown name is refused **before** anything dispatches or charges, even with `--allow-empty`. That check fails closed: an environment list that cannot be read is that error (a bad key exits **3**, a backend that is down **10**), never a run that goes on to dispatch unchecked; only a backend answering that the project has no environment surface (a V2 project, or an older backend without the route) leaves the name to the batch's own validation. `--target-url <url>` is a publicly reachable address to test, typically a pull request's preview deployment; `--skip-preflight` skips its reachability probe when the preview is still warming up. `ci run` refuses loopback targets, including a selected environment's stored loopback URL when no `--target-url` overrides it, with exit **5** and zero-valued step outputs. For a local app, use `testsprite test run --all --env <name> --wait` (see [`test run`](#testsprite-test-run-test-id)). Backend tests use the URL in their own code, not `--target-url`.
 
 **One execution.** Every selected test is seeded into one execution and the server paces dispatch under the project's execution settings, exactly as for a GitHub App run — a CI run is one row in the Portal, never a first batch plus a rate-deferred retry. A backend that cannot honor this is refused with exit **7** (`admission-not-honored`) after the outputs are published; the batch is never silently cut to the per-key budget.
 
@@ -1227,7 +1229,7 @@ permissions:
   contents: read
   pull-requests: read
 jobs:
-  gate:
+  testsprite-tests:
     concurrency:
       group: testsprite-testsprite.yml-${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
@@ -1277,7 +1279,7 @@ permissions:
   contents: read
   pull-requests: read
 jobs:
-  gate:
+  testsprite-tests:
     concurrency:
       group: testsprite-testsprite.yml-${{ github.event.pull_request.number || github.event.deployment.sha }}
       cancel-in-progress: true
@@ -1438,7 +1440,7 @@ Any field named like `password`, `token`, `secret`, `apiKey` / `api_key`, `autho
 | `TESTSPRITE_NO_UPDATE_NOTIFIER`            | Any non-empty value disables the once-per-24h "new version available" notice                                                                                                  |
 | `NO_COLOR`                                 | Suppress ANSI escape sequences in ticker output ([no-color.org](https://no-color.org/))                                                                                       |
 | `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`  | Standard proxy support - API traffic is routed through the configured proxy                                                                                                   |
-| `TESTSPRITE_NO_SKILL_WARNING`              | Any non-empty value silences the "verify skill not installed" reminder (CI / manual use)                                                                                      |
+| `TESTSPRITE_NO_SKILL_WARNING`              | Any value except blank, `0`, `false`, or `no` (after trimming and ignoring case) silences the "verify skill not installed" reminder (CI / manual use)                         |
 | `TESTSPRITE_NO_TELEMETRY` / `DO_NOT_TRACK` | Any truthy value (not `0`/`false`/empty) disables usage telemetry (see Telemetry below)                                                                                       |
 | `TESTSPRITE_PORTAL_URL`                    | Override the Portal origin used for `dashboardUrl` links (non-prod environments)                                                                                              |
 | `TESTSPRITE_CLIENT`                        | Identifies a wrapper driving the CLI (`<name>/<version>`, e.g. `github-action/v1`); appended to the User-Agent and reported as telemetry `client`. Invalid values are ignored |
@@ -1449,7 +1451,7 @@ Authenticated runs send one best-effort "command outcome" event per invocation
 to TestSprite (`POST /api/cli/v1/telemetry`) so we can measure which commands
 run and diagnose failures. Each event carries only:
 
-- the command name (e.g. `test run`), the outcome (`success`/`error`/`abort`),
+- the command name (e.g. `test run`), the outcome (`success`/`error`),
   the exit code, a machine error **code** (e.g. `VALIDATION_ERROR`), and the
   duration;
 - context: CLI version, OS, Node version, output mode, CI-vs-interactive (`ci`),
@@ -1483,7 +1485,7 @@ It **never** sends: your API key, target URLs, free-form flag or argument values
 run ids (other than the `ci run` execution id above — the server's own UUID, which names nothing about you or your code), repository names, or error **messages**. The event is a fixed
 allowlist; timeout seconds and the local concurrency limit are bounded numeric controls. It is bounded to ~1s and fully best-effort — it never delays beyond that,
 never changes a command's behavior or exit code, and is skipped entirely when no
-API key is configured or under `--dry-run`.
+API key is configured, under `--dry-run`, or when the command is interrupted (Ctrl-C / SIGTERM / SIGHUP).
 
 Opt out with `TESTSPRITE_NO_TELEMETRY=1` or the cross-tool
 `DO_NOT_TRACK=1` (any truthy value; `0`/`false`/empty do not opt out).
@@ -1588,7 +1590,7 @@ testsprite ci run --project proj_xxxxxxxx \
 ```
 
 - **Waiting is automatic.** The command follows accepted runs to a terminal verdict (or `--timeout`, default 600 s). Skipped tests warn by default; add `--fail-on-skipped` for a strict gate.
-- **`--report junit --report-file <path>`** optionally writes a JUnit XML sidecar for dispatched runs. Skipped tests are currently omitted from JUnit; the unified summary includes them.
+- **`--report junit --report-file <path>`** optionally writes a JUnit XML sidecar. Skipped tests appear as `<skipped>` testcases with their reasons; the unified summary includes them.
 - **`--summary-file <path>`** writes a compact machine summary (`{ total, passed, failed, skipped, timedOut, runs[] }`) you can read from any step — `failed` counts only dispatched runs that failed; tests that never dispatched (deferred / conflicted / not found / skipped) count under `skipped`. **`--gh-output`** additionally emits a job-summary table and annotations (`::error::` for failures/timeouts, `::warning::` for never-dispatched tests); it auto-enables under `GITHUB_ACTIONS=true`, so you rarely pass it by hand.
 
 Archive any requested reports with a step that also runs after failure (`if: always()` in GitHub Actions).

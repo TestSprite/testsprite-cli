@@ -10529,6 +10529,23 @@ async function finishZeroDispatchBatch(params: {
   );
 }
 
+function refuseCiLoopbackTarget(deps: TestDeps, validationError?: unknown): never {
+  recordTelemetryExtras({ ciRunOutcome: 'refused_loopback' });
+  emitCiStepOutputs(
+    { total: 0, passed: 0, failed: 0, skipped: 0, timedOut: 0, runs: [] },
+    {
+      env: deps.env ?? process.env,
+      stderr: deps.stderr ?? (line => process.stderr.write(`${line}\n`)),
+    },
+  );
+  if (validationError !== undefined) throw validationError;
+  throw localValidationError(
+    'target-url',
+    'ci run requires a publicly reachable target URL. For a local app, use ' +
+      'testsprite test run --all --env <name> --wait (with --project <id> if needed)',
+  );
+}
+
 /**
  * `test run --all --project <id>` — M4 piece-2.
  *
@@ -10572,6 +10589,16 @@ export async function runTestRunAll(
   const stderrFn = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
   const out = makeOutput(opts.output, deps);
 
+  if (opts.ci && opts.targetUrl !== undefined) {
+    let loopback;
+    try {
+      loopback = parseLoopbackTargetUrl(opts.targetUrl);
+    } catch (err) {
+      refuseCiLoopbackTarget(deps, err);
+    }
+    if (loopback) refuseCiLoopbackTarget(deps);
+  }
+
   if (opts.dryRun && opts.targetUrl === undefined && !opts.noWait && !explicitIds) {
     let target: ResolvedRunTarget | undefined;
     try {
@@ -10580,12 +10607,13 @@ export async function runTestRunAll(
         projectId,
         environment,
         dryRun: true,
-        stderr: stderrFn,
+        stderr: opts.ci ? () => undefined : stderrFn,
       });
     } catch (err) {
       if (err instanceof InterruptError) throw err;
     }
     if (target) {
+      if (opts.ci) refuseCiLoopbackTarget(deps);
       await runTestRunLocalBatch(
         {
           ...opts,
@@ -10676,9 +10704,10 @@ export async function runTestRunAll(
           environment,
           targetUrl: opts.targetUrl,
           noWait: opts.noWait,
-          stderr: stderrFn,
+          stderr: opts.ci ? () => undefined : stderrFn,
         });
   if (automaticTarget) {
+    if (opts.ci) refuseCiLoopbackTarget(deps);
     await runTestRunLocalBatch(
       {
         ...opts,
@@ -12001,6 +12030,15 @@ export async function runTestRunAll(
   // The failed request outranks every code below (deferred 7, failed verdict 1,
   // credits 12, conflict 6): the runs it left behind have been awaited and reported.
   if (stoppedError !== undefined) throw stoppedFailure();
+
+  // A rejected credential is batch-wide and must not be masked by undispatched
+  // tests. Other failures still yield to the deferred gate below.
+  if (freshRunResults.some(r => r.error?.exitCode === 3)) {
+    const authFailure = resolveWaitFailure(freshRunResults, {
+      timeoutSeconds: opts.timeoutSeconds,
+    });
+    if (authFailure) throw authFailure;
+  }
 
   // Rate-deferred tests were never dispatched → the batch is incomplete (exit 7),
   // mirroring `test rerun --all`. Checked before the failed-run throw so the
