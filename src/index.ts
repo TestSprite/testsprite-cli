@@ -22,6 +22,7 @@ import { createUsageCommand } from './commands/usage.js';
 import { resolveProfileName } from './lib/config.js';
 import { classifyBillingRefusal } from './lib/billing-refusal.js';
 import { TARGETS, type AgentTarget } from './lib/agent-targets.js';
+import { validatePositionalArgs } from './lib/args.js';
 import {
   ApiError,
   CLIError,
@@ -75,21 +76,20 @@ program
   .version(VERSION)
   .option('--output <mode>', 'Output format (json|text)', 'text')
   .option('--profile <name>', 'Configuration profile to use')
-  .option('--endpoint-url <url>', 'Override the API endpoint host')
+  .option('--endpoint-url <url>', 'API base URL (a full http(s) URL)')
   .option(
     '--verbose',
-    'Emit human-readable HTTP retry / backoff / polling-mode transitions to stderr. Less noisy than --debug; useful for diagnosing hangs without the full trace.',
+    'Log HTTP retry / backoff / polling transitions to stderr (lighter than --debug)',
   )
   .option('--debug', 'Print HTTP method/path, request id, latency, retry decisions to stderr')
   .option(
     '--dry-run',
-    'Skip the network and credentials; emit a canned sample matching the OpenAPI contract. Useful for learning the CLI surface without an API key. Note: file inputs you pass (--plan-from/--plans/--steps) are still read and validated locally; only --code-file uses a placeholder.',
+    'Skip the network and credentials; emit a canned sample matching the OpenAPI contract. Exception: run commands (`test run`, `test rerun`, `test create --run`, `testlist run`) with credentials and no explicit target may make read-only GETs to preview an automatic tunnel target; nothing is created or started. File inputs (--plan-from/--plans/--steps) are still read locally; --code-file uses a placeholder.',
   )
   .option(
     '--request-timeout <seconds>',
-    'Client-side per-request timeout in seconds (default: 120). Aborts any single fetch that does not complete within this deadline. ' +
-      'Override via TESTSPRITE_REQUEST_TIMEOUT_MS env var (milliseconds). ' +
-      'Range: 1–600. Does not affect the --timeout polling ceiling for `test run/wait`.',
+    'Per-request timeout in seconds (default 120; range 1–600, values outside are clamped). ' +
+      'Does not affect the --timeout polling ceiling for `test run/wait`.',
   );
 
 // `setup` is the primary onboarding command, listed FIRST in --help so a coding
@@ -231,6 +231,14 @@ function unknownRootCommandMaskedByHelp(args: readonly string[]): string | undef
   return args.slice(1).some(arg => arg === '--help' || arg === '-h') ? first : undefined;
 }
 
+program.addHelpText(
+  'after',
+  '\nEnvironment:\n' +
+    '  TESTSPRITE_API_KEY (overrides stored credentials), TESTSPRITE_NO_UPDATE_NOTIFIER (disables\n' +
+    '  the version check); TESTSPRITE_API_URL, TESTSPRITE_PROFILE and TESTSPRITE_REQUEST_TIMEOUT_MS\n' +
+    '  (milliseconds) mirror --endpoint-url, --profile and --request-timeout.',
+);
+
 program.addHelpText('beforeAll', context => {
   if (context.command !== program) return '';
   const unknownCommand = unknownRootCommandMaskedByHelp(program.args);
@@ -278,6 +286,13 @@ function telemetryGlobals(): {
 // action; the helper self-gates (text-only, non-dry-run, a small command
 // allowlist, opt-out via TESTSPRITE_NO_SKILL_WARNING) and never throws.
 program.hook('preAction', (_thisCommand, actionCommand) => {
+  const commandPath = commandPathOf(actionCommand);
+  // Record which leaf command ran, for the telemetry emit around parseAsync.
+  ranCommandPath = commandPath;
+
+  // Validate positional arguments across all commands before executing their actions.
+  validatePositionalArgs(actionCommand);
+
   const globals = actionCommand.optsWithGlobals() as {
     output?: string;
     profile?: string;
@@ -288,9 +303,6 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     local?: string;
     localHost?: string;
   };
-  const commandPath = commandPathOf(actionCommand);
-  // Record which leaf command ran, for the telemetry emit around parseAsync.
-  ranCommandPath = commandPath;
   // Preserve explicit --local attempts, including refusals and borrowed tunnels;
   // only flag presence is recorded. Automatic tunnel paths record the same fact.
   if (globals.local !== undefined) recordTelemetryExtras({ local: true });
@@ -516,8 +528,9 @@ try {
           code: 'REQUEST_TIMEOUT',
           message: err.message,
           nextAction:
+            err.nextAction ??
             'Increase --request-timeout <seconds> or set TESTSPRITE_REQUEST_TIMEOUT_MS. ' +
-            'Check that the backend is reachable and not overloaded.',
+              'Check that the backend is reachable and not overloaded.',
           requestId: err.requestId,
           details: { timeoutMs: err.timeoutMs },
         },

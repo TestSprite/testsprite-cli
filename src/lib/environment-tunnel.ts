@@ -12,6 +12,7 @@ import { recordTelemetryTunnelOpened } from './telemetry.js';
 import type { HttpClient } from './http.js';
 import type { RunResponse } from './runs.types.js';
 import { Output } from './output.js';
+import type { DeprecationEntry } from './deprecate.js';
 import { emitCiArtifacts, summarizeAcceptedPayload } from './gh-output.js';
 import { buildJUnitReport, writeJUnitReportFile } from './junit-report.js';
 import { pollRunUntilTerminal, TimeoutError, isTerminalStatus } from './poll.js';
@@ -47,10 +48,30 @@ export function readEnvironmentPreflight<T>(
   client: Pick<HttpClient, 'get'>,
   path: string,
 ): Promise<T> {
-  return client.get<T>(path, {
-    retry: false,
-    signal: AbortSignal.timeout(ENVIRONMENT_PREFLIGHT_TIMEOUT_MS),
-  });
+  // Abort with a RequestTimeoutError as the reason, not AbortSignal.timeout's
+  // raw DOMException: HttpClient passes a RequestTimeoutError through
+  // untouched, so a stalled preflight read surfaces as REQUEST_TIMEOUT
+  // (exit 7) instead of reaching the top-level catch as an uncaught
+  // exception. The 5s deadline here is fixed — --request-timeout does not
+  // govern it — so the message and nextAction name the preflight read
+  // rather than pointing at the flag.
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort(
+      new RequestTimeoutError(ENVIRONMENT_PREFLIGHT_TIMEOUT_MS, 'local', {
+        message:
+          `Environment preflight read timed out after ` +
+          `${ENVIRONMENT_PREFLIGHT_TIMEOUT_MS / 1000}s (client-side).`,
+        nextAction:
+          'The environment preflight read timed out. ' +
+          'Check that the backend is reachable and not overloaded, then retry.',
+      }),
+    );
+  }, ENVIRONMENT_PREFLIGHT_TIMEOUT_MS);
+  timer.unref?.();
+  return client
+    .get<T>(path, { retry: false, signal: controller.signal })
+    .finally(() => clearTimeout(timer));
 }
 
 export function assertNoTunnelOptions(args: {
@@ -70,13 +91,6 @@ export function assertNoTunnelOptions(args: {
         'cancelled when this command stops waiting — Ctrl-C detaches, and `testsprite test ' +
         'cancel <run-id>` is the way to stop one',
     );
-}
-
-export function severalIdsWithoutTunnel(): never {
-  throw localValidationError(
-    'test-id',
-    'several test ids run through one tunnel with --local <port>. For tests the runner can already reach, use `testsprite test run --all --project <id> [--filter <text>]`, or run them one at a time.',
-  );
 }
 
 const announcedEnvironments = new WeakMap<Map<string, Environment[] | undefined>, Set<string>>();
@@ -570,7 +584,10 @@ export async function emitEnvironmentDispatchPartial(
     ghOutput?: boolean;
     summaryFile?: string;
   },
-  deps: ClientFactoryDeps & { stdout?: (line: string) => void },
+  deps: ClientFactoryDeps & {
+    stdout?: (line: string) => void;
+    deprecations?: readonly DeprecationEntry[];
+  },
   label: string,
   error: unknown,
   context: EnvironmentTunnelContext,
@@ -603,9 +620,11 @@ export async function emitEnvironmentDispatchPartial(
     ...(responses.some(response => response.notFound) ? { notFound } : {}),
   };
   const stderr = deps.stderr ?? (line => process.stderr.write(`${line}\n`));
-  new Output(opts.output, { stdout: deps.stdout, stderr: deps.stderr }).print(partial, () =>
-    accepted.map(row => `${row.runId}  ${row.status}`).join('\n'),
-  );
+  new Output(
+    opts.output,
+    { stdout: deps.stdout, stderr: deps.stderr },
+    { deprecations: deps.deprecations },
+  ).print(partial, () => accepted.map(row => `${row.runId}  ${row.status}`).join('\n'));
   const summary = summarizeAcceptedPayload(JSON.stringify(partial));
   summary.runs.push(
     ...notRunTestIds.map(testId => ({

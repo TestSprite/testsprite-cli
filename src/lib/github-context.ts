@@ -23,7 +23,12 @@ export interface GithubContextDeps {
   /** Reads `$GITHUB_EVENT_PATH`; injectable so tests never touch the runner. */
   readFile?: (path: string) => string;
   fetchImpl?: FetchImpl;
+  /** Budget for the GitHub pull-request lookup, as `--request-timeout` gives every other call. */
+  requestTimeoutMs?: number;
 }
+
+/** Same default as the HttpClient's per-request budget when no flag or env var sets one. */
+const DEFAULT_LOOKUP_TIMEOUT_MS = 30_000;
 
 /** The temporary environment a pull request's runs live in — shared with the GitHub App. */
 export function previewEnvironmentName(prNumber: number): string {
@@ -86,14 +91,20 @@ export async function readGithubRunContext(
       );
     }
     const pulls = await listPullsForCommit(
-      { env, repoOwner, repoName, sha, token },
+      {
+        env,
+        repoOwner,
+        repoName,
+        sha,
+        token,
+        timeoutMs: deps.requestTimeoutMs ?? DEFAULT_LOOKUP_TIMEOUT_MS,
+      },
       deps.fetchImpl ?? globalThis.fetch,
     );
-    // The PR whose head IS this commit is the one this deployment belongs to.
-    // Anything looser (several open PRs, a merged one) is not a gate target.
-    const exact = pulls.filter(p => p.headSha === sha);
-    const open = pulls.filter(p => p.state === 'open');
-    const chosen = exact[0] ?? (open.length === 1 ? open[0] : undefined);
+    // Only an OPEN PR whose head IS this commit is the one this deployment belongs to.
+    // Anything looser (an open PR that merely contains the commit, a merged or closed one) is
+    // not a gate target: a redeploy of a merged PR's head commit must not clone an environment.
+    const chosen = pulls.find(p => p.headSha === sha && p.state === 'open');
     if (!chosen) {
       return {
         kind: 'no_pull_request',
@@ -152,7 +163,14 @@ interface PullSummary {
 }
 
 async function listPullsForCommit(
-  args: { env: NodeJS.ProcessEnv; repoOwner: string; repoName: string; sha: string; token: string },
+  args: {
+    env: NodeJS.ProcessEnv;
+    repoOwner: string;
+    repoName: string;
+    sha: string;
+    token: string;
+    timeoutMs: number;
+  },
   fetchImpl: FetchImpl,
 ): Promise<PullSummary[]> {
   const base = (args.env.GITHUB_API_URL ?? 'https://api.github.com').replace(/\/+$/, '');
@@ -166,10 +184,17 @@ async function listPullsForCommit(
         authorization: `Bearer ${args.token}`,
         'x-github-api-version': '2022-11-28',
       },
+      // Without a budget a GitHub API that never answers hangs the job until the runner kills it.
+      signal: AbortSignal.timeout(args.timeoutMs),
     });
   } catch (err) {
     throw new CLIError(
-      `Could not look up the pull request for commit ${args.sha.slice(0, 7)}: ${err instanceof Error ? err.message : String(err)}`,
+      `Could not look up the pull request for commit ${args.sha.slice(0, 7)}: ` +
+        (isTimeout(err)
+          ? `GitHub did not answer within ${Math.round(args.timeoutMs / 1000)}s`
+          : err instanceof Error
+            ? err.message
+            : String(err)),
       10,
     );
   }
@@ -182,7 +207,23 @@ async function listPullsForCommit(
       response.status === 401 || response.status === 403 ? 5 : 10,
     );
   }
-  const body: unknown = await response.json();
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch (err) {
+    // A proxy or captive portal answering 200 with HTML must be a transient failure, not an uncaught crash; so is
+    // a body that stalls until the timeout aborts it, which is reported as the timeout it is, and a connection that
+    // drops mid-body, which is reported with its own cause rather than as "not JSON".
+    throw new CLIError(
+      `Could not look up the pull request for commit ${args.sha.slice(0, 7)}: ` +
+        (isTimeout(err)
+          ? `GitHub did not finish answering within ${Math.round(args.timeoutMs / 1000)}s`
+          : err instanceof SyntaxError
+            ? `GitHub answered ${response.status} with a body that is not JSON`
+            : `GitHub's ${response.status} response body could not be read: ${err instanceof Error ? err.message : String(err)}`),
+      10,
+    );
+  }
   if (!Array.isArray(body)) return [];
   return body.flatMap((item): PullSummary[] => {
     const pr = asRecord(item);
@@ -204,4 +245,8 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function isTimeout(err: unknown): boolean {
+  return err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError');
 }

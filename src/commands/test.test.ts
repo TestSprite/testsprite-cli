@@ -11,7 +11,7 @@ import {
 import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 import type { Command } from 'commander';
 import type { RunResponse } from '../lib/runs.types.js';
 import { ApiError, InterruptError } from '../lib/errors.js';
@@ -1264,6 +1264,76 @@ describe('createTestCommand list — required flag', () => {
     expect(seen[0]).toMatch(/[?&]status=failed%2Cblocked/);
   });
 
+  it('--status not_run asks the server for the test cases that never ran (draft, ready)', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      seen.push(url);
+      return { body: { items: [], nextToken: null } };
+    });
+    for (const status of ['not_run', 'failed,not_run']) {
+      await runList(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          projectId: 'project_alice',
+          status,
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined },
+      );
+    }
+    expect(new URL(seen[0]!).searchParams.get('status')).toBe('draft,ready');
+    expect(new URL(seen[1]!).searchParams.get('status')).toBe('failed,draft,ready');
+  });
+
+  it('--status still accepts the older values (draft, ready, queued, running, unknown)', async () => {
+    const { credentialsPath } = makeCreds();
+    const seen: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      seen.push(url);
+      return { body: { items: [], nextToken: null } };
+    });
+    await runList(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        status: 'draft,ready,queued,running,unknown',
+      },
+      { credentialsPath, fetchImpl, stdout: () => undefined },
+    );
+    expect(new URL(seen[0]!).searchParams.get('status')).toBe('draft,ready,queued,running,unknown');
+  });
+
+  it('--status rejects an unknown token naming the latest-status values', async () => {
+    const { credentialsPath } = makeCreds();
+    const err = (await runList(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        status: 'fail',
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: { items: [], nextToken: null } })),
+        stdout: () => undefined,
+      },
+    ).catch((e: unknown) => e)) as ApiError;
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err.nextAction).toContain('passed, failed, blocked, cancelled, not_run');
+    expect(err.getDetail('accepted')).toEqual([
+      'passed',
+      'failed',
+      'blocked',
+      'cancelled',
+      'not_run',
+    ]);
+  });
+
   it('M2.1 piece 2: --status rejects unknown tokens locally (exit 5, no fetch)', async () => {
     // Defense: a typo like `--status fail` shouldn't silently filter
     // to nothing. Fail fast client-side with the accepted set in
@@ -1971,6 +2041,153 @@ describe('isPresignedCodeUrl', () => {
 });
 
 describe('runCodeGet', () => {
+  it.each(['json', 'text'] as const)(
+    '%s mode rejects malformed test-code responses before writing output',
+    async output => {
+      const { credentialsPath } = makeCreds();
+      const stdout: string[] = [];
+      const fetchImpl = makeFetch(() => ({
+        body: { ...TEST_CODE_INLINE, code: { unexpected: 'do not emit this body' } },
+      }));
+      await expect(
+        runCodeGet(
+          { profile: 'default', output, debug: false, testId: 'test_fe' },
+          {
+            credentialsPath,
+            fetchImpl,
+            stdout: line => stdout.push(line),
+            rawStdout: chunk => {
+              stdout.push(chunk);
+            },
+          },
+        ),
+      ).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+      expect(stdout).toEqual([]);
+    },
+  );
+
+  it('rejects a missing code field without replacing an existing --out file', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-shape-'));
+    const target = join(dir, 'existing.json');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- target is inside this test's own mkdtempSync directory, never user input.
+    writeFileSync(target, 'keep the original');
+    const withoutCode: Record<string, unknown> = { ...TEST_CODE_INLINE };
+    delete withoutCode.code;
+    const fetchImpl = makeFetch(() => ({ body: withoutCode }));
+    await expect(
+      runCodeGet(
+        { profile: 'default', output: 'json', debug: false, testId: 'test_fe', out: target },
+        { credentialsPath, fetchImpl },
+      ),
+    ).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- target is the fixture path created inside this test's own temp directory.
+    expect(readFileSync(target, 'utf8')).toBe('keep the original');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- dir is created by this test's mkdtempSync call, never user input.
+    expect(readdirSync(dir)).toEqual(['existing.json']);
+  });
+
+  it('preserves additive fields and future code language/framework strings', async () => {
+    const { credentialsPath } = makeCreds();
+    const body = {
+      ...TEST_CODE_INLINE,
+      language: 'ruby',
+      framework: 'rspec',
+      provenance: { source: 'future-server' },
+    };
+    const lines: string[] = [];
+    const result = await runCodeGet(
+      { profile: 'default', output: 'json', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl: makeFetch(() => ({ body })), stdout: line => lines.push(line) },
+    );
+    expectTypeOf(result.language).toEqualTypeOf<string>();
+    expectTypeOf(result.framework).toEqualTypeOf<string | undefined>();
+    expect(result).toEqual(body);
+    expect(JSON.parse(lines.join(''))).toEqual(body);
+  });
+
+  it('routes null code to the no-code response without dereferencing it', async () => {
+    const { credentialsPath } = makeCreds();
+    const lines: string[] = [];
+    await runCodeGet(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: { ...TEST_CODE_INLINE, code: null } })),
+        stderr: line => lines.push(line),
+        rawStdout: () => {
+          throw new Error('must not write an absent source body');
+        },
+      },
+    );
+    expect(lines).toContain('(no code generated yet — run the test first)');
+  });
+
+  it('null code with --out refuses to write and leaves an existing file unchanged', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-null-'));
+    const target = join(dir, 'existing.py');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- target is inside this test's own mkdtempSync directory, never user input.
+    writeFileSync(target, 'keep the original');
+    await expect(
+      runCodeGet(
+        { profile: 'default', output: 'text', debug: false, testId: 'test_fe', out: target },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(() => ({ body: { ...TEST_CODE_INLINE, code: null } })),
+          stderr: () => undefined,
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- target is the fixture path created inside this test's own temp directory.
+    expect(readFileSync(target, 'utf8')).toBe('keep the original');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- dir is created by this test's mkdtempSync call, never user input.
+    expect(readdirSync(dir)).toEqual(['existing.py']);
+  });
+
+  it('dry-run with null code and --out reports zero bytes instead of throwing', async () => {
+    const { credentialsPath } = makeCreds();
+    const errs: string[] = [];
+    await runCodeGet(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: true,
+        testId: 'test_fe',
+        out: join(tmpdir(), 'cli-dry-run-never-written.py'),
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: { ...TEST_CODE_INLINE, code: null } })),
+        stderr: line => errs.push(line),
+        stdout: () => undefined,
+        rawStdout: () => undefined,
+      },
+    );
+    expect(errs.join('\n')).toContain('would write code body (0 bytes)');
+  });
+
+  it('rejects an invalid auto-fetched codeVersion before sending code put', async () => {
+    const { credentialsPath } = makeCreds();
+    const dir = mkdtempSync(join(tmpdir(), 'cli-test-code-version-'));
+    const codeFile = join(dir, 'replacement.py');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- codeFile is a fixture inside this test's own mkdtempSync directory.
+    writeFileSync(codeFile, 'print("replacement")');
+    const methods: string[] = [];
+    const fetchImpl = makeFetch((_url, init) => {
+      methods.push(init.method ?? 'GET');
+      return { body: { ...TEST_CODE_INLINE, codeVersion: { unexpected: true } } };
+    });
+    await expect(
+      runCodePut(
+        { profile: 'default', output: 'json', debug: false, testId: 'test_fe', codeFile },
+        { credentialsPath, fetchImpl, stderr: () => undefined },
+      ),
+    ).rejects.toMatchObject({ code: 'INTERNAL', exitCode: 1 });
+    expect(methods).toEqual(['GET']);
+  });
+
   it('JSON mode prints the §6.3 wire shape verbatim and skips the URL fetch', async () => {
     const { credentialsPath } = makeCreds();
     const seen: string[] = [];
@@ -3633,6 +3850,34 @@ describe('runSteps', () => {
     // Shared run metadata renders once at the bottom.
     expect(block).toContain('runId:       run_abc');
     expect(block).toContain('codeVersion: v3');
+  });
+
+  it('text mode puts every header over its column, failure marker included', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      body: {
+        items: [STEP_PASSED, { ...STEP_FAILED, outcomeContributesToFailure: true }],
+        nextToken: null,
+      },
+    }));
+    const out: string[] = [];
+    await runSteps(
+      { profile: 'default', output: 'text', debug: false, testId: 'test_fe' },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    const [header, passedRow, failedRow] = out.join('\n').split('\n');
+    expect(failedRow!.startsWith('* ')).toBe(true);
+    for (const row of [passedRow!, failedRow!]) {
+      for (const [heading, value] of [
+        ['INDEX', /\d/],
+        ['ACTION', /click/],
+        ['STATUS', /passed|failed/],
+        ['DESCRIPTION', /Click the/],
+        ['UPDATED', /2026-/],
+      ] as const) {
+        expect(row.search(value), `${heading} in: ${row}`).toBe(header!.indexOf(heading));
+      }
+    }
   });
 
   it('text mode reads "No steps." on an empty list', async () => {
@@ -5709,14 +5954,51 @@ describe('runFailureGet', () => {
     expect(fetchCalls).toBe(0);
   });
 
-  it('--out rejects a path under a missing parent dir with VALIDATION_ERROR (exit 5) before any network I/O', async () => {
+  it('--out two levels under a missing directory writes the bundle there', async () => {
+    const { credentialsPath } = makeCreds();
+    const ctx = makeFailureContext();
+    const fetchImpl = makeFetch(url => {
+      if (url.startsWith('https://signed.example.com')) {
+        return { body: '<html>snapshot</html>' };
+      }
+      if (url.startsWith('https://video.example.com')) {
+        return { body: 'fake-video-bytes' };
+      }
+      return { body: ctx };
+    });
+    const missingParentBase = mkdtempSync(join(tmpdir(), 'cli-p5-missing-parent-'));
+    const outDir = join(missingParentBase, 'no-such-dir', 'deeper', 'bundle');
+    try {
+      const result = await runFailureGet(
+        {
+          profile: 'default',
+          output: 'text',
+          debug: false,
+          testId: 'test_failed',
+          failedOnly: false,
+          out: outDir,
+        },
+        { credentialsPath, fetchImpl, stdout: () => undefined },
+      );
+      expect(result.bundle!.dir).toBe(outDir);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads back the bundle this test wrote into its own mkdtemp temp dir, never user input.
+      expect(existsSync(join(outDir, 'meta.json'))).toBe(true);
+    } finally {
+      rmSync(missingParentBase, { recursive: true, force: true });
+    }
+  });
+
+  it('--out at an existing file exits 5 before any network I/O', async () => {
     const { credentialsPath } = makeCreds();
     let fetchCalls = 0;
     const fetchImpl = makeFetch(() => {
       fetchCalls += 1;
       return { body: makeFailureContext() };
     });
-    const missingParentBase = mkdtempSync(join(tmpdir(), 'cli-p5-missing-parent-'));
+    const base = mkdtempSync(join(tmpdir(), 'cli-p5-out-file-'));
+    const existingFile = join(base, 'bundle.txt');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes into this test's own mkdtemp temp dir, never user input.
+    writeFileSync(existingFile, 'content');
     try {
       await expect(
         runFailureGet(
@@ -5726,12 +6008,48 @@ describe('runFailureGet', () => {
             debug: false,
             testId: 'test_failed',
             failedOnly: false,
-            out: join(missingParentBase, 'no-such-dir', 'bundle'),
+            out: existingFile,
           },
           { credentialsPath, fetchImpl },
         ),
       ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
       expect(fetchCalls).toBe(0);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('a failed fetch with --out under a missing directory leaves no directory behind', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      status: 404,
+      body: {
+        error: {
+          code: 'NOT_FOUND',
+          message: 'Test has no failing run.',
+          nextAction: 'Test has no failing run. Use `testsprite test result <test-id>`.',
+          requestId: 'req_test',
+          details: { resource: 'test', id: 'test_passing', reason: 'no_failing_run' },
+        },
+      },
+    }));
+    const missingParentBase = mkdtempSync(join(tmpdir(), 'cli-p5-missing-parent-'));
+    try {
+      await expect(
+        runFailureGet(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            testId: 'test_passing',
+            failedOnly: false,
+            out: join(missingParentBase, 'no-such-dir', 'deeper', 'bundle'),
+          },
+          { credentialsPath, fetchImpl, stdout: () => undefined },
+        ),
+      ).rejects.toMatchObject({ code: 'NOT_FOUND', exitCode: 4 });
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- this test's own mkdtemp temp dir, never user input.
+      expect(existsSync(join(missingParentBase, 'no-such-dir'))).toBe(false);
     } finally {
       rmSync(missingParentBase, { recursive: true, force: true });
     }
@@ -7344,6 +7662,89 @@ describe('runCreate', () => {
     expect(stderrLines.some(l => l.includes('[advisory]') && l.includes('already exists'))).toBe(
       false,
     );
+  });
+
+  it('Fix 4 — emits debug log when duplicate-name advisory lookup fails in debug mode', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('// test code');
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'GET' && url.includes('/tests')) {
+        return {
+          status: 403,
+          body: {
+            error: {
+              code: 'AUTH_FORBIDDEN',
+              message: 'Forbidden',
+              nextAction: '',
+              requestId: 'r1',
+              details: {},
+            },
+          },
+        };
+      }
+      return { body: SAMPLE_RESPONSE };
+    });
+
+    const stderrLines: string[] = [];
+    await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: true,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'another test',
+        codeFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+    );
+
+    expect(
+      stderrLines.some(l => l.includes('[debug] duplicate-name advisory lookup failed: Forbidden')),
+    ).toBe(true);
+  });
+
+  it('Fix 4 — keeps stderr free of [debug] lines when the lookup fails without --debug', async () => {
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('// test code');
+    let listCalled = false;
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'GET' && url.includes('/tests')) {
+        listCalled = true;
+        return {
+          status: 403,
+          body: {
+            error: {
+              code: 'AUTH_FORBIDDEN',
+              message: 'Forbidden',
+              nextAction: '',
+              requestId: 'r1',
+              details: {},
+            },
+          },
+        };
+      }
+      return { body: SAMPLE_RESPONSE };
+    });
+
+    const stderrLines: string[] = [];
+    const result = await runCreate(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        projectId: 'project_alice',
+        type: 'frontend',
+        name: 'another test',
+        codeFile,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+    );
+
+    // The lookup did fail and the create still went through; nothing is reported.
+    expect(listCalled).toBe(true);
+    expect(result.testId).toBe('test_new');
+    expect(stderrLines.filter(l => l.includes('[debug]'))).toEqual([]);
   });
 });
 
@@ -9880,6 +10281,62 @@ describe('runCreateFromPlan', () => {
     expect(result.testId).toBe(SAMPLE_RESPONSE.testId);
   });
 
+  /** Creates from FE_PLAN while the dup-name listing (GET /tests) fails with 403. */
+  async function createFromPlanWithFailingLookup(debug: boolean) {
+    const { credentialsPath } = makeCreds();
+    let listAttempted = false;
+    const fetchImpl = makeFetch((url, init) => {
+      if ((init.method ?? 'GET') === 'GET' && url.includes('/tests')) {
+        listAttempted = true;
+        return {
+          status: 403,
+          body: {
+            error: {
+              code: 'AUTH_FORBIDDEN',
+              message: 'Forbidden',
+              nextAction: '',
+              requestId: 'r',
+              details: {},
+            },
+          },
+        };
+      }
+      return { body: SAMPLE_RESPONSE };
+    });
+    const stderrLines: string[] = [];
+
+    const result = await runCreateFromPlan(
+      { profile: 'default', output: 'json', debug, planFrom: writePlanFile(FE_PLAN) },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: () => undefined,
+        stderr: line => stderrLines.push(line),
+      },
+    );
+
+    return { result, stderrLines, listAttempted };
+  }
+
+  it('[finding-4] reports a failed dup-name lookup on the plan-from path under --debug', async () => {
+    const { result, stderrLines, listAttempted } = await createFromPlanWithFailingLookup(true);
+
+    expect(listAttempted).toBe(true);
+    expect(result.testId).toBe(SAMPLE_RESPONSE.testId);
+    expect(
+      stderrLines.some(l => l.includes('[debug] duplicate-name advisory lookup failed: Forbidden')),
+    ).toBe(true);
+  });
+
+  it('[finding-4] keeps stderr free of [debug] lines when the plan-from lookup fails without --debug', async () => {
+    const { result, stderrLines, listAttempted } = await createFromPlanWithFailingLookup(false);
+
+    // The lookup did fail and the create still went through; nothing is reported.
+    expect(listAttempted).toBe(true);
+    expect(result.testId).toBe(SAMPLE_RESPONSE.testId);
+    expect(stderrLines.filter(l => l.includes('[debug]'))).toEqual([]);
+  });
+
   it('[finding-4] skips dup-name lookup when dry-run is true', async () => {
     const { credentialsPath } = makeCreds();
     let listAttempted = false;
@@ -10133,6 +10590,7 @@ describe('runCreateBatch', () => {
           output: 'json',
           debug: false,
           plans: plansFile,
+          run: true,
           maxConcurrency: 0,
         },
         { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
@@ -10154,6 +10612,7 @@ describe('runCreateBatch', () => {
           output: 'json',
           debug: false,
           plans: plansFile,
+          run: true,
           maxConcurrency: 101,
         },
         { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
@@ -10168,14 +10627,17 @@ describe('runCreateBatch', () => {
     const { credentialsPath } = makeCreds();
     const plansFile = writePlansJsonl([FE_SPEC]);
     const fetchImpl = makeFetch(() => ({ body: SAMPLE_RESPONSE }));
-    // Should NOT throw VALIDATION_ERROR for exactly 100
+    // Should NOT throw VALIDATION_ERROR for exactly 100 (with --run, the only
+    // mode that reads it; --dry-run previews the triggers without a server).
     await expect(
       runCreateBatch(
         {
           profile: 'default',
           output: 'json',
           debug: false,
+          dryRun: true,
           plans: plansFile,
+          run: true,
           maxConcurrency: 100,
         },
         { credentialsPath, fetchImpl, stdout: () => undefined, stderr: () => undefined },
