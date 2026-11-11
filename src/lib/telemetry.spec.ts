@@ -20,6 +20,7 @@ import {
   recordOutcome,
   recordTelemetryExtras,
   resolveTelemetryAuth,
+  tryResolveTelemetryAuth,
   sanitizeTelemetryExtras,
   takeTelemetryExtras,
 } from './telemetry.js';
@@ -536,6 +537,47 @@ describe('resolveTelemetryAuth', () => {
     const auth = resolveTelemetryAuth({}, { env: {}, credentialsPath: writeCreds(false) });
     expect(auth.apiKey).toBeUndefined();
     expect(auth.apiUrl).toBe('https://api.example.com');
+  });
+});
+
+// tryResolveTelemetryAuth — the pre-action hook's variant; must never throw
+describe('tryResolveTelemetryAuth', () => {
+  /** A credentials path that exists but cannot be read as a file, on every OS. */
+  function unreadableCredsPath(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'ts-telemetry-unreadable-'));
+    const path = join(dir, 'credentials');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture path built from this test's own mkdtempSync() dir, never user input
+    mkdirSync(path);
+    return path;
+  }
+
+  it('returns the same auth as resolveTelemetryAuth when the file reads', () => {
+    const credentialsPath = writeCreds(true);
+    expect(tryResolveTelemetryAuth({}, { env: {}, credentialsPath })).toEqual(
+      resolveTelemetryAuth({}, { env: {}, credentialsPath }),
+    );
+  });
+
+  it('returns undefined instead of throwing when the credentials read fails', () => {
+    const credentialsPath = unreadableCredsPath();
+    expect(() => resolveTelemetryAuth({}, { env: {}, credentialsPath })).toThrow();
+    expect(tryResolveTelemetryAuth({}, { env: {}, credentialsPath })).toBeUndefined();
+  });
+
+  it('hands the swallowed error to onError (the --debug line)', () => {
+    const onError = vi.fn();
+    tryResolveTelemetryAuth({}, { env: {}, credentialsPath: unreadableCredsPath(), onError });
+    expect(onError).toHaveBeenCalledOnce();
+    expect(onError.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+  });
+
+  it('stays silent when onError itself throws', () => {
+    const onError = vi.fn(() => {
+      throw new Error('stderr closed');
+    });
+    expect(
+      tryResolveTelemetryAuth({}, { env: {}, credentialsPath: unreadableCredsPath(), onError }),
+    ).toBeUndefined();
   });
 });
 
