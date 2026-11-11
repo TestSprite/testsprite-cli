@@ -96,9 +96,11 @@ async function runCli(args: string[]): Promise<{ status: number; stdout: string;
       ...process.env,
       HOME: home,
       USERPROFILE: home,
-      // A key in the environment: the file is still read (loadConfig always
-      // reads the profile), and without the fix that read is what crashes.
-      TESTSPRITE_API_KEY: 'sk-user-e2e-env-key',
+      // No key in the environment: with a key and a URL both set, loadConfig
+      // skips the credentials file, so the read under test would never happen.
+      // The control reads its key from the file; without the fix that read is
+      // what crashes.
+      TESTSPRITE_API_KEY: '',
       TESTSPRITE_API_URL: baseUrl,
       TESTSPRITE_PROFILE: '',
       TESTSPRITE_NO_SKILL_WARNING: '1',
@@ -138,13 +140,13 @@ describe.skipIf(!canDenyRead)('telemetry pre-action hook — unreadable credenti
   it('doctor runs and reports the Credentials problem itself; no beacon', async () => {
     const result = await runCli(['doctor']);
     const output = result.stdout + result.stderr;
-    // TESTSPRITE_API_KEY is set and /me answers, so the unreadable file is a
-    // WARN (commands still work) and doctor completes with exit 0.
-    expect(result.status).toBe(0);
+    // With no key in the environment the unreadable file leaves doctor without
+    // one, so Credentials is a FAIL and doctor exits 1 after printing its report.
+    expect(result.status).toBe(1);
     expect(output).not.toMatch(/Error: (EACCES|EPERM)/);
     expect(output).toContain('TestSprite doctor');
     expect(output).toMatch(
-      /\[WARN\]\s+Credentials\s+credentials file exists but cannot be read \((EACCES|EPERM)\)/,
+      /\[FAIL\]\s+Credentials\s+credentials file exists but cannot be read \((EACCES|EPERM)\)/,
     );
     expect(telemetryPosts()).toEqual([]);
   });
