@@ -8710,7 +8710,8 @@ describe('run --all --wait: auth takes precedence over rate-deferred tests', () 
               },
             },
           };
-        if (url.endsWith('/runs/run_abc')) {
+        // The poll reads the run with a ?waitSeconds query.
+        if (url.split('?')[0]!.endsWith('/runs/run_abc')) {
           return { body: { ...makePassedRun(), status: verdict } };
         }
         throw new Error(`Unexpected request: ${url}`);
