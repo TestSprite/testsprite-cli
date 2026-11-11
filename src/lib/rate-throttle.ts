@@ -74,4 +74,13 @@ export class RateThrottle {
     // Add a 50 ms buffer so we land solidly after the cutoff.
     return Math.max(0, ageoutMs + 50);
   }
+
+  /**
+   * Return the last acquired slot when its caller will not dispatch a request.
+   * Call only after acquire() returns 0 and before yielding or acquiring again,
+   * so no other caller can have recorded a newer slot in the meantime.
+   */
+  releaseLast(): void {
+    this.slots.pop();
+  }
 }

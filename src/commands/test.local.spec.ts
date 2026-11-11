@@ -9,6 +9,7 @@
  */
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import net, { type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,6 +19,7 @@ import { EnvHttpProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from 'und
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { ShutdownController } from '../lib/interrupt.js';
+import { LOCAL_PORT_PROBE_TIMEOUT_MS } from '../lib/local-target.js';
 import type { JUnitReportFlagOptions } from '../lib/junit-report.js';
 import { TunnelLostError } from '../lib/tunnel-session.js';
 import { takeTelemetryExtras } from '../lib/telemetry.js';
@@ -277,48 +279,75 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('test run --local — before anything is minted or charged', () => {
-  it('refuses a dead port with NO mint and NO trigger', async () => {
-    // Port 1 is not a valid application listener in the test environment and
-    // avoids opening a real server (some CI sandboxes prohibit bind/listen).
-    const port = 1;
-    const calls: Call[] = [];
-    let thrown: unknown;
-    try {
-      await runTestRun(
-        {
-          profile: 'default',
-          output: 'text',
-          debug: false,
-          testId: 'test_xyz',
-          localPort: port,
-          localHost: '127.0.0.1',
-          wait: true,
-          timeoutSeconds: 30,
-        },
-        {
-          ...makeCreds(),
-          fetchImpl: makeRecordingFetch({ calls, targetUrl: `http://127.0.0.1:${port}` }),
-          stderr: () => {},
-          stdout: () => {},
-          sleep: async () => {},
-          createTunnelClient: fakeTunnel().factory,
-        },
-      );
-    } catch (err) {
-      thrown = err;
-    }
-    expect(thrown).toBeInstanceOf(ApiError);
-    expect((thrown as ApiError).code).toBe('VALIDATION_ERROR');
-    // The whole point: no run row, no credit spend, no tunnel credential.
-    expect(calls).toEqual([
-      { method: 'GET', url: 'http://localhost:13502/api/cli/v1/tests/test_xyz', body: undefined },
-      {
-        method: 'GET',
-        url: 'http://localhost:13502/api/cli/v1/projects/project_1/env',
-        body: undefined,
-      },
-    ]);
-  });
+  it.each(['ECONNREFUSED', 'ETIMEDOUT'] as const)(
+    'refuses a dead port (%s) with NO mint and NO trigger',
+    async code => {
+      // Keep the real preflight and command path, but avoid relying on how the
+      // runner's OS handles port 1. A silent socket exercises dialOnce's timer.
+      vi.useFakeTimers();
+      const port = 5173;
+      const socket = new net.Socket();
+      const connect = vi.spyOn(net, 'connect').mockImplementation((() => {
+        if (code === 'ECONNREFUSED') {
+          queueMicrotask(() => socket.emit('error', Object.assign(new Error(code), { code })));
+        }
+        return socket;
+      }) as typeof net.connect);
+      // local-target imports the built-in namespace; keep its live binding in sync.
+      syncBuiltinESMExports();
+      const calls: Call[] = [];
+      try {
+        const result = runTestRun(
+          {
+            profile: 'default',
+            output: 'text',
+            debug: false,
+            testId: 'test_xyz',
+            localPort: port,
+            localHost: '127.0.0.1',
+            wait: true,
+            timeoutSeconds: 30,
+          },
+          {
+            ...makeCreds(),
+            fetchImpl: makeRecordingFetch({ calls, targetUrl: `http://127.0.0.1:${port}` }),
+            stderr: () => {},
+            stdout: () => {},
+            sleep: async () => {},
+            createTunnelClient: fakeTunnel().factory,
+          },
+        ).catch((err: unknown) => err);
+        await vi.advanceTimersByTimeAsync(LOCAL_PORT_PROBE_TIMEOUT_MS);
+        const thrown = await result;
+        expect(thrown).toBeInstanceOf(ApiError);
+        expect((thrown as ApiError).code).toBe('VALIDATION_ERROR');
+        expect((thrown as ApiError).exitCode).toBe(5);
+        expect((thrown as ApiError).details).toMatchObject({
+          reason: 'local-port-not-listening',
+          probeReason: expect.stringContaining(code),
+        });
+        expect(connect).toHaveBeenCalledExactlyOnceWith({ host: '127.0.0.1', port });
+        expect(socket.destroyed).toBe(true);
+        // The whole point: no run row, no credit spend, no tunnel credential.
+        expect(calls).toEqual([
+          {
+            method: 'GET',
+            url: 'http://localhost:13502/api/cli/v1/tests/test_xyz',
+            body: undefined,
+          },
+          {
+            method: 'GET',
+            url: 'http://localhost:13502/api/cli/v1/projects/project_1/env',
+            body: undefined,
+          },
+        ]);
+      } finally {
+        connect.mockRestore();
+        syncBuiltinESMExports();
+        socket.destroy();
+      }
+    },
+  );
 
   it('refuses --local together with --target-url without touching the network', async () => {
     // This validation runs before the port probe. The exact `field` and
