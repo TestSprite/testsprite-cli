@@ -368,11 +368,72 @@ test('scheduled workflow pins the policy and runs only in the public repo', () =
   const path = fileURLToPath(new URL('../workflows/claim-ttl.yml', import.meta.url));
   const workflow = readFileSync(path, 'utf8');
   assert.match(workflow, /^ {4}if: github\.repository == 'TestSprite\/testsprite-cli'$/m);
-  assert.match(workflow, /^ {2}CLAIM_TTL_HOURS: '72'$/m);
-  assert.match(workflow, /^ {2}CLAIM_WARN_HOURS: '48'$/m);
+  assert.match(workflow, /^ {2}CLAIM_TTL_HOURS: '48'$/m);
+  assert.match(workflow, /^ {2}CLAIM_WARN_HOURS: '24'$/m);
   assert.match(workflow, /^ {2}CLAIM_TTL_SINCE: '2026-09-24T00:00:00Z'$/m);
   assert.match(
     workflow,
     /^ {2}DRY_RUN: \$\{\{ inputs\.dry_run == true && 'true' \|\| 'false' \}\}$/m,
   );
+});
+
+const accepted = hours => ({
+  event: 'labeled',
+  label: { name: 'accepted' },
+  created_at: assignedAt(hours),
+});
+const openerIssue = {
+  number: 42,
+  user: { login: 'contributor' },
+  assignees: [{ login: 'contributor' }],
+  labels: [],
+};
+
+test('the opener’s window starts at acceptance, not at the claim', async () => {
+  // Accepted 72h ago, claimed by the opener 30h ago: the opener's 72h are up.
+  const h = harness({
+    issues: [openerIssue],
+    events: { 42: [accepted(72), claim('contributor', 30)] },
+  });
+  await h.execute();
+  assert.equal(h.of('removeAssignees').length, 1);
+  assert.match(h.of('createComment')[0].body, /counted from when this issue was accepted/);
+  // The marker still names the assignment, so a later re-claim gets its own notices.
+  assert.match(
+    h.of('createComment')[0].body,
+    /claim-ttl:expired:contributor:2026-09-28T18:00:00.000Z/,
+  );
+});
+
+test('a non-opener’s window starts at their own claim', async () => {
+  const h = harness({
+    issues: [{ ...openerIssue, user: { login: 'opener' } }],
+    events: { 42: [accepted(72), claim('contributor', 30)] },
+  });
+  await h.execute();
+  assert.deepEqual(h.writes(), []);
+});
+
+test('a linked draft PR keeps the opener’s claim past the window', async () => {
+  const h = harness({
+    issues: [openerIssue],
+    events: { 42: [accepted(72), claim('contributor', 30), linkedPr('contributor', 'open', true)] },
+  });
+  await h.execute();
+  assert.deepEqual(h.writes(), []);
+});
+
+test('the warning states the hours left under the configured policy', async () => {
+  const h = harness({
+    events: { 42: [claim('contributor', 24)] },
+    env: { CLAIM_TTL_HOURS: '48', CLAIM_WARN_HOURS: '24' },
+  });
+  await h.execute();
+  assert.match(h.of('createComment')[0].body, /expires in about 24 hours/);
+  const expired = harness({
+    events: { 42: [claim('contributor', 48)] },
+    env: { CLAIM_TTL_HOURS: '48', CLAIM_WARN_HOURS: '24' },
+  });
+  await expired.execute();
+  assert.match(expired.of('createComment')[0].body, /expired after 48 hours without a linked PR/);
 });
