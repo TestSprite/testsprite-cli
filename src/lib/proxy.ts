@@ -5,7 +5,8 @@
  * variables, so behind a corporate or CI proxy every request dies with
  * `fetch failed` after a full retry cycle. Installing undici's
  * `EnvHttpProxyAgent` as the global dispatcher restores the conventional
- * behavior (including NO_PROXY exemptions) for every fetch the CLI makes.
+ * behavior (including NO_PROXY exemptions) for every fetch the CLI makes. A
+ * value written without a scheme (`proxy.corp:3128`) is read as `http://`.
  *
  * Only active when a proxy env var is actually present, so the default path
  * stays byte-identical and pays zero startup cost. Dependency note for
@@ -15,6 +16,18 @@
  */
 import type { Dispatcher } from 'undici';
 import { EnvHttpProxyAgent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
+
+const SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+function pickProxyValue(...candidates: Array<string | undefined>): string {
+  const value = candidates.find(candidate => candidate !== undefined && candidate.trim() !== '');
+  return value === undefined ? '' : value.trim();
+}
+
+// curl and most other tools read a bare `host:port` as an http proxy.
+function withDefaultScheme(value: string): string {
+  return value === '' || SCHEME.test(value) ? value : `http://${value}`;
+}
 
 export interface ProxyDeps {
   env?: NodeJS.ProcessEnv;
@@ -36,15 +49,22 @@ export function maybeInstallProxyAgent(deps: ProxyDeps = {}): boolean {
   );
   if (!hasProxy) return false;
   const install = deps.install ?? setGlobalDispatcher;
-  // EnvHttpProxyAgent reads HTTPS_PROXY/HTTP_PROXY/NO_PROXY itself, per
-  // request, so NO_PROXY exemptions apply without extra plumbing here.
+  // The values are passed explicitly, as strings even when unset, so that
+  // `deps.env` is the only input: undici falls back to `process.env` for an
+  // undefined option, and rejects a scheme-less `host:port` it reads itself.
   //
   // A malformed or unsupported proxy value (e.g. `socks5://...`) makes the
   // agent throw. Because this runs at startup, an unguarded throw would abort
   // every command before the CLI's own error handling — so fall back to the
   // default (proxy-less) dispatcher and warn instead of crashing.
   try {
-    install(new EnvHttpProxyAgent());
+    install(
+      new EnvHttpProxyAgent({
+        httpProxy: withDefaultScheme(pickProxyValue(env.http_proxy, env.HTTP_PROXY)),
+        httpsProxy: withDefaultScheme(pickProxyValue(env.https_proxy, env.HTTPS_PROXY)),
+        noProxy: env.no_proxy ?? env.NO_PROXY ?? '',
+      }),
+    );
     return true;
   } catch (error) {
     const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
