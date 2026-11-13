@@ -7185,6 +7185,53 @@ describe('run text links keep the execution page off the dashboard label', () =>
   });
 });
 
+describe('run text card names the failed step', () => {
+  function makeFailedRun(overrides: Partial<RunResponse> = {}): RunResponse {
+    return {
+      ...makePassedRun(),
+      status: 'failed',
+      failureKind: 'assertion',
+      error: 'Expected heading "Checkout" to be visible',
+      stepSummary: { total: 7, completed: 5, passedCount: 4, failedCount: 1 },
+      ...overrides,
+    };
+  }
+
+  it('prints failedStepIndex right after failureKind, with the value `test result` prints', () => {
+    const lines = renderRunResponseText(makeFailedRun({ failedStepIndex: 4 })).split('\n');
+    const kindAt = lines.indexOf('failureKind assertion');
+    expect(kindAt).toBeGreaterThanOrEqual(0);
+    expect(lines[kindAt + 1]).toBe('failedStepIndex 4');
+  });
+
+  it('prints failedStepIndex for a blocked run', () => {
+    const text = renderRunResponseText(
+      makeFailedRun({ status: 'blocked', failureKind: 'auth', failedStepIndex: 0 }),
+    );
+    expect(text.split('\n')).toContain('failedStepIndex 0');
+  });
+
+  it('omits the line when a failed run carries no failedStepIndex', () => {
+    const text = renderRunResponseText(makeFailedRun({ failedStepIndex: null }));
+    expect(text).not.toContain('failedStepIndex');
+  });
+
+  it('omits the line when the backend wait fallback leaves failedStepIndex out', () => {
+    // backendResultToRunResponse copies the field from an unvalidated
+    // `GET /tests/{id}/result` body, so it can arrive as undefined.
+    const run = makeFailedRun();
+    delete (run as Partial<RunResponse>).failedStepIndex;
+    const text = renderRunResponseText(run, { isBackend: true });
+    expect(text).not.toContain('failedStepIndex');
+    expect(text).not.toContain('undefined');
+  });
+
+  it('omits the line for a passed run', () => {
+    const text = renderRunResponseText({ ...makePassedRun(), failedStepIndex: 4 });
+    expect(text).not.toContain('failedStepIndex');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Billing refusals on the batch surface + per-command telemetry facts
 // ---------------------------------------------------------------------------
