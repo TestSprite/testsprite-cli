@@ -1408,6 +1408,41 @@ describe('runTestWait: network outage mid-wait', () => {
   });
 });
 
+describe('runTestWait — text card names the failed step', () => {
+  it('a failed run carrying failedStepIndex prints it on the card', async () => {
+    const { credentialsPath } = makeCreds();
+    const run: RunResponse = {
+      ...makeRun('failed'),
+      failureKind: 'assertion',
+      failedStepIndex: 4,
+      error: 'Expected heading "Checkout" to be visible',
+    };
+    const stdoutLines: string[] = [];
+
+    await runTestWait(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(() => ({ body: run })),
+        stdout: line => stdoutLines.push(line),
+        stderr: () => {},
+        sleep: instantSleep,
+      },
+    ).catch(() => {
+      // exit 1 (failed run) — only stdout matters here
+    });
+
+    expect(stdoutLines.join('\n').split('\n')).toContain('failedStepIndex 4');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // FIX 4 — D5-UX: text mode shows the `error` string for failed/blocked runs
 // ---------------------------------------------------------------------------

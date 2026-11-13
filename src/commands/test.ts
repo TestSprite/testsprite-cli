@@ -7876,6 +7876,17 @@ export function renderRunResponseText(
   if (run.startedAt) lines.push(`startedAt   ${run.startedAt}`);
   if (run.finishedAt) lines.push(`finishedAt  ${run.finishedAt}`);
   if (run.failureKind) lines.push(`failureKind ${run.failureKind}`);
+  // Say where a failed or blocked run stopped, with the same label and value
+  // `test result` prints, so the card needs no second command to locate it.
+  // Checked as a number, not `!== null`: the backend wait fallback builds this
+  // run from an unvalidated `GET /tests/{id}/result` body, where the field can
+  // be missing, and the card must not print `failedStepIndex undefined`.
+  if (
+    (run.status === 'failed' || run.status === 'blocked') &&
+    typeof run.failedStepIndex === 'number'
+  ) {
+    lines.push(`failedStepIndex ${run.failedStepIndex}`);
+  }
   // D5-UX: show the human error string when status is failed/blocked and
   // the backend provided it. Truncate long multi-line errors to the first
   // line (≤200 chars) so the text output stays readable. JSON mode is
