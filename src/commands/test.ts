@@ -15807,6 +15807,15 @@ export function createTestCommand(deps: TestDeps = {}): Command {
           '--filter only applies with --all (it narrows which project tests run). Remove --filter, or add --all with --project <id> or TESTSPRITE_PROJECT_ID.',
         );
       }
+      // --allow-empty only softens the --all zero-dispatch gate; anywhere else it
+      // would be silently ignored — reject loudly, matching `test rerun`.
+      if (cmdOpts.allowEmpty === true && !isAll) {
+        throw localValidationError(
+          'allow-empty',
+          '--allow-empty only applies with --all (it permits an empty resolved run set). ' +
+            'Remove --allow-empty, or add --all --project <id>.',
+        );
+      }
       // --status narrows the --all set exactly as --filter does, with the same
       // silent-ignore failure mode without --all.
       if (cmdOpts.status !== undefined && !isAll) {
