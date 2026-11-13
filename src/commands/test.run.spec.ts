@@ -4471,6 +4471,41 @@ describe('runTestRunAll — batch fresh run', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
   });
 
+  it('<test-id> --allow-empty (without --all) → exit 5 before any request', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const fetchImpl = vi.fn(() => {
+      throw new Error('network called');
+    }) as unknown as FetchImpl;
+    const test = createTestCommand({ fetchImpl });
+    disableExits(test);
+    await expect(
+      test.parseAsync(['run', 'test_xyz', '--allow-empty'], { from: 'user' }),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'allow-empty' }),
+      nextAction: expect.stringContaining('add --all'),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('--all --allow-empty is still accepted (positive control)', async () => {
+    const { createTestCommand } = await import('./test.js');
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = vi.fn(makeFetch(() => ({ body: BATCH_FRESH_RESP })));
+    const test = createTestCommand({
+      credentialsPath,
+      fetchImpl,
+      stdout: () => undefined,
+      stderr: () => undefined,
+      sleep: instantSleep,
+    });
+    await test.parseAsync(['run', '--all', '--project', 'proj_1', '--allow-empty'], {
+      from: 'user',
+    });
+    expect(fetchImpl).toHaveBeenCalled();
+  });
+
   it('--wait polls each accepted runId and returns on all-pass (exit 0)', async () => {
     const { credentialsPath } = makeCreds();
     const fetchImpl = makeFetch((url, init) => {
