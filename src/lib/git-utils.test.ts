@@ -135,8 +135,11 @@ describe('git-utils', () => {
 
     it('treats .git as a file (worktree or submodule) the same as a directory', () => {
       // existsSync is true for both files and directories; the walker only asks for existence.
-      const mockExists = (p: string) => p === join('/wt', '.git');
-      expect(findGitRoot('/wt/pkg', { existsSync: mockExists })).toBe(resolve('/wt'));
+      // Build fixtures from resolve() so they carry the drive letter on Windows,
+      // matching the resolved path the walker compares against.
+      const wt = resolve('/wt');
+      const mockExists = (p: string) => p === join(wt, '.git');
+      expect(findGitRoot(join(wt, 'pkg'), { existsSync: mockExists })).toBe(wt);
     });
   });
 

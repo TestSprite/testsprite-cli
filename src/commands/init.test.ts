@@ -16,11 +16,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import { readProfile, writeProfile } from '../lib/credentials.js';
 import type { MeResponse } from './auth.js';
 import type { AgentFs } from './agent.js';
+import type * as AgentModule from './agent.js';
+import { runInstall } from './agent.js';
 import { Command } from 'commander';
 import type { InitDeps } from './init.js';
 import { runInit, addSetupOptions } from './init.js';
@@ -42,6 +44,13 @@ vi.mock('node:fs', async importOriginal => {
     unlinkSync: vi.fn(actual.unlinkSync),
     writeFileSync: vi.fn(actual.writeFileSync),
   };
+});
+
+// runInstall gets the same pass-through double as the node:fs functions above,
+// so a test can make the agent install step write a stray stdout line.
+vi.mock('./agent.js', async importOriginal => {
+  const actual = await importOriginal<typeof AgentModule>();
+  return { ...actual, runInstall: vi.fn(actual.runInstall) };
 });
 
 // ---------------------------------------------------------------------------
@@ -68,21 +77,43 @@ function makeOkFetch(): InitDeps['fetchImpl'] {
   ) as unknown as InitDeps['fetchImpl'];
 }
 
+/** Mock fetch that never answers; it rejects only when the request is aborted. */
+function makeHangingFetch(): InitDeps['fetchImpl'] {
+  return vi.fn(
+    (_input: string | URL | Request, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+          once: true,
+        });
+      }),
+  );
+}
+
 /** Mock fetch that returns 401 for any request (simulates bad key). */
-function makeAuthFailFetch(): InitDeps['fetchImpl'] {
+function makeAuthFailFetch(
+  overrides: {
+    status?: number;
+    code?: string;
+    message?: string;
+    nextAction?: string;
+    requestId?: string;
+  } = {},
+): InitDeps['fetchImpl'] {
+  const {
+    status = 401,
+    code = 'AUTH_INVALID',
+    message = 'Invalid API key',
+    nextAction = 'Provide a valid key.',
+    requestId = 'r-1',
+  } = overrides;
   return vi.fn(
     async () =>
       new Response(
         JSON.stringify({
-          error: {
-            code: 'AUTH_INVALID',
-            message: 'Invalid API key',
-            nextAction: 'Provide a valid key.',
-            requestId: 'r-1',
-          },
+          error: { code, message, nextAction, requestId },
         }),
         {
-          status: 401,
+          status,
           headers: { 'content-type': 'application/json' },
         },
       ),
@@ -204,6 +235,7 @@ afterEach(() => {
   for (const fn of [mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync]) {
     vi.mocked(fn).mockReset();
   }
+  vi.mocked(runInstall).mockReset();
 });
 
 describe('runInit — session-only environment credentials', () => {
@@ -509,6 +541,53 @@ describe('runInit — session-only environment credentials', () => {
   });
 });
 
+describe('runInit: the key check against /me does not answer', () => {
+  const options = () =>
+    makeBaseOpts({ fromEnv: true, noAgent: true, output: 'json', requestTimeoutMs: 20 });
+
+  it('setup --from-env exits 7 with REQUEST_TIMEOUT, keeps the request id and saves nothing', async () => {
+    const { captured, deps } = makeCapture();
+    const err = await runInit(options(), {
+      ...deps,
+      env: { TESTSPRITE_API_KEY: 'sk-user-valid-key' },
+      credentialsPath,
+      fetchImpl: makeHangingFetch(),
+      isTTY: false,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RequestTimeoutError);
+    expect(err).toMatchObject({
+      code: 'REQUEST_TIMEOUT',
+      exitCode: 7,
+      requestId: expect.stringMatching(/^cli_/),
+    });
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    const stderr = captured.stderr.join('\n');
+    expect(stderr).toContain('timed out, profile NOT updated');
+    expect(stderr).not.toContain('API key rejected');
+    expect(captured.stdout).toEqual([]);
+  });
+
+  it('a 401 from /me still exits 3 with the typed envelope', async () => {
+    const { captured, deps } = makeCapture();
+    await expect(
+      runInit(options(), {
+        ...deps,
+        env: { TESTSPRITE_API_KEY: 'sk-user-revoked-key' },
+        credentialsPath,
+        fetchImpl: makeAuthFailFetch(),
+        isTTY: false,
+      }),
+    ).rejects.toMatchObject({
+      code: 'AUTH_INVALID',
+      exitCode: 3,
+      nextAction: 'Provide a valid key.',
+      requestId: 'r-1',
+    });
+    expect(readProfile('default', { path: credentialsPath })).toBeUndefined();
+    expect(captured.stderr.join('\n')).toContain('API key rejected');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 1. Happy path — interactive (text + json output)
 // ---------------------------------------------------------------------------
@@ -624,6 +703,130 @@ describe('runInit — happy path (interactive)', () => {
     const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
     expect(parsed.status).toBe('initialized');
     expect(captured.stderr.some(line => line.includes('setup identity lookup failed'))).toBe(true);
+  });
+
+  /**
+   * Runs setup with the profile read in resolveReportedEndpoint failing: once
+   * the configure and whoami fetches are done, reading the credentials file throws.
+   */
+  async function runInitWithFailingProfileRead(
+    debug: boolean,
+  ): Promise<{ captured: Captured; failedReads: number }> {
+    const { captured, deps } = makeCapture();
+    const fetchMock = makeOkFetch()!;
+    const actual = await vi.importActual<typeof NodeFs>('node:fs');
+    let fetchCount = 0;
+    let failedReads = 0;
+    const trackingFetch = vi.fn(
+      async (input: Parameters<typeof fetchMock>[0], init?: Parameters<typeof fetchMock>[1]) => {
+        fetchCount++;
+        return fetchMock(input, init);
+      },
+    );
+
+    vi.mocked(readFileSync).mockImplementation((...args) => {
+      if (fetchCount >= 2 && args[0] === credentialsPath) {
+        failedReads++;
+        throw new Error('simulated credentials read error');
+      }
+      return actual.readFileSync(...args);
+    });
+
+    await runInit(
+      makeBaseOpts({ apiKey: 'sk-user-json-test', debug, noAgent: true, output: 'json' }),
+      {
+        ...deps,
+        fetchImpl: trackingFetch,
+        credentialsPath,
+        isTTY: false,
+      },
+    );
+
+    return { captured, failedReads };
+  }
+
+  it('debug mode reports resolve endpoint profile read failure without failing the command', async () => {
+    const { captured, failedReads } = await runInitWithFailingProfileRead(true);
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
+    expect(parsed.status).toBe('initialized');
+    expect(failedReads).toBeGreaterThan(0);
+    expect(
+      captured.stderr.some(line =>
+        line.includes(
+          '[debug] resolve endpoint profile read failed: simulated credentials read error',
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps stderr free of [debug] lines when the profile read fails without --debug', async () => {
+    const { captured, failedReads } = await runInitWithFailingProfileRead(false);
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as Record<string, unknown>;
+    expect(parsed.status).toBe('initialized');
+    // The read did fail; it just must not be reported.
+    expect(failedReads).toBeGreaterThan(0);
+    expect(captured.stderr.filter(line => line.includes('[debug]'))).toEqual([]);
+  });
+
+  /**
+   * Runs setup with the agent install step writing one stray non-JSON stdout
+   * line before its real result. runInstall prints a single JSON document in
+   * json mode, so the parse fallback is only reachable by faking that output.
+   */
+  async function runInitWithStrayInstallOutput(debug: boolean): Promise<Captured> {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    const actual = await vi.importActual<typeof AgentModule>('./agent.js');
+    vi.mocked(runInstall).mockImplementationOnce(async (installOpts, installDeps) => {
+      installDeps?.stdout?.('not json');
+      await actual.runInstall(installOpts, installDeps);
+    });
+
+    await runInit(makeBaseOpts({ apiKey: 'sk-user-json-test', debug, output: 'json' }), {
+      ...deps,
+      fetchImpl: makeOkFetch(),
+      credentialsPath,
+      isTTY: false,
+      cwd: CWD,
+      fs: agentFs,
+    });
+
+    return captured;
+  }
+
+  it('debug mode reports a non-JSON line from the agent install step and keeps the summary', async () => {
+    const captured = await runInitWithStrayInstallOutput(true);
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as {
+      status: string;
+      agent: { action: string; skills?: string[] } | null;
+    };
+    expect(parsed.status).toBe('initialized');
+    // The real install result after the stray line is still picked up.
+    expect(parsed.agent?.action).toBe('installed');
+    expect(parsed.agent?.skills).toContain('testsprite-verify');
+    expect(vi.mocked(runInstall)).toHaveBeenCalledTimes(1);
+    expect(
+      captured.stderr.filter(line =>
+        line.includes('[debug] setup agent install output parse non-JSON:'),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('keeps stderr free of [debug] lines when the agent install step writes a non-JSON line without --debug', async () => {
+    const captured = await runInitWithStrayInstallOutput(false);
+
+    const parsed = JSON.parse(captured.stdout.join('\n')) as {
+      status: string;
+      agent: { action: string } | null;
+    };
+    expect(parsed.status).toBe('initialized');
+    expect(parsed.agent?.action).toBe('installed');
+    // The stray line was written; it just must not be reported.
+    expect(vi.mocked(runInstall)).toHaveBeenCalledTimes(1);
+    expect(captured.stderr.filter(line => line.includes('[debug]'))).toEqual([]);
   });
 
   it('stops before skill installation when the identity request is interrupted', async () => {
@@ -2057,10 +2260,18 @@ describe('runInit -- skipIfConfigured', () => {
   it('skips the API key prompt and reuses saved credentials when the profile exists', async () => {
     const { captured, deps } = makeCapture();
     const { fs: agentFs } = makeMemFs();
-    // Write a saved key before running setup.
-    writeProfile('default', { apiKey: 'sk-saved' }, { path: credentialsPath });
-    // Provide a mock fetch that accepts /me so runWhoami (identity banner) succeeds.
-    const fetchMock = makeOkFetch();
+    // Write a saved key before running setup. Valid format, so the identity
+    // lookup reaches the server instead of failing the local format check.
+    writeProfile('default', { apiKey: 'sk-user-saved-key' }, { path: credentialsPath });
+    // Mock fetch that accepts /me and records every request it receives.
+    const requests: string[] = [];
+    const fetchMock = vi.fn(async (url: string, init: { method?: string }) => {
+      requests.push(`${init.method ?? 'GET'} ${new URL(url).pathname}`);
+      return new Response(JSON.stringify(ME), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as InitDeps['fetchImpl'];
     const prompt = { secret: vi.fn(async () => 'sk-should-never-be-asked') };
 
     await runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
@@ -2075,10 +2286,77 @@ describe('runInit -- skipIfConfigured', () => {
     // The prompt must never have fired.
     expect(prompt.secret).not.toHaveBeenCalled();
     // The saved key must be untouched.
-    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-saved');
-    // The summary must still be emitted.
-    const parsed = JSON.parse(captured.stdout.join('')) as { status: string };
+    expect(readProfile('default', { path: credentialsPath })?.apiKey).toBe('sk-user-saved-key');
+    // The saved key is checked against the server exactly once.
+    expect(requests).toEqual([expect.stringMatching(/^GET \S*\/me$/)]);
+    // The summary must still be emitted, with the identity the server returned
+    // rather than the placeholder used when the lookup fails.
+    const parsed = JSON.parse(captured.stdout.join('')) as {
+      status: string;
+      env: string;
+      scopes: string[];
+    };
     expect(parsed.status).toBe('initialized');
+    expect(parsed.env).toBe(ME.env);
+    expect(parsed.scopes).toEqual(ME.scopes);
+  });
+
+  it('fails with AUTH_INVALID instead of reporting success when the saved key is rejected', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    // A key that is still on disk but no longer accepted by the server.
+    // Valid format so the failure comes from the server, not the local format check.
+    writeProfile('default', { apiKey: 'sk-user-revoked-key' }, { path: credentialsPath });
+
+    // `--skip-if-configured` skips the configure-time GET /me, so whoami is the
+    // only call that reaches the server. Before this fix its 401 was swallowed
+    // and the run still printed an `initialized` summary with exit 0.
+    await expect(
+      runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
+        ...deps,
+        credentialsPath,
+        fetchImpl: makeAuthFailFetch(),
+        fs: agentFs,
+        isTTY: false,
+      }),
+    ).rejects.toMatchObject({ code: 'AUTH_INVALID', exitCode: 3 });
+
+    // No success summary may reach stdout.
+    expect(captured.stdout.join('')).not.toContain('initialized');
+  });
+
+  it('preserves the server error detail when the saved key is forbidden', async () => {
+    const { captured, deps } = makeCapture();
+    const { fs: agentFs } = makeMemFs();
+    writeProfile('default', { apiKey: 'sk-user-revoked-key' }, { path: credentialsPath });
+
+    // 403 rather than 401: a key the server still recognises but no longer
+    // authorises must fail the same way. The failure also has to carry the
+    // server's own remediation text and requestId through, because that is what
+    // an operator needs to open a support ticket -- a generic "setup failed"
+    // would lose both.
+    await expect(
+      runInit(makeBaseOpts({ skipIfConfigured: true, noAgent: true, output: 'json' }), {
+        ...deps,
+        credentialsPath,
+        fetchImpl: makeAuthFailFetch({
+          status: 403,
+          code: 'AUTH_FORBIDDEN',
+          message: 'API key is not permitted for this organization',
+          nextAction: 'Ask an organization admin to grant access.',
+          requestId: 'r-403',
+        }),
+        fs: agentFs,
+        isTTY: false,
+      }),
+    ).rejects.toMatchObject({
+      code: 'AUTH_FORBIDDEN',
+      exitCode: 3,
+      requestId: 'r-403',
+      nextAction: 'Ask an organization admin to grant access.',
+    });
+
+    expect(captured.stdout.join('')).not.toContain('initialized');
   });
 
   it('proceeds to prompt when skipIfConfigured is true but no credentials exist', async () => {

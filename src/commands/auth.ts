@@ -6,9 +6,10 @@ import {
   emitDryRunBanner,
   makeHttpClient,
   parseRequestTimeoutFlag,
+  resolveRequestTimeoutMs,
   type CommonOptions as FactoryCommonOptions,
 } from '../lib/client-factory.js';
-import { ApiError, CLIError, InterruptError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { facadeBaseUrl, resolvePortalBase } from '../lib/facade.js';
 import type { FetchImpl } from '../lib/http.js';
 import { HttpClient } from '../lib/http.js';
@@ -283,7 +284,10 @@ export async function runConfigure(
     baseUrl: facadeBaseUrl(apiUrl),
     apiKey,
     fetchImpl: deps.fetchImpl,
-    requestTimeoutMs: opts.requestTimeoutMs,
+    // Same precedence as every other command's client (flag > env > default,
+    // same clamping): `setup --from-env` previously read the flag only, so a
+    // TESTSPRITE_REQUEST_TIMEOUT_MS deadline was silently ignored here.
+    requestTimeoutMs: resolveRequestTimeoutMs(opts, env),
     shutdownSignal: deps.shutdownSignal ?? globalShutdown.signal,
     shutdown: deps.shutdown ?? globalShutdown,
   });
@@ -299,6 +303,13 @@ export async function runConfigure(
   } catch (err) {
     if (err instanceof InterruptError) throw err;
     const message = err instanceof Error ? err.message : String(err);
+    // A client-side timeout says nothing about the key. Rethrow it unchanged so
+    // it keeps its REQUEST_TIMEOUT code, exit 7 and request id, instead of the
+    // exit-3 "rejected" wrapper below that sends the user to rotate a good key.
+    if (err instanceof RequestTimeoutError) {
+      stderr(`API key check against ${apiUrl} timed out, profile NOT updated: ${message}`);
+      throw err;
+    }
     stderr(`API key rejected by ${apiUrl}: ${message} — profile NOT updated`);
     // When the verification call returned a typed API error (AUTH_INVALID,
     // AUTH_FORBIDDEN, etc.), re-throw it directly so `index.ts` renders the
@@ -311,7 +322,7 @@ export async function runConfigure(
       err.message = `API key rejected by ${apiUrl}: ${message} — did you mean to set TESTSPRITE_API_URL?`;
       throw err;
     }
-    // Non-ApiError (truly unexpected throws like a TypeError from a
+    // Anything else (truly unexpected throws like a TypeError from a
     // misconfigured fetchImpl). Exit 3 (auth family).
     throw new CLIError(
       `API key rejected by ${apiUrl}: ${message} — did you mean to set TESTSPRITE_API_URL?`,

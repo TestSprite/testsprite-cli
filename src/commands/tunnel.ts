@@ -220,6 +220,7 @@ async function deleteTunnelForCleanup(
   await withTeardownDeadline(createClient, shutdown, client =>
     client.delete<unknown>(`/tunnel/${encodeURIComponent(clientId)}`, {
       allowNoContent: true,
+      replaySafe: true,
     }),
   );
 }

@@ -30,6 +30,10 @@ vi.mock('../lib/local-target.js', async importOriginal => ({
 const clientId = '11111111-2222-3333-4444-555555555555';
 const savedUrl = 'http://127.0.0.1:5173/';
 const common = { profile: 'default', output: 'json' as const, debug: false };
+/**
+ * Build an offline environment/tunnel fixture with configurable API responses.
+ * Capture requests and output, and inject shutdown events for interruption tests.
+ */
 function fixture(
   options: {
     url?: string;
@@ -37,6 +41,8 @@ function fixture(
     envStatus?: number;
     echo?: boolean;
     mintStatus?: number;
+    /** Client id the tunnel mint returns (a different one simulates a new tunnel). */
+    tunnelClientId?: string;
     triggerStatus?: number;
     batchResponse?: (body: Record<string, unknown>) => Record<string, unknown>;
     envs?: Array<Record<string, unknown>>;
@@ -134,7 +140,7 @@ function fixture(
         ? error(options.mintStatus, 'missing_scope')
         : json(
             {
-              clientId,
+              clientId: options.tunnelClientId ?? clientId,
               secret: 'fixture-secret',
               controlUrl: 'ws://tunnel.example/ws',
               tunnelAddr: 'tunnel.example:7400',
@@ -142,7 +148,7 @@ function fixture(
             },
             201,
           );
-    if (method === 'DELETE' && path === `/tunnel/${clientId}`)
+    if (method === 'DELETE' && path === `/tunnel/${options.tunnelClientId ?? clientId}`)
       return new Response(null, { status: 204 });
     if (method === 'POST' && path.endsWith('/cancel'))
       return json({
@@ -1301,6 +1307,39 @@ describe('environment tunnel resolution', () => {
     });
   });
 
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'keeps one owned test-list partial envelope on %s during polling',
+    async signal => {
+      const shutdown = new ShutdownController();
+      const f = fixture({
+        shutdown,
+        poll: () => {
+          shutdown.interrupt(signal);
+          throw shutdown.signal.reason;
+        },
+      });
+      const error = await runTestlistRun(
+        { ...common, listId: 'L', wait: true, timeoutSeconds: 10, maxConcurrency: 5 },
+        f.deps,
+      ).catch((err: unknown) => err);
+
+      expect(error).toBe(shutdown.signal.reason);
+      expect(error).toMatchObject({ exitCode: signal === 'SIGINT' ? 130 : 143 });
+      expect(f.stdout).toHaveLength(1);
+      expect(JSON.parse(f.stdout[0]!)).toMatchObject({
+        accepted: [{ testId: 'a', runId: 'run_a', status: 'running' }],
+        conflicts: [],
+        deferred: [],
+        notRunTestIds: [],
+      });
+      // Owned tunnels retain their existing cleanup behavior; only the remote
+      // non-tunnel path detaches without cancelling runs.
+      expect(f.calls.filter(call => call.path.endsWith('/cancel')).map(call => call.path)).toEqual([
+        '/runs/run_a/cancel',
+      ]);
+    },
+  );
+
   it('uses distinct bounded idempotency keys for loopback test-list groups', async () => {
     const f = fixture({
       tests: [
@@ -1333,6 +1372,112 @@ describe('environment tunnel resolution', () => {
     expect(keys).toHaveLength(2);
     expect(new Set(keys).size).toBe(2);
     expect(keys.every(key => key.length <= 256)).toBe(true);
+  });
+
+  /** Record the idempotency key each `POST /tests/{id}/runs` carries, by test id. */
+  function captureTriggerKeys(f: ReturnType<typeof fixture>): Record<string, string> {
+    const keys: Record<string, string> = {};
+    const original = f.deps.fetchImpl;
+    f.deps.fetchImpl = vi.fn(async (input: Parameters<typeof fetch>[0], init: RequestInit = {}) => {
+      const trigger = /\/tests\/([^/]+)\/runs$/.exec(String(input));
+      if (trigger?.[1] && init.method === 'POST')
+        keys[trigger[1]] = new Headers(init.headers).get('idempotency-key')!;
+      return original(input, init);
+    });
+    return keys;
+  }
+
+  const threeTests = [
+    { id: 'a', type: 'frontend', projectId: 'P' },
+    { id: 'b', type: 'frontend', projectId: 'P' },
+    { id: 'c', type: 'frontend', projectId: 'P' },
+  ];
+
+  it('derives every trigger key of a several-id run from --idempotency-key, the tunnel and the test id', async () => {
+    const f = fixture({ tests: threeTests });
+    const keys = captureTriggerKeys(f);
+    await f.run('run', 'a', 'b', 'c', '--skip-preflight', '--idempotency-key', 'ci-build-42');
+    expect(keys).toEqual({
+      a: `ci-build-42:${clientId}:a`,
+      b: `ci-build-42:${clientId}:b`,
+      c: `ci-build-42:${clientId}:c`,
+    });
+  });
+
+  it('re-sends the same trigger keys when a several-id run is retried with the printed key', async () => {
+    const first = fixture({ tests: threeTests });
+    const firstKeys = captureTriggerKeys(first);
+    await first.run('run', 'a', 'b', 'c', '--skip-preflight');
+    const printed = first.stderr
+      .find(line => line.startsWith('idempotency-key: '))
+      ?.slice('idempotency-key: '.length);
+    expect(printed).toMatch(/^cli-run-/);
+
+    const retry = fixture({ tests: threeTests });
+    const retryKeys = captureTriggerKeys(retry);
+    await retry.run('run', 'a', 'b', 'c', '--skip-preflight', '--idempotency-key', printed!);
+
+    // Identical keys let the server return the runs the first attempt started
+    // instead of starting (and billing) every test a second time.
+    expect(Object.keys(firstKeys)).toHaveLength(3);
+    expect(retryKeys).toEqual(firstKeys);
+    expect(new Set(Object.values(firstKeys)).size).toBe(3);
+  });
+
+  it('uses new trigger keys when a several-id run is retried through a new tunnel', async () => {
+    const first = fixture({ tests: threeTests });
+    const firstKeys = captureTriggerKeys(first);
+    await first.run('run', 'a', 'b', 'c', '--skip-preflight', '--idempotency-key', 'ci-build-42');
+
+    const retry = fixture({ tests: threeTests, tunnelClientId: 'new-tunnel-client' });
+    const retryKeys = captureTriggerKeys(retry);
+    await retry.run('run', 'a', 'b', 'c', '--skip-preflight', '--idempotency-key', 'ci-build-42');
+
+    // The old runs are bound to a tunnel that is gone, and reusing their keys
+    // with a new tunnelClientId would be refused as IDEMPOTENCY_BODY_MISMATCH.
+    expect(retryKeys).toEqual({
+      a: 'ci-build-42:new-tunnel-client:a',
+      b: 'ci-build-42:new-tunnel-client:b',
+      c: 'ci-build-42:new-tunnel-client:c',
+    });
+    expect(Object.values(retryKeys).some(key => Object.values(firstKeys).includes(key))).toBe(
+      false,
+    );
+  });
+
+  it('scopes create-batch --run trigger keys to the tunnel', async () => {
+    const f = fixture();
+    const keys = captureTriggerKeys(f);
+    const plans = join(mkdtempSync(join(tmpdir(), 'env-plans-')), 'plans.jsonl');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture-owned temporary directory.
+    writeFileSync(
+      plans,
+      ['a', 'b']
+        .map(name =>
+          JSON.stringify({
+            projectId: 'P',
+            type: 'frontend',
+            name,
+            planSteps: [{ type: 'action', description: 'Open the app' }],
+          }),
+        )
+        .join('\n'),
+    );
+    await runCreateBatch(
+      {
+        ...common,
+        plans,
+        run: true,
+        wait: false,
+        idempotencyKey: 'ci-build-42',
+        skipPreflight: true,
+      },
+      f.deps,
+    );
+    expect(keys).toEqual({
+      a: `ci-build-42:run:${clientId}:a`,
+      b: `ci-build-42:run:${clientId}:b`,
+    });
   });
 
   it('drains concurrent create-batch triggers before printing receipts and closing the tunnel', async () => {
@@ -1573,6 +1718,7 @@ describe('environment tunnel compatibility regressions', () => {
 });
 
 describe('creation tunnel preflight receipts', () => {
+  /** Write fixture plans with the requested test types for batch tunnel scenarios. */
   function plansFile(types: Array<'frontend' | 'backend'> = ['frontend', 'frontend']) {
     const plans = join(mkdtempSync(join(tmpdir(), 'creation-preflight-')), 'plans.jsonl');
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- fixture-owned temporary directory.

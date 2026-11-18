@@ -735,6 +735,119 @@ describe('runDeleteBatch (dogfood L1796)', () => {
     expect(skipped?.status).toBe('skipped');
   });
 
+  function errorResp(status: number, code: string) {
+    return {
+      status,
+      body: { error: { code, message: code, nextAction: '', requestId: 'r1', details: {} } },
+    };
+  }
+
+  it('a rejected key exits 3 with the typed AUTH_INVALID error, not the generic 1', async () => {
+    const creds = makeCreds();
+    const fetchImpl = makeFetch((_url, init) =>
+      init.method === 'DELETE' ? errorResp(401, 'AUTH_INVALID') : { body: {} },
+    );
+    const stdout: string[] = [];
+
+    const err = await runDeleteBatch(
+      {
+        testIds: ['test_a', 'test_b'],
+        all: false,
+        confirm: true,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, fetchImpl, stdout: (l: string) => stdout.push(l), stderr: () => {} },
+    ).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ exitCode: 3, code: 'AUTH_INVALID' });
+    // The per-test summary still lands on stdout before the error.
+    const summary = JSON.parse(stdout.join('\n')) as CliBulkDeleteSummary;
+    expect(summary.summary).toEqual({ total: 2, deleted: 0, skipped: 0, failed: 2 });
+  });
+
+  it('a too-old CLI (426 CLIENT_TOO_OLD) exits 14', async () => {
+    const creds = makeCreds();
+    const fetchImpl = makeFetch((_url, init) =>
+      init.method === 'DELETE' ? errorResp(426, 'CLIENT_TOO_OLD') : { body: {} },
+    );
+
+    const err = await runDeleteBatch(
+      {
+        testIds: ['test_a', 'test_b'],
+        all: false,
+        confirm: true,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, fetchImpl, stdout: () => {}, stderr: () => {} },
+    ).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ exitCode: 14, code: 'CLIENT_TOO_OLD' });
+  });
+
+  it('auth outranks a too-old CLI: deleted + 426 + 401 exits 3', async () => {
+    const creds = makeCreds();
+    const fetchImpl = makeFetch((url, init) => {
+      if (init.method !== 'DELETE') return { body: {} };
+      if (url.includes('test_old')) return errorResp(426, 'CLIENT_TOO_OLD');
+      if (url.includes('test_denied')) return errorResp(401, 'AUTH_INVALID');
+      const testId = url.split('/tests/')[1]!.split('?')[0]!;
+      return { body: deleteResp(testId) };
+    });
+    const stdout: string[] = [];
+
+    const err = await runDeleteBatch(
+      {
+        testIds: ['test_ok', 'test_old', 'test_denied'],
+        all: false,
+        confirm: true,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, fetchImpl, stdout: (l: string) => stdout.push(l), stderr: () => {} },
+    ).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ exitCode: 3, code: 'AUTH_INVALID' });
+    const summary = JSON.parse(stdout.join('\n')) as CliBulkDeleteSummary;
+    expect(summary.summary).toEqual({ total: 3, deleted: 1, skipped: 0, failed: 2 });
+  });
+
+  it('a non-batch-wide deletion failure keeps the generic exit 1', async () => {
+    const creds = makeCreds();
+    const fetchImpl = makeFetch((url, init) => {
+      if (init.method !== 'DELETE') return { body: {} };
+      if (url.includes('test_bad')) return errorResp(400, 'VALIDATION_ERROR');
+      const testId = url.split('/tests/')[1]!.split('?')[0]!;
+      return { body: deleteResp(testId) };
+    });
+
+    const err = await runDeleteBatch(
+      {
+        testIds: ['test_ok', 'test_bad'],
+        all: false,
+        confirm: true,
+        output: 'json',
+        profile: 'default',
+        dryRun: false,
+        debug: false,
+        verbose: false,
+      },
+      { ...creds, fetchImpl, stdout: () => {}, stderr: () => {} },
+    ).catch((e: unknown) => e);
+
+    expect(err).toMatchObject({ exitCode: 1 });
+  });
+
   it('--dry-run skips all HTTP calls and returns full synthetic summary', async () => {
     const creds = makeCreds();
     const callCount = { n: 0 };

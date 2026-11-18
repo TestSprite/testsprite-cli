@@ -21,7 +21,7 @@ import {
 } from '../lib/client-factory.js';
 import { normalizeEnvVar, resolveProfileName } from '../lib/config.js';
 import { emitDeprecationNotice } from '../lib/deprecate.js';
-import { CLIError, InterruptError, localValidationError } from '../lib/errors.js';
+import { ApiError, CLIError, InterruptError, localValidationError } from '../lib/errors.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode } from '../lib/output.js';
 import type { AuthDeps, ConfigureResult, MeResponse } from './auth.js';
 import { missingApiKeyError, runConfigure, runWhoami } from './auth.js';
@@ -56,13 +56,21 @@ const DEFAULT_API_URL = 'https://api.testsprite.com';
  * configuring staging/dev (codex). On the real path this runs AFTER the profile
  * is written, so the persisted apiUrl is reflected faithfully.
  */
-function resolveReportedEndpoint(opts: InitOptions, deps: InitDeps): string {
+function resolveReportedEndpoint(
+  opts: InitOptions,
+  deps: InitDeps,
+  stderrFn?: (line: string) => void,
+): string {
   const env = deps.env ?? process.env;
   const envApiUrl = normalizeEnvVar(env.TESTSPRITE_API_URL);
   let existing: string | undefined;
   try {
     existing = readProfile(opts.profile, { path: deps.credentialsPath })?.apiUrl;
-  } catch {
+  } catch (err) {
+    if (opts.debug && stderrFn) {
+      const reason = err instanceof Error ? err.message : String(err);
+      stderrFn(`[debug] resolve endpoint profile read failed: ${reason}`);
+    }
     existing = undefined;
   }
   return opts.endpointUrl ?? envApiUrl ?? existing ?? DEFAULT_API_URL;
@@ -456,7 +464,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     throw missingApiKeyError(
       'No API key available in non-interactive mode. ' +
         'Pass --api-key <key>, --from-env (reads TESTSPRITE_API_KEY), or run interactively.',
-      resolveReportedEndpoint(opts, deps),
+      resolveReportedEndpoint(opts, deps, stderrFn),
     );
   }
   // JSON-output guard: an interactive secret prompt writes to stdout and would
@@ -542,7 +550,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
 
     const summary: InitSummary = {
       profile: opts.profile,
-      apiUrl: resolveReportedEndpoint(opts, deps),
+      apiUrl: resolveReportedEndpoint(opts, deps, stderrFn),
       env: 'development',
       scopes: [],
       agent: resolution
@@ -601,6 +609,23 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     me = await runWhoami(opts, whoamiDeps);
   } catch (err) {
     if (err instanceof InterruptError) throw err;
+    // `--skip-if-configured` skipped the configure-time validation, so whoami is
+    // the only call that ever reaches the server on this path. Swallowing its
+    // auth failure made `setup --skip-if-configured` print an "initialized"
+    // summary with exit 0 for a key that had since been revoked, and the first
+    // real command failed afterwards with a much less obvious error. Let the
+    // typed envelop through instead (AUTH_INVALID / AUTH_FORBIDDEN, exit 3).
+    // Scoped to the two auth codes on purpose: a malformed saved key reports
+    // VALIDATION_ERROR from the client factory, and that stays display-only so
+    // a cosmetic format complaint cannot fail an otherwise valid setup.
+    // Every other path still treats whoami as display-only.
+    if (
+      skipWillApply &&
+      err instanceof ApiError &&
+      (err.code === 'AUTH_INVALID' || err.code === 'AUTH_FORBIDDEN')
+    ) {
+      throw err;
+    }
     // Whoami is display-only. If it fails after a successful configure,
     // continue with a minimal placeholder so the summary still prints.
     if (opts.debug) {
@@ -653,7 +678,11 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
         if (Array.isArray(parsed) && parsed.length > 0) {
           capturedInstallResults = parsed;
         }
-      } catch {
+      } catch (err) {
+        if (opts.debug) {
+          const reason = err instanceof Error ? err.message : String(err);
+          stderrFn(`[debug] setup agent install output parse non-JSON: ${reason}`);
+        }
         // ignore non-JSON lines (shouldn't happen in json mode, but be safe)
       }
     };
@@ -709,7 +738,7 @@ export async function runInit(opts: InitOptions, deps: InitDeps = {}): Promise<v
     profile: opts.profile,
     // Resolved AFTER configure persists the profile → reflects the real endpoint
     // (staging/dev/prod), not a flat prod default (codex).
-    apiUrl: resolveReportedEndpoint(opts, deps),
+    apiUrl: resolveReportedEndpoint(opts, deps, stderrFn),
     env: me.env,
     email: me.email,
     scopes: me.scopes,

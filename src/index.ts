@@ -22,6 +22,7 @@ import { createUsageCommand } from './commands/usage.js';
 import { resolveProfileName } from './lib/config.js';
 import { classifyBillingRefusal } from './lib/billing-refusal.js';
 import { TARGETS, type AgentTarget } from './lib/agent-targets.js';
+import { validatePositionalArgs } from './lib/args.js';
 import {
   ApiError,
   CLIError,
@@ -50,7 +51,7 @@ import {
   isTelemetryOptedOut,
   recordOutcome,
   recordTelemetryExtras,
-  resolveTelemetryAuth,
+  tryResolveTelemetryAuth,
   type ResolvedTelemetryAuth,
   type WaitTimeoutTelemetry,
 } from './lib/telemetry.js';
@@ -285,6 +286,13 @@ function telemetryGlobals(): {
 // action; the helper self-gates (text-only, non-dry-run, a small command
 // allowlist, opt-out via TESTSPRITE_NO_SKILL_WARNING) and never throws.
 program.hook('preAction', (_thisCommand, actionCommand) => {
+  const commandPath = commandPathOf(actionCommand);
+  // Record which leaf command ran, for the telemetry emit around parseAsync.
+  ranCommandPath = commandPath;
+
+  // Validate positional arguments across all commands before executing their actions.
+  validatePositionalArgs(actionCommand);
+
   const globals = actionCommand.optsWithGlobals() as {
     output?: string;
     profile?: string;
@@ -295,9 +303,6 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
     local?: string;
     localHost?: string;
   };
-  const commandPath = commandPathOf(actionCommand);
-  // Record which leaf command ran, for the telemetry emit around parseAsync.
-  ranCommandPath = commandPath;
   // Preserve explicit --local attempts, including refusals and borrowed tunnels;
   // only flag presence is recorded. Automatic tunnel paths record the same fact.
   if (globals.local !== undefined) recordTelemetryExtras({ local: true });
@@ -311,13 +316,25 @@ program.hook('preAction', (_thisCommand, actionCommand) => {
   // Telemetry gate, same reasons as the update notice below: skip `completion`
   // (its stdout is eval'd by shells) and `--plan-template` (pure-local). Resolve
   // auth now, before the command's action runs, so `auth remove` still reports
-  // on the key it used; skip the read for opt-out / dry-run.
+  // on the key it used; skip the read for opt-out / dry-run. The read is
+  // best-effort: an unreadable credentials file must not end the process here,
+  // before the command could run — `doctor` exists to diagnose exactly that, and
+  // offline commands never need the key. On failure the command runs as if
+  // telemetry were off (no event, and no fallback read at exit either).
   telemetryEmit = commandPath !== 'completion' && !isPlanTemplate;
   if (telemetryEmit && !isTelemetryOptedOut(process.env) && globals.dryRun !== true) {
-    telemetryAuth = resolveTelemetryAuth({
-      profile: globals.profile,
-      endpointUrl: globals.endpointUrl,
-    });
+    telemetryAuth = tryResolveTelemetryAuth(
+      { profile: globals.profile, endpointUrl: globals.endpointUrl },
+      {
+        onError: globals.debug
+          ? error =>
+              process.stderr.write(
+                `[debug] telemetry skipped: ${error instanceof Error ? error.message : String(error)}\n`,
+              )
+          : undefined,
+      },
+    );
+    if (telemetryAuth === undefined) telemetryEmit = false;
   }
   if (!isPlanTemplate) {
     maybeEmitSkillNudge({
@@ -511,8 +528,9 @@ try {
           code: 'REQUEST_TIMEOUT',
           message: err.message,
           nextAction:
+            err.nextAction ??
             'Increase --request-timeout <seconds> or set TESTSPRITE_REQUEST_TIMEOUT_MS. ' +
-            'Check that the backend is reachable and not overloaded.',
+              'Check that the backend is reachable and not overloaded.',
           requestId: err.requestId,
           details: { timeoutMs: err.timeoutMs },
         },

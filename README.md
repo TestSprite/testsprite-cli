@@ -79,8 +79,9 @@ From there, the loop runs on its own — an example session, typed by the coding
 
 ```bash
 # 1 — describe the behavior you want to guarantee, run it, wait
-testsprite test create --project proj_8f0f6 --type frontend \
-  --plan-from ./checkout-flow.plan.json --run --wait --output json
+# Set projectId in checkout-flow.plan.json to your project ID.
+testsprite test create --plan-from ./checkout-flow.plan.json \
+  --run --wait --output json
 #   → exits 1: the run failed
 
 # 2 — pull ONE self-consistent failure bundle
@@ -135,7 +136,8 @@ Use an API key with `run:tunnel`; the CLI names the missing scope if the key can
 
 ```bash
 testsprite project create --type frontend --name "My local app" --local 3000
-testsprite test create --plan-from ./checkout.plan.json --project <project-id>
+# Set projectId in checkout.plan.json to the project ID returned above.
+testsprite test create --plan-from ./checkout.plan.json
 testsprite test run <test-id>  # the saved loopback URL opens a tunnel and waits
 testsprite test run <id> <id> --max-concurrency 5
 testsprite test run --all --project <project-id>

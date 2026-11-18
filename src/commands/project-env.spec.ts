@@ -1842,6 +1842,18 @@ describe('runEnvDelete', () => {
     expect(calls).toEqual([]);
   });
 
+  it.each(['..', '.'])('refuses the name %s and sends no request', async name => {
+    const { credentialsPath } = makeCreds();
+    const calls: Call[] = [];
+    await expect(
+      runEnvDelete(
+        { ...COMMON, projectId: PROJECT_ID, name, confirm: true },
+        { credentialsPath, fetchImpl: makeFetch(calls, () => ({ body: {} })), stdout: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+    expect(calls).toEqual([]);
+  });
+
   it('DELETEs /projects/{id}/env/{name} with an idempotency key', async () => {
     const { credentialsPath } = makeCreds();
     const calls: Call[] = [];
@@ -2272,5 +2284,94 @@ describe('environment rename validation compatibility', () => {
       exitCode: 5,
       details: { field: 'rename' },
     });
+  });
+});
+
+describe('dot environment names are refused by every verb', () => {
+  const dotNames = ['.', '..'];
+
+  const verbs: Array<{
+    label: string;
+    run: (name: string, dryRun: boolean, deps: Record<string, unknown>) => Promise<unknown>;
+  }> = [
+    {
+      label: 'get',
+      run: (name, dryRun, deps) =>
+        runEnvGet({ ...COMMON, dryRun, projectId: PROJECT_ID, name }, deps),
+    },
+    {
+      label: 'create',
+      run: (name, dryRun, deps) =>
+        runEnvCreate({ ...COMMON, dryRun, projectId: PROJECT_ID, name }, deps),
+    },
+    {
+      label: 'update',
+      run: (name, dryRun, deps) =>
+        runEnvUpdate({ ...COMMON, dryRun, projectId: PROJECT_ID, name, username: 'u' }, deps),
+    },
+    {
+      label: 'update --rename',
+      run: (name, dryRun, deps) =>
+        runEnvUpdate(
+          { ...COMMON, dryRun, projectId: PROJECT_ID, name: 'demo', rename: name },
+          deps,
+        ),
+    },
+    {
+      label: 'delete',
+      run: (name, dryRun, deps) =>
+        runEnvDelete({ ...COMMON, dryRun, projectId: PROJECT_ID, name, confirm: true }, deps),
+    },
+    {
+      label: 'set-default',
+      run: (name, dryRun, deps) =>
+        runEnvSetDefault({ ...COMMON, dryRun, projectId: PROJECT_ID, name }, deps),
+    },
+  ];
+
+  for (const { label, run } of verbs) {
+    for (const name of dotNames) {
+      for (const dryRun of [false, true]) {
+        it(`${label} "${name}"${dryRun ? ' --dry-run' : ''} exits 5 and sends no request`, async () => {
+          const { credentialsPath } = makeCreds();
+          const calls: Call[] = [];
+          const err = await run(name, dryRun, {
+            credentialsPath,
+            fetchImpl: makeFetch(calls, () => ({ body: {} })),
+            stdout: () => {},
+            stderr: () => {},
+          }).catch(e => e as ApiError);
+          expect(err).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+          expect((err as ApiError).nextAction).toContain(`"${'.'}"`);
+          expect(calls).toEqual([]);
+        });
+      }
+    }
+  }
+
+  it('reports the rename field when --rename is a dot name', async () => {
+    await expect(
+      runEnvUpdate(
+        { ...COMMON, projectId: PROJECT_ID, name: 'demo', rename: '..' },
+        { stdout: () => {}, stderr: () => {} },
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR', details: { field: 'rename' } });
+  });
+
+  it('still accepts names that merely contain dots', async () => {
+    const { credentialsPath } = makeCreds();
+    for (const name of ['v1.2', '..staging', 'a..b']) {
+      const calls: Call[] = [];
+      await runEnvDelete(
+        { ...COMMON, projectId: PROJECT_ID, name, confirm: true },
+        {
+          credentialsPath,
+          fetchImpl: makeFetch(calls, () => ({ body: { deleted: true, name } })),
+          stdout: () => {},
+          stderr: () => {},
+        },
+      );
+      expect(calls).toHaveLength(1);
+    }
   });
 });

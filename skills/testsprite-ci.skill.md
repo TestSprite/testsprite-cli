@@ -136,6 +136,10 @@ deployments are filtered out by the `if:`).
   check is right, the report is the server's view of the execution.
 - `exit 7` with "did not confirm the single-execution admission mode" = the backend is
   too old for `ci run`; the dispatched runs were cancelled and refunded.
+- `exit 5` with `target-protected` = the preview is behind Vercel Deployment Protection,
+  so nothing was dispatched. Ask the user to turn off Vercel Authentication for previews,
+  or to add a Protection Bypass for Automation secret as a repo secret and append
+  `?x-vercel-protection-bypass=<secret>&x-vercel-set-bypass-cookie=true` to the URL.
 - Screenshots in the report are capped at 12 per execution; later rows show `—`.
 - Shape A is per commit: a new push starts its own run against its own preview, and
   cancelling the job only stops the CLI — the execution keeps running and reports in
