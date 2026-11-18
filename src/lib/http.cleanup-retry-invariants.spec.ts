@@ -65,7 +65,7 @@ describe('cleanup transport retry invariants', () => {
       clientWith(fetchImpl).delete('/tunnel/c1', {
         allowNoContent: true,
         retryOnConflict: false,
-        transportRetrySafe: true,
+        replaySafe: true,
       }),
     ).rejects.toMatchObject({ code: 'CONFLICT' });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
@@ -80,7 +80,7 @@ describe('cleanup transport retry invariants', () => {
     await expect(
       clientWith(fetchImpl).delete('/tunnel/c1', {
         allowNoContent: true,
-        transportRetrySafe: true,
+        replaySafe: true,
         retry: false,
       }),
     ).rejects.toThrow();

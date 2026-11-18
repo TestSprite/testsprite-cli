@@ -234,9 +234,11 @@ export interface RequestOptions<T = unknown> {
   /**
    * The endpoint absorbs a replay with no side effect even without an
    * `Idempotency-Key` (a re-cancel is a 200 no-op, a binding is gone after
-   * any DELETE), so a keyless write may still retry a 5xx envelope. Without
-   * it, keyless POST/PUT/PATCH/DELETE are sent once on a 5xx: the server may
-   * have committed before failing.
+   * any DELETE), so a keyless write may still retry a 5xx envelope and a
+   * transport failure (a fetch rejection, a connection dropped mid-response,
+   * a bare 408/502/504). Without it, keyless POST/PUT/PATCH/DELETE are sent
+   * once on either: the server may have committed before failing. Never set
+   * it on an arbitrary keyless mutation.
    */
   replaySafe?: boolean;
   /**
@@ -255,13 +257,6 @@ export interface RequestOptions<T = unknown> {
    * retry inside one read is never mistaken for a silent connection.
    */
   onRetryWait?: (delayMs: number) => void;
-  /**
-   * Allow transport retries for operations whose endpoint contract
-   * explicitly guarantees safe replay without an Idempotency-Key.
-   *
-   * Defaults to false. Never enable for arbitrary keyless mutations.
-   */
-  transportRetrySafe?: boolean;
 }
 
 const RETRY_BASE_MS = 250;
@@ -1743,9 +1738,7 @@ function transportRetryDecision(attempt: number, random: () => number): RetryDec
 
 function canRetryTransport(method: string, options: RequestOptions): boolean {
   return (
-    options.transportRetrySafe === true ||
-    isIdempotentMethod(method) ||
-    hasIdempotencyKey(options.headers)
+    options.replaySafe === true || isIdempotentMethod(method) || hasIdempotencyKey(options.headers)
   );
 }
 
