@@ -2054,6 +2054,9 @@ export async function runPlanPut(
   if (opts.dryRun && opts.dryRunSimulateError === 'PRECONDITION_FAILED') {
     const expectedCount = opts.expectedStepCount ?? planSteps.length;
     const stderr = deps.stderr ?? ((line: string) => process.stderr.write(`${line}\n`));
+    // No dry-run request is sent on this path, so the lazy banner would never
+    // fire; emit it before the simulated conflict.
+    emitDryRunBanner(stderr);
     stderr(
       `Plan-steps conflict. Server has a different step count than ${expectedCount}. ` +
         `Re-fetch with 'testsprite test get ${opts.testId}' to see the current planSteps[] length and retry with --expected-step-count <current>.`,
@@ -5940,6 +5943,10 @@ export async function runCodePut(
     // code 6 without a real API key.  The throw feeds into the catch
     // block below — identical code path as a real server 412.
     if (opts.dryRun && opts.dryRunSimulateError === 'PRECONDITION_FAILED') {
+      // With --force or --expected-version there was no auto-fetch, so no
+      // dry-run request has fired the lazy banner yet; emit it here. After
+      // an auto-fetch it already printed, and this call is a no-op.
+      emitDryRunBanner(deps.stderr ?? (line => process.stderr.write(`${line}\n`)));
       throw ApiError.fromEnvelope(
         {
           error: {
