@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { resolveWaitFailure, waitMemberError, type WaitMemberResult } from './wait-exit.js';
 import { ApiError, CLIError } from './errors.js';
 import { classifyBillingRefusal } from './billing-refusal.js';
+import { classifyCliError } from './telemetry.js';
 
 const OPTS = { timeoutSeconds: 600 };
 const err = (code: string, exitCode: number): WaitMemberResult['error'] => ({
@@ -132,6 +133,22 @@ describe('resolveWaitFailure — --wait fan-out exit-code precedence', () => {
     ) as CLIError;
     expect(f).toBeInstanceOf(CLIError);
     expect(f.exitCode).toBe(3);
+    expect(f.code).toBe('AUTH_INVALID');
+  });
+
+  it('an auth failure carries the member auth code, not the generic CLI_ERROR (§2)', () => {
+    const f = resolveWaitFailure(
+      [{ status: 'error', runId: 'r1', error: err('AUTH_REQUIRED', 3) }],
+      OPTS,
+    ) as CLIError;
+    expect(f).toBeInstanceOf(CLIError);
+    expect(f.exitCode).toBe(3);
+    // Both machine consumers read `err.code`: the `--output json` envelope
+    // (`error.code`, index.ts) and telemetry's `errorCode`
+    // (classifyCliError). It must be the real auth code so agents/CI take
+    // their re-auth branch instead of seeing an unclassified failure.
+    expect(f.code).toBe('AUTH_REQUIRED');
+    expect(classifyCliError(f).errorCode).toBe('AUTH_REQUIRED');
   });
 
   it('a NOT_FOUND poll error → ApiError exit 4 with a machine-readable code (§2)', () => {

@@ -11,7 +11,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
@@ -325,6 +325,9 @@ describe('runDocsUpload — failure modes are distinguished', () => {
     expect(text).toContain('step 2 of 3');
     expect(text).toMatch(/re-run/i);
     expect(text).toMatch(/expire/i);
+    // A complete error body keeps the status and its diagnostic prefix.
+    expect(apiErr.message).toContain('HTTP 403');
+    expect(apiErr.message).toContain('<Error><Code>AccessDenied</Code>');
     // `reason` is the discriminator callers branch on: it separates a failed
     // upload (nothing registered, re-run mints a fresh URL) from a failed
     // registration (the bytes already landed, re-running is safe).
@@ -429,6 +432,172 @@ describe('runDocsUpload — failure modes are distinguished', () => {
 
     expect(err).toBeInstanceOf(RequestTimeoutError);
     expect((err as RequestTimeoutError).exitCode).toBe(7);
+  });
+
+  it('a stalled non-OK PUT body still hits the per-request timeout and is cancelled', async () => {
+    const { credentialsPath } = makeCreds();
+    const { path } = makeFile('openapi.json', '{}3b');
+    let cancelled = false;
+    const { fetchImpl, calls } = makeDocsFetch({
+      // The Response resolves immediately (headers arrived), delivers a partial
+      // XML body, then stalls — exactly the stalled-403 shape from the report.
+      // This stream does not observe the fetch signal, so the reader must race
+      // the deadline itself rather than relying on undici to abort the body.
+      putResponse: () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('<Error><Code>AccessDenied</Code>'));
+            },
+            pull: () => new Promise<void>(() => undefined),
+            cancel: () => {
+              cancelled = true;
+            },
+          }),
+          { status: 403 },
+        ),
+    });
+
+    const io = captureIo();
+    const err = await runDocsUpload(baseOpts({ file: path, requestTimeoutMs: 50 }), {
+      credentialsPath,
+      fetchImpl,
+      stdout: io.stdout,
+      stderr: io.stderr,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(RequestTimeoutError);
+    expect((err as RequestTimeoutError).exitCode).toBe(7);
+    // The CLI clamps the flag to its 1s minimum; the stalled body returns at
+    // that deadline instead of waiting for the peer to end the response.
+    expect((err as RequestTimeoutError).timeoutMs).toBe(1000);
+    // Never register after a PUT that was refused.
+    expect(calls.map(c => c.method)).toEqual(['POST', 'PUT']);
+    // Give the fire-and-forget stream cancel a tick to reach the source.
+    await new Promise(resolve => setImmediate(resolve));
+    expect(cancelled).toBe(true);
+  });
+
+  it('Ctrl-C while a non-OK PUT body is stalled surfaces InterruptError, not a timeout', async () => {
+    const { credentialsPath } = makeCreds();
+    const { path } = makeFile('openapi.json', '{}3c');
+    const shutdown = new ShutdownController();
+    let reading!: () => void;
+    const started = new Promise<void>(resolve => {
+      reading = resolve;
+    });
+    const { fetchImpl, calls } = makeDocsFetch({
+      putResponse: () =>
+        new Response(
+          new ReadableStream<Uint8Array>(
+            {
+              pull() {
+                reading();
+                return new Promise<void>(() => undefined);
+              },
+            },
+            { highWaterMark: 0 },
+          ),
+          { status: 403 },
+        ),
+    });
+
+    const io = captureIo();
+    const pending = runDocsUpload(baseOpts({ file: path, requestTimeoutMs: 1000 }), {
+      credentialsPath,
+      fetchImpl,
+      stdout: io.stdout,
+      stderr: io.stderr,
+      shutdown,
+    }).catch((e: unknown) => e);
+    await started;
+    shutdown.interrupt('SIGINT');
+    const err = await pending;
+
+    expect(err).toBeInstanceOf(InterruptError);
+    expect(err).not.toBeInstanceOf(RequestTimeoutError);
+    expect((err as InterruptError).exitCode).toBe(130);
+    expect(calls.map(c => c.method)).toEqual(['POST', 'PUT']);
+  });
+
+  it('bounds the failed-PUT diagnostic snippet and cancels an oversized body', async () => {
+    const { credentialsPath } = makeCreds();
+    const { path } = makeFile('openapi.json', '{}3d');
+    const cancel = vi.fn();
+    const pull = vi.fn((controller: ReadableStreamDefaultController<Uint8Array>) => {
+      controller.enqueue(new TextEncoder().encode('x'.repeat(4096)));
+    });
+    const { fetchImpl, calls } = makeDocsFetch({
+      putResponse: () =>
+        new Response(new ReadableStream({ pull, cancel }, { highWaterMark: 0 }), { status: 403 }),
+    });
+
+    const io = captureIo();
+    const err = await runDocsUpload(baseOpts({ file: path }), {
+      credentialsPath,
+      fetchImpl,
+      stdout: io.stdout,
+      stderr: io.stderr,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).message).toContain(`HTTP 403 — ${'x'.repeat(300)}`);
+    expect((err as ApiError).message).not.toContain('x'.repeat(301));
+    expect(pull).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(calls.map(c => c.method)).toEqual(['POST', 'PUT']);
+  });
+
+  it('a non-OK PUT with no body still reports the already-known HTTP status', async () => {
+    const { credentialsPath } = makeCreds();
+    const { path } = makeFile('openapi.json', '{}3f');
+    const { fetchImpl, calls } = makeDocsFetch({
+      putResponse: () => new Response(null, { status: 403 }),
+    });
+
+    const io = captureIo();
+    const err = await runDocsUpload(baseOpts({ file: path }), {
+      credentialsPath,
+      fetchImpl,
+      stdout: io.stdout,
+      stderr: io.stderr,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).message).toContain('HTTP 403');
+    expect((err as ApiError).details.reason).toBe('presigned_put_failed');
+    expect(calls.map(c => c.method)).toEqual(['POST', 'PUT']);
+  });
+
+  it('a broken diagnostic body still reports the already-known HTTP status', async () => {
+    const { credentialsPath } = makeCreds();
+    const { path } = makeFile('openapi.json', '{}3e');
+    const { fetchImpl, calls } = makeDocsFetch({
+      putResponse: () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              controller.error(new Error('socket hang up'));
+            },
+          }),
+          { status: 403 },
+        ),
+    });
+
+    const io = captureIo();
+    const err = await runDocsUpload(baseOpts({ file: path }), {
+      credentialsPath,
+      fetchImpl,
+      stdout: io.stdout,
+      stderr: io.stderr,
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).details.reason).toBe('presigned_put_failed');
+    expect((err as ApiError).message).toContain('HTTP 403');
+    // A broken diagnostic must not replace the storage status with a read error.
+    expect((err as ApiError).message).not.toContain('socket hang up');
+    expect(calls.map(c => c.method)).toEqual(['POST', 'PUT']);
   });
 
   it('a stalled REGISTER times out with the step-3 upload-succeeded context, still exit 7 (F4)', async () => {

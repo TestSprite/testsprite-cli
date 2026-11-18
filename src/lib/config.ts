@@ -1,6 +1,11 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { DEFAULT_PROFILE, defaultCredentialsPath, readProfile } from './credentials.js';
+import {
+  DEFAULT_PROFILE,
+  assertValidProfileName,
+  defaultCredentialsPath,
+  readProfile,
+} from './credentials.js';
 
 export interface Config {
   apiUrl: string;
@@ -63,8 +68,7 @@ export function resolveProfileName(
 export function loadConfig(options: LoadConfigOptions = {}): Config {
   const env = options.env ?? process.env;
   const profile = resolveProfileName(options.profile, env);
-  const credentialsPath = options.credentialsPath ?? defaultCredentialsPath();
-  const fileEntry = readProfile(profile, { path: credentialsPath });
+  assertValidProfileName(profile);
 
   // Empty / whitespace-only env vars are treated as unset so they do not
   // short-circuit the `??` chain (e.g. `export TESTSPRITE_API_URL=` or
@@ -75,9 +79,16 @@ export function loadConfig(options: LoadConfigOptions = {}): Config {
   // normalization in auth configure and init/setup.
   const envApiUrl = normalizeEnvVar(env.TESTSPRITE_API_URL);
   const envApiKey = normalizeEnvVar(env.TESTSPRITE_API_KEY);
+  const explicitApiUrl = options.endpointUrl ?? envApiUrl;
+  // A complete explicit configuration must not depend on the credentials store.
+  // Missing fields still need the profile, including its normal filesystem errors.
+  const fileEntry =
+    envApiKey === undefined || explicitApiUrl === undefined
+      ? readProfile(profile, { path: options.credentialsPath ?? defaultCredentialsPath() })
+      : undefined;
 
   return {
-    apiUrl: options.endpointUrl ?? envApiUrl ?? fileEntry?.apiUrl ?? DEFAULT_API_URL,
+    apiUrl: explicitApiUrl ?? fileEntry?.apiUrl ?? DEFAULT_API_URL,
     apiKey: envApiKey ?? fileEntry?.apiKey,
     profile,
   };

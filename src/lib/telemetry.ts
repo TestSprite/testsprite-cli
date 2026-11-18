@@ -212,6 +212,8 @@ export type TelemetryConflictReason =
   | 'mcp_view_only'
   | 'local_address'
   | 'tunnel-required'
+  | 'no_producer'
+  | 'producer_in_flight'
   | 'error';
 
 /**
@@ -318,6 +320,8 @@ const ENUM_KEYS: {
     'mcp_view_only',
     'local_address',
     'tunnel-required',
+    'no_producer',
+    'producer_in_flight',
     'error',
   ]),
   platform: new Set(['github']),
@@ -643,6 +647,35 @@ export function resolveTelemetryAuth(
     credentialsPath: deps.credentialsPath ?? defaultCredentialsPath(),
   });
   return { apiKey: config.apiKey, apiUrl: config.apiUrl };
+}
+
+/**
+ * {@link resolveTelemetryAuth} for the pre-action hook, which runs before every
+ * command: never throws. An unreadable credentials file (EPERM/EACCES — the
+ * Windows ACL lock-out `doctor` diagnoses — or any other read/parse failure)
+ * returns `undefined` so the caller can skip the beacon and let the command run
+ * and report the problem its own way, as the module contract requires
+ * (telemetry never changes a command's behavior, output, or exit code).
+ * `onError` receives the swallowed error, for `--debug`.
+ */
+export function tryResolveTelemetryAuth(
+  opts: { profile?: string; endpointUrl?: string },
+  deps: {
+    env?: NodeJS.ProcessEnv;
+    credentialsPath?: string;
+    onError?: (error: unknown) => void;
+  } = {},
+): ResolvedTelemetryAuth | undefined {
+  try {
+    return resolveTelemetryAuth(opts, deps);
+  } catch (error) {
+    try {
+      deps.onError?.(error);
+    } catch {
+      // A broken diagnostic sink must not turn a skipped beacon into a failure.
+    }
+    return undefined;
+  }
 }
 
 /**

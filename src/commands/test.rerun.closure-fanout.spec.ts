@@ -94,7 +94,7 @@ function makeBeRerunResp(): RerunResponse {
 
 function makeTerminalRun(
   runId: string,
-  status: 'passed' | 'failed' | 'blocked' = 'passed',
+  status: 'passed' | 'failed' | 'blocked' | 'cancelled' = 'passed',
 ): RunResponse {
   return {
     runId,
@@ -183,8 +183,9 @@ describe('BE closure fan-out: a member poll error is classified (survives fan-ou
       if (url.includes('/runs/run_rerun_be_named')) return { body: namedRun };
       // Producer member poll fails for the whole window — the fan-out still
       // completes and prints the partial, but the producer's verdict was never
-      // observed, so --wait must exit 7 (not silently succeed as exit 0).
-      return errorBody('UNAVAILABLE', { reason: 'upstream' });
+      // observed, so --wait must exit 7 (not silently succeed as exit 0). A
+      // 500, because a 503 is an outage the poll waits out until --timeout.
+      return errorBody('INTERNAL', { reason: 'upstream' });
     });
 
     const err = await runTestRerun(
@@ -213,9 +214,9 @@ describe('BE closure fan-out: a member poll error is classified (survives fan-ou
     // carrying its diagnostic code.
     expect(Array.isArray(json.closureFailures)).toBe(true);
     const producerFailure = json.closureFailures!.find(f => f.testId === 'test_be_producer_01');
-    expect(producerFailure?.status).toBe('UNAVAILABLE');
+    expect(producerFailure?.status).toBe('INTERNAL');
     expect(producerFailure?.unobserved).toBe(true);
-    expect(stderrLines.some(l => l.includes('closure member') && l.includes('UNAVAILABLE'))).toBe(
+    expect(stderrLines.some(l => l.includes('closure member') && l.includes('INTERNAL'))).toBe(
       true,
     );
   });
@@ -253,5 +254,120 @@ describe('BE closure fan-out: a member poll error is classified (survives fan-ou
     expect((err as ApiError).exitCode).toBe(4);
     // ...and a parseable partial was still written before the re-throw.
     expect(stdoutLines.length).toBeGreaterThan(0);
+  });
+});
+
+describe('BE rerun --wait: failure recovery hint names test failure get <test-id>', () => {
+  const baseOpts = {
+    all: false as const,
+    wait: true as const,
+    timeoutSeconds: 10,
+    autoHeal: false,
+    autoHealExplicit: false,
+    skipDependencies: false,
+    maxConcurrency: 10,
+    profile: 'default',
+    dryRun: false,
+    debug: false,
+    verbose: false,
+  };
+
+  async function rerun(args: {
+    output: 'text' | 'json';
+    rerunResp: RerunResponse;
+    namedStatus: 'passed' | 'failed' | 'blocked' | 'cancelled';
+    testType?: 'backend' | 'frontend';
+  }) {
+    const creds = makeCreds();
+    const namedRun = makeTerminalRun('run_rerun_be_named', args.namedStatus);
+    const producerRun = makeTerminalRun('run_rerun_be_producer', 'passed');
+    producerRun.testId = 'test_be_producer_01';
+    const stderr: string[] = [];
+    const typeLookups: string[] = [];
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/test_be_consumer_01/runs/rerun')) return { body: args.rerunResp };
+      if (url.includes('/runs/run_rerun_be_named')) return { body: namedRun };
+      if (url.includes('/runs/run_rerun_be_producer')) return { body: producerRun };
+      if (/\/tests\/test_be_(consumer|producer)_01(\?|$)/.test(url)) {
+        typeLookups.push(url);
+        return { body: { ...BE_TEST, type: args.testType ?? 'backend' } };
+      }
+      return errorBody('NOT_FOUND');
+    });
+    const err = await runTestRerun(
+      { ...baseOpts, output: args.output, testIds: ['test_be_consumer_01'] },
+      {
+        ...creds,
+        sleep: instantSleep,
+        fetchImpl,
+        stderr: line => stderr.push(line),
+        stdout: () => {},
+      },
+    ).catch(e => e);
+    return { err, hint: stderr.find(l => l.startsWith('Run finished')) ?? '', typeLookups };
+  }
+
+  it.each(['text', 'json'] as const)(
+    'multi-member closure (%s): a failed named test points at test failure get, with no extra type lookup',
+    async output => {
+      const { err, hint, typeLookups } = await rerun({
+        output,
+        rerunResp: makeBeRerunResp(),
+        namedStatus: 'failed',
+      });
+      expect(err.exitCode).toBe(1);
+      expect(hint).toContain("'testsprite test failure get test_be_consumer_01'");
+      expect(hint).not.toContain('artifact get');
+      // Only the pre-trigger read of the named test; the hint adds nothing.
+      expect(typeLookups).toHaveLength(1);
+    },
+  );
+
+  it('multi-member closure (json): a cancelled named test exits 1 with no failure-bundle hint', async () => {
+    const { err, hint } = await rerun({
+      output: 'json',
+      rerunResp: makeBeRerunResp(),
+      namedStatus: 'cancelled',
+    });
+    expect(err.exitCode).toBe(1);
+    expect(hint).toBe('');
+  });
+
+  it('single-member closure (json): known backend from the closure, so no extra type lookup', async () => {
+    const resp = makeBeRerunResp();
+    resp.closure!.members = resp.closure!.members.slice(0, 1);
+    resp.closure!.addedProducers = [];
+    const { err, hint, typeLookups } = await rerun({
+      output: 'json',
+      rerunResp: resp,
+      namedStatus: 'blocked',
+    });
+    expect(err.exitCode).toBe(1);
+    expect(hint).toContain("'testsprite test failure get test_be_consumer_01'");
+    expect(typeLookups).toHaveLength(1);
+  });
+
+  it('no closure (json): a failed backend rerun reuses the type read before triggering', async () => {
+    const resp = makeBeRerunResp();
+    delete resp.closure;
+    const { hint, typeLookups } = await rerun({
+      output: 'json',
+      rerunResp: resp,
+      namedStatus: 'failed',
+    });
+    expect(hint).toContain("'testsprite test failure get test_be_consumer_01'");
+    expect(typeLookups).toHaveLength(1);
+  });
+
+  it('no closure (json): a failed frontend rerun keeps the run-scoped artifact hint', async () => {
+    const resp = makeBeRerunResp();
+    delete resp.closure;
+    const { hint } = await rerun({
+      output: 'json',
+      rerunResp: resp,
+      namedStatus: 'failed',
+      testType: 'frontend',
+    });
+    expect(hint).toContain("'testsprite test artifact get run_rerun_be_named'");
   });
 });

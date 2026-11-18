@@ -26,6 +26,7 @@ import {
   BATCH_RUN_RATE_LIMIT,
   BATCH_RUN_RATE_MAX_OUTER_RETRIES,
   DEFAULT_BATCH_RUN_CONCURRENCY,
+  PLAN_TEMPLATE_TEXT,
   createTestCommand,
   isTransientRateLimit,
   runCreate,
@@ -190,7 +191,19 @@ describe('runCreateBatch --run --wait: happy path', () => {
     const fetchImpl = makeFetch(url => {
       // Batch create
       if (url.includes('/tests/batch')) {
-        return { body: makeBatchCreateResponse(testIds) };
+        return {
+          body: {
+            results: testIds.map((testId, specIndex) => ({
+              specIndex,
+              testId,
+              status: 'created' as const,
+              ...(specIndex === 0
+                ? { dashboardUrl: 'https://portal.testsprite.com/tests/test_a1' }
+                : {}),
+            })),
+            summary: { total: testIds.length, created: testIds.length, failed: 0 },
+          },
+        };
       }
       // Trigger POST /tests/{id}/runs
       const triggerMatch = /\/tests\/(test_[a-z0-9]+)\/runs$/.exec(url);
@@ -238,8 +251,21 @@ describe('runCreateBatch --run --wait: happy path', () => {
     );
 
     // JSON output is the batch-run envelope
-    const printed = JSON.parse(stdout.join('')) as { results: unknown[] };
+    const printed = JSON.parse(stdout.join('')) as {
+      results: unknown[];
+      creation: {
+        results: Array<{ testId?: string; status: string; dashboardUrl?: string }>;
+        summary: { total: number; created: number; failed: number };
+      };
+    };
     expect(printed.results).toHaveLength(3);
+    expect(printed.creation.summary).toEqual({ total: 3, created: 3, failed: 0 });
+    expect(printed.creation.results).toHaveLength(3);
+    expect(printed.creation.results[0]).toMatchObject({
+      testId: 'test_a1',
+      status: 'created',
+      dashboardUrl: 'https://portal.testsprite.com/tests/test_a1',
+    });
     const results = printed.results as Array<{ testId: string; status: string; runId: string }>;
     expect(results.every(r => r.status === 'passed')).toBe(true);
     expect(results.map(r => r.testId).sort()).toEqual(['test_a1', 'test_a2', 'test_a3'].sort());
@@ -417,10 +443,16 @@ describe('runCreateBatch --run (no --wait): exit-code contract', () => {
 
     const printed = JSON.parse(stdout.join('')) as {
       results: Array<{ testId: string; status: string; error?: unknown }>;
+      creation: {
+        results: Array<{ specIndex: number; testId?: string; status: string }>;
+        summary: { total: number; created: number; failed: number };
+      };
     };
     expect(printed.results).toHaveLength(3);
     expect(printed.results.every(r => r.status === 'queued')).toBe(true);
     expect(printed.results.every(r => r.error === undefined)).toBe(true);
+    expect(printed.creation.results).toHaveLength(3);
+    expect(printed.creation.summary).toEqual({ total: 3, created: 3, failed: 0 });
   });
 
   it('all triggers succeed (queued) → text summary reports "3/3 triggered", exit 0 (no "0/N passed")', async () => {
@@ -845,10 +877,10 @@ describe('runCreateBatch --run --wait: --timeout per-run', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Idempotency: each per-run key is unique (regression guard)
+// Idempotency: per-run keys are distinct and stable across retries
 // ---------------------------------------------------------------------------
 
-describe('runCreateBatch --run: idempotency key uniqueness', () => {
+describe('runCreateBatch --run: run idempotency keys', () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
   let errorSpy: ReturnType<typeof vi.spyOn>;
 
@@ -862,14 +894,17 @@ describe('runCreateBatch --run: idempotency key uniqueness', () => {
     errorSpy.mockRestore();
   });
 
-  it('each run trigger gets a distinct idempotency key, none matches the create key', async () => {
+  /**
+   * Run `create-batch --run --wait` for three FE specs against a fake server
+   * and record the idempotency key on the create POST and on each trigger.
+   */
+  async function runCapturingKeys(idempotencyKey?: string) {
     const { credentialsPath } = makeCreds();
     const testIds = ['test_f1', 'test_f2', 'test_f3'];
     const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC, FE_SPEC]);
-    const createIdemKey = 'cli-create-batch-test-key';
-
-    const seenRunIdempotencyKeys: string[] = [];
-    let createIdempotencyKeySeen = '';
+    const runKeys: Record<string, string> = {};
+    const stderr: string[] = [];
+    let createKey = '';
 
     const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
       const url =
@@ -881,7 +916,7 @@ describe('runCreateBatch --run: idempotency key uniqueness', () => {
       const headers = new Headers(init.headers as Record<string, string>);
 
       if (url.includes('/tests/batch')) {
-        createIdempotencyKeySeen = headers.get('idempotency-key') ?? '';
+        createKey = headers.get('idempotency-key') ?? '';
         return new Response(JSON.stringify(makeBatchCreateResponse(testIds)), {
           status: 200,
           headers: { 'content-type': 'application/json' },
@@ -891,10 +926,8 @@ describe('runCreateBatch --run: idempotency key uniqueness', () => {
       const triggerMatch = /\/tests\/(test_[a-z0-9]+)\/runs$/.exec(url);
       if (triggerMatch?.[1]) {
         const testId = triggerMatch[1];
-        const key = headers.get('idempotency-key') ?? '';
-        seenRunIdempotencyKeys.push(key);
-        const runId = `run_${testId}`;
-        return new Response(JSON.stringify(makeTriggerResponse(testId, runId)), {
+        runKeys[testId] = headers.get('idempotency-key') ?? '';
+        return new Response(JSON.stringify(makeTriggerResponse(testId, `run_${testId}`)), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
@@ -903,8 +936,7 @@ describe('runCreateBatch --run: idempotency key uniqueness', () => {
       const pollMatch = /\/runs\/(run_test_[a-z0-9]+)/.exec(url);
       if (pollMatch?.[1]) {
         const runId = pollMatch[1];
-        const testId = runId.replace('run_', '');
-        return new Response(JSON.stringify(makePassedRun(testId, runId)), {
+        return new Response(JSON.stringify(makePassedRun(runId.replace('run_', ''), runId)), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
@@ -927,31 +959,59 @@ describe('runCreateBatch --run: idempotency key uniqueness', () => {
         plans: plansFile,
         run: true,
         wait: true,
-        idempotencyKey: createIdemKey,
+        ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
         timeoutSeconds: 60,
       },
       {
         credentialsPath,
         fetchImpl,
         stdout: () => {},
-        stderr: () => {},
+        stderr: line => stderr.push(line),
         sleep: instantSleep,
       },
     );
+    return { createKey, runKeys, stderr };
+  }
 
-    // 3 run triggers → 3 run idempotency keys
-    expect(seenRunIdempotencyKeys).toHaveLength(3);
-    // All run keys must be unique
-    const uniqueKeys = new Set(seenRunIdempotencyKeys);
-    expect(uniqueKeys.size).toBe(3);
-    // None of the run keys matches the create key (regression guard)
-    expect(seenRunIdempotencyKeys).not.toContain(createIdemKey);
-    // The create key was used on the batch POST
-    expect(createIdempotencyKeySeen).toBe(createIdemKey);
-    // All run keys should start with 'cli-batch-run-'
-    for (const key of seenRunIdempotencyKeys) {
-      expect(key).toMatch(/^cli-batch-run-[0-9a-f-]{36}$/);
+  it('derives a distinct run key per test from the create key, never the create key itself', async () => {
+    const { createKey, runKeys } = await runCapturingKeys('cli-create-batch-test-key');
+
+    expect(createKey).toBe('cli-create-batch-test-key');
+    expect(runKeys).toEqual({
+      test_f1: 'cli-create-batch-test-key:run:test_f1',
+      test_f2: 'cli-create-batch-test-key:run:test_f2',
+      test_f3: 'cli-create-batch-test-key:run:test_f3',
+    });
+  });
+
+  it('re-sends the same run keys when retried with the same --idempotency-key', async () => {
+    const first = await runCapturingKeys('ci-build-42');
+    const retry = await runCapturingKeys('ci-build-42');
+
+    // Identical keys let the server return the runs the first attempt started
+    // instead of starting (and billing) them a second time.
+    expect(retry.runKeys).toEqual(first.runKeys);
+  });
+
+  it('re-sends the same run keys when retried with the printed auto-minted key', async () => {
+    const first = await runCapturingKeys();
+    const printed = first.stderr
+      .find(line => line.startsWith('idempotency-key: '))
+      ?.slice('idempotency-key: '.length);
+    expect(printed).toBe(first.createKey);
+
+    const retry = await runCapturingKeys(printed);
+    expect(retry.runKeys).toEqual(first.runKeys);
+  });
+
+  it('keeps a derived run key within 256 characters when the create key is at the limit', async () => {
+    const { runKeys } = await runCapturingKeys('k'.repeat(256));
+
+    for (const [testId, key] of Object.entries(runKeys)) {
+      expect(key.length).toBeLessThanOrEqual(256);
+      expect(key.endsWith(`:run:${testId}`)).toBe(true);
     }
+    expect(new Set(Object.values(runKeys)).size).toBe(3);
   });
 });
 
@@ -1069,6 +1129,89 @@ describe('runCreateBatch --run --wait: CONFLICT auto-resume', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Partial creation success — the receipt must survive normal completion with
+// and without --wait, independently of the run-result status.
+// ---------------------------------------------------------------------------
+
+describe('runCreateBatch --run: partial creation receipt', () => {
+  it.each([true, false])(
+    'preserves created and validation_error rows on normal completion (wait=%s)',
+    async wait => {
+      const { credentialsPath } = makeCreds();
+      const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC]);
+      const creationResponse = {
+        results: [
+          { specIndex: 0, testId: 'test_partial_created', status: 'created' },
+          {
+            specIndex: 1,
+            status: 'validation_error',
+            error: { code: 'VALIDATION_ERROR', message: 'invalid plan', field: 'planSteps' },
+          },
+        ],
+        summary: { total: 2, created: 1, failed: 1 },
+      };
+
+      const fetchImpl = makeFetch(url => {
+        if (url.includes('/tests/batch')) return { body: creationResponse };
+        if (url.endsWith('/tests/test_partial_created/runs')) {
+          return { body: makeTriggerResponse('test_partial_created', 'run_partial_created') };
+        }
+        if (url.includes('/runs/run_partial_created')) {
+          return { body: makePassedRun('test_partial_created', 'run_partial_created') };
+        }
+        return {
+          status: 404,
+          body: {
+            error: { code: 'NOT_FOUND', message: 'not found', nextAction: '', requestId: 'r1' },
+          },
+        };
+      });
+
+      const stdout: string[] = [];
+      await runCreateBatch(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: false,
+          plans: plansFile,
+          run: true,
+          wait,
+          maxConcurrency: 1,
+          timeoutSeconds: 60,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: line => stdout.push(line),
+          stderr: () => {},
+          sleep: instantSleep,
+        },
+      );
+
+      const printed = JSON.parse(stdout.join('')) as {
+        results: Array<{ testId: string; status: string }>;
+        creation: {
+          results: Array<{ specIndex: number; testId?: string; status: string; error?: unknown }>;
+          summary: { total: number; created: number; failed: number };
+        };
+      };
+      expect(printed.results).toHaveLength(1);
+      expect(printed.results[0]?.status).toBe(wait ? 'passed' : 'queued');
+      expect(printed.creation.summary).toEqual({ total: 2, created: 1, failed: 1 });
+      expect(printed.creation.results).toMatchObject([
+        { specIndex: 0, testId: 'test_partial_created', status: 'created' },
+        {
+          specIndex: 1,
+          status: 'validation_error',
+          error: { code: 'VALIDATION_ERROR', field: 'planSteps' },
+        },
+      ]);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
 // --dry-run mode
 // ---------------------------------------------------------------------------
 
@@ -1136,9 +1279,51 @@ describe('runCreateBatch --run --dry-run', () => {
     expect(envelope.dryRun).toBe(true);
     expect(Array.isArray(envelope.testIds)).toBe(true);
     expect((envelope.testIds as string[]).sort()).toEqual(testIds.sort());
-    // results array is present
+    // Both run descriptors and the original create receipt are present.
     expect(Array.isArray(envelope.results)).toBe(true);
     expect((envelope.results as unknown[]).length).toBe(testIds.length);
+    expect(envelope.creation).toMatchObject({
+      results: testIds.map((testId, specIndex) => ({
+        specIndex,
+        testId,
+        status: 'created',
+      })),
+      summary: { total: 2, created: 2, failed: 0 },
+    });
+  });
+
+  it('text dry-run keeps the existing descriptor shape without a creation field', async () => {
+    const { credentialsPath } = makeCreds();
+    const plansFile = writePlansJsonl([FE_SPEC]);
+    const fetchImpl = makeFetch(url => {
+      if (url.includes('/tests/batch')) return { body: makeBatchCreateResponse(['test_text_dry']) };
+      return { status: 404, body: {} };
+    });
+    const stdout: string[] = [];
+
+    await runCreateBatch(
+      {
+        profile: 'default',
+        output: 'text',
+        debug: false,
+        dryRun: true,
+        plans: plansFile,
+        run: true,
+        wait: false,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdout.push(line),
+        stderr: () => {},
+      },
+    );
+
+    const output = stdout.join('');
+    // Text mode uses the human-readable formatter, not the JSON envelope.
+    expect(() => JSON.parse(output)).toThrow();
+    expect(output).not.toContain('creation');
   });
 });
 
@@ -1743,14 +1928,25 @@ it('a paused workspace outranks a mixed-in credits refusal from create-batch --r
 
 it('marks a dispatched batch run for recovery guidance on fan-out interruption', async () => {
   const { credentialsPath } = makeCreds();
-  const plansFile = writePlansJsonl([FE_SPEC]);
+  const plansFile = writePlansJsonl([FE_SPEC, FE_SPEC]);
   const interruption = new InterruptError('SIGINT');
   const stdout: string[] = [];
   const stderr: string[] = [];
+  const creationResponse = {
+    results: [
+      { specIndex: 0, testId: 'test_one', status: 'created' },
+      {
+        specIndex: 1,
+        status: 'validation_error',
+        error: { code: 'VALIDATION_ERROR', message: 'invalid spec' },
+      },
+    ],
+    summary: { total: 2, created: 1, failed: 1 },
+  };
   const fetchImpl = (async (input: FetchInput) => {
     const url = String(input);
     if (url.includes('/tests/batch')) {
-      return new Response(JSON.stringify(makeBatchCreateResponse(['test_one'])));
+      return new Response(JSON.stringify(creationResponse));
     }
     if (url.includes('/tests/test_one/runs')) {
       return new Response(JSON.stringify(makeTriggerResponse('test_one', 'run_one')));
@@ -1785,6 +1981,17 @@ it('marks a dispatched batch run for recovery guidance on fan-out interruption',
   expect((error as InterruptError).runWaitContext).toBe(true);
   expect(JSON.parse(stdout.at(-1)!) as unknown).toMatchObject({
     results: [{ testId: 'test_one', runId: 'run_one', status: 'running' }],
+    creation: {
+      results: [
+        { specIndex: 0, testId: 'test_one', status: 'created' },
+        {
+          specIndex: 1,
+          status: 'validation_error',
+          error: { code: 'VALIDATION_ERROR', message: 'invalid spec' },
+        },
+      ],
+      summary: { total: 2, created: 1, failed: 1 },
+    },
   });
   expect(stderr.join('\n')).toContain('testsprite test wait run_one');
 });
@@ -3507,5 +3714,398 @@ describe('create run environment', () => {
     }
     expect(environments).toEqual(['staging', 'staging', 'staging', 'staging']);
     expect(stderr.filter(line => line === 'batch-run summary: 1/1 triggered')).toHaveLength(2);
+  });
+});
+
+// #376: --wait / --timeout (and create-batch --max-concurrency) act on the
+// runs --run triggers. Without --run they are refused like --env, before any
+// request, instead of creating the test(s), running nothing and exiting 0.
+describe('create run chain flags without --run (#376)', () => {
+  function refusingDeps(files: ReturnType<typeof fixtures>): {
+    deps: {
+      credentialsPath: string;
+      fetchImpl: typeof globalThis.fetch;
+      stdout: () => void;
+      stderr: () => void;
+    };
+    calls: () => number;
+  } {
+    let calls = 0;
+    return {
+      deps: {
+        credentialsPath: files.credentialsPath,
+        fetchImpl: (async () => {
+          calls++;
+          throw new Error('unexpected network');
+        }) as typeof globalThis.fetch,
+        stdout: () => {},
+        stderr: () => {},
+      },
+      calls: () => calls,
+    };
+  }
+
+  const codeFileArgs = (files: ReturnType<typeof fixtures>) => [
+    'create',
+    '--project',
+    'project_1',
+    '--type',
+    'frontend',
+    '--name',
+    'example',
+    '--code-file',
+    files.codeFile,
+  ];
+
+  const cases: Array<{
+    label: string;
+    field: string;
+    args: (files: ReturnType<typeof fixtures>) => string[];
+  }> = [
+    {
+      label: 'create --code-file --wait',
+      field: 'wait',
+      args: f => [...codeFileArgs(f), '--wait'],
+    },
+    {
+      label: 'create --code-file --timeout',
+      field: 'timeout',
+      args: f => [...codeFileArgs(f), '--timeout', '30'],
+    },
+    {
+      label: 'create --plan-from --wait',
+      field: 'wait',
+      args: f => ['create', '--plan-from', f.planFile, '--wait'],
+    },
+    {
+      label: 'create --plan-from --timeout',
+      field: 'timeout',
+      args: f => ['create', '--plan-from', f.planFile, '--timeout', '30'],
+    },
+    {
+      label: 'create-batch --plans --wait',
+      field: 'wait',
+      args: f => ['create-batch', '--plans', f.plansFile, '--wait'],
+    },
+    {
+      label: 'create-batch --plans --timeout',
+      field: 'timeout',
+      args: f => ['create-batch', '--plans', f.plansFile, '--timeout', '30'],
+    },
+    {
+      label: 'create-batch --plans --max-concurrency',
+      field: 'max-concurrency',
+      args: f => ['create-batch', '--plans', f.plansFile, '--max-concurrency', '5'],
+    },
+    {
+      label: 'create-batch --plan-from-dir --max-concurrency',
+      field: 'max-concurrency',
+      args: f => ['create-batch', '--plan-from-dir', f.planDir, '--max-concurrency', '5'],
+    },
+  ];
+
+  it.each(cases)(
+    '$label without --run → exit 5 on that flag, zero network',
+    async ({ field, args }) => {
+      const files = fixtures();
+      const { deps, calls } = refusingDeps(files);
+      const command = createTestCommand(deps);
+      const err = await command.parseAsync(args(files), { from: 'user' }).catch(e => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5, details: { field } });
+      expect(err.nextAction).toContain(`--${field} requires --run`);
+      expect(err.nextAction).toContain(`Add --run, or remove --${field}`);
+      expect(calls()).toBe(0);
+    },
+  );
+
+  it('the run helpers refuse the same flags without run: true', async () => {
+    const files = fixtures();
+    const { deps, calls } = refusingDeps(files);
+    const common = { profile: 'default', output: 'json' as const, debug: false };
+    const codeFileOpts = {
+      ...common,
+      projectId: 'project_1',
+      type: 'frontend' as const,
+      name: 'example',
+      codeFile: files.codeFile,
+    };
+    for (const [field, invoke] of [
+      ['wait', () => runCreate({ ...codeFileOpts, wait: true }, deps)],
+      ['timeout', () => runCreate({ ...codeFileOpts, timeout: 30, timeoutIsDefault: false }, deps)],
+      ['wait', () => runCreateFromPlan({ ...common, planFrom: files.planFile, wait: true }, deps)],
+      [
+        'timeout',
+        () =>
+          runCreateFromPlan(
+            { ...common, planFrom: files.planFile, timeout: 30, timeoutIsDefault: false },
+            deps,
+          ),
+      ],
+      ['wait', () => runCreateBatch({ ...common, plans: files.plansFile, wait: true }, deps)],
+      [
+        'timeout',
+        () => runCreateBatch({ ...common, plans: files.plansFile, timeoutSeconds: 30 }, deps),
+      ],
+      [
+        'max-concurrency',
+        () => runCreateBatch({ ...common, plans: files.plansFile, maxConcurrency: 5 }, deps),
+      ],
+    ] as const) {
+      const err = await invoke().catch(e => e);
+      expect(err).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5, details: { field } });
+    }
+    expect(calls()).toBe(0);
+  });
+
+  it('the run helpers treat a timeout without timeoutIsDefault as given', async () => {
+    const files = fixtures();
+    const { deps, calls } = refusingDeps(files);
+    const common = { profile: 'default', output: 'json' as const, debug: false };
+    const codeFileOpts = {
+      ...common,
+      projectId: 'project_1',
+      type: 'frontend' as const,
+      name: 'example',
+      codeFile: files.codeFile,
+    };
+    for (const invoke of [
+      () => runCreate({ ...codeFileOpts, timeout: 30 }, deps),
+      () => runCreateFromPlan({ ...common, planFrom: files.planFile, timeout: 30 }, deps),
+    ]) {
+      const err = await invoke().catch(e => e);
+      expect(err).toMatchObject({
+        code: 'VALIDATION_ERROR',
+        exitCode: 5,
+        details: { field: 'timeout' },
+      });
+    }
+    expect(calls()).toBe(0);
+    // Control: the CLI's parsed default (timeoutIsDefault: true) is not a given --timeout.
+    // No fetchImpl here, so --dry-run answers from its canned sample.
+    const dryDeps = { credentialsPath: files.credentialsPath, stdout: () => {}, stderr: () => {} };
+    await expect(
+      runCreate({ ...codeFileOpts, dryRun: true, timeout: 600, timeoutIsDefault: true }, dryDeps),
+    ).resolves.toBeDefined();
+    await expect(
+      runCreateFromPlan(
+        { ...common, planFrom: files.planFile, dryRun: true, timeout: 600, timeoutIsDefault: true },
+        dryDeps,
+      ),
+    ).resolves.toBeDefined();
+  });
+
+  it.each([
+    { label: '--wait', flags: ['--wait'] },
+    { label: '--timeout', flags: ['--timeout', '30'] },
+  ])(
+    'create --plan-template $label still prints the template and exits 0 (it ignores every other flag)',
+    async ({ flags }) => {
+      const files = fixtures();
+      const { deps, calls } = refusingDeps(files);
+      const out: string[] = [];
+      const command = createTestCommand({ ...deps, stdout: line => out.push(line) });
+      await expect(
+        command.parseAsync(['create', '--plan-template', ...flags], { from: 'user' }),
+      ).resolves.toBe(command);
+      expect(out.join('\n')).toBe(PLAN_TEMPLATE_TEXT);
+      expect(calls()).toBe(0);
+    },
+  );
+
+  it('control: the same flags with --run are accepted and reach the run', async () => {
+    const files = fixtures();
+    const triggered: string[] = [];
+    let polls = 0;
+    const fetchImpl = makeFetch((url, init) => {
+      if (url.endsWith('/tests/batch')) return { body: makeBatchCreateResponse(['test_batch']) };
+      if (url.endsWith('/tests') && init.method === 'POST')
+        return {
+          body: {
+            testId: 'test_created',
+            type: 'frontend',
+            codeVersion: 'v1',
+            createdAt: '2026-09-22T00:00:00Z',
+          },
+        };
+      if (url.includes('/runs') && init.method === 'POST') {
+        triggered.push(url);
+        return { body: makeTriggerResponse('test_created', 'run_created') };
+      }
+      if (url.includes('/runs/run_created')) {
+        polls++;
+        return { body: makePassedRun('test_created', 'run_created') };
+      }
+      return { body: { items: [], nextToken: null } };
+    });
+    const deps = {
+      credentialsPath: files.credentialsPath,
+      fetchImpl,
+      sleep: instantSleep,
+      stdout: () => {},
+      stderr: () => {},
+    };
+    for (const args of [
+      [...codeFileArgs(files), '--run', '--wait', '--timeout', '30'],
+      ['create', '--plan-from', files.planFile, '--run', '--wait', '--timeout', '30'],
+      [
+        'create-batch',
+        '--plans',
+        files.plansFile,
+        '--run',
+        '--wait',
+        '--timeout',
+        '30',
+        '--max-concurrency',
+        '5',
+      ],
+    ]) {
+      const command = createTestCommand(deps);
+      await expect(command.parseAsync(args, { from: 'user' })).resolves.toBe(command);
+    }
+    expect(triggered).toHaveLength(3);
+    expect(polls).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe('create-batch conflict attachment compatibility', () => {
+  it.each([
+    {
+      name: 'matching named environment',
+      requestedEnv: 'staging',
+      storedEnv: 'env_staging',
+      ok: true,
+    },
+    {
+      name: 'different named environment',
+      requestedEnv: 'staging',
+      storedEnv: 'env_default',
+      ok: false,
+    },
+    {
+      name: 'missing stored environment',
+      requestedEnv: 'staging',
+      storedEnv: undefined,
+      ok: false,
+    },
+    { name: 'null stored environment', storedEnv: null, ok: false },
+    { name: 'matching default environment', storedEnv: 'env_default', ok: true },
+    { name: 'different default environment', storedEnv: 'env_staging', ok: false },
+    { name: 'matching target', targetUrl: 'https://example.com', ok: true },
+    { name: 'different target', targetUrl: 'https://other.example.com', ok: false },
+    {
+      name: 'unreadable run with target',
+      targetUrl: 'https://example.com',
+      unreadable: true,
+      ok: false,
+    },
+    { name: 'legacy unreadable run without flags', unreadable: true, ok: true },
+    {
+      name: 'unreadable environment listing',
+      storedEnv: 'env_default',
+      listingError: true,
+      ok: false,
+    },
+  ])('$name', async scenario => {
+    const { credentialsPath } = makeCreds();
+    const ids = ['test_attach_a', 'test_attach_b'];
+    const output: string[] = [];
+    const reads = new Map<string, number>();
+    let verificationListings = 0;
+    const fetchImpl = makeFetch((url, init) => {
+      const path = new URL(url).pathname;
+      const notFound = {
+        status: 404,
+        body: {
+          error: {
+            code: 'NOT_FOUND',
+            message: 'Unavailable',
+            nextAction: '',
+            requestId: 'req_attach',
+          },
+        },
+      };
+      if (path.endsWith('/tests/batch')) return { body: makeBatchCreateResponse(ids) };
+      if (path.endsWith('/env')) {
+        if (reads.size > 0) {
+          verificationListings++;
+          if (scenario.listingError) return notFound;
+        }
+        return {
+          body: {
+            environments: [
+              { id: 'env_default', name: 'default', url: 'https://example.com', isDefault: true },
+              { id: 'env_staging', name: 'staging', url: 'https://example.com', isDefault: false },
+            ],
+          },
+        };
+      }
+      const id = ids.find(testId => path.includes(testId));
+      if (id && init.method === 'POST')
+        return {
+          status: 409,
+          body: {
+            error: {
+              code: 'CONFLICT',
+              message: 'Already running',
+              nextAction: '',
+              requestId: 'req_attach',
+              details: { reason: 'run_in_flight', currentRunId: `run_${id}` },
+            },
+          },
+        };
+      if (id && path.includes('/runs/run_')) {
+        const count = (reads.get(id) ?? 0) + 1;
+        reads.set(id, count);
+        if (scenario.unreadable && count === 1) return notFound;
+        return {
+          body: {
+            ...makePassedRun(id, `run_${id}`),
+            ...(scenario.storedEnv === null
+              ? { environment: null }
+              : scenario.storedEnv
+                ? { environment: { id: scenario.storedEnv, name: 'stored' } }
+                : {}),
+          },
+        };
+      }
+      if (id) return { body: { testId: id, projectId: 'project_alice', type: 'frontend' } };
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    const invocation = runCreateBatch(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        plans: writePlansJsonl([FE_SPEC, FE_SPEC]),
+        run: true,
+        wait: true,
+        environment: scenario.requestedEnv,
+        targetUrl: scenario.targetUrl,
+        skipPreflight: true,
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => output.push(line),
+        stderr: () => undefined,
+        sleep: instantSleep,
+      },
+    );
+    if (scenario.ok) await invocation;
+    else await expect(invocation).rejects.toMatchObject({ exitCode: 6 });
+    const rows = JSON.parse(output.join('')).results;
+    expect(rows).toHaveLength(2);
+    for (const id of ids) {
+      const row = rows.find((r: { testId: string }) => r.testId === id);
+      if (scenario.ok) expect(row).toMatchObject({ runId: `run_${id}`, status: 'passed' });
+      else {
+        expect(row).toMatchObject({ status: 'error', error: { code: 'CONFLICT', exitCode: 6 } });
+        expect(row.error.message).toContain(`testsprite test wait run_${id}`);
+        expect(reads.get(id)).toBe(1);
+      }
+    }
+    if (scenario.storedEnv) expect(verificationListings).toBe(1);
   });
 });

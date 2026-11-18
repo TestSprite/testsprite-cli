@@ -11,7 +11,7 @@ import { ApiError, InterruptError } from '../lib/errors.js';
 import type { FetchImpl, HttpClient } from '../lib/http.js';
 import { GLOBAL_OPTS_HINT, Output, resolveOutputMode, type OutputMode } from '../lib/output.js';
 import { formatScheduleFrequencyAdvisory, runsPerMonth } from '../lib/cron.js';
-import { renderTextTable, type TextTableColumn } from '../lib/text-table.js';
+import { renderTextTable, resolveTextColumns, type TextTableColumn } from '../lib/text-table.js';
 import { assertIdempotencyKey } from '../lib/validate.js';
 import { historyRetentionNote, type HistoryRetentionMeta } from '../lib/history-retention.js';
 
@@ -183,6 +183,9 @@ export async function runList(
   deps: ScheduleDeps = {},
 ): Promise<ScheduleListResponse> {
   const out = makeOutput(opts.output, deps);
+  if (opts.output === 'text') {
+    resolveTextColumns(opts.columns, SCHEDULE_LIST_COLUMNS);
+  }
   const client = makeClient(opts, deps);
 
   const response = await client.get<ScheduleListResponse>('/schedules');
@@ -478,10 +481,9 @@ export async function runDelete(
         code: 'VALIDATION_ERROR',
         message: 'Refusing to delete without --confirm.',
         nextAction:
-          'This removes the schedule and its run history, and stops it firing (no ' +
-          'restore window — recreating it starts a fresh schedule). The CLI convention ' +
-          'is explicit confirmation for destructive operations. Re-run with --confirm. ' +
-          '(--dry-run also works without --confirm.)',
+          'This removes the schedule and stops it firing; past runs are kept but no longer ' +
+          'listed under it (no restore window). Re-run with --confirm ' +
+          '(--dry-run also works without it).',
         requestId: 'local',
         details: { field: 'confirm', reason: 'required for destructive operation' },
       },
@@ -512,6 +514,9 @@ export async function runRunList(
   deps: ScheduleDeps = {},
 ): Promise<ScheduleRunListResponse> {
   const out = makeOutput(opts.output, deps);
+  if (opts.output === 'text') {
+    resolveTextColumns(opts.columns, RUN_LIST_COLUMNS);
+  }
   const client = makeClient(opts, deps);
 
   const response = await client.get<ScheduleRunListResponse>(
@@ -763,15 +768,21 @@ function localValidationError(message: string): ApiError {
 // ---------------------------------------------------------------------------
 
 export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
-  const schedule = new Command('schedule').description('Manage TestSprite schedules');
+  const schedule = new Command('schedule')
+    .summary('Manage schedules (V3 workspace)')
+    .description(
+      'Manage TestSprite schedules. Needs a V3 workspace and an API key with the read:schedules / write:schedules scopes.',
+    );
 
   schedule
     .command('list')
+    .summary('List schedules visible to the API key')
     .description(
       'List schedules visible to the API key\n' +
         '\nExit codes:\n' +
         '  0  success\n' +
         '  3  auth error\n' +
+        '  5  validation error (e.g., bad --columns)\n' +
         '  7  schedules are not available on this account\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
         ' 13  not available on your plan',
@@ -792,6 +803,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
 
   schedule
     .command('get <schedule-id>')
+    .summary('Get a schedule by id')
     .description(
       'Get a schedule by id\n' +
         '\nExit codes:\n' +
@@ -809,8 +821,10 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
 
   schedule
     .command('create')
+    .summary('Create a schedule (starts enabled; runs spend credits)')
     .description(
-      'Create a schedule\n' +
+      'Create a schedule. It starts enabled and each run spends credits (an estimate is printed);\n' +
+        'pause it with `schedule update <id> --pause`.\n' +
         '\nExit codes:\n' +
         '  0  success\n' +
         '  3  auth error\n' +
@@ -831,10 +845,9 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
     )
     .option(
       '--cron <expr>',
-      'standard 5-field cron (minute hour day-of-month month day-of-week), ' +
-        'e.g. "0 3 * * *". Day-of-week is 0-7, with both 0 and 7 = Sunday. ' +
-        'Constrain ' +
-        'day-of-month or day-of-week, not both. (required)',
+      'standard 5-field cron (minute hour day-of-month month day-of-week), e.g. "0 3 * * *". ' +
+        'Day-of-week 0-7 (0 and 7 = Sunday). Constrain day-of-month or day-of-week, not both. ' +
+        'Numeric fields only (* n a-b */n, lists); no names, ?, L, W or #. (required)',
     )
     .option('--timezone <tz>', 'IANA timezone (default UTC)')
     .option('--start <iso>', 'ISO 8601 start instant (default: a few minutes from now)')
@@ -863,6 +876,7 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
 
   schedule
     .command('update <schedule-id>')
+    .summary('Update a schedule, or pause/resume it')
     .description(
       'Update a schedule, or pause/resume it\n' +
         '\nExit codes:\n' +
@@ -879,12 +893,12 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
     .option('--name <name>', 'new schedule name')
     .option(
       '--env <name>',
-      "Pin this project schedule to an environment; omit to always use the project's default environment",
+      'Pin this project schedule to an environment; omit to leave the current pin unchanged',
     )
     .option(
       '--cron <expr>',
-      'new standard 5-field cron, as printed by `schedule get`. Day-of-week is ' +
-        '0-7, with both 0 and 7 = Sunday. Constrain day-of-month or day-of-week, not both.',
+      'new standard 5-field cron, as printed by `schedule get`. Day-of-week 0-7 (0 and 7 = Sunday). ' +
+        'Constrain day-of-month or day-of-week, not both. Numeric fields only (no names, ?, L, W or #).',
     )
     .option('--timezone <tz>', 'new IANA timezone')
     .option('--start <iso>', 'new ISO 8601 start instant')
@@ -922,8 +936,10 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
 
   schedule
     .command('delete <schedule-id>')
+    .summary('Delete a schedule (requires --confirm)')
     .description(
-      'Delete a schedule and its run history. Requires --confirm.\n' +
+      'Delete a schedule and stop it firing. Past runs are kept but no longer listed under it.\n' +
+        'Requires --confirm.\n' +
         '\nExit codes:\n' +
         '  0  success\n' +
         '  3  auth error\n' +
@@ -959,12 +975,15 @@ export function createScheduleCommand(deps: ScheduleDeps = {}): Command {
 
   run
     .command('list <schedule-id>')
+    .summary("List a schedule's most recent runs")
     .description(
-      "List a schedule's past runs\n" +
+      "List a schedule's most recent runs (up to 100, within your plan's history window;\n" +
+        'JSON `meta.hiddenCount` shows how many are hidden)\n' +
         '\nExit codes:\n' +
         '  0  success\n' +
         '  3  auth error\n' +
         '  4  not found\n' +
+        '  5  validation error (e.g., bad --columns)\n' +
         '  7  schedules are not available on this account\n' +
         ' 10  transport/network failure (UNAVAILABLE) — retry the command\n' +
         ' 13  not available on your plan',

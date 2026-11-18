@@ -283,11 +283,12 @@ testsprite test run <test-id> --env staging --wait --timeout 600
 
 Key behaviors:
 
-- Environment `--url` must be public; the CLI rejects localhost, RFC1918, and
-  link-local addresses. Use `--local <port>` for an app on this machine
-  (frontend only). Existing API keys work. A
-  public environment plus `--local` fails before a tunnel opens if the CLI can
-  list the project's environments; otherwise the server refuses it before dispatch.
+- Environment `--url` takes a public http/https URL or a loopback http origin
+  with an explicit port (frontend only; it runs through an automatic tunnel,
+  like `--local <port>`); private and link-local addresses are refused.
+  Existing API keys work. `--env <name> --local <port>` sends
+  that environment's sign-in to your local app; the server applies it or refuses
+  before dispatch.
 - `--wait` long-polls until terminal and handles its own backoff — don't wrap it
   in a retry loop.
 - `--local` implies `--wait`, with a default timeout of 1200 seconds per run (ordinary
