@@ -37,6 +37,6 @@ export function decodeWithBom(bytes: Buffer): string {
  * `readFileSync(path, 'utf8')`.
  */
 export function readTextFileBomAware(path: string): string {
-  // eslint-disable-next-line security/detect-non-literal-fs-filename -- `path` is the caller-supplied text file (plan, steps, code, password, or credentials), the same paths the readers this helper replaces already open.
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- `path` is a caller-supplied text file path; this helper only changes how the bytes are decoded, so callers keep their own path checks, exactly as with the readFileSync(path, 'utf8') call it replaces.
   return decodeWithBom(readFileSync(path));
 }

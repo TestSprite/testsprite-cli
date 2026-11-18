@@ -20,6 +20,7 @@ import {
   existsSync,
   fstatSync,
   openSync,
+  readFileSync,
   readSync,
   readdirSync,
   statSync,
@@ -61,7 +62,6 @@ import {
   parseJUnitReportFormat,
   type JUnitTestResult,
 } from '../lib/junit-report.js';
-import { decodeWithBom, readTextFileBomAware } from '../lib/text-file.js';
 import {
   ApiError,
   CLIError,
@@ -1877,7 +1877,7 @@ function readCodeFileGuarded(path: string): string {
 
 function readCodeFile(path: string): string {
   try {
-    return readTextFileBomAware(resolveAbsolute(path));
+    return stripBom(readFileSync(resolveAbsolute(path), 'utf8'));
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT') {
@@ -1893,6 +1893,17 @@ function readCodeFile(path: string): string {
 
 function resolveAbsolute(path: string): string {
   return isAbsolute(path) ? path : resolve(process.cwd(), path);
+}
+
+/**
+ * Drop a leading UTF-8 BOM (U+FEFF) from a freshly-read file. PowerShell 5.1's
+ * default `Set-Content -Encoding utf8` writes a BOM; without this strip,
+ * `JSON.parse` fails with an invisible "Unexpected token" error that renders
+ * as a blank character on most consoles. Most JSON parsers strip BOM at this
+ * boundary — we just bring this one in line.
+ */
+function stripBom(raw: string): string {
+  return raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
 }
 
 function requireNonEmpty(flagName: string, value: string): void {
@@ -2155,7 +2166,7 @@ function parsePlanStepsFile(path: string): unknown {
  * that window, since a swap of the path afterward can no longer change what
  * gets read.
  *
- * Returns `{ ok: true, raw }` on success (UTF-8/UTF-16 BOM decoded) or
+ * Returns `{ ok: true, raw }` on success (BOM already stripped) or
  * `{ ok: false, sizeBytes }` when the file is over `maxBytes` — the
  * oversize case is handed back rather than turned into an error here
  * because each caller throws its own `PAYLOAD_TOO_LARGE` envelope (distinct
@@ -2173,7 +2184,7 @@ function readCappedFileGuarded(
   field: string,
   path: string,
   maxBytes: number,
-): { ok: true; raw: string; sizeBytes: number } | { ok: false; sizeBytes: number } {
+): { ok: true; raw: string } | { ok: false; sizeBytes: number } {
   const absolute = resolveAbsolute(path);
 
   let fd: number;
@@ -2256,14 +2267,7 @@ function readCappedFileGuarded(
       // A lower bound for a pipe or a growing file: reading stopped here.
       return { ok: false, sizeBytes: bytes.length };
     }
-    let raw: string;
-    try {
-      raw = decodeWithBom(bytes);
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : 'unknown error';
-      throw localValidationError(field, `cannot decode ${path}: ${reason}`);
-    }
-    return { ok: true, raw, sizeBytes: bytes.length };
+    return { ok: true, raw: stripBom(bytes.toString('utf8')) };
   } finally {
     closeSync(fd);
   }
@@ -4129,8 +4133,7 @@ interface CreateBatchOptions extends CommonOptions {
  *
  * Caps:
  *   - 50 specs per batch (CLI rejects locally before sending)
- *   - 5 MB total raw bytes (CLI enforces while reading files; the assembled
- *     JSON size is re-checked after stringify)
+ *   - 5 MB total body (CLI checks after stringify)
  *   - 200 steps + 256 KB per individual plan (per-line validation)
  *
  * BE specs in the batch are flagged on stderr with their `specIndex`
@@ -5427,11 +5430,8 @@ function readPlansJsonlGuarded(path: string): CliPlanInput[] {
  * filename so the caller can fix one file at a time.
  *
  * Caps: 50 specs total (same as JSONL); aggregate size checked against
- * MAX_BATCH_BODY_BYTES (5 MB) on the RAW bytes as each file is read — a
- * UTF-16LE/BE body decodes to roughly half its byte count, so a cap checked
- * only on the decoded (or JSON-serialised) text let a >5 MB directory slip
- * through. The JSON-serialised size of the assembled array is still checked
- * afterwards as a final guard.
+ * MAX_BATCH_BODY_BYTES (5 MB) using the JSON-serialised size of the assembled
+ * spec array.
  */
 function readPlansFromDirGuarded(dir: string, stderrFn: (line: string) => void): CliPlanInput[] {
   const absolute = resolveAbsolute(dir);
@@ -5466,44 +5466,16 @@ function readPlansFromDirGuarded(dir: string, stderrFn: (line: string) => void):
 
   const specs: CliPlanInput[] = [];
   let skippedCount = 0;
-  let rawBytes = 0;
   for (let i = 0; i < entries.length; i += 1) {
     const filename = entries[i]!;
     const filePath = join(absolute, filename);
 
     let raw: string;
     try {
-      // Cap the batch on raw bytes as each file comes off disk: a UTF-16
-      // file's decoded length is ~half its byte count, so checking the
-      // assembled text afterwards would under-count UTF-16 directories.
-      const result = readCappedFileGuarded(
-        'plan-from-dir',
-        filePath,
-        MAX_BATCH_BODY_BYTES - rawBytes,
-      );
-      if (!result.ok) {
-        throw ApiError.fromEnvelope({
-          error: {
-            code: 'PAYLOAD_TOO_LARGE',
-            message: `Plan-from-dir batch exceeds the 5 MB CLI cap (${rawBytes + result.sizeBytes} bytes).`,
-            nextAction: 'Split into multiple smaller directories or trim step descriptions.',
-            requestId: 'local',
-            details: {
-              field: 'plan-from-dir',
-              sizeBytes: rawBytes + result.sizeBytes,
-              maxBytes: MAX_BATCH_BODY_BYTES,
-            },
-          },
-        });
-      }
-      raw = result.raw;
-      rawBytes += result.sizeBytes;
+      raw = stripBom(readFileSync(filePath, 'utf8'));
     } catch (err) {
-      // Typed errors from the capped reader (the PAYLOAD_TOO_LARGE envelope
-      // above, its localValidationError file errors) pass through unchanged.
-      // Hard I/O error (permission denied etc.): re-throw so the user knows
-      // the directory is unreadable — this is not a "skip" case.
-      if (err instanceof ApiError || err instanceof CLIError) throw err;
+      // Hard I/O error (permission denied etc.): re-throw so the user knows the
+      // directory is unreadable — this is not a "skip" case.
       const reason = err instanceof Error ? err.message : 'unknown error';
       throw localValidationError('plan-from-dir', `cannot read ${filename}: ${reason}`);
     }
@@ -6431,7 +6403,7 @@ export async function runLint(opts: LintOptions, deps: TestDeps = {}): Promise<C
     const absolute = resolveAbsolute(opts.plans);
     let content: string;
     try {
-      content = readTextFileBomAware(absolute);
+      content = readFileSync(absolute, 'utf8');
     } catch {
       throw localValidationError('plans', `cannot read file: ${absolute}`);
     }
