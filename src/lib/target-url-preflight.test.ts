@@ -43,6 +43,20 @@ function dnsRejecting(code: string): (hostname: string) => Promise<unknown> {
   return vi.fn().mockRejectedValue(err);
 }
 
+/** A fetch mock answering with a real redirect `Response`; `null` sends no Location header. */
+function fetchRedirectingTo(location: string | null, status = 302) {
+  return vi
+    .fn<typeof fetch>()
+    .mockResolvedValue(
+      new Response(null, { status, headers: location === null ? {} : { location } }),
+    );
+}
+
+const PROTECTED_PREVIEW = 'https://shop-git-feat-coupon-acme.vercel.app';
+/** What a preview behind Vercel Deployment Protection answers a visitor with no Vercel session. */
+const VERCEL_LOGIN_WALL =
+  'https://vercel.com/sso-api?url=https%3A%2F%2Fshop-git-feat-coupon-acme.vercel.app%2F&nonce=fa4094f2';
+
 describe('probeTargetUrl — rule table', () => {
   it('aborts and releases a tracked reachability probe on interrupt', async () => {
     const shutdown = new ShutdownController();
@@ -405,6 +419,39 @@ describe('probeTargetUrl — redirect handling (SSRF guard)', () => {
     expect(capturedInit?.redirect).toBe('manual');
   });
 
+  it("a 302 to Vercel's login wall (Deployment Protection) -> refuse, without fetching it", async () => {
+    const fetchImpl = fetchRedirectingTo(VERCEL_LOGIN_WALL);
+    const outcome = await probeTargetUrl(PROTECTED_PREVIEW, {
+      dnsLookup: dnsResolving(),
+      fetchImpl,
+      proxyActive: false,
+    });
+    expect(outcome).toEqual({
+      verdict: 'refuse',
+      refusal: 'target-protected',
+      reason: expect.stringContaining('vercel.com/sso-api'),
+    });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    expect(fetchImpl.mock.calls[0]![0]).toBe(PROTECTED_PREVIEW);
+  });
+
+  // The fake fetch with no `headers` at all is the `fetchResolving` case above.
+  it.each([
+    ["the app's own login page", '/login', 302],
+    ['the same host (a bypass cookie being set)', `${PROTECTED_PREVIEW}/`, 307],
+    ['a look-alike host', 'https://vercel.com.evil.example/sso-api', 302],
+    ['a relative /sso-api on the preview itself', '/sso-api', 302],
+    ['an unparseable Location', 'http://[', 302],
+    ['no Location header', null, 302],
+  ] as const)('a redirect to %s -> ok', async (_label, location, status) => {
+    const outcome = await probeTargetUrl(PROTECTED_PREVIEW, {
+      dnsLookup: dnsResolving(),
+      fetchImpl: fetchRedirectingTo(location, status),
+      proxyActive: false,
+    });
+    expect(outcome).toEqual({ verdict: 'ok' });
+  });
+
   // A mocked `fetchImpl` can prove the *option* passed to fetch (the test
   // above) but can't prove non-dereferencing itself — a canned mock returns
   // whatever status it's told regardless of `redirect`, so it can't tell
@@ -499,6 +546,31 @@ describe('assertTargetUrlReachable — call-site integration', () => {
     expect((err as ApiError).exitCode).toBe(5);
     expect((err as ApiError).nextAction).toContain('--skip-preflight');
     expect((err as ApiError).message).toContain('--skip-preflight');
+  });
+
+  it("throws exit 5 with reason 'target-protected' and both Vercel fixes for the login wall", async () => {
+    const err = await assertTargetUrlReachable(
+      PROTECTED_PREVIEW,
+      {},
+      {
+        dnsLookup: dnsResolving(),
+        fetchImpl: fetchRedirectingTo(VERCEL_LOGIN_WALL),
+        proxyActive: false,
+      },
+      () => undefined,
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'targetUrl', reason: 'target-protected' },
+    });
+    expect((err as ApiError).message).toContain('Vercel Deployment Protection');
+    expect((err as ApiError).nextAction).toContain('Vercel Authentication');
+    expect((err as ApiError).nextAction).toContain(
+      'x-vercel-protection-bypass=<secret>&x-vercel-set-bypass-cookie=true',
+    );
+    expect((err as ApiError).nextAction).toContain('--skip-preflight');
   });
 
   it('prints a [advisory] line (and does not throw) on a warn verdict', async () => {

@@ -13,7 +13,7 @@ import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-facto
 import { ApiError, InterruptError, RequestTimeoutError } from '../lib/errors.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import type { RunResponse } from '../lib/runs.types.js';
-import { runTestWait } from './test.js';
+import { RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS, runTestWait } from './test.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1226,6 +1226,189 @@ describe('runTestWait: TimeoutError writes partial JSON to stdout', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Network outage mid-wait (#437), on the real HttpClient with fake timers
+// ---------------------------------------------------------------------------
+
+describe('runTestWait: network outage mid-wait', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const jsonRunResponse = (status: RunResponse['status']): Response =>
+    new Response(JSON.stringify(makeRun(status)), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+
+  it('waits out an outage longer than two transport-retry bursts and prints the verdict (exit 0)', async () => {
+    vi.useFakeTimers();
+    const { credentialsPath } = makeCreds();
+    // Fetch 1 answers (the endpoint is proven); fetches 2-9 are a dead network,
+    // two full http.ts bursts of 4 attempts, which ended the wait with exit 10
+    // before; fetch 10 is the verdict.
+    let fetchCalls = 0;
+    const fetchImpl: typeof globalThis.fetch = async () => {
+      fetchCalls += 1;
+      if (fetchCalls > 1 && fetchCalls <= 9) throw new TypeError('fetch failed');
+      return jsonRunResponse(fetchCalls === 1 ? 'running' : 'passed');
+    };
+    const stdoutLines: string[] = [];
+    const stderrLines: string[] = [];
+
+    const pending = runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        verbose: true,
+        runId: 'run_abc',
+        timeoutSeconds: 600,
+      },
+      {
+        credentialsPath,
+        fetchImpl,
+        stdout: line => stdoutLines.push(line),
+        stderr: line => stderrLines.push(line),
+      },
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await pending;
+
+    expect(result.status).toBe('passed');
+    expect(fetchCalls).toBe(10);
+    expect(JSON.parse(stdoutLines.join('\n'))).toMatchObject({
+      runId: 'run_abc',
+      status: 'passed',
+    });
+    const stderr = stderrLines.join('\n');
+    expect(stderr).toContain(
+      '[verbose] Cannot reach the TestSprite API (fetch failed); run run_abc keeps executing server-side.',
+    );
+    expect(stderr).toMatch(/\[verbose\] Reconnected after \d+s; still waiting for run run_abc/);
+  });
+
+  it('exits 10 with {runId, status} on stdout when the outage outlasts --timeout', async () => {
+    vi.useFakeTimers();
+    const { credentialsPath } = makeCreds();
+    let fetchCalls = 0;
+    const fetchImpl: typeof globalThis.fetch = async () => {
+      fetchCalls += 1;
+      if (fetchCalls > 1) throw new TypeError('fetch failed');
+      return jsonRunResponse('running');
+    };
+    const stdoutLines: string[] = [];
+
+    const pending = runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 30,
+      },
+      { credentialsPath, fetchImpl, stdout: line => stdoutLines.push(line), stderr: () => {} },
+    ).catch((caught: unknown) => caught);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    const caught = await pending;
+    expect(caught).toBeInstanceOf(ApiError);
+    expect(caught).toMatchObject({
+      code: 'UNAVAILABLE',
+      exitCode: 10,
+      details: { runId: 'run_abc', timeoutSeconds: 30 },
+    });
+    expect((caught as ApiError).nextAction).toContain('testsprite test wait run_abc');
+    expect(JSON.parse(stdoutLines.join('\n'))).toEqual({ runId: 'run_abc', status: 'running' });
+  });
+
+  it('fails fast with exit 10 when the first read cannot reach the API (first contact)', async () => {
+    vi.useFakeTimers();
+    const { credentialsPath } = makeCreds();
+    let fetchCalls = 0;
+    const fetchImpl: typeof globalThis.fetch = async () => {
+      fetchCalls += 1;
+      throw new TypeError('fetch failed');
+    };
+    const stdoutLines: string[] = [];
+
+    const pending = runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: line => stdoutLines.push(line), stderr: () => {} },
+    ).catch((caught: unknown) => caught);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(await pending).toMatchObject({ code: 'UNAVAILABLE', exitCode: 10 });
+    // Two http.ts transport-retry bursts of 4 attempts, then the error: no
+    // waiting out, and no partial, since the run was never read.
+    expect(fetchCalls).toBe(8);
+    expect(stdoutLines).toEqual([]);
+  });
+
+  it('aborts a long-poll read that never answers after 45s and reconnects, instead of waiting ~300s', async () => {
+    vi.useFakeTimers();
+    const { credentialsPath } = makeCreds();
+    // Poll read 1 answers; poll read 2 is a dead socket (no answer, no error)
+    // until its signal aborts; poll read 3, on a fresh connection, is the
+    // verdict. Other requests (the backend-result lookup) answer normally.
+    let pollReads = 0;
+    let secondReadAbortedAtMs: number | undefined;
+    const startMs = Date.now();
+    const fetchImpl: typeof globalThis.fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (!url.includes('/runs/run_abc')) return jsonRunResponse('running');
+      pollReads += 1;
+      if (pollReads === 2) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            'abort',
+            () => {
+              secondReadAbortedAtMs = Date.now() - startMs;
+              reject(init.signal!.reason);
+            },
+            { once: true },
+          );
+        });
+      }
+      return jsonRunResponse(pollReads === 1 ? 'running' : 'passed');
+    };
+    const stderrLines: string[] = [];
+
+    const pending = runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        verbose: true,
+        runId: 'run_abc',
+        timeoutSeconds: 600,
+      },
+      { credentialsPath, fetchImpl, stdout: () => {}, stderr: line => stderrLines.push(line) },
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await pending;
+
+    expect(result.status).toBe('passed');
+    expect(pollReads).toBe(3);
+    // Read 2 starts at 2s (the long-poll floor after an instant answer) and is
+    // aborted 45s later.
+    expect(secondReadAbortedAtMs).toBe(47_000);
+    expect(stderrLines.join('\n')).toContain(
+      '[verbose] Cannot reach the TestSprite API (no answer for 45s); run run_abc keeps executing server-side.',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // FIX 4 — D5-UX: text mode shows the `error` string for failed/blocked runs
 // ---------------------------------------------------------------------------
 describe('[fix-4-ux] runTestWait — text mode shows error string for failed/blocked runs', () => {
@@ -1770,5 +1953,269 @@ describe('test wait — stderr progress line', () => {
       if (isTTYDescriptor) Object.defineProperty(process.stderr, 'isTTY', isTTYDescriptor);
       else delete (process.stderr as { isTTY?: boolean }).isTTY;
     }
+  });
+});
+
+describe('runTestWait — failure recovery hint for a run that is terminal on the first poll', () => {
+  // Backend run rows finalize server-side, so the wait fallback (which already
+  // knew the type) rarely fires; the run row itself comes back failed/blocked.
+  async function waitTerminal(args: {
+    output: 'text' | 'json';
+    runStatus: RunResponse['status'];
+    type?: string;
+    typeLookupFails?: boolean;
+  }) {
+    const { credentialsPath } = makeCreds();
+    const router = beWaitRouter({
+      type: args.type,
+      runStatus: args.runStatus,
+      result: () => makeBeResult(),
+    });
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const err = await runTestWait(
+      {
+        profile: 'default',
+        output: args.output,
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(url =>
+          args.typeLookupFails && /\/tests\/test_xyz(\?|$)/.test(url)
+            ? errorBody('INTERNAL')
+            : router.handler(url),
+        ),
+        stdout: line => stdout.push(line),
+        stderr: line => stderr.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    const hint = stderr.find(line => line.startsWith('Run finished')) ?? '';
+    return { err, hint, stdout, counts: router.counts };
+  }
+
+  it.each(['failed', 'blocked'] as const)(
+    'JSON: a %s backend run points at test failure get <test-id> (one type lookup)',
+    async runStatus => {
+      const { err, hint, counts } = await waitTerminal({ output: 'json', runStatus });
+      expect(err.exitCode).toBe(1);
+      expect(hint).toContain(`status: ${runStatus}`);
+      expect(hint).toContain("'testsprite test failure get test_xyz'");
+      expect(hint).not.toContain('artifact get');
+      expect(counts.type).toBe(1);
+    },
+  );
+
+  it('JSON: text and JSON now give the same hint for the same failed backend run', async () => {
+    const text = await waitTerminal({ output: 'text', runStatus: 'failed' });
+    const json = await waitTerminal({ output: 'json', runStatus: 'failed' });
+    expect(json.hint).toBe(text.hint);
+  });
+
+  it('JSON: stdout is still the run row verbatim — the lookup only feeds the stderr hint', async () => {
+    const { stdout } = await waitTerminal({ output: 'json', runStatus: 'failed' });
+    expect(JSON.parse(stdout.join('\n'))).toMatchObject(makeRun('failed'));
+  });
+
+  it('JSON: a passed run makes no type lookup', async () => {
+    const { err, counts } = await waitTerminal({ output: 'json', runStatus: 'passed' });
+    expect(err.status).toBe('passed');
+    expect(counts.type).toBe(0);
+  });
+
+  it('JSON: a failed frontend run keeps the run-scoped artifact hint', async () => {
+    const { hint, counts } = await waitTerminal({
+      output: 'json',
+      runStatus: 'failed',
+      type: 'frontend',
+    });
+    expect(hint).toContain("'testsprite test artifact get run_abc'");
+    expect(counts.type).toBe(1);
+  });
+
+  it('JSON: a rate-limited type lookup is tried once, never retried, and falls back', async () => {
+    const { credentialsPath } = makeCreds();
+    const router = beWaitRouter({ runStatus: 'failed', result: () => makeBeResult() });
+    let lookups = 0;
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const err = await runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(url => {
+          if (/\/tests\/test_xyz(\?|$)/.test(url)) {
+            lookups += 1;
+            return errorBody('RATE_LIMITED');
+          }
+          return router.handler(url);
+        }),
+        stdout: line => stdout.push(line),
+        stderr: line => stderr.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(lookups).toBe(1);
+    expect(err.exitCode).toBe(1);
+    expect(JSON.parse(stdout.join('\n'))).toMatchObject({ runId: 'run_abc', status: 'failed' });
+    expect(stderr.find(l => l.startsWith('Run finished'))).toContain(
+      "'testsprite test artifact get run_abc'",
+    );
+  });
+
+  it('JSON: a 5xx type lookup is tried once, not retried, and falls back', async () => {
+    const { credentialsPath } = makeCreds();
+    const router = beWaitRouter({ runStatus: 'failed', result: () => makeBeResult() });
+    let lookups = 0;
+    const stderr: string[] = [];
+    const err = await runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(url => {
+          if (/\/tests\/test_xyz(\?|$)/.test(url)) {
+            lookups += 1;
+            return errorBody('INTERNAL');
+          }
+          return router.handler(url);
+        }),
+        stdout: () => {},
+        stderr: line => stderr.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(lookups).toBe(1);
+    expect(err.exitCode).toBe(1);
+    expect(stderr.find(l => l.startsWith('Run finished'))).toContain(
+      "'testsprite test artifact get run_abc'",
+    );
+  });
+
+  it('reuses the backend type found while polling when the hint lookup later fails', async () => {
+    // Poll 1: run row still running → the BE fallback probes the type (backend)
+    // but the testId result is not ready. Poll 2: the run row is failed. The
+    // hint's own lookup then fails, yet the type is already known.
+    const { credentialsPath } = makeCreds();
+    let polls = 0;
+    let typeReads = 0;
+    const stderr: string[] = [];
+    const err = await runTestWait(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: false,
+        runId: 'run_abc',
+        timeoutSeconds: 60,
+      },
+      {
+        credentialsPath,
+        fetchImpl: makeFetch(url => {
+          if (url.includes('/tests/test_xyz/result')) return errorBody('NOT_FOUND');
+          if (/\/tests\/test_xyz(\?|$)/.test(url)) {
+            typeReads += 1;
+            return typeReads === 1
+              ? {
+                  body: {
+                    id: 'test_xyz',
+                    projectId: 'p1',
+                    name: 'BE test',
+                    type: 'backend',
+                    createdFrom: 'mcp',
+                    status: 'running',
+                    createdAt: '2026-05-15T10:00:00.000Z',
+                    updatedAt: '2026-05-15T10:00:00.000Z',
+                  },
+                }
+              : errorBody('INTERNAL');
+          }
+          polls += 1;
+          return { body: makeRun(polls === 1 ? 'running' : 'failed') };
+        }),
+        stdout: () => {},
+        stderr: line => stderr.push(line),
+        sleep: instantSleep,
+      },
+    ).catch(e => e);
+    expect(err.exitCode).toBe(1);
+    expect(stderr.find(l => l.startsWith('Run finished'))).toContain(
+      "'testsprite test failure get test_xyz'",
+    );
+    // The polled type was reused: no second lookup for the hint.
+    expect(typeReads).toBe(1);
+  });
+
+  it('JSON: a type lookup that never answers is abandoned at its deadline', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const { credentialsPath } = makeCreds();
+      const router = beWaitRouter({ runStatus: 'failed', result: () => makeBeResult() });
+      const stderr: string[] = [];
+      const answer = makeFetch(router.handler);
+      const fetchImpl = (async (input: FetchInput, init: RequestInit = {}) => {
+        const url =
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (!/\/tests\/test_xyz(\?|$)/.test(url)) return answer(input, init);
+        // Hang until the caller aborts — the shape of a stalled lookup.
+        return new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () =>
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+          );
+        });
+      }) as typeof globalThis.fetch;
+      const pending = runTestWait(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: false,
+          runId: 'run_abc',
+          timeoutSeconds: 60,
+        },
+        {
+          credentialsPath,
+          fetchImpl,
+          stdout: () => {},
+          stderr: l => stderr.push(l),
+          sleep: instantSleep,
+        },
+      ).catch(e => e);
+      await vi.advanceTimersByTimeAsync(RUN_CARD_TYPE_LOOKUP_TIMEOUT_MS);
+      const err = await pending;
+      expect(err.exitCode).toBe(1);
+      expect(stderr.find(l => l.startsWith('Run finished'))).toContain(
+        "'testsprite test artifact get run_abc'",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('JSON: a failed type lookup falls back to the artifact hint without changing the exit code', async () => {
+    const { err, hint } = await waitTerminal({
+      output: 'json',
+      runStatus: 'failed',
+      typeLookupFails: true,
+    });
+    expect(err.exitCode).toBe(1);
+    expect(hint).toContain("'testsprite test artifact get run_abc'");
   });
 });

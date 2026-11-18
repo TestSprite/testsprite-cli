@@ -602,6 +602,52 @@ describe('localValidationError', () => {
     expect(err.nextAction).toBe('Flag `--page-size` is invalid: must be a positive integer.');
     expect(err.nextAction.endsWith('..')).toBe(false);
   });
+
+  it('kind=argument formats bare positional name wrapped in angle brackets', () => {
+    const err = localValidationError(
+      'projectId',
+      'cannot be empty or whitespace-only',
+      undefined,
+      'argument',
+    );
+    expect(err.code).toBe('VALIDATION_ERROR');
+    expect(err.exitCode).toBe(5);
+    expect(err.nextAction).toBe(
+      'Argument `<project-id>` is invalid: cannot be empty or whitespace-only.',
+    );
+  });
+
+  it('kind=argument preserves existing bracketed argument names', () => {
+    const required = localValidationError(
+      '<project-id>',
+      'cannot be empty or whitespace-only',
+      undefined,
+      'argument',
+    );
+    expect(required.nextAction).toBe(
+      'Argument `<project-id>` is invalid: cannot be empty or whitespace-only.',
+    );
+
+    const optional = localValidationError(
+      '[output-path]',
+      'cannot be empty or whitespace-only',
+      undefined,
+      'argument',
+    );
+    expect(optional.nextAction).toBe(
+      'Argument `[output-path]` is invalid: cannot be empty or whitespace-only.',
+    );
+
+    const variadic = localValidationError(
+      '<run-id...>',
+      'cannot be empty or whitespace-only',
+      undefined,
+      'argument',
+    );
+    expect(variadic.nextAction).toBe(
+      'Argument `<run-id...>` is invalid: cannot be empty or whitespace-only.',
+    );
+  });
 });
 
 describe('ApiError.getDetail', () => {
@@ -691,6 +737,24 @@ describe('RequestTimeoutError', () => {
     // 1500ms → 2s in the message
     const err = new RequestTimeoutError(1_500);
     expect(err.message).toContain('2s');
+  });
+
+  it('leaves nextAction unset by default so renderers use the generic advice', () => {
+    const err = new RequestTimeoutError(5_000);
+    expect(err.nextAction).toBeUndefined();
+  });
+
+  it('honors caller-specific message and nextAction overrides', () => {
+    const err = new RequestTimeoutError(5_000, 'local', {
+      message: 'Environment preflight read timed out after 5s (client-side).',
+      nextAction: 'The environment preflight read timed out. Check the backend, then retry.',
+    });
+    expect(err.message).toBe('Environment preflight read timed out after 5s (client-side).');
+    expect(err.message).not.toContain('--request-timeout');
+    expect(err.nextAction).toContain('environment preflight read');
+    expect(err.code).toBe('REQUEST_TIMEOUT');
+    expect(err.exitCode).toBe(7);
+    expect(err.timeoutMs).toBe(5_000);
   });
 });
 

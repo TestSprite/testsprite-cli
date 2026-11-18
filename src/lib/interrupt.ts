@@ -12,10 +12,11 @@
  * Broken pipe: when output is piped to a reader that closes early
  * (`testsprite ... | head`), the kernel raises `EPIPE` on the next stdout write.
  * Node turns an `'error'` with no listener into an uncaughtException and dumps a
- * raw `write EPIPE` stack (exit 1). Outside an armed lifetime the guard exits
- * 0 immediately, the conventional SIGPIPE-equivalent result. While armed it
- * first requests coordinated shutdown so tunnel cleanup can finish, then the
- * same synthetic interrupt reason preserves exit 0.
+ * raw `write EPIPE` stack (exit 1). Outside an armed lifetime the guard lets
+ * the command settle so its own exit code (a failing verdict included) stands,
+ * with a backstop exit for a process left idle; a clean result still exits 0.
+ * While armed it first requests coordinated shutdown so tunnel cleanup can
+ * finish, then the same synthetic interrupt reason preserves exit 0.
  *
  * `process` and the streams are injectable so the wiring is unit-testable
  * without spawning a subprocess or sending a real signal.
@@ -339,20 +340,28 @@ export interface BrokenPipeDeps {
   exit?: (code: number) => void;
   /** Shutdown coordinator. Defaults to {@link globalShutdown}. */
   shutdown?: ShutdownController;
+  /** Backstop timer. Defaults to `setTimeout`. */
+  setTimer?: (callback: () => void, delayMs: number) => Pick<NodeJS.Timeout, 'unref'>;
+  /** The exit code set so far. Defaults to reading `process.exitCode`. */
+  exitCode?: () => number | string | null | undefined;
 }
 
 /**
  * Guard against `EPIPE` on stdout/stderr so piping to a reader that closes
  * early (`testsprite ... | head`) exits cleanly instead of crashing with an
  * unhandled `write EPIPE` stack. An armed stdout path requests graceful
- * shutdown before exiting 0; a disarmed one exits 0 immediately. Only `EPIPE`
- * is swallowed; any other stream error is left to surface normally.
+ * shutdown before exiting 0; a disarmed one leaves the exit code to the
+ * command and only arms a backstop. Only `EPIPE` is swallowed; any other
+ * stream error is left to surface normally.
  */
 export function installBrokenPipeGuard(deps: BrokenPipeDeps = {}): void {
   const stdout = deps.stdout ?? process.stdout;
   const stderr = deps.stderr ?? process.stderr;
   const exit = deps.exit ?? ((code: number) => process.exit(code));
   const shutdown = deps.shutdown ?? globalShutdown;
+  const setTimer = deps.setTimer ?? setTimeout;
+  const exitCode = deps.exitCode ?? (() => process.exitCode);
+  let backstopArmed = false;
 
   stdout.on('error', (error: NodeJS.ErrnoException) => {
     // Reader went away (`| head`, `| less` then q): exit cleanly like SIGPIPE
@@ -366,7 +375,17 @@ export function installBrokenPipeGuard(deps: BrokenPipeDeps = {}): void {
         shutdown.brokenPipe();
         return;
       }
-      exit(0);
+      // Exiting here would race index.ts, which sets a failing verdict's exit
+      // code only after an async telemetry flush, and turn it into 0. Let the
+      // command settle; once the event loop drains the process exits with the
+      // code it set. The unref'd backstop only fires when something keeps the
+      // process alive (an idle prompt, a stdout `drain` that never comes).
+      if (backstopArmed) return;
+      backstopArmed = true;
+      setTimer(() => {
+        const code = Number(exitCode() ?? 0);
+        exit(Number.isInteger(code) ? code : 0);
+      }, INTERRUPT_EXIT_BACKSTOP_MS).unref();
       return;
     }
     throw error;
