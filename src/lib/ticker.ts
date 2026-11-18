@@ -117,7 +117,7 @@ function graphemeWidth(grapheme: string): number {
  * @param text - Text to measure.
  * @returns The number of terminal columns occupied by the text.
  */
-function terminalWidth(text: string): number {
+export function terminalWidth(text: string): number {
   let width = 0;
   for (const { segment } of graphemeSegmenter.segment(text)) {
     width += graphemeWidth(segment);

@@ -345,11 +345,12 @@ export async function runSignInSet(
 }
 
 export function createProjectSignInCommand(deps: ProjectDeps = {}): Command {
-  const group = new Command('sign-in').description(
-    'Inspect or change how an environment signs in to the app under test.',
-  );
+  const group = new Command('sign-in')
+    .summary('Inspect or change how an environment signs in')
+    .description('Inspect or change how an environment signs in to the app under test.');
   group
     .command('get <project-id>')
+    .summary('Show the environment sign-in mode and status')
     .description(
       'Show the environment sign-in mode, credentials status, OTP channels, or SSO session.',
     )
@@ -360,14 +361,21 @@ export function createProjectSignInCommand(deps: ProjectDeps = {}): Command {
     });
   group
     .command('set <project-id>')
-    .description('Set the sign-in mode; choose OTP when creating a new environment.')
+    .summary('Set the environment sign-in mode')
+    .description(
+      'Set the sign-in mode. OTP can only be chosen at `project env create --sign-in otp`, never switched to or from.\n' +
+        'manual (log in once in the Portal; runs are not signed in until then) and otp are not available on local environments.',
+    )
     .option(
       '--mode <mode>',
-      'required: public, account, otp, or manual (aliases: none, credentials, sso)',
+      'required: public, account or manual (aliases: none, credentials, sso)',
     )
     .option('--env <name>', 'environment name (defaults to the project default)')
     .option('--username <user>', 'test-account username (account only)')
-    .option('--password <pw>', 'test-account password (prefer --password-file; account only)')
+    .option(
+      '--password <pw>',
+      'test-account password (prefer --password-file, exclusive; account only)',
+    )
     .option('--password-file <path>', 'read the test-account password from a file (account only)')
     .option(
       '--session-ttl <seconds|never>',

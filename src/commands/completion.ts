@@ -137,7 +137,8 @@ export function createCompletionCommand(
     )
     .addHelpText(
       'after',
-      '\nExamples:\n' +
+      '\nCompletes commands and their subcommands one level deep; option names are not completed.\n' +
+        '\nExamples:\n' +
         '  eval "$(testsprite completion bash)"       # bash, current session\n' +
         '  testsprite completion zsh > ~/.zsh/_testsprite\n' +
         '  testsprite completion fish | source        # fish, current session',

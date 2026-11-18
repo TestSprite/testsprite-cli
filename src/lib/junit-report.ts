@@ -1,5 +1,5 @@
-import { createWriteStream } from 'node:fs';
-import { rename, stat, unlink } from 'node:fs/promises';
+import { createWriteStream, statSync } from 'node:fs';
+import { rename, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { localValidationError, TransportError } from './errors.js';
@@ -14,6 +14,8 @@ export interface JUnitTestResult {
   status: string;
   /** Observed on polled runs; used for classname when --project is omitted. */
   projectId?: string;
+  /** This row's own `classname`, when the batch spans several projects. */
+  classname?: string;
   error?: { code: string; message: string; exitCode?: number };
   /** Why a member was skipped before dispatch. */
   skipReason?: string;
@@ -122,12 +124,17 @@ export function assertJUnitReportOptions(opts: JUnitReportFlagOptions): void {
  * Prefer explicit `--project`, then ids observed on polled run rows.
  */
 export function resolveBatchReportProjectId(
-  opts: { projectId?: string },
+  opts: { projectId?: string; projectIdByTestId?: ReadonlyMap<string, string> },
   results: ReadonlyArray<{ projectId?: string }>,
 ): string {
   if (opts.projectId) return opts.projectId;
+  // Explicit ids that span several projects have no single `--project`; each
+  // row carries its own project as its classname and the suite gets this token.
+  const known = new Set(opts.projectIdByTestId?.values());
+  if (known.size > 1) return 'multiple-projects';
   const fromPoll = results.map(r => r.projectId).find((id): id is string => !!id);
   if (fromPoll) return fromPoll;
+  if (known.size === 1) return [...known][0]!;
   throw localValidationError(
     'project',
     '--report junit requires --project <id> when the project cannot be inferred from run results',
@@ -135,10 +142,22 @@ export function resolveBatchReportProjectId(
 }
 
 /**
+ * Characters XML 1.0 forbids anywhere in a document: the `Char` production
+ * allows only #x9, #xA, #xD, [#x20-#xD7FF], [#xE000-#xFFFD] and
+ * [#x10000-#x10FFFF]. No entity can represent the excluded characters, so
+ * they are stripped rather than escaped — a single one in a free-text run
+ * message (LLM / server supplied) makes strict parsers reject the whole
+ * report. Tab, newline and carriage return are legal and preserved.
+ */
+// eslint-disable-next-line no-control-regex
+const XML_1_0_ILLEGAL_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g;
+
+/**
  * Escape text for inclusion in XML element bodies and double-quoted attributes.
  */
 export function escapeXml(text: string): string {
   return text
+    .replace(XML_1_0_ILLEGAL_CHARS, '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -161,12 +180,14 @@ function failureMessage(result: JUnitTestResult): string {
   return result.status;
 }
 
-function renderTestcase(result: JUnitTestResult, classname: string): string {
+function renderTestcase(result: JUnitTestResult, classname: string, displayName?: string): string {
   const outcome = classifyJUnitOutcome(result.status, result.error);
   // A readable CI test tab keys on `name`: prefer the human test name, fall back
   // to the id. The UUID is preserved as a `testId` attribute (ignored by
   // renderers, read by machine consumers) so the switch loses no information.
-  const name = escapeXml(result.name?.trim() || result.testId);
+  // `displayName` carries the precomputed disambiguated name for colliding
+  // groups (see resolveJUnitDisplayNames).
+  const name = escapeXml(displayName ?? (result.name?.trim() || result.testId));
   const cls = escapeXml(classname);
   const time = formatTime(result.durationSeconds);
   const idAttr = ` testId="${escapeXml(result.testId)}"`;
@@ -213,6 +234,65 @@ function renderTestcase(result: JUnitTestResult, classname: string): string {
 }
 
 /**
+ * Standard JUnit consumers (GitLab, Jenkins) key a testcase on classname+name
+ * and ignore extra attributes, so rows sharing both collapse into one — a
+ * same-name pair from a multi-project list then loses one verdict and one
+ * run's diagnostics (#515). The stable logical testId — not the ephemeral
+ * runId, which would break cross-run comparison — joins the standard identity
+ * for colliding groups only: unique names render exactly as before.
+ */
+function resolveJUnitDisplayNames(
+  results: ReadonlyArray<JUnitTestResult>,
+  fallbackClassname: string,
+): Array<string | undefined> {
+  const rawNames = results.map(result => result.name?.trim() || result.testId);
+  const names = [...rawNames];
+  // XML consumers normalize attribute whitespace: line endings collapse first
+  // (CRLF/CR → LF), then tabs/newlines/carriage returns each become a space.
+  // Raw-distinct names can therefore share an identity downstream, so the
+  // collision keys use the normalized form; rendering keeps the original text.
+  const attributeKey = (value: string): string =>
+    value.replace(/\r\n?/g, '\n').replace(/[\n\t]/g, ' ');
+  const keyOf = (classname: string, name: string): string =>
+    `${attributeKey(classname)}\u0000${attributeKey(name)}`;
+  // The suffix must stay injective under attributeKey normalization, or two raw-distinct
+  // ids ("a\tb" vs "a b") re-collide after suffixing and the round cap gives up leaving
+  // duplicate identities. JSON-escaping (minus the surrounding quotes) encodes control
+  // characters as visible two-char escapes, so distinct ids render distinct suffixes
+  // that normalization cannot fold; ids without escapes render unchanged.
+  const displayTestId = (testId: string): string => JSON.stringify(testId).slice(1, -1);
+  // Suffixing can itself collide with a row whose human title already looks
+  // like a suffixed one ("Checkout [case-a]" as a literal name), so iterate
+  // until no (classname, name) pair collides. Each round's colliding set gets
+  // an injective encoded suffix, so the set ends pairwise distinct and the
+  // loop terminates. A group whose rows all share one testId can never be
+  // separated by any suffix — the rows are exact duplicates — so it is left
+  // alone instead of spinning to the round cap (testlist run can pass the
+  // same id twice, billing each row).
+  for (let round = 0; round <= results.length; round++) {
+    const groups = new Map<string, { count: number; testIds: Set<string> }>();
+    results.forEach((result, index) => {
+      const key = keyOf(result.classname ?? fallbackClassname, names[index]!);
+      const group = groups.get(key) ?? { count: 0, testIds: new Set<string>() };
+      group.count += 1;
+      group.testIds.add(result.testId);
+      groups.set(key, group);
+    });
+    let changed = false;
+    results.forEach((result, index) => {
+      const key = keyOf(result.classname ?? fallbackClassname, names[index]!);
+      const group = groups.get(key)!;
+      if (group.count > 1 && group.testIds.size > 1) {
+        names[index] = `${names[index]} [${displayTestId(result.testId)}]`;
+        changed = true;
+      }
+    });
+    if (!changed) break;
+  }
+  return names.map((name, index) => (name === rawNames[index] ? undefined : name));
+}
+
+/**
  * Build a JUnit XML document from batch results, including skipped members. Per-`testcase` `time` is
  * the run's wall-clock duration (from `startedAt`/`finishedAt`); the `testsuite`
  * `time` is their sum. `time` falls back to `0` for a run with no timing.
@@ -235,7 +315,10 @@ export function buildJUnitReport(opts: JUnitReportBuildOptions): string {
   }
 
   const suiteName = escapeXml(opts.suiteName);
-  const testcases = results.map(r => renderTestcase(r, opts.classname)).join('\n');
+  const displayNames = resolveJUnitDisplayNames(results, opts.classname);
+  const testcases = results
+    .map((r, index) => renderTestcase(r, r.classname ?? opts.classname, displayNames[index]))
+    .join('\n');
 
   return [
     XML_DECL,
@@ -267,34 +350,63 @@ export function skippedJUnitResultsFromSummary(
     .map(row => ({ testId: row.testId, status: 'skipped', skipReason: row.error ?? row.status }));
 }
 
-async function assertReportFileParent(rawPath: string): Promise<string> {
+function errorCode(err: unknown): string {
+  return (err as NodeJS.ErrnoException | undefined)?.code ?? 'unknown error';
+}
+
+function isAbsentPathError(err: unknown): boolean {
+  const code = errorCode(err);
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+/**
+ * Check that an output artifact path (`--report-file`, `--summary-file`) can be
+ * written: non-empty, not a directory, and inside an existing directory.
+ * Returns the resolved absolute path.
+ *
+ * Called in each command's pre-flight, before anything is dispatched or billed,
+ * so a mistyped directory fails fast with exit 5 instead of surfacing only after
+ * a full batch has run. The write itself re-checks (the directory can vanish in
+ * between).
+ */
+export function assertArtifactPath(field: 'report-file' | 'summary-file', rawPath: string): string {
   if (typeof rawPath !== 'string' || rawPath.length === 0) {
-    throw localValidationError('report-file', 'must be a non-empty file path');
+    throw localValidationError(field, 'must be a non-empty file path');
+  }
+  if (/[\\/]$/.test(rawPath)) {
+    throw localValidationError(field, 'must point to a file, not a directory');
   }
   const resolved = isAbsolute(rawPath) ? rawPath : resolve(process.cwd(), rawPath);
-  if (resolved.endsWith('/') || resolved.endsWith('\\')) {
-    throw localValidationError('report-file', 'must point to a file, not a directory');
-  }
 
   const parent = dirname(resolved);
   let parentStat;
   try {
-    parentStat = await stat(parent);
-  } catch {
-    throw localValidationError('report-file', `parent directory does not exist: ${parent}`);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- inspect the user-selected artifact parent before dispatch; no file content is read.
+    parentStat = statSync(parent);
+  } catch (err) {
+    if (isAbsentPathError(err))
+      throw localValidationError(field, `parent directory does not exist: ${parent}`);
+    throw localValidationError(
+      field,
+      `cannot access parent directory ${parent}: ${errorCode(err)}`,
+    );
   }
   if (!parentStat.isDirectory()) {
-    throw localValidationError('report-file', `parent path is not a directory: ${parent}`);
+    throw localValidationError(field, `parent path is not a directory: ${parent}`);
   }
 
   let targetStat;
   try {
-    targetStat = await stat(resolved);
-  } catch {
-    return resolved;
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- inspect the user-selected artifact target to reject directories and inaccessible paths before dispatch.
+    targetStat = statSync(resolved);
+  } catch (err) {
+    // Only a missing target is fine (it will be created); anything else (EACCES, ELOOP...) would fail the
+    // write after the run was dispatched, which is exactly what this pre-flight exists to prevent.
+    if (isAbsentPathError(err)) return resolved;
+    throw localValidationError(field, `cannot access ${resolved}: ${errorCode(err)}`);
   }
   if (targetStat.isDirectory()) {
-    throw localValidationError('report-file', `must point to a file, not a directory: ${resolved}`);
+    throw localValidationError(field, `must point to a file, not a directory: ${resolved}`);
   }
   return resolved;
 }
@@ -303,7 +415,7 @@ async function assertReportFileParent(rawPath: string): Promise<string> {
  * Atomically write JUnit XML to `--report-file` (temp sibling + rename).
  */
 export async function writeJUnitReportFile(rawPath: string, xml: string): Promise<void> {
-  const resolved = await assertReportFileParent(rawPath);
+  const resolved = assertArtifactPath('report-file', rawPath);
   const parent = dirname(resolved);
   const tmpPath = join(parent, `.${basename(resolved)}.tmp-${randomUUID()}`);
 
