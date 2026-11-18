@@ -48,6 +48,12 @@ export interface TriggerRunBody {
    * this picks WHOSE credentials it logs in with.
    */
   environment?: string;
+  /**
+   * BE only: run just the named test without expanding the producer/teardown
+   * closure. Sent only when the caller asked for it (never `false`); an older
+   * backend strips the field, so omitting it is the default on the wire.
+   */
+  skipDependencies?: boolean;
 }
 
 /** The environment a run resolved to — its credentials, its config, its address. */
@@ -263,6 +269,12 @@ export interface TriggerRunResponse {
    * run has no execution page). Same present-or-absent contract.
    */
   executionUrl?: string;
+  /**
+   * `true` exactly when the request carried `skipDependencies: true` and this
+   * backend handled it; otherwise OMITTED. A CLI that sent the flag and gets no
+   * echo was served by a backend that stripped it and ran the full closure.
+   */
+  skipDependencies?: boolean;
 }
 
 /**
@@ -570,6 +582,8 @@ export interface BatchRunFreshRequest {
   autoHeal?: false;
   /** See `TriggerRunBody.environment` — applied to every test in the batch. */
   environment?: string;
+  /** See `TriggerRunBody.skipDependencies` — applies to every BE test in the batch. */
+  skipDependencies?: boolean;
   /** Per-run URL override for the batch; echoed when the backend honors it. */
   targetUrl?: string;
   /**
@@ -659,6 +673,8 @@ export interface BatchRunFreshResponse {
   /** Echoes, same contract as `targetUrl`: absent means this backend never read the field. */
   admission?: 'budget' | 'all';
   previewName?: string;
+  /** See `TriggerRunResponse.skipDependencies`; same present-or-omitted contract. */
+  skipDependencies?: boolean;
 }
 
 // ─── Execution report (GET /tests/executions/{executionId}/report) ───────────

@@ -188,17 +188,18 @@ describe('assertOutDirParentExists', () => {
     await expect(assertOutDirParentExists(target)).resolves.toBeUndefined();
   });
 
-  it('throws VALIDATION_ERROR when parent does not exist', async () => {
+  it('resolves for a --out two levels under a missing directory and creates nothing', async () => {
     const noParentBase = mkdtempSync(join(tmpdir(), 'cli-p4-noparent-'));
-    const target = join(noParentBase, 'does-not-exist-xyz', 'bundle');
-    await expect(assertOutDirParentExists(target))
-      .rejects.toMatchObject({
-        code: 'VALIDATION_ERROR',
-        details: expect.objectContaining({
-          reason: expect.stringContaining('parent directory does not exist'),
-        }),
-      })
-      .finally(() => rmSync(noParentBase, { recursive: true, force: true }));
+    try {
+      const target = join(noParentBase, 'missing', 'deeper', 'bundle');
+      await expect(assertOutDirParentExists(target)).resolves.toBeUndefined();
+      // Validation only: writeBundle creates the directories once the response
+      // has passed its integrity checks, never this pre-check.
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- this test's own mkdtemp temp dir, never user input.
+      expect(existsSync(join(noParentBase, 'missing'))).toBe(false);
+    } finally {
+      rmSync(noParentBase, { recursive: true, force: true });
+    }
   });
 
   it('throws VALIDATION_ERROR when parent is not a directory (is a file)', async () => {
@@ -231,6 +232,21 @@ describe('assertOutDirParentExists', () => {
     const existingDir = join(tmpDir, 'bundle');
     await mkdir(existingDir);
     await expect(assertOutDirParentExists(existingDir)).resolves.toBeUndefined();
+  });
+
+  it('reports a file in the way as "not a directory", even a few levels up', async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), 'cli-p4-parent-'));
+    const blocker = join(tmpDir, 'blocker');
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- writes into this test's own mkdtemp temp dir, never user input.
+    await writeFile(blocker, 'not a directory');
+    await expect(
+      assertOutDirParentExists(join(blocker, 'runs', 'run_x', 'bundle')),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      details: expect.objectContaining({
+        reason: `parent path is not a directory: ${blocker}`,
+      }),
+    });
   });
 });
 
@@ -320,6 +336,34 @@ describe('runArtifactGet', () => {
 
       const expectedDir = join(tmpDir, '.testsprite', 'runs', SAMPLE_RUN_ID);
       expect(result.bundle!.dir).toBe(expectedDir);
+      expect(existsSync(join(expectedDir, 'meta.json'))).toBe(true);
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  it('--out ./.testsprite/runs/<run-id>/ in a fresh project writes where the default does', async () => {
+    const { credentialsPath } = makeCreds();
+    const ctx = makeArtifactContext();
+    const tmpDir = await mkdtemp(join(tmpdir(), 'cli-p4-explicit-default-'));
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(tmpDir);
+    try {
+      const result = await runArtifactGet(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          runId: SAMPLE_RUN_ID,
+          // The verify skill's spelling, before .testsprite/ exists.
+          out: `./.testsprite/runs/${SAMPLE_RUN_ID}/`,
+          failedOnly: false,
+        },
+        { credentialsPath, fetchImpl: makeFetch(() => ({ body: ctx })), stdout: () => {} },
+      );
+
+      const expectedDir = join(tmpDir, '.testsprite', 'runs', SAMPLE_RUN_ID);
+      expect(result.bundle!.dir).toBe(expectedDir);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads back the bundle this test wrote into its own mkdtemp temp dir, never user input.
       expect(existsSync(join(expectedDir, 'meta.json'))).toBe(true);
     } finally {
       cwdSpy.mockRestore();
@@ -527,29 +571,67 @@ describe('runArtifactGet', () => {
     expect(text).toContain('GET');
   });
 
-  // ---- --out parent missing → exit 5 ----
+  // ---- --out under missing directories → created, like the default ----
 
-  it('--out with missing parent directory → VALIDATION_ERROR (exit 5)', async () => {
+  it('--out two levels under a missing directory writes the bundle there', async () => {
     const { credentialsPath } = makeCreds();
-    const fetchImpl = makeFetch(() => ({ body: {} }));
-
+    const ctx = makeArtifactContext();
     const missingParentBase = mkdtempSync(join(tmpdir(), 'cli-p4-missing-parent-'));
-    const missingParent = join(missingParentBase, 'definitely-does-not-exist-xyz', 'bundle');
-    await expect(
-      runArtifactGet(
+    const outDir = join(missingParentBase, 'missing', 'deeper', 'bundle');
+    try {
+      const result = await runArtifactGet(
         {
           profile: 'default',
           output: 'json',
           debug: false,
           runId: SAMPLE_RUN_ID,
-          out: missingParent,
+          out: outDir,
           failedOnly: false,
         },
-        { credentialsPath, fetchImpl, stdout: () => {} },
-      ),
-    )
-      .rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
-      .finally(() => rmSync(missingParentBase, { recursive: true, force: true }));
+        { credentialsPath, fetchImpl: makeFetch(() => ({ body: ctx })), stdout: () => {} },
+      );
+      expect(result.bundle!.dir).toBe(outDir);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads back the bundle this test wrote into its own mkdtemp temp dir, never user input.
+      expect(existsSync(join(outDir, 'meta.json'))).toBe(true);
+    } finally {
+      rmSync(missingParentBase, { recursive: true, force: true });
+    }
+  });
+
+  it('a failed fetch with --out under a missing directory leaves no directory behind', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({
+      status: 404,
+      body: {
+        error: {
+          code: 'NOT_FOUND',
+          message: 'Run not found.',
+          nextAction: 'Check the id.',
+          requestId: 'req_404',
+          details: { reason: 'not_found' },
+        },
+      },
+    }));
+    const missingParentBase = mkdtempSync(join(tmpdir(), 'cli-p4-missing-parent-'));
+    try {
+      await expect(
+        runArtifactGet(
+          {
+            profile: 'default',
+            output: 'json',
+            debug: false,
+            runId: SAMPLE_RUN_ID,
+            out: join(missingParentBase, 'missing', 'deeper', 'bundle'),
+            failedOnly: false,
+          },
+          { credentialsPath, fetchImpl, stdout: () => {} },
+        ),
+      ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- this test's own mkdtemp temp dir, never user input.
+      expect(existsSync(join(missingParentBase, 'missing'))).toBe(false);
+    } finally {
+      rmSync(missingParentBase, { recursive: true, force: true });
+    }
   });
 
   // ---- --out is a file → exit 5 ----
@@ -929,6 +1011,33 @@ describe('runFailureGet M2 non-regression (requireRunId is opt-in)', () => {
     const meta = JSON.parse(readFileSync(join(outDir, 'meta.json'), 'utf8'));
     expect(meta.runIdIfAvailable).toBeNull();
     expect(meta.testId).toBe('test_m2');
+  });
+
+  it('--out ./.testsprite/failure works in a fresh project (the README quick start)', async () => {
+    const { credentialsPath } = makeCreds();
+    const ctx = makeArtifactContext();
+    const tmpDir = await mkdtemp(join(tmpdir(), 'cli-p4-quickstart-'));
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(tmpDir);
+    try {
+      const result = await runFailureGet(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          testId: 'test_fe',
+          out: './.testsprite/failure',
+          failedOnly: false,
+        },
+        { credentialsPath, fetchImpl: makeFetch(() => ({ body: ctx })), stdout: () => {} },
+      );
+
+      const expectedDir = join(tmpDir, '.testsprite', 'failure');
+      expect(result.bundle!.dir).toBe(expectedDir);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- reads back the bundle this test wrote into its own mkdtemp temp dir, never user input.
+      expect(existsSync(join(expectedDir, 'meta.json'))).toBe(true);
+    } finally {
+      cwdSpy.mockRestore();
+    }
   });
 });
 

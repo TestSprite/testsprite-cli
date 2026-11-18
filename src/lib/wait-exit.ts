@@ -161,6 +161,12 @@ export function resolveWaitFailure(
     return new CLIError(
       `${notPassed} run${notPassed !== 1 ? 's' : ''} failed — auth error (${authErr.error.code}): ${authErr.error.message}`,
       3,
+      // Carry the member's real catalog code (AUTH_REQUIRED / AUTH_INVALID /
+      // AUTH_FORBIDDEN — `isAuthCode` above guarantees one of them) so the
+      // JSON envelope's `error.code` and telemetry's `errorCode` classify
+      // this as auth instead of falling into the generic 'CLI_ERROR'
+      // bucket — agreeing with the exit code and the message.
+      authErr.error.code,
     );
   }
 

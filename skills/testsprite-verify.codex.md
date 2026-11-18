@@ -45,17 +45,17 @@ testsprite test run <test-id> --env staging \
 # Backend Python assertion
 testsprite test create --type backend --name "Login rejects empty password" \
   --project <id> --code-file /tmp/test.py --run --wait --timeout 600
-# Deployed replay (V3 FE: 0.5 credit)
-testsprite test rerun <test-id> --env staging --wait --output json
-# Dependency batch; optional --filter <substring>
+# Several tests, one batch (V3 FE: 0.5 credit each)
+testsprite test run <test-id> <test-id> --env staging --wait --output json
+# Dependency batch; --filter <substr>, --status failed,blocked
 testsprite test run --all --project <id> --env staging --wait --output json
 ```
 
 - Supported backends grant existing keys `run:tunnel`; a narrowed key without it
-  exits 3. Free-plan local runs work; V3 FE costs 0.5 credit. BE cannot use `--local`.
+  exits 3. Free-plan local runs work. BE cannot use `--local`.
 - `--local` implies `--wait` (1200 s per run; ordinary: 600). `--local-host`:
   `localhost`, `127.0.0.1` (default), `::1`. A dead port exits 5 before charge;
-  `--skip-preflight` skips the probe. Environment `--url` rejects private hosts.
+  `--skip-preflight` skips the probe. Environment `--url` rejects private (non-loopback) hosts.
   `--local` selects/creates `local-<port>`; a named `--env` must be local.
   `--target-url` cannot combine with `--local`.
 - Run local ids together (`test run <id> <id> … --local <port>`); `--all --project
@@ -82,14 +82,14 @@ testsprite test run --all --project <id> --env staging --wait --output json
   free BLOCKED results. A public `--env` or Default works regardless of earlier
   tunnel runs. V3 local runs use the agent path, never saved-code replay, and
   preserve saved code.
-- `--wait` handles polling/backoff; do not wrap it in a retry loop.
+- `--wait` handles polling/backoff; don't wrap it in a retry loop.
 - Backend Python runs top-to-bottom, not via pytest: call `test_*` functions.
   The sandbox has stdlib, `requests`, `pytest`, `numpy`, `scipy`; use HTTP,
   not project imports or uninstalled packages.
 - Backend `--produces`/`--needs` are repeatable; `--category teardown` marks cleanup.
   Set dependencies with `test create` or edit with `test update`; do not delete
   and recreate. Use `test run --all` for producer → consumer → teardown ordering
-  and variable passing. A BE `test rerun` includes that closure and its side effects;
+  and variable passing. A BE run includes that closure and its side effects;
   `--skip-dependencies` selects only the named test. Triage failed producers before
   blaming consumers starved of their token/fixture.
 
