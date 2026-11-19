@@ -127,6 +127,7 @@ existing test already covers.
 ```bash
 testsprite test list --project <projectId> --output json
 testsprite test list --project <projectId> --status failed --output json   # what's already red
+testsprite test run --all --project <projectId> --status failed,blocked --wait --timeout 600 --output json   # re-run what did not pass
 ```
 
 Heuristic: a change to `src/components/CheckoutForm.tsx` is more likely covered
@@ -382,12 +383,9 @@ testsprite project env create <projectId> --name staging --url https://staging.e
 # (a) existing test
 testsprite test run <test-id> --env staging --wait --timeout 600 --output json
 
-# (a-rerun) replay of a deployed test (V3 FE: 0.5 credit). Replays saved code (auto-heal on — more
-# lenient than a fresh run; for strict verification of a new change prefer `test run`).
-# BE: dispatches the WHOLE dependency closure — producers and teardowns run too, not just <test-id>,
-# so expect their side effects (fixtures re-created, teardown deletes) and extra runs in history.
-testsprite test rerun <test-id> --env staging --wait --timeout 600 --output json
-testsprite test rerun <test-id> --skip-dependencies --wait --timeout 600   # BE: named test only
+# (a-several) several tests in one batch; --skip-dependencies (BE) runs only the named tests
+testsprite test run <test-id> <test-id> --env staging --wait --timeout 600 --output json
+testsprite test run <test-id> --skip-dependencies --wait --timeout 600
 
 # (b-FE) new FE test from plan
 testsprite test create --plan-from plan.json --run --wait --env staging --timeout 600
@@ -398,6 +396,7 @@ testsprite test create --type backend --name "..." --project <projectId> --code-
 # (b-BE coverage set with dependencies) create each test without --run, then one wave-ordered batch
 testsprite test run --all --project <projectId> --env staging --wait --timeout 600 --output json
 testsprite test run --all --project <projectId> --filter <name-substr> --wait --timeout 600   # subset by name
+testsprite test run --all --project <projectId> --status failed,blocked --wait --timeout 600   # only what did not pass
 
 # (c) FE coverage set — single-call create + run (FE-only)
 testsprite test create-batch --plans plans.jsonl --run --wait \
@@ -410,21 +409,21 @@ testsprite test create-batch --plans plans.jsonl --run --wait \
 testsprite test plan put <test-id> --steps refined.json && \
 testsprite test run <test-id> --env staging --wait --timeout 600
 
-# (d-BE) refine BE code + re-run. NOTE: if you reach for `test rerun` here instead, a BE rerun
-# dispatches the full producer/teardown closure — use --skip-dependencies while iterating on one
-# script (producers already verified this round), then finish with a closure run before reporting.
+# (d-BE) refine BE code + re-run. A BE run dispatches the producer/teardown closure by default —
+# use --skip-dependencies while iterating on one script (producers already verified this round),
+# then finish with a closure run before reporting.
 testsprite test code put <test-id> --code-file refined.py --expected-version <current-version> && \
 testsprite test run <test-id> --env staging --wait --timeout 600
 ```
 
 Key behaviors:
 
-- Environment `--url` must be public; the CLI rejects localhost, RFC1918 and
-  link-local addresses. For an app on this machine, use `--local <port>`
-  (frontend only). If the CLI can list the project's environments, a named
-  public environment plus `--local` fails before a tunnel opens; otherwise the
-  server refuses the same combination before dispatch. A local environment
-  without `--local` is refused before dispatch and costs nothing.
+- Environment `--url` takes a public http/https URL or a loopback http origin
+  with an explicit port (frontend only); private and link-local addresses are
+  refused. Running against a loopback environment opens a tunnel automatically
+  and waits, like `--local <port>`. `--env <name> --local <port>` sends that
+  environment's sign-in to your local app; the server applies it or refuses
+  before dispatch.
 - `--wait` long-polls until terminal and handles its own backoff — don't wrap it
   in a retry loop.
 - `--local` implies `--wait`, with a default timeout of 1200 seconds per run (ordinary
@@ -481,13 +480,17 @@ Key behaviors:
   tests (producers → consumers → `teardown` last); FE tests in the project are
   skipped with an advisory, and everything not dispatched is enumerated
   (`conflicts` / `deferred` / `skippedFrontend`) so don't count `accepted[]`
-  alone. `test rerun <be-id>` expands the producer/teardown closure by default —
-  stderr summarizes `Reran N tests: 1 selected + P producer(s) + T teardown(s)`,
-  and failed members surface as `closureFailures[]` without flipping the exit
+  alone. A big batch is accepted whole and its runs show `queued` until they
+  start; `deferred` is rare (a project's lock stayed busy, or a test went in
+  flight during dispatch) and is never resent (exit 7). A BE run expands the
+  producer/teardown closure by default; failed
+  members surface as `closureFailures[]` without flipping the exit
   code. Pass `--skip-dependencies` only when this round already verified the
   producers and you're iterating fast on one script.
-- `test code put` needs `--expected-version <codeVersion>`; stale etag → exit 6,
-  re-fetch via `test get <id>` and retry. `--force` bypasses but is audit-logged.
+- `test code put`: `--expected-version <codeVersion>` is optional (the CLI
+  fetches the current version, which races with concurrent edits); stale etag → exit 6,
+  re-fetch via
+  `test get <id>` and retry. `--force` bypasses but is audit-logged.
 - Idempotency: the CLI auto-mints an `Idempotency-Key`; replays within 24h return
   the original test/run.
 
@@ -525,7 +528,7 @@ and runtime output: if the runtime output references a literal you submitted
 earlier in the plan, the action succeeded and the error is runtime-phase.
 
 **BE closure runs: root-cause the earliest failed wave, not the selected test.**
-When a rerun or `run --all` expanded a dependency closure and a **producer**
+When a `run` or `run --all` expanded a dependency closure and a **producer**
 failed, every consumer downstream of it fails or blocks by starvation (missing
 token / missing fixture). The selected test's red verdict does not implicate
 your feature — report it as failed-downstream, pull the producer's artifact

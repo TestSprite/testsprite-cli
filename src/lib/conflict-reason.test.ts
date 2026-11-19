@@ -58,14 +58,57 @@ describe('summarizeConflicts', () => {
     expect(summarizeConflicts([{ testId: 'a' }])).toBe('1 already in flight');
   });
 
-  it('renders an unknown future reason as "not dispatched", not "undefined"', () => {
+  it('renders an unknown future reason as "other", not "undefined" or a repeat of "not dispatched"', () => {
     // The loose wire schema admits reasons this CLI version does not know yet.
     const summary = summarizeConflicts([
       { testId: 'a', reason: 'some_future_reason' as never },
       { testId: 'b', reason: 'some_future_reason' as never },
     ]);
-    expect(summary).toBe('2 not dispatched');
+    expect(summary).toBe('2 other');
     expect(summary).not.toContain('undefined');
+    expect(summary).not.toContain('not dispatched');
+  });
+
+  it('labels the dependency refusals', () => {
+    expect(
+      summarizeConflicts([
+        { testId: 'a', reason: 'no_producer' },
+        { testId: 'b', reason: 'producer_in_flight', currentRunId: 'r1' },
+        { testId: 'c', reason: 'producer_in_flight', currentRunId: 'r2' },
+      ]),
+    ).toBe('1 no producer for its variables, 2 producer running in another run');
+  });
+});
+
+describe('dependency conflict reasons', () => {
+  it('no_producer prefers the backend message, with a fallback', () => {
+    expect(
+      describeConflict({
+        testId: 't',
+        reason: 'no_producer',
+        message: 'Missing upstream variable(s): "project_id"',
+      }),
+    ).toBe('Missing upstream variable(s): "project_id"');
+    expect(describeConflict({ testId: 't', reason: 'no_producer' })).toBe(
+      'no test case captures a variable it needs',
+    );
+  });
+
+  it('producer_in_flight is not "already in flight"; it prefers the message, never names its own run', () => {
+    expect(
+      describeConflict({
+        testId: 't',
+        reason: 'producer_in_flight',
+        currentRunId: 'run-9',
+        message: '"token" — producer: "Login" is running in another run (run run-9)',
+      }),
+    ).toContain('producer: "Login"');
+    expect(
+      describeConflict({ testId: 't', reason: 'producer_in_flight', currentRunId: 'run-9' }),
+    ).toBe('its producer is running in another run');
+    expect(describeConflict({ testId: 't', reason: 'producer_in_flight' })).toBe(
+      'its producer is running in another run',
+    );
   });
 });
 

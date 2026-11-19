@@ -301,7 +301,7 @@ describe('P4 schema contract — CLI runners return §6.x shapes', () => {
       { credentialsPath, stdout: () => undefined },
     );
     validateTestCode(code);
-    expect(code.code.startsWith('https://')).toBe(false);
+    expect(code.code?.startsWith('https://')).toBe(false);
   });
 
   it('runCodeGet (presigned) returns a §6.3 TestCode with https code', async () => {
@@ -311,7 +311,7 @@ describe('P4 schema contract — CLI runners return §6.x shapes', () => {
       { credentialsPath, stdout: () => undefined },
     );
     validateTestCode(code);
-    expect(code.code.startsWith('https://')).toBe(true);
+    expect(code.code?.startsWith('https://')).toBe(true);
   });
 
   it('runSteps returns a §6.4 TestStepList', async () => {

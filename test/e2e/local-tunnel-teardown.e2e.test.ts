@@ -193,6 +193,11 @@ beforeAll(async () => {
     if (method === 'GET' && url === `/api/cli/v1/runs/${RUN_ID}`) {
       // Hang forever — same long-poll-stall simulation as signal.e2e.test.ts.
       // The CLI's own abort (on SIGINT) or --timeout is what must cut this.
+      // Held through `delayedResponses`: otherwise the `'close'` guard above
+      // destroys it as soon as the request is read, and the CLI sees a
+      // network failure instead of a stall.
+      delayedResponses.add(res);
+      res.on('close', () => delayedResponses.delete(res));
       runPollWaiters.splice(0).forEach(fn => fn());
       return;
     }

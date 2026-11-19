@@ -525,3 +525,78 @@ describe('HttpClient.triggerRun — INSUFFICIENT_CREDITS vs RATE_LIMITED retry',
     expect(callCount).toBe(3);
   });
 });
+
+// ---------------------------------------------------------------------------
+// triggerBatchRunFresh — whole-request 429 is retried by the HTTP layer
+// ---------------------------------------------------------------------------
+
+describe('HttpClient.triggerBatchRunFresh — whole-request 429', () => {
+  const okBody = {
+    accepted: [{ testId: 't1', runId: 'run_1', enqueuedAt: '2026-10-22T00:00:00Z' }],
+    conflicts: [],
+    deferred: [],
+    skippedFrontend: [],
+    skippedIntegration: [],
+  };
+  const rateLimited = (reason: string | undefined, retryAfter: string): Response =>
+    new Response(
+      JSON.stringify({
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'slow down',
+          nextAction: 'retry',
+          requestId: 'req_1',
+          details: reason ? { reason, retryAfterSeconds: Number(retryAfter) } : {},
+        },
+      }),
+      { status: 429, headers: { 'content-type': 'application/json', 'retry-after': retryAfter } },
+    );
+  const body = { projectId: 'p1', source: 'cli' as const };
+
+  function clientWith(fetchImpl: typeof fetch, sleeps: number[]): HttpClient {
+    return new HttpClient({
+      baseUrl: 'https://api.example.com/api/cli/v1',
+      apiKey: 'sk-test',
+      fetchImpl,
+      sleep: ms => {
+        sleeps.push(ms);
+        return Promise.resolve();
+      },
+      random: () => 0,
+    });
+  }
+
+  it.each([
+    ['admission_busy', 'admission_busy'],
+    ['the plain rate limit', undefined],
+  ])('retries %s honouring Retry-After and returns the next 200', async (_label, reason) => {
+    const sleeps: number[] = [];
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(rateLimited(reason, '5'))
+      .mockResolvedValueOnce(jsonResponse(okBody));
+    const client = clientWith(fetchImpl as unknown as typeof fetch, sleeps);
+    const resp = await client.triggerBatchRunFresh(body, { idempotencyKey: 'k' });
+    expect(resp.accepted).toHaveLength(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(sleeps).toContain(5000);
+  });
+
+  it('gives up after the shared rate-limit budget and surfaces RATE_LIMITED', async () => {
+    const sleeps: number[] = [];
+    const fetchImpl = vi.fn(async () => rateLimited('admission_busy', '5'));
+    const client = clientWith(fetchImpl as unknown as typeof fetch, sleeps);
+    const err = await client.triggerBatchRunFresh(body, { idempotencyKey: 'k' }).catch(e => e);
+    expect(err.code).toBe('RATE_LIMITED');
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not retry inflight_cap (standing condition)', async () => {
+    const sleeps: number[] = [];
+    const fetchImpl = vi.fn(async () => rateLimited('inflight_cap', '30'));
+    const client = clientWith(fetchImpl as unknown as typeof fetch, sleeps);
+    const err = await client.triggerBatchRunFresh(body, { idempotencyKey: 'k' }).catch(e => e);
+    expect(err.code).toBe('RATE_LIMITED');
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});

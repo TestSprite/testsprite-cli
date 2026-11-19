@@ -1,4 +1,5 @@
 import { localValidationError } from './errors.js';
+import type { DeprecationEntry } from './deprecate.js';
 import { redactDeep } from './redact.js';
 
 export type OutputMode = 'json' | 'text';
@@ -89,9 +90,21 @@ export class Output {
   private readonly stdoutWrite: (line: string) => void;
   private readonly stderrWrite: (line: string) => void;
   private readonly rawStdoutWrite: (text: string) => void | Promise<void>;
+  private readonly deprecations: readonly DeprecationEntry[] | undefined;
 
-  constructor(mode: OutputMode = 'text', streams: OutputStreams = {}) {
+  /**
+   * `options.deprecations` is appended as the LAST key of a JSON object
+   * payload from `print` (text mode, arrays and error envelopes are never
+   * touched), so a deprecated command's output stays the same document plus
+   * one trailing key.
+   */
+  constructor(
+    mode: OutputMode = 'text',
+    streams: OutputStreams = {},
+    options: { deprecations?: readonly DeprecationEntry[] } = {},
+  ) {
     this.mode = mode;
+    this.deprecations = options.deprecations?.length ? options.deprecations : undefined;
     this.stdoutWrite =
       streams.stdout ??
       (line => {
@@ -116,7 +129,15 @@ export class Output {
     // `index.ts`, and `--debug` tracing in `client-factory.ts` — never to a
     // success payload.
     if (this.mode === 'json' || !textRenderer) {
-      this.stdoutWrite(JSON.stringify(data, null, 2));
+      const withDeprecations =
+        this.mode === 'json' &&
+        this.deprecations &&
+        typeof data === 'object' &&
+        data !== null &&
+        !Array.isArray(data)
+          ? { ...data, deprecations: this.deprecations }
+          : data;
+      this.stdoutWrite(JSON.stringify(withDeprecations, null, 2));
       return;
     }
     this.stdoutWrite(textRenderer(data));

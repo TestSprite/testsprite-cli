@@ -1,7 +1,8 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import { runsPerMonth } from '../lib/cron.js';
 import { ApiError } from '../lib/errors.js';
 import {
@@ -430,6 +431,38 @@ describe('get → update round trip', () => {
     // of having one.
     expect(runsPerMonth(fetched.cron!)).not.toBeNull();
   });
+
+  it('previews environment pinning under --dry-run without UNSUPPORTED refusal', async () => {
+    const out: string[] = [];
+    const stderr: string[] = [];
+    const result = await runUpdate(
+      { ...BASE, output: 'text', scheduleId: 'sch_1', env: 'staging', dryRun: true },
+      { stdout: l => out.push(l), stderr: l => stderr.push(l) },
+    );
+    expect(result.environment).toBe('staging');
+    expect(result.environmentMode).toBe('pinned');
+    expect(out.join('\n')).toContain('staging (pinned)');
+  });
+
+  it('echoes start and end dates under --dry-run in json output normalized as ISO strings', async () => {
+    const out: string[] = [];
+    const result = await runUpdate(
+      {
+        ...BASE,
+        output: 'json',
+        scheduleId: 'sch_1',
+        start: '2027-01-01',
+        end: '2027-06-01',
+        dryRun: true,
+      },
+      { stdout: l => out.push(l), stderr: () => {} },
+    );
+    expect(result.startAt).toBe(new Date('2027-01-01').toISOString());
+    expect(result.endAt).toBe(new Date('2027-06-01').toISOString());
+    const json = JSON.parse(out.join('\n'));
+    expect(json.startAt).toBe(new Date('2027-01-01').toISOString());
+    expect(json.endAt).toBe(new Date('2027-06-01').toISOString());
+  });
 });
 
 describe('runDelete', () => {
@@ -560,5 +593,67 @@ describe('runRunList', () => {
     );
 
     expect(result.runs).toEqual([]);
+  });
+
+  it('text output rejects unknown columns with VALIDATION_ERROR before auth/network access', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new Error('should not make network calls on invalid columns');
+    });
+
+    await expect(
+      runRunList(
+        { ...BASE, output: 'text', scheduleId: 'sch_1', columns: 'bogus' },
+        { stdout: () => undefined, fetchImpl: fetchImpl as unknown as typeof fetch },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'columns' },
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('text output rejects unknown columns with VALIDATION_ERROR even when server returns empty list', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { runs: [] } }));
+    await expect(
+      runRunList(
+        { ...BASE, output: 'text', scheduleId: 'sch_1', columns: 'bogus' },
+        { credentialsPath, fetchImpl, stdout: () => undefined },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'columns' },
+    });
+  });
+
+  it('text output rejects unknown columns with VALIDATION_ERROR before dry-run banner emission', async () => {
+    resetDryRunBannerForTesting();
+    const stderr: string[] = [];
+
+    await expect(
+      runRunList(
+        { ...BASE, output: 'text', scheduleId: 'sch_1', dryRun: true, columns: 'bogus' },
+        { stdout: () => undefined, stderr: line => stderr.push(line) },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: { field: 'columns' },
+    });
+    expect(stderr).toEqual([]);
+  });
+
+  it('json output ignores text-only column flags', async () => {
+    const { credentialsPath } = makeCreds();
+    const fetchImpl = makeFetch(() => ({ body: { runs: [RUN] } }));
+
+    const out: string[] = [];
+    const result = await runRunList(
+      { ...BASE, output: 'json', scheduleId: 'sch_1', columns: 'bogus', noHeader: true },
+      { credentialsPath, fetchImpl, stdout: line => out.push(line) },
+    );
+    expect(result.runs).toEqual([RUN]);
   });
 });
