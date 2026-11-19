@@ -60,6 +60,39 @@ describe('readSecretFileGuarded', () => {
     expect(readSecretFileGuarded('password-file', path)).toBe('hunter2');
   });
 
+  it('decodes a UTF-16LE file with a BOM (PowerShell 5.1 `>` / `Set-Content -Encoding unicode`)', () => {
+    const path = join(tmpRoot, 'pw-utf16le.txt');
+    const bytes = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('s3cret\r\n', 'utf16le')]);
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (tmpRoot), not user input.
+    writeFileSync(path, bytes);
+    expect(readSecretFileGuarded('password-file', path)).toBe('s3cret');
+  });
+
+  it('decodes a UTF-16BE file with a BOM', () => {
+    const path = join(tmpRoot, 'pw-utf16be.txt');
+    const body = Buffer.from('s3cret\r\n', 'utf16le');
+    body.swap16();
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (tmpRoot), not user input.
+    writeFileSync(path, Buffer.concat([Buffer.from([0xfe, 0xff]), body]));
+    expect(readSecretFileGuarded('password-file', path)).toBe('s3cret');
+  });
+
+  it('rejects a UTF-16BE file with an odd byte count as VALIDATION_ERROR', () => {
+    const path = join(tmpRoot, 'pw-utf16be-odd.txt');
+    const body = Buffer.from('s3cret', 'utf16le');
+    body.swap16();
+    // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (tmpRoot), not user input.
+    writeFileSync(path, Buffer.concat([Buffer.from([0xfe, 0xff]), body, Buffer.from([0x00])]));
+    try {
+      readSecretFileGuarded('password-file', path);
+      expect.unreachable('should have thrown');
+    } catch (err) {
+      expect(err).toMatchObject({ code: 'VALIDATION_ERROR', exitCode: 5 });
+      expect((err as ApiError).details).toMatchObject({ field: 'password-file' });
+      expect((err as ApiError).nextAction).toContain('incomplete code unit');
+    }
+  });
+
   it('preserves interior whitespace', () => {
     const path = join(tmpRoot, 'pw-spaces.txt');
     // eslint-disable-next-line security/detect-non-literal-fs-filename -- test fixture write into this test's own mkdtempSync-created temp dir (tmpRoot), not user input.

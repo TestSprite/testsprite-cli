@@ -1398,7 +1398,7 @@ Print a shell completion script (shell auto-detected from `$SHELL`), for example
 
 ### Profiles & credentials
 
-Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, the `TESTSPRITE_API_KEY` / `TESTSPRITE_API_URL` env vars override the file, so CI can run without ever touching `~/.testsprite/credentials`.
+Credentials live at `~/.testsprite/credentials` (INI-style, mode `0600`) — one section per profile. A credentials file resaved as UTF-16 (Windows PowerShell 5.1 `>` / `Out-File`, or Notepad's "Unicode") is still read, and the next save writes it back as UTF-8. **Profile resolution order** (highest first): `--profile` flag → `TESTSPRITE_PROFILE` env → `default`. Within a profile, the `TESTSPRITE_API_KEY` / `TESTSPRITE_API_URL` env vars override the file, so CI can run without ever touching `~/.testsprite/credentials`.
 
 ### Global flags
 
