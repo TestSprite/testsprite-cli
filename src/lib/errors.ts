@@ -420,19 +420,27 @@ export function localValidationError(
   });
 }
 
+export interface TransportErrorOptions {
+  /** Cause-specific remediation; defaults to the generic availability text. */
+  nextAction?: string;
+  /** Machine-readable cause, e.g. `{ cause: 'SELF_SIGNED_CERT_IN_CHAIN' }`. */
+  details?: Record<string, unknown>;
+}
+
 /**
  * Network/transport failure not associated with a server envelope. Treated
  * as `UNAVAILABLE` for exit-code purposes per design §8.2.
  */
 export class TransportError extends ApiError {
-  constructor(message: string, requestId = 'local') {
+  constructor(message: string, requestId = 'local', options: TransportErrorOptions = {}) {
     super({
       code: 'UNAVAILABLE',
       message,
       nextAction:
+        options.nextAction ??
         'Service is temporarily unavailable. The CLI retries with exponential backoff; if this persists, report it.',
       requestId,
-      details: {},
+      details: options.details ?? {},
     });
     this.name = 'TransportError';
   }
@@ -481,9 +489,13 @@ export class RequestTimeoutError extends CLIError {
 /**
  * Every facade-emitted HTTP status maps to a
  * known error code. When the envelope is missing or its `code` field is
- * unrecognized (proxy returned an empty body, content was mangled), we fall
- * back to the status-derived code so the retry budget and exit code match
- * what the contract promises.
+ * unrecognized (content was mangled), we fall back to the status-derived code
+ * so the retry budget and exit code match what the contract promises.
+ *
+ * `HttpClient` never routes a 4xx (other than 408/429) whose body is not JSON,
+ * including an empty one, through this mapping: that answer came from
+ * something between the CLI and the API (a proxy or firewall page), so it is
+ * reported as such instead of as a bad key, missing credits or an old CLI.
  */
 function codeFromHttpStatus(status: number | undefined): ErrorCode {
   switch (status) {

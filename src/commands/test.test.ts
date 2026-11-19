@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'v
 import type { Command } from 'commander';
 import type { RunResponse } from '../lib/runs.types.js';
 import { ApiError, InterruptError } from '../lib/errors.js';
+import { DRY_RUN_BANNER, resetDryRunBannerForTesting } from '../lib/client-factory.js';
 import { GLOBAL_OPTS_HINT } from '../lib/output.js';
 import { ShutdownController } from '../lib/interrupt.js';
 import { defaultSleep } from '../lib/poll-support.js';
@@ -406,6 +407,55 @@ describe('runList', () => {
       from: 'user',
     });
     expect(new URL(seen[0]!).searchParams.get('environment')).toBe('staging');
+  });
+
+  it('--dry-run does not emit the banner when local validation fails (issue #360)', async () => {
+    // Repro: `testsprite test list --dry-run` (no --project) used to print
+    // "[dry-run] sample response — not from the server" before the
+    // VALIDATION_ERROR, because the banner fired at client construction
+    // while `requireProjectId` ran after. The banner is now lazy (first
+    // dry-run response), so only the error prints.
+    resetDryRunBannerForTesting();
+    const stderr: string[] = [];
+    await expect(
+      runList(
+        { profile: 'default', output: 'json', debug: false, dryRun: true },
+        {
+          env: {} as NodeJS.ProcessEnv,
+          stderr: line => stderr.push(line),
+          stdout: () => undefined,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR',
+      exitCode: 5,
+      details: expect.objectContaining({ field: 'project' }),
+    });
+    expect(stderr.join('\n')).not.toContain(DRY_RUN_BANNER);
+  });
+
+  it('--dry-run emits the banner when the command produces a dry-run response', async () => {
+    // Happy path guard: with validation passing, the lazy banner still
+    // prints exactly once before the canned sample.
+    resetDryRunBannerForTesting();
+    const stderr: string[] = [];
+    const out: string[] = [];
+    await runList(
+      {
+        profile: 'default',
+        output: 'json',
+        debug: false,
+        dryRun: true,
+        projectId: 'project_alice',
+      },
+      {
+        env: {} as NodeJS.ProcessEnv,
+        stderr: line => stderr.push(line),
+        stdout: line => out.push(line),
+      },
+    );
+    expect(stderr.filter(l => l === DRY_RUN_BANNER)).toHaveLength(1);
+    expect(JSON.parse(out.join('\n'))).toHaveProperty('items');
   });
 
   it('json keeps status and adds statusByEnvironment and headlineEnvironment', async () => {
@@ -3428,6 +3478,7 @@ describe('runCodePut', () => {
 
   // Fix #2 — dogfood 2026-05-14: --dry-run-simulate-error PRECONDITION_FAILED
   it('--dry-run --dry-run-simulate-error PRECONDITION_FAILED: exits 6 + emits retry hint', async () => {
+    resetDryRunBannerForTesting();
     const { credentialsPath } = makeCreds();
     const codeFile = writeCodeFile('any code');
     const stderrLines: string[] = [];
@@ -3454,6 +3505,44 @@ describe('runCodePut', () => {
     expect(stderrLines.some(l => l.includes('Code conflict'))).toBe(true);
     expect(stderrLines.some(l => l.includes('v99'))).toBe(true);
     expect(stderrLines.some(l => l.includes('--expected-version'))).toBe(true);
+    // --expected-version skips the auto-fetch, so no request is sent: the
+    // banner is emitted explicitly, once, before the simulated conflict.
+    expect(stderrLines.filter(l => l === DRY_RUN_BANNER)).toHaveLength(1);
+    expect(stderrLines.indexOf(DRY_RUN_BANNER)).toBeLessThan(
+      stderrLines.findIndex(l => l.includes('Code conflict')),
+    );
+  });
+
+  it('--dry-run --dry-run-simulate-error PRECONDITION_FAILED with --force: emits the banner once', async () => {
+    resetDryRunBannerForTesting();
+    const { credentialsPath } = makeCreds();
+    const codeFile = writeCodeFile('any code');
+    const stderrLines: string[] = [];
+    await expect(
+      runCodePut(
+        {
+          profile: 'default',
+          output: 'json',
+          debug: false,
+          dryRun: true,
+          testId: 'test_abc',
+          codeFile,
+          force: true,
+          dryRunSimulateError: 'PRECONDITION_FAILED',
+        },
+        {
+          credentialsPath,
+          stdout: () => undefined,
+          stderr: line => stderrLines.push(line),
+        },
+      ),
+    ).rejects.toMatchObject({ code: 'PRECONDITION_FAILED', exitCode: 6 });
+    expect(stderrLines.some(l => l.includes('Code conflict'))).toBe(true);
+    // --force skips the auto-fetch too, so the banner is emitted explicitly.
+    expect(stderrLines.filter(l => l === DRY_RUN_BANNER)).toHaveLength(1);
+    expect(stderrLines.indexOf(DRY_RUN_BANNER)).toBeLessThan(
+      stderrLines.findIndex(l => l.includes('Code conflict')),
+    );
   });
 
   it('without --dry-run, a real 412 from the server still routes through the normal retry-hint path', async () => {
@@ -8546,6 +8635,7 @@ describe('runPlanPut', () => {
 
   // Fix #2 — dogfood 2026-05-14: --dry-run-simulate-error PRECONDITION_FAILED
   it('--dry-run --dry-run-simulate-error PRECONDITION_FAILED: exits 6 + emits retry hint', async () => {
+    resetDryRunBannerForTesting();
     const { credentialsPath } = makeCreds();
     const stepsFile = writeStepsFile({ planSteps: STEPS });
     const stderrLines: string[] = [];
@@ -8570,6 +8660,12 @@ describe('runPlanPut', () => {
     // Retry hint must be present on stderr
     expect(stderrLines.some(l => l.includes('Plan-steps conflict'))).toBe(true);
     expect(stderrLines.some(l => l.includes('--expected-step-count'))).toBe(true);
+    // No request is sent, so the banner is emitted explicitly, once, before
+    // the simulated conflict.
+    expect(stderrLines.filter(l => l === DRY_RUN_BANNER)).toHaveLength(1);
+    expect(stderrLines.indexOf(DRY_RUN_BANNER)).toBeLessThan(
+      stderrLines.findIndex(l => l.includes('Plan-steps conflict')),
+    );
   });
 });
 
