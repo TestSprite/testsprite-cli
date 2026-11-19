@@ -145,6 +145,38 @@ describe('serializeCredentials', () => {
   });
 });
 
+/** CRLF, the line ending Notepad and Windows PowerShell 5.1 write. */
+const ENCODED_CREDENTIALS_TEXT =
+  '[default]\r\napi_key = sk-existing\r\n\r\n[prod]\r\napi_key = sk-prod\r\n';
+const ENCODED_CREDENTIALS_PROFILES = {
+  default: { apiKey: 'sk-existing' },
+  prod: { apiKey: 'sk-prod' },
+};
+
+/** Bytes an editor saves: optional BOM plus the text in that encoding. */
+function credentialsFileBytes(
+  encoding: 'utf8' | 'utf8-bom' | 'utf16le' | 'utf16be',
+  text: string,
+): Buffer {
+  if (encoding === 'utf8') return Buffer.from(text, 'utf8');
+  if (encoding === 'utf8-bom') {
+    return Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(text, 'utf8')]);
+  }
+  if (encoding === 'utf16le') {
+    return Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, 'utf16le')]);
+  }
+  const body = Buffer.from(text, 'utf16le');
+  body.swap16();
+  return Buffer.concat([Buffer.from([0xfe, 0xff]), body]);
+}
+
+function plantCredentialsFile(encoding: 'utf8' | 'utf8-bom' | 'utf16le' | 'utf16be'): Buffer {
+  const bytes = credentialsFileBytes(encoding, ENCODED_CREDENTIALS_TEXT);
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- `credentialsPath` lives in this suite's `mkdtempSync` temp dir, never user input; planting an encoded credentials file is the point of the test
+  writeFileSync(credentialsPath, bytes);
+  return bytes;
+}
+
 describe('readCredentialsFile / readProfile', () => {
   it('returns empty when file is missing', () => {
     expect(readCredentialsFile({ path: credentialsPath })).toEqual({});
@@ -156,6 +188,30 @@ describe('readCredentialsFile / readProfile', () => {
     writeFileSync(credentialsPath, '[default]\napi_key = sk-x\n');
     expect(readProfile('default', { path: credentialsPath })).toEqual({ apiKey: 'sk-x' });
   });
+
+  it.each(['utf16le', 'utf16be'] as const)(
+    'reads a %s credentials file the same as the UTF-8 original',
+    encoding => {
+      plantCredentialsFile('utf8');
+      const original = readCredentialsFile({ path: credentialsPath });
+      expect(original).toEqual(ENCODED_CREDENTIALS_PROFILES);
+      plantCredentialsFile(encoding);
+      expect(readCredentialsFile({ path: credentialsPath })).toEqual(original);
+    },
+  );
+
+  it.each([
+    ['without a BOM', 'utf8'],
+    ['with a UTF-8 BOM', 'utf8-bom'],
+  ] as const)(
+    'a credentials file %s is unchanged and reads the same profiles',
+    (_label, encoding) => {
+      const bytes = plantCredentialsFile(encoding);
+      expect(readCredentialsFile({ path: credentialsPath })).toEqual(ENCODED_CREDENTIALS_PROFILES);
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- same suite temp dir; asserting a read left the file bytes alone
+      expect(readFileSync(credentialsPath).equals(bytes)).toBe(true);
+    },
+  );
 });
 
 describe('writeProfile', () => {
@@ -416,6 +472,26 @@ describe('writeProfile', () => {
     expect(file.default).toEqual({ apiKey: 'sk-d', apiUrl: 'https://prod' });
     expect(file.dev).toEqual({ apiKey: 'sk-dev', apiUrl: 'https://dev' });
   });
+
+  it.each(['utf16le', 'utf16be'] as const)(
+    'writeProfile on a %s file keeps existing profiles and writes UTF-8 without a BOM',
+    encoding => {
+      plantCredentialsFile(encoding);
+      writeProfile('staging', { apiKey: 'sk-staging' }, { path: credentialsPath });
+
+      expect(readCredentialsFile({ path: credentialsPath })).toEqual({
+        ...ENCODED_CREDENTIALS_PROFILES,
+        staging: { apiKey: 'sk-staging' },
+      });
+      // eslint-disable-next-line security/detect-non-literal-fs-filename -- same suite temp dir; asserting the rewrite dropped the BOM
+      const saved = readFileSync(credentialsPath);
+      expect(saved.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]))).toBe(false);
+      expect(saved.subarray(0, 2).equals(Buffer.from([0xff, 0xfe]))).toBe(false);
+      expect(saved.subarray(0, 2).equals(Buffer.from([0xfe, 0xff]))).toBe(false);
+      expect(saved.subarray(0, 9).toString('utf8')).toBe('[default]');
+      expect(saved.includes(0)).toBe(false);
+    },
+  );
 
   it('reclaims stale mutation locks and removes the lock after writing', () => {
     const lockPath = `${credentialsPath}.lock`;
